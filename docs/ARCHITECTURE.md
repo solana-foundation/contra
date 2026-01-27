@@ -12,8 +12,6 @@ Contra is a **payment channel** with direct access to Solana Mainnet liquidity. 
 
 Contra achieves these features through escrow/withdraw programs and an indexer/operator that syncs deposits/withdrawals with Solana Mainnet.
 
-![Contra How it Works](./assets/contra-how.png)
-
 ### Table of Contents
 
 - [Contra Core](#contra-core)

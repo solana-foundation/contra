@@ -1,0 +1,25 @@
+[package]
+name = "test_utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bs58.workspace = true
+contra-escrow-program-client.workspace = true
+contra-withdraw-program-client.workspace = true
+contra-indexer = { path = "../indexer" }
+serde_json.workspace = true
+solana-address.workspace = true
+solana-client.workspace = true
+solana-rpc.workspace = true
+solana-sdk.workspace = true
+solana-sdk-ids = "3.0"
+solana-test-validator.workspace = true
+solana-transaction-status.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+
+[lib]

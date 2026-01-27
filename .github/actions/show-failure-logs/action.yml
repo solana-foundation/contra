@@ -1,0 +1,32 @@
+name: 'Show Failure Logs'
+description: 'Show debugging information when tests fail'
+
+inputs:
+  test-type:
+    description: 'Type of test that failed (e.g., "Rust integration")'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Show debugging information
+      shell: bash
+      if: failure()
+      run: |
+        echo "=== ${{ inputs.test-type }} failure logs ==="
+        echo "Timestamp: $(date)"
+        echo ""
+        
+        echo "=== Recent log files ==="
+        find . -name "*.log" -type f -mtime -1 -exec echo "=== {} ===" \; -exec tail -50 {} \; 2>/dev/null || echo "No log files found"
+        echo ""
+        
+        echo "=== System resources ==="
+        echo "Memory usage:"
+        free -h || echo "free command not available"
+        echo ""
+        echo "Disk usage:"
+        df -h . || echo "df command not available"
+        echo ""
+        
+        echo "=== End of failure logs ==="

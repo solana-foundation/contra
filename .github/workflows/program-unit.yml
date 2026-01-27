@@ -1,0 +1,70 @@
+name: Program Unit Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "contra-escrow-program/**"
+      - "contra-withdraw-program/**"
+      - "Cargo.*"
+      - ".github/workflows/program-unit.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "contra-escrow-program/**"
+      - "contra-withdraw-program/**"
+      - "Cargo.*"
+      - ".github/workflows/program-unit.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+
+permissions:
+  contents: read
+
+jobs:
+  unit-test:
+    name: Unit Tests with Coverage
+    runs-on: contra-runner-1
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          rust-toolchain: stable
+          rust-components: llvm-tools-preview
+
+      - name: Run unit tests with coverage
+        run: |
+          echo "🧪 Running unit tests with coverage..."
+          make unit-coverage
+
+      - name: Generate HTML coverage report
+        run: |
+          echo "📊 Generating HTML coverage reports..."
+          make coverage-html
+
+      - name: Display coverage summary
+        run: |
+          echo "📈 Coverage summary will be shown by make unit-coverage"
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-coverage-reports
+          path: |
+            contra-escrow-program/coverage-*.lcov
+            contra-escrow-program/coverage-html-*/
+            contra-withdraw-program/coverage-*.lcov
+            contra-withdraw-program/coverage-html-*/
+          retention-days: 30
+
+      - name: Show failure logs
+        if: failure()
+        uses: ./.github/actions/show-failure-logs
+        with:
+          test-type: "Program unit"

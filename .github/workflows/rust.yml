@@ -1,0 +1,76 @@
+name: Rust Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+
+      - name: Run cargo check
+        run: cargo check --all-features
+
+  fmt:
+    name: Format
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          rust-components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          rust-components: clippy
+
+      - name: Run clippy
+        run: cargo clippy --all-features -- -D warnings
+
+  integration-test:
+    name: Integration Tests
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+
+      - name: Run integration tests
+        run: make integration-test
+
+  unit-tests:
+    name: Indexer Unit Tests
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+
+      - name: Run indexer unit tests (yellowstone)
+        run: make unit-test

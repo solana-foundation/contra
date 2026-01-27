@@ -1,0 +1,1157 @@
+{
+  "version": "0.1.0",
+  "name": "contra_escrow_program",
+  "instructions": [
+    {
+      "name": "CreateInstance",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "admin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin of Instance"
+          ]
+        },
+        {
+          "name": "instanceSeed",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Instance seed signer for PDA derivation"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to be created"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "bump",
+          "type": "u8"
+        }
+      ],
+      "discriminant": {
+        "type": "u8",
+        "value": 0
+      }
+    },
+    {
+      "name": "AllowMint",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "admin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin of Instance"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to validate admin authority"
+          ]
+        },
+        {
+          "name": "mint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token mint to be allowed"
+          ]
+        },
+        {
+          "name": "allowedMint",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "PDA of the Allowed Mint"
+          ]
+        },
+        {
+          "name": "instanceAta",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance Escrow account for specified mint"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token program"
+          ]
+        },
+        {
+          "name": "associatedTokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Associated Token program"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "bump",
+          "type": "u8"
+        }
+      ],
+      "discriminant": {
+        "type": "u8",
+        "value": 1
+      }
+    },
+    {
+      "name": "BlockMint",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "admin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin of Instance"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to validate admin authority"
+          ]
+        },
+        {
+          "name": "mint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token mint to be blocked"
+          ]
+        },
+        {
+          "name": "allowedMint",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Existing Allowed Mint PDA"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "System program for account creation"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [],
+      "discriminant": {
+        "type": "u8",
+        "value": 2
+      }
+    },
+    {
+      "name": "AddOperator",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "admin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin of Instance"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to validate admin authority"
+          ]
+        },
+        {
+          "name": "operator",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Operator public key to be added"
+          ]
+        },
+        {
+          "name": "operatorPda",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Operator PDA to be created"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "bump",
+          "type": "u8"
+        }
+      ],
+      "discriminant": {
+        "type": "u8",
+        "value": 3
+      }
+    },
+    {
+      "name": "RemoveOperator",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "admin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Admin of Instance"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to validate admin authority"
+          ]
+        },
+        {
+          "name": "operator",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Operator public key to be removed"
+          ]
+        },
+        {
+          "name": "operatorPda",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Existing Operator PDA"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [],
+      "discriminant": {
+        "type": "u8",
+        "value": 4
+      }
+    },
+    {
+      "name": "SetNewAdmin",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "currentAdmin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Current admin of Instance"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to update admin"
+          ]
+        },
+        {
+          "name": "newAdmin",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "New admin public key"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [],
+      "discriminant": {
+        "type": "u8",
+        "value": 5
+      }
+    },
+    {
+      "name": "Deposit",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "user",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "User depositing tokens"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to validate"
+          ]
+        },
+        {
+          "name": "mint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token mint being deposited"
+          ]
+        },
+        {
+          "name": "allowedMint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "AllowedMint PDA to validate mint is allowed"
+          ]
+        },
+        {
+          "name": "userAta",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "User's Associated Token Account for this mint"
+          ]
+        },
+        {
+          "name": "instanceAta",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance's Associated Token Account (escrow) for this mint"
+          ]
+        },
+        {
+          "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "System program"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token program for the mint"
+          ]
+        },
+        {
+          "name": "associatedTokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Associated Token program"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "recipient",
+          "type": {
+            "option": "publicKey"
+          }
+        }
+      ],
+      "discriminant": {
+        "type": "u8",
+        "value": 6
+      }
+    },
+    {
+      "name": "ReleaseFunds",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "operator",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Operator releasing the funds"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to validate and update"
+          ]
+        },
+        {
+          "name": "operatorPda",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Operator PDA to validate operator permissions"
+          ]
+        },
+        {
+          "name": "mint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token mint being released"
+          ]
+        },
+        {
+          "name": "allowedMint",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "AllowedMint PDA to validate mint is allowed"
+          ]
+        },
+        {
+          "name": "userAta",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "User's Associated Token Account for this mint"
+          ]
+        },
+        {
+          "name": "instanceAta",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance's Associated Token Account (escrow) for this mint"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token program for the mint"
+          ]
+        },
+        {
+          "name": "associatedTokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Associated Token program"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "user",
+          "type": "publicKey"
+        },
+        {
+          "name": "newWithdrawalRoot",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "transactionNonce",
+          "type": "u64"
+        },
+        {
+          "name": "siblingProofs",
+          "type": {
+            "array": [
+              "u8",
+              512
+            ]
+          }
+        }
+      ],
+      "discriminant": {
+        "type": "u8",
+        "value": 7
+      }
+    },
+    {
+      "name": "ResetSmtRoot",
+      "accounts": [
+        {
+          "name": "payer",
+          "isMut": true,
+          "isSigner": true,
+          "docs": [
+            "Transaction fee payer"
+          ]
+        },
+        {
+          "name": "operator",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Operator resetting the SMT root"
+          ]
+        },
+        {
+          "name": "instance",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Instance PDA to reset"
+          ]
+        },
+        {
+          "name": "operatorPda",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Operator PDA to validate operator permissions"
+          ]
+        },
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        },
+        {
+          "name": "contraEscrowProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Current program for CPI"
+          ]
+        }
+      ],
+      "args": [],
+      "discriminant": {
+        "type": "u8",
+        "value": 8
+      }
+    },
+    {
+      "name": "EmitEvent",
+      "accounts": [
+        {
+          "name": "eventAuthority",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "Event authority PDA for emitting events"
+          ]
+        }
+      ],
+      "args": [],
+      "discriminant": {
+        "type": "u8",
+        "value": 228
+      }
+    }
+  ],
+  "accounts": [
+    {
+      "name": "AllowedMint",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Instance",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "admin",
+            "type": "publicKey"
+          },
+          {
+            "name": "withdrawalTransactionsRoot",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "currentTreeIndex",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Operator",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "CreateInstanceEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "admin",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AllowMintEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "mint",
+            "type": "publicKey"
+          },
+          {
+            "name": "decimals",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BlockMintEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "mint",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AddOperatorEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "operator",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RemoveOperatorEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "operator",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SetNewAdminEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "oldAdmin",
+            "type": "publicKey"
+          },
+          {
+            "name": "newAdmin",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DepositEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "user",
+            "type": "publicKey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "recipient",
+            "type": "publicKey"
+          },
+          {
+            "name": "mint",
+            "type": "publicKey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReleaseFundsEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "operator",
+            "type": "publicKey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "user",
+            "type": "publicKey"
+          },
+          {
+            "name": "mint",
+            "type": "publicKey"
+          },
+          {
+            "name": "newWithdrawalRoot",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ResetSmtRootEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "eventDiscriminator",
+            "type": "u8"
+          },
+          {
+            "name": "instanceSeed",
+            "type": "publicKey"
+          },
+          {
+            "name": "operator",
+            "type": "publicKey"
+          }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": 0,
+      "name": "InvalidEventAuthority",
+      "msg": "Invalid event authority provided"
+    },
+    {
+      "code": 1,
+      "name": "InvalidAta",
+      "msg": "Invalid ATA provided"
+    },
+    {
+      "code": 2,
+      "name": "InvalidMint",
+      "msg": "Invalid mint provided"
+    },
+    {
+      "code": 3,
+      "name": "InvalidInstanceId",
+      "msg": "Instance ID invalid or does not respect rules"
+    },
+    {
+      "code": 4,
+      "name": "InvalidInstance",
+      "msg": "Invalid instance provided"
+    },
+    {
+      "code": 5,
+      "name": "InvalidAdmin",
+      "msg": "Invalid admin provided"
+    },
+    {
+      "code": 6,
+      "name": "PermanentDelegateNotAllowed",
+      "msg": "Permanent delegate extension not allowed"
+    },
+    {
+      "code": 7,
+      "name": "PausableMintNotAllowed",
+      "msg": "Pausable mint extension not allowed"
+    },
+    {
+      "code": 8,
+      "name": "InvalidOperatorPda",
+      "msg": "Invalid operator PDA provided"
+    },
+    {
+      "code": 9,
+      "name": "InvalidTokenAccount",
+      "msg": "Invalid token account provided"
+    },
+    {
+      "code": 10,
+      "name": "InvalidEscrowBalance",
+      "msg": "Invalid escrow balance"
+    },
+    {
+      "code": 11,
+      "name": "InvalidAllowedMint",
+      "msg": "Invalid allowed mint"
+    },
+    {
+      "code": 12,
+      "name": "InvalidSmtProof",
+      "msg": "Invalid SMT proof provided"
+    },
+    {
+      "code": 13,
+      "name": "InvalidTransactionNonceForCurrentTreeIndex",
+      "msg": "Invalid transaction nonce for current tree index"
+    }
+  ],
+  "metadata": {
+    "origin": "shank",
+    "address": "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83"
+  }
+}

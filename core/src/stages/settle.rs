@@ -1,0 +1,365 @@
+use {
+    crate::{
+        accounts::{traits::BlockInfo, AccountsDB},
+        nodes::node::WorkerHandle,
+    },
+    solana_hash::Hash,
+    solana_rpc_client_types::response::RpcPerfSample,
+    solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        pubkey::Pubkey,
+        transaction::SanitizedTransaction,
+    },
+    solana_svm::{
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
+        transaction_processor::LoadAndExecuteSanitizedTransactionsOutput,
+    },
+    solana_svm_transaction::svm_message::SVMMessage,
+    std::{
+        collections::HashMap,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    },
+    tokio::{sync::mpsc, time::Instant},
+    tokio_util::sync::CancellationToken,
+    tracing::{debug, error, info, warn},
+};
+
+const SETTLE_START_DELAY_MS: u64 = 1000;
+
+/// A single account that has been settled
+/// We need to track if the account was deleted so we can tombstone it
+/// in the accounts database
+pub struct AccountSettlement {
+    pub account: AccountSharedData,
+    pub deleted: bool,
+}
+
+struct SettleResult {
+    slot: u64,
+    blockhash: Hash,
+    account_settlements: Vec<(Pubkey, AccountSettlement)>,
+}
+
+#[derive(Clone)]
+struct LastBlock {
+    slot: u64,
+    blockhash: Hash,
+}
+
+pub struct SettleArgs {
+    pub execution_results_rx: mpsc::UnboundedReceiver<(
+        LoadAndExecuteSanitizedTransactionsOutput,
+        Vec<SanitizedTransaction>,
+    )>,
+    pub settled_accounts_tx: mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>,
+    pub settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
+    pub accountsdb_connection_url: String,
+    pub blocktime_ms: u64,
+    pub perf_sample_period_secs: u64,
+    pub shutdown_token: CancellationToken,
+}
+
+pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
+    let SettleArgs {
+        execution_results_rx,
+        settled_accounts_tx,
+        settled_blockhashes_tx,
+        accountsdb_connection_url,
+        blocktime_ms,
+        perf_sample_period_secs,
+        shutdown_token,
+    } = args;
+    let handle = tokio::spawn(async move {
+        async fn run_settle_worker(
+            mut execution_results_rx: mpsc::UnboundedReceiver<(
+                LoadAndExecuteSanitizedTransactionsOutput,
+                Vec<SanitizedTransaction>,
+            )>,
+            settled_accounts_tx: mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>,
+            settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
+            accountsdb_connection_url: String,
+            blocktime_ms: u64,
+            perf_sample_period_secs: u64,
+            shutdown_token: CancellationToken,
+        ) -> anyhow::Result<()> {
+            info!("Settle worker started");
+
+            let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
+                .await
+                .unwrap();
+            let last_slot = accounts_db.get_latest_slot().await.ok();
+            let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
+
+            // Validate that last_slot and last_blockhash are both present or both absent
+            match (last_slot, last_blockhash) {
+                (Some(_), None) => {
+                    anyhow::bail!("Invalid state: last_slot exists but last_blockhash is missing");
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!("Invalid state: last_blockhash exists but last_slot is missing");
+                }
+                _ => {}
+            }
+
+            let mut last_block = match (last_slot, last_blockhash) {
+                (Some(last_slot), Some(last_blockhash)) => Some(LastBlock {
+                    slot: last_slot,
+                    blockhash: last_blockhash,
+                }),
+                _ => None,
+            };
+            let mut processing_results = Vec::new();
+            let mut blocktime_interval = tokio::time::interval_at(
+                Instant::now() + Duration::from_millis(SETTLE_START_DELAY_MS),
+                Duration::from_millis(blocktime_ms),
+            );
+
+            // Performance sample tracking
+            let mut perf_sample_interval = tokio::time::interval_at(
+                Instant::now() + Duration::from_secs(perf_sample_period_secs),
+                Duration::from_secs(perf_sample_period_secs),
+            );
+            let mut perf_start_slot = last_block.as_ref().map(|b| b.slot).unwrap_or(0);
+            let mut perf_num_transactions = 0u64;
+
+            loop {
+                tokio::select! {
+                    // Settle transactions every BLOCKTIME_MS
+                    _ = blocktime_interval.tick() => {
+                        if let Ok(settle_result) = settle_transactions(last_block.clone(), &mut accounts_db, &processing_results).await {
+                            // Track performance metrics
+                            let num_txs = processing_results.len() as u64;
+                            perf_num_transactions += num_txs;
+
+                            last_block = Some(LastBlock {
+                                slot: settle_result.slot,
+                                blockhash: settle_result.blockhash,
+                            });
+                            processing_results.clear();
+                            debug!("Settled {} transactions in slot {}, blockhash {}", settle_result.account_settlements.len(), settle_result.slot, settle_result.blockhash);
+                            if let Err(e) = settled_accounts_tx.send(settle_result.account_settlements) {
+                                warn!("Failed to send settled accounts: {:?}", e);
+                                break;
+                            }
+                            if let Err(e) = settled_blockhashes_tx.send(settle_result.blockhash) {
+                                warn!("Failed to send settled blockhashes: {:?}", e);
+                                break;
+                            }
+                        } else {
+                            error!("Failed to settle transactions");
+                            break;
+                        }
+                    }
+
+                    // Save performance sample periodically
+                    _ = perf_sample_interval.tick() => {
+                        if let Some(ref current_block) = last_block {
+                            let current_slot = current_block.slot;
+                            let num_slots = current_slot.saturating_sub(perf_start_slot);
+
+                            let sample = RpcPerfSample {
+                                slot: current_slot,
+                                num_transactions: perf_num_transactions,
+                                num_slots,
+                                sample_period_secs: perf_sample_period_secs as u16,
+                                // In Contra, all transactions are non-vote transactions
+                                num_non_vote_transactions: Some(perf_num_transactions),
+                            };
+
+                            if let Err(e) = accounts_db.store_performance_sample(sample).await {
+                                warn!("Failed to store performance sample: {:?}", e);
+                            } else {
+                                debug!("Stored performance sample for slot {}: {} txs over {} slots",
+                                    current_slot, perf_num_transactions, num_slots);
+                            }
+
+                            // Reset counters for next period
+                            perf_start_slot = current_slot;
+                            perf_num_transactions = 0;
+                        }
+                    }
+
+                    // Process execution results
+                    result = execution_results_rx.recv() => {
+                        match result {
+                            Some((svm_output, transactions)) => {
+                                debug!("Settle worker received output with {} transactions", transactions.len());
+                                if svm_output.processing_results.len() != transactions.len() {
+                                    error!("Processing results and transactions length mismatch");
+                                    break;
+                                }
+                                info!("Extending {} processing results", svm_output.processing_results.len());
+                                processing_results.extend(svm_output.processing_results.into_iter().zip(transactions.into_iter()));
+                            }
+                            None => {
+                                info!("Settle worker stopped - channel closed");
+                                break;
+                            }
+                        }
+                    }
+
+                    // Handle shutdown signal
+                    _ = shutdown_token.cancelled() => {
+                        info!("Settle worker received shutdown signal");
+                        break;
+                    }
+                }
+            }
+
+            info!("Settle worker stopped");
+            Ok(())
+        }
+
+        if let Err(e) = run_settle_worker(
+            execution_results_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            accountsdb_connection_url,
+            blocktime_ms,
+            perf_sample_period_secs,
+            shutdown_token,
+        )
+        .await
+        {
+            error!("Settle worker failed: {:?}", e);
+        }
+    });
+
+    WorkerHandle::new("Settle".to_string(), handle)
+}
+
+/// Settle transactions: Update accounts database with changes
+async fn settle_transactions(
+    last_block: Option<LastBlock>,
+    accounts_db: &mut AccountsDB,
+    processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
+) -> Result<SettleResult, Box<dyn std::error::Error>> {
+    let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> = HashMap::new();
+
+    // Determine block time
+    let block_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Generate blockhash and determine next slot
+    // TODO: Check the blockhash generation scheme
+    let (next_blockhash, next_slot, last_blockhash, last_slot) =
+        if let Some(ref last_block) = last_block {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0..8].copy_from_slice(&last_block.slot.to_le_bytes());
+            hash_bytes[8..16].copy_from_slice(&block_time.to_le_bytes());
+            let next_blockhash = Hash::new_from_array(hash_bytes);
+            let next_slot = last_block.slot + 1;
+            (
+                next_blockhash,
+                next_slot,
+                last_block.blockhash,
+                last_block.slot,
+            )
+        } else {
+            (Hash::default(), 0, Hash::default(), 0)
+        };
+
+    // Start collecting transaction signatures for this block
+    let mut block_transaction_signatures = Vec::new();
+    let mut transactions_for_db = Vec::new();
+
+    for (processing_result, sanitized_transaction) in processing_results.iter() {
+        let signature = sanitized_transaction.signature();
+
+        // Only collect successful transactions for batch write
+        if let Ok(processed_tx) = processing_result {
+            transactions_for_db.push((
+                *signature,
+                sanitized_transaction,
+                next_slot,
+                block_time,
+                processed_tx,
+            ));
+        }
+
+        match processing_result {
+            Ok(ProcessedTransaction::Executed(executed_tx)) => {
+                debug!(
+                    "Executed transaction: {:?}",
+                    sanitized_transaction.signature()
+                );
+
+                for (index, (pubkey, account_data)) in
+                    executed_tx.loaded_transaction.accounts.iter().enumerate()
+                {
+                    if sanitized_transaction.is_writable(index) {
+                        if account_data.lamports() == 0 && account_data.data().is_empty() {
+                            final_accounts_actual.insert(
+                                *pubkey,
+                                AccountSettlement {
+                                    account: account_data.clone(),
+                                    deleted: true,
+                                },
+                            );
+                        } else {
+                            final_accounts_actual.insert(
+                                *pubkey,
+                                AccountSettlement {
+                                    account: account_data.clone(),
+                                    deleted: false,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                // Add transaction signature to block
+                block_transaction_signatures.push(*signature);
+            }
+            Ok(ProcessedTransaction::FeesOnly(fees_only_transaction)) => {
+                warn!("FeesOnly transaction: {:?}", fees_only_transaction);
+
+                // For fees-only transactions, we just record the transaction
+                // The rollback accounts have already been handled by SVM
+                // and fees have been deducted
+
+                // Add transaction signature to block
+                block_transaction_signatures.push(*signature);
+            }
+            Err(e) => {
+                warn!("Transaction failed: {:?}, error: {:?}", signature, e);
+                // Failed transactions still get recorded
+                block_transaction_signatures.push(*signature);
+            }
+        }
+    }
+
+    // Convert final_accounts to Vec for batch write
+    let accounts_vec: Vec<(Pubkey, AccountSettlement)> =
+        final_accounts_actual.into_iter().collect();
+
+    // Create block info
+    let block_info = BlockInfo {
+        slot: next_slot,
+        blockhash: next_blockhash,
+        previous_blockhash: last_blockhash,
+        parent_slot: last_slot,
+        // TODO: Do we need this?
+        block_height: Some(next_slot),
+        block_time: Some(block_time),
+        transaction_signatures: block_transaction_signatures,
+    };
+
+    // Use write_batch for atomic writes
+    accounts_db
+        .write_batch(
+            &accounts_vec,
+            transactions_for_db,
+            Some(block_info),
+            Some(next_slot),
+        )
+        .await?;
+
+    Ok(SettleResult {
+        slot: next_slot,
+        blockhash: next_blockhash,
+        account_settlements: accounts_vec,
+    })
+}

@@ -1,0 +1,86 @@
+name: TypeScript SDK Unit Tests
+
+on:
+  workflow_call:
+  push:
+    branches: [main]
+    paths:
+      - "contra-escrow-program/clients/typescript/**"
+      - ".github/workflows/sdk-unit.yml"
+      - "contra-escrow-program/idl/**"
+      - "contra-escrow-program/scripts/**"
+      - "contra-escrow-program/package.json"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "contra-escrow-program/clients/typescript/**"
+      - ".github/workflows/sdk-unit.yml"
+      - "contra-escrow-program/idl/**"
+      - "contra-escrow-program/scripts/**"
+      - "contra-escrow-program/package.json"
+
+jobs:
+  typescript-sdk-unit:
+    name: TypeScript SDK Unit Tests
+    runs-on: contra-runner-1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 10.15.1
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install root dependencies
+        shell: bash
+        run: cd contra-escrow-program && pnpm install --frozen-lockfile
+
+      - name: Generate clients
+        run: cd contra-escrow-program && pnpm run generate-clients
+
+      - name: Check code formatting
+        run: cd contra-escrow-program && pnpm run format:check
+
+      - name: Build TypeScript SDK
+        run: cd contra-escrow-program && pnpm run build
+
+      - name: Run TypeScript unit tests with coverage
+        run: |
+          echo "🧪 Running TypeScript SDK unit tests with coverage..."
+          cd contra-escrow-program && pnpm run test:unit --coverage --coverageDirectory=coverage-unit
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts-unit-coverage-reports
+          path: |
+            contra-escrow-program/clients/typescript/coverage-unit/
+          retention-days: 30
+
+      - name: Display coverage summary
+        working-directory: contra-escrow-program/clients/typescript
+        run: |
+          if [ -f coverage-unit/coverage-summary.json ]; then
+            echo "📊 Coverage Summary:"
+            cat coverage-unit/coverage-summary.json | jq '.total'
+          fi
+
+      - name: Show failure logs
+        if: failure()
+        uses: ./.github/actions/show-failure-logs
+        with:
+          test-type: "TypeScript unit"

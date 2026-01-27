@@ -1,0 +1,47 @@
+[package]
+name = "yellowstone-grpc-geyser"
+version = "10.0.0"
+authors = { workspace = true }
+edition = { workspace = true }
+description = "Yellowstone gRPC Geyser Plugin"
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+keywords = { workspace = true }
+publish = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+core_affinity = { workspace = true }
+agave-geyser-plugin-interface = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-clock = { workspace = true }
+solana-logger = { workspace = true }
+solana-pubkey = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tonic = { workspace = true, features = ["gzip", "zstd", "tls-native-roots"] }
+tonic-health = { workspace = true }
+yellowstone-grpc-proto = { workspace = true, features = [
+    "convert",
+    "plugin",
+    "tonic",
+] }
+
+[build-dependencies]
+anyhow = { workspace = true }
+cargo-lock = { workspace = true }
+git-version = { workspace = true }
+vergen = { workspace = true, features = ["build", "rustc"] }
+
+[lints]
+workspace = true

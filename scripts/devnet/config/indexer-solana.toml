@@ -1,0 +1,34 @@
+# Devnet configuration for Solana indexer (Yellowstone)
+
+[common]
+program_type = "escrow"
+# TODO: Add devnet solana rpc url
+rpc_url = "your_devnet_solana_rpc_url"
+# TODO: Add escrow instance id
+escrow_instance_id = "your_escrow_instance_id"
+
+[storage]
+type = "postgres"
+max_connections = 10
+
+[indexer]
+datasource_type = "yellowstone"
+
+[indexer.yellowstone]
+# TODO: Add devnet solana yellowstone endpoint
+endpoint = "your_devnet_solana_yellowstone_endpoint"
+commitment = "confirmed"
+
+[indexer.rpc_polling]
+poll_interval_ms = 1000
+error_retry_interval_ms = 5000
+batch_size = 50
+
+[indexer.backfill]
+enabled = false
+backfill_only = false
+# TODO: Add devnet solana rpc url
+rpc_url = "your_devnet_solana_rpc_url"
+batch_size = 100
+max_gap_slots = 10000000
+start_slot = 0

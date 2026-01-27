@@ -1,0 +1,66 @@
+[package]
+name = "contra-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+base64 = { workspace = true }
+bincode = { workspace = true }
+bs58 = { workspace = true }
+clap = { workspace = true }
+contra-withdraw-program-client = { path = "../contra-withdraw-program/clients/rust" }
+enum_dispatch = { workspace = true }
+futures = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+jsonrpsee = { workspace = true }
+rand = { workspace = true }
+redis = { workspace = true }
+rocksdb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
+solana-account-decoder = { workspace = true }
+solana-bpf-loader-program = { workspace = true }
+solana-client = { version = "2.3.10" }
+solana-compute-budget = { workspace = true }
+solana-epoch-info = { workspace = true }
+solana-epoch-schedule = { workspace = true }
+solana-fee-calculator = { workspace = true }
+solana-hash = { workspace = true }
+solana-loader-v3-interface = { workspace = true }
+solana-program-runtime = { workspace = true }
+solana-rent-collector = { workspace = true }
+solana-rpc-client-types = { workspace = true }
+solana-runtime-transaction = { workspace = true }
+solana-sdk = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-svm = { workspace = true }
+solana-svm-callback = { workspace = true }
+solana-svm-feature-set = { workspace = true }
+solana-svm-rent-collector = { workspace = true }
+solana-svm-transaction = { workspace = true }
+solana-system-interface = { workspace = true }
+solana-system-program = { workspace = true }
+solana-timings = { workspace = true }
+solana-transaction-error = { workspace = true }
+solana-transaction-status = { workspace = true }
+solana-transaction-status-client-types = { workspace = true }
+spl-associated-token-account = { workspace = true }
+spl-token = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-mpmc = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3.2.0"
+solana-logger = { workspace = true }

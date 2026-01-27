@@ -1,0 +1,106 @@
+extern crate alloc;
+
+use crate::{
+    constants::tree_constants::EMPTY_TREE_ROOT,
+    error::ContraEscrowProgramError,
+    events::ResetSmtRootEvent,
+    processor::{
+        shared::{account_check::verify_signer, event_utils::emit_event},
+        verify_current_program, verify_mutability,
+    },
+    state::{discriminator::AccountSerialize, Instance, Operator},
+    validate_event_accounts,
+};
+use pinocchio::{
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
+};
+
+/// Processes the ResetSmtRoot instruction.
+///
+/// # Account Layout
+/// 0. `[signer, writable]` payer - Pays for transaction fees
+/// 1. `[signer]` operator - Operator resetting the SMT root
+/// 2. `[writable]` instance - Instance PDA to validate and update
+/// 3. `[]` operator_pda - Operator PDA to validate operator permissions
+/// 4. `[]` event_authority - Event authority PDA for emitting events
+/// 5. `[]` contra_escrow_program - Current program for CPI
+pub fn process_reset_smt_root(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    _instruction_data: &[u8],
+) -> ProgramResult {
+    let [payer_info, operator_info, instance_info, operator_pda_info, event_authority_info, program_info] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    verify_signer(payer_info, true)?;
+    verify_signer(operator_info, false)?;
+
+    verify_mutability(instance_info, true)?;
+
+    verify_current_program(program_info)?;
+
+    validate_event_accounts!(event_authority_info, program_info);
+
+    // Validate instance exists and is properly formed
+    let instance_data = instance_info.try_borrow_data()?;
+    let mut instance = Instance::try_from_bytes(&instance_data)?;
+
+    instance
+        .validate_pda(instance_info)
+        .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
+
+    // Validate operator exists and is properly formed
+    let operator_pda_data = operator_pda_info.try_borrow_data()?;
+    let operator_pda = Operator::try_from_bytes(&operator_pda_data)?;
+
+    operator_pda
+        .validate_pda(instance_info.key(), operator_info.key(), operator_pda_info)
+        .map_err(|_| ContraEscrowProgramError::InvalidOperatorPda)?;
+
+    drop(instance_data);
+
+    // Reset withdrawal transactions root to empty tree root
+    instance.withdrawal_transactions_root = EMPTY_TREE_ROOT;
+    instance.current_tree_index = instance
+        .current_tree_index
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    // Write updated instance back to account
+    let updated_instance_data = instance.to_bytes();
+    instance_info
+        .try_borrow_mut_data()?
+        .copy_from_slice(&updated_instance_data);
+
+    // Emit ResetSmtRoot event
+    let event = ResetSmtRootEvent::new(instance.instance_seed, *operator_info.key());
+    emit_event(
+        program_id,
+        event_authority_info,
+        program_info,
+        &event.to_bytes(),
+    )?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ID as CONTRA_ESCROW_PROGRAM_ID;
+    use alloc::vec;
+
+    #[test]
+    fn test_process_reset_smt_root_empty_accounts() {
+        let instruction_data = vec![];
+        let accounts = [];
+
+        let result =
+            process_reset_smt_root(&CONTRA_ESCROW_PROGRAM_ID, &accounts, &instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
+    }
+}

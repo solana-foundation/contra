@@ -1,0 +1,26 @@
+[package]
+name = "contra-withdraw-program"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+] }
+
+[features]
+no-entrypoint = []
+idl = []
+devnet = []
+
+[dependencies]
+pinocchio = { workspace = true }
+pinocchio-associated-token-account = { workspace = true }
+pinocchio-log = { workspace = true }
+pinocchio-pubkey = { workspace = true }
+pinocchio-token = { workspace = true }
+shank = { workspace = true }
+thiserror = { workspace = true }

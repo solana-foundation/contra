@@ -1,0 +1,36 @@
+.DS_Store
+.env
+.vscode/
+/keypairs
+
+/worktrees
+
+# Rust
+**/target/
+**/coverage/
+**/generated/
+**/escrow-generated/
+**/withdraw-generated/
+
+# Javascript / Typescript
+**/node_modules/
+**/dist/
+
+# AI
+.claude/
+
+# Profiling
+__pycache__/
+**/flamechart_*.svg
+
+# Solana Test Validator
+**/test-ledger
+
+# Yellowstone gRPC plugin build
+indexer/.yellowstone-grpc/
+integration/.yellowstone-grpc/
+
+# Local
+.local/
+
+indexer/config/devnet/

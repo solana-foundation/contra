@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # cAdvisor metrics for all containers
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    metric_relabel_configs:
+      # Keep only metrics for specific containers
+      - source_labels: [container_label_com_docker_compose_service]
+        regex: '(write-node|read-node|postgres-primary|postgres-replica|postgres-indexer|activity|indexer)'
+        action: keep
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

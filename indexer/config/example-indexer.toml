@@ -1,0 +1,69 @@
+# Example configuration for Contra Indexer
+# Copy this file and customize for your deployment
+# Secrets (DATABASE_URL, tokens) should be set via environment variables
+
+[common]
+# Program type: "escrow" or "withdraw"
+program_type = "escrow"
+
+# RPC endpoint URL
+rpc_url = "http://localhost:8899"
+
+# Escrow instance ID (required for escrow program type, omit for withdraw)
+# escrow_instance_id = "YourPubkeyHere..."
+
+[storage]
+# Storage type: "postgres"
+type = "postgres"
+
+# Maximum number of database connections
+max_connections = 10
+
+# Database URL must be set via environment variable: DATABASE_URL
+# Example: export DATABASE_URL="postgresql://user:pass@localhost:5432/indexer"
+
+[indexer]
+# Datasource type: "rpc_polling" or "yellowstone"
+datasource_type = "rpc_polling"
+
+# === RPC Polling Configuration ===
+[indexer.rpc_polling]
+# Starting slot (optional, omit to start from latest)
+# start_slot = 0
+
+# Polling interval in milliseconds
+poll_interval_ms = 1000
+
+# Error retry interval in milliseconds
+error_retry_interval_ms = 5000
+
+# Batch size for processing blocks
+batch_size = 50
+
+# === Yellowstone gRPC Configuration ===
+[indexer.yellowstone]
+# Yellowstone gRPC endpoint URL
+# endpoint = "grpc://your-yellowstone-endpoint:10000"
+
+# Commitment level: "processed", "confirmed", or "finalized"
+commitment = "confirmed"
+
+# Token must be set via environment variable: INDEXER_YELLOWSTONE_TOKEN
+# Example: export INDEXER_YELLOWSTONE_TOKEN="your-token"
+
+# === Backfill Configuration ===
+[indexer.backfill]
+# Enable automatic backfill on startup
+enabled = false
+
+# Enable backfill only mode (exits after backfill completes)
+backfill_only = false
+
+# Batch size for backfill operations
+batch_size = 5
+
+# Max gap in slots before requiring manual intervention (~45 days at 400ms slots)
+max_gap_slots = 10000000
+
+# RPC URL for backfill (optional, defaults to common.rpc_url)
+# rpc_url = "http://localhost:8899"

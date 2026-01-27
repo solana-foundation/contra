@@ -1,0 +1,16 @@
+use crate::rpc::{error::custom_error, ReadDeps};
+use jsonrpsee::core::RpcResult;
+use solana_rpc_client_types::config::RpcContextConfig;
+
+pub async fn get_blocks_impl(
+    read_deps: &ReadDeps,
+    start_slot: u64,
+    end_slot: Option<u64>,
+    _config: Option<RpcContextConfig>,
+) -> RpcResult<Vec<u64>> {
+    read_deps
+        .accounts_db
+        .get_blocks(start_slot, end_slot)
+        .await
+        .map_err(|e| custom_error(-32000, format!("Failed to get blocks: {}", e)))
+}

@@ -1,0 +1,22 @@
+# Environment variables (contains private keys)
+.env
+.env.local
+.env.cloud
+
+# Node modules
+node_modules/
+
+# Build output
+dist/
+
+# K6 output
+k6-results/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

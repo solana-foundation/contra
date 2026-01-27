@@ -1,0 +1,39 @@
+# Ignore build artifacts
+target/
+
+# Ignore test databases
+*.db
+*.db-journal
+test_db/
+/tmp/
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore git files
+.git/
+.gitignore
+
+# Ignore documentation files (not needed for build)
+*.md
+docs/
+
+# Ignore test files
+tests/
+benches/
+
+# Ignore local environment files
+.env
+.env.local
+
+# Ignore logs
+*.log
+logs/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

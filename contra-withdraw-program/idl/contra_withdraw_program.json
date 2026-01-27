@@ -1,0 +1,96 @@
+{
+  "version": "0.1.0",
+  "name": "contra_withdraw_program",
+  "instructions": [
+    {
+      "name": "WithdrawFunds",
+      "accounts": [
+        {
+          "name": "user",
+          "isMut": false,
+          "isSigner": true,
+          "docs": [
+            "User initiating the withdrawal"
+          ]
+        },
+        {
+          "name": "mint",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Token mint"
+          ]
+        },
+        {
+          "name": "tokenAccount",
+          "isMut": true,
+          "isSigner": false,
+          "docs": [
+            "Source token account"
+          ]
+        },
+        {
+          "name": "tokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Token program"
+          ]
+        },
+        {
+          "name": "associatedTokenProgram",
+          "isMut": false,
+          "isSigner": false,
+          "docs": [
+            "Associated token program"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "destination",
+          "type": {
+            "option": "publicKey"
+          }
+        }
+      ],
+      "discriminant": {
+        "type": "u8",
+        "value": 0
+      }
+    }
+  ],
+  "types": [
+    {
+      "name": "WithdrawFundsEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "destination",
+            "type": "publicKey"
+          }
+        ]
+      }
+    }
+  ],
+  "errors": [
+    {
+      "code": 0,
+      "name": "InvalidMint",
+      "msg": "Invalid mint provided"
+    }
+  ],
+  "metadata": {
+    "origin": "shank",
+    "address": "J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi"
+  }
+}

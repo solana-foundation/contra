@@ -1,0 +1,32 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Indexer specific
+indexer/target/
+indexer/.cargo/
+
+# Test artifacts
+indexer/tests/*/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# Documentation
+*.md
+!README.md
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore

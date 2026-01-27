@@ -1,0 +1,64 @@
+# Example configuration for Contra Operator
+# Copy this file and customize for your deployment
+# Secrets (DATABASE_URL, private keys) must be set via environment variables
+
+[common]
+# Program type: "escrow" or "withdraw"
+program_type = "escrow"
+
+# RPC endpoint URL for transaction submission
+rpc_url = "http://localhost:8899"
+
+# Escrow instance ID (required for escrow program type, omit for withdraw)
+# escrow_instance_id = "YourPubkeyHere..."
+
+[storage]
+# Storage type: "postgres"
+type = "postgres"
+
+# Maximum number of database connections
+max_connections = 10
+
+# Database URL must be set via environment variable: DATABASE_URL
+# Example: export DATABASE_URL="postgresql://user:pass@localhost:5432/indexer"
+
+[operator]
+# Database polling interval in seconds
+poll_interval_secs = 5
+
+# Number of transactions to fetch per batch
+batch_size = 10
+
+# Maximum retry attempts for failed transactions
+retry_max_attempts = 3
+
+# Retry base delay in seconds (exponential backoff applies)
+retry_base_delay_secs = 1
+
+# Channel buffer size for internal queues
+channel_buffer_size = 100
+
+# === Signer Configuration (via Environment Variables) ===
+#
+# Required for all operators:
+#   ADMIN_SIGNER=memory|vault|turnkey|privy
+#   ADMIN_PRIVATE_KEY=<key-or-identifier>
+#
+# Optional (falls back to admin if not set):
+#   OPERATOR_SIGNER=memory|vault|turnkey|privy
+#   OPERATOR_PRIVATE_KEY=<key-or-identifier>
+#
+# Type-specific variables (required based on signer type):
+#
+# Vault signers:
+#   ADMIN_VAULT_ADDR, ADMIN_VAULT_TOKEN, ADMIN_PUBKEY
+#   OPERATOR_VAULT_ADDR, OPERATOR_VAULT_TOKEN, OPERATOR_PUBKEY
+#
+# Turnkey signers:
+#   ADMIN_TURNKEY_API_PUBLIC_KEY, ADMIN_TURNKEY_API_PRIVATE_KEY,
+#   ADMIN_TURNKEY_ORGANIZATION_ID, ADMIN_PUBKEY
+#   OPERATOR_TURNKEY_* (same pattern)
+#
+# Privy signers:
+#   ADMIN_PRIVY_APP_ID, ADMIN_PRIVY_APP_SECRET, ADMIN_PRIVY_WALLET_ID
+#   OPERATOR_PRIVY_* (same pattern)

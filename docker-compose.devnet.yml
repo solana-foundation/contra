@@ -1,0 +1,378 @@
+services:
+  # PostgreSQL Primary (for write node)
+  postgres-primary:
+    image: postgres:16-alpine
+    container_name: contra-postgres-primary
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_REPLICATION_MODE=master
+      - POSTGRES_REPLICATION_USER=${POSTGRES_REPLICATION_USER}
+      - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+      # Enable replication - allow connections from Docker network
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+      - POSTGRES_HOST_AUTH_METHOD=scram-sha-256
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./init-primary-hba.sh:/docker-entrypoint-initdb.d/02-hba.sh:ro
+    command: |
+      postgres
+      -c wal_level=replica
+      -c hot_standby=on
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c hot_standby_feedback=on
+      -c wal_log_hints=on
+      -c archive_mode=on
+      -c archive_command='/bin/true'
+      -c listen_addresses='*'
+    networks:
+      - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Write Node (formerly sequencer)
+  write-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-write-node
+    restart: unless-stopped
+    depends_on:
+      - postgres-primary
+    environment:
+      - RUST_LOG=info
+      - CONTRA_PORT=${CONTRA_WRITE_PORT}
+      - CONTRA_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+      - CONTRA_ENABLE_READ=false
+      - CONTRA_SIGVERIFY_QUEUE_SIZE=${CONTRA_SIGVERIFY_QUEUE_SIZE}
+      - CONTRA_SIGVERIFY_WORKERS=${CONTRA_SIGVERIFY_WORKERS}
+      - CONTRA_MAX_CONNECTIONS=${CONTRA_WRITE_MAX_CONNECTIONS}
+      - CONTRA_MAX_TX_PER_BATCH=${CONTRA_MAX_TX_PER_BATCH}
+      - CONTRA_LOG_LEVEL=info
+      - CONTRA_JSON_LOGS=false
+      - CONTRA_MODE=write
+      - CONTRA_ADMIN_KEYS=${CONTRA_ADMIN_KEYS}
+    ports:
+      - "${CONTRA_WRITE_PORT}:${CONTRA_WRITE_PORT}"
+    command: ["/usr/local/bin/node"]
+    networks:
+      - contra-network
+
+  # PostgreSQL Replica (for read node)
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: contra-postgres-replica
+    restart: unless-stopped
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_REPLICATION_MODE=slave
+      - POSTGRES_MASTER_HOST=postgres-primary
+      - POSTGRES_MASTER_PORT=5432
+      - POSTGRES_REPLICATION_USER=${POSTGRES_REPLICATION_USER}
+      - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+      - PGUSER=${POSTGRES_USER}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    user: postgres
+    command: |
+      bash -c "
+        until PGPASSWORD=${POSTGRES_PASSWORD} psql -h postgres-primary -U ${POSTGRES_USER} -d ${POSTGRES_DB} -c 'SELECT 1' > /dev/null 2>&1; do
+          echo 'Waiting for primary to be ready...'
+          sleep 2
+        done
+
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          echo 'Setting up replica...'
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=${POSTGRES_REPLICATION_PASSWORD} pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U ${POSTGRES_REPLICATION_USER} -v -P -R -S replica_slot
+
+          chmod 700 /var/lib/postgresql/data
+          touch /var/lib/postgresql/data/standby.signal
+        fi
+
+        postgres
+      "
+    networks:
+      - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Read Node
+  read-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-read-node
+    restart: unless-stopped
+    depends_on:
+      - postgres-replica
+      - write-node
+    environment:
+      - RUST_LOG=info
+      - CONTRA_PORT=${CONTRA_READ_PORT}
+      - CONTRA_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
+      - CONTRA_MAX_CONNECTIONS=${CONTRA_READ_MAX_CONNECTIONS}
+      - CONTRA_ENABLE_WRITE=false
+      - CONTRA_ENABLE_READ=true
+      - CONTRA_LOG_LEVEL=info
+      - CONTRA_JSON_LOGS=false
+      - CONTRA_MODE=read
+    ports:
+      - "${CONTRA_READ_PORT}:${CONTRA_READ_PORT}"
+    command: ["/usr/local/bin/node"]
+    networks:
+      - contra-network
+
+  # Gateway (Routes requests between write and read nodes)
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-gateway
+    restart: unless-stopped
+    depends_on:
+      - write-node
+      - read-node
+    environment:
+      - RUST_LOG=info
+      - GATEWAY_PORT=${GATEWAY_PORT}
+      - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
+      - GATEWAY_READ_URL=${GATEWAY_READ_URL}
+    ports:
+      - "${GATEWAY_PORT}:${GATEWAY_PORT}"
+    command: ["/usr/local/bin/gateway"]
+    networks:
+      - contra-network
+
+  # PostgreSQL for Indexer
+  postgres-indexer:
+    image: postgres:16-alpine
+    container_name: contra-postgres-indexer
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_INDEXER_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres-indexer-data:/var/lib/postgresql/data
+    networks:
+      - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_INDEXER_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Indexer Service - Solana (Yellowstone)
+  indexer-solana:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-indexer-solana
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    depends_on:
+      postgres-indexer:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info,contra_indexer=debug
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
+      - INDEXER_YELLOWSTONE_ENDPOINT=${DEVNET_YELLOWSTONE_ENDPOINT}
+      - INDEXER_YELLOWSTONE_TOKEN=${INDEXER_YELLOWSTONE_TOKEN}
+      - INDEXER_BACKFILL_RPC_URL=${DEVNET_RPC_URL}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        /usr/local/bin/indexer \
+          --config /config/devnet/indexer-solana.toml \
+          -v \
+          indexer
+    volumes:
+      - ./scripts/devnet/config:/config/devnet:ro
+    networks:
+      - contra-network
+
+  # Indexer Service - Contra (RPC Polling)
+  indexer-contra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-indexer-contra
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    depends_on:
+      postgres-indexer:
+        condition: service_healthy
+      read-node:
+        condition: service_started
+    environment:
+      - RUST_LOG=info,contra_indexer=debug
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - COMMON_RPC_URL=${GATEWAY_URL}
+      - INDEXER_BACKFILL_RPC_URL=${GATEWAY_URL}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        /usr/local/bin/indexer \
+          --config /config/devnet/indexer-contra.toml \
+          -v \
+          indexer
+    volumes:
+      - ./scripts/devnet/config:/config/devnet:ro
+    networks:
+      - contra-network
+
+  # Operator Service - Solana
+  operator-solana:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-operator-solana
+    restart: unless-stopped
+    depends_on:
+      postgres-indexer:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info,contra_indexer=debug
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - COMMON_RPC_URL=${GATEWAY_URL}
+      - COMMON_SOURCE_RPC_URL=${DEVNET_RPC_URL}
+      - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
+      - ADMIN_SIGNER=memory
+      - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - OPERATOR_SIGNER=memory
+      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        /usr/local/bin/indexer \
+          --config /config/devnet/operator-solana.toml \
+          -v \
+          operator
+    volumes:
+      - ./scripts/devnet/config:/config/devnet:ro
+    networks:
+      - contra-network
+
+  # Operator Service - Contra
+  operator-contra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-operator-contra
+    restart: unless-stopped
+    depends_on:
+      postgres-indexer:
+        condition: service_healthy
+      write-node:
+        condition: service_started
+    environment:
+      - RUST_LOG=info,contra_indexer=debug
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
+      - ADMIN_SIGNER=memory
+      - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - OPERATOR_SIGNER=memory
+      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        /usr/local/bin/indexer \
+          --config /config/devnet/operator-contra.toml \
+          -v \
+          operator
+    volumes:
+      - ./scripts/devnet/config:/config/devnet:ro
+    networks:
+      - contra-network
+
+  # cAdvisor for container metrics
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: contra-cadvisor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    networks:
+      - contra-network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: contra-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    networks:
+      - contra-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: contra-grafana
+    restart: unless-stopped
+    ports:
+      - "37429:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - contra-network
+
+volumes:
+  postgres-primary-data:
+  postgres-replica-data:
+  postgres-indexer-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  contra-network:
+    driver: bridge

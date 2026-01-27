@@ -1,0 +1,17 @@
+# Local docker-compose configuration for Contra Operator (withdraw program)
+
+[common]
+program_type = "withdraw"
+rpc_url = "http://localhost:18899"
+escrow_instance_id = "7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz"
+
+[storage]
+type = "postgres"
+max_connections = 10
+
+[operator]
+poll_interval_secs = 5
+batch_size = 10
+retry_max_attempts = 3
+retry_base_delay_secs = 1
+channel_buffer_size = 100

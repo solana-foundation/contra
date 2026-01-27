@@ -1,0 +1,162 @@
+.PHONY: build fmt
+.PHONY: compose-indexer compose-operator compose-all
+.PHONY: start-validator run-yellowstone run-rpc run-operator
+.PHONY: unit-test all-test
+.PHONY: run-mock-transactions
+.PHONY: yellowstone-clone build-yellowstone-plugin clean-yellowstone
+
+# Configuration
+CONTRA_ESCROW_PROGRAM_ID ?= GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+CONTRA_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
+CONTRA_ESCROW_PROGRAM_SO ?= ../target/deploy/contra_escrow_program.so
+CONTRA_WITHDRAW_PROGRAM_SO ?= ../target/deploy/contra_withdraw_program.so
+GEYSER_CONFIG ?= src/indexer/datasource/common/yellowstone_grpc/config.json
+DATABASE_URL ?= postgres://contra:contra_password@localhost:5432/indexer
+ESCROW_INSTANCE_ID ?=
+
+# Yellowstone gRPC plugin configuration
+YELLOWSTONE_REPO ?= https://github.com/rpcpool/yellowstone-grpc.git
+YELLOWSTONE_DIR ?= .yellowstone-grpc
+YELLOWSTONE_BRANCH ?= fix-core-affinity-mac
+YELLOWSTONE_DYLIB_SRC = $(YELLOWSTONE_DIR)/target/release/libyellowstone_grpc_geyser.dylib
+YELLOWSTONE_DYLIB_DEST = src/indexer/datasource/common/yellowstone_grpc/libyellowstone_grpc_geyser.dylib
+
+## Build the indexer
+build:
+	@echo "Building indexer..."
+	@cargo build --release
+
+## Format code
+fmt:
+	@echo "Formatting code..."
+	@cargo fmt
+	@cargo clippy --all-targets --all-features -- -D warnings
+
+###################################
+# Docker compose services
+###################################
+compose-indexer:
+	@docker compose up -d validator indexer-solana indexer-contra
+
+compose-operator:
+	@docker compose up -d postgres-indexer operator-solana operator-contra
+
+compose-all:
+	@docker compose up -d validator indexer-solana indexer-contra postgres-indexer operator-solana operator-contra
+
+###################################
+# Individual service start
+###################################
+## Start local Solana validator with Yellowstone gRPC plugin
+start-validator:
+	@echo "Starting Solana test validator with Yellowstone gRPC..."
+	@echo "gRPC endpoint will be available at: localhost:10000"
+	@echo "Prometheus metrics at: localhost:8999"
+	@solana-test-validator -r \
+		--bpf-program $(CONTRA_ESCROW_PROGRAM_ID) $(CONTRA_ESCROW_PROGRAM_SO) \
+		--bpf-program $(CONTRA_WITHDRAW_PROGRAM_ID) $(CONTRA_WITHDRAW_PROGRAM_SO) \
+		--geyser-plugin-config $(GEYSER_CONFIG) \
+		--port 18899
+
+## Run the indexer with Yellowstone gRPC datasource
+run-yellowstone:
+	@echo "Running indexer with Yellowstone gRPC datasource..."
+	@if [ -z "$(ESCROW_INSTANCE_ID)" ]; then \
+		echo "ERROR: ESCROW_INSTANCE_ID is required for escrow program"; \
+		echo "Usage: make run-yellowstone ESCROW_INSTANCE_ID=<your_instance_pubkey>"; \
+		exit 1; \
+	fi
+	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
+		DATABASE_URL=$(DATABASE_URL) \
+		cargo run --bin contra-indexer -- \
+		--config config/local/indexer-solana.toml \
+		--verbose \
+		indexer
+
+## Run the indexer with RPC polling datasource
+run-rpc:
+	@echo "Running indexer with RPC polling..."
+	@if [ -z "$(ESCROW_INSTANCE_ID)" ]; then \
+		echo "ERROR: ESCROW_INSTANCE_ID is required for escrow program"; \
+		echo "Usage: make run-rpc ESCROW_INSTANCE_ID=<your_instance_pubkey>"; \
+		exit 1; \
+	fi
+	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
+		DATABASE_URL=$(DATABASE_URL) \
+		cargo run --bin contra-indexer -- \
+		--config config/local/indexer-contra.toml \
+		--verbose \
+		indexer
+
+## Run the operator
+run-operator:
+	@echo "Running operator..."
+	@if [ -z "$(ESCROW_INSTANCE_ID)" ]; then \
+		echo "ERROR: ESCROW_INSTANCE_ID is required for escrow program"; \
+		echo "Usage: make run-operator ESCROW_INSTANCE_ID=<your_instance_pubkey>"; \
+		exit 1; \
+	fi
+	@if [ -z "$(ADMIN_PRIVATE_KEY)" ]; then \
+		echo "ERROR: ADMIN_PRIVATE_KEY is required"; \
+		echo "Usage: make run-operator ADMIN_PRIVATE_KEY=<key> [OPERATOR_PRIVATE_KEY=<key>]"; \
+		exit 1; \
+	fi
+	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
+		DATABASE_URL=$(DATABASE_URL) \
+		ADMIN_SIGNER=memory \
+		ADMIN_PRIVATE_KEY=$(ADMIN_PRIVATE_KEY) \
+		OPERATOR_SIGNER=memory \
+		OPERATOR_PRIVATE_KEY=$(or $(OPERATOR_PRIVATE_KEY),$(ADMIN_PRIVATE_KEY)) \
+		cargo run --bin contra-indexer -- \
+		--config config/local/operator-solana.toml \
+		--verbose \
+		operator
+
+###################################
+# Testing commands
+###################################
+## Run unit tests for all datasources
+unit-test:
+	@echo "Testing all datasources sequentially..."
+	@echo "→ Testing yellowstone datasource..."
+	@cargo test --lib --features datasource-yellowstone
+	@echo "→ Testing rpc datasource..."
+	@cargo test --lib --features datasource-rpc
+	@echo "✅ All datasources tested"
+
+## Test all
+all-test: unit-test
+
+## Run the mock transactions generator
+run-mock-transactions:
+	@echo "Running mock transactions generator..."
+	@cargo run --bin generate_transactions
+
+
+###################################
+# Yellowstone
+###################################
+## Clone or update Yellowstone gRPC repository
+yellowstone-clone:
+	@if [ -d "$(YELLOWSTONE_DIR)" ]; then \
+		echo "Updating Yellowstone gRPC repository..."; \
+		cd $(YELLOWSTONE_DIR) && git pull origin $(YELLOWSTONE_BRANCH); \
+	else \
+		echo "Cloning Yellowstone gRPC repository..."; \
+		git clone $(YELLOWSTONE_REPO) $(YELLOWSTONE_DIR); \
+		cd $(YELLOWSTONE_DIR) && git checkout $(YELLOWSTONE_BRANCH); \
+	fi
+
+## Build Yellowstone gRPC Geyser plugin
+build-yellowstone-plugin: yellowstone-clone
+	@echo "Building Yellowstone gRPC Geyser plugin..."
+	@cd $(YELLOWSTONE_DIR)/yellowstone-grpc-geyser && cargo build --release --no-default-features
+	@echo "Copying dylib to indexer..."
+	@cp $(YELLOWSTONE_DYLIB_SRC) $(YELLOWSTONE_DYLIB_DEST)
+	@echo "✅ Plugin built and copied to: $(YELLOWSTONE_DYLIB_DEST)"
+	@echo "Note: On Linux this will be .so, on macOS .dylib, update config.json accordingly"
+
+## Clean Yellowstone build artifacts
+clean-yellowstone:
+	@echo "Cleaning Yellowstone build artifacts..."
+	@rm -rf $(YELLOWSTONE_DIR)

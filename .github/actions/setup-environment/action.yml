@@ -1,0 +1,115 @@
+name: "Setup Environment"
+description: "Common setup steps for Contra CI/CD workflows"
+
+inputs:
+  rust-components:
+    description: "Rust components to install (comma-separated)"
+    required: false
+    default: ""
+  install-cargo-tools:
+    description: "Additional cargo tools to install (comma-separated)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set tool versions
+      shell: bash
+      run: |
+        echo "RUST_VERSION=1.91.0" >> $GITHUB_ENV
+        echo "SHANK_VERSION=0.4.5" >> $GITHUB_ENV
+        echo "LLVM_COV_VERSION=0.6.21" >> $GITHUB_ENV
+
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libudev-dev \
+          pkg-config \
+          libssl-dev \
+          protobuf-compiler \
+          librocksdb-dev \
+          clang \
+          libclang-dev
+
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        components: ${{ inputs.rust-components }}
+        toolchain: ${{ env.RUST_VERSION }}
+
+    - name: Cache cargo binaries
+      uses: actions/cache@v4
+      id: cargo-bin-cache
+      with:
+        path: |
+          ~/.cargo/bin/shank
+          ~/.cargo/bin/cargo-llvm-cov
+        key: cargo-bins-v7-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-shank-${{ env.SHANK_VERSION }}-llvm-cov-${{ env.LLVM_COV_VERSION }}
+
+    - name: Add cargo bin to PATH
+      shell: bash
+      run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install base cargo tools
+      if: steps.cargo-bin-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "Installing shank-cli@${SHANK_VERSION}..."
+        cargo install shank-cli@${SHANK_VERSION}
+        echo "Installing cargo-llvm-cov@${LLVM_COV_VERSION}..."
+        cargo install cargo-llvm-cov@${LLVM_COV_VERSION}
+
+    - name: Install additional cargo tools
+      if: inputs.install-cargo-tools != ''
+      shell: bash
+      run: |
+        IFS=',' read -ra TOOLS <<< "${{ inputs.install-cargo-tools }}"
+        for tool in "${TOOLS[@]}"; do
+          tool=$(echo "$tool" | xargs)  # Trim whitespace
+          echo "Installing $tool..."
+          cargo install "$tool"
+        done
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "lts/*"
+        registry-url: "https://registry.npmjs.org"
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: 10.14.0
+
+    - name: Setup pnpm cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.pnpm-store
+        key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+        restore-keys: |
+          ${{ runner.os }}-pnpm-
+
+    - name: Setup Solana CLI
+      uses: ./.github/actions/setup-solana
+
+    - name: Add Solana to PATH
+      shell: bash
+      run: echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+
+    - name: Install dependencies
+      shell: bash
+      run: make install
+
+    - name: Build program and generate clients
+      shell: bash
+      run: |
+        echo "🔨 Building programs and generating clients..."
+        make build

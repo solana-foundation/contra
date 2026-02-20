@@ -81,6 +81,11 @@ RUN make -C contra-withdraw-program build
 COPY core ./core
 COPY gateway ./gateway
 COPY indexer ./indexer
+
+# Resolve the symlink: copy the built .so into core/precompiles/
+# (the source symlink points to target/deploy/ which exists in the builder)
+RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so 2>/dev/null || true
+
 RUN cargo build --release \
     -p contra-core \
     -p contra-gateway \
@@ -103,15 +108,16 @@ COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/node
 COPY --from=builder /usr/src/contra/target/release/activity /usr/local/bin/activity
 COPY --from=builder /usr/src/contra/target/release/gateway /usr/local/bin/gateway
 COPY --from=builder /usr/src/contra/target/release/indexer /usr/local/bin/indexer
+COPY --from=builder /usr/src/contra/target/release/streamer /usr/local/bin/streamer
+
+# Copy indexer/operator config files
+COPY indexer/config /etc/contra/config
 
 # Create data directory for RocksDB
 RUN mkdir -p /data && chown contra:contra /data
 
 # Switch to non-root user
 USER contra
-
-# Set the data directory as a volume
-VOLUME ["/data"]
 
 # No default entrypoint - let docker-compose specify the command
 # This ensures proper signal handling for graceful shutdown

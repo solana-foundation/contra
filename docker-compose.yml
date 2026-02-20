@@ -163,6 +163,30 @@ services:
     networks:
       - contra-network
 
+  # WebSocket Transaction Streamer
+  streamer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-streamer
+    restart: unless-stopped
+    depends_on:
+      - postgres-replica
+      - write-node
+      - postgres-indexer
+    environment:
+      - RUST_LOG=info
+      - STREAMER_PORT=${STREAMER_PORT:-8902}
+      - STREAMER_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
+      - STREAMER_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - STREAMER_POLL_INTERVAL_MS=200
+      - STREAMER_LOG_LEVEL=info
+    ports:
+      - "${STREAMER_PORT:-8902}:${STREAMER_PORT:-8902}"
+    command: ["/usr/local/bin/streamer"]
+    networks:
+      - contra-network
+
   # Activity Generator
   activity:
     build:

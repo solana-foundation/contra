@@ -10,7 +10,7 @@ use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 use super::types::{SenderSMTState, SenderState};
 
@@ -95,6 +95,43 @@ impl SenderState {
             "SMT state initialized with tree_index {}, populated {} existing nonces",
             tree_index,
             nonces.len()
+        );
+
+        // CRITICAL: Verify local SMT root matches on-chain root
+        // This ensures database is in sync with on-chain state
+        let computed_root = smt_state.current_root();
+        let onchain_root = instance.withdrawal_transactions_root;
+
+        if computed_root != onchain_root {
+            error!(
+                "SMT root mismatch detected! Database out of sync with on-chain state."
+            );
+            error!("  Instance PDA: {}", instance_pda);
+            error!("  Tree Index: {}", tree_index);
+            error!("  Nonces from DB: {:?}", nonces);
+            error!("  Local root:    {:?}", computed_root);
+            error!("  On-chain root: {:?}", onchain_root);
+            error!("");
+            error!("This typically means:");
+            error!("  1. A withdrawal was successfully processed on-chain");
+            error!("  2. But the operator crashed before updating the database");
+            error!("  3. The database is now missing transaction records");
+            error!("");
+            error!("Resolution options:");
+            error!("  1. Reset and resync the database from on-chain events");
+            error!("  2. Manually reconcile missing transactions");
+            error!("  3. Reset the on-chain SMT tree (requires admin)");
+
+            return Err(crate::error::ProgramError::SmtRootMismatch {
+                local_root: computed_root,
+                onchain_root,
+            }
+            .into());
+        }
+
+        info!(
+            "SMT root verification passed: {:?}",
+            computed_root
         );
 
         self.smt_state = Some(SenderSMTState {

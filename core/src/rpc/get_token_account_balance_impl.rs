@@ -33,7 +33,10 @@ pub async fn get_token_account_balance_impl(
             return Err(custom_error(-32602, "Invalid token account data"));
         }
 
-        // Extract the amount (bytes 64-72) and decimals (byte 44)
+        // Extract the mint pubkey (bytes 0-32) and amount (bytes 64-72)
+        let mint_pubkey = Pubkey::try_from(&data[0..32])
+            .map_err(|_| custom_error(-32602, "Invalid mint pubkey in token account"))?;
+
         let amount_bytes = &data[64..72];
         let amount = u64::from_le_bytes(
             amount_bytes
@@ -41,9 +44,21 @@ pub async fn get_token_account_balance_impl(
                 .map_err(|_| custom_error(-32602, "Invalid token amount"))?,
         );
 
-        // For simplicity, we'll use a fixed decimal value of 6 (common for many tokens)
-        // In a real implementation, you'd need to fetch this from the mint account
-        let decimals = 6u8;
+        // Read decimals from the mint account (byte offset 44 in SPL Mint layout)
+        let mint_account = read_deps.accounts_db.get_account_shared_data(&mint_pubkey).await;
+        let decimals = match mint_account {
+            Some(mint) => {
+                let mint_data = mint.data();
+                if mint_data.len() >= 45 {
+                    mint_data[44]
+                } else {
+                    return Err(custom_error(-32602, "Invalid mint account data"));
+                }
+            }
+            None => {
+                return Err(custom_error(-32602, "Mint account not found"));
+            }
+        };
 
         let ui_amount = amount as f64 / 10_f64.powi(decimals as i32);
         let ui_amount_string = ui_amount.to_string();

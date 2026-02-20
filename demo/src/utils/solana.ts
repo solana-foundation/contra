@@ -117,16 +117,73 @@ export const createTransferTransaction = async (
   return transaction;
 };
 
+const BLOCKHASH_TTL_MS = 15_000;
+
+let cachedBlockhash: { value: string; fetchedAt: number } | null = null;
+let inflight: Promise<string> | null = null;
+
+const fetchBlockhash = async (url: string): Promise<string> => {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getLatestBlockhash',
+      params: [{ commitment: 'finalized' }],
+    }),
+  });
+
+  const json = await response.json();
+  if (json.error) {
+    throw new Error(json.error.message || 'Failed to get blockhash');
+  }
+
+  const blockhash = json.result?.value?.blockhash;
+  if (!blockhash || typeof blockhash !== 'string') {
+    console.error('Unexpected getLatestBlockhash response:', JSON.stringify(json.result));
+    throw new Error('Invalid blockhash response from read node');
+  }
+
+  console.log('Fetched new blockhash:', blockhash);
+  return blockhash;
+};
+
+const getLatestBlockhash = async (url: string): Promise<string> => {
+  if (cachedBlockhash && Date.now() - cachedBlockhash.fetchedAt < BLOCKHASH_TTL_MS) {
+    return cachedBlockhash.value;
+  }
+
+  // Deduplicate concurrent fetches
+  if (inflight) return inflight;
+
+  inflight = fetchBlockhash(url)
+    .then((blockhash) => {
+      cachedBlockhash = { value: blockhash, fetchedAt: Date.now() };
+      return blockhash;
+    })
+    .catch((err) => {
+      cachedBlockhash = null; // invalidate on error
+      throw err;
+    })
+    .finally(() => {
+      inflight = null;
+    });
+
+  return inflight;
+};
+
 export const sendTransaction = async (
   transaction: Transaction,
   signers: Keypair[],
-  url: string
+  url: string,
+  readUrl: string
 ): Promise<{ signature: string; latency: number }> => {
   const startTime = Date.now();
 
-  // Since we're working with a gasless system, we don't need recent blockhash
-  // Set a dummy blockhash
-  transaction.recentBlockhash = '11111111111111111111111111111111';
+  // Fetch a real blockhash from the read node
+  const blockhash = await getLatestBlockhash(readUrl);
+  transaction.recentBlockhash = blockhash;
   transaction.feePayer = signers[0].publicKey;
 
   // Sign the transaction

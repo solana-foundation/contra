@@ -1,30 +1,34 @@
 use crate::{
+    pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     smt_utils::{ProcessorSMT, MAX_TREE_LEAVES},
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
         assert_get_or_release_funds,
     },
     utils::{
-        assert_program_error, set_mint, setup_test_balances, TestContext,
-        INVALID_INSTRUCTION_DATA_ERROR, INVALID_SMT_PROOF_ERROR,
+        assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        CONTRA_ESCROW_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR, INVALID_SMT_PROOF_ERROR,
         INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
     },
 };
 
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    signature::{Keypair, Signer},
+};
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
 const LARGE_DEPOSIT: u64 = 10_000_000;
 const RELEASE_AMOUNT: u64 = 100_000;
 
-/// Helper: set up a fully initialized escrow context ready for release_funds tests.
 fn setup_release_context() -> (
     TestContext,
-    Keypair,       // operator
-    solana_sdk::pubkey::Pubkey, // instance_pda
-    solana_sdk::pubkey::Pubkey, // operator_pda
-    Keypair,       // mint
-    Keypair,       // user
+    Keypair,                       // operator
+    solana_sdk::pubkey::Pubkey,    // instance_pda
+    solana_sdk::pubkey::Pubkey,    // operator_pda
+    Keypair,                       // mint
+    Keypair,                       // user
 ) {
     let mut context = TestContext::new();
     let admin = Keypair::new();
@@ -72,7 +76,6 @@ fn setup_release_context() -> (
     (context, operator, instance_pda, operator_pda, mint, user)
 }
 
-/// T010-1: Truncated proof data — all-zero sibling proofs (invalid).
 #[test]
 fn test_malformed_proof_all_zero_siblings() {
     let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
@@ -80,7 +83,6 @@ fn test_malformed_proof_all_zero_siblings() {
     let nonce: u64 = 42;
     let all_zero_proofs = [0u8; 512];
 
-    // Generate what the root would be with a valid proof, but use zero proofs
     let mut smt = ProcessorSMT::new();
     smt.insert(nonce);
     let new_root = smt.current_root();
@@ -103,9 +105,6 @@ fn test_malformed_proof_all_zero_siblings() {
     assert_program_error(result, INVALID_SMT_PROOF_ERROR);
 }
 
-/// T010-2: Proof with wrong tree height — provide fewer sibling bytes than expected.
-/// The program expects exactly 512 bytes (16 siblings × 32 bytes).
-/// We test by providing a valid-looking but incorrect proof from a different nonce.
 #[test]
 fn test_malformed_proof_wrong_nonce_siblings() {
     let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
@@ -113,8 +112,33 @@ fn test_malformed_proof_wrong_nonce_siblings() {
     let nonce: u64 = 42;
     let wrong_nonce: u64 = 999;
 
-    // Generate proof for wrong_nonce but try to use it for nonce
-    let mut smt = ProcessorSMT::new();
+    // Insert a nonce first so the tree is non-empty — in an empty tree all nonce
+    // paths produce identical sibling proofs, so wrong-nonce proofs would pass.
+    let setup_nonce: u64 = 500;
+    let mut setup_smt = ProcessorSMT::new();
+    let (_, setup_proofs) = setup_smt.generate_exclusion_proof_for_verification(setup_nonce);
+    setup_smt.insert(setup_nonce);
+    let setup_root = setup_smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        setup_root,
+        setup_nonce,
+        setup_proofs,
+        false,
+    )
+    .expect("Setup release should succeed");
+
+    // Generate exclusion proof for wrong_nonce against the non-empty tree,
+    // then submit it for a different nonce
+    let mut smt = setup_smt;
     let (_, wrong_proofs) = smt.generate_exclusion_proof_for_verification(wrong_nonce);
     smt.insert(nonce);
     let new_root = smt.current_root();
@@ -137,13 +161,10 @@ fn test_malformed_proof_wrong_nonce_siblings() {
     assert_program_error(result, INVALID_SMT_PROOF_ERROR);
 }
 
-/// T010-3: Nonce outside current tree_index range.
-/// tree_index=0 allows nonces 0..65535. Nonce 65536 should be rejected.
 #[test]
 fn test_malformed_proof_nonce_outside_tree_range() {
     let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
 
-    // Nonce outside tree_index=0 range
     let nonce: u64 = MAX_TREE_LEAVES as u64;
 
     let mut smt = ProcessorSMT::new();
@@ -172,7 +193,6 @@ fn test_malformed_proof_nonce_outside_tree_range() {
     );
 }
 
-/// T010-4: Nonce far outside any valid range.
 #[test]
 fn test_malformed_proof_nonce_far_outside_range() {
     let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
@@ -203,4 +223,117 @@ fn test_malformed_proof_nonce_far_outside_range() {
         result,
         INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
     );
+}
+
+#[test]
+fn test_malformed_proof_truncated_siblings() {
+    let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
+
+    let nonce: u64 = 42;
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
+    smt.insert(nonce);
+    let new_root = smt.current_root();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let accounts = vec![
+        AccountMeta::new(context.payer.pubkey(), true),
+        AccountMeta::new_readonly(operator.pubkey(), true),
+        AccountMeta::new(instance_pda, false),
+        AccountMeta::new_readonly(operator_pda, false),
+        AccountMeta::new_readonly(mint.pubkey(), false),
+        AccountMeta::new_readonly(allowed_mint_pda, false),
+        AccountMeta::new(user_ata, false),
+        AccountMeta::new(instance_ata, false),
+        AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        AccountMeta::new_readonly(ATA_PROGRAM_ID, false),
+        AccountMeta::new_readonly(event_authority_pda, false),
+        AccountMeta::new_readonly(CONTRA_ESCROW_PROGRAM_ID, false),
+    ];
+
+    // 15 siblings (480 bytes) instead of the required 16 (512 bytes)
+    let mut data = vec![7];
+    data.extend_from_slice(&RELEASE_AMOUNT.to_le_bytes());
+    data.extend_from_slice(user.pubkey().as_ref());
+    data.extend_from_slice(&new_root);
+    data.extend_from_slice(&nonce.to_le_bytes());
+    data.extend_from_slice(&sibling_proofs[..480]);
+
+    let instruction = Instruction {
+        program_id: CONTRA_ESCROW_PROGRAM_ID,
+        accounts,
+        data,
+    };
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+    assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+}
+
+#[test]
+fn test_boundary_nonce_last_valid_for_tree_index_zero() {
+    let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
+
+    let nonce: u64 = MAX_TREE_LEAVES as u64 - 1;
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
+    smt.insert(nonce);
+    let new_root = smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        new_root,
+        nonce,
+        sibling_proofs,
+        false,
+    )
+    .expect("Last valid nonce for tree_index=0 should succeed");
+}
+
+#[test]
+fn test_zero_amount_release() {
+    let (mut context, operator, instance_pda, operator_pda, mint, user) = setup_release_context();
+
+    let nonce: u64 = 42;
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
+    smt.insert(nonce);
+    let new_root = smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        &user.pubkey(),
+        new_root,
+        nonce,
+        sibling_proofs,
+        false,
+    )
+    .expect("Zero-amount release succeeds — processor does not validate amount > 0");
 }

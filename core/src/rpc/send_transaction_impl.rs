@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, WriteDeps};
+use crate::rpc::{
+    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+    WriteDeps,
+};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bincode::Options;
 use jsonrpsee::core::RpcResult;
@@ -19,13 +22,13 @@ pub async fn send_transaction_impl(
     // Decode the base64 transaction
     let tx_data = STANDARD
         .decode(&transaction)
-        .map_err(|e| custom_error(-32602, format!("Invalid base64 encoding: {}", e)))?;
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid base64 encoding: {}", e)))?;
 
     // Check packet size limit (1232 bytes is Solana's PACKET_DATA_SIZE)
     const PACKET_DATA_SIZE: usize = 1232;
     if tx_data.len() > PACKET_DATA_SIZE {
         return Err(custom_error(
-            -32602,
+            INVALID_PARAMS_CODE,
             format!(
                 "Transaction too large: {} bytes (max: {} bytes)",
                 tx_data.len(),
@@ -43,7 +46,7 @@ pub async fn send_transaction_impl(
     // Try to deserialize as VersionedTransaction first (standard format)
     let versioned_tx = bincode_options
         .deserialize::<VersionedTransaction>(&tx_data)
-        .map_err(|e| custom_error(-32602, format!("Failed to deserialize transaction: {}", e)))?;
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Failed to deserialize transaction: {}", e)))?;
 
     let runtime_tx = RuntimeTransaction::try_create(
         versioned_tx,
@@ -55,7 +58,7 @@ pub async fn send_transaction_impl(
         }),
         &HashSet::new(),
     )
-    .map_err(|err| custom_error(-32602, format!("invalid transaction: {err}")))?;
+    .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
 
     // Filter: only accept SPL token, ATA, System Program, and Withdraw Program transactions
@@ -83,7 +86,7 @@ pub async fn send_transaction_impl(
             program_ids
         );
         return Err(custom_error(
-            -32602,
+            INVALID_PARAMS_CODE,
             "Only SPL token, ATA, System, and Withdraw program transactions are accepted",
         ));
     }
@@ -96,7 +99,7 @@ pub async fn send_transaction_impl(
     write_deps
         .dedup_tx
         .send(sanitized_tx)
-        .map_err(|_| custom_error(-32000, "Internal error: dedup channel closed"))?;
+        .map_err(|_| custom_error(JSON_RPC_SERVER_ERROR, "Internal error: dedup channel closed"))?;
 
     debug!("Transaction {} sent to dedup stage", signature);
     Ok(signature)

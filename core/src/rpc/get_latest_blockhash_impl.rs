@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcContextConfig;
 use solana_rpc_client_types::response::{Response, RpcBlockhash, RpcResponseContext};
@@ -12,12 +15,12 @@ pub async fn get_latest_blockhash_impl(
         .accounts_db
         .get_latest_slot()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get slot: {}", e)))?;
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
     let blockhash = read_deps
         .accounts_db
         .get_latest_blockhash()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get blockhash: {}", e)))?;
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get blockhash: {}", e)))?;
 
     // Calculate last valid block height
     // In Solana, a blockhash is valid for approximately 150 blocks

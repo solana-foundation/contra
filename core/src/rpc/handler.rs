@@ -1,6 +1,9 @@
 use {
     super::{api::ContraRpcServer, rpc_impl::ContraRpcImpl},
-    crate::rpc::rpc_impl::{ReadDeps, WriteDeps},
+    crate::rpc::{
+        error::{INTERNAL_ERROR_CODE, PARSE_ERROR_CODE},
+        rpc_impl::{ReadDeps, WriteDeps},
+    },
     http_body_util::{BodyExt, Full},
     hyper::{body::Bytes, Method, Request, Response, StatusCode},
     jsonrpsee::server::RpcModule,
@@ -18,7 +21,7 @@ pub async fn handle_request(
             // Process the JSON-RPC request using jsonrpsee
             // Convert body_bytes to a String first
             let json_str = String::from_utf8(body_bytes.to_vec())
-                .unwrap_or_else(|_| String::from(r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error: Invalid UTF-8"},"id":null}"#));
+                .unwrap_or_else(|_| format!(r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"Parse error: Invalid UTF-8"}},"id":null}}"#, PARSE_ERROR_CODE));
 
             // The second parameter is the maximum response size (10MB)
             let max_response_size = 10 * 1024 * 1024;
@@ -32,8 +35,8 @@ pub async fn handle_request(
                 Err(e) => {
                     // Create a JSON-RPC error response
                     format!(
-                        r#"{{"jsonrpc":"2.0","error":{{"code":-32603,"message":"Internal error: {}"}},"id":null}}"#,
-                        e
+                        r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"Internal error: {}"}},"id":null}}"#,
+                        INTERNAL_ERROR_CODE, e
                     )
                 }
             };

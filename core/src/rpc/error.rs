@@ -1,5 +1,12 @@
 use jsonrpsee::types::ErrorObjectOwned;
 
+pub use jsonrpsee::types::error::{
+    INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, PARSE_ERROR_CODE,
+};
+
+/// Generic JSON-RPC server error (base of the -32000..-32099 reserved range).
+pub const JSON_RPC_SERVER_ERROR: i32 = -32000;
+
 pub fn custom_error(code: i32, message: impl ToString) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(code, message.to_string(), None::<()>)
 }

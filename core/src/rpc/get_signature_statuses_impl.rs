@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcSignatureStatusConfig;
 use solana_rpc_client_types::response::{Response, RpcResponseContext};
@@ -17,7 +20,7 @@ pub async fn get_signature_statuses_impl(
         .accounts_db
         .get_latest_slot()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get slot: {}", e)))?;
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
 
     let mut statuses = Vec::with_capacity(signatures.len());
 

@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::response::RpcPerfSample;
 
@@ -16,7 +19,7 @@ pub async fn get_recent_performance_samples_impl(
         .await
         .map_err(|e| {
             custom_error(
-                -32000,
+                JSON_RPC_SERVER_ERROR,
                 format!("Failed to get recent performance samples: {}", e),
             )
         })

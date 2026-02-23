@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 
 pub async fn get_first_available_block_impl(read_deps: &ReadDeps) -> RpcResult<u64> {
@@ -8,7 +11,7 @@ pub async fn get_first_available_block_impl(read_deps: &ReadDeps) -> RpcResult<u
         .await
         .map_err(|e| {
             custom_error(
-                -32000,
+                JSON_RPC_SERVER_ERROR,
                 format!("Failed to get first available block: {}", e),
             )
         })

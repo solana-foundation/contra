@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcContextConfig;
 
@@ -10,5 +13,5 @@ pub async fn get_transaction_count_impl(
         .accounts_db
         .get_transaction_count()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get transaction count: {}", e)))
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get transaction count: {}", e)))
 }

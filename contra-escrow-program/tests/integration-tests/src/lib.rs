@@ -17,6 +17,10 @@ mod test_deposit;
 #[cfg(test)]
 mod test_release_funds;
 #[cfg(test)]
+mod test_release_funds_double_spend;
+#[cfg(test)]
+mod test_release_funds_malformed_proofs;
+#[cfg(test)]
 mod test_remove_operator;
 #[cfg(test)]
 mod test_reset_smt_root;

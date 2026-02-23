@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_epoch_info::EpochInfo;
 use solana_rpc_client_types::config::RpcEpochConfig;
@@ -11,5 +14,5 @@ pub async fn get_epoch_info_impl(
         .accounts_db
         .get_epoch_info()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get epoch info: {}", e)))
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get epoch info: {}", e)))
 }

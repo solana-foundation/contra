@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcContextConfig;
 use solana_rpc_client_types::response::{Response, RpcResponseContext};
@@ -15,18 +18,18 @@ pub async fn is_blockhash_valid_impl(
         .accounts_db
         .get_latest_slot()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get slot: {}", e)))?;
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
 
     // Parse the provided blockhash
     let provided_hash = Hash::from_str(&blockhash)
-        .map_err(|e| custom_error(-32602, format!("Invalid blockhash: {}", e)))?;
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid blockhash: {}", e)))?;
 
     // Get the latest blockhash
     let latest_hash = read_deps
         .accounts_db
         .get_latest_blockhash()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get blockhash: {}", e)))?;
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get blockhash: {}", e)))?;
 
     // Check if the blockhash matches the latest one
     // In a production system, you'd want to check a range of recent blockhashes

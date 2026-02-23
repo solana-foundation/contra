@@ -1,6 +1,9 @@
 use crate::{
     accounts::bob::BOB,
-    rpc::{error::custom_error, ReadDeps},
+    rpc::{
+        error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+        ReadDeps,
+    },
 };
 use jsonrpsee::core::RpcResult;
 use solana_account_decoder::encode_ui_account;
@@ -21,7 +24,7 @@ pub async fn get_account_info_impl(
     config: Option<RpcAccountInfoConfig>,
 ) -> RpcResult<Response<Option<UiAccount>>> {
     let pubkey = Pubkey::from_str(&pubkey)
-        .map_err(|e| custom_error(-32602, format!("Invalid pubkey: {}", e)))?;
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid pubkey: {}", e)))?;
 
     let config = config.unwrap_or_default();
 
@@ -29,7 +32,7 @@ pub async fn get_account_info_impl(
         .accounts_db
         .get_latest_slot()
         .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get slot: {}", e)))?;
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
 
     // Get account from database
     let (_settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();

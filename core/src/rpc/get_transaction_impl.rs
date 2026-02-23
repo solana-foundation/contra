@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, INVALID_PARAMS_CODE},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use serde_json::{json, Value};
 use solana_rpc_client_types::config::{RpcEncodingConfigWrapper, RpcTransactionConfig};
@@ -12,7 +15,7 @@ pub async fn get_transaction_impl(
     config: Option<RpcEncodingConfigWrapper<RpcTransactionConfig>>,
 ) -> RpcResult<Option<Value>> {
     let sig = Signature::from_str(&signature)
-        .map_err(|e| custom_error(-32602, format!("Invalid signature: {}", e)))?;
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid signature: {}", e)))?;
 
     // Extract encoding from config (default to "json")
     let config = config.map(|c| c.convert_to_current()).unwrap_or_default();

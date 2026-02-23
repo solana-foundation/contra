@@ -1,4 +1,7 @@
-use crate::rpc::{error::custom_error, ReadDeps};
+use crate::rpc::{
+    error::{custom_error, INVALID_PARAMS_CODE},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use solana_account_decoder_client_types::token::UiTokenAmount;
 use solana_rpc_client_types::config::RpcContextConfig;
@@ -12,7 +15,7 @@ pub async fn get_token_account_balance_impl(
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<UiTokenAmount>> {
     // Parse the pubkey
-    let pubkey = Pubkey::from_str(&pubkey).map_err(|_| custom_error(-32602, "Invalid pubkey"))?;
+    let pubkey = Pubkey::from_str(&pubkey).map_err(|_| custom_error(INVALID_PARAMS_CODE, "Invalid pubkey"))?;
 
     // Get the token account data
     let account = read_deps.accounts_db.get_account_shared_data(&pubkey).await;
@@ -23,14 +26,14 @@ pub async fn get_token_account_balance_impl(
             .expect("Valid token program ID");
 
         if *account.owner() != token_program_id {
-            return Err(custom_error(-32602, "Account is not a token account"));
+            return Err(custom_error(INVALID_PARAMS_CODE, "Account is not a token account"));
         }
 
         // Parse the token account data
         let data = account.data();
         if data.len() < 165 {
             // SPL Token account size
-            return Err(custom_error(-32602, "Invalid token account data"));
+            return Err(custom_error(INVALID_PARAMS_CODE, "Invalid token account data"));
         }
 
         // Extract the amount (bytes 64-72) and decimals (byte 44)
@@ -38,7 +41,7 @@ pub async fn get_token_account_balance_impl(
         let amount = u64::from_le_bytes(
             amount_bytes
                 .try_into()
-                .map_err(|_| custom_error(-32602, "Invalid token amount"))?,
+                .map_err(|_| custom_error(INVALID_PARAMS_CODE, "Invalid token amount"))?,
         );
 
         // For simplicity, we'll use a fixed decimal value of 6 (common for many tokens)
@@ -60,6 +63,6 @@ pub async fn get_token_account_balance_impl(
             },
         })
     } else {
-        Err(custom_error(-32602, "Account not found"))
+        Err(custom_error(INVALID_PARAMS_CODE, "Account not found"))
     }
 }

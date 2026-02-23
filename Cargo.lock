@@ -1803,6 +1803,7 @@ dependencies = [
  "hyper 1.7.0",
  "hyper-rustls",
  "hyper-util",
+ "jsonrpsee",
  "rustls 0.23.31",
  "serde_json",
  "tokio",

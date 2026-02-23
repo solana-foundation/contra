@@ -1,5 +1,6 @@
 use crate::rpc::{
-    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    constants::MAX_SIGNATURES,
+    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     ReadDeps,
 };
 use jsonrpsee::core::RpcResult;
@@ -9,17 +10,29 @@ use solana_sdk::signature::Signature;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::{TransactionConfirmationStatus, TransactionStatus};
 use std::str::FromStr;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn get_signature_statuses_impl(
     read_deps: &ReadDeps,
     signatures: Vec<String>,
     _config: Option<RpcSignatureStatusConfig>,
 ) -> RpcResult<Response<Vec<Option<TransactionStatus>>>> {
-    let current_slot =
-        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
-        })?;
+    if signatures.len() > MAX_SIGNATURES {
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            format!(
+                "Too many signatures: {} (max: {})",
+                signatures.len(),
+                MAX_SIGNATURES
+            ),
+        ));
+    }
+
+    let current_slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
 
     let mut statuses = Vec::with_capacity(signatures.len());
 
@@ -27,8 +40,12 @@ pub async fn get_signature_statuses_impl(
         // Parse the signature
         let signature = match Signature::from_str(&sig_str) {
             Ok(sig) => sig,
-            Err(_) => {
-                // Invalid signature format - return null for this entry
+            Err(e) => {
+                warn!(
+                    signature = %sig_str.get(..20).unwrap_or(&sig_str),
+                    error = %e,
+                    "Skipping unparseable signature"
+                );
                 statuses.push(None);
                 continue;
             }

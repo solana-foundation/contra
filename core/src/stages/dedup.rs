@@ -53,7 +53,7 @@ pub async fn load_dedup_state(
         }
     };
 
-    let start_slot = latest_slot.saturating_sub(max_blockhashes as u64 - 1);
+    let start_slot = latest_slot.saturating_sub((max_blockhashes as u64).saturating_sub(1));
 
     let blocks = accounts_db
         .get_blocks_in_range(start_slot, latest_slot)

@@ -23,9 +23,7 @@ pub struct BlockInfo {
     /// Transaction signatures in this block, in order
     pub transaction_signatures: Vec<Signature>,
     /// The recent_blockhash each transaction referenced, parallel to transaction_signatures.
-    /// Used to rebuild the dedup cache on restart. Defaults to empty for blocks written
-    /// before this field was introduced.
-    #[serde(default)]
+    /// Used to rebuild the dedup cache on restart.
     pub transaction_recent_blockhashes: Vec<Hash>,
 }
 

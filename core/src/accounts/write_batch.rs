@@ -67,7 +67,7 @@ async fn write_batch_postgres(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-    slot: Option<u64>,
+    _slot: Option<u64>, // latest slot is derived from MAX(slot) in blocks table; no separate write needed
 ) -> Result<(), String> {
     if db.read_only {
         warn!("Attempted to write batch in read-only mode");
@@ -176,18 +176,6 @@ async fn write_batch_postgres(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
-    }
-
-    // Update slot if provided
-    if let Some(new_slot) = slot {
-        sqlx::query(
-            "INSERT INTO metadata (key, value) VALUES ('latest_slot', $1)
-                 ON CONFLICT (key) DO UPDATE SET value = $1",
-        )
-        .bind(&new_slot.to_le_bytes()[..])
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to update latest slot: {}", e))?;
     }
 
     // Commit the transaction

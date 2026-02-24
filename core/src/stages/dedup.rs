@@ -1,6 +1,6 @@
 use {
     crate::{accounts::traits::AccountsDB, nodes::node::WorkerHandle},
-    anyhow::Result,
+    anyhow::{ensure, Result},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
     std::collections::{HashMap, HashSet, LinkedList},
     tokio::sync::mpsc,
@@ -60,6 +60,14 @@ pub async fn load_dedup_state(
         .await?;
 
     for block in &blocks {
+        ensure!(
+            block.transaction_signatures.len() == block.transaction_recent_blockhashes.len(),
+            "Block {} has mismatched transaction_signatures ({}) and transaction_recent_blockhashes ({}) lengths",
+            block.slot,
+            block.transaction_signatures.len(),
+            block.transaction_recent_blockhashes.len(),
+        );
+
         live_blockhashes.push_back(block.blockhash);
 
         for (signature, recent_blockhash) in block

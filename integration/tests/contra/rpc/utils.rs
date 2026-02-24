@@ -2,9 +2,11 @@ use {
     anyhow::Result,
     contra_core::nodes::node::{run_node, NodeConfig, NodeHandles},
     solana_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{pubkey::Pubkey, transaction::Transaction},
+    solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction},
+    solana_transaction_status::UiTransactionEncoding,
     std::{sync::Once, time::Duration},
     tokio::time::sleep,
+    tracing::warn,
 };
 
 // Ensure tracing is only initialized once across all tests
@@ -46,23 +48,25 @@ pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
     Ok((node_handles, url))
 }
 
-/// Send a transaction and poll until it is visible, up to 3 seconds.
-pub async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
-    let sig = client.send_transaction(tx).await.unwrap();
+/// Poll until a transaction is visible, up to 3 seconds.
+pub async fn confirm_transaction(client: &RpcClient, sig: Signature) {
     for _ in 0..30 {
-        sleep(Duration::from_millis(100)).await;
-        if client
-            .get_transaction(
-                &sig,
-                solana_transaction_status::UiTransactionEncoding::Base64,
-            )
+        match client
+            .get_transaction(&sig, UiTransactionEncoding::Base64)
             .await
-            .is_ok()
         {
-            return;
+            Ok(_) => return,
+            Err(e) => warn!("Error getting transaction: {}", e),
         }
+        sleep(Duration::from_millis(100)).await;
     }
     panic!("Transaction {} not confirmed within 3 seconds", sig);
+}
+
+/// Send a transaction and poll until it is visible.
+pub async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
+    let sig = client.send_transaction(tx).await.unwrap();
+    confirm_transaction(client, sig).await;
 }
 
 /// Return the parsed token balance of a token account.

@@ -1,13 +1,13 @@
-//! Integration tests for batch atomicity — invariant C1:
+//! Integration tests for batch atomicity:
 //! A slot and all its account changes, transactions, and metadata MUST be written
 //! as a single DB transaction. Either the whole slot commits or nothing does.
 //!
-//! Two tests verify this from complementary angles:
+//! Three tests verify this:
 //!
 //! 1. `test_write_batch_constraint_injection` — adds a CHECK constraint that forces
 //!    `write_batch` to fail after accounts are written but before the block row is
 //!    inserted, then asserts all prior writes in that batch were rolled back.
-//!    This proves our code uses a real transaction.
+//!    This proves `write_batch` uses a real transaction.
 //!
 //! 2. `test_write_batch_process_kill_simulation` — opens a raw Postgres connection,
 //!    manually BEGINs a transaction and writes partial slot data, then uses
@@ -15,6 +15,11 @@
 //!    Postgres sees when the OS sends SIGKILL to the Contra process), and asserts
 //!    the partial data is gone.
 //!    This proves the underlying mechanism works under real connection-kill conditions.
+//!
+//! 3. `test_store_block_atomicity` — adds a CHECK constraint that forces
+//!    `store_block` to fail after the block row is written but before the
+//!    `latest_blockhash` metadata is updated, then asserts the block row was
+//!    rolled back with it. This proves the fix to `store_block_postgres` is correct.
 
 use {
     contra_core::{
@@ -317,5 +322,76 @@ async fn test_write_batch_process_kill_simulation() {
     assert!(
         accounts[0].is_some(),
         "pubkey_slot1 (slot 1 baseline) must still exist"
+    );
+}
+
+/// Test 3: `store_block_postgres` atomicity
+///
+/// `store_block` performs two writes inside a transaction: a block row insert and
+/// a `latest_blockhash` metadata update. This test injects a CHECK constraint that
+/// blocks the metadata update, forcing the transaction to fail after the block row
+/// has been written. Asserts that the block row is rolled back with it — proving
+/// the two writes are atomic and cannot be split by a crash.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_store_block_atomicity() {
+    let container = Postgres::default()
+        .with_db_name("contra_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("Failed to start PostgreSQL container");
+
+    let url = format!(
+        "postgres://postgres:password@{}:{}/contra_node",
+        container.get_host().await.unwrap(),
+        container.get_host_port_ipv4(5432).await.unwrap(),
+    );
+
+    let mut db = AccountsDB::new(&url, false)
+        .await
+        .expect("Failed to create AccountsDB");
+
+    let pool = match &db {
+        AccountsDB::Postgres(pg) => Arc::clone(&pg.pool),
+        _ => panic!("Expected Postgres backend"),
+    };
+
+    // Inject fault: block any insert of `latest_blockhash` into the metadata table.
+    // store_block writes the block row first, then updates latest_blockhash.
+    // With this constraint the second write fails, proving both writes roll back.
+    sqlx::query(
+        "ALTER TABLE metadata ADD CONSTRAINT test_no_blockhash_key CHECK (key != 'latest_blockhash')",
+    )
+    .execute(&*pool)
+    .await
+    .expect("Failed to add test constraint");
+
+    // store_block for slot 1 must fail — the latest_blockhash update is blocked.
+    let result = db.store_block(slot_block_info(1)).await;
+    assert!(
+        result.is_err(),
+        "store_block must fail when the latest_blockhash update is blocked"
+    );
+
+    // The block row that was written before the failure must have been rolled back.
+    assert!(
+        db.get_block(1).await.is_none(),
+        "slot 1 block must not exist — the blocks insert was rolled back with the failed metadata update"
+    );
+
+    // Drop the constraint and confirm store_block now succeeds end-to-end.
+    sqlx::query("ALTER TABLE metadata DROP CONSTRAINT test_no_blockhash_key")
+        .execute(&*pool)
+        .await
+        .expect("Failed to drop test constraint");
+
+    db.store_block(slot_block_info(1))
+        .await
+        .expect("store_block must succeed after constraint is removed");
+
+    assert!(
+        db.get_block(1).await.is_some(),
+        "slot 1 block must exist after the clean store_block"
     );
 }

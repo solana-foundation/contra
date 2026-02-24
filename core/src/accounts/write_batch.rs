@@ -54,9 +54,6 @@ pub async fn write_batch(
 }
 
 /// Writes a complete slot batch (accounts + transactions + block metadata) atomically.
-///
-/// Invariant C1: a slot and ALL of its account changes, transactions, and metadata
-/// (latest_slot, latest_blockhash) MUST be written as a single DB transaction.
 /// Either every write in this batch commits, or none do — no partial slot state
 /// is ever visible to readers.
 async fn write_batch_postgres(

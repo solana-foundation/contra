@@ -85,6 +85,24 @@ impl Gateway {
                 .unwrap());
         }
 
+        // Shallow liveness check — verifies the gateway process is running.
+        // Does not probe backend read/write nodes.
+        if req.method() == hyper::Method::GET && req.uri().path() == "/health" {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header(
+                    "Access-Control-Allow-Origin",
+                    self.cors_allowed_origin.as_str(),
+                )
+                .body(
+                    Full::new(Bytes::from(r#"{"status":"ok"}"#))
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                )
+                .unwrap());
+        }
+
         // Only accept POST requests
         if req.method() != hyper::Method::POST {
             return Ok(Response::builder()

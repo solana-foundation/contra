@@ -82,7 +82,10 @@ pub async fn handle_request(
                         return Ok(payload_too_large());
                     }
                     None => {
-                        warn!("Rejecting request with unparseable Content-Length header: {:?}", cl);
+                        warn!(
+                            "Rejecting request with unparseable Content-Length header: {:?}",
+                            cl
+                        );
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .header("Content-Type", "application/json")
@@ -164,38 +167,6 @@ pub async fn handle_request(
     Ok(response)
 }
 
-#[cfg(test)]
-async fn start_test_rpc_server() -> std::net::SocketAddr {
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
-    use tokio::net::TcpListener;
-
-    // Empty RPC module — sufficient for testing body validation layer
-    let rpc_module = Arc::new(RpcModule::new(()));
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let rpc_module = Arc::clone(&rpc_module);
-
-            tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let rpc_module = Arc::clone(&rpc_module);
-                    async move { handle_request(req, rpc_module).await }
-                });
-                let _ = http1::Builder::new().serve_connection(io, service).await;
-            });
-        }
-    });
-
-    addr
-}
-
 pub async fn create_rpc_module(
     read_deps: Option<ReadDeps>,
     write_deps: Option<WriteDeps>,
@@ -214,8 +185,37 @@ pub async fn create_rpc_module(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn start_test_rpc_server() -> std::net::SocketAddr {
+        // Empty RPC module — sufficient for testing body validation layer
+        let rpc_module = Arc::new(RpcModule::new(()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let rpc_module = Arc::clone(&rpc_module);
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let rpc_module = Arc::clone(&rpc_module);
+                        async move { handle_request(req, rpc_module).await }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                });
+            }
+        });
+
+        addr
+    }
 
     /// Send raw bytes to the test server and return the response as a string.
     async fn send_raw(addr: std::net::SocketAddr, data: &[u8]) -> String {
@@ -246,7 +246,10 @@ mod tests {
         );
         let response = send_raw(addr, req.as_bytes()).await;
         assert_status(&response, 413);
-        assert!(response.contains(&PARSE_ERROR_CODE.to_string()), "Expected PARSE_ERROR_CODE in body");
+        assert!(
+            response.contains(&PARSE_ERROR_CODE.to_string()),
+            "Expected PARSE_ERROR_CODE in body"
+        );
     }
 
     #[tokio::test]
@@ -324,7 +327,10 @@ mod tests {
         let response = send_raw(addr, req.as_bytes()).await;
         // Empty RPC module returns method-not-found, but status is 200 (JSON-RPC errors are in-band)
         assert_status(&response, 200);
-        assert!(response.contains("jsonrpc"), "Expected JSON-RPC response body");
+        assert!(
+            response.contains("jsonrpc"),
+            "Expected JSON-RPC response body"
+        );
     }
 
     #[tokio::test]
@@ -350,7 +356,13 @@ mod tests {
 
         let response = send_raw(addr, &raw).await;
         assert_status(&response, 200); // JSON-RPC errors are in-band
-        assert!(response.contains(&PARSE_ERROR_CODE.to_string()), "Expected PARSE_ERROR_CODE in body");
-        assert!(response.contains("Invalid UTF-8"), "Expected UTF-8 error message");
+        assert!(
+            response.contains(&PARSE_ERROR_CODE.to_string()),
+            "Expected PARSE_ERROR_CODE in body"
+        );
+        assert!(
+            response.contains("Invalid UTF-8"),
+            "Expected UTF-8 error message"
+        );
     }
 }

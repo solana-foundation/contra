@@ -338,11 +338,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_404_for_non_root_path() {
+    async fn returns_404_for_unknown_path() {
+        let addr = start_test_rpc_server().await;
+        let req = "GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 404);
+    }
+
+    #[tokio::test]
+    async fn health_returns_503_when_rpc_has_no_methods() {
         let addr = start_test_rpc_server().await;
         let req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
         let response = send_raw(addr, req.as_bytes()).await;
-        assert_status(&response, 404);
+        assert_status(&response, 503);
     }
 
     #[tokio::test]

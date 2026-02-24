@@ -39,4 +39,10 @@ pub enum ProgramError {
         expected_tree_index: u64,
         current_tree_index: u64,
     },
+
+    #[error("SMT root mismatch: local root {local_root:?} does not match on-chain root {onchain_root:?}. Database may be out of sync with on-chain state.")]
+    SmtRootMismatch {
+        local_root: [u8; 32],
+        onchain_root: [u8; 32],
+    },
 }

@@ -37,7 +37,7 @@ pub fn create_dedup_channel() -> (
 /// Returns empty state only on a fresh node (no metadata in DB yet).
 /// Any DB query failure is propagated as an error — the caller must not
 /// start the node with an empty cache when prior state exists, as that
-/// would violate invariant C3.
+/// could allow duplicate transactions to execute after a restart.
 pub async fn load_dedup_state(
     accounts_db: &AccountsDB,
     max_blockhashes: usize,

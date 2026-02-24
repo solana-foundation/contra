@@ -14,7 +14,7 @@ use super::utils::{restart_contra, start_contra};
 use crate::helpers::get_free_port;
 use crate::setup;
 
-/// Verify that dedup state survives a node restart (invariant C3).
+/// Verify that dedup state survives a node restart.
 ///
 /// Flow:
 ///   1. Start a fresh Contra node backed by the provided Postgres DB.

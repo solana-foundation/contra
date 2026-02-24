@@ -139,8 +139,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel::<Hash>();
 
         // Load persisted dedup state from DB before starting the stage.
-        // Failure here is fatal: starting with an empty cache would violate
-        // invariant C3 (duplicate transactions could execute after a restart).
+        // Failure here is fatal: starting with an empty cache could allow
+        // duplicate transactions to execute after a restart.
         let db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
         let (initial_live_blockhashes, initial_dedup_cache) =
             load_dedup_state(&db, config.max_blockhashes()).await?;

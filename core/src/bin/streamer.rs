@@ -1,4 +1,5 @@
 use {
+    axum::http::HeaderValue,
     axum::{
         extract::{
             ws::{Message, WebSocket, WebSocketUpgrade},
@@ -19,7 +20,7 @@ use {
     sqlx::{postgres::PgPoolOptions, FromRow, PgPool},
     std::{net::SocketAddr, sync::Arc, time::Duration},
     tokio::{signal, sync::broadcast},
-    tower_http::cors::{Any, CorsLayer},
+    tower_http::cors::{AllowOrigin, Any, CorsLayer},
     tracing::{debug, error, info, warn},
 };
 
@@ -726,8 +727,16 @@ async fn main() {
     // Build the axum app
     let state = Arc::new(AppState { tx_sender });
 
+    let cors_origin = if args.cors_allowed_origin == "*" {
+        AllowOrigin::any()
+    } else {
+        let header_value = HeaderValue::from_str(&args.cors_allowed_origin)
+            .expect("Invalid CORS allowed origin value");
+        AllowOrigin::exact(header_value)
+    };
+
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(cors_origin)
         .allow_methods(Any)
         .allow_headers(Any);
 

@@ -7,11 +7,11 @@ on:
       - completed
   workflow_dispatch:
   push:
-    branches: [main, feat/coverage-ci]
+    branches: [main, feat/coverage-ci, hardening/pre-release-audit]
     paths:
       - ".github/workflows/program-coverage.yml"
   pull_request:
-    branches: [main]
+    branches: [main, hardening/pre-release-audit]
     paths:
       - ".github/workflows/program-coverage.yml"
 

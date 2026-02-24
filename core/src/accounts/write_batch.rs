@@ -31,14 +31,7 @@ pub async fn write_batch(
 ) -> Result<(), String> {
     match db {
         AccountsDB::Postgres(postgres_db) => {
-            write_batch_postgres(
-                postgres_db,
-                account_settlements,
-                transactions,
-                block_info,
-                slot,
-            )
-            .await
+            write_batch_postgres(postgres_db, account_settlements, transactions, block_info).await
         }
         AccountsDB::Redis(redis_db) => {
             write_batch_redis(
@@ -67,7 +60,6 @@ async fn write_batch_postgres(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-    _slot: Option<u64>, // latest slot is derived from MAX(slot) in blocks table; no separate write needed
 ) -> Result<(), String> {
     if db.read_only {
         warn!("Attempted to write batch in read-only mode");

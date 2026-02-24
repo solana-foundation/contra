@@ -2,7 +2,7 @@ use {
     contra_core::nodes::node::{NodeConfig, NodeMode},
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
-        commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
+        commitment_config::CommitmentConfig, signature::Keypair, signer::Signer,
         transaction::Transaction,
     },
     spl_associated_token_account::get_associated_token_address,
@@ -10,7 +10,7 @@ use {
     tokio::time::sleep,
 };
 
-use super::utils::{restart_contra, start_contra};
+use super::utils::{restart_contra, send_and_confirm, start_contra, token_balance};
 use crate::helpers::get_free_port;
 use crate::setup;
 
@@ -163,33 +163,4 @@ pub async fn run_dedup_persistence_test(db_url: String) {
     println!("  PASS: dedup state persisted across restart");
 
     new_handles.shutdown().await;
-}
-
-async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
-    let sig = client.send_transaction(tx).await.unwrap();
-    // Poll until the transaction is visible, up to 3 seconds
-    for _ in 0..30 {
-        sleep(Duration::from_millis(100)).await;
-        if client
-            .get_transaction(
-                &sig,
-                solana_transaction_status::UiTransactionEncoding::Base64,
-            )
-            .await
-            .is_ok()
-        {
-            return;
-        }
-    }
-    panic!("Transaction {} not confirmed within 3 seconds", sig);
-}
-
-async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> u64 {
-    client
-        .get_token_account_balance(token_account)
-        .await
-        .unwrap()
-        .amount
-        .parse::<u64>()
-        .unwrap()
 }

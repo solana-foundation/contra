@@ -1,6 +1,8 @@
 use {
     anyhow::Result,
     contra_core::nodes::node::{run_node, NodeConfig, NodeHandles},
+    solana_client::nonblocking::rpc_client::RpcClient,
+    solana_sdk::{pubkey::Pubkey, transaction::Transaction},
     std::{sync::Once, time::Duration},
     tokio::time::sleep,
 };
@@ -42,6 +44,36 @@ pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
     println!("Node endpoint: {}", url);
 
     Ok((node_handles, url))
+}
+
+/// Send a transaction and poll until it is visible, up to 3 seconds.
+pub async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
+    let sig = client.send_transaction(tx).await.unwrap();
+    for _ in 0..30 {
+        sleep(Duration::from_millis(100)).await;
+        if client
+            .get_transaction(
+                &sig,
+                solana_transaction_status::UiTransactionEncoding::Base64,
+            )
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    panic!("Transaction {} not confirmed within 3 seconds", sig);
+}
+
+/// Return the parsed token balance of a token account.
+pub async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> u64 {
+    client
+        .get_token_account_balance(token_account)
+        .await
+        .unwrap()
+        .amount
+        .parse::<u64>()
+        .unwrap()
 }
 
 /// Shut down an existing node and restart it with the same config.

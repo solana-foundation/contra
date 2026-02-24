@@ -3,7 +3,7 @@ use crate::rpc::{
     ReadDeps,
 };
 use jsonrpsee::core::RpcResult;
-use solana_account_decoder_client_types::token::UiTokenAmount;
+use solana_account_decoder_client_types::token::{real_number_string_trimmed, UiTokenAmount};
 use solana_rpc_client_types::config::RpcContextConfig;
 use solana_rpc_client_types::response::{Response, RpcResponseContext};
 use solana_sdk::{account::ReadableAccount, pubkey::Pubkey};
@@ -58,8 +58,11 @@ pub async fn get_token_account_balance_impl(
     })?;
     let decimals = mint.decimals;
 
+    // Use f64 only for the optional numeric field (lossy for large amounts, matches Solana RPC)
     let ui_amount = amount as f64 / 10_f64.powi(decimals as i32);
-    let ui_amount_string = ui_amount.to_string();
+
+    // Use Solana's canonical formatter to avoid f64 precision loss in the string field
+    let ui_amount_string = real_number_string_trimmed(amount, decimals);
 
     let slot =
         read_deps.accounts_db.get_latest_slot().await.map_err(|e| {

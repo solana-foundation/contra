@@ -115,6 +115,8 @@ tokio-mpmc = "0.2.4"
 tokio-util = { version = "0.7", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
 url = "2.5.7"
 yellowstone-grpc-client = "9.0.1"
 yellowstone-grpc-proto = { version = "9.0.1", features = ["convert"] }

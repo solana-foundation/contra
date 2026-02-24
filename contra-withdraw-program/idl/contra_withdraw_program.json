@@ -87,6 +87,11 @@
       "code": 0,
       "name": "InvalidMint",
       "msg": "Invalid mint provided"
+    },
+    {
+      "code": 1,
+      "name": "ZeroAmount",
+      "msg": "Withdrawal amount must be greater than zero"
     }
   ],
   "metadata": {

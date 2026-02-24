@@ -29,6 +29,7 @@ pub const CONTRA_WITHDRAW_PROGRAM_ID: Pubkey =
 
 // Contra Withdraw Program Error Codes (using generated error enum)
 pub const INVALID_MINT_ERROR: u32 = ContraWithdrawProgramError::InvalidMint as u32;
+pub const ZERO_AMOUNT_ERROR: u32 = ContraWithdrawProgramError::ZeroAmount as u32;
 
 // Standard Solana Program Error Codes
 pub const INVALID_ARGUMENT_ERROR: u32 = 5; // ProgramError::InvalidArgument

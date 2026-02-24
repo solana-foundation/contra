@@ -1,4 +1,5 @@
 pub mod api;
+pub mod constants;
 pub mod error;
 mod get_account_info_impl;
 mod get_block_impl;

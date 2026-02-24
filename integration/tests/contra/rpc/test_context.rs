@@ -118,7 +118,10 @@ impl ContraContext {
     }
 
     pub async fn check_transaction_exists(&self, signature: Signature) {
-        for _ in 0..3 {
+        // Settle runs every blocktime_ms (100ms). Worst case: transaction arrives just
+        // after a settle tick, so we wait ~100ms for the next settle + DB commit time.
+        // 20 retries × 100ms = 2 seconds, comfortably above that budget.
+        for _ in 0..20 {
             match self
                 .read_client
                 .get_transaction(&signature, UiTransactionEncoding::Base64)

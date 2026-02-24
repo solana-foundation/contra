@@ -76,10 +76,12 @@ async fn test_with_postgres() {
             node_host, node_port
         );
 
-        let test_context = setup(node_db_url).await.unwrap();
+        let test_context = setup(node_db_url.clone()).await.unwrap();
         test_suite(&test_context.contra_ctx, &test_context.l1_ctx).await;
-
         shutdown(test_context).await;
+
+        // Dedup persistence test runs with its own node instance against the same DB
+        run_dedup_persistence_test(node_db_url).await;
     })
     .await
     .unwrap();

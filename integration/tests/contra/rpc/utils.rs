@@ -43,3 +43,16 @@ pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
 
     Ok((node_handles, url))
 }
+
+/// Shut down an existing node and restart it with the same config.
+/// Used by the dedup-persistence test to simulate a process restart.
+pub async fn restart_contra(
+    handles: NodeHandles,
+    config: NodeConfig,
+) -> Result<(NodeHandles, String)> {
+    println!("\n=== Restarting Node ===");
+    handles.shutdown().await;
+    // Brief pause to allow the OS to release the port
+    sleep(Duration::from_millis(200)).await;
+    start_contra(config).await
+}

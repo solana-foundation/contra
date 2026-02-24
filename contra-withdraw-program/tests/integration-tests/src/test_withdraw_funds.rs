@@ -11,6 +11,7 @@ use crate::{
     utils::{
         assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
         CONTRA_WITHDRAW_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        ZERO_AMOUNT_ERROR,
     },
 };
 
@@ -85,6 +86,31 @@ fn test_withdraw_funds_insufficient_funds() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, TOKEN_INSUFFICIENT_FUNDS_ERROR);
+}
+
+#[test]
+fn test_withdraw_funds_zero_amount() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+
+    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint.pubkey())
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .amount(0)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, ZERO_AMOUNT_ERROR);
 }
 
 #[test]

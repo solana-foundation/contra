@@ -171,9 +171,7 @@ fn parse_escrow_instruction(
         DISC_DEPOSIT => {
             // data: [disc(1), amount(8), ...]
             if data.len() >= 9 {
-                let amt = u64::from_le_bytes(
-                    data[1..9].try_into().unwrap_or([0u8; 8]),
-                );
+                let amt = u64::from_le_bytes(data[1..9].try_into().unwrap_or([0u8; 8]));
                 amount = Some(amt.to_string());
             }
             from = resolve_key(account_keys, ix_accounts, 1); // user
@@ -183,9 +181,7 @@ fn parse_escrow_instruction(
         DISC_RELEASE_FUNDS => {
             // data: [disc(1), amount(8), user(32), ...]
             if data.len() >= 9 {
-                let amt = u64::from_le_bytes(
-                    data[1..9].try_into().unwrap_or([0u8; 8]),
-                );
+                let amt = u64::from_le_bytes(data[1..9].try_into().unwrap_or([0u8; 8]));
                 amount = Some(amt.to_string());
             }
             if data.len() >= 41 {
@@ -411,20 +407,18 @@ struct IndexerTxRow {
 // Poller — indexer DB for escrow deposits / withdrawals
 // ---------------------------------------------------------------------------
 
-async fn poll_indexer(
-    pool: PgPool,
-    tx_sender: broadcast::Sender<String>,
-    poll_interval: Duration,
-) {
-    let mut last_seen_id: i64 = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MAX(id) FROM transactions",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(Some(0))
-    .unwrap_or(0);
+async fn poll_indexer(pool: PgPool, tx_sender: broadcast::Sender<String>, poll_interval: Duration) {
+    let mut last_seen_id: i64 =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
 
-    info!("[indexer] Starting poller from transaction id {}", last_seen_id);
+    info!(
+        "[indexer] Starting poller from transaction id {}",
+        last_seen_id
+    );
 
     loop {
         tokio::time::sleep(poll_interval).await;
@@ -480,7 +474,10 @@ async fn poll_indexer(
 
             match serde_json::to_string(&streamed) {
                 Ok(json) => {
-                    debug!("[indexer] Broadcasting {}: {}", streamed.signature, streamed.tx_type);
+                    debug!(
+                        "[indexer] Broadcasting {}: {}",
+                        streamed.signature, streamed.tx_type
+                    );
                     let _ = tx_sender.send(json);
                 }
                 Err(e) => error!("Failed to serialize: {}", e),
@@ -563,10 +560,7 @@ async fn poll_loop(
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_ws_connection(socket, state))
 }
 

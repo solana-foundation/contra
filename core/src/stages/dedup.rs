@@ -1,5 +1,6 @@
 use {
     crate::{accounts::traits::AccountsDB, nodes::node::WorkerHandle},
+    anyhow::Result,
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
     std::collections::{HashMap, HashSet, LinkedList},
     tokio::sync::mpsc,
@@ -33,12 +34,14 @@ pub fn create_dedup_channel() -> (
 /// - `live_blockhashes`: the ordered list of recent settled blockhashes
 /// - `dedup_cache`: blockhash → set of signatures that used it as recent_blockhash
 ///
-/// Returns empty state if the DB has no blocks yet (fresh node).
-/// On DB error, logs a warning and returns empty state so the node still starts.
+/// Returns empty state only on a fresh node (no metadata in DB yet).
+/// Any DB query failure is propagated as an error — the caller must not
+/// start the node with an empty cache when prior state exists, as that
+/// would violate invariant C3.
 pub async fn load_dedup_state(
     accounts_db: &AccountsDB,
     max_blockhashes: usize,
-) -> (LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>) {
+) -> Result<(LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>)> {
     let mut live_blockhashes: LinkedList<Hash> = LinkedList::new();
     let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
 
@@ -46,25 +49,15 @@ pub async fn load_dedup_state(
         Ok(slot) => slot,
         Err(_) => {
             info!("Dedup: no prior blocks found, starting with empty state");
-            return (live_blockhashes, dedup_cache);
+            return Ok((live_blockhashes, dedup_cache));
         }
     };
 
     let start_slot = latest_slot.saturating_sub(max_blockhashes as u64 - 1);
 
-    let blocks = match accounts_db
+    let blocks = accounts_db
         .get_blocks_in_range(start_slot, latest_slot)
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "Dedup: failed to load prior blocks for recovery, starting with empty state: {}",
-                e
-            );
-            return (live_blockhashes, dedup_cache);
-        }
-    };
+        .await?;
 
     for block in &blocks {
         live_blockhashes.push_back(block.blockhash);
@@ -88,7 +81,7 @@ pub async fn load_dedup_state(
         blocks.len(),
     );
 
-    (live_blockhashes, dedup_cache)
+    Ok((live_blockhashes, dedup_cache))
 }
 
 pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {

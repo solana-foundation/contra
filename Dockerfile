@@ -84,7 +84,7 @@ COPY indexer ./indexer
 
 # Resolve the symlink: copy the built .so into core/precompiles/
 # (the source symlink points to target/deploy/ which exists in the builder)
-RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so 2>/dev/null || true
+RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
 
 RUN cargo build --release \
     -p contra-core \

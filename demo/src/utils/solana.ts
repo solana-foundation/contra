@@ -150,12 +150,12 @@ const fetchBlockhash = async (url: string): Promise<string> => {
 };
 
 const getLatestBlockhash = async (url: string): Promise<string> => {
+  // Deduplicate concurrent fetches first
+  if (inflight) return inflight;
+
   if (cachedBlockhash && Date.now() - cachedBlockhash.fetchedAt < BLOCKHASH_TTL_MS) {
     return cachedBlockhash.value;
   }
-
-  // Deduplicate concurrent fetches
-  if (inflight) return inflight;
 
   inflight = fetchBlockhash(url)
     .then((blockhash) => {

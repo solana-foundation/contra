@@ -80,7 +80,11 @@ impl Gateway {
             Some(bytes) => {
                 builder = builder.header("Content-Type", "application/json");
                 builder
-                    .body(Full::new(bytes).map_err(|never| match never {}).boxed_unsync())
+                    .body(
+                        Full::new(bytes)
+                            .map_err(|never| match never {})
+                            .boxed_unsync(),
+                    )
                     .unwrap()
             }
             None => builder
@@ -279,40 +283,6 @@ impl Gateway {
     }
 }
 
-#[cfg(test)]
-async fn start_test_gateway() -> SocketAddr {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .ok();
-
-    let gateway = Arc::new(Gateway::new(
-        "http://127.0.0.1:1".to_string(),
-        "http://127.0.0.1:1".to_string(),
-        "*".to_string(),
-    ));
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let io = TokioIo::new(stream);
-            let gateway = Arc::clone(&gateway);
-
-            tokio::spawn(async move {
-                let service = service_fn(move |req| {
-                    let gateway = Arc::clone(&gateway);
-                    async move { gateway.handle_request(req).await }
-                });
-                let _ = http1::Builder::new().serve_connection(io, service).await;
-            });
-        }
-    });
-
-    addr
-}
-
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting Contra Gateway");
     info!("  Port: {}", args.port);
@@ -354,6 +324,39 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    async fn start_test_gateway() -> SocketAddr {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let gateway = Arc::new(Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "*".to_string(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let io = TokioIo::new(stream);
+                let gateway = Arc::clone(&gateway);
+
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let gateway = Arc::clone(&gateway);
+                        async move { gateway.handle_request(req).await }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                });
+            }
+        });
+
+        addr
+    }
 
     /// Send raw bytes to the test gateway and return the response as a string.
     async fn send_raw(addr: SocketAddr, data: &[u8]) -> String {

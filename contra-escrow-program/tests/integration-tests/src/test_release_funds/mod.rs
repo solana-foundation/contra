@@ -1,3 +1,6 @@
+mod double_spend;
+mod malformed_proofs;
+
 use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda, find_operator_pda},
     smt_utils::{ProcessorSMT, MAX_TREE_LEAVES},

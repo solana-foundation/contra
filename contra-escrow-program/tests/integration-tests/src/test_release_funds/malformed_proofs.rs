@@ -24,11 +24,11 @@ const RELEASE_AMOUNT: u64 = 100_000;
 
 fn setup_release_context() -> (
     TestContext,
-    Keypair,                       // operator
-    solana_sdk::pubkey::Pubkey,    // instance_pda
-    solana_sdk::pubkey::Pubkey,    // operator_pda
-    Keypair,                       // mint
-    Keypair,                       // user
+    Keypair,                    // operator
+    solana_sdk::pubkey::Pubkey, // instance_pda
+    solana_sdk::pubkey::Pubkey, // operator_pda
+    Keypair,                    // mint
+    Keypair,                    // user
 ) {
     let mut context = TestContext::new();
     let admin = Keypair::new();

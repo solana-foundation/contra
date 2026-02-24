@@ -5,8 +5,8 @@ use crate::{
         assert_get_or_release_funds, assert_get_or_reset_smt_root,
     },
     utils::{
-        assert_program_error, set_mint, setup_test_balances, TestContext,
-        INVALID_SMT_PROOF_ERROR, INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
+        assert_program_error, set_mint, setup_test_balances, TestContext, INVALID_SMT_PROOF_ERROR,
+        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
     },
 };
 
@@ -89,8 +89,8 @@ fn test_double_spend_same_nonce_after_tree_reset() {
 
     // After reset, tree_index=1 expects nonces 65536..131071.
     // Nonce 42 belongs to tree_index=0 and should be rejected.
-    // Uses a different amount to produce distinct instruction data (avoids LiteSVM
-    // AlreadyProcessed dedup — same signers + identical data + same blockhash = same tx sig).
+    context.warp_to_slot(2);
+
     let mut replay_smt = ProcessorSMT::new();
     let (_, replay_proofs) = replay_smt.generate_exclusion_proof_for_verification(nonce);
     replay_smt.insert(nonce);
@@ -103,7 +103,7 @@ fn test_double_spend_same_nonce_after_tree_reset() {
         &operator_pda,
         &mint.pubkey(),
         &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT + 1,
+        RELEASE_AMOUNT,
         &user.pubkey(),
         replay_root,
         nonce,
@@ -188,7 +188,8 @@ fn test_double_spend_smt_exclusion_rejects_used_nonce() {
     // Replay the same nonce without tree reset. The on-chain root now has nonce 42
     // as a non-empty leaf, so the exclusion proof fails — the SMT math itself
     // prevents double-spend, not just tree_index validation.
-    // Different amount to avoid LiteSVM AlreadyProcessed dedup.
+    context.warp_to_slot(2);
+
     let result = assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -196,7 +197,7 @@ fn test_double_spend_smt_exclusion_rejects_used_nonce() {
         &operator_pda,
         &mint.pubkey(),
         &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT + 1,
+        RELEASE_AMOUNT,
         &user.pubkey(),
         new_root,
         nonce,
@@ -273,13 +274,14 @@ fn test_double_spend_sequential_releases_then_replay() {
             sibling_proofs,
             false,
         )
-        .expect(&format!("Release with nonce {} should succeed", nonce));
+        .unwrap_or_else(|_| panic!("Release with nonce {} should succeed", nonce));
     }
 
     // Replay nonce 42 after three sequential releases.
     // On-chain root has nonces 42, 43, 44 — exclusion proof for 42 fails.
     // Fresh SMT proofs won't match the on-chain root that already contains 42.
-    // Different amount to avoid LiteSVM AlreadyProcessed dedup.
+    context.warp_to_slot(2);
+
     let replay_nonce: u64 = 42;
 
     let mut replay_smt = ProcessorSMT::new();
@@ -294,7 +296,7 @@ fn test_double_spend_sequential_releases_then_replay() {
         &operator_pda,
         &mint.pubkey(),
         &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT + 1,
+        RELEASE_AMOUNT,
         &user.pubkey(),
         replay_root,
         replay_nonce,

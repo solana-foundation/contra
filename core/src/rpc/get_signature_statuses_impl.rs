@@ -16,11 +16,10 @@ pub async fn get_signature_statuses_impl(
     signatures: Vec<String>,
     _config: Option<RpcSignatureStatusConfig>,
 ) -> RpcResult<Response<Vec<Option<TransactionStatus>>>> {
-    let current_slot = read_deps
-        .accounts_db
-        .get_latest_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
+    let current_slot =
+        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
+            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+        })?;
 
     let mut statuses = Vec::with_capacity(signatures.len());
 

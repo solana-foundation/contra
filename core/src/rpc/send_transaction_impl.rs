@@ -20,9 +20,12 @@ pub async fn send_transaction_impl(
     _config: Option<RpcSendTransactionConfig>,
 ) -> RpcResult<String> {
     // Decode the base64 transaction
-    let tx_data = STANDARD
-        .decode(&transaction)
-        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid base64 encoding: {}", e)))?;
+    let tx_data = STANDARD.decode(&transaction).map_err(|e| {
+        custom_error(
+            INVALID_PARAMS_CODE,
+            format!("Invalid base64 encoding: {}", e),
+        )
+    })?;
 
     // Check packet size limit (1232 bytes is Solana's PACKET_DATA_SIZE)
     const PACKET_DATA_SIZE: usize = 1232;
@@ -46,7 +49,12 @@ pub async fn send_transaction_impl(
     // Try to deserialize as VersionedTransaction first (standard format)
     let versioned_tx = bincode_options
         .deserialize::<VersionedTransaction>(&tx_data)
-        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Failed to deserialize transaction: {}", e)))?;
+        .map_err(|e| {
+            custom_error(
+                INVALID_PARAMS_CODE,
+                format!("Failed to deserialize transaction: {}", e),
+            )
+        })?;
 
     let runtime_tx = RuntimeTransaction::try_create(
         versioned_tx,
@@ -96,10 +104,12 @@ pub async fn send_transaction_impl(
 
     // Send to dedup channel (which forwards to sigverify after deduplication)
     info!("Sending transaction {} to dedup stage", signature);
-    write_deps
-        .dedup_tx
-        .send(sanitized_tx)
-        .map_err(|_| custom_error(JSON_RPC_SERVER_ERROR, "Internal error: dedup channel closed"))?;
+    write_deps.dedup_tx.send(sanitized_tx).map_err(|_| {
+        custom_error(
+            JSON_RPC_SERVER_ERROR,
+            "Internal error: dedup channel closed",
+        )
+    })?;
 
     debug!("Transaction {} sent to dedup stage", signature);
     Ok(signature)

@@ -13,5 +13,10 @@ pub async fn get_transaction_count_impl(
         .accounts_db
         .get_transaction_count()
         .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get transaction count: {}", e)))
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get transaction count: {}", e),
+            )
+        })
 }

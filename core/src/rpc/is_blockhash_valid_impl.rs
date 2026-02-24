@@ -14,11 +14,10 @@ pub async fn is_blockhash_valid_impl(
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<bool>> {
     // Get the current slot
-    let slot = read_deps
-        .accounts_db
-        .get_latest_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
+    let slot =
+        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
+            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+        })?;
 
     // Parse the provided blockhash
     let provided_hash = Hash::from_str(&blockhash)
@@ -29,7 +28,12 @@ pub async fn is_blockhash_valid_impl(
         .accounts_db
         .get_latest_blockhash()
         .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get blockhash: {}", e)))?;
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get blockhash: {}", e),
+            )
+        })?;
 
     // Check if the blockhash matches the latest one
     // In a production system, you'd want to check a range of recent blockhashes

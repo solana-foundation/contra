@@ -33,6 +33,11 @@ async fn store_block_postgres(
     let block_data = bincode::serialize(&block_info)
         .map_err(|e| format!("Failed to serialize block info: {}", e))?;
 
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
     // Store block
     sqlx::query(
         "INSERT INTO blocks (slot, data) VALUES ($1, $2)
@@ -40,7 +45,7 @@ async fn store_block_postgres(
     )
     .bind(slot as i64)
     .bind(&block_data)
-    .execute(pool.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to store block: {}", e))?;
 
@@ -50,9 +55,13 @@ async fn store_block_postgres(
          ON CONFLICT (key) DO UPDATE SET value = $1",
     )
     .bind(blockhash.as_ref())
-    .execute(pool.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to store latest blockhash: {}", e))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
     debug!(
         "Stored block at slot {} with {} transactions",

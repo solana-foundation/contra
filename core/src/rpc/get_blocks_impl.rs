@@ -15,5 +15,10 @@ pub async fn get_blocks_impl(
         .accounts_db
         .get_blocks(start_slot, end_slot)
         .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get blocks: {}", e)))
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get blocks: {}", e),
+            )
+        })
 }

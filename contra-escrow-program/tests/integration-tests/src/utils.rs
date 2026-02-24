@@ -231,6 +231,26 @@ impl TestContext {
             unix_timestamp: current_clock.unix_timestamp + seconds,
         });
     }
+
+    pub fn warp_to_slot(&mut self, slot: u64) {
+        let clock = self.svm.get_sysvar::<Clock>();
+        self.svm.set_sysvar(&Clock { slot, ..clock });
+        self.svm.expire_blockhash();
+    }
+
+    pub fn warp_to_timestamp(&mut self, unix_timestamp: i64) {
+        self.svm.set_sysvar(&Clock {
+            slot: 1,
+            epoch_start_timestamp: unix_timestamp,
+            epoch: 0,
+            leader_schedule_epoch: 0,
+            unix_timestamp,
+        });
+    }
+
+    pub fn get_current_timestamp(&self) -> i64 {
+        self.svm.get_sysvar::<Clock>().unix_timestamp
+    }
 }
 
 impl Default for TestContext {

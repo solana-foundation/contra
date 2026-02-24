@@ -11,16 +11,20 @@ pub async fn get_latest_blockhash_impl(
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<RpcBlockhash>> {
     // Get the latest slot and blockhash from the database
-    let slot = read_deps
-        .accounts_db
-        .get_latest_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
+    let slot =
+        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
+            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+        })?;
     let blockhash = read_deps
         .accounts_db
         .get_latest_blockhash()
         .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get blockhash: {}", e)))?;
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get blockhash: {}", e),
+            )
+        })?;
 
     // Calculate last valid block height
     // In Solana, a blockhash is valid for approximately 150 blocks

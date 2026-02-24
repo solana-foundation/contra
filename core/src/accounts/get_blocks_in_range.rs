@@ -52,6 +52,10 @@ async fn get_blocks_in_range_postgres(
     Ok(blocks)
 }
 
+/// Maximum number of keys per Redis MGET command.
+/// Keeps individual commands bounded regardless of how large max_blockhashes grows.
+const MGET_CHUNK_SIZE: u64 = 1000;
+
 async fn get_blocks_in_range_redis(
     db: &RedisAccountsDB,
     start_slot: u64,
@@ -62,26 +66,34 @@ async fn get_blocks_in_range_redis(
     }
 
     let mut conn = db.connection.clone();
-
-    // Build all keys for the slot range upfront, then MGET in one round-trip
-    let keys: Vec<String> = (start_slot..=end_slot)
-        .map(|slot| format!("block:{}", slot))
-        .collect();
-
-    let values: Vec<Option<Vec<u8>>> = conn
-        .mget(&keys)
-        .await
-        .context("Failed to MGET blocks from Redis")?;
-
     let mut blocks = Vec::new();
-    for (slot, maybe_bytes) in (start_slot..=end_slot).zip(values) {
-        let Some(bytes) = maybe_bytes else {
-            continue;
-        };
-        match bincode::deserialize::<BlockInfo>(&bytes) {
-            Ok(block) => blocks.push(block),
-            Err(e) => warn!("Failed to deserialize block {} from Redis: {}", slot, e),
+
+    // Issue MGET in fixed-size chunks so a single command stays bounded
+    // regardless of how large the slot range is.
+    let mut chunk_start = start_slot;
+    while chunk_start <= end_slot {
+        let chunk_end = (chunk_start + MGET_CHUNK_SIZE - 1).min(end_slot);
+
+        let keys: Vec<String> = (chunk_start..=chunk_end)
+            .map(|slot| format!("block:{}", slot))
+            .collect();
+
+        let values: Vec<Option<Vec<u8>>> = conn
+            .mget(&keys)
+            .await
+            .context("Failed to MGET blocks from Redis")?;
+
+        for (slot, maybe_bytes) in (chunk_start..=chunk_end).zip(values) {
+            let Some(bytes) = maybe_bytes else {
+                continue;
+            };
+            match bincode::deserialize::<BlockInfo>(&bytes) {
+                Ok(block) => blocks.push(block),
+                Err(e) => warn!("Failed to deserialize block {} from Redis: {}", slot, e),
+            }
         }
+
+        chunk_start = chunk_end + 1;
     }
 
     Ok(blocks)

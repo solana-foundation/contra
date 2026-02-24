@@ -53,6 +53,9 @@ pub async fn write_batch(
     }
 }
 
+/// Writes a complete slot batch (accounts + transactions + block metadata) atomically.
+/// Either every write in this batch commits, or none do — no partial slot state
+/// is ever visible to readers.
 async fn write_batch_postgres(
     db: &mut PostgresAccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],

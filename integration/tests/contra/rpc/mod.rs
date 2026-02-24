@@ -1,3 +1,4 @@
+mod test_batch_atomicity;
 mod test_context;
 // mod test_cors; // Disabled - CORS is now handled by the gateway
 mod test_empty_transaction;

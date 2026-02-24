@@ -2,9 +2,9 @@ name: Rust Checks
 
 on:
   push:
-    branches: [main]
+    branches: [main, hardening/pre-release-audit]
   pull_request:
-    branches: [main]
+    branches: [main, hardening/pre-release-audit]
 
 env:
   CARGO_TERM_COLOR: always

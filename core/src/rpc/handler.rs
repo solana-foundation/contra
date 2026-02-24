@@ -2,7 +2,7 @@ use {
     super::{api::ContraRpcServer, rpc_impl::ContraRpcImpl},
     crate::rpc::{
         constants::{MAX_BODY_SIZE, MAX_RESPONSE_SIZE},
-        error::{INTERNAL_ERROR_CODE, INVALID_REQUEST_CODE, PARSE_ERROR_CODE},
+        error::{INTERNAL_ERROR_CODE, PARSE_ERROR_CODE},
         rpc_impl::{ReadDeps, WriteDeps},
     },
     http_body_util::{BodyExt, Full, LengthLimitError, Limited},
@@ -19,7 +19,7 @@ pub async fn handle_request(
     let payload_too_large = || {
         let body = format!(
             r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"Request body exceeds maximum size of {} bytes"}},"id":null}}"#,
-            INVALID_REQUEST_CODE, MAX_BODY_SIZE
+            PARSE_ERROR_CODE, MAX_BODY_SIZE
         );
         Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -89,7 +89,7 @@ pub async fn handle_request(
                             .body(Full::new(Bytes::from(
                                 format!(
                                     r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"Invalid Content-Length header"}},"id":null}}"#,
-                                    INVALID_REQUEST_CODE
+                                    PARSE_ERROR_CODE
                                 ),
                             )))
                             .expect("static response builder"));
@@ -246,7 +246,7 @@ mod tests {
         );
         let response = send_raw(addr, req.as_bytes()).await;
         assert_status(&response, 413);
-        assert!(response.contains(&INVALID_REQUEST_CODE.to_string()), "Expected INVALID_REQUEST_CODE in body");
+        assert!(response.contains(&PARSE_ERROR_CODE.to_string()), "Expected PARSE_ERROR_CODE in body");
     }
 
     #[tokio::test]

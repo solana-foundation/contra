@@ -7,6 +7,10 @@ pub enum ContraWithdrawProgramError {
     /// (0) Invalid mint provided
     #[error("Invalid mint provided")]
     InvalidMint,
+
+    /// (1) Withdrawal amount must be greater than zero
+    #[error("Withdrawal amount must be greater than zero")]
+    ZeroAmount,
 }
 
 impl From<ContraWithdrawProgramError> for ProgramError {

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# reconcile-escrow-balance.sh — Reconcile on-chain escrow balance vs DB expected balance per mint
+#
+# Usage: ./scripts/reconcile-escrow-balance.sh <ESCROW_OWNER> <MINT> <DB_CONNECTION_STRING>
+#
+# Arguments:
+#   ESCROW_OWNER       — Instance PDA that owns escrow token accounts
+#   MINT               — Token mint address to reconcile
+#   DB_CONNECTION_STRING — Postgres connection URL to indexer DB
+#
+# Environment variables:
+#   SOLANA_RPC_URL  — RPC endpoint (default: http://localhost:8899)
+#   ALERT_WEBHOOK   — Optional webhook URL for mismatch alerts
+#
+# Requirements: spl-token CLI, psql, jq, curl
+#
+# Exit codes:
+#   0 — balances match
+#   1 — mismatch detected (ALERT)
+#   2 — usage/connection error
+
+set -euo pipefail
+
+if [ $# -lt 3 ]; then
+    echo "Usage: $0 <ESCROW_OWNER> <MINT> <DB_CONNECTION_STRING>"
+    echo ""
+    echo "Example:"
+    echo "  $0 5xYz...PDA So11...mint 'postgresql://user:pass@localhost:5432/contra'"
+    echo ""
+    echo "Environment variables:"
+    echo "  SOLANA_RPC_URL  — RPC endpoint (default: http://localhost:8899)"
+    echo "  ALERT_WEBHOOK   — Optional webhook URL for mismatch alerts"
+    exit 2
+fi
+
+ESCROW_OWNER="$1"
+MINT="$2"
+DB_URL="$3"
+RPC_URL="${SOLANA_RPC_URL:-http://localhost:8899}"
+
+echo "=== Contra Escrow Balance Reconciliation ==="
+echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Escrow owner: ${ESCROW_OWNER}"
+echo "Mint:         ${MINT}"
+echo "RPC:          ${RPC_URL}"
+echo ""
+
+# Step 1: Get on-chain token balance (raw units)
+echo "Fetching on-chain balance..."
+SPL_OUTPUT=$(spl-token balance --owner "$ESCROW_OWNER" "$MINT" --url "$RPC_URL" --output json 2>&1) || {
+    echo "ERROR: Failed to fetch on-chain token balance for mint ${MINT}."
+    echo "Detail: ${SPL_OUTPUT}"
+    exit 2
+}
+
+ONCHAIN_BALANCE=$(echo "$SPL_OUTPUT" | jq -r '.amount') || {
+    echo "ERROR: Failed to parse spl-token JSON output."
+    echo "Raw output: ${SPL_OUTPUT}"
+    exit 2
+}
+
+if [ -z "$ONCHAIN_BALANCE" ] || [ "$ONCHAIN_BALANCE" = "null" ]; then
+    echo "ERROR: No token account found for owner ${ESCROW_OWNER}, mint ${MINT}."
+    exit 2
+fi
+
+echo "On-chain balance (raw): ${ONCHAIN_BALANCE}"
+
+# Step 2: Query database for expected balance (raw units)
+echo "Querying database for expected balance..."
+DB_EXPECTED=$(psql "$DB_URL" -t -A -v "mint=${MINT}" -c "
+    SELECT
+        COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE 0 END), 0) -
+        COALESCE(SUM(CASE WHEN transaction_type = 'withdrawal' THEN amount ELSE 0 END), 0)
+        AS expected_balance
+    FROM transactions
+    WHERE mint = :'mint' AND status = 'completed';
+" 2>&1) || {
+    echo "ERROR: Failed to query database."
+    echo "Detail: ${DB_EXPECTED}"
+    exit 2
+}
+DB_EXPECTED=$(echo "$DB_EXPECTED" | tr -d '[:space:]')
+
+echo "DB expected balance (raw): ${DB_EXPECTED}"
+
+# Step 3: Compare (both in raw token units)
+if ! [[ "$ONCHAIN_BALANCE" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: On-chain balance is not a valid integer: '${ONCHAIN_BALANCE}'"
+    exit 2
+fi
+if ! [[ "$DB_EXPECTED" =~ ^-?[0-9]+$ ]]; then
+    echo "ERROR: DB expected balance is not a valid integer: '${DB_EXPECTED}'"
+    exit 2
+fi
+
+DELTA=$((ONCHAIN_BALANCE - DB_EXPECTED))
+
+echo ""
+echo "=== Result ==="
+echo "On-chain: ${ONCHAIN_BALANCE}"
+echo "Expected: ${DB_EXPECTED}"
+echo "Delta:    ${DELTA}"
+
+if [ "$DELTA" -eq 0 ]; then
+    echo ""
+    echo "PASS — Balances reconcile."
+    exit 0
+else
+    echo ""
+    echo "FAIL — Mismatch detected!"
+
+    if [ -n "${ALERT_WEBHOOK:-}" ]; then
+        PAYLOAD=$(jq -n \
+            --arg text "Escrow balance mismatch! On-chain: ${ONCHAIN_BALANCE}, Expected: ${DB_EXPECTED}, Delta: ${DELTA}, Owner: ${ESCROW_OWNER}, Mint: ${MINT}" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{text: $text, timestamp: $ts}')
+        HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${ALERT_WEBHOOK}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD") || {
+            echo "ERROR: Alert webhook request failed (curl error)."
+            exit 2
+        }
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "ERROR: Alert webhook returned HTTP ${HTTP_CODE}."
+            exit 2
+        fi
+        echo "Alert sent (HTTP ${HTTP_CODE})."
+    fi
+
+    exit 1
+fi

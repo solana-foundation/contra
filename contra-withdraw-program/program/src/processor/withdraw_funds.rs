@@ -5,6 +5,7 @@ use pinocchio::{
 };
 
 use crate::{
+    error::ContraWithdrawProgramError,
     events::WithdrawFundsEvent,
     processor::{
         validate_ata, verify_ata_program, verify_mint_account, verify_signer, verify_token_program,
@@ -31,6 +32,11 @@ pub fn process_withdraw_funds(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+
+    if args.amount == 0 {
+        return Err(ContraWithdrawProgramError::ZeroAmount.into());
+    }
+
     let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info] =
         accounts
     else {

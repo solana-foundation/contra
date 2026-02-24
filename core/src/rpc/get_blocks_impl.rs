@@ -15,7 +15,10 @@ pub async fn get_blocks_impl(
     let effective_end = match end_slot {
         Some(end) => {
             if end < start_slot {
-                return Err(custom_error(INVALID_PARAMS_CODE, "end_slot must be >= start_slot"));
+                return Err(custom_error(
+                    INVALID_PARAMS_CODE,
+                    "end_slot must be >= start_slot",
+                ));
             }
             end
         }

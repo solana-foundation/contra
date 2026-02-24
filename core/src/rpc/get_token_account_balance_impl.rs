@@ -33,8 +33,12 @@ pub async fn get_token_account_balance_impl(
     }
 
     let data = account.data();
-    let token_account = TokenAccount::unpack(data)
-        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid token account data: {}", e)))?;
+    let token_account = TokenAccount::unpack(data).map_err(|e| {
+        custom_error(
+            INVALID_PARAMS_CODE,
+            format!("Invalid token account data: {}", e),
+        )
+    })?;
 
     let amount = token_account.amount;
     let mint_pubkey = token_account.mint;
@@ -46,18 +50,21 @@ pub async fn get_token_account_balance_impl(
         .await
         .ok_or_else(|| custom_error(INVALID_PARAMS_CODE, "Mint account not found"))?;
 
-    let mint = Mint::unpack(mint_account.data())
-        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid mint account data: {}", e)))?;
+    let mint = Mint::unpack(mint_account.data()).map_err(|e| {
+        custom_error(
+            INVALID_PARAMS_CODE,
+            format!("Invalid mint account data: {}", e),
+        )
+    })?;
     let decimals = mint.decimals;
 
     let ui_amount = amount as f64 / 10_f64.powi(decimals as i32);
     let ui_amount_string = ui_amount.to_string();
 
-    let slot = read_deps
-        .accounts_db
-        .get_latest_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
+    let slot =
+        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
+            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+        })?;
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

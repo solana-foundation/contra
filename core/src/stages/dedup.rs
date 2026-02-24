@@ -59,6 +59,8 @@ pub async fn load_dedup_state(
         .get_blocks_in_range(start_slot, latest_slot)
         .await?;
 
+    let loaded_hashes: HashSet<Hash> = blocks.iter().map(|b| b.blockhash).collect();
+
     for block in &blocks {
         ensure!(
             block.transaction_signatures.len() == block.transaction_recent_blockhashes.len(),
@@ -75,10 +77,12 @@ pub async fn load_dedup_state(
             .iter()
             .zip(block.transaction_recent_blockhashes.iter())
         {
-            dedup_cache
-                .entry(*recent_blockhash)
-                .or_default()
-                .insert(*signature);
+            if loaded_hashes.contains(recent_blockhash) {
+                dedup_cache
+                    .entry(*recent_blockhash)
+                    .or_default()
+                    .insert(*signature);
+            }
         }
     }
 

@@ -7,6 +7,7 @@ pub mod get_accounts;
 pub mod get_block;
 pub mod get_block_time;
 pub mod get_blocks;
+pub mod get_blocks_in_range;
 pub mod get_epoch_info;
 pub mod get_first_available_block;
 pub mod get_latest_blockhash;

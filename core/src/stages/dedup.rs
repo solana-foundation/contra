@@ -1,5 +1,5 @@
 use {
-    crate::nodes::node::WorkerHandle,
+    crate::{accounts::traits::AccountsDB, nodes::node::WorkerHandle},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
     std::collections::{HashMap, HashSet, LinkedList},
     tokio::sync::mpsc,
@@ -13,6 +13,10 @@ pub struct DedupArgs {
     pub settled_blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
     pub output_tx: tokio_mpmc::Sender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
+    /// Pre-populated from DB on startup; empty on a fresh node.
+    pub initial_live_blockhashes: LinkedList<Hash>,
+    /// Pre-populated from DB on startup; empty on a fresh node.
+    pub initial_dedup_cache: HashMap<Hash, HashSet<Signature>>,
 }
 
 /// Create the dedup channel pair (unbounded)
@@ -23,6 +27,67 @@ pub fn create_dedup_channel() -> (
     mpsc::unbounded_channel()
 }
 
+/// Load dedup state from the DB to seed the cache on restart.
+///
+/// Reads the last `max_blockhashes` blocks and reconstructs:
+/// - `live_blockhashes`: the ordered list of recent settled blockhashes
+/// - `dedup_cache`: blockhash → set of signatures that used it as recent_blockhash
+///
+/// Returns empty state if the DB has no blocks yet (fresh node).
+/// On DB error, logs a warning and returns empty state so the node still starts.
+pub async fn load_dedup_state(
+    accounts_db: &AccountsDB,
+    max_blockhashes: usize,
+) -> (LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>) {
+    let mut live_blockhashes: LinkedList<Hash> = LinkedList::new();
+    let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
+
+    let latest_slot = match accounts_db.get_latest_slot().await {
+        Ok(slot) => slot,
+        Err(_) => {
+            info!("Dedup: no prior blocks found, starting with empty state");
+            return (live_blockhashes, dedup_cache);
+        }
+    };
+
+    let start_slot = latest_slot.saturating_sub(max_blockhashes as u64 - 1);
+
+    let blocks = match accounts_db.get_blocks_in_range(start_slot, latest_slot).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "Dedup: failed to load prior blocks for recovery, starting with empty state: {}",
+                e
+            );
+            return (live_blockhashes, dedup_cache);
+        }
+    };
+
+    for block in &blocks {
+        live_blockhashes.push_back(block.blockhash);
+
+        for (signature, recent_blockhash) in block
+            .transaction_signatures
+            .iter()
+            .zip(block.transaction_recent_blockhashes.iter())
+        {
+            dedup_cache
+                .entry(*recent_blockhash)
+                .or_default()
+                .insert(*signature);
+        }
+    }
+
+    info!(
+        "Dedup: restored {} live blockhashes and {} cache entries from {} blocks",
+        live_blockhashes.len(),
+        dedup_cache.values().map(|s| s.len()).sum::<usize>(),
+        blocks.len(),
+    );
+
+    (live_blockhashes, dedup_cache)
+}
+
 pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
     let DedupArgs {
         max_blockhashes,
@@ -30,13 +95,14 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
         mut settled_blockhashes_rx,
         output_tx,
         shutdown_token,
+        initial_live_blockhashes,
+        initial_dedup_cache,
     } = args;
     let handle = tokio::spawn(async move {
         info!("Dedup stage started");
 
-        // HashMap: blockhash -> set of signatures
-        let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
-        let mut live_blockhashes = LinkedList::new();
+        let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = initial_dedup_cache;
+        let mut live_blockhashes: LinkedList<Hash> = initial_live_blockhashes;
 
         loop {
             tokio::select! {

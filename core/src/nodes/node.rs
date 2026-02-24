@@ -7,8 +7,12 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stages::{
-            execution::start_execution_worker, sequencer::start_sequence_worker,
-            settle::start_settle_worker, sigverify::start_sigverify_workerpool, AccountSettlement,
+            dedup::load_dedup_state,
+            execution::start_execution_worker,
+            sequencer::start_sequence_worker,
+            settle::start_settle_worker,
+            sigverify::start_sigverify_workerpool,
+            AccountSettlement,
         },
     },
     futures::future::FutureExt,
@@ -32,6 +36,7 @@ pub enum NodeMode {
     Aio,
 }
 
+#[derive(Clone)]
 pub struct NodeConfig {
     pub mode: NodeMode,
     pub port: u16,
@@ -131,6 +136,21 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         // Create settled blockhashes channel between settler and dedup
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel::<Hash>();
 
+        // Load persisted dedup state from DB before starting the stage.
+        // Uses a short-lived read-only connection; falls back to empty state on error.
+        let (initial_live_blockhashes, initial_dedup_cache) = {
+            match AccountsDB::new(&config.accountsdb_connection_url, true).await {
+                Ok(db) => load_dedup_state(&db, config.max_blockhashes()).await,
+                Err(e) => {
+                    tracing::warn!(
+                        "Dedup: could not open DB for state recovery, starting with empty state: {}",
+                        e
+                    );
+                    (std::collections::LinkedList::new(), std::collections::HashMap::new())
+                }
+            }
+        };
+
         // Start dedup stage (filters duplicate transactions before sigverify)
         let dedup = crate::stages::start_dedup(crate::stages::DedupArgs {
             max_blockhashes: config.max_blockhashes(),
@@ -138,6 +158,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             settled_blockhashes_rx,
             output_tx: sigverify_tx.clone(),
             shutdown_token: shutdown_token.clone(),
+            initial_live_blockhashes,
+            initial_dedup_cache,
         })
         .await;
         write_workers.push(dedup);

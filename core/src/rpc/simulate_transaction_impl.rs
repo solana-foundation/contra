@@ -43,9 +43,12 @@ pub async fn simulate_transaction(
     let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Base64);
 
     // Decode the base64 transaction
-    let tx_data = STANDARD
-        .decode(&transaction)
-        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid base64 encoding: {}", e)))?;
+    let tx_data = STANDARD.decode(&transaction).map_err(|e| {
+        custom_error(
+            INVALID_PARAMS_CODE,
+            format!("Invalid base64 encoding: {}", e),
+        )
+    })?;
 
     // Check packet size limit (1232 bytes is Solana's PACKET_DATA_SIZE)
     const PACKET_DATA_SIZE: usize = 1232;
@@ -69,7 +72,12 @@ pub async fn simulate_transaction(
     // Try to deserialize as VersionedTransaction first (standard format)
     let versioned_tx = bincode_options
         .deserialize::<VersionedTransaction>(&tx_data)
-        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Failed to deserialize transaction: {}", e)))?;
+        .map_err(|e| {
+            custom_error(
+                INVALID_PARAMS_CODE,
+                format!("Failed to deserialize transaction: {}", e),
+            )
+        })?;
 
     let runtime_tx = RuntimeTransaction::try_create(
         versioned_tx,
@@ -100,7 +108,10 @@ pub async fn simulate_transaction(
                 ));
             }
             SigverifyResult::SigverifyFailed(e) => {
-                return Err(custom_error(INVALID_PARAMS_CODE, format!("Sigverify failed: {}", e)));
+                return Err(custom_error(
+                    INVALID_PARAMS_CODE,
+                    format!("Sigverify failed: {}", e),
+                ));
             }
             SigverifyResult::Valid(_) => (),
         }
@@ -109,11 +120,10 @@ pub async fn simulate_transaction(
     info!("Simulating transaction: {}", sanitized_tx.signature());
 
     // Get the current slot for context
-    let slot = read_deps
-        .accounts_db
-        .get_latest_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?;
+    let slot =
+        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
+            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+        })?;
 
     let mut batch = ConflictFreeBatch::new();
     batch.add_transaction(TransactionWithIndex {
@@ -130,7 +140,10 @@ pub async fn simulate_transaction(
     } else if let Some(admin_results) = execution_result.admin_results {
         admin_results
     } else {
-        return Err(custom_error(INVALID_PARAMS_CODE, "No execution result found"));
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            "No execution result found",
+        ));
     };
 
     // Extract execution results
@@ -254,7 +267,10 @@ pub async fn simulate_transaction(
             }
         }
     } else {
-        return Err(custom_error(INVALID_PARAMS_CODE, "No execution result found"));
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            "No execution result found",
+        ));
     };
 
     Ok(Response {

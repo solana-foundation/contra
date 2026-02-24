@@ -7,12 +7,9 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stages::{
-            dedup::load_dedup_state,
-            execution::start_execution_worker,
-            sequencer::start_sequence_worker,
-            settle::start_settle_worker,
-            sigverify::start_sigverify_workerpool,
-            AccountSettlement,
+            dedup::load_dedup_state, execution::start_execution_worker,
+            sequencer::start_sequence_worker, settle::start_settle_worker,
+            sigverify::start_sigverify_workerpool, AccountSettlement,
         },
     },
     futures::future::FutureExt,
@@ -146,7 +143,10 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                         "Dedup: could not open DB for state recovery, starting with empty state: {}",
                         e
                     );
-                    (std::collections::LinkedList::new(), std::collections::HashMap::new())
+                    (
+                        std::collections::LinkedList::new(),
+                        std::collections::HashMap::new(),
+                    )
                 }
             }
         };

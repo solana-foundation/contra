@@ -56,13 +56,8 @@ pub async fn run_dedup_persistence_test(db_url: String) {
 
     // --- Create mint ---
     let blockhash = client.get_latest_blockhash().await.unwrap();
-    let create_mint_tx = setup::create_mint_account_transaction(
-        &operator,
-        &mint,
-        &operator.pubkey(),
-        3,
-        blockhash,
-    );
+    let create_mint_tx =
+        setup::create_mint_account_transaction(&operator, &mint, &operator.pubkey(), 3, blockhash);
     send_and_confirm(&client, &create_mint_tx).await;
     println!("  Mint created");
 
@@ -119,8 +114,14 @@ pub async fn run_dedup_persistence_test(db_url: String) {
     let bob_balance_before = token_balance(&client, &bob_ata).await;
     let tx_count_before = client.get_transaction_count().await.unwrap();
 
-    assert_eq!(alice_balance_before, 750_000, "Alice should have 750_000 before restart");
-    assert_eq!(bob_balance_before, 250_000, "Bob should have 250_000 before restart");
+    assert_eq!(
+        alice_balance_before, 750_000,
+        "Alice should have 750_000 before restart"
+    );
+    assert_eq!(
+        bob_balance_before, 250_000,
+        "Bob should have 250_000 before restart"
+    );
     println!(
         "  Pre-restart — Alice: {}, Bob: {}, tx_count: {}",
         alice_balance_before, bob_balance_before, tx_count_before

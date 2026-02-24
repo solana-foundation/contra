@@ -32,14 +32,13 @@ async fn get_blocks_in_range_postgres(
 ) -> Result<Vec<BlockInfo>> {
     let pool = db.pool.clone();
 
-    let rows = sqlx::query(
-        "SELECT data FROM blocks WHERE slot >= $1 AND slot <= $2 ORDER BY slot ASC",
-    )
-    .bind(start_slot as i64)
-    .bind(end_slot as i64)
-    .fetch_all(pool.as_ref())
-    .await
-    .context("Failed to query blocks in range")?;
+    let rows =
+        sqlx::query("SELECT data FROM blocks WHERE slot >= $1 AND slot <= $2 ORDER BY slot ASC")
+            .bind(start_slot as i64)
+            .bind(end_slot as i64)
+            .fetch_all(pool.as_ref())
+            .await
+            .context("Failed to query blocks in range")?;
 
     let mut blocks = Vec::with_capacity(rows.len());
     for row in rows {

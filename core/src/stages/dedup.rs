@@ -52,7 +52,10 @@ pub async fn load_dedup_state(
 
     let start_slot = latest_slot.saturating_sub(max_blockhashes as u64 - 1);
 
-    let blocks = match accounts_db.get_blocks_in_range(start_slot, latest_slot).await {
+    let blocks = match accounts_db
+        .get_blocks_in_range(start_slot, latest_slot)
+        .await
+    {
         Ok(b) => b,
         Err(e) => {
             warn!(

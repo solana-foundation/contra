@@ -42,12 +42,16 @@ pub async fn handle_request(
                         Some(slot) => Response::builder()
                             .status(StatusCode::OK)
                             .header("Content-Type", "application/json")
-                            .body(Full::new(Bytes::from(
-                                format!(r#"{{"status":"ok","slot":{}}}"#, slot),
-                            )))
+                            .body(Full::new(Bytes::from(format!(
+                                r#"{{"status":"ok","slot":{}}}"#,
+                                slot
+                            ))))
                             .unwrap(),
                         None => {
-                            tracing::warn!("Health check: getSlot returned unexpected response: {}", resp);
+                            tracing::warn!(
+                                "Health check: getSlot returned unexpected response: {}",
+                                resp
+                            );
                             Response::builder()
                                 .status(StatusCode::SERVICE_UNAVAILABLE)
                                 .header("Content-Type", "application/json")

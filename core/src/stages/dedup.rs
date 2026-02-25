@@ -45,9 +45,9 @@ pub async fn load_dedup_state(
     let mut live_blockhashes: LinkedList<Hash> = LinkedList::new();
     let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
 
-    let latest_slot = match accounts_db.get_latest_slot().await {
-        Ok(slot) => slot,
-        Err(_) => {
+    let latest_slot = match accounts_db.get_latest_slot().await? {
+        Some(slot) => slot,
+        None => {
             info!("Dedup: no prior blocks found, starting with empty state");
             return Ok((live_blockhashes, dedup_cache));
         }

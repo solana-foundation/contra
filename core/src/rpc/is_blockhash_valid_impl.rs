@@ -14,10 +14,12 @@ pub async fn is_blockhash_valid_impl(
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<bool>> {
     // Get the current slot
-    let slot =
-        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
-        })?;
+    let slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
+        .unwrap_or(0);
 
     // Parse the provided blockhash
     let provided_hash = Hash::from_str(&blockhash)

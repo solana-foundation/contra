@@ -7,7 +7,7 @@ use {
     anyhow::{Context, Result},
     redis::AsyncCommands,
     sqlx::Row,
-    tracing::{error, warn},
+    tracing::warn,
 };
 
 pub async fn get_blocks_in_range(
@@ -43,10 +43,9 @@ async fn get_blocks_in_range_postgres(
     let mut blocks = Vec::with_capacity(rows.len());
     for row in rows {
         let data: Vec<u8> = row.get("data");
-        match bincode::deserialize::<BlockInfo>(&data) {
-            Ok(block) => blocks.push(block),
-            Err(e) => error!("Failed to deserialize block in range query: {}", e),
-        }
+        let block = bincode::deserialize::<BlockInfo>(&data)
+            .context("Failed to deserialize block in range query")?;
+        blocks.push(block);
     }
 
     Ok(blocks)

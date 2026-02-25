@@ -28,10 +28,12 @@ pub async fn get_account_info_impl(
 
     let config = config.unwrap_or_default();
 
-    let slot =
-        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
-        })?;
+    let slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
+        .unwrap_or(0);
 
     // Get account from database
     let (_settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();

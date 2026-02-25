@@ -11,10 +11,12 @@ pub async fn get_latest_blockhash_impl(
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<RpcBlockhash>> {
     // Get the latest slot and blockhash from the database
-    let slot =
-        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
-        })?;
+    let slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
+        .unwrap_or(0);
     let blockhash = read_deps
         .accounts_db
         .get_latest_blockhash()

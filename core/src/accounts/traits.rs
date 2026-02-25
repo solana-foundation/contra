@@ -48,7 +48,7 @@ impl AccountsDB {
         super::get_transaction::get_transaction(self, signature).await
     }
 
-    pub async fn get_latest_slot(&self) -> Result<u64> {
+    pub async fn get_latest_slot(&self) -> Result<Option<u64>> {
         super::get_latest_slot::get_latest_slot(self).await
     }
 

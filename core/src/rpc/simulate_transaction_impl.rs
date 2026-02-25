@@ -120,10 +120,12 @@ pub async fn simulate_transaction(
     info!("Simulating transaction: {}", sanitized_tx.signature());
 
     // Get the current slot for context
-    let slot =
-        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
-        })?;
+    let slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
+        .unwrap_or(0);
 
     let mut batch = ConflictFreeBatch::new();
     batch.add_transaction(TransactionWithIndex {

@@ -499,9 +499,13 @@ async fn poll_loop(
 ) {
     // Initialise to the latest slot so we only stream new activity.
     let mut last_seen_slot: u64 = match accounts_db.get_latest_slot().await {
-        Ok(slot) => {
+        Ok(Some(slot)) => {
             info!("Starting poller from slot {}", slot);
             slot
+        }
+        Ok(None) => {
+            info!("No blocks found, starting poller from slot 0");
+            0
         }
         Err(e) => {
             warn!("Failed to get latest slot, starting from 0: {}", e);

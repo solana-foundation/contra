@@ -64,10 +64,12 @@ pub async fn get_token_account_balance_impl(
     // Use Solana's canonical formatter to avoid f64 precision loss in the string field
     let ui_amount_string = real_number_string_trimmed(amount, decimals);
 
-    let slot =
-        read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
-        })?;
+    let slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
+        .unwrap_or(0);
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

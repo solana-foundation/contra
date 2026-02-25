@@ -11,12 +11,17 @@ pub async fn get_supply_impl(
     _config: Option<RpcSupplyConfig>,
 ) -> RpcResult<Response<RpcSupply>> {
     // Get the current slot for context
-    let slot = read_deps.accounts_db.get_latest_slot().await.map_err(|e| {
-        custom_error(
-            JSON_RPC_SERVER_ERROR,
-            format!("Failed to get latest slot: {}", e),
-        )
-    })?;
+    let slot = read_deps
+        .accounts_db
+        .get_latest_slot()
+        .await
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get latest slot: {}", e),
+            )
+        })?
+        .unwrap_or(0);
 
     // Contra has no native token supply, so all values are 0
     Ok(Response {

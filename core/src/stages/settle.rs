@@ -87,7 +87,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
                 .await
                 .unwrap();
-            let last_slot = accounts_db.get_latest_slot().await.ok();
+            let last_slot = accounts_db.get_latest_slot().await.ok().flatten();
             let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
 
             // Validate that last_slot and last_blockhash are both present or both absent

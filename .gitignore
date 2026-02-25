@@ -37,3 +37,5 @@ indexer/config/devnet/
 
 # Auto Claude data directory
 .auto-claude/
+/.auto-claude-*
+.claude_settings.json

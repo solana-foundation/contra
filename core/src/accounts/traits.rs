@@ -142,4 +142,20 @@ impl AccountsDB {
             )),
         }
     }
+
+    pub async fn new_dual(
+        postgres_url: &str,
+        redis_url: &str,
+        read_only: bool,
+    ) -> Result<Self> {
+        let postgres = PostgresAccountsDB::new(postgres_url, read_only)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e))?;
+
+        let redis = RedisAccountsDB::new(redis_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?;
+
+        Ok(AccountsDB::Dual(postgres, redis))
+    }
 }

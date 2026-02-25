@@ -76,22 +76,77 @@ pub async fn run_reconciliation(
 
 /// Performs a single reconciliation check
 ///
-/// This function will be implemented in later subtasks to:
+/// This function orchestrates the complete reconciliation flow:
 /// 1. Fetch on-chain balances for all mints held by the escrow
 /// 2. Query database for sum of completed deposits minus withdrawals per mint
 /// 3. Compare balances with tolerance threshold
 /// 4. Send webhook alert if mismatch exceeds tolerance
 async fn perform_reconciliation_check(
-    _storage: &Arc<Storage>,
-    _config: &OperatorConfig,
-    _rpc_client: &Arc<RpcClientWithRetry>,
-    _escrow_instance_id: Pubkey,
+    storage: &Arc<Storage>,
+    config: &OperatorConfig,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    escrow_instance_id: Pubkey,
 ) -> Result<(), OperatorError> {
-    // TODO: Implement in subtask-3-2 (fetch on-chain balances)
-    // TODO: Implement in subtask-3-3 (compare balances with tolerance)
-    // TODO: Implement in subtask-3-4 (send webhook alert on mismatch)
+    // Step 1: Fetch on-chain balances from Solana RPC
+    let on_chain_balances = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
 
-    // For now, this is a no-op skeleton
+    // Step 2: Query database for completed transaction balances per mint
+    let db_balance_results = storage.get_escrow_balances_by_mint().await
+        .map_err(|e| OperatorError::StorageError(format!("Failed to query database balances: {}", e)))?;
+
+    // Convert DB results to HashMap<Pubkey, u64> for comparison
+    let mut db_balances = std::collections::HashMap::new();
+    for balance_result in db_balance_results {
+        let mint = balance_result.mint_address.parse::<Pubkey>()
+            .map_err(|e| OperatorError::StorageError(format!("Invalid mint address: {}", e)))?;
+
+        // Calculate net balance (deposits - withdrawals)
+        let net_balance = if balance_result.total_deposits >= balance_result.total_withdrawals {
+            balance_result.total_deposits - balance_result.total_withdrawals
+        } else {
+            // This shouldn't happen in a properly functioning system, but handle it gracefully
+            warn!(
+                "Withdrawals exceed deposits for mint {}: deposits={}, withdrawals={}",
+                balance_result.mint_address,
+                balance_result.total_deposits,
+                balance_result.total_withdrawals
+            );
+            0 // Treat as zero balance for comparison
+        };
+
+        db_balances.insert(mint, net_balance);
+    }
+
+    // Step 3: Compare balances with tolerance threshold
+    let mismatches = compare_balances(
+        &on_chain_balances,
+        &db_balances,
+        config.reconciliation_tolerance_bps,
+    );
+
+    // Step 4: Send webhook alert if mismatches found
+    if !mismatches.is_empty() {
+        error!(
+            "Balance reconciliation failed: found {} mismatch(es) exceeding tolerance of {} bps",
+            mismatches.len(),
+            config.reconciliation_tolerance_bps
+        );
+
+        for mismatch in &mismatches {
+            error!(
+                "Mismatch for mint {}: on-chain={}, db={}, delta={} bps",
+                mismatch.mint,
+                mismatch.on_chain_balance,
+                mismatch.db_balance,
+                mismatch.delta_bps
+            );
+        }
+
+        send_webhook_alert(&config.reconciliation_webhook_url, &mismatches).await?;
+    } else {
+        info!("Balance reconciliation successful: all mints within tolerance");
+    }
+
     Ok(())
 }
 
@@ -120,7 +175,7 @@ pub struct BalanceMismatch {
 ///
 /// # Returns
 /// * `Vec<BalanceMismatch>` - List of mismatches exceeding tolerance, empty if all balances reconcile
-fn compare_balances(
+pub(crate) fn compare_balances(
     on_chain_balances: &HashMap<Pubkey, u64>,
     db_balances: &HashMap<Pubkey, u64>,
     tolerance_bps: u16,
@@ -266,7 +321,7 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// # Returns
 /// * `Ok(())` if all webhooks sent successfully (or no URL configured)
 /// * `Err(OperatorError::WebhookError)` if webhook delivery fails after retries
-async fn send_webhook_alert(
+pub(crate) async fn send_webhook_alert(
     webhook_url: &Option<String>,
     mismatches: &[BalanceMismatch],
 ) -> Result<(), OperatorError> {

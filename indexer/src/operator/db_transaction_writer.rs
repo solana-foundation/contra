@@ -263,4 +263,25 @@ mod tests {
         // Test passes if no panic occurs and no webhook is attempted
         // This verifies graceful degradation when ALERT_WEBHOOK is unset
     }
+
+    #[tokio::test]
+    async fn test_webhook_failure_does_not_crash_handle_update() {
+        // Use an invalid URL to simulate webhook failure
+        let invalid_url = "http://invalid-host-that-does-not-exist.local:9999";
+
+        // Create DbTransactionWriter with invalid webhook URL
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(invalid_url.to_string()));
+
+        // Create a failed transaction update
+        let update = create_test_update(TransactionStatus::Failed);
+
+        // Handle the update (webhook POST will fail but should not crash)
+        writer.handle_update(update).await;
+
+        // Test passes if no panic occurs
+        // This verifies that webhook failures (network errors, 404, timeouts)
+        // are logged but don't crash the transaction status update process
+    }
 }

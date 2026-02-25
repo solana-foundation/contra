@@ -104,97 +104,102 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
     // Only create write pipeline for Write and Aio modes
     let mut write_workers: Vec<WorkerHandle> = Vec::new();
-    let (write_deps, live_blockhashes_arc) = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-        // Create the dedup channel (receives from RPC, sends to sigverify) - unbounded
-        let (dedup_tx, dedup_rx) = crate::stages::create_dedup_channel();
+    let (write_deps, live_blockhashes_arc) =
+        if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+            // Create the dedup channel (receives from RPC, sends to sigverify) - unbounded
+            let (dedup_tx, dedup_rx) = crate::stages::create_dedup_channel();
 
-        // Create the sigverify channel (needed for NodeHandles in all modes)
-        let (sigverify_tx, sigverify_rx) =
-            tokio_mpmc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
+            // Create the sigverify channel (needed for NodeHandles in all modes)
+            let (sigverify_tx, sigverify_rx) =
+                tokio_mpmc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
 
-        // Create sequencer channel (unbounded mpsc for single consumer)
-        let (sequencer_tx, sequencer_rx) = mpsc::unbounded_channel::<SanitizedTransaction>();
+            // Create sequencer channel (unbounded mpsc for single consumer)
+            let (sequencer_tx, sequencer_rx) = mpsc::unbounded_channel::<SanitizedTransaction>();
 
-        // Create batch channel between sequencer and executor (unbounded for pipelining)
-        let (batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
+            // Create batch channel between sequencer and executor (unbounded for pipelining)
+            let (batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
 
-        // Create execution results channel between executor and settler (unbounded for pipelining)
-        let (execution_results_tx, execution_results_rx) = mpsc::unbounded_channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>();
+            // Create execution results channel between executor and settler (unbounded for pipelining)
+            let (execution_results_tx, execution_results_rx) = mpsc::unbounded_channel::<(
+                LoadAndExecuteSanitizedTransactionsOutput,
+                Vec<SanitizedTransaction>,
+            )>();
 
-        // Create settled accounts channel between settler and executor
-        let (settled_accounts_tx, settled_accounts_rx) =
-            mpsc::unbounded_channel::<Vec<(Pubkey, AccountSettlement)>>();
+            // Create settled accounts channel between settler and executor
+            let (settled_accounts_tx, settled_accounts_rx) =
+                mpsc::unbounded_channel::<Vec<(Pubkey, AccountSettlement)>>();
 
-        // Create settled blockhashes channel between settler and dedup
-        let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel::<Hash>();
+            // Create settled blockhashes channel between settler and dedup
+            let (settled_blockhashes_tx, settled_blockhashes_rx) =
+                mpsc::unbounded_channel::<Hash>();
 
-        // Start dedup stage (filters duplicate transactions before sigverify)
-        let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
-            max_blockhashes: config.max_blockhashes(),
-            input_rx: dedup_rx,
-            settled_blockhashes_rx,
-            output_tx: sigverify_tx.clone(),
-            shutdown_token: shutdown_token.clone(),
-        })
-        .await;
-        write_workers.push(dedup);
+            // Start dedup stage (filters duplicate transactions before sigverify)
+            let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
+                max_blockhashes: config.max_blockhashes(),
+                input_rx: dedup_rx,
+                settled_blockhashes_rx,
+                output_tx: sigverify_tx.clone(),
+                shutdown_token: shutdown_token.clone(),
+            })
+            .await;
+            write_workers.push(dedup);
 
-        // Start sigverify worker pool
-        let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
-            num_workers: config.sigverify_workers,
-            admin_keys: config.admin_keys.clone(),
-            rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown_token.clone(),
-        })
-        .await;
-        write_workers.extend(sigverify_workers);
+            // Start sigverify worker pool
+            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
+                num_workers: config.sigverify_workers,
+                admin_keys: config.admin_keys.clone(),
+                rx: sigverify_rx,
+                sequencer_tx,
+                shutdown_token: shutdown_token.clone(),
+            })
+            .await;
+            write_workers.extend(sigverify_workers);
 
-        // Start sequencer (produces conflict-free batches)
-        let sequence = start_sequence_worker(crate::stages::SequencerArgs {
-            max_tx_per_batch: config.max_tx_per_batch,
-            rx: sequencer_rx,
-            batch_tx,
-            shutdown_token: shutdown_token.clone(),
-        })
-        .await;
-        write_workers.push(sequence);
+            // Start sequencer (produces conflict-free batches)
+            let sequence = start_sequence_worker(crate::stages::SequencerArgs {
+                max_tx_per_batch: config.max_tx_per_batch,
+                rx: sequencer_rx,
+                batch_tx,
+                shutdown_token: shutdown_token.clone(),
+            })
+            .await;
+            write_workers.push(sequence);
 
-        // Start executor (executes and settles batches)
-        let execution = start_execution_worker(crate::stages::ExecutionArgs {
-            batch_rx,
-            settled_accounts_rx,
-            execution_results_tx,
-            accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-            shutdown_token: shutdown_token.clone(),
-        })
-        .await;
-        write_workers.push(execution);
+            // Start executor (executes and settles batches)
+            let execution = start_execution_worker(crate::stages::ExecutionArgs {
+                batch_rx,
+                settled_accounts_rx,
+                execution_results_tx,
+                accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+                shutdown_token: shutdown_token.clone(),
+            })
+            .await;
+            write_workers.push(execution);
 
-        let settle = start_settle_worker(crate::stages::SettleArgs {
-            execution_results_rx,
-            settled_accounts_tx,
-            settled_blockhashes_tx,
-            accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-            blocktime_ms: config.blocktime_ms,
-            perf_sample_period_secs: config.perf_sample_period_secs,
-            shutdown_token: shutdown_token.clone(),
-        })
-        .await;
-        write_workers.push(settle);
+            let settle = start_settle_worker(crate::stages::SettleArgs {
+                execution_results_rx,
+                settled_accounts_tx,
+                settled_blockhashes_tx,
+                accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+                blocktime_ms: config.blocktime_ms,
+                perf_sample_period_secs: config.perf_sample_period_secs,
+                shutdown_token: shutdown_token.clone(),
+            })
+            .await;
+            write_workers.push(settle);
 
-        (Some(WriteDeps {
-            dedup_tx: dedup_tx.clone(),
-        }), live_blockhashes)
-    } else {
-        // Read-only node: no write pipeline, create empty live_blockhashes Arc
-        use std::collections::LinkedList;
-        use std::sync::{Arc, RwLock};
-        (None, Arc::new(RwLock::new(LinkedList::new())))
-    };
+            (
+                Some(WriteDeps {
+                    dedup_tx: dedup_tx.clone(),
+                }),
+                live_blockhashes,
+            )
+        } else {
+            // Read-only node: no write pipeline, create empty live_blockhashes Arc
+            use std::collections::LinkedList;
+            use std::sync::{Arc, RwLock};
+            (None, Arc::new(RwLock::new(LinkedList::new())))
+        };
 
     // Start RPC service based on node mode
     let rpc_config = RpcServiceConfig {

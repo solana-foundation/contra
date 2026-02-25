@@ -1,5 +1,5 @@
 use {
-    super::types::StoredTransaction,
+    super::types::{StoredInnerInstruction, StoredInnerInstructions, StoredTransaction},
     base64::{engine::general_purpose::STANDARD, Engine},
     solana_sdk::{
         account::ReadableAccount, clock::UnixTimestamp, message::v0::LoadedAddresses,
@@ -9,7 +9,6 @@ use {
     solana_transaction_status::{
         TransactionStatusMeta, UiTransactionEncoding, UiTransactionStatusMeta,
     },
-    solana_transaction_status_client_types::InnerInstructions,
     tracing::info,
 };
 
@@ -20,6 +19,32 @@ pub fn get_stored_transaction(
     processed: &ProcessedTransaction,
 ) -> StoredTransaction {
     info!("Stored transaction: {:?}", processed);
+
+    let inner_instructions = match processed {
+        ProcessedTransaction::Executed(executed) => executed
+            .execution_details
+            .inner_instructions
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .iter()
+                    .enumerate()
+                    .map(|(index, instructions)| StoredInnerInstructions {
+                        index: index as u8,
+                        instructions: instructions
+                            .iter()
+                            .map(|ii| StoredInnerInstruction {
+                                program_id_index: ii.instruction.program_id_index,
+                                accounts: ii.instruction.accounts.clone(),
+                                data: ii.instruction.data.clone(),
+                                stack_height: Some(ii.stack_height as u32),
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            }),
+        ProcessedTransaction::FeesOnly(_) => None,
+    };
 
     let meta = match processed {
         ProcessedTransaction::Executed(executed) => {
@@ -39,24 +64,7 @@ pub fn get_stored_transaction(
                     .iter()
                     .map(|(_, account)| account.lamports())
                     .collect(),
-                inner_instructions: details.inner_instructions.as_ref().map(|inner| {
-                    inner
-                        .iter()
-                        .enumerate()
-                        .map(|(index, instructions)| InnerInstructions {
-                            index: index as u8,
-                            instructions: instructions
-                                .iter()
-                                .map(|ii| {
-                                    solana_transaction_status_client_types::InnerInstruction {
-                                        instruction: ii.instruction.clone(),
-                                        stack_height: Some(ii.stack_height as u32),
-                                    }
-                                })
-                                .collect(),
-                        })
-                        .collect()
-                }),
+                inner_instructions: None,
                 log_messages: details.log_messages.clone(),
                 pre_token_balances: None,
                 post_token_balances: None,
@@ -88,6 +96,7 @@ pub fn get_stored_transaction(
         slot,
         block_time,
         transaction: transaction.to_versioned_transaction(),
+        inner_instructions,
         meta: UiTransactionStatusMeta::from(meta),
     }
 }

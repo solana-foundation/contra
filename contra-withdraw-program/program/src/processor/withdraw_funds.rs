@@ -5,10 +5,12 @@ use pinocchio::{
 };
 
 use crate::{
+    constants::event_authority_pda,
     error::ContraWithdrawProgramError,
     events::WithdrawFundsEvent,
     processor::{
-        validate_ata, verify_ata_program, verify_mint_account, verify_signer, verify_token_program,
+        emit_event, validate_ata, verify_ata_program, verify_current_program, verify_mint_account,
+        verify_signer, verify_token_program,
     },
     require_len,
 };
@@ -22,12 +24,14 @@ use pinocchio_token::instructions::Burn;
 /// 2. `[writable]` token_account - Source token account
 /// 3. `[]` token_program - Token program
 /// 4. `[]` associated_token_program - Associated token program
+/// 5. `[]` event_authority - Event authority PDA for emitting events
+/// 6. `[]` contra_withdraw_program - Current program for CPI
 ///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to withdraw
 /// * `destination` (Pubkey) - Destination public key
 pub fn process_withdraw_funds(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
@@ -37,7 +41,7 @@ pub fn process_withdraw_funds(
         return Err(ContraWithdrawProgramError::ZeroAmount.into());
     }
 
-    let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info] =
+    let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -47,6 +51,11 @@ pub fn process_withdraw_funds(
 
     verify_ata_program(associated_token_program_info)?;
     verify_token_program(token_program_info)?;
+    verify_current_program(program_info)?;
+
+    if event_authority_info.key().ne(&event_authority_pda::ID) {
+        return Err(ContraWithdrawProgramError::InvalidEventAuthority.into());
+    }
 
     verify_mint_account(mint_info)?;
 
@@ -68,12 +77,9 @@ pub fn process_withdraw_funds(
 
     let destination = args.destination.unwrap_or(*user_info.key());
 
-    // Log event
-    let withdraw_funds_event = WithdrawFundsEvent {
-        amount: args.amount,
-        destination,
-    };
-    pinocchio_log::log!("{}", withdraw_funds_event.to_bytes().as_slice());
+    let withdraw_funds_event = WithdrawFundsEvent::new(args.amount, destination);
+    let event_data = withdraw_funds_event.to_bytes();
+    emit_event(program_id, event_authority_info, program_info, &event_data)?;
 
     Ok(())
 }

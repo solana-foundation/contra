@@ -1911,6 +1911,7 @@ dependencies = [
 name = "contra-withdraw-program"
 version = "0.1.0"
 dependencies = [
+ "const-crypto",
  "pinocchio",
  "pinocchio-associated-token-account",
  "pinocchio-log",

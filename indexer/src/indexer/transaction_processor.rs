@@ -221,8 +221,10 @@ fn convert_to_db_models(
         },
 
         ProgramInstruction::Withdraw(withdraw_ix) => match withdraw_ix.as_ref() {
-            WithdrawInstruction::WithdrawFunds { accounts, data } => {
-                let recipient = data.destination.to_string();
+            WithdrawInstruction::WithdrawFunds {
+                accounts, event, ..
+            } => {
+                let recipient = event.destination.to_string();
 
                 (
                     None,
@@ -231,7 +233,7 @@ fn convert_to_db_models(
                             signature.clone(),
                             instruction_meta.slot,
                             accounts.mint.to_string(),
-                            data.amount,
+                            event.amount,
                         )
                         .initiator(accounts.user.to_string())
                         .recipient(recipient)

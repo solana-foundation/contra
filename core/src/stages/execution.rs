@@ -16,8 +16,8 @@ use {
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
     solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::SanitizedTransaction},
     solana_svm::transaction_processor::{
-        LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
-        TransactionProcessingConfig, TransactionProcessingEnvironment,
+        ExecutionRecordingConfig, LoadAndExecuteSanitizedTransactionsOutput,
+        TransactionBatchProcessor, TransactionProcessingConfig, TransactionProcessingEnvironment,
     },
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
@@ -249,6 +249,12 @@ pub async fn execute_batch(
     };
 
     let processing_config = TransactionProcessingConfig {
+        recording_config: ExecutionRecordingConfig {
+            enable_cpi_recording: true,
+            enable_log_recording: false,
+            enable_return_data_recording: false,
+            enable_transaction_balance_recording: false,
+        },
         ..Default::default()
     };
 

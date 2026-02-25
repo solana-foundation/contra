@@ -22,6 +22,9 @@ use spl_associated_token_account::{
 };
 
 const MIN_LAMPORTS: u64 = 500_000_000;
+const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
+const EVENT_IX_TAG_LE: [u8; 8] = [228, 69, 165, 46, 81, 203, 154, 29];
+const WITHDRAW_FUNDS_EVENT_DISCRIMINATOR: u8 = 0;
 
 pub const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 pub const CONTRA_WITHDRAW_PROGRAM_ID: Pubkey =
@@ -30,6 +33,38 @@ pub const CONTRA_WITHDRAW_PROGRAM_ID: Pubkey =
 // Contra Withdraw Program Error Codes (using generated error enum)
 pub const INVALID_MINT_ERROR: u32 = ContraWithdrawProgramError::InvalidMint as u32;
 pub const ZERO_AMOUNT_ERROR: u32 = ContraWithdrawProgramError::ZeroAmount as u32;
+pub const INVALID_EVENT_AUTHORITY_ERROR: u32 =
+    ContraWithdrawProgramError::InvalidEventAuthority as u32;
+
+pub fn find_event_authority_pda() -> Pubkey {
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_WITHDRAW_PROGRAM_ID).0
+}
+
+pub fn parse_withdraw_event(transaction_metadata: &TransactionMetadata) -> Option<(u64, Pubkey)> {
+    for inner_instruction_set in &transaction_metadata.inner_instructions {
+        for inner_instruction in inner_instruction_set {
+            let data = &inner_instruction.instruction.data;
+            if data.len() < 49 {
+                continue;
+            }
+
+            if !data.starts_with(&EVENT_IX_TAG_LE) || data[8] != WITHDRAW_FUNDS_EVENT_DISCRIMINATOR
+            {
+                continue;
+            }
+
+            let amount = u64::from_le_bytes(data[9..17].try_into().ok()?);
+
+            let mut destination_bytes = [0u8; 32];
+            destination_bytes.copy_from_slice(&data[17..49]);
+            let destination = Pubkey::new_from_array(destination_bytes);
+
+            return Some((amount, destination));
+        }
+    }
+
+    None
+}
 
 // Standard Solana Program Error Codes
 pub const INVALID_ARGUMENT_ERROR: u32 = 5; // ProgramError::InvalidArgument

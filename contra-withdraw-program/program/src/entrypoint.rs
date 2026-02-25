@@ -4,7 +4,8 @@ use pinocchio::{
 };
 
 use crate::{
-    discriminator::ContraWithdrawInstructionDiscriminators, processor::process_withdraw_funds,
+    discriminator::ContraWithdrawInstructionDiscriminators,
+    processor::{process_emit_event, process_withdraw_funds},
 };
 
 entrypoint!(process_instruction);
@@ -24,6 +25,9 @@ pub fn process_instruction(
     match discriminator {
         ContraWithdrawInstructionDiscriminators::WithdrawFunds => {
             process_withdraw_funds(program_id, accounts, instruction_data)
+        }
+        ContraWithdrawInstructionDiscriminators::EmitEvent => {
+            process_emit_event(program_id, accounts)
         }
     }
 }

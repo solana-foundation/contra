@@ -1,4 +1,4 @@
-use crate::error::ContraWithdrawProgramError;
+use crate::{error::ContraWithdrawProgramError, ID as CONTRA_WITHDRAW_PROGRAM_ID};
 use pinocchio::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 use pinocchio_associated_token_account::ID as ATA_PROGRAM_ID;
 use pinocchio_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
@@ -85,6 +85,15 @@ pub fn verify_token_program(info: &AccountInfo) -> Result<(), ProgramError> {
 pub fn verify_token_program_account(info: &AccountInfo) -> Result<(), ProgramError> {
     if !info.is_owned_by(&TOKEN_PROGRAM_ID) {
         return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+pub fn verify_current_program(info: &AccountInfo) -> Result<(), ProgramError> {
+    if info.key().ne(&CONTRA_WITHDRAW_PROGRAM_ID) {
+        return Err(ProgramError::IncorrectProgramId);
     }
 
     Ok(())

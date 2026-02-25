@@ -17,6 +17,7 @@ idl = []
 devnet = []
 
 [dependencies]
+const-crypto = { workspace = true }
 pinocchio = { workspace = true }
 pinocchio-associated-token-account = { workspace = true }
 pinocchio-log = { workspace = true }

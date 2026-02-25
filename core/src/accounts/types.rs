@@ -8,11 +8,25 @@ use {
     },
     solana_transaction_status::{
         ConfirmedTransactionWithStatusMeta, EncodeError, EncodedConfirmedTransactionWithStatusMeta,
-        TransactionStatusMeta, TransactionTokenBalance, TransactionWithStatusMeta, UiInstruction,
+        TransactionStatusMeta, TransactionTokenBalance, TransactionWithStatusMeta,
         UiTransactionEncoding, UiTransactionStatusMeta, VersionedTransactionWithStatusMeta,
     },
     solana_transaction_status_client_types::InnerInstruction,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredInnerInstruction {
+    pub program_id_index: u8,
+    pub accounts: Vec<u8>,
+    pub data: Vec<u8>,
+    pub stack_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredInnerInstructions {
+    pub index: u8,
+    pub instructions: Vec<StoredInnerInstruction>,
+}
 
 /// Stored transaction with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +34,7 @@ pub struct StoredTransaction {
     pub slot: u64,
     pub block_time: UnixTimestamp,
     pub transaction: VersionedTransaction,
+    pub inner_instructions: Option<Vec<StoredInnerInstructions>>,
     // Store as UiTransactionStatusMeta because TransactionStatusMeta does not
     // implement Serialize/Deserialize
     pub meta: UiTransactionStatusMeta,
@@ -52,27 +67,22 @@ impl StoredTransaction {
             fee: self.meta.fee,
             pre_balances: self.meta.pre_balances.clone(),
             post_balances: self.meta.post_balances.clone(),
-            inner_instructions: self.meta.inner_instructions.clone().map(|inner| {
+            inner_instructions: self.inner_instructions.clone().map(|inner| {
                 inner
                     .into_iter()
                     .map(
-                        |ui_inner| solana_transaction_status_client_types::InnerInstructions {
-                            index: ui_inner.index,
-                            instructions: ui_inner
+                        |stored_inner| solana_transaction_status_client_types::InnerInstructions {
+                            index: stored_inner.index,
+                            instructions: stored_inner
                                 .instructions
                                 .into_iter()
-                                .map(|ui_inst| InnerInstruction {
-                                    instruction: match ui_inst {
-                                        UiInstruction::Compiled(compiled) => CompiledInstruction {
-                                            program_id_index: compiled.program_id_index,
-                                            accounts: compiled.accounts,
-                                            data: bs58::decode(&compiled.data)
-                                                .into_vec()
-                                                .unwrap_or_default(),
-                                        },
-                                        _ => panic!("Unexpected instruction type"),
+                                .map(|stored_inst| InnerInstruction {
+                                    instruction: CompiledInstruction {
+                                        program_id_index: stored_inst.program_id_index,
+                                        accounts: stored_inst.accounts,
+                                        data: stored_inst.data,
                                     },
-                                    stack_height: None,
+                                    stack_height: stored_inst.stack_height,
                                 })
                                 .collect(),
                         },

@@ -27,10 +27,29 @@ pub enum ContraWithdrawProgramInstruction {
         name = "associated_token_program",
         description = "Associated token program"
     )]
+    #[account(
+        5,
+        name = "event_authority",
+        description = "Event authority PDA for emitting events"
+    )]
+    #[account(
+        6,
+        name = "contra_withdraw_program",
+        description = "Current program for CPI"
+    )]
     WithdrawFunds {
         /// Amount of tokens to withdraw
         amount: u64,
         /// Destination public key
         destination: Option<Pubkey>,
     } = 0,
+
+    /// Invoked via CPI from this program to log event via instruction data.
+    #[account(
+        0,
+        signer,
+        name = "event_authority",
+        description = "Event authority PDA for emitting events"
+    )]
+    EmitEvent {} = 228,
 }

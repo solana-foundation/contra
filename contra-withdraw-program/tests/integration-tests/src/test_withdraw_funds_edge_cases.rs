@@ -7,8 +7,9 @@ use spl_associated_token_account::get_associated_token_address;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
 use crate::utils::{
-    assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-    INVALID_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+    assert_program_error, find_event_authority_pda, set_mint, setup_test_balances, TestContext,
+    ATA_PROGRAM_ID, CONTRA_WITHDRAW_PROGRAM_ID, INVALID_MINT_ERROR,
+    MISSING_REQUIRED_SIGNATURE_ERROR,
 };
 
 const INITIAL_BALANCE: u64 = 1_000_000;
@@ -26,6 +27,7 @@ fn test_withdraw_funds_wrong_mint() {
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let event_authority = find_event_authority_pda();
 
     let instruction = WithdrawFundsBuilder::new()
         .user(user.pubkey())
@@ -33,6 +35,8 @@ fn test_withdraw_funds_wrong_mint() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority)
+        .contra_withdraw_program(CONTRA_WITHDRAW_PROGRAM_ID)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
@@ -52,6 +56,7 @@ fn test_withdraw_funds_non_signer_user() {
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+    let event_authority = find_event_authority_pda();
 
     // Build canonical instruction, then strip the signer flag from user account
     let mut instruction = WithdrawFundsBuilder::new()
@@ -60,6 +65,8 @@ fn test_withdraw_funds_non_signer_user() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority)
+        .contra_withdraw_program(CONTRA_WITHDRAW_PROGRAM_ID)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 

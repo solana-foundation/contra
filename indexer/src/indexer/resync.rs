@@ -9,7 +9,8 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 /// Resync service for rebuilding indexer database from chain history
 pub struct ResyncService {
@@ -80,14 +81,54 @@ impl ResyncService {
 
         // Start checkpoint writer service
         let checkpoint_writer = CheckpointWriter::new(self.storage.clone());
-        let _checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
+        let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
         info!("CheckpointWriter service started");
 
-        // Create transaction processor
-        let _transaction_processor =
-            TransactionProcessor::new(self.storage.clone(), checkpoint_tx);
+        // Create cancellation token for graceful shutdown
+        let cancellation_token = CancellationToken::new();
 
-        // TODO: Start TransactionProcessor and invoke backfill service to process all transactions from genesis_slot to current slot
+        // Start transaction processor as separate tokio task
+        let transaction_processor =
+            TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone());
+        let processor_handle = tokio::spawn(async move {
+            transaction_processor
+                .start(instruction_rx, cancellation_token)
+                .await
+        });
+        info!("TransactionProcessor task spawned");
+
+        // Run backfill service (this will process all transactions from genesis_slot to current)
+        backfill_service.run(instruction_tx.clone()).await?;
+        info!("Backfill service completed");
+
+        // Drop instruction_tx to signal no more instructions coming
+        drop(instruction_tx);
+
+        // Wait for processor to finish processing all instructions
+        match processor_handle.await {
+            Ok(Ok(())) => info!("Transaction processor completed successfully"),
+            Ok(Err(e)) => {
+                error!("Transaction processor failed: {}", e);
+                return Err(e);
+            }
+            Err(e) => {
+                error!("Transaction processor task panicked: {:?}", e);
+                return Err(IndexerError::ShutdownChannelSend);
+            }
+        }
+
+        // Perform cleanup after backfill
+        if let Err(e) =
+            crate::shutdown_utils::cleanup_after_backfill(
+                checkpoint_handle,
+                checkpoint_tx,
+                self.storage.clone(),
+            )
+            .await
+        {
+            error!("Cleanup after backfill failed: {}", e);
+            return Err(IndexerError::ShutdownChannelSend);
+        }
 
         info!("Resync complete for {:?}", self.program_type);
         Ok(())

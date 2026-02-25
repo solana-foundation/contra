@@ -1,6 +1,6 @@
 use {
     super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
-    anyhow::{anyhow, Context, Result},
+    anyhow::{anyhow, Result},
     redis::AsyncCommands,
 };
 
@@ -14,12 +14,18 @@ pub async fn get_latest_slot(db: &AccountsDB) -> Result<Option<u64>> {
 async fn get_latest_slot_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
     let pool = db.pool.clone();
 
-    let slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
+    let result = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
         .fetch_one(pool.as_ref())
-        .await
-        .context("Failed to query latest slot")?;
+        .await;
 
-    Ok(slot.map(|s| s as u64))
+    match result {
+        Ok(slot) => Ok(slot.map(|s| s as u64)),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => {
+            // "undefined_table" — schema not yet created, treat as fresh node
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::Error::from(e).context("Failed to query latest slot")),
+    }
 }
 
 async fn get_latest_slot_redis(db: &RedisAccountsDB) -> Result<Option<u64>> {

@@ -110,8 +110,8 @@ pub async fn run_dedup_persistence_test(db_url: String) {
 
     sleep(Duration::from_millis(300)).await;
 
-    let alice_balance_before = token_balance(&client, &alice_ata).await;
-    let bob_balance_before = token_balance(&client, &bob_ata).await;
+    let alice_balance_before = token_balance(&client, &alice_ata).await.unwrap();
+    let bob_balance_before = token_balance(&client, &bob_ata).await.unwrap();
     let tx_count_before = client.get_transaction_count().await.unwrap();
 
     assert_eq!(
@@ -139,8 +139,8 @@ pub async fn run_dedup_persistence_test(db_url: String) {
     sleep(Duration::from_millis(500)).await;
 
     // --- Assert: no double execution ---
-    let alice_balance_after = token_balance(&client, &alice_ata).await;
-    let bob_balance_after = token_balance(&client, &bob_ata).await;
+    let alice_balance_after = token_balance(&client, &alice_ata).await.unwrap();
+    let bob_balance_after = token_balance(&client, &bob_ata).await.unwrap();
     let tx_count_after = client.get_transaction_count().await.unwrap();
 
     assert_eq!(

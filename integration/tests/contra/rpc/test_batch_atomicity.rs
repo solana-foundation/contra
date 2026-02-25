@@ -42,6 +42,7 @@ fn slot_block_info(slot: u64) -> BlockInfo {
         block_height: Some(slot),
         block_time: Some(0),
         transaction_signatures: vec![],
+        transaction_recent_blockhashes: vec![],
     }
 }
 
@@ -86,12 +87,11 @@ async fn test_write_batch_constraint_injection() {
         )],
         vec![],
         Some(slot_block_info(1)),
-        Some(1),
     )
     .await
     .expect("slot 1 write_batch must succeed");
 
-    assert_eq!(db.get_latest_slot().await.unwrap(), 1);
+    assert_eq!(db.get_latest_slot().await.unwrap(), Some(1));
 
     // Inject fault: any INSERT into blocks with slot = 2 will fail.
     // This simulates a mid-transaction failure after accounts have been written
@@ -119,7 +119,6 @@ async fn test_write_batch_constraint_injection() {
             )],
             vec![],
             Some(slot_block_info(2)),
-            Some(2),
         )
         .await;
 
@@ -131,7 +130,7 @@ async fn test_write_batch_constraint_injection() {
     // latest_slot is derived from MAX(slot) in blocks — slot 2 block was rolled back.
     assert_eq!(
         db.get_latest_slot().await.unwrap(),
-        1,
+        Some(1),
         "latest_slot must still be 1; slot 2 block was never committed"
     );
 
@@ -173,14 +172,13 @@ async fn test_write_batch_constraint_injection() {
         )],
         vec![],
         Some(slot_block_info(2)),
-        Some(2),
     )
     .await
     .expect("slot 2 write_batch must succeed after constraint is removed");
 
     assert_eq!(
         db.get_latest_slot().await.unwrap(),
-        2,
+        Some(2),
         "DB must be at slot 2 after the clean write"
     );
 }
@@ -229,13 +227,12 @@ async fn test_write_batch_process_kill_simulation() {
                 )],
                 vec![],
                 Some(slot_block_info(1)),
-                Some(1),
             )
             .await
             .expect("slot 1 write_batch must succeed");
     }
 
-    assert_eq!(db.get_latest_slot().await.unwrap(), 1);
+    assert_eq!(db.get_latest_slot().await.unwrap(), Some(1));
 
     // Open a raw connection — this represents the Contra process's DB connection
     // that is in the middle of a write_batch for slot 2.
@@ -300,7 +297,7 @@ async fn test_write_batch_process_kill_simulation() {
     // latest_slot is MAX(slot) from blocks — slot 2 block was rolled back.
     assert_eq!(
         db.get_latest_slot().await.unwrap(),
-        1,
+        Some(1),
         "latest_slot must still be 1 after the simulated process kill"
     );
 

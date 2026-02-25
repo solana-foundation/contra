@@ -121,7 +121,7 @@ impl ContraContext {
     }
 
     pub async fn get_token_balance(&self, token_account: &Pubkey) -> Result<u64> {
-        Ok(super::utils::token_balance(&self.read_client, token_account).await)
+        super::utils::token_balance(&self.read_client, token_account).await
     }
 
     pub async fn get_transaction_count(&self) -> Result<u64> {

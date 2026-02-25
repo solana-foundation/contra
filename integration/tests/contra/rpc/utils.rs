@@ -70,14 +70,13 @@ pub async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
 }
 
 /// Return the parsed token balance of a token account.
-pub async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> u64 {
-    client
+/// Returns Err if the account does not exist or the balance cannot be parsed.
+pub async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> Result<u64> {
+    let balance = client
         .get_token_account_balance(token_account)
         .await
-        .unwrap()
-        .amount
-        .parse::<u64>()
-        .unwrap()
+        .map_err(anyhow::Error::from)?;
+    balance.amount.parse::<u64>().map_err(anyhow::Error::from)
 }
 
 /// Shut down an existing node and restart it with the same config.

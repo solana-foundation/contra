@@ -41,9 +41,9 @@ pub fn create_dedup_channel() -> (
 pub async fn load_dedup_state(
     accounts_db: &AccountsDB,
     max_blockhashes: usize,
-) -> Result<(LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>)> {
-    let mut live_blockhashes: LinkedList<Hash> = LinkedList::new();
-    let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
+) -> Result<DedupState> {
+    let live_blockhashes: LinkedList<Hash> = LinkedList::new();
+    let dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
 
     let latest_slot = match accounts_db.get_latest_slot().await? {
         Some(slot) => slot,
@@ -59,9 +59,29 @@ pub async fn load_dedup_state(
         .get_blocks_in_range(start_slot, latest_slot)
         .await?;
 
+    let (live_blockhashes, dedup_cache) = build_dedup_state(&blocks)?;
+
+    info!(
+        "Dedup: restored {} live blockhashes and {} cache entries from {} blocks",
+        live_blockhashes.len(),
+        dedup_cache.values().map(|s| s.len()).sum::<usize>(),
+        blocks.len(),
+    );
+
+    Ok((live_blockhashes, dedup_cache))
+}
+
+type DedupState = (LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>);
+
+/// Pure computation: build `(live_blockhashes, dedup_cache)` from an ordered
+/// slice of blocks. Extracted so it can be unit-tested without a live DB.
+fn build_dedup_state(blocks: &[crate::accounts::traits::BlockInfo]) -> Result<DedupState> {
+    let mut live_blockhashes: LinkedList<Hash> = LinkedList::new();
+    let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
+
     let loaded_hashes: HashSet<Hash> = blocks.iter().map(|b| b.blockhash).collect();
 
-    for block in &blocks {
+    for block in blocks {
         ensure!(
             block.transaction_signatures.len() == block.transaction_recent_blockhashes.len(),
             "Block {} has mismatched transaction_signatures ({}) and transaction_recent_blockhashes ({}) lengths",
@@ -85,13 +105,6 @@ pub async fn load_dedup_state(
             }
         }
     }
-
-    info!(
-        "Dedup: restored {} live blockhashes and {} cache entries from {} blocks",
-        live_blockhashes.len(),
-        dedup_cache.values().map(|s| s.len()).sum::<usize>(),
-        blocks.len(),
-    );
 
     Ok((live_blockhashes, dedup_cache))
 }
@@ -191,17 +204,21 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use solana_sdk::{
-        hash::Hash,
-        message::Message,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        transaction::{SanitizedTransaction, Transaction},
+    use {
+        super::*,
+        crate::accounts::traits::BlockInfo,
+        solana_sdk::{
+            hash::Hash,
+            message::Message,
+            pubkey::Pubkey,
+            signature::{Keypair, Signature, Signer},
+            transaction::{SanitizedTransaction, Transaction},
+        },
+        solana_system_interface::instruction as system_instruction,
+        std::{collections::HashSet, time::Duration},
     };
-    use solana_system_interface::instruction as system_instruction;
-    use std::collections::HashSet;
-    use std::time::Duration;
+
+    // --- helpers shared by both suites ---
 
     fn make_tx(payer: &Keypair, blockhash: Hash) -> SanitizedTransaction {
         let to = Pubkey::new_unique();
@@ -209,6 +226,19 @@ mod tests {
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let tx = Transaction::new(&[payer], msg, blockhash);
         SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap()
+    }
+
+    fn make_block(slot: u64, blockhash: Hash, sigs: &[(Signature, Hash)]) -> BlockInfo {
+        BlockInfo {
+            slot,
+            blockhash,
+            previous_blockhash: Hash::default(),
+            parent_slot: slot.saturating_sub(1),
+            block_height: Some(slot),
+            block_time: None,
+            transaction_signatures: sigs.iter().map(|(s, _)| *s).collect(),
+            transaction_recent_blockhashes: sigs.iter().map(|(_, h)| *h).collect(),
+        }
     }
 
     /// Spin up the dedup stage and return the handles needed for driving it.
@@ -229,6 +259,8 @@ mod tests {
             settled_blockhashes_rx: bh_rx,
             output_tx,
             shutdown_token: shutdown.clone(),
+            initial_live_blockhashes: LinkedList::new(),
+            initial_dedup_cache: HashMap::new(),
         };
         tokio::spawn(async move {
             start_dedup(args).await;
@@ -237,22 +269,21 @@ mod tests {
         (input_tx, bh_tx, output_rx, shutdown)
     }
 
+    // --- live dedup stage tests ---
+
     #[tokio::test]
     async fn unknown_blockhash_rejected() {
         let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
 
-        // Register one live blockhash
         let live_bh = Hash::new_unique();
         bh_tx.send(live_bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // Send tx with a *different* blockhash
         let payer = Keypair::new();
         let unknown_bh = Hash::new_unique();
         let tx = make_tx(&payer, unknown_bh);
         input_tx.send(tx).unwrap();
 
-        // Should NOT appear on the output channel
         let result = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(
             result.is_err(),
@@ -273,12 +304,10 @@ mod tests {
         let payer = Keypair::new();
         let tx = make_tx(&payer, bh);
 
-        // First send — should be forwarded
         input_tx.send(tx.clone()).unwrap();
         let first = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
         assert!(first.is_ok(), "first tx should be forwarded");
 
-        // Second send (same signature) — should be dropped
         input_tx.send(tx).unwrap();
         let second = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(second.is_err(), "duplicate tx should not be forwarded");
@@ -315,7 +344,6 @@ mod tests {
     async fn expired_blockhash_evicted() {
         let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
 
-        // Fill the window (max_blockhashes = 8) then add one more to evict the first
         let mut hashes = Vec::new();
         for _ in 0..9 {
             let h = Hash::new_unique();
@@ -324,7 +352,6 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        // hashes[0] should now be evicted
         let payer = Keypair::new();
         let tx = make_tx(&payer, hashes[0]);
         input_tx.send(tx).unwrap();
@@ -334,7 +361,6 @@ mod tests {
             "tx using evicted blockhash should not be forwarded"
         );
 
-        // hashes[8] (latest) should still work
         let tx2 = make_tx(&payer, hashes[8]);
         input_tx.send(tx2).unwrap();
         let result2 = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
@@ -344,5 +370,87 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    // --- build_dedup_state unit tests ---
+
+    #[test]
+    fn test_empty_blocks_returns_empty_state() {
+        let (live, cache) = build_dedup_state(&[]).unwrap();
+        assert!(live.is_empty());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_single_block_no_transactions() {
+        let hash = Hash::new_unique();
+        let block = make_block(1, hash, &[]);
+        let (live, cache) = build_dedup_state(&[block]).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(*live.front().unwrap(), hash);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_transactions_referencing_in_window_hash_are_cached() {
+        let hash1 = Hash::new_unique();
+        let hash2 = Hash::new_unique();
+        let sig1 = Signature::new_unique();
+        let sig2 = Signature::new_unique();
+
+        let blocks = vec![
+            make_block(1, hash1, &[]),
+            make_block(2, hash2, &[(sig1, hash1), (sig2, hash1)]),
+        ];
+        let (live, cache) = build_dedup_state(&blocks).unwrap();
+
+        assert_eq!(live.len(), 2);
+        let sigs = cache.get(&hash1).unwrap();
+        assert!(sigs.contains(&sig1));
+        assert!(sigs.contains(&sig2));
+        assert!(!cache.contains_key(&hash2));
+    }
+
+    #[test]
+    fn test_transactions_referencing_out_of_window_hash_are_filtered() {
+        let old_hash = Hash::new_unique();
+        let hash1 = Hash::new_unique();
+        let sig = Signature::new_unique();
+
+        let blocks = vec![make_block(1, hash1, &[(sig, old_hash)])];
+        let (live, cache) = build_dedup_state(&blocks).unwrap();
+
+        assert_eq!(live.len(), 1);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_mismatched_lengths_returns_error() {
+        let mut block = make_block(1, Hash::new_unique(), &[]);
+        block.transaction_signatures.push(Signature::new_unique());
+
+        let result = build_dedup_state(&[block]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mismatched transaction_signatures"));
+    }
+
+    #[test]
+    fn test_multiple_blocks_all_hashes_in_live_list() {
+        let hashes: Vec<Hash> = (0..5).map(|_| Hash::new_unique()).collect();
+        let blocks: Vec<BlockInfo> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| make_block(i as u64, h, &[]))
+            .collect();
+
+        let (live, _) = build_dedup_state(&blocks).unwrap();
+
+        assert_eq!(live.len(), 5);
+        for (got, expected) in live.iter().zip(hashes.iter()) {
+            assert_eq!(got, expected);
+        }
     }
 }

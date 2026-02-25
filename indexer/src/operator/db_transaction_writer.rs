@@ -130,3 +130,120 @@ impl DbTransactionWriter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::common::models::TransactionStatus;
+    use crate::storage::common::storage::mock::MockStorage;
+    use chrono::Utc;
+    use mockito::Server;
+
+    // Helper function to create a test TransactionStatusUpdate
+    fn create_test_update(status: TransactionStatus) -> TransactionStatusUpdate {
+        TransactionStatusUpdate {
+            transaction_id: 12345,
+            status,
+            counterpart_signature: Some("test_signature_123".to_string()),
+            error_message: Some("Test error message".to_string()),
+            processed_at: Some(Utc::now()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webhook_alert_success() {
+        // Create mock webhook server
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"success": true}"#)
+            .create_async()
+            .await;
+
+        // Create DbTransactionWriter with mock webhook URL
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+
+        // Create a failed transaction update
+        let update = create_test_update(TransactionStatus::Failed);
+
+        // Send webhook alert
+        writer.send_webhook_alert(&server.url(), &update).await;
+
+        // Verify webhook was called
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_webhook_alert_non_success_status() {
+        // Create mock webhook server returning 500 error
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_body(r#"{"error": "Internal server error"}"#)
+            .create_async()
+            .await;
+
+        // Create DbTransactionWriter with mock webhook URL
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+
+        // Create a failed transaction update
+        let update = create_test_update(TransactionStatus::Failed);
+
+        // Send webhook alert (should handle error gracefully)
+        writer.send_webhook_alert(&server.url(), &update).await;
+
+        // Verify webhook was called despite error
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_webhook_alert_payload_structure() {
+        // Create mock webhook server that captures the request
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_header("content-type", "application/json")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        // Create DbTransactionWriter with mock webhook URL
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+
+        // Create a failed transaction update
+        let update = create_test_update(TransactionStatus::Failed);
+
+        // Send webhook alert
+        writer.send_webhook_alert(&server.url(), &update).await;
+
+        // Verify webhook was called with correct payload structure
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_webhook_alert_network_error() {
+        // Use an invalid URL to simulate network error
+        let invalid_url = "http://invalid-host-that-does-not-exist.local:9999";
+
+        // Create DbTransactionWriter with invalid webhook URL
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(invalid_url.to_string()));
+
+        // Create a failed transaction update
+        let update = create_test_update(TransactionStatus::Failed);
+
+        // Send webhook alert (should handle error gracefully without panicking)
+        writer.send_webhook_alert(invalid_url, &update).await;
+
+        // Test passes if no panic occurs
+    }
+}

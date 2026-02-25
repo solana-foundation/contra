@@ -15,7 +15,6 @@ and will also initialize that mint on Contra. This simplifies our operator's cod
 validate mint existence on Contra.
 */
 
-const MEMO_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 const MINT_IDEMPOTENCY_MEMO_PREFIX: &str = "contra:mint-idempotency:";
 
 pub fn mint_idempotency_memo(transaction_id: i64) -> String {
@@ -268,7 +267,7 @@ impl MintToBuilder {
 
         if let Some(memo) = self.idempotency_memo.as_deref() {
             instructions.push(Instruction {
-                program_id: MEMO_PROGRAM_ID,
+                program_id: spl_memo::id(),
                 accounts: vec![],
                 data: memo.as_bytes().to_vec(),
             });

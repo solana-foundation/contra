@@ -5,6 +5,7 @@ use crate::operator::utils::transaction_util::{check_transaction_status, Confirm
 use crate::operator::{sign_and_send_transaction, SignerUtil};
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::{
     EncodedTransaction, UiInstruction, UiMessage, UiParsedInstruction,
@@ -14,7 +15,6 @@ use tracing::{error, info, warn};
 
 use super::types::{InstructionWithSigners, SenderState};
 
-const MEMO_PROGRAM_ID_STR: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
 
 /// Attempt JIT mint initialization by sending initialize_mint transaction first
@@ -229,7 +229,7 @@ fn transaction_has_memo(
                 .get(instruction.program_id_index as usize)
                 .map(|key| key.as_str());
 
-            program_id == Some(MEMO_PROGRAM_ID_STR)
+            program_id.is_some_and(is_memo_program_id)
                 && bs58::decode(&instruction.data)
                     .into_vec()
                     .map(|memo_data| memo_data == expected_memo.as_bytes())
@@ -242,17 +242,23 @@ fn instruction_has_memo(instruction: &UiInstruction, expected_memo: &str) -> boo
     match instruction {
         UiInstruction::Compiled(_) => false,
         UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed_instruction)) => {
-            parsed_instruction.program_id == MEMO_PROGRAM_ID_STR
+            is_memo_program_id(&parsed_instruction.program_id)
                 && parsed_instruction.parsed.as_str() == Some(expected_memo)
         }
         UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(partially_decoded)) => {
-            partially_decoded.program_id == MEMO_PROGRAM_ID_STR
+            is_memo_program_id(&partially_decoded.program_id)
                 && bs58::decode(&partially_decoded.data)
                     .into_vec()
                     .map(|memo_data| memo_data == expected_memo.as_bytes())
                     .unwrap_or(false)
         }
     }
+}
+
+fn is_memo_program_id(program_id: &str) -> bool {
+    Pubkey::from_str(program_id)
+        .map(|pubkey| pubkey == spl_memo::id() || pubkey == spl_memo::v1::id())
+        .unwrap_or(false)
 }
 
 fn memo_matches(returned_memo: &str, expected_memo: &str) -> bool {

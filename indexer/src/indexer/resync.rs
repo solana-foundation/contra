@@ -1,6 +1,6 @@
 use crate::{
     config::{BackfillConfig, ProgramType},
-    error::IndexerError,
+    error::{DataSourceError, IndexerError},
     indexer::{
         backfill::BackfillService, checkpoint::CheckpointWriter,
         datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
@@ -98,6 +98,20 @@ impl ResyncService {
             error!("Failed to fetch current slot before backfill: {}", e);
             IndexerError::from(e)
         })?;
+
+        // Validate genesis_slot is not in the future
+        if genesis_slot > current_slot {
+            error!(
+                "Invalid genesis_slot {}: cannot be ahead of current_slot {}",
+                genesis_slot, current_slot
+            );
+            return Err(IndexerError::from(DataSourceError::InvalidConfig {
+                reason: format!(
+                    "genesis_slot {} is ahead of current_slot {}",
+                    genesis_slot, current_slot
+                ),
+            }));
+        }
 
         let total_slots = if current_slot > genesis_slot {
             current_slot - genesis_slot

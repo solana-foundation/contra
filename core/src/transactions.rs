@@ -29,3 +29,44 @@ pub fn is_admin_instruction(program_id: &Pubkey, instruction_type: u8) -> bool {
 pub fn is_allowed_instruction(program_id: &Pubkey, _instruction_type: u8) -> bool {
     program_id == &spl_token::id()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spl_initialize_mint_is_admin() {
+        assert!(is_admin_instruction(&spl_token::id(), 0));
+    }
+
+    #[test]
+    fn spl_transfer_is_not_admin() {
+        // SPL token transfer = instruction type 3
+        assert!(!is_admin_instruction(&spl_token::id(), 3));
+    }
+
+    #[test]
+    fn unknown_program_is_not_admin() {
+        let random = Pubkey::new_unique();
+        assert!(!is_admin_instruction(&random, 0));
+    }
+
+    #[test]
+    fn spl_token_is_allowed() {
+        assert!(is_allowed_instruction(&spl_token::id(), 3));
+    }
+
+    #[test]
+    fn unknown_program_is_not_allowed() {
+        let random = Pubkey::new_unique();
+        assert!(!is_allowed_instruction(&random, 0));
+    }
+
+    #[test]
+    fn system_program_is_not_allowed() {
+        assert!(!is_allowed_instruction(
+            &solana_sdk::system_program::id(),
+            0
+        ));
+    }
+}

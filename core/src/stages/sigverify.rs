@@ -226,3 +226,181 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
     }
     handles
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::{
+        hash::Hash,
+        instruction::{AccountMeta, Instruction},
+        signature::{Keypair, Signature, Signer},
+        transaction::{SanitizedTransaction, Transaction},
+    };
+    use std::collections::HashSet;
+
+    /// Build a signed `SanitizedTransaction` from instructions + signers.
+    fn sanitize(
+        instructions: &[Instruction],
+        payer: &Keypair,
+        signers: &[&Keypair],
+    ) -> SanitizedTransaction {
+        let tx = Transaction::new_signed_with_payer(
+            instructions,
+            Some(&payer.pubkey()),
+            signers,
+            Hash::default(),
+        );
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap()
+    }
+
+    fn spl_transfer_ix(from_ata: &Pubkey, to_ata: &Pubkey, authority: &Pubkey) -> Instruction {
+        spl_token::instruction::transfer(&spl_token::id(), from_ata, to_ata, authority, &[], 1_000)
+            .unwrap()
+    }
+
+    fn initialize_mint_ix(mint: &Pubkey, authority: &Pubkey) -> Instruction {
+        spl_token::instruction::initialize_mint(&spl_token::id(), mint, authority, None, 6).unwrap()
+    }
+
+    // --- C9: empty transaction (no instructions) must be rejected ------
+
+    #[tokio::test]
+    async fn empty_transaction_rejected() {
+        let payer = Keypair::new();
+        let tx = sanitize(&[], &payer, &[&payer]);
+        let result = sigverify_transaction(&tx, &[]).await;
+        assert!(
+            matches!(
+                result,
+                SigverifyResult::InvalidTransaction(TransactionType::Empty)
+            ),
+            "expected InvalidTransaction(Empty), got {result}"
+        );
+    }
+
+    // --- C8: mixed admin + non-admin instructions must be rejected -----
+
+    #[tokio::test]
+    async fn mixed_transaction_rejected() {
+        let admin = Keypair::new();
+        let user = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+
+        let admin_ix = initialize_mint_ix(&mint, &admin.pubkey());
+        let normal_ix = spl_transfer_ix(&from_ata, &to_ata, &user.pubkey());
+
+        let tx = sanitize(&[admin_ix, normal_ix], &admin, &[&admin, &user]);
+        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        assert!(
+            matches!(
+                result,
+                SigverifyResult::InvalidTransaction(TransactionType::Mixed)
+            ),
+            "expected InvalidTransaction(Mixed), got {result}"
+        );
+    }
+
+    // --- C7: admin instruction without admin signer must be rejected ---
+
+    #[tokio::test]
+    async fn admin_instruction_without_admin_signer_rejected() {
+        let non_admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let real_admin = Pubkey::new_unique(); // in admin_keys but not a tx signer
+
+        let ix = initialize_mint_ix(&mint, &non_admin.pubkey());
+        let tx = sanitize(&[ix], &non_admin, &[&non_admin]);
+        let result = sigverify_transaction(&tx, &[real_admin]).await;
+        assert!(
+            matches!(result, SigverifyResult::NotSignedByAdmin),
+            "expected NotSignedByAdmin, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_instruction_with_admin_signer_accepted() {
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+
+        let ix = initialize_mint_ix(&mint, &admin.pubkey());
+        let tx = sanitize(&[ix], &admin, &[&admin]);
+        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Admin)),
+            "expected Valid(Admin), got {result}"
+        );
+    }
+
+    // --- C5: tampered signature must be rejected -------------------------
+
+    #[tokio::test]
+    async fn tampered_signature_rejected() {
+        let payer = Keypair::new();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+        let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
+
+        // Build a properly signed transaction, then replace the signature
+        let mut tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::default(),
+        );
+        // Replace signature with a corrupted copy
+        let mut sig_bytes = <[u8; 64]>::from(tx.signatures[0]);
+        sig_bytes[0] ^= 0xff;
+        tx.signatures[0] = Signature::from(sig_bytes);
+
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        let result = sigverify_transaction(&sanitized, &[]).await;
+        assert!(
+            matches!(result, SigverifyResult::SigverifyFailed(_)),
+            "expected SigverifyFailed, got {result}"
+        );
+    }
+
+    // --- Normal happy path: properly signed normal tx accepted ---------
+
+    #[tokio::test]
+    async fn valid_normal_transaction_accepted() {
+        let payer = Keypair::new();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+        let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
+
+        let tx = sanitize(&[ix], &payer, &[&payer]);
+        let result = sigverify_transaction(&tx, &[]).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Normal)),
+            "expected Valid(Normal), got {result}"
+        );
+    }
+
+    // --- classify_transaction edge cases --------------------------------
+
+    #[tokio::test]
+    async fn instruction_with_empty_data_not_counted() {
+        // An instruction with no data bytes is skipped by classify_transaction.
+        // A tx with only such instructions is classified Empty.
+        let payer = Keypair::new();
+        let program_id = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id,
+            accounts: vec![AccountMeta::new_readonly(payer.pubkey(), false)],
+            data: vec![], // empty data
+        };
+        let tx = sanitize(&[ix], &payer, &[&payer]);
+        let result = sigverify_transaction(&tx, &[]).await;
+        assert!(
+            matches!(
+                result,
+                SigverifyResult::InvalidTransaction(TransactionType::Empty)
+            ),
+            "expected InvalidTransaction(Empty) for empty-data ix, got {result}"
+        );
+    }
+}

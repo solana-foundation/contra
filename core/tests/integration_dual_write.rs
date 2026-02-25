@@ -431,3 +431,248 @@ async fn test_db_first_semantics_with_redis_down() {
     // 3. ✓ Data immediately available for read from Postgres
     // 4. ✓ Operation returns success (Redis failure non-fatal)
 }
+
+/// Test that cache warming on startup recovers from divergence
+///
+/// This test verifies the cache recovery scenario after Redis failure and restart:
+/// 1. Write data to Postgres while Redis is down
+/// 2. Start Redis (create valid Redis connection)
+/// 3. Call cache warming function (simulating node startup)
+/// 4. Verify cache warming populates Redis from Postgres
+/// 5. Verify Redis matches Postgres state
+///
+/// This demonstrates that the system can recover from cache divergence
+/// by re-synchronizing Redis from Postgres on startup.
+#[tokio::test]
+#[ignore] // Requires database setup: TEST_POSTGRES_URL and TEST_REDIS_URL environment variables
+async fn test_cache_warming_recovers_from_divergence() {
+    use contra_core::stages::warm_redis_cache;
+    use redis::AsyncCommands;
+
+    // Setup: Initialize tracing
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+
+    // Setup: Get test database URLs from environment
+    let postgres_url = env::var("TEST_POSTGRES_URL")
+        .unwrap_or_else(|_| "postgresql://contra:contra@localhost:5432/contra_test".to_string());
+
+    let redis_url = env::var("TEST_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+    // Phase 1: Write data to Postgres while Redis is down
+    // ====================================================
+
+    // Create Postgres connection (should succeed)
+    let postgres_db = match PostgresAccountsDB::new(&postgres_url, false).await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Skipping test: Cannot connect to test Postgres: {}", e);
+            eprintln!("Set TEST_POSTGRES_URL environment variable to run this test");
+            return;
+        }
+    };
+
+    // Use an invalid Redis URL to simulate Redis being down during initial writes
+    let redis_url_invalid = "redis://invalid-redis-host-that-does-not-exist:6379";
+    let redis_db_down = match RedisAccountsDB::new(redis_url_invalid).await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Redis connection failed as expected: {}", e);
+            eprintln!("Skipping test: Cannot set up Redis failure scenario");
+            return;
+        }
+    };
+
+    // Create dual backend with Redis down
+    let mut accounts_db = AccountsDB::Dual(postgres_db, redis_db_down);
+
+    // Create test data and write to Postgres (Redis write will fail)
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
+
+    let account = Account {
+        lamports: 250_000_000,
+        data: vec![99; 15],
+        owner: solana_sdk::system_program::id(),
+        executable: false,
+        rent_epoch: 0,
+    };
+
+    let account_settlement = AccountSettlement {
+        account: solana_sdk::account::AccountSharedData::from(account),
+        deleted: false,
+    };
+    let account_settlements = vec![(pubkey, account_settlement)];
+
+    let transaction = system_transaction::transfer(
+        &keypair,
+        &Keypair::new().pubkey(),
+        5_000_000,
+        Hash::default(),
+    );
+    let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
+    let processed = ProcessedTransaction::default();
+
+    let test_slot = 300u64;
+    let test_blockhash = Hash::new_unique();
+    let test_block_time = 1234567890i64;
+
+    let transactions = vec![(
+        Signature::default(),
+        &sanitized_tx,
+        test_slot,
+        test_block_time,
+        &processed,
+    )];
+
+    let block_info = Some(BlockInfo {
+        slot: test_slot,
+        blockhash: test_blockhash,
+        block_height: Some(test_slot),
+        block_time: Some(test_block_time),
+    });
+
+    // Write batch: Postgres should succeed, Redis should fail (non-fatal)
+    let result = write_batch(
+        &mut accounts_db,
+        &account_settlements,
+        transactions,
+        block_info,
+        Some(test_slot),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "write_batch should succeed even when Redis is down: {:?}",
+        result.err()
+    );
+
+    // Verify data written to Postgres
+    if let AccountsDB::Dual(postgres_db, _) = &accounts_db {
+        let slot_in_db = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(slot) FROM blocks"
+        )
+        .fetch_one(&*postgres_db.pool)
+        .await
+        .expect("Should be able to query Postgres");
+
+        assert_eq!(
+            slot_in_db,
+            Some(test_slot as i64),
+            "Test slot should be written to Postgres"
+        );
+    }
+
+    // Phase 2: Start Redis and run cache warming
+    // ===========================================
+
+    // Create a VALID Redis connection (simulating Redis coming back online)
+    let redis_db = match RedisAccountsDB::new(&redis_url).await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Skipping test: Cannot connect to test Redis: {}", e);
+            eprintln!("Set TEST_REDIS_URL environment variable to run this test");
+            eprintln!("Or ensure Redis is running at {}", redis_url);
+            return;
+        }
+    };
+
+    // Clear Redis to simulate fresh start (or diverged state)
+    let mut redis_conn = redis_db.connection.clone();
+    let _: () = redis_conn
+        .del(&["latest_slot", "latest_blockhash"])
+        .await
+        .expect("Should be able to clear Redis keys");
+
+    // Verify Redis is empty before cache warming
+    let redis_slot_before: Option<u64> = redis_conn
+        .get("latest_slot")
+        .await
+        .ok();
+    assert!(
+        redis_slot_before.is_none(),
+        "Redis should be empty before cache warming"
+    );
+
+    // Extract Postgres DB reference for cache warming
+    let postgres_db = if let AccountsDB::Dual(pg, _) = &accounts_db {
+        pg
+    } else {
+        panic!("Expected Dual variant");
+    };
+
+    // Phase 3: Call cache warming (simulating node startup)
+    // ======================================================
+    let warm_result = warm_redis_cache(postgres_db, &redis_db).await;
+
+    assert!(
+        warm_result.is_ok(),
+        "Cache warming should succeed: {:?}",
+        warm_result.err()
+    );
+
+    // Phase 4: Verify Redis matches Postgres state
+    // =============================================
+
+    // Verify latest_slot was written to Redis
+    let redis_slot: Option<u64> = redis_conn
+        .get("latest_slot")
+        .await
+        .expect("Should be able to read latest_slot from Redis");
+
+    assert_eq!(
+        redis_slot,
+        Some(test_slot),
+        "Redis latest_slot should match Postgres after cache warming"
+    );
+
+    // Verify latest_blockhash was written to Redis
+    let redis_blockhash: Option<String> = redis_conn
+        .get("latest_blockhash")
+        .await
+        .expect("Should be able to read latest_blockhash from Redis");
+
+    assert!(
+        redis_blockhash.is_some(),
+        "Redis latest_blockhash should be populated after cache warming"
+    );
+
+    // Verify blockhash matches what was written to Postgres
+    let postgres_blockhash_bytes: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT value FROM metadata WHERE key = 'latest_blockhash'"
+    )
+    .fetch_optional(&*postgres_db.pool)
+    .await
+    .expect("Should be able to query Postgres blockhash");
+
+    if let Some(bytes) = postgres_blockhash_bytes {
+        let hash_array: [u8; 32] = bytes.as_slice().try_into().expect("Valid hash bytes");
+        let hash = Hash::new_from_array(hash_array);
+        let expected_hash_str = hash.to_string();
+
+        assert_eq!(
+            redis_blockhash.as_ref(),
+            Some(&expected_hash_str),
+            "Redis blockhash should match Postgres after cache warming"
+        );
+    }
+
+    // Cleanup: Clear test data from Redis
+    let _: () = redis_conn
+        .del(&["latest_slot", "latest_blockhash"])
+        .await
+        .ok()
+        .unwrap_or(());
+
+    // Test demonstrates:
+    // 1. ✓ Write data to Postgres while Redis is down
+    // 2. ✓ Start Redis (create valid connection)
+    // 3. ✓ Restart node with dual backend (cache warming)
+    // 4. ✓ Verify cache warming populates Redis from Postgres
+    // 5. ✓ Verify Redis matches Postgres state
+    // 6. ✓ System recovers from cache divergence automatically
+}

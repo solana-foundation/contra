@@ -50,7 +50,7 @@ struct LastBlock {
 
 /// Warm the Redis cache by reading from Postgres and writing to Redis
 /// This is called on startup to ensure Redis has the latest state from Postgres
-async fn warm_redis_cache(
+pub async fn warm_redis_cache(
     postgres_db: &PostgresAccountsDB,
     redis_db: &RedisAccountsDB,
 ) -> Result<()> {

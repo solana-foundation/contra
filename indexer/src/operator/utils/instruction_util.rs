@@ -1,7 +1,7 @@
 use crate::error::ProgramError;
 use crate::operator::{
     is_mint_not_initialized_error, ConfirmationResult, SignerUtil, DEFAULT_CU_MINT,
-    DEFAULT_CU_RELEASE_FUNDS,
+    DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
@@ -14,8 +14,6 @@ Mint initialization is going to be done outside of the operator. There's a comma
 and will also initialize that mint on Contra. This simplifies our operator's code and reduces the checks it needs to do if we'd want to
 validate mint existence on Contra.
 */
-
-const MINT_IDEMPOTENCY_MEMO_PREFIX: &str = "contra:mint-idempotency:";
 
 pub fn mint_idempotency_memo(transaction_id: i64) -> String {
     format!("{MINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
@@ -111,7 +109,7 @@ impl TransactionBuilder {
         match self {
             TransactionBuilder::ReleaseFunds(builder) => Some(builder.transaction_id),
             TransactionBuilder::InitializeMint(_) => None,
-            TransactionBuilder::Mint(builder) => Some(builder.txn_id as i64),
+            TransactionBuilder::Mint(builder) => Some(builder.txn_id),
             TransactionBuilder::ResetSmtRoot(_) => None,
         }
     }
@@ -324,7 +322,7 @@ impl MintToBuilder {
 #[derive(Clone, Debug, Default)]
 pub struct MintToBuilderWithTxnId {
     pub builder: MintToBuilder,
-    pub txn_id: u64,
+    pub txn_id: i64,
 }
 
 /// Builder for initialize_mint instruction (sent before first mint)

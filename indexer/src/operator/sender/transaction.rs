@@ -70,7 +70,7 @@ impl SenderState {
             TransactionBuilder::Mint(ref builder_with_txn_id) => {
                 // Cache the builder for potential JIT retry
                 self.mint_builders.insert(
-                    builder_with_txn_id.txn_id as i64,
+                    builder_with_txn_id.txn_id,
                     builder_with_txn_id.builder.clone(),
                 );
 
@@ -138,7 +138,7 @@ pub async fn handle_transaction_submission(
             Ok(Some(existing_signature)) => {
                 handle_success(
                     state,
-                    Some(builder_with_txn_id.txn_id as i64),
+                    Some(builder_with_txn_id.txn_id),
                     None,
                     existing_signature,
                     storage_tx,
@@ -152,7 +152,7 @@ pub async fn handle_transaction_submission(
                     "Mint idempotency lookup failed for transaction_id {}: {}",
                     builder_with_txn_id.txn_id, e
                 );
-                send_fatal_error(storage_tx, Some(builder_with_txn_id.txn_id as i64), &e).await;
+                send_fatal_error(storage_tx, Some(builder_with_txn_id.txn_id), &e).await;
                 return;
             }
         }

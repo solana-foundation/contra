@@ -268,7 +268,7 @@ pub async fn process_deposit_funds(
 
         let wrapped = TransactionBuilder::Mint(Box::new(MintToBuilderWithTxnId {
             builder,
-            txn_id: transaction.id as u64,
+            txn_id: transaction.id,
         }));
 
         send_guaranteed(&sender_tx, wrapped, "processed deposit")

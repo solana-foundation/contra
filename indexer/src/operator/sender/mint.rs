@@ -2,7 +2,9 @@ use crate::operator::utils::instruction_util::{
     mint_idempotency_memo, InitializeMintBuilder, MintToBuilderWithTxnId, TransactionBuilder,
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
-use crate::operator::{sign_and_send_transaction, SignerUtil};
+use crate::operator::{
+    sign_and_send_transaction, SignerUtil, MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+};
 use serde_json::Value;
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -17,8 +19,6 @@ use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use super::types::{InstructionWithSigners, SenderState};
-
-const IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
 
 #[derive(Clone, Copy, Debug)]
 struct ExpectedMintInstruction {
@@ -148,7 +148,7 @@ pub(super) async fn find_existing_mint_signature(
     state: &SenderState,
     builder_with_txn_id: &MintToBuilderWithTxnId,
 ) -> Result<Option<Signature>, String> {
-    let transaction_id = builder_with_txn_id.txn_id as i64;
+    let transaction_id = builder_with_txn_id.txn_id;
     let Some(expected_mint) = expected_mint_instruction(transaction_id, builder_with_txn_id) else {
         return Ok(None);
     };
@@ -158,7 +158,7 @@ pub(super) async fn find_existing_mint_signature(
         .rpc_client
         .get_signatures_for_address(
             &expected_mint.recipient_ata,
-            IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+            MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
         )
         .await
     {

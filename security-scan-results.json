@@ -1,0 +1,65 @@
+{
+  "scan_date": "2026-02-25T14:05:00Z",
+  "scanner": "manual-security-scan",
+  "task": "subtask-4-3",
+  "files_scanned": [
+    "core/src/stages/dedup.rs",
+    "core/src/rpc/rpc_impl.rs",
+    "core/src/nodes/node.rs",
+    "core/src/rpc/is_blockhash_valid_impl.rs",
+    "integration/tests/contra/rpc/test_blockhash_validation.rs",
+    "integration/tests/contra/integration.rs",
+    "integration/tests/contra/rpc/mod.rs"
+  ],
+  "commits_reviewed": [
+    "e3971ad",
+    "5cb7bcb",
+    "a991aca",
+    "60fa205",
+    "4fd8771",
+    "0cb9f99",
+    "4ab78d3"
+  ],
+  "patterns_checked": [
+    "password",
+    "secret",
+    "api_key",
+    "token",
+    "private_key",
+    "aws_access",
+    "credential",
+    "BEGIN.*KEY",
+    "base64_encoded_strings",
+    "hardcoded_ips",
+    "connection_strings"
+  ],
+  "findings": [
+    {
+      "type": "info",
+      "severity": "none",
+      "file": "integration/tests/contra/rpc/test_blockhash_validation.rs",
+      "description": "Test fixture uses localhost Redis URL (redis://127.0.0.1:6379)",
+      "line_context": "let redis_url = Url::parse(\"redis://127.0.0.1:6379\").unwrap();",
+      "risk_assessment": "No security risk - standard test pattern for local development",
+      "recommendation": "None - acceptable for test code"
+    }
+  ],
+  "secrets_detected": 0,
+  "vulnerabilities_detected": 0,
+  "summary": {
+    "passed": true,
+    "critical_issues": 0,
+    "high_issues": 0,
+    "medium_issues": 0,
+    "low_issues": 0,
+    "info_issues": 1
+  },
+  "verification_details": {
+    "no_hardcoded_secrets": true,
+    "no_api_keys": true,
+    "no_private_keys": true,
+    "no_exposed_credentials": true,
+    "test_fixtures_appropriate": true,
+    "security_invariant_c4_upheld": true
+  }
+}

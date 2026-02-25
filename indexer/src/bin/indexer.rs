@@ -111,6 +111,8 @@ enum Mode {
     Indexer,
     /// Run as an operator
     Operator,
+    /// Run as a resync operation
+    Resync,
 }
 
 const INDEXER_PREFIX: &str = "INDEXER";
@@ -171,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Indexer => run_indexer(figment, args.verbose).await,
         Mode::Operator => run_operator(figment, args.verbose).await,
+        Mode::Resync => Err("Resync mode not yet implemented".into()),
     }
 }
 

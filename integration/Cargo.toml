@@ -11,6 +11,10 @@ path = "tests/contra/integration.rs"
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
 
+[[test]]
+name = "reconciliation_integration"
+path = "tests/indexer/reconciliation.rs"
+
 [features]
 test-tree = ["contra-indexer/test-tree"]
 

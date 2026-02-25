@@ -27,6 +27,25 @@ pub enum IndexerError {
 
     #[error("Checkpoint error: {0}")]
     Checkpoint(#[from] CheckpointError),
+
+    #[error("Reconciliation failed: {0}")]
+    Reconciliation(#[from] ReconciliationError),
+}
+
+/// Errors from startup reconciliation against on-chain state
+#[derive(Debug, thiserror::Error)]
+pub enum ReconciliationError {
+    #[error("Storage error: {0}")]
+    Storage(#[from] StorageError),
+
+    #[error("RPC error for mint {mint}: {reason}")]
+    Rpc { mint: String, reason: String },
+
+    #[error("{count} mint(s) exceed mismatch threshold of {threshold} raw units; see logs for per-mint details")]
+    MismatchExceedsThreshold { count: usize, threshold: u64 },
+
+    #[error("Invalid pubkey '{pubkey}': {reason}")]
+    InvalidPubkey { pubkey: String, reason: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

@@ -6,6 +6,7 @@ pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
 pub mod get_mint;
+pub mod get_mint_balances_for_reconciliation;
 pub mod get_pending_db_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
@@ -126,6 +127,13 @@ impl Storage {
     /// Get mint metadata by address
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
         get_mint::get_mint(self, mint_address).await
+    }
+
+    /// Return per-mint aggregate balances (completed deposits minus withdrawals) for startup reconciliation.
+    pub async fn get_mint_balances_for_reconciliation(
+        &self,
+    ) -> Result<Vec<MintDbBalance>, StorageError> {
+        get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self).await
     }
 
     /// Close the storage connection pool gracefully

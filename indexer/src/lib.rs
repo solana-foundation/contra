@@ -11,6 +11,7 @@ pub mod test_utils;
 
 pub use config::{
     BackfillConfig, ContraIndexerConfig, DatasourceType, IndexerConfig, OperatorConfig,
-    PostgresConfig, ProgramType, RpcPollingConfig, StorageType, YellowstoneConfig,
+    PostgresConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
+    YellowstoneConfig,
 };
 pub use indexer::run;

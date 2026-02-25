@@ -3,7 +3,9 @@ use tracing::info;
 
 use crate::{
     error::StorageError,
-    storage::common::models::{DbMint, DbTransaction, TransactionStatus, TransactionType},
+    storage::common::models::{
+        DbMint, DbTransaction, MintDbBalance, TransactionStatus, TransactionType,
+    },
     PostgresConfig,
 };
 
@@ -688,6 +690,41 @@ impl PostgresDb {
         .await?;
 
         Ok(mint)
+    }
+
+    /// Return per-mint aggregate balances for startup reconciliation.
+    ///
+    /// For each mint known to the DB, sums:
+    /// - `total_deposits`  : ALL indexed deposits (any status), because a deposit increases
+    ///   the escrow ATA balance on-chain the moment it is observed — the operator's contra minting
+    ///   status (`pending`/`processing`/`completed`/`failed`) does not change what is on-chain.
+    /// - `total_withdrawals`: only `completed` withdrawals, because only a completed
+    ///   `release_funds` call actually moves tokens out of the ATA.
+    ///
+    /// Mints with no transactions still appear (with totals = 0) because of the LEFT JOIN.
+    pub async fn get_mint_balances_for_reconciliation_internal(
+        &self,
+    ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
+        sqlx::query_as::<_, MintDbBalance>(
+            r#"
+            SELECT
+                m.mint_address,
+                m.token_program,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
+                    0
+                )::BIGINT AS total_deposits,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
+                    0
+                )::BIGINT AS total_withdrawals
+            FROM mints m
+            LEFT JOIN transactions t ON t.mint = m.mint_address
+            GROUP BY m.mint_address, m.token_program
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn close(&self) -> Result<(), sqlx::Error> {

@@ -1,3 +1,14 @@
+//! Escrow balance reconciliation module
+//!
+//! Validates the critical invariant **G1**: on-chain escrow holdings MUST equal total user
+//! liabilities in the database. This module performs periodic reconciliation checks by comparing
+//! the escrow's Associated Token Account (ATA) balances on-chain against the sum of completed
+//! deposits minus completed withdrawals for each mint. Discrepancies exceeding the configured
+//! tolerance threshold trigger webhook alerts to notify operators of potential security issues.
+//!
+//! The G1 invariant is fundamental to the safety and correctness of the escrow system: if on-chain
+//! balances fall short of database liabilities, users may be unable to withdraw their funds.
+
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::RetryPolicy;

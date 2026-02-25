@@ -62,3 +62,19 @@ channel_buffer_size = 100
 # Privy signers:
 #   ADMIN_PRIVY_APP_ID, ADMIN_PRIVY_APP_SECRET, ADMIN_PRIVY_WALLET_ID
 #   OPERATOR_PRIVY_* (same pattern)
+
+[reconciliation]
+# How often to run escrow balance reconciliation checks (in seconds)
+# Default: 300 seconds (5 minutes)
+reconciliation_interval_secs = 300
+
+# Tolerance threshold in basis points (100 bps = 1%)
+# Differences within this threshold are considered acceptable
+# Default: 10 bps (0.1%)
+reconciliation_tolerance_bps = 10
+
+# Webhook URL for reconciliation alerts (optional)
+# POST requests will be sent to this URL when balance mismatches are detected
+# Payload format: {"mint": "...", "on_chain_balance": ..., "db_balance": ..., "delta_bps": ..., "timestamp": "..."}
+# Uncomment and set to enable webhook alerts:
+# reconciliation_webhook_url = "https://your-webhook-endpoint.com/alerts"

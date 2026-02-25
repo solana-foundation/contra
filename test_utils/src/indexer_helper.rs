@@ -92,6 +92,7 @@ pub async fn start_contra_indexer(
         rpc_polling: Some(rpc_polling_config),
         yellowstone: yellowstone_config,
         backfill: backfill_config,
+        reconciliation: contra_indexer::ReconciliationConfig::default(),
     };
 
     indexer_config.validate()?;
@@ -181,6 +182,7 @@ pub async fn start_l1_indexer(
         rpc_polling: Some(rpc_polling_config),
         yellowstone: Some(yellowstone_config),
         backfill: backfill_config,
+        reconciliation: contra_indexer::ReconciliationConfig::default(),
     };
 
     common_config.validate()?;

@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use contra_indexer::{
     BackfillConfig, ContraIndexerConfig, DatasourceType, IndexerConfig, OperatorConfig,
-    PostgresConfig, ProgramType, RpcPollingConfig, StorageType, YellowstoneConfig,
+    PostgresConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
+    YellowstoneConfig,
 };
 use figment::{
     providers::{Env, Format, Toml},
@@ -33,12 +34,20 @@ struct StorageSection {
     max_connections: u32,
 }
 
+#[derive(Deserialize, Default)]
+struct ReconciliationSection {
+    #[serde(default)]
+    mismatch_threshold_raw: u64,
+}
+
 #[derive(Deserialize)]
 struct IndexerSection {
     datasource_type: DatasourceType,
     rpc_polling: Option<RpcPollingSection>,
     yellowstone: Option<YellowstoneSection>,
     backfill: BackfillSection,
+    #[serde(default)]
+    reconciliation: ReconciliationSection,
 }
 
 #[derive(Deserialize)]
@@ -131,6 +140,8 @@ fn map_env_to_config_path(
                 format!("indexer.rpc_polling.{}", suffix)
             } else if let Some(suffix) = key_lower.strip_prefix("backfill_") {
                 format!("indexer.backfill.{}", suffix)
+            } else if let Some(suffix) = key_lower.strip_prefix("reconciliation_") {
+                format!("indexer.reconciliation.{}", suffix)
             } else {
                 format!("indexer.{}", key_lower)
             }
@@ -260,11 +271,16 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         escrow_instance_id,
     };
 
+    let reconciliation_config = ReconciliationConfig {
+        mismatch_threshold_raw: indexer.reconciliation.mismatch_threshold_raw,
+    };
+
     let indexer_config = IndexerConfig {
         datasource_type: indexer.datasource_type,
         rpc_polling: rpc_polling_config,
         yellowstone: yellowstone_config,
         backfill: backfill_config,
+        reconciliation: reconciliation_config,
     };
 
     common_config.validate()?;

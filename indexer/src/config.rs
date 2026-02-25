@@ -148,6 +148,23 @@ impl ContraIndexerConfig {
     }
 }
 
+/// Configuration for startup reconciliation against on-chain state.
+///
+/// Only applies when `program_type = escrow`. Skipped for `withdraw` indexers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReconciliationConfig {
+    /// Maximum absolute mismatch (in raw token units) allowed before blocking startup.
+    /// 0 (default) means any mismatch blocks startup.
+    /// Mismatches above this value log error + emit alert and abort.
+    /// Mismatches at or below this value (but > 0) log a warning and continue.
+    ///
+    /// There is a small race window between the DB balance query and the on-chain RPC
+    /// fetch: a deposit arriving in that window will appear in the ATA but not yet in
+    /// the DB, producing a transient false positive. If spurious failures occur in
+    /// production, set this to the raw amount of one or two minimum deposits.
+    pub mismatch_threshold_raw: u64,
+}
+
 /// Indexer-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerConfig {
@@ -159,6 +176,9 @@ pub struct IndexerConfig {
     pub yellowstone: Option<YellowstoneConfig>,
     /// Backfill configuration for crash recovery
     pub backfill: BackfillConfig,
+    /// Startup reconciliation configuration
+    #[serde(default)]
+    pub reconciliation: ReconciliationConfig,
 }
 
 impl IndexerConfig {
@@ -298,6 +318,7 @@ mod tests {
                 exit_after_backfill: false,
                 rpc_url: "http://localhost:8899".to_string(),
             },
+            reconciliation: ReconciliationConfig::default(),
         }
     }
 

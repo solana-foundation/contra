@@ -1,4 +1,5 @@
 use crate::rpc::{
+    constants::PACKET_DATA_SIZE,
     error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     WriteDeps,
 };
@@ -27,8 +28,6 @@ pub async fn send_transaction_impl(
         )
     })?;
 
-    // Check packet size limit (1232 bytes is Solana's PACKET_DATA_SIZE)
-    const PACKET_DATA_SIZE: usize = 1232;
     if tx_data.len() > PACKET_DATA_SIZE {
         return Err(custom_error(
             INVALID_PARAMS_CODE,
@@ -113,4 +112,84 @@ pub async fn send_transaction_impl(
 
     debug!("Transaction {} sent to dedup stage", signature);
     Ok(signature)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::WriteDeps;
+    use solana_sdk::{
+        hash::Hash,
+        instruction::Instruction,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        transaction::{SanitizedTransaction, Transaction},
+    };
+    use tokio::sync::mpsc;
+
+    fn encode_tx(tx: &Transaction) -> String {
+        let bytes = bincode::serialize(tx).unwrap();
+        STANDARD.encode(&bytes)
+    }
+
+    /// Returns WriteDeps and the receiver (must be held alive for happy-path tests).
+    fn make_write_deps() -> (WriteDeps, mpsc::UnboundedReceiver<SanitizedTransaction>) {
+        let (dedup_tx, rx) = mpsc::unbounded_channel();
+        (WriteDeps { dedup_tx }, rx)
+    }
+
+    #[tokio::test]
+    async fn disallowed_program_rejected() {
+        let payer = Keypair::new();
+        let fake_program = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: fake_program,
+            accounts: vec![],
+            data: vec![1],
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::default(),
+        );
+        let encoded = encode_tx(&tx);
+        let (deps, _rx) = make_write_deps();
+
+        let result = send_transaction_impl(&deps, encoded, None).await;
+        assert!(result.is_err(), "disallowed program should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Only SPL token"),
+            "expected allowlist error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_programs_accepted() {
+        let payer = Keypair::new();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+        let ix = spl_token::instruction::transfer(
+            &spl_token::id(),
+            &from_ata,
+            &to_ata,
+            &payer.pubkey(),
+            &[],
+            1_000,
+        )
+        .unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::default(),
+        );
+        let encoded = encode_tx(&tx);
+        // Keep _rx alive so the dedup channel send succeeds
+        let (deps, _rx) = make_write_deps();
+
+        let result = send_transaction_impl(&deps, encoded, None).await;
+        assert!(result.is_ok(), "SPL token tx should pass allowlist");
+    }
 }

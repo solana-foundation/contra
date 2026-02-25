@@ -50,6 +50,17 @@ pub async fn write_batch(
             )
             .await
         }
+        AccountsDB::Dual(postgres_db, redis_db) => {
+            write_batch_dual(
+                postgres_db,
+                redis_db,
+                account_settlements,
+                transactions,
+                block_info,
+                slot,
+            )
+            .await
+        }
     }
 }
 

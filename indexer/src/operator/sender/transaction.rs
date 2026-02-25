@@ -134,18 +134,27 @@ pub async fn handle_transaction_submission(
     let extra_error_checks_policy = &tx_builder.extra_error_checks_policy();
 
     if let TransactionBuilder::Mint(builder_with_txn_id) = &tx_builder {
-        if let Some(existing_signature) =
-            find_existing_mint_signature(state, builder_with_txn_id).await
-        {
-            handle_success(
-                state,
-                Some(builder_with_txn_id.txn_id as i64),
-                None,
-                existing_signature,
-                storage_tx,
-            )
-            .await;
-            return;
+        match find_existing_mint_signature(state, builder_with_txn_id).await {
+            Ok(Some(existing_signature)) => {
+                handle_success(
+                    state,
+                    Some(builder_with_txn_id.txn_id as i64),
+                    None,
+                    existing_signature,
+                    storage_tx,
+                )
+                .await;
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                error!(
+                    "Mint idempotency lookup failed for transaction_id {}: {}",
+                    builder_with_txn_id.txn_id, e
+                );
+                send_fatal_error(storage_tx, Some(builder_with_txn_id.txn_id as i64), &e).await;
+                return;
+            }
         }
     }
 

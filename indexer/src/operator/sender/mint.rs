@@ -146,9 +146,11 @@ pub(super) async fn try_jit_mint_initialization(
 pub(super) async fn find_existing_mint_signature(
     state: &SenderState,
     builder_with_txn_id: &MintToBuilderWithTxnId,
-) -> Option<Signature> {
+) -> Result<Option<Signature>, String> {
     let transaction_id = builder_with_txn_id.txn_id as i64;
-    let expected_mint = expected_mint_instruction(transaction_id, builder_with_txn_id)?;
+    let Some(expected_mint) = expected_mint_instruction(transaction_id, builder_with_txn_id) else {
+        return Ok(None);
+    };
     let expected_memo = mint_idempotency_memo(transaction_id);
 
     let signatures = match state
@@ -161,11 +163,10 @@ pub(super) async fn find_existing_mint_signature(
     {
         Ok(signatures) => signatures,
         Err(e) => {
-            warn!(
+            return Err(format!(
                 "Failed idempotency lookup for transaction_id {} on {}: {}",
                 transaction_id, expected_mint.recipient_ata, e
-            );
-            return None;
+            ));
         }
     };
 
@@ -193,11 +194,10 @@ pub(super) async fn find_existing_mint_signature(
         let transaction = match state.rpc_client.get_transaction(&signature).await {
             Ok(transaction) => transaction,
             Err(e) => {
-                warn!(
+                return Err(format!(
                     "Failed to fetch transaction {} for idempotency confirmation: {}",
                     signature, e
-                );
-                continue;
+                ));
             }
         };
 
@@ -206,11 +206,11 @@ pub(super) async fn find_existing_mint_signature(
                 "Skipping resend for transaction_id {}: found existing confirmed mint {} with memo {}",
                 transaction_id, signature, memo
             );
-            return Some(signature);
+            return Ok(Some(signature));
         }
     }
 
-    None
+    Ok(None)
 }
 
 fn expected_mint_instruction(

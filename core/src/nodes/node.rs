@@ -104,7 +104,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
     // Only create write pipeline for Write and Aio modes
     let mut write_workers: Vec<WorkerHandle> = Vec::new();
-    let write_deps = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+    let (write_deps, live_blockhashes_arc) = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
         // Create the dedup channel (receives from RPC, sends to sigverify) - unbounded
         let (dedup_tx, dedup_rx) = crate::stages::create_dedup_channel();
 
@@ -132,7 +132,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel::<Hash>();
 
         // Start dedup stage (filters duplicate transactions before sigverify)
-        let dedup = crate::stages::start_dedup(crate::stages::DedupArgs {
+        let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
             max_blockhashes: config.max_blockhashes(),
             input_rx: dedup_rx,
             settled_blockhashes_rx,
@@ -186,11 +186,14 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         .await;
         write_workers.push(settle);
 
-        Some(WriteDeps {
+        (Some(WriteDeps {
             dedup_tx: dedup_tx.clone(),
-        })
+        }), live_blockhashes)
     } else {
-        None
+        // Read-only node: no write pipeline, create empty live_blockhashes Arc
+        use std::collections::LinkedList;
+        use std::sync::{Arc, RwLock};
+        (None, Arc::new(RwLock::new(LinkedList::new())))
     };
 
     // Start RPC service based on node mode
@@ -203,6 +206,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 accounts_db: AccountsDB::new(&config.accountsdb_connection_url, true)
                     .await
                     .unwrap(),
+                live_blockhashes: live_blockhashes_arc,
             }),
             NodeMode::Write => None,
         },

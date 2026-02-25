@@ -21,7 +21,6 @@ use {
     spl_associated_token_account::get_associated_token_address,
     std::time::Duration,
     tokio::time::sleep,
-    tracing::warn,
 };
 
 use contra_indexer::storage::Storage;
@@ -118,34 +117,11 @@ impl ContraContext {
     }
 
     pub async fn check_transaction_exists(&self, signature: Signature) {
-        for _ in 0..3 {
-            match self
-                .read_client
-                .get_transaction(&signature, UiTransactionEncoding::Base64)
-                .await
-            {
-                Ok(_tx) => {
-                    return;
-                }
-                Err(e) => {
-                    warn!("Error getting transaction: {}", e);
-                }
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        panic!("Transaction {} not found", signature);
+        super::utils::confirm_transaction(&self.read_client, signature).await;
     }
 
     pub async fn get_token_balance(&self, token_account: &Pubkey) -> Result<u64> {
-        let amount = self
-            .read_client
-            .get_token_account_balance(token_account)
-            .await
-            .map_err(anyhow::Error::from)?
-            .amount
-            .parse::<u64>()
-            .map_err(anyhow::Error::from)?;
-        Ok(amount)
+        super::utils::token_balance(&self.read_client, token_account).await
     }
 
     pub async fn get_transaction_count(&self) -> Result<u64> {

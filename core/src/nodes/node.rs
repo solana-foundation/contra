@@ -7,8 +7,9 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stages::{
-            execution::start_execution_worker, sequencer::start_sequence_worker,
-            settle::start_settle_worker, sigverify::start_sigverify_workerpool, AccountSettlement,
+            dedup::load_dedup_state, execution::start_execution_worker,
+            sequencer::start_sequence_worker, settle::start_settle_worker,
+            sigverify::start_sigverify_workerpool, AccountSettlement,
         },
     },
     futures::future::FutureExt,
@@ -32,6 +33,7 @@ pub enum NodeMode {
     Aio,
 }
 
+#[derive(Clone)]
 pub struct NodeConfig {
     pub mode: NodeMode,
     pub port: u16,
@@ -98,6 +100,11 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     if config.blocktime_ms == 0 && matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
         return Err("blocktime_ms cannot be 0 for write nodes".into());
     }
+    if config.max_blockhashes() == 0 && matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+        return Err(
+            "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)".into(),
+        );
+    }
 
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
@@ -131,6 +138,13 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         // Create settled blockhashes channel between settler and dedup
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel::<Hash>();
 
+        // Load persisted dedup state from DB before starting the stage.
+        // Failure here is fatal: starting with an empty cache could allow
+        // duplicate transactions to execute after a restart.
+        let db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+        let (initial_live_blockhashes, initial_dedup_cache) =
+            load_dedup_state(&db, config.max_blockhashes()).await?;
+
         // Start dedup stage (filters duplicate transactions before sigverify)
         let dedup = crate::stages::start_dedup(crate::stages::DedupArgs {
             max_blockhashes: config.max_blockhashes(),
@@ -138,6 +152,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             settled_blockhashes_rx,
             output_tx: sigverify_tx.clone(),
             shutdown_token: shutdown_token.clone(),
+            initial_live_blockhashes,
+            initial_dedup_cache,
         })
         .await;
         write_workers.push(dedup);
@@ -308,5 +324,24 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert_eq!(err.to_string(), "blocktime_ms cannot be 0 for write nodes");
+    }
+
+    #[tokio::test]
+    async fn test_run_node_rejects_zero_max_blockhashes() {
+        // transaction_expiration_ms < blocktime_ms → max_blockhashes() == 0
+        let config = NodeConfig {
+            transaction_expiration_ms: 50,
+            blocktime_ms: 100,
+            ..Default::default()
+        };
+
+        assert_eq!(config.max_blockhashes(), 0);
+        let result = run_node(config).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)"
+        );
     }
 }

@@ -22,6 +22,9 @@ pub struct BlockInfo {
     pub block_time: Option<i64>,
     /// Transaction signatures in this block, in order
     pub transaction_signatures: Vec<Signature>,
+    /// The recent_blockhash each transaction referenced, parallel to transaction_signatures.
+    /// Used to rebuild the dedup cache on restart.
+    pub transaction_recent_blockhashes: Vec<Hash>,
 }
 
 // The AccountsDB enum now uses match statements instead of enum_dispatch for most methods
@@ -45,7 +48,7 @@ impl AccountsDB {
         super::get_transaction::get_transaction(self, signature).await
     }
 
-    pub async fn get_latest_slot(&self) -> Result<u64> {
+    pub async fn get_latest_slot(&self) -> Result<Option<u64>> {
         super::get_latest_slot::get_latest_slot(self).await
     }
 
@@ -77,6 +80,14 @@ impl AccountsDB {
         super::get_blocks::get_blocks(self, start_slot, end_slot).await
     }
 
+    pub async fn get_blocks_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<BlockInfo>> {
+        super::get_blocks_in_range::get_blocks_in_range(self, start_slot, end_slot).await
+    }
+
     pub async fn get_epoch_info(&self) -> Result<crate::rpc::api::EpochInfo> {
         super::get_epoch_info::get_epoch_info(self).await
     }
@@ -92,10 +103,8 @@ impl AccountsDB {
             &ProcessedTransaction,
         )>,
         block_info: Option<BlockInfo>,
-        slot: Option<u64>,
     ) -> Result<(), String> {
-        super::write_batch::write_batch(self, account_settlements, transactions, block_info, slot)
-            .await
+        super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
     pub async fn get_accounts(&self, accounts: &[Pubkey]) -> Vec<Option<AccountSharedData>> {

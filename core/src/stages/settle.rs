@@ -87,7 +87,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
                 .await
                 .unwrap();
-            let last_slot = accounts_db.get_latest_slot().await.ok();
+            let last_slot = accounts_db.get_latest_slot().await.ok().flatten();
             let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
 
             // Validate that last_slot and last_blockhash are both present or both absent
@@ -263,10 +263,12 @@ async fn settle_transactions(
 
     // Start collecting transaction signatures for this block
     let mut block_transaction_signatures = Vec::new();
+    let mut block_transaction_recent_blockhashes = Vec::new();
     let mut transactions_for_db = Vec::new();
 
     for (processing_result, sanitized_transaction) in processing_results.iter() {
         let signature = sanitized_transaction.signature();
+        let recent_blockhash = *sanitized_transaction.message().recent_blockhash();
 
         // Only collect successful transactions for batch write
         if let Ok(processed_tx) = processing_result {
@@ -310,8 +312,8 @@ async fn settle_transactions(
                     }
                 }
 
-                // Add transaction signature to block
                 block_transaction_signatures.push(*signature);
+                block_transaction_recent_blockhashes.push(recent_blockhash);
             }
             Ok(ProcessedTransaction::FeesOnly(fees_only_transaction)) => {
                 warn!("FeesOnly transaction: {:?}", fees_only_transaction);
@@ -320,13 +322,14 @@ async fn settle_transactions(
                 // The rollback accounts have already been handled by SVM
                 // and fees have been deducted
 
-                // Add transaction signature to block
                 block_transaction_signatures.push(*signature);
+                block_transaction_recent_blockhashes.push(recent_blockhash);
             }
             Err(e) => {
                 warn!("Transaction failed: {:?}, error: {:?}", signature, e);
                 // Failed transactions still get recorded
                 block_transaction_signatures.push(*signature);
+                block_transaction_recent_blockhashes.push(recent_blockhash);
             }
         }
     }
@@ -345,16 +348,12 @@ async fn settle_transactions(
         block_height: Some(next_slot),
         block_time: Some(block_time),
         transaction_signatures: block_transaction_signatures,
+        transaction_recent_blockhashes: block_transaction_recent_blockhashes,
     };
 
     // Use write_batch for atomic writes
     accounts_db
-        .write_batch(
-            &accounts_vec,
-            transactions_for_db,
-            Some(block_info),
-            Some(next_slot),
-        )
+        .write_batch(&accounts_vec, transactions_for_db, Some(block_info))
         .await?;
 
     Ok(SettleResult {

@@ -1,8 +1,12 @@
 use {
     anyhow::Result,
     contra_core::nodes::node::{run_node, NodeConfig, NodeHandles},
+    solana_client::nonblocking::rpc_client::RpcClient,
+    solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction},
+    solana_transaction_status::UiTransactionEncoding,
     std::{sync::Once, time::Duration},
     tokio::time::sleep,
+    tracing::warn,
 };
 
 // Ensure tracing is only initialized once across all tests
@@ -42,4 +46,48 @@ pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
     println!("Node endpoint: {}", url);
 
     Ok((node_handles, url))
+}
+
+/// Poll until a transaction is visible, up to 3 seconds.
+pub async fn confirm_transaction(client: &RpcClient, sig: Signature) {
+    for _ in 0..30 {
+        match client
+            .get_transaction(&sig, UiTransactionEncoding::Base64)
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => warn!("Error getting transaction: {}", e),
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Transaction {} not confirmed within 3 seconds", sig);
+}
+
+/// Send a transaction and poll until it is visible.
+pub async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
+    let sig = client.send_transaction(tx).await.unwrap();
+    confirm_transaction(client, sig).await;
+}
+
+/// Return the parsed token balance of a token account.
+/// Returns Err if the account does not exist or the balance cannot be parsed.
+pub async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> Result<u64> {
+    let balance = client
+        .get_token_account_balance(token_account)
+        .await
+        .map_err(anyhow::Error::from)?;
+    balance.amount.parse::<u64>().map_err(anyhow::Error::from)
+}
+
+/// Shut down an existing node and restart it with the same config.
+/// Used by the dedup-persistence test to simulate a process restart.
+pub async fn restart_contra(
+    handles: NodeHandles,
+    config: NodeConfig,
+) -> Result<(NodeHandles, String)> {
+    println!("\n=== Restarting Node ===");
+    handles.shutdown().await;
+    // Brief pause to allow the OS to release the port
+    sleep(Duration::from_millis(200)).await;
+    start_contra(config).await
 }

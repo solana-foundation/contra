@@ -91,6 +91,82 @@ async fn perform_reconciliation_check(
     Ok(())
 }
 
+/// Represents a balance mismatch between on-chain and database balances for a specific mint
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceMismatch {
+    pub mint: Pubkey,
+    pub on_chain_balance: u64,
+    pub db_balance: u64,
+    pub delta_bps: u64,
+}
+
+/// Compares on-chain and database balances for all mints and identifies mismatches exceeding tolerance
+///
+/// Calculates the delta in basis points for each mint using the formula:
+/// `delta_bps = |(on_chain - db) / on_chain * 10000|`
+///
+/// Mismatches are detected when:
+/// - A mint exists on-chain but not in DB (or vice versa) - always a critical mismatch
+/// - The delta exceeds the tolerance threshold (e.g., 10 basis points = 0.1%)
+///
+/// # Arguments
+/// * `on_chain_balances` - Map of mint pubkey to balance fetched from Solana RPC
+/// * `db_balances` - Map of mint pubkey to net balance (deposits - withdrawals) from database
+/// * `tolerance_bps` - Maximum acceptable delta in basis points (100 bps = 1%)
+///
+/// # Returns
+/// * `Vec<BalanceMismatch>` - List of mismatches exceeding tolerance, empty if all balances reconcile
+fn compare_balances(
+    on_chain_balances: &HashMap<Pubkey, u64>,
+    db_balances: &HashMap<Pubkey, u64>,
+    tolerance_bps: u16,
+) -> Vec<BalanceMismatch> {
+    let mut mismatches = Vec::new();
+
+    // Collect all unique mints from both sources
+    let mut all_mints: std::collections::HashSet<Pubkey> = on_chain_balances.keys().copied().collect();
+    all_mints.extend(db_balances.keys().copied());
+
+    for mint in all_mints {
+        let on_chain = *on_chain_balances.get(&mint).unwrap_or(&0);
+        let db = *db_balances.get(&mint).unwrap_or(&0);
+
+        // Both zero is considered a match (no alert needed)
+        if on_chain == 0 && db == 0 {
+            continue;
+        }
+
+        // Calculate delta in basis points
+        // Formula: |(on_chain - db) / on_chain * 10000|
+        // Special case: if on_chain is zero but db is not, this is a critical mismatch
+        let delta_bps = if on_chain == 0 {
+            // Critical: DB shows balance but on-chain is zero
+            u64::MAX // Use max to ensure it exceeds any tolerance
+        } else {
+            // Calculate percentage difference in basis points
+            let diff = if on_chain > db {
+                on_chain - db
+            } else {
+                db - on_chain
+            };
+            // Use u128 to avoid overflow during multiplication
+            ((diff as u128 * 10000) / on_chain as u128) as u64
+        };
+
+        // Check if delta exceeds tolerance
+        if delta_bps > tolerance_bps as u64 {
+            mismatches.push(BalanceMismatch {
+                mint,
+                on_chain_balance: on_chain,
+                db_balance: db,
+                delta_bps,
+            });
+        }
+    }
+
+    mismatches
+}
+
 /// Fetches on-chain token balances for all token accounts owned by the escrow
 ///
 /// Queries the Solana RPC using `get_token_accounts_by_owner` to retrieve all SPL token accounts
@@ -193,5 +269,235 @@ mod tests {
 
         assert_eq!(*balances.get(&mint1).unwrap(), 300);
         assert_eq!(*balances.get(&mint2).unwrap(), 500);
+    }
+
+    #[test]
+    fn test_compare_balances_exact_match() {
+        // Test exact balance match - should return no mismatches
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        on_chain.insert(mint, 1000);
+        db.insert(mint, 1000);
+
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(mismatches.len(), 0, "Exact match should have no mismatches");
+    }
+
+    #[test]
+    fn test_compare_balances_within_tolerance() {
+        // Test balance difference within tolerance - should return no mismatches
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 10000 on-chain, 9999 in DB = 1 basis point difference (0.01%)
+        on_chain.insert(mint, 10000);
+        db.insert(mint, 9999);
+
+        let mismatches = compare_balances(&on_chain, &db, 10); // 10 bps tolerance
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Difference within tolerance should have no mismatches"
+        );
+    }
+
+    #[test]
+    fn test_compare_balances_exceeds_tolerance() {
+        // Test balance difference exceeding tolerance - should return mismatch
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 10000 on-chain, 9900 in DB = 100 basis points difference (1%)
+        on_chain.insert(mint, 10000);
+        db.insert(mint, 9900);
+
+        let mismatches = compare_balances(&on_chain, &db, 10); // 10 bps tolerance
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "Difference exceeding tolerance should have mismatch"
+        );
+
+        let mismatch = &mismatches[0];
+        assert_eq!(mismatch.mint, mint);
+        assert_eq!(mismatch.on_chain_balance, 10000);
+        assert_eq!(mismatch.db_balance, 9900);
+        assert_eq!(mismatch.delta_bps, 100); // 1% = 100 basis points
+    }
+
+    #[test]
+    fn test_compare_balances_both_zero() {
+        // Test both balances zero - should return no mismatches
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        on_chain.insert(mint, 0);
+        db.insert(mint, 0);
+
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Both zero should have no mismatches"
+        );
+    }
+
+    #[test]
+    fn test_compare_balances_on_chain_only() {
+        // Test mint exists on-chain but not in DB - critical mismatch
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let db = HashMap::new();
+
+        on_chain.insert(mint, 1000);
+
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "On-chain balance without DB balance should be mismatch"
+        );
+
+        let mismatch = &mismatches[0];
+        assert_eq!(mismatch.mint, mint);
+        assert_eq!(mismatch.on_chain_balance, 1000);
+        assert_eq!(mismatch.db_balance, 0);
+        assert_eq!(mismatch.delta_bps, 10000); // 100% difference
+    }
+
+    #[test]
+    fn test_compare_balances_db_only() {
+        // Test mint exists in DB but not on-chain - critical mismatch
+        let mint = Pubkey::new_unique();
+        let on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        db.insert(mint, 1000);
+
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "DB balance without on-chain balance should be critical mismatch"
+        );
+
+        let mismatch = &mismatches[0];
+        assert_eq!(mismatch.mint, mint);
+        assert_eq!(mismatch.on_chain_balance, 0);
+        assert_eq!(mismatch.db_balance, 1000);
+        assert_eq!(
+            mismatch.delta_bps,
+            u64::MAX,
+            "On-chain zero with DB balance should have MAX delta"
+        );
+    }
+
+    #[test]
+    fn test_compare_balances_multiple_mints() {
+        // Test multiple mints with mixed results
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mint3 = Pubkey::new_unique();
+
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Mint1: exact match (no mismatch)
+        on_chain.insert(mint1, 1000);
+        db.insert(mint1, 1000);
+
+        // Mint2: within tolerance (no mismatch)
+        on_chain.insert(mint2, 10000);
+        db.insert(mint2, 9999); // 1 bps difference
+
+        // Mint3: exceeds tolerance (mismatch)
+        on_chain.insert(mint3, 10000);
+        db.insert(mint3, 9800); // 200 bps difference (2%)
+
+        let mismatches = compare_balances(&on_chain, &db, 10); // 10 bps tolerance
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "Should only have one mismatch for mint3"
+        );
+
+        let mismatch = &mismatches[0];
+        assert_eq!(mismatch.mint, mint3);
+        assert_eq!(mismatch.delta_bps, 200);
+    }
+
+    #[test]
+    fn test_compare_balances_bps_calculation_accuracy() {
+        // Test basis points calculation accuracy
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Test 0.1% difference (10 basis points)
+        on_chain.insert(mint, 100000);
+        db.insert(mint, 99900); // 0.1% = 10 bps
+
+        let mismatches = compare_balances(&on_chain, &db, 9);
+        assert_eq!(mismatches.len(), 1, "Should detect 10 bps with 9 bps tolerance");
+        assert_eq!(mismatches[0].delta_bps, 10);
+
+        // Test edge case: exactly at tolerance threshold
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(mismatches.len(), 0, "Should not detect 10 bps with 10 bps tolerance");
+    }
+
+    #[test]
+    fn test_compare_balances_db_greater_than_on_chain() {
+        // Test when DB balance is greater than on-chain balance
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        on_chain.insert(mint, 9000);
+        db.insert(mint, 10000); // DB has more than on-chain
+
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "DB > on-chain should be detected as mismatch"
+        );
+
+        let mismatch = &mismatches[0];
+        assert_eq!(mismatch.on_chain_balance, 9000);
+        assert_eq!(mismatch.db_balance, 10000);
+        // Delta = |9000 - 10000| / 9000 * 10000 = 1000 / 9000 * 10000 ≈ 1111 bps
+        assert!(
+            mismatch.delta_bps > 1000,
+            "Delta should be > 1000 bps for 1000 unit difference on 9000 base"
+        );
+    }
+
+    #[test]
+    fn test_compare_balances_large_values() {
+        // Test with large token amounts to ensure no overflow
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Use large values (e.g., billions of tokens)
+        let large_value = 1_000_000_000_000u64; // 1 trillion
+        on_chain.insert(mint, large_value);
+        db.insert(mint, large_value - 100_000_000); // 100 million difference
+
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(mismatches.len(), 1);
+
+        let mismatch = &mismatches[0];
+        // Delta should be approximately 1 bps (100M / 1T * 10000 = 1)
+        assert!(
+            mismatch.delta_bps > 0,
+            "Should detect difference even with large values"
+        );
     }
 }

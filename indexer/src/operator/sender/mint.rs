@@ -7,6 +7,8 @@ use crate::operator::{
 };
 use serde_json::Value;
 use solana_keychain::SolanaSigner;
+use solana_rpc_client_api::client_error::ErrorKind;
+use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -164,6 +166,14 @@ pub(super) async fn find_existing_mint_signature(
     {
         Ok(signatures) => signatures,
         Err(e) => {
+            if is_method_not_found_error(e.as_ref()) {
+                warn!(
+                    "Skipping mint idempotency lookup for transaction_id {}: \
+                     RPC endpoint does not support getSignaturesForAddress",
+                    transaction_id
+                );
+                return Ok(None);
+            }
             return Err(format!(
                 "Failed idempotency lookup for transaction_id {} on {}: {}",
                 transaction_id, expected_mint.recipient_ata, e
@@ -212,6 +222,13 @@ pub(super) async fn find_existing_mint_signature(
     }
 
     Ok(None)
+}
+
+fn is_method_not_found_error(error: &solana_rpc_client_api::client_error::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
+    )
 }
 
 fn expected_mint_instruction(

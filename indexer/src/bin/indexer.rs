@@ -354,6 +354,9 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         rpc_commitment: operator
             .rpc_commitment
             .unwrap_or(CommitmentLevel::Confirmed),
+        reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
+        reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
+        reconciliation_webhook_url: operator.reconciliation_webhook_url,
     };
 
     // Validate signer configuration early (from environment variables)

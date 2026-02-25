@@ -1,8 +1,10 @@
 use {
     crate::{
-        accounts::{traits::BlockInfo, AccountsDB},
+        accounts::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::BlockInfo, AccountsDB},
         nodes::node::WorkerHandle,
     },
+    anyhow::{anyhow, Context, Result},
+    redis::AsyncCommands,
     solana_hash::Hash,
     solana_rpc_client_types::response::RpcPerfSample,
     solana_sdk::{
@@ -44,6 +46,66 @@ struct SettleResult {
 struct LastBlock {
     slot: u64,
     blockhash: Hash,
+}
+
+/// Warm the Redis cache by reading from Postgres and writing to Redis
+/// This is called on startup to ensure Redis has the latest state from Postgres
+async fn warm_redis_cache(
+    postgres_db: &PostgresAccountsDB,
+    redis_db: &RedisAccountsDB,
+) -> Result<()> {
+    info!("Warming Redis cache from Postgres...");
+
+    // Read latest_slot from Postgres
+    let pool = postgres_db.pool.clone();
+    let slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
+        .fetch_one(pool.as_ref())
+        .await
+        .context("Failed to query latest slot from Postgres")?;
+
+    if let Some(slot_value) = slot {
+        let slot_u64 = slot_value as u64;
+
+        // Write latest_slot to Redis
+        let mut conn = redis_db.connection.clone();
+        conn.set("latest_slot", slot_u64)
+            .await
+            .map_err(|e| anyhow!("Failed to write latest_slot to Redis: {}", e))?;
+
+        info!("Warmed Redis cache: latest_slot = {}", slot_u64);
+    } else {
+        warn!("No blocks found in Postgres - skipping latest_slot cache warming");
+    }
+
+    // Read latest_blockhash from Postgres
+    let blockhash_bytes: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM metadata WHERE key = 'latest_blockhash'")
+            .fetch_optional(pool.as_ref())
+            .await
+            .context("Failed to query latest blockhash from Postgres")?;
+
+    if let Some(bytes) = blockhash_bytes {
+        // Convert bytes to Hash and then to string for Redis storage
+        let hash_array: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid blockhash bytes length: {}", bytes.len()))?;
+        let hash = Hash::new_from_array(hash_array);
+        let hash_str = hash.to_string();
+
+        // Write latest_blockhash to Redis
+        let mut conn = redis_db.connection.clone();
+        conn.set("latest_blockhash", hash_str.clone())
+            .await
+            .map_err(|e| anyhow!("Failed to write latest_blockhash to Redis: {}", e))?;
+
+        info!("Warmed Redis cache: latest_blockhash = {}", hash_str);
+    } else {
+        warn!("No blockhash found in Postgres metadata - skipping latest_blockhash cache warming");
+    }
+
+    info!("Redis cache warming completed successfully");
+    Ok(())
 }
 
 pub struct SettleArgs {

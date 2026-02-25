@@ -27,21 +27,13 @@ pub async fn write_batch(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-    slot: Option<u64>,
 ) -> Result<(), String> {
     match db {
         AccountsDB::Postgres(postgres_db) => {
             write_batch_postgres(postgres_db, account_settlements, transactions, block_info).await
         }
         AccountsDB::Redis(redis_db) => {
-            write_batch_redis(
-                redis_db,
-                account_settlements,
-                transactions,
-                block_info,
-                slot,
-            )
-            .await
+            write_batch_redis(redis_db, account_settlements, transactions, block_info).await
         }
     }
 }
@@ -189,7 +181,6 @@ async fn write_batch_redis(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-    slot: Option<u64>,
 ) -> Result<(), String> {
     // Use Redis pipeline for atomic batch operations
     let mut pipe = redis::pipe();
@@ -221,17 +212,13 @@ async fn write_batch_redis(
         pipe.incr("transaction_count", tx_count);
     }
 
-    // Store block info
+    // Store block info and update latest slot
     if let Some(block) = block_info {
         pipe.set("latest_blockhash", block.blockhash.to_string());
+        pipe.set("latest_slot", block.slot);
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
         pipe.set(key, serialized);
-    }
-
-    // Update slot
-    if let Some(new_slot) = slot {
-        pipe.set("latest_slot", new_slot);
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

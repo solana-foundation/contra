@@ -353,12 +353,7 @@ async fn settle_transactions(
 
     // Use write_batch for atomic writes
     accounts_db
-        .write_batch(
-            &accounts_vec,
-            transactions_for_db,
-            Some(block_info),
-            Some(next_slot),
-        )
+        .write_batch(&accounts_vec, transactions_for_db, Some(block_info))
         .await?;
 
     Ok(SettleResult {

@@ -103,10 +103,8 @@ impl AccountsDB {
             &ProcessedTransaction,
         )>,
         block_info: Option<BlockInfo>,
-        slot: Option<u64>,
     ) -> Result<(), String> {
-        super::write_batch::write_batch(self, account_settlements, transactions, block_info, slot)
-            .await
+        super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
     pub async fn get_accounts(&self, accounts: &[Pubkey]) -> Vec<Option<AccountSharedData>> {

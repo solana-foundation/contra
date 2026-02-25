@@ -149,6 +149,19 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
                 .await
                 .unwrap();
+
+            // Warm Redis cache from Postgres on startup (Dual backend only)
+            match &accounts_db {
+                crate::accounts::traits::AccountsDB::Dual(postgres_db, redis_db) => {
+                    if let Err(e) = warm_redis_cache(postgres_db, redis_db).await {
+                        warn!("Cache warming failed (non-fatal): {}", e);
+                    }
+                }
+                _ => {
+                    info!("Skipping cache warming - not using dual backend");
+                }
+            }
+
             let last_slot = accounts_db.get_latest_slot().await.ok();
             let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
 

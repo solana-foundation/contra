@@ -1,10 +1,14 @@
 use crate::{
     config::{BackfillConfig, ProgramType},
     error::IndexerError,
-    indexer::{backfill::BackfillService, datasource::rpc_polling::rpc::RpcPoller},
+    indexer::{
+        backfill::BackfillService, checkpoint::CheckpointWriter,
+        datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
+    },
     storage::Storage,
 };
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::info;
 
 /// Resync service for rebuilding indexer database from chain history
@@ -69,7 +73,21 @@ impl ResyncService {
             self.escrow_instance_id,
         );
 
-        // TODO: Step 4: Invoke backfill service to process all transactions from genesis_slot to current slot
+        // Step 4: Setup processing pipeline
+        // Create channels for instruction flow and checkpoint updates
+        let (instruction_tx, instruction_rx) = mpsc::channel(1000);
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
+
+        // Start checkpoint writer service
+        let checkpoint_writer = CheckpointWriter::new(self.storage.clone());
+        let _checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
+        info!("CheckpointWriter service started");
+
+        // Create transaction processor
+        let _transaction_processor =
+            TransactionProcessor::new(self.storage.clone(), checkpoint_tx);
+
+        // TODO: Start TransactionProcessor and invoke backfill service to process all transactions from genesis_slot to current slot
 
         info!("Resync complete for {:?}", self.program_type);
         Ok(())

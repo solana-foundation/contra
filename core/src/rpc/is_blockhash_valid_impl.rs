@@ -24,12 +24,16 @@ pub async fn is_blockhash_valid_impl(
     // Check if the blockhash is in the live blockhash window
     // This validates against the full window maintained by the Dedup stage,
     // not just the single latest blockhash, upholding security invariant C4
-    let is_valid = read_deps
+    //
+    // Edge cases handled:
+    // - Empty window: iter().any() returns false (all blockhashes rejected at startup)
+    // - Lock poisoning: Properly handled with map_err instead of unwrap()
+    let live_blockhashes = read_deps
         .live_blockhashes
         .read()
-        .unwrap()
-        .iter()
-        .any(|h| h == &provided_hash);
+        .map_err(|e| custom_error(-32603, format!("Failed to acquire blockhash lock: {}", e)))?;
+
+    let is_valid = live_blockhashes.iter().any(|h| h == &provided_hash);
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

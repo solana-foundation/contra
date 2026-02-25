@@ -784,4 +784,314 @@ mod tests {
 
         mock.assert_async().await;
     }
+
+    // Additional edge case tests for basis points calculation
+
+    #[test]
+    fn test_bps_calculation_very_small_difference() {
+        // Test that differences less than 1 basis point are detected correctly
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 1,000,000 on-chain, 999,999 in DB
+        // Delta = 1 / 1,000,000 * 10,000 = 0.01 bps (rounds to 0)
+        on_chain.insert(mint, 1_000_000);
+        db.insert(mint, 999_999);
+
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Sub-basis-point differences should be within 0 bps tolerance"
+        );
+    }
+
+    #[test]
+    fn test_bps_calculation_exactly_one_basis_point() {
+        // Test exactly 1 basis point difference
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 100,000 on-chain, 99,990 in DB = exactly 10 / 100,000 * 10,000 = 1 bps
+        on_chain.insert(mint, 100_000);
+        db.insert(mint, 99_990);
+
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(mismatches.len(), 1, "1 bps should exceed 0 bps tolerance");
+        assert_eq!(mismatches[0].delta_bps, 1);
+
+        let mismatches = compare_balances(&on_chain, &db, 1);
+        assert_eq!(mismatches.len(), 0, "1 bps should be within 1 bps tolerance");
+    }
+
+    #[test]
+    fn test_bps_calculation_small_balances() {
+        // Test with very small balances to ensure no division issues
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 10 on-chain, 9 in DB = 1 / 10 * 10,000 = 1,000 bps (10%)
+        on_chain.insert(mint, 10);
+        db.insert(mint, 9);
+
+        let mismatches = compare_balances(&on_chain, &db, 999);
+        assert_eq!(mismatches.len(), 1, "10% difference should exceed 9.99% tolerance");
+        assert_eq!(mismatches[0].delta_bps, 1000);
+    }
+
+    #[test]
+    fn test_bps_calculation_single_unit_difference() {
+        // Test with single unit differences at various scales
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mint3 = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 1 unit difference on 1000 base = 10 bps
+        on_chain.insert(mint1, 1000);
+        db.insert(mint1, 999);
+
+        // 1 unit difference on 10000 base = 1 bps
+        on_chain.insert(mint2, 10000);
+        db.insert(mint2, 9999);
+
+        // 1 unit difference on 100 base = 100 bps
+        on_chain.insert(mint3, 100);
+        db.insert(mint3, 99);
+
+        let mismatches = compare_balances(&on_chain, &db, 5);
+        // Should detect mint1 (10 bps) and mint3 (100 bps), but not mint2 (1 bps)
+        assert_eq!(
+            mismatches.len(),
+            2,
+            "Should detect mismatches > 5 bps tolerance"
+        );
+
+        // Verify the detected mismatches are mint1 and mint3
+        let mismatch_mints: Vec<Pubkey> = mismatches.iter().map(|m| m.mint).collect();
+        assert!(mismatch_mints.contains(&mint1));
+        assert!(mismatch_mints.contains(&mint3));
+        assert!(!mismatch_mints.contains(&mint2));
+    }
+
+    #[test]
+    fn test_bps_calculation_near_max_u64() {
+        // Test with values near u64::MAX to ensure no overflow in intermediate calculations
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Use large values that would overflow if we didn't use u128 internally
+        let large_value = u64::MAX / 2; // Half of u64::MAX
+        let diff = large_value / 10000; // 0.01% difference
+
+        on_chain.insert(mint, large_value);
+        db.insert(mint, large_value - diff);
+
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "Should detect mismatch with large values"
+        );
+
+        // Delta should be approximately 1 bps
+        let mismatch = &mismatches[0];
+        assert!(
+            mismatch.delta_bps >= 1 && mismatch.delta_bps <= 2,
+            "Delta should be approximately 1 bps, got {}",
+            mismatch.delta_bps
+        );
+    }
+
+    #[test]
+    fn test_bps_calculation_rounding_behavior() {
+        // Test integer division rounding behavior
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 99,999 on-chain, 99,998 in DB
+        // Delta = 1 / 99,999 * 10,000 = 0.100001... bps (rounds down to 0)
+        on_chain.insert(mint, 99_999);
+        db.insert(mint, 99_998);
+
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Rounded-down sub-basis-point difference should be within 0 bps tolerance"
+        );
+
+        // Now test a case that rounds up to 1 bps
+        on_chain.insert(mint, 10_001);
+        db.insert(mint, 10_000);
+
+        // Delta = 1 / 10,001 * 10,000 = 0.9999... bps (rounds down to 0)
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Should round down to 0 bps"
+        );
+    }
+
+    #[test]
+    fn test_bps_calculation_exact_tolerance_boundaries() {
+        // Test behavior at exact tolerance boundaries
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mint3 = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Exactly 10 bps difference
+        on_chain.insert(mint1, 100_000);
+        db.insert(mint1, 99_900);
+
+        // Exactly 11 bps difference
+        on_chain.insert(mint2, 100_000);
+        db.insert(mint2, 99_890);
+
+        // Exactly 9 bps difference
+        on_chain.insert(mint3, 100_000);
+        db.insert(mint3, 99_910);
+
+        // Test with 10 bps tolerance - should only detect mint2 (11 bps)
+        let mismatches = compare_balances(&on_chain, &db, 10);
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "Should only detect mismatches > 10 bps tolerance"
+        );
+        assert_eq!(mismatches[0].mint, mint2);
+        assert_eq!(mismatches[0].delta_bps, 11);
+    }
+
+    #[test]
+    fn test_bps_calculation_symmetry() {
+        // Test that delta calculation is symmetric (on_chain > db vs db > on_chain)
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Case 1: on_chain > db by 100
+        on_chain.insert(mint1, 10_000);
+        db.insert(mint1, 9_900);
+
+        // Case 2: db > on_chain by 100 (same absolute difference)
+        on_chain.insert(mint2, 10_000);
+        db.insert(mint2, 10_100);
+
+        let mismatches = compare_balances(&on_chain, &db, 50);
+        assert_eq!(
+            mismatches.len(),
+            2,
+            "Both cases should be detected as mismatches"
+        );
+
+        // Both should have 100 bps delta (1% of 10,000)
+        for mismatch in mismatches {
+            assert_eq!(
+                mismatch.delta_bps, 100,
+                "Delta should be 100 bps for both cases"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bps_calculation_zero_tolerance() {
+        // Test with zero tolerance - only exact matches should pass
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // Exact match
+        on_chain.insert(mint1, 1000);
+        db.insert(mint1, 1000);
+
+        // Tiny difference
+        on_chain.insert(mint2, 1_000_000);
+        db.insert(mint2, 999_999);
+
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Sub-basis-point differences should pass with 0 tolerance due to rounding"
+        );
+    }
+
+    #[test]
+    fn test_bps_calculation_maximum_tolerance() {
+        // Test with maximum u16 tolerance (65535 bps = 655.35%)
+        let mint = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 100% difference (10000 bps)
+        on_chain.insert(mint, 1000);
+        db.insert(mint, 0);
+
+        let mismatches = compare_balances(&on_chain, &db, u16::MAX);
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "100% difference should be within 655% tolerance"
+        );
+
+        // But db-only case (on_chain = 0, db > 0) should still be detected
+        let on_chain_empty = HashMap::new();
+        let mut db_only = HashMap::new();
+        db_only.insert(mint, 1000);
+
+        let mismatches = compare_balances(&on_chain_empty, &db_only, u16::MAX);
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "DB-only balance should always be detected (u64::MAX delta)"
+        );
+        assert_eq!(mismatches[0].delta_bps, u64::MAX);
+    }
+
+    #[test]
+    fn test_bps_calculation_precision_with_decimal_percentages() {
+        // Test precision for common decimal percentages
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mint3 = Pubkey::new_unique();
+        let mut on_chain = HashMap::new();
+        let mut db = HashMap::new();
+
+        // 0.5% difference = 50 bps
+        on_chain.insert(mint1, 100_000);
+        db.insert(mint1, 99_500);
+
+        // 0.25% difference = 25 bps
+        on_chain.insert(mint2, 100_000);
+        db.insert(mint2, 99_750);
+
+        // 0.125% difference = 12.5 bps (rounds to 12)
+        on_chain.insert(mint3, 100_000);
+        db.insert(mint3, 99_875);
+
+        let mismatches = compare_balances(&on_chain, &db, 0);
+        assert_eq!(mismatches.len(), 3);
+
+        // Verify delta values
+        let deltas: HashMap<Pubkey, u64> = mismatches
+            .iter()
+            .map(|m| (m.mint, m.delta_bps))
+            .collect();
+
+        assert_eq!(deltas[&mint1], 50, "0.5% should be 50 bps");
+        assert_eq!(deltas[&mint2], 25, "0.25% should be 25 bps");
+        assert_eq!(deltas[&mint3], 12, "0.125% should be 12 bps (rounded down)");
+    }
 }

@@ -438,3 +438,135 @@ async fn settle_transactions(
         account_settlements: accounts_vec,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::AsyncCommands;
+    use solana_hash::Hash;
+
+    /// Test that cache warming reads from Postgres and writes to Redis correctly.
+    ///
+    /// This test verifies:
+    /// 1. Reads latest_slot from Postgres (MAX(slot) from blocks table)
+    /// 2. Writes latest_slot to Redis
+    /// 3. Reads latest_blockhash from Postgres metadata table
+    /// 4. Writes latest_blockhash to Redis
+    ///
+    /// Note: This is an integration test that requires:
+    /// - TEST_POSTGRES_URL environment variable with a test database
+    /// - TEST_REDIS_URL environment variable with a test Redis instance
+    #[tokio::test]
+    #[ignore] // Requires database setup
+    async fn test_cache_warming() {
+        use std::env;
+
+        // Setup: Get test database URLs from environment
+        let postgres_url = env::var("TEST_POSTGRES_URL")
+            .unwrap_or_else(|_| "postgresql://contra:contra@localhost:5432/contra_test".to_string());
+        let redis_url = env::var("TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+        // Create Postgres connection
+        let postgres_db = match PostgresAccountsDB::new(&postgres_url, false).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: Cannot connect to test Postgres: {}", e);
+                return;
+            }
+        };
+
+        // Create Redis connection
+        let redis_db = match RedisAccountsDB::new(&redis_url).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: Cannot connect to test Redis: {}", e);
+                return;
+            }
+        };
+
+        // Setup test data in Postgres
+        let test_slot = 12345u64;
+        let test_blockhash = Hash::default();
+        let test_blockhash_bytes = test_blockhash.to_bytes();
+
+        let pool = postgres_db.pool.clone();
+
+        // Insert test block with slot
+        let insert_result = sqlx::query(
+            "INSERT INTO blocks (slot, blockhash, previous_blockhash, parent_slot, block_time)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (slot) DO NOTHING"
+        )
+        .bind(test_slot as i64)
+        .bind(test_blockhash_bytes.to_vec())
+        .bind(test_blockhash_bytes.to_vec())
+        .bind(0i64)
+        .bind(0i64)
+        .execute(pool.as_ref())
+        .await;
+
+        if let Err(e) = insert_result {
+            eprintln!("Skipping test: Cannot insert test data into Postgres: {}", e);
+            return;
+        }
+
+        // Insert test blockhash into metadata
+        let metadata_result = sqlx::query(
+            "INSERT INTO metadata (key, value)
+             VALUES ('latest_blockhash', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+        )
+        .bind(test_blockhash_bytes.to_vec())
+        .execute(pool.as_ref())
+        .await;
+
+        if let Err(e) = metadata_result {
+            eprintln!("Skipping test: Cannot insert metadata into Postgres: {}", e);
+            return;
+        }
+
+        // Execute: Call warm_redis_cache
+        let result = warm_redis_cache(&postgres_db, &redis_db).await;
+
+        // Verify: Function should succeed
+        assert!(
+            result.is_ok(),
+            "warm_redis_cache should succeed. Got error: {:?}",
+            result.err()
+        );
+
+        // Verify: Check that Redis was populated correctly
+        let mut conn = redis_db.connection.clone();
+
+        // Check latest_slot in Redis
+        let redis_slot: Option<u64> = conn.get("latest_slot").await.ok();
+        assert_eq!(
+            redis_slot,
+            Some(test_slot),
+            "Redis should contain the correct latest_slot"
+        );
+
+        // Check latest_blockhash in Redis
+        let redis_blockhash_str: Option<String> = conn.get("latest_blockhash").await.ok();
+        assert_eq!(
+            redis_blockhash_str,
+            Some(test_blockhash.to_string()),
+            "Redis should contain the correct latest_blockhash"
+        );
+
+        // Cleanup: Remove test data from Postgres
+        let _ = sqlx::query("DELETE FROM blocks WHERE slot = $1")
+            .bind(test_slot as i64)
+            .execute(pool.as_ref())
+            .await;
+
+        let _ = sqlx::query("DELETE FROM metadata WHERE key = 'latest_blockhash'")
+            .execute(pool.as_ref())
+            .await;
+
+        // Cleanup: Remove test data from Redis
+        let _: Result<(), _> = conn.del("latest_slot").await;
+        let _: Result<(), _> = conn.del("latest_blockhash").await;
+    }
+}

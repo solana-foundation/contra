@@ -3,7 +3,7 @@
   "spec": "002-add-alerting-for-failed-withdrawals-issuances",
   "state": "building",
   "subtasks": {
-    "completed": 1,
+    "completed": 3,
     "total": 9,
     "in_progress": 1,
     "failed": 0
@@ -18,8 +18,8 @@
     "max": 1
   },
   "session": {
-    "number": 2,
+    "number": 4,
     "started_at": "2026-02-25T13:40:04.544957"
   },
-  "last_update": "2026-02-25T13:40:58.998775"
+  "last_update": "2026-02-25T13:45:33.137595"
 }

@@ -163,8 +163,6 @@ mod tests {
         (input_tx, bh_tx, output_rx, shutdown)
     }
 
-    // --- C4: transaction with unknown blockhash must be rejected --------
-
     #[tokio::test]
     async fn unknown_blockhash_rejected() {
         let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
@@ -190,8 +188,6 @@ mod tests {
         shutdown.cancel();
     }
 
-    // --- C3: duplicate signature must be rejected ----------------------
-
     #[tokio::test]
     async fn duplicate_signature_rejected() {
         let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
@@ -215,8 +211,6 @@ mod tests {
 
         shutdown.cancel();
     }
-
-    // --- Happy path: valid unique tx with known blockhash forwarded ----
 
     #[tokio::test]
     async fn valid_transaction_forwarded() {
@@ -242,8 +236,6 @@ mod tests {
 
         shutdown.cancel();
     }
-
-    // --- Blockhash window eviction ------------------------------------
 
     #[tokio::test]
     async fn expired_blockhash_evicted() {

@@ -138,8 +138,6 @@ mod tests {
         (WriteDeps { dedup_tx }, rx)
     }
 
-    // --- C6: disallowed program ID must be rejected --------------------
-
     #[tokio::test]
     async fn disallowed_program_rejected() {
         let payer = Keypair::new();

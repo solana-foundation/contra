@@ -262,8 +262,6 @@ mod tests {
         spl_token::instruction::initialize_mint(&spl_token::id(), mint, authority, None, 6).unwrap()
     }
 
-    // --- C9: empty transaction (no instructions) must be rejected ------
-
     #[tokio::test]
     async fn empty_transaction_rejected() {
         let payer = Keypair::new();
@@ -277,8 +275,6 @@ mod tests {
             "expected InvalidTransaction(Empty), got {result}"
         );
     }
-
-    // --- C8: mixed admin + non-admin instructions must be rejected -----
 
     #[tokio::test]
     async fn mixed_transaction_rejected() {
@@ -301,8 +297,6 @@ mod tests {
             "expected InvalidTransaction(Mixed), got {result}"
         );
     }
-
-    // --- C7: admin instruction without admin signer must be rejected ---
 
     #[tokio::test]
     async fn admin_instruction_without_admin_signer_rejected() {
@@ -332,8 +326,6 @@ mod tests {
             "expected Valid(Admin), got {result}"
         );
     }
-
-    // --- C5: unsigned / tampered signatures must be rejected -------------
 
     #[tokio::test]
     async fn unsigned_transaction_rejected() {
@@ -386,8 +378,6 @@ mod tests {
         );
     }
 
-    // --- Normal happy path: properly signed normal tx accepted ---------
-
     #[tokio::test]
     async fn valid_normal_transaction_accepted() {
         let payer = Keypair::new();
@@ -402,8 +392,6 @@ mod tests {
             "expected Valid(Normal), got {result}"
         );
     }
-
-    // --- classify_transaction edge cases --------------------------------
 
     #[tokio::test]
     async fn instruction_with_empty_data_not_counted() {

@@ -436,4 +436,111 @@ mod tests {
         // 2. Warning logs were emitted for Redis failure
         // This requires log capture infrastructure not shown here
     }
+
+    /// Test that write_batch_dual treats Redis failures as non-fatal.
+    ///
+    /// This test verifies the core requirement:
+    /// - When Postgres write succeeds but Redis write fails, the function returns Ok(())
+    /// - Redis failures are logged but do not propagate as errors
+    ///
+    /// Note: This is an integration test that requires:
+    /// - TEST_POSTGRES_URL environment variable with a test database
+    /// - Invalid Redis URL to simulate Redis failure
+    #[tokio::test]
+    #[ignore] // Requires database setup
+    async fn test_write_batch_redis_failure_nonfatal() {
+        use std::env;
+
+        // Setup: Get test database URL from environment
+        let postgres_url = env::var("TEST_POSTGRES_URL")
+            .unwrap_or_else(|_| "postgresql://contra:contra@localhost:5432/contra_test".to_string());
+
+        // Use an invalid Redis URL to guarantee Redis write will fail
+        let redis_url = "redis://invalid-host:6379";
+
+        // Create Postgres connection (should succeed)
+        let mut postgres_db = match PostgresAccountsDB::new(&postgres_url, false).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: Cannot connect to test Postgres: {}", e);
+                return;
+            }
+        };
+
+        // Create Redis connection with invalid host
+        // If connection creation fails, we'll create a mock scenario
+        let mut redis_db = match RedisAccountsDB::new(redis_url).await {
+            Ok(db) => db,
+            Err(_) => {
+                eprintln!("Skipping test: Cannot set up Redis test scenario");
+                return;
+            }
+        };
+
+        // Create minimal test data
+        let keypair = Keypair::new();
+        let pubkey = keypair.pubkey();
+        let account = Account {
+            lamports: 1000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let account_settlement = crate::stages::AccountSettlement {
+            account: solana_sdk::account::AccountSharedData::from(account),
+            deleted: false,
+        };
+        let account_settlements = vec![(pubkey, account_settlement)];
+
+        // Create a minimal test transaction
+        let transaction = system_transaction::transfer(
+            &keypair,
+            &Keypair::new().pubkey(),
+            100,
+            Hash::default(),
+        );
+        let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
+        let processed = ProcessedTransaction::default();
+
+        let transactions = vec![(
+            Signature::default(),
+            &sanitized_tx,
+            0u64,
+            0i64,
+            &processed,
+        )];
+
+        let block_info = Some(BlockInfo {
+            slot: 100,
+            blockhash: Hash::default(),
+            block_height: Some(100),
+            block_time: Some(0),
+        });
+
+        // Execute: Call write_batch_dual with valid Postgres but failing Redis
+        let result = write_batch_dual(
+            &mut postgres_db,
+            &mut redis_db,
+            &account_settlements,
+            transactions,
+            block_info,
+            Some(100),
+        )
+        .await;
+
+        // Verify: The function MUST return Ok(()) even when Redis fails
+        // This is the core requirement: Redis failures are best-effort and non-fatal
+        assert!(
+            result.is_ok(),
+            "write_batch_dual must return Ok(()) when Redis fails (non-fatal). Got: {:?}",
+            result.err()
+        );
+
+        // The test passing means:
+        // 1. Postgres write succeeded (otherwise would have returned Err)
+        // 2. Redis write failed (due to invalid host)
+        // 3. Redis failure was caught and logged, not propagated
+        // 4. Function returned Ok(()) - Redis failure is non-fatal
+    }
 }

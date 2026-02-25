@@ -10,7 +10,7 @@ use solana_sdk::signature::Signature;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::{TransactionConfirmationStatus, TransactionStatus};
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 pub async fn get_signature_statuses_impl(
     read_deps: &ReadDeps,
@@ -43,7 +43,7 @@ pub async fn get_signature_statuses_impl(
                 warn!(
                     signature = %sig_str.get(..20).unwrap_or(&sig_str),
                     error = %e,
-                    "Skipping unparseable signature"
+                    "Invalid signature format in getSignatureStatuses"
                 );
                 statuses.push(None);
                 continue;
@@ -57,9 +57,11 @@ pub async fn get_signature_statuses_impl(
             Some(tx) => {
                 // Transaction found - return its status
                 // In Contra, all found transactions are confirmed (finalized)
-                info!(
-                    "Transaction found: {} {:?} err: {:?}",
-                    signature, tx.meta.status, tx.meta.err
+                debug!(
+                    signature = %signature,
+                    status = ?tx.meta.status,
+                    err = ?tx.meta.err,
+                    "getSignatureStatuses transaction found"
                 );
 
                 let err = tx.meta.err.clone();
@@ -77,7 +79,10 @@ pub async fn get_signature_statuses_impl(
                 }));
             }
             None => {
-                info!("Transaction not found: {}", signature);
+                debug!(
+                    signature = %signature,
+                    "getSignatureStatuses transaction not found"
+                );
                 // Transaction not found
                 statuses.push(None);
             }

@@ -85,6 +85,41 @@ async fn test_with_postgres() {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_signature_statuses_only_with_postgres() {
+    init_tracing();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let node_postgres_container = Postgres::default()
+            .with_db_name("contra_node")
+            .with_user("postgres")
+            .with_password("password")
+            .start()
+            .await
+            .expect("Failed to start node PostgreSQL container");
+
+        let node_host = node_postgres_container
+            .get_host()
+            .await
+            .expect("Failed to get node host");
+        let node_port = node_postgres_container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Failed to get node port");
+        let node_db_url = format!(
+            "postgres://postgres:password@{}:{}/contra_node",
+            node_host, node_port
+        );
+
+        let test_context = setup(node_db_url).await.unwrap();
+        run_get_signature_statuses_test(&test_context.contra_ctx).await;
+        shutdown(test_context).await;
+    })
+    .await
+    .unwrap();
+}
+
 // TODO: Tests aren't running well together. Individually, they pass. This
 // started happening after adding the L1 -> Contra operator. Needs
 // investigation.
@@ -307,6 +342,8 @@ async fn test_suite(contra_ctx: &ContraContext, l1_ctx: &L1Context) {
     run_first_available_block_test(contra_ctx).await;
     // Run get blocks test
     run_get_blocks_test(contra_ctx).await;
+    // Run get signature statuses test
+    run_get_signature_statuses_test(contra_ctx).await;
     // Run get block time test
     run_get_block_time_test(contra_ctx).await;
     // Run get slot leaders test

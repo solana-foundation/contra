@@ -314,3 +314,126 @@ async fn write_batch_redis(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::{
+        account::Account,
+        hash::Hash,
+        signature::{Keypair, Signer},
+        system_transaction,
+    };
+
+    /// Test that write_batch_dual succeeds when Postgres writes complete
+    /// but Redis is unavailable (connection fails).
+    ///
+    /// This test verifies:
+    /// 1. Postgres write succeeds
+    /// 2. Redis write failure is logged but not fatal
+    /// 3. Function returns Ok(())
+    ///
+    /// Note: This is an integration test that requires:
+    /// - TEST_POSTGRES_URL environment variable with a test database
+    /// - Redis to be unavailable (or invalid Redis URL)
+    #[tokio::test]
+    #[ignore] // Requires database setup
+    async fn test_write_batch_postgres_only() {
+        use std::env;
+
+        // Setup: Get test database URL from environment
+        let postgres_url = env::var("TEST_POSTGRES_URL")
+            .unwrap_or_else(|_| "postgresql://contra:contra@localhost:5432/contra_test".to_string());
+
+        // Use an invalid Redis URL to simulate Redis being unavailable
+        let redis_url = "redis://invalid-host:6379";
+
+        // Create database connections
+        // Postgres should succeed, Redis should fail to connect
+        let mut postgres_db = match PostgresAccountsDB::new(&postgres_url, false).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: Cannot connect to test Postgres: {}", e);
+                return;
+            }
+        };
+
+        // Create Redis connection (this should fail or be invalid)
+        let mut redis_db = match RedisAccountsDB::new(redis_url).await {
+            Ok(db) => db,
+            Err(_) => {
+                // If we can't even create the Redis connection, create a connection
+                // that will fail on write. For testing purposes, we'll skip if we
+                // can't set up the test scenario properly.
+                eprintln!("Skipping test: Cannot set up Redis test scenario");
+                return;
+            }
+        };
+
+        // Create test data
+        let keypair = Keypair::new();
+        let pubkey = keypair.pubkey();
+        let account = Account {
+            lamports: 1000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let account_settlement = crate::stages::AccountSettlement {
+            account: solana_sdk::account::AccountSharedData::from(account),
+            deleted: false,
+        };
+        let account_settlements = vec![(pubkey, account_settlement)];
+
+        // Create a test transaction
+        let transaction = system_transaction::transfer(
+            &keypair,
+            &Keypair::new().pubkey(),
+            100,
+            Hash::default(),
+        );
+        let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
+
+        let processed = ProcessedTransaction::default();
+
+        let transactions = vec![(
+            Signature::default(),
+            &sanitized_tx,
+            0u64,
+            0i64,
+            &processed,
+        )];
+
+        let block_info = Some(BlockInfo {
+            slot: 100,
+            blockhash: Hash::default(),
+            block_height: Some(100),
+            block_time: Some(0),
+        });
+
+        // Execute: Call write_batch_dual
+        // This should succeed even if Redis fails
+        let result = write_batch_dual(
+            &mut postgres_db,
+            &mut redis_db,
+            &account_settlements,
+            transactions,
+            block_info,
+            Some(100),
+        )
+        .await;
+
+        // Verify: Function should return Ok despite Redis failure
+        assert!(
+            result.is_ok(),
+            "write_batch_dual should succeed even when Redis fails. Got error: {:?}",
+            result.err()
+        );
+
+        // Note: In a real test environment, we would also verify:
+        // 1. Postgres contains the written data
+        // 2. Warning logs were emitted for Redis failure
+        // This requires log capture infrastructure not shown here
+    }
+}

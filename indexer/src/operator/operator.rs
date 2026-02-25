@@ -1,7 +1,8 @@
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::operator::{
-    fetcher, processor, sender, DbTransactionWriter, RetryConfig, RpcClientWithRetry,
+    fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
+    RpcClientWithRetry,
 };
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
@@ -113,6 +114,26 @@ pub async fn run(
         .await
         {
             tracing::error!("Sender error: {}", e);
+        }
+    });
+
+    // Start reconciliation task
+    let reconciliation_storage = storage.clone();
+    let reconciliation_config = config.clone();
+    let reconciliation_rpc = rpc_client.clone();
+    let reconciliation_escrow = common_config.escrow_instance_id;
+    let reconciliation_token = cancellation_token.clone();
+    let _reconciliation_handle = tokio::spawn(async move {
+        if let Err(e) = reconciliation::run_reconciliation(
+            reconciliation_storage,
+            reconciliation_config,
+            reconciliation_rpc,
+            reconciliation_escrow,
+            reconciliation_token,
+        )
+        .await
+        {
+            tracing::error!("Reconciliation error: {}", e);
         }
     });
 

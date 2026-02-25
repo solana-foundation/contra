@@ -1,7 +1,7 @@
 # Master Makefile for Contra Programs
 # Delegates to subdirectory Makefiles
 
-.PHONY: install build fmt generate-idl generate-clients
+.PHONY: setup install build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test all-test
 .PHONY: unit-coverage integration-coverage coverage-html all-coverage
 .PHONY: build-devnet deploy-devnet
@@ -10,6 +10,15 @@
 
 # Default target
 all: build
+
+# Setup target - orchestrates all project setup steps
+setup:
+	@echo "🚀 Setting up all projects..."
+	@echo "📦 Installing dependencies for contra-escrow-program..."
+	@cd contra-escrow-program && pnpm install
+	@echo "📦 Installing dependencies for contra-withdraw-program..."
+	@cd contra-withdraw-program && pnpm install
+	@echo "✅ Setup complete! You can now run 'make build' to build all projects."
 
 # Common targets that run on all projects (escrow + withdraw + indexer)
 install:

@@ -30,6 +30,7 @@ pub struct BlockInfo {
 pub enum AccountsDB {
     Postgres(PostgresAccountsDB),
     Redis(RedisAccountsDB),
+    Dual(PostgresAccountsDB, RedisAccountsDB),
 }
 
 impl AccountsDB {

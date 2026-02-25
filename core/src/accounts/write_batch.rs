@@ -53,6 +53,50 @@ pub async fn write_batch(
     }
 }
 
+pub async fn write_batch_dual(
+    postgres_db: &mut PostgresAccountsDB,
+    redis_db: &mut RedisAccountsDB,
+    account_settlements: &[(Pubkey, AccountSettlement)],
+    transactions: Vec<(
+        Signature,
+        &SanitizedTransaction,
+        u64,
+        UnixTimestamp,
+        &ProcessedTransaction,
+    )>,
+    block_info: Option<BlockInfo>,
+    slot: Option<u64>,
+) -> Result<(), String> {
+    // Clone data for Redis since we'll write to Postgres first
+    let transactions_clone = transactions.clone();
+    let block_info_clone = block_info.clone();
+
+    // Write to Postgres first - fail if this fails
+    write_batch_postgres(
+        postgres_db,
+        account_settlements,
+        transactions,
+        block_info,
+        slot,
+    )
+    .await?;
+
+    // Write to Redis best-effort - log but don't fail
+    if let Err(e) = write_batch_redis(
+        redis_db,
+        account_settlements,
+        transactions_clone,
+        block_info_clone,
+        slot,
+    )
+    .await
+    {
+        warn!("Best-effort Redis write failed: {}", e);
+    }
+
+    Ok(())
+}
+
 async fn write_batch_postgres(
     db: &mut PostgresAccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],

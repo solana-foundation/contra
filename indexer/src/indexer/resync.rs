@@ -28,11 +28,18 @@ impl ResyncService {
             self.program_type, genesis_slot
         );
 
-        // TODO: Implement resync logic
-        // 1. Drop existing tables
-        // 2. Recreate schema
-        // 3. Invoke backfill service from genesis_slot to current slot
-        // 4. Process all transactions
+        // Step 1: Drop existing tables
+        info!("Dropping existing database tables...");
+        self.storage.drop_tables().await?;
+        info!("Database tables dropped successfully");
+
+        // Step 2: Recreate schema
+        info!("Recreating database schema...");
+        self.storage.init_schema().await?;
+        info!("Database schema recreated successfully");
+
+        // TODO: Step 3: Invoke backfill service from genesis_slot to current slot
+        // TODO: Step 4: Process all transactions
 
         info!("Resync complete for {:?}", self.program_type);
         Ok(())

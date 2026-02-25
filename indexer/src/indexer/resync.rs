@@ -47,12 +47,18 @@ impl ResyncService {
 
         // Step 1: Drop existing tables
         info!("Dropping existing database tables...");
-        self.storage.drop_tables().await?;
+        self.storage.drop_tables().await.map_err(|e| {
+            error!("Failed to drop database tables during resync: {}", e);
+            e
+        })?;
         info!("Database tables dropped successfully");
 
         // Step 2: Recreate schema
         info!("Recreating database schema...");
-        self.storage.init_schema().await?;
+        self.storage.init_schema().await.map_err(|e| {
+            error!("Failed to recreate database schema during resync: {}", e);
+            e
+        })?;
         info!("Database schema recreated successfully");
 
         // Step 3: Create BackfillService with genesis_slot configuration
@@ -95,7 +101,10 @@ impl ResyncService {
 
         // Run backfill service (this will process all transactions from genesis_slot to current)
         let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
-            error!("Failed to fetch current slot before backfill: {}", e);
+            error!(
+                "Failed to fetch current slot before resync backfill: {}",
+                e
+            );
             IndexerError::from(e)
         })?;
 
@@ -124,7 +133,13 @@ impl ResyncService {
             genesis_slot, current_slot, total_slots
         );
 
-        backfill_service.run(instruction_tx.clone()).await?;
+        backfill_service.run(instruction_tx.clone()).await.map_err(|e| {
+            error!(
+                "Backfill service failed during resync from slot {} to {}: {}",
+                genesis_slot, current_slot, e
+            );
+            e
+        })?;
         info!("Backfill service completed");
 
         // Drop instruction_tx to signal no more instructions coming
@@ -134,25 +149,27 @@ impl ResyncService {
         match processor_handle.await {
             Ok(Ok(())) => info!("Transaction processor completed successfully"),
             Ok(Err(e)) => {
-                error!("Transaction processor failed: {}", e);
+                error!("Transaction processor failed during resync: {}", e);
                 return Err(e);
             }
             Err(e) => {
-                error!("Transaction processor task panicked: {:?}", e);
+                error!(
+                    "Transaction processor task panicked during resync: {:?}",
+                    e
+                );
                 return Err(IndexerError::ShutdownChannelSend);
             }
         }
 
         // Perform cleanup after backfill
-        if let Err(e) =
-            crate::shutdown_utils::cleanup_after_backfill(
-                checkpoint_handle,
-                checkpoint_tx,
-                self.storage.clone(),
-            )
-            .await
+        if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
+            checkpoint_handle,
+            checkpoint_tx,
+            self.storage.clone(),
+        )
+        .await
         {
-            error!("Cleanup after backfill failed: {}", e);
+            error!("Cleanup after resync backfill failed: {}", e);
             return Err(IndexerError::ShutdownChannelSend);
         }
 

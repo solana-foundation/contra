@@ -18,14 +18,14 @@ pub async fn run_blockhash_validation_test(ctx: &ContraContext) {
 
     let is_valid = ctx
         .read_client
-        .is_blockhash_valid(&recent_blockhash, solana_sdk::commitment_config::CommitmentConfig::confirmed())
+        .is_blockhash_valid(
+            &recent_blockhash,
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        )
         .await
         .unwrap();
 
-    assert!(
-        is_valid,
-        "Recent blockhash should be valid"
-    );
+    assert!(is_valid, "Recent blockhash should be valid");
     println!("✓ Recent blockhash is valid");
 
     // Test 2: Generate more blocks to populate the blockhash window
@@ -52,7 +52,11 @@ pub async fn run_blockhash_validation_test(ctx: &ContraContext) {
 
         match ctx.send_transaction(&tx).await {
             Ok(sig) => println!("Transaction {} sent: {:?}", i + 1, sig),
-            Err(e) => println!("Transaction {} failed (expected in some test setups): {:?}", i + 1, e),
+            Err(e) => println!(
+                "Transaction {} failed (expected in some test setups): {:?}",
+                i + 1,
+                e
+            ),
         }
 
         // Small delay to allow block progression
@@ -68,7 +72,10 @@ pub async fn run_blockhash_validation_test(ctx: &ContraContext) {
     // Note: This test may pass or fail depending on the blockhash window size
     let first_is_valid = ctx
         .read_client
-        .is_blockhash_valid(&first_blockhash, solana_sdk::commitment_config::CommitmentConfig::confirmed())
+        .is_blockhash_valid(
+            &first_blockhash,
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        )
         .await
         .unwrap();
 
@@ -90,14 +97,14 @@ pub async fn run_blockhash_validation_test(ctx: &ContraContext) {
 
     let fake_is_valid = ctx
         .read_client
-        .is_blockhash_valid(&fake_blockhash, solana_sdk::commitment_config::CommitmentConfig::confirmed())
+        .is_blockhash_valid(
+            &fake_blockhash,
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        )
         .await
         .unwrap();
 
-    assert!(
-        !fake_is_valid,
-        "Fake blockhash should be invalid"
-    );
+    assert!(!fake_is_valid, "Fake blockhash should be invalid");
     println!("✓ Fake blockhash is correctly rejected");
 
     // Test 5: Verify RPC-Dedup consistency
@@ -106,7 +113,10 @@ pub async fn run_blockhash_validation_test(ctx: &ContraContext) {
     let fresh_blockhash = ctx.get_blockhash().await.unwrap();
     let fresh_is_valid = ctx
         .read_client
-        .is_blockhash_valid(&fresh_blockhash, solana_sdk::commitment_config::CommitmentConfig::confirmed())
+        .is_blockhash_valid(
+            &fresh_blockhash,
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        )
         .await
         .unwrap();
 

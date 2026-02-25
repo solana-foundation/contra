@@ -9,7 +9,6 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 /// Resync service for rebuilding indexer database from chain history
@@ -84,15 +83,12 @@ impl ResyncService {
         let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
         info!("CheckpointWriter service started");
 
-        // Create cancellation token for graceful shutdown
-        let cancellation_token = CancellationToken::new();
-
         // Start transaction processor as separate tokio task
         let transaction_processor =
             TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone());
         let processor_handle = tokio::spawn(async move {
             transaction_processor
-                .start(instruction_rx, cancellation_token)
+                .start(instruction_rx)
                 .await
         });
         info!("TransactionProcessor task spawned");

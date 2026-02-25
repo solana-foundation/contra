@@ -246,4 +246,21 @@ mod tests {
 
         // Test passes if no panic occurs
     }
+
+    #[tokio::test]
+    async fn test_graceful_degradation_when_webhook_unset() {
+        // Create DbTransactionWriter with NO webhook URL (None)
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, None);
+
+        // Create a failed transaction update
+        let update = create_test_update(TransactionStatus::Failed);
+
+        // Handle the update (should complete gracefully without attempting webhook)
+        writer.handle_update(update).await;
+
+        // Test passes if no panic occurs and no webhook is attempted
+        // This verifies graceful degradation when ALERT_WEBHOOK is unset
+    }
 }

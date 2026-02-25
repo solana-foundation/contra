@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::operator::{
     tree_constants::{EMPTY_SUBTREE_HASHES, EMPTY_TREE_ROOT, MAX_TREE_LEAVES, TREE_HEIGHT},
-    NON_EMPTY_LEAF_HASH,
+    EMPTY_LEAF, NON_EMPTY_LEAF_HASH,
 };
 
 /// In-memory SMT state tracker for a specific instance
@@ -111,7 +111,7 @@ impl SmtState {
         self.nonces.contains(&nonce)
     }
 
-    /// Remove a nonce from the SMT (for rollback on transaction failure)
+    /// Remove a nonce from the SMT and recompute the affected path (for rollback on transaction failure)
     ///
     /// This is used to keep the local SMT state in sync with on-chain state.
     /// When a transaction fails after inserting a nonce, we need to remove it
@@ -119,7 +119,54 @@ impl SmtState {
     ///
     /// Returns true if the nonce was removed, false if it didn't exist.
     pub fn remove_nonce(&mut self, nonce: u64) -> bool {
-        self.nonces.remove(&nonce)
+        if !self.nonces.remove(&nonce) {
+            return false;
+        }
+
+        let leaf_position = nonce as usize % MAX_TREE_LEAVES;
+
+        // If another nonce maps to the same leaf position, the leaf is still occupied
+        let leaf_still_occupied = self
+            .nonces
+            .iter()
+            .any(|&n| n as usize % MAX_TREE_LEAVES == leaf_position);
+
+        if leaf_still_occupied {
+            return true;
+        }
+
+        // Walk leaf→root with EMPTY_LEAF, mirroring insert_nonce
+        let mut current_hash = EMPTY_LEAF;
+        let mut current_pos = leaf_position;
+
+        for (level, empty_subtree_hash) in EMPTY_SUBTREE_HASHES.iter().enumerate() {
+            let sibling_pos = current_pos ^ 1;
+
+            let sibling_hash = self.level_caches[level]
+                .get(&sibling_pos)
+                .copied()
+                .unwrap_or(*empty_subtree_hash);
+
+            // Update cache: remove if reverting to empty default, else store
+            if current_hash == *empty_subtree_hash {
+                self.level_caches[level].remove(&current_pos);
+            } else {
+                self.level_caches[level].insert(current_pos, current_hash);
+            }
+
+            let bit = current_pos & 1;
+            current_hash = if bit == 0 {
+                Self::hash_combine(&current_hash, &sibling_hash)
+            } else {
+                Self::hash_combine(&sibling_hash, &current_hash)
+            };
+
+            current_pos /= 2;
+        }
+
+        self.current_root = current_hash;
+
+        true
     }
 
     /// Get all nonces in the current tree
@@ -300,5 +347,144 @@ mod tests {
         }
 
         assert_eq!(state.nonce_count(), nonces.len());
+    }
+
+    #[test]
+    fn test_remove_nonce_restores_root() {
+        let mut state = SmtState::new(0);
+        state.insert_nonce(42);
+        assert_ne!(state.current_root(), EMPTY_TREE_ROOT);
+
+        assert!(state.remove_nonce(42));
+        assert_eq!(state.current_root(), EMPTY_TREE_ROOT);
+        assert_eq!(state.nonce_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_nonce_proof_valid_after_removal() {
+        let mut state = SmtState::new(0);
+        state.insert_nonce(10);
+        state.insert_nonce(20);
+
+        // Remove nonce 10
+        assert!(state.remove_nonce(10));
+        let root_after_removal = state.current_root();
+
+        // Generate exclusion proof for removed nonce 10
+        let proof = state.generate_exclusion_proof(10);
+
+        // Verify: EMPTY_LEAF + siblings → current root
+        let leaf_position = 10_usize % MAX_TREE_LEAVES;
+        let mut current_hash = EMPTY_LEAF;
+        for (level, &sibling) in proof.iter().enumerate() {
+            let bit = (leaf_position >> level) & 1;
+            current_hash = if bit == 0 {
+                SmtState::hash_combine(&current_hash, &sibling)
+            } else {
+                SmtState::hash_combine(&sibling, &current_hash)
+            };
+        }
+        assert_eq!(current_hash, root_after_removal);
+    }
+
+    #[test]
+    fn test_remove_nonce_with_leaf_collision() {
+        // nonces 0 and MAX_TREE_LEAVES map to the same leaf position (0)
+        let colliding_nonce = MAX_TREE_LEAVES as u64;
+
+        let mut state = SmtState::new(0);
+        state.insert_nonce(0);
+        state.insert_nonce(colliding_nonce);
+
+        // Remove one — leaf should stay occupied
+        assert!(state.remove_nonce(0));
+        let root_after = state.current_root();
+
+        // Build fresh tree with only the remaining nonce
+        let mut fresh = SmtState::new(0);
+        fresh.insert_nonce(colliding_nonce);
+
+        assert_eq!(root_after, fresh.current_root());
+    }
+
+    #[test]
+    fn test_remove_all_nonces_restores_empty() {
+        let mut state = SmtState::new(0);
+        let nonces = vec![1, 50, 300, 9999];
+        for &n in &nonces {
+            state.insert_nonce(n);
+        }
+
+        for &n in &nonces {
+            assert!(state.remove_nonce(n));
+        }
+
+        assert_eq!(state.current_root(), EMPTY_TREE_ROOT);
+        assert_eq!(state.nonce_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_nonce() {
+        let mut state = SmtState::new(0);
+        state.insert_nonce(1);
+        let root_before = state.current_root();
+
+        assert!(!state.remove_nonce(999));
+        assert_eq!(state.current_root(), root_before);
+        assert_eq!(state.nonce_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_and_reinsert() {
+        let mut state = SmtState::new(0);
+        state.insert_nonce(42);
+        let original_root = state.current_root();
+
+        state.remove_nonce(42);
+        assert_eq!(state.current_root(), EMPTY_TREE_ROOT);
+
+        state.insert_nonce(42);
+        assert_eq!(state.current_root(), original_root);
+    }
+
+    #[test]
+    fn test_remove_middle_nonce_matches_fresh_tree() {
+        let mut state = SmtState::new(0);
+        state.insert_nonce(10);
+        state.insert_nonce(20);
+        state.insert_nonce(30);
+
+        state.remove_nonce(20);
+
+        let mut fresh = SmtState::new(0);
+        fresh.insert_nonce(10);
+        fresh.insert_nonce(30);
+
+        assert_eq!(state.current_root(), fresh.current_root());
+    }
+
+    #[test]
+    fn test_remove_order_independence() {
+        let nonces = vec![5, 50, 500, 5000];
+
+        let mut state1 = SmtState::new(0);
+        let mut state2 = SmtState::new(0);
+        for &n in &nonces {
+            state1.insert_nonce(n);
+            state2.insert_nonce(n);
+        }
+
+        // Remove in forward order
+        for &n in &nonces {
+            state1.remove_nonce(n);
+        }
+
+        // Remove in reverse order
+        for &n in nonces.iter().rev() {
+            state2.remove_nonce(n);
+        }
+
+        assert_eq!(state1.current_root(), EMPTY_TREE_ROOT);
+        assert_eq!(state2.current_root(), EMPTY_TREE_ROOT);
     }
 }

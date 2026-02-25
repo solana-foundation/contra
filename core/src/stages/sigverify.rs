@@ -333,7 +333,30 @@ mod tests {
         );
     }
 
-    // --- C5: tampered signature must be rejected -------------------------
+    // --- C5: unsigned / tampered signatures must be rejected -------------
+
+    #[tokio::test]
+    async fn unsigned_transaction_rejected() {
+        // Sign with wrong keypair — message references payer but a different key signs
+        let payer = Keypair::new();
+        let wrong_signer = Keypair::new();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+        let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
+
+        let message = solana_sdk::message::Message::new(&[ix], Some(&payer.pubkey()));
+        // Sign the message with wrong_signer instead of payer
+        let mut tx = Transaction::new_unsigned(message);
+        tx.signatures = vec![wrong_signer.sign_message(&tx.message_data())];
+
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        let result = sigverify_transaction(&sanitized, &[]).await;
+        assert!(
+            matches!(result, SigverifyResult::SigverifyFailed(_)),
+            "expected SigverifyFailed for wrong signer, got {result}"
+        );
+    }
 
     #[tokio::test]
     async fn tampered_signature_rejected() {

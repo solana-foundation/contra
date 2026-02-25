@@ -44,8 +44,12 @@ use {
             RpcSimulateTransactionResult, RpcSupply, RpcVoteAccountStatus,
         },
     },
-    solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
+    solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::SanitizedTransaction},
     solana_transaction_status_client_types::TransactionStatus,
+    std::{
+        collections::LinkedList,
+        sync::{Arc, RwLock},
+    },
     tokio::sync::mpsc,
 };
 
@@ -53,6 +57,7 @@ pub struct ReadDeps {
     pub accounts_db: AccountsDB,
     // Used for simulating sigverify
     pub admin_keys: Vec<Pubkey>,
+    pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 }
 
 pub struct WriteDeps {

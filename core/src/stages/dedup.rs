@@ -1,7 +1,10 @@
 use {
     crate::nodes::node::WorkerHandle,
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
-    std::collections::{HashMap, HashSet, LinkedList},
+    std::{
+        collections::{HashMap, HashSet, LinkedList},
+        sync::{Arc, RwLock},
+    },
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
     tracing::{info, warn},
@@ -36,7 +39,7 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
 
         // HashMap: blockhash -> set of signatures
         let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
-        let mut live_blockhashes = LinkedList::new();
+        let live_blockhashes = Arc::new(RwLock::new(LinkedList::new()));
 
         loop {
             tokio::select! {
@@ -44,9 +47,10 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
                 result = settled_blockhashes_rx.recv() => {
                     match result {
                         Some(blockhash) => {
-                            live_blockhashes.push_back(blockhash);
-                            while live_blockhashes.len() > max_blockhashes {
-                                if let Some(expired_blockhash) = live_blockhashes.pop_front() {
+                            let mut blockhashes = live_blockhashes.write().unwrap();
+                            blockhashes.push_back(blockhash);
+                            while blockhashes.len() > max_blockhashes {
+                                if let Some(expired_blockhash) = blockhashes.pop_front() {
                                     dedup_cache.remove(&expired_blockhash);
                                 }
                             }
@@ -64,7 +68,7 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
 
-                            if !live_blockhashes.contains(&blockhash) {
+                            if !live_blockhashes.read().unwrap().contains(&blockhash) {
                                 warn!("Blockhash {} not found in live blockhashes", blockhash);
                                 continue;
                             }

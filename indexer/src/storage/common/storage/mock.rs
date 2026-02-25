@@ -1,5 +1,7 @@
 use crate::error::StorageError;
-use crate::storage::common::models::{DbMint, DbTransaction, TransactionStatus, TransactionType};
+use crate::storage::common::models::{
+    DbMint, DbTransaction, MintDbBalance, TransactionStatus, TransactionType,
+};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,6 +11,7 @@ pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
+    pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
 }
 
 impl MockStorage {
@@ -125,6 +128,16 @@ impl MockStorage {
 
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
         Ok(self.mints.lock().unwrap().get(mint_address).cloned())
+    }
+
+    pub fn set_mint_balances(&self, balances: Vec<MintDbBalance>) {
+        *self.mint_balances.lock().unwrap() = balances;
+    }
+
+    pub async fn get_mint_balances_for_reconciliation(
+        &self,
+    ) -> Result<Vec<MintDbBalance>, StorageError> {
+        Ok(self.mint_balances.lock().unwrap().clone())
     }
 
     pub async fn close(&self) -> Result<(), StorageError> {

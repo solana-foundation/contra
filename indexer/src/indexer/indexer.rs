@@ -1,8 +1,9 @@
-use crate::error::{DataSourceError, IndexerError};
+use crate::config::ProgramType;
+use crate::error::{DataSourceError, IndexerError, ReconciliationError};
 use crate::{
     indexer::{
         checkpoint::CheckpointWriter, datasource::common::datasource::DataSource,
-        transaction_processor::TransactionProcessor,
+        reconciliation::run_startup_reconciliation, transaction_processor::TransactionProcessor,
     },
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer},
     storage::{PostgresDb, Storage},
@@ -45,16 +46,55 @@ pub async fn run(
     storage.init_schema().await?;
     info!("Storage initialized");
 
-    // 2. Create channels
+    // 2. Startup reconciliation (escrow only, before any data processing).
+    //
+    // Skip when running in backfill-only mode (backfill.enabled &&
+    // backfill.exit_after_backfill). In that mode the DB is intentionally
+    // incomplete — reconciling it against the current on-chain state would
+    // produce false positives and block the very operation that repairs the
+    // discrepancy. Concurrent backfill (exit_after_backfill = false) still
+    // runs reconciliation because the live datasource is about to start.
+    let backfill_only =
+        indexer_config.backfill.enabled && indexer_config.backfill.exit_after_backfill;
+    if !backfill_only {
+        match (common_config.program_type, common_config.escrow_instance_id) {
+            (ProgramType::Escrow, Some(seed)) => {
+                run_startup_reconciliation(
+                    &indexer_config.reconciliation,
+                    common_config.program_type,
+                    &storage,
+                    &common_config.rpc_url,
+                    &seed,
+                )
+                .await?;
+            }
+            (ProgramType::Escrow, None) => {
+                return Err(IndexerError::Reconciliation(
+                    ReconciliationError::InvalidPubkey {
+                        pubkey: "<missing>".to_string(),
+                        reason: "escrow_instance_id is required for escrow reconciliation"
+                            .to_string(),
+                    },
+                ));
+            }
+            _ => {
+                info!("Startup reconciliation skipped (non-escrow program)");
+            }
+        }
+    } else {
+        info!("Startup reconciliation skipped (backfill-only mode)");
+    }
+
+    // 3. Create channels
     let (instruction_tx, instruction_rx) = mpsc::channel(1000);
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
 
-    // 3. Start checkpoint writer service
+    // 4. Start checkpoint writer service
     let checkpoint_writer = CheckpointWriter::new(storage.clone());
     let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
     info!("CheckpointWriter service started");
 
-    // 4. Run backfill if enabled
+    // 5. Run backfill if enabled
     if indexer_config.backfill.enabled {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -109,7 +149,7 @@ pub async fn run(
         }
     }
 
-    // 5. Start datasource
+    // 6. Start datasource
     let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
         #[cfg(feature = "datasource-rpc")]
         DatasourceType::RpcPolling => {
@@ -167,7 +207,7 @@ pub async fn run(
         }
     };
 
-    // 6. Create cancellation token for graceful shutdown
+    // 7. Create cancellation token for graceful shutdown
     let cancellation_token = CancellationToken::new();
 
     info!("Starting datasource...");
@@ -175,7 +215,7 @@ pub async fn run(
         .start(instruction_tx.clone(), cancellation_token.clone())
         .await?;
 
-    // 6. Start transaction processor
+    // 8. Start transaction processor
     let transaction_processor = TransactionProcessor::new(storage.clone(), checkpoint_tx.clone());
     let processor_handle = tokio::spawn(async move {
         if let Err(e) = transaction_processor.start(instruction_rx).await {
@@ -185,13 +225,13 @@ pub async fn run(
 
     info!("Indexer started, waiting for shutdown signal...");
 
-    // 7. Wait for shutdown signal
+    // 9. Wait for shutdown signal
     signal::ctrl_c()
         .await
         .map_err(|_| IndexerError::ShutdownChannelSend)?;
     info!("Shutdown signal received, initiating graceful shutdown...");
 
-    // 8. Graceful shutdown
+    // 10. Graceful shutdown
     shutdown_indexer(
         cancellation_token,
         storage,

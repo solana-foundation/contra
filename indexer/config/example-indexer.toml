@@ -67,3 +67,22 @@ max_gap_slots = 10000000
 
 # RPC URL for backfill (optional, defaults to common.rpc_url)
 # rpc_url = "http://localhost:8899"
+
+# === Startup Reconciliation Configuration ===
+# Runs automatically on startup when program_type = "escrow".
+# Skipped automatically for "withdraw".
+[indexer.reconciliation]
+# Maximum absolute mismatch allowed (in raw token units, not UI decimals).
+#
+# 0 (default) = strict: any mismatch blocks startup.
+# > 0 = tolerance: mismatches up to this value log a warning and continue;
+#        mismatches above this value log an error with reconciliation_alert=true
+#        and abort startup.
+#
+# Note on false positives: there is a small race window between the DB balance
+# query and the on-chain RPC fetch. A deposit that arrives on-chain in that
+# window will appear in the ATA balance but not yet in the DB, producing a
+# transient mismatch even when the indexer state is otherwise correct.
+# If you observe spurious startup failures caused by this, set this to a small
+# value (e.g. the raw amount of one or two minimum deposits for this mint).
+mismatch_threshold_raw = 0

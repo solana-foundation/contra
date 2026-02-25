@@ -53,6 +53,21 @@ pub struct DbTransaction {
     pub counterpart_signature: Option<String>,
 }
 
+/// Per-mint balance aggregate used during startup reconciliation.
+/// Returned by the reconciliation storage query.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MintDbBalance {
+    pub mint_address: String,
+    pub token_program: String,
+    /// Sum of amounts for all indexed deposits (any status).
+    /// Deposits increase the on-chain ATA balance the moment they are observed,
+    /// regardless of whether the operator has completed the corresponding contra mint.
+    pub total_deposits: i64,
+    /// Sum of amounts for completed withdrawals only.
+    /// Only a completed `release_funds` call actually reduces the on-chain ATA balance.
+    pub total_withdrawals: i64,
+}
+
 /// Mint metadata stored
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DbMint {

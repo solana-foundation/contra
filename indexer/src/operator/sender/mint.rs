@@ -1,11 +1,21 @@
-use crate::operator::utils::instruction_util::{InitializeMintBuilder, TransactionBuilder};
+use crate::operator::utils::instruction_util::{
+    mint_idempotency_memo, InitializeMintBuilder, MintToBuilderWithTxnId, TransactionBuilder,
+};
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{sign_and_send_transaction, SignerUtil};
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::signature::Signature;
+use solana_transaction_status::{
+    EncodedTransaction, UiInstruction, UiMessage, UiParsedInstruction,
+};
+use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use super::types::{InstructionWithSigners, SenderState};
+
+const MEMO_PROGRAM_ID_STR: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+const IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
 
 /// Attempt JIT mint initialization by sending initialize_mint transaction first
 /// Returns Some(mint_to_instruction) if successful, None if failed
@@ -120,9 +130,186 @@ pub(super) async fn try_jit_mint_initialization(
     }
 }
 
+/// Check recent ATA signatures for an already-confirmed mint carrying this transaction's
+/// deterministic idempotency memo.
+pub(super) async fn find_existing_mint_signature(
+    state: &SenderState,
+    builder_with_txn_id: &MintToBuilderWithTxnId,
+) -> Option<Signature> {
+    let transaction_id = builder_with_txn_id.txn_id as i64;
+    let recipient_ata = builder_with_txn_id.builder.get_recipient_ata()?;
+    let expected_memo = mint_idempotency_memo(transaction_id);
+
+    let signatures = match state
+        .rpc_client
+        .get_signatures_for_address(&recipient_ata, IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT)
+        .await
+    {
+        Ok(signatures) => signatures,
+        Err(e) => {
+            warn!(
+                "Failed idempotency lookup for transaction_id {} on {}: {}",
+                transaction_id, recipient_ata, e
+            );
+            return None;
+        }
+    };
+
+    for signature_status in signatures {
+        if signature_status.err.is_some() {
+            continue;
+        }
+
+        let memo = match signature_status.memo.as_deref() {
+            Some(memo) if memo_matches(memo, &expected_memo) => memo,
+            _ => continue,
+        };
+
+        let signature = match Signature::from_str(&signature_status.signature) {
+            Ok(signature) => signature,
+            Err(e) => {
+                warn!(
+                    "Skipping invalid signature returned by RPC during idempotency check: {} ({})",
+                    signature_status.signature, e
+                );
+                continue;
+            }
+        };
+
+        let transaction = match state.rpc_client.get_transaction(&signature).await {
+            Ok(transaction) => transaction,
+            Err(e) => {
+                warn!(
+                    "Failed to fetch transaction {} for idempotency confirmation: {}",
+                    signature, e
+                );
+                continue;
+            }
+        };
+
+        if transaction_succeeded(&transaction) && transaction_has_memo(&transaction, &expected_memo)
+        {
+            info!(
+                "Skipping resend for transaction_id {}: found existing confirmed mint {} with memo {}",
+                transaction_id, signature, memo
+            );
+            return Some(signature);
+        }
+    }
+
+    None
+}
+
+fn transaction_succeeded(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+) -> bool {
+    transaction
+        .transaction
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.err.is_none())
+}
+
+fn transaction_has_memo(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+    expected_memo: &str,
+) -> bool {
+    let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
+        return false;
+    };
+
+    match &ui_transaction.message {
+        UiMessage::Parsed(parsed_message) => parsed_message
+            .instructions
+            .iter()
+            .any(|instruction| instruction_has_memo(instruction, expected_memo)),
+        UiMessage::Raw(raw_message) => raw_message.instructions.iter().any(|instruction| {
+            let program_id = raw_message
+                .account_keys
+                .get(instruction.program_id_index as usize)
+                .map(|key| key.as_str());
+
+            program_id == Some(MEMO_PROGRAM_ID_STR)
+                && bs58::decode(&instruction.data)
+                    .into_vec()
+                    .map(|memo_data| memo_data == expected_memo.as_bytes())
+                    .unwrap_or(false)
+        }),
+    }
+}
+
+fn instruction_has_memo(instruction: &UiInstruction, expected_memo: &str) -> bool {
+    match instruction {
+        UiInstruction::Compiled(_) => false,
+        UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed_instruction)) => {
+            parsed_instruction.program_id == MEMO_PROGRAM_ID_STR
+                && parsed_instruction.parsed.as_str() == Some(expected_memo)
+        }
+        UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(partially_decoded)) => {
+            partially_decoded.program_id == MEMO_PROGRAM_ID_STR
+                && bs58::decode(&partially_decoded.data)
+                    .into_vec()
+                    .map(|memo_data| memo_data == expected_memo.as_bytes())
+                    .unwrap_or(false)
+        }
+    }
+}
+
+fn memo_matches(returned_memo: &str, expected_memo: &str) -> bool {
+    returned_memo
+        .split("; ")
+        .any(|memo| strip_memo_length_prefix(memo) == expected_memo)
+}
+
+fn strip_memo_length_prefix(memo: &str) -> &str {
+    let Some(stripped) = memo.strip_prefix('[') else {
+        return memo;
+    };
+
+    let Some((length, value)) = stripped.split_once("] ") else {
+        return memo;
+    };
+
+    if length.chars().all(|c| c.is_ascii_digit()) {
+        value
+    } else {
+        memo
+    }
+}
+
 /// Cleanup mint builder cache when transaction completes or fails
 pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Option<i64>) {
     if let Some(txn_id) = transaction_id {
         state.mint_builders.remove(&txn_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{memo_matches, strip_memo_length_prefix};
+
+    #[test]
+    fn strip_memo_length_prefix_handles_formatted_values() {
+        assert_eq!(
+            strip_memo_length_prefix("[12] contra:mint-idempotency:42"),
+            "contra:mint-idempotency:42"
+        );
+        assert_eq!(
+            strip_memo_length_prefix("contra:mint-idempotency:42"),
+            "contra:mint-idempotency:42"
+        );
+    }
+
+    #[test]
+    fn memo_matches_handles_plain_and_formatted_values() {
+        let expected = "contra:mint-idempotency:99";
+
+        assert!(memo_matches(expected, expected));
+        assert!(memo_matches("[27] contra:mint-idempotency:99", expected));
+        assert!(memo_matches(
+            "[5] hello; [27] contra:mint-idempotency:99",
+            expected
+        ));
+        assert!(!memo_matches("[5] hello", expected));
     }
 }

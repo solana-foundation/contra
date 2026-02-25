@@ -1,5 +1,7 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_rpc_client_api::client_error;
+use solana_rpc_client_api::config::RpcTransactionConfig;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
@@ -130,8 +132,9 @@ impl RpcClientWithRetry {
     ///   - `RetryPolicy::Idempotent`: Retry with exponential backoff (for idempotent operations)
     ///
     /// # Safety
-    /// For non-idempotent operations (e.g., minting tokens), use `RetryPolicy::None` to prevent
-    /// duplicate transactions. Only use retry for operations that are safe to execute multiple times.
+    /// For operations that can duplicate side effects (for example mint sends), use
+    /// `RetryPolicy::None` at send time and add an external idempotency check before resubmission.
+    /// Only use retry for operations that are safe to execute multiple times.
     pub async fn send_transaction(
         &self,
         transaction: &solana_sdk::transaction::Transaction,
@@ -177,6 +180,56 @@ impl RpcClientWithRetry {
             RetryPolicy::Idempotent,
             || async { self.rpc_client.get_signature_statuses(signatures).await },
         )
+        .await
+    }
+
+    /// Get recent signatures that touched an address (read-only, safe to retry)
+    pub async fn get_signatures_for_address(
+        &self,
+        address: &Pubkey,
+        limit: usize,
+    ) -> Result<
+        Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+        Box<client_error::Error>,
+    > {
+        self.with_retry(
+            "get_signatures_for_address",
+            RetryPolicy::Idempotent,
+            || async {
+                let config = GetConfirmedSignaturesForAddress2Config {
+                    before: None,
+                    until: None,
+                    limit: Some(limit),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                };
+
+                self.rpc_client
+                    .get_signatures_for_address_with_config(address, config)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Get a confirmed transaction in JSON-parsed encoding (read-only, safe to retry)
+    pub async fn get_transaction(
+        &self,
+        signature: &Signature,
+    ) -> Result<
+        solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+        Box<client_error::Error>,
+    > {
+        let config = RpcTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+
+        self.with_retry("get_transaction", RetryPolicy::Idempotent, || async {
+            self.rpc_client
+                .get_transaction_with_config(signature, config.clone())
+                .await
+        })
         .await
     }
 }

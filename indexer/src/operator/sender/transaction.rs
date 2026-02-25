@@ -12,7 +12,9 @@ use solana_sdk::signature::Signature;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use super::mint::{cleanup_mint_builder, try_jit_mint_initialization};
+use super::mint::{
+    cleanup_mint_builder, find_existing_mint_signature, try_jit_mint_initialization,
+};
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{InstructionWithSigners, SenderState, TransactionStatusUpdate};
 
@@ -130,6 +132,22 @@ pub async fn handle_transaction_submission(
     let retry_policy = tx_builder.retry_policy();
     let compute_unit_price = tx_builder.compute_unit_price();
     let extra_error_checks_policy = &tx_builder.extra_error_checks_policy();
+
+    if let TransactionBuilder::Mint(builder_with_txn_id) = &tx_builder {
+        if let Some(existing_signature) =
+            find_existing_mint_signature(state, builder_with_txn_id).await
+        {
+            handle_success(
+                state,
+                Some(builder_with_txn_id.txn_id as i64),
+                None,
+                existing_signature,
+                storage_tx,
+            )
+            .await;
+            return;
+        }
+    }
 
     match state.handle_transaction_builder(tx_builder.clone()).await {
         Ok(instruction) => {

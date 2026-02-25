@@ -19,6 +19,10 @@ pub async fn get_account_shared_data(
             get_account_shared_data_postgres(postgres_db, pubkey).await
         }
         AccountsDB::Redis(redis_db) => get_account_shared_data_redis(redis_db, pubkey).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => {
+            get_account_shared_data_postgres(postgres_db, pubkey).await
+        }
     }
 }
 

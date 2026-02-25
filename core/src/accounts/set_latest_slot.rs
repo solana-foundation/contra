@@ -8,6 +8,16 @@ pub async fn set_latest_slot(db: &mut AccountsDB, slot: u64) -> Result<(), Strin
     match db {
         AccountsDB::Postgres(postgres_db) => set_latest_slot_postgres(postgres_db, slot).await,
         AccountsDB::Redis(redis_db) => set_latest_slot_redis(redis_db, slot).await,
+        // Dual backend: write to Postgres first, then Redis (best-effort)
+        AccountsDB::Dual(postgres_db, redis_db) => {
+            // Write to Postgres first (blocking)
+            set_latest_slot_postgres(postgres_db, slot).await?;
+            // Write to Redis (best-effort, non-fatal)
+            if let Err(e) = set_latest_slot_redis(redis_db, slot).await {
+                warn!("Best-effort Redis write failed for latest_slot: {}", e);
+            }
+            Ok(())
+        }
     }
 }
 

@@ -11,6 +11,8 @@ pub async fn get_transaction_count(db: &AccountsDB) -> Result<u64> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_transaction_count_postgres(postgres_db).await,
         AccountsDB::Redis(redis_db) => get_transaction_count_redis(redis_db).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => get_transaction_count_postgres(postgres_db).await,
     }
 }
 

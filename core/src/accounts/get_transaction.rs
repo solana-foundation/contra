@@ -12,6 +12,8 @@ pub async fn get_transaction(db: &AccountsDB, signature: &Signature) -> Option<S
     match db {
         AccountsDB::Postgres(postgres_db) => get_transaction_postgres(postgres_db, signature).await,
         AccountsDB::Redis(redis_db) => get_transaction_redis(redis_db, signature).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => get_transaction_postgres(postgres_db, signature).await,
     }
 }
 

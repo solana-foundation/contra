@@ -11,6 +11,8 @@ pub async fn get_accounts(db: &AccountsDB, accounts: &[Pubkey]) -> Vec<Option<Ac
     match db {
         AccountsDB::Postgres(postgres_db) => get_accounts_postgres(postgres_db, accounts).await,
         AccountsDB::Redis(redis_db) => get_accounts_redis(redis_db, accounts).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => get_accounts_postgres(postgres_db, accounts).await,
     }
 }
 

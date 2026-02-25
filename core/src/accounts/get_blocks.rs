@@ -17,6 +17,10 @@ pub async fn get_blocks(
             get_blocks_postgres(postgres_db, start_slot, end_slot).await
         }
         AccountsDB::Redis(redis_db) => get_blocks_redis(redis_db, start_slot, end_slot).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => {
+            get_blocks_postgres(postgres_db, start_slot, end_slot).await
+        }
     }
 }
 

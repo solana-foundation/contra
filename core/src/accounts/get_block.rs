@@ -14,6 +14,8 @@ pub async fn get_block(db: &AccountsDB, slot: u64) -> Option<BlockInfo> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_block_postgres(postgres_db, slot).await,
         AccountsDB::Redis(redis_db) => get_block_redis(redis_db, slot).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => get_block_postgres(postgres_db, slot).await,
     }
 }
 

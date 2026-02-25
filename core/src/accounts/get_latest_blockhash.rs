@@ -10,6 +10,8 @@ pub async fn get_latest_blockhash(db: &AccountsDB) -> Result<Hash> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_latest_blockhash_postgres(postgres_db).await,
         AccountsDB::Redis(redis_db) => get_latest_blockhash_redis(redis_db).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => get_latest_blockhash_postgres(postgres_db).await,
     }
 }
 

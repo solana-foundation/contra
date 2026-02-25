@@ -15,6 +15,17 @@ pub async fn set_account(db: &mut AccountsDB, pubkey: Pubkey, account: AccountSh
             set_account_postgres(postgres_db, pubkey, account).await
         }
         AccountsDB::Redis(redis_db) => set_account_redis(redis_db, pubkey, account).await,
+        // Dual backend: write to Postgres first, then Redis (best-effort)
+        AccountsDB::Dual(postgres_db, redis_db) => {
+            // Write to Postgres (blocking)
+            set_account_postgres(postgres_db, pubkey, account.clone()).await;
+            // Write to Redis (best-effort, non-fatal)
+            if let Err(e) = bincode::serialize(&account) {
+                warn!("Failed to serialize account for Redis cache: {}", e);
+            } else {
+                set_account_redis(redis_db, pubkey, account).await;
+            }
+        }
     }
 }
 

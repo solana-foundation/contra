@@ -3,6 +3,7 @@ use {
     anyhow::{Context, Result},
     redis::AsyncCommands,
     solana_rpc_client_types::response::RpcPerfSample,
+    tracing::warn,
 };
 
 pub async fn store_performance_sample(db: &mut AccountsDB, sample: RpcPerfSample) -> Result<()> {
@@ -11,6 +12,16 @@ pub async fn store_performance_sample(db: &mut AccountsDB, sample: RpcPerfSample
             store_performance_sample_postgres(postgres_db, sample).await
         }
         AccountsDB::Redis(redis_db) => store_performance_sample_redis(redis_db, sample).await,
+        // Dual backend: write to Postgres first, then Redis (best-effort)
+        AccountsDB::Dual(postgres_db, redis_db) => {
+            // Write to Postgres first (blocking)
+            store_performance_sample_postgres(postgres_db, sample.clone()).await?;
+            // Write to Redis (best-effort, non-fatal)
+            if let Err(e) = store_performance_sample_redis(redis_db, sample).await {
+                warn!("Best-effort Redis write failed for performance sample: {}", e);
+            }
+            Ok(())
+        }
     }
 }
 

@@ -13,6 +13,18 @@ pub async fn store_block(db: &mut AccountsDB, block_info: BlockInfo) -> Result<(
     match db {
         AccountsDB::Postgres(postgres_db) => store_block_postgres(postgres_db, block_info).await,
         AccountsDB::Redis(redis_db) => store_block_redis(redis_db, block_info).await,
+        // Dual backend: write to Postgres first, then Redis (best-effort)
+        AccountsDB::Dual(postgres_db, redis_db) => {
+            // Clone for Redis since we'll write to Postgres first
+            let block_info_clone = block_info.clone();
+            // Write to Postgres first (blocking)
+            store_block_postgres(postgres_db, block_info).await?;
+            // Write to Redis (best-effort, non-fatal)
+            if let Err(e) = store_block_redis(redis_db, block_info_clone).await {
+                warn!("Best-effort Redis write failed for block: {}", e);
+            }
+            Ok(())
+        }
     }
 }
 

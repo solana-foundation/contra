@@ -3,23 +3,23 @@
   "spec": "001-make-redis-write-best-effort-db-first-cache-second",
   "state": "building",
   "subtasks": {
-    "completed": 10,
+    "completed": 13,
     "total": 18,
     "in_progress": 1,
     "failed": 0
   },
   "phase": {
-    "current": "Migrate Settle Worker to Dual Backend",
+    "current": "Integration Testing",
     "id": null,
-    "total": 1
+    "total": 3
   },
   "workers": {
     "active": 0,
     "max": 1
   },
   "session": {
-    "number": 11,
+    "number": 14,
     "started_at": "2026-02-25T13:40:55.420929"
   },
-  "last_update": "2026-02-25T14:33:36.422596"
+  "last_update": "2026-02-25T14:44:16.961158"
 }

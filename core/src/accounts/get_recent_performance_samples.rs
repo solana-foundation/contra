@@ -14,6 +14,10 @@ pub async fn get_recent_performance_samples(
             get_recent_performance_samples_postgres(postgres_db, limit).await
         }
         AccountsDB::Redis(redis_db) => get_recent_performance_samples_redis(redis_db, limit).await,
+        // Dual backend: read from Postgres (source of truth), not Redis cache
+        AccountsDB::Dual(postgres_db, _redis_db) => {
+            get_recent_performance_samples_postgres(postgres_db, limit).await
+        }
     }
 }
 

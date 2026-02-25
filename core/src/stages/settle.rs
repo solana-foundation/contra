@@ -146,9 +146,25 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
-            let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
-                .await
-                .unwrap();
+            // Determine backend mode based on connection URL
+            // If Postgres URL, use dual backend (Postgres + Redis)
+            // If Redis URL, use single Redis backend for backward compatibility
+            let mut accounts_db = if accountsdb_connection_url.starts_with("postgresql://")
+                || accountsdb_connection_url.starts_with("postgres://")
+            {
+                // Dual backend mode: Postgres primary + Redis cache
+                let redis_url = "redis://localhost:6379";
+                info!("Initializing dual backend: Postgres primary + Redis cache");
+                AccountsDB::new_dual(&accountsdb_connection_url, redis_url, false)
+                    .await
+                    .unwrap()
+            } else {
+                // Single backend mode (backward compatibility)
+                info!("Initializing single backend mode");
+                AccountsDB::new(&accountsdb_connection_url, false)
+                    .await
+                    .unwrap()
+            };
 
             // Warm Redis cache from Postgres on startup (Dual backend only)
             match &accounts_db {

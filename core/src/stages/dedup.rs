@@ -26,7 +26,7 @@ pub fn create_dedup_channel() -> (
     mpsc::unbounded_channel()
 }
 
-pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
+pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedList<Hash>>>) {
     let DedupArgs {
         max_blockhashes,
         mut input_rx,
@@ -34,12 +34,16 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
         output_tx,
         shutdown_token,
     } = args;
+
+    // Create shared state for live blockhashes
+    let live_blockhashes = Arc::new(RwLock::new(LinkedList::new()));
+    let live_blockhashes_clone = Arc::clone(&live_blockhashes);
+
     let handle = tokio::spawn(async move {
         info!("Dedup stage started");
 
         // HashMap: blockhash -> set of signatures
         let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
-        let live_blockhashes = Arc::new(RwLock::new(LinkedList::new()));
 
         loop {
             tokio::select! {
@@ -47,7 +51,7 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
                 result = settled_blockhashes_rx.recv() => {
                     match result {
                         Some(blockhash) => {
-                            let mut blockhashes = live_blockhashes.write().unwrap();
+                            let mut blockhashes = live_blockhashes_clone.write().unwrap();
                             blockhashes.push_back(blockhash);
                             while blockhashes.len() > max_blockhashes {
                                 if let Some(expired_blockhash) = blockhashes.pop_front() {
@@ -68,7 +72,7 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
 
-                            if !live_blockhashes.read().unwrap().contains(&blockhash) {
+                            if !live_blockhashes_clone.read().unwrap().contains(&blockhash) {
                                 warn!("Blockhash {} not found in live blockhashes", blockhash);
                                 continue;
                             }
@@ -116,5 +120,8 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
         info!("Dedup stopped");
     });
 
-    WorkerHandle::new("Dedup".to_string(), handle)
+    (
+        WorkerHandle::new("Dedup".to_string(), handle),
+        live_blockhashes,
+    )
 }

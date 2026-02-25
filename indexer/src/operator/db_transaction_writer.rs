@@ -11,11 +11,23 @@ use tracing::{error, info};
 pub struct DbTransactionWriter {
     storage: Arc<Storage>,
     update_rx: mpsc::Receiver<TransactionStatusUpdate>,
+    client: reqwest::Client,
+    webhook_url: Option<String>,
 }
 
 impl DbTransactionWriter {
-    pub fn new(storage: Arc<Storage>, update_rx: mpsc::Receiver<TransactionStatusUpdate>) -> Self {
-        Self { storage, update_rx }
+    pub fn new(
+        storage: Arc<Storage>,
+        update_rx: mpsc::Receiver<TransactionStatusUpdate>,
+        webhook_url: Option<String>,
+    ) -> Self {
+        let client = reqwest::Client::new();
+        Self {
+            storage,
+            update_rx,
+            client,
+            webhook_url,
+        }
     }
 
     /// Start processing status updates from the channel

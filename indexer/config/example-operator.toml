@@ -69,12 +69,47 @@ channel_buffer_size = 100
 reconciliation_interval_secs = 300
 
 # Tolerance threshold in basis points (100 bps = 1%)
-# Differences within this threshold are considered acceptable
+#
+# Basis points (bps) are a unit of measurement equal to 1/100th of a percent.
+# Examples:
+#   - 10 bps = 0.1% tolerance
+#   - 100 bps = 1.0% tolerance
+#   - 1 bps = 0.01% tolerance
+#
+# The delta is calculated as: |(on_chain_balance - db_balance) / on_chain_balance * 10000|
+#
+# Example scenario:
+#   - On-chain balance: 1,000,000 tokens
+#   - DB balance:       999,500 tokens
+#   - Delta: |1,000,000 - 999,500| / 1,000,000 * 10000 = 50 bps (0.5%)
+#   - If tolerance_bps = 10, this would trigger an alert (50 > 10)
+#   - If tolerance_bps = 100, this would be within tolerance (50 < 100)
+#
+# Tolerance accounts for in-flight transactions and minor timing differences.
+# Set lower for stricter monitoring, higher if you expect more transaction latency.
+#
 # Default: 10 bps (0.1%)
 reconciliation_tolerance_bps = 10
 
 # Webhook URL for reconciliation alerts (optional)
-# POST requests will be sent to this URL when balance mismatches are detected
-# Payload format: {"mint": "...", "on_chain_balance": ..., "db_balance": ..., "delta_bps": ..., "timestamp": "..."}
+# POST requests will be sent to this URL when balance mismatches exceed the tolerance threshold
+#
+# Webhook Payload Format (JSON):
+# {
+#   "mint": "TokenMintPubkey...",           // The SPL token mint address (e.g., USDC, SOL)
+#   "on_chain_balance": 1000000,            // Actual balance in the escrow's ATA on-chain (u64)
+#   "db_balance": 999500,                   // Expected balance from database (sum of deposits - withdrawals) (i64)
+#   "delta_bps": 50,                        // Calculated difference in basis points (u64)
+#   "timestamp": "2026-02-25T12:34:56Z"     // ISO 8601 timestamp when the mismatch was detected
+# }
+#
+# Webhooks are sent with:
+# - HTTP Method: POST
+# - Content-Type: application/json
+# - Retry Logic: 3 attempts with exponential backoff (500ms base delay, capped at 5s)
+# - Timeout: Standard reqwest defaults
+#
+# If webhook URL is not set, mismatches will only be logged (no HTTP requests sent).
+#
 # Uncomment and set to enable webhook alerts:
 # reconciliation_webhook_url = "https://your-webhook-endpoint.com/alerts"

@@ -8,9 +8,10 @@ use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use solana_transaction_status::parse_instruction::ParsedInstruction;
 use solana_transaction_status::{
-    EncodedTransaction, ParsedInstruction, UiCompiledInstruction, UiInstruction, UiMessage,
-    UiParsedInstruction, UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
+    EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage, UiParsedInstruction,
+    UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
 };
 use std::str::FromStr;
 use tracing::{error, info, warn};
@@ -630,7 +631,8 @@ mod tests {
         ExpectedMintInstruction,
     };
     use solana_sdk::pubkey::Pubkey;
-    use solana_transaction_status::{ParsedInstruction, UiInstruction, UiParsedInstruction};
+    use solana_transaction_status::parse_instruction::ParsedInstruction;
+    use solana_transaction_status::{UiInstruction, UiParsedInstruction};
 
     #[test]
     fn strip_memo_length_prefix_handles_formatted_values() {

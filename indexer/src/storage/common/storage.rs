@@ -5,6 +5,7 @@ pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
+pub mod get_escrow_balances_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_pending_db_transactions;
@@ -134,6 +135,15 @@ impl Storage {
         &self,
     ) -> Result<Vec<MintDbBalance>, StorageError> {
         get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self).await
+    }
+
+    /// Query escrow balances by mint for continuous reconciliation checks.
+    /// Only counts **completed** transactions for both deposits and withdrawals.
+    /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
+    pub async fn get_escrow_balances_by_mint(
+        &self,
+    ) -> Result<Vec<MintDbBalance>, StorageError> {
+        get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
     }
 
     /// Close the storage connection pool gracefully

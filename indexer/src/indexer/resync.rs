@@ -94,6 +94,22 @@ impl ResyncService {
         info!("TransactionProcessor task spawned");
 
         // Run backfill service (this will process all transactions from genesis_slot to current)
+        let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
+            error!("Failed to fetch current slot before backfill: {}", e);
+            IndexerError::from(e)
+        })?;
+
+        let total_slots = if current_slot > genesis_slot {
+            current_slot - genesis_slot
+        } else {
+            0
+        };
+
+        info!(
+            "Starting backfill from slot {} to slot {} ({} slots to process)...",
+            genesis_slot, current_slot, total_slots
+        );
+
         backfill_service.run(instruction_tx.clone()).await?;
         info!("Backfill service completed");
 
@@ -126,7 +142,10 @@ impl ResyncService {
             return Err(IndexerError::ShutdownChannelSend);
         }
 
-        info!("Resync complete for {:?}", self.program_type);
+        info!(
+            "Resync complete for {:?}. Processed {} slots (from {} to {})",
+            self.program_type, total_slots, genesis_slot, current_slot
+        );
         Ok(())
     }
 }

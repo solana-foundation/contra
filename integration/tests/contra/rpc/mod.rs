@@ -1,5 +1,6 @@
 mod test_context;
 // mod test_cors; // Disabled - CORS is now handled by the gateway
+mod test_blockhash_validation;
 mod test_empty_transaction;
 mod test_epoch_info;
 mod test_epoch_schedule;
@@ -20,6 +21,7 @@ mod test_vote_accounts;
 mod utils;
 
 pub use test_context::{ContraContext, L1Context};
+pub use test_blockhash_validation::run_blockhash_validation_test;
 pub use test_empty_transaction::run_empty_transaction_test;
 pub use test_epoch_info::run_epoch_info_test;
 pub use test_epoch_schedule::run_epoch_schedule_test;

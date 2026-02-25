@@ -321,6 +321,8 @@ async fn test_suite(contra_ctx: &ContraContext, l1_ctx: &L1Context) {
     run_vote_accounts_test(contra_ctx).await;
     // Run get supply test
     run_get_supply_test(contra_ctx).await;
+    // Run blockhash validation test
+    run_blockhash_validation_test(contra_ctx).await;
     // Run security tests
     run_non_admin_sending_admin_instruction_test(contra_ctx).await;
     run_empty_transaction_test(contra_ctx).await;

@@ -10,21 +10,68 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+concurrency:
+  group: rust-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check
+  changes:
+    name: Detect Changed Areas
     runs-on: contra-runner-1
+    outputs:
+      rust_checks: ${{ steps.filter.outputs.rust_checks }}
+      integration: ${{ steps.filter.outputs.integration }}
+      core_indexer: ${{ steps.filter.outputs.core_indexer }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Setup environment
-        uses: ./.github/actions/setup-environment
+      - name: Detect changed files
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust_checks:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - '.github/actions/setup-solana/**'
+              - 'core/**'
+              - 'indexer/**'
+              - 'integration/**'
+              - 'test_utils/**'
+              - 'contra-escrow-program/**'
+              - 'contra-withdraw-program/**'
+            integration:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - '.github/actions/setup-solana/**'
+              - 'core/**'
+              - 'indexer/**'
+              - 'integration/**'
+              - 'test_utils/**'
+              - 'contra-escrow-program/**'
+              - 'contra-withdraw-program/**'
+            core_indexer:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - 'core/**'
+              - 'indexer/**'
 
-      - name: Run cargo check
-        run: cargo check --all-features
-
-  fmt:
-    name: Format
+  check:
+    name: Check
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +79,34 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          install-base-cargo-tools: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          setup-solana: "false"
+          install-dependencies: "false"
+          build-programs: "false"
+
+      - name: Run cargo check
+        run: cargo check --all-features
+
+  fmt:
+    name: Format
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true'
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          install-base-cargo-tools: "false"
+          install-system-dependencies: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          setup-solana: "false"
+          install-dependencies: "false"
+          build-programs: "false"
           rust-components: rustfmt
 
       - name: Check formatting
@@ -39,6 +114,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +123,12 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          install-base-cargo-tools: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          setup-solana: "false"
+          install-dependencies: "false"
+          build-programs: "false"
           rust-components: clippy
 
       - name: Run clippy
@@ -53,24 +136,37 @@ jobs:
 
   integration-test:
     name: Integration Tests
+    needs: changes
+    if: needs.changes.outputs.integration == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
+        with:
+          build-programs: "false"
 
       - name: Run integration tests
-        run: make integration-test
+        run: make integration-test-ci
 
   unit-tests:
-    name: Indexer Unit Tests
+    name: Core + Indexer Unit Tests
+    needs: changes
+    if: needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
+        with:
+          install-base-cargo-tools: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          setup-solana: "false"
+          install-dependencies: "false"
+          build-programs: "false"
 
-      - name: Run indexer unit tests (yellowstone)
-        run: make unit-test
+      - name: Run core + indexer unit tests
+        run: make unit-test-ci

@@ -2,7 +2,7 @@
 # Delegates to subdirectory Makefiles
 
 .PHONY: install build fmt generate-idl generate-clients
-.PHONY: unit-test integration-test all-test
+.PHONY: unit-test unit-test-ci integration-test integration-test-ci all-test
 .PHONY: unit-coverage integration-coverage coverage-html all-coverage
 .PHONY: build-devnet deploy-devnet
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
@@ -50,10 +50,31 @@ unit-test:
 	@$(MAKE) -C core unit-test
 	@$(MAKE) -C indexer unit-test
 
+# CI-focused unit tests for non-program crates.
+# Program unit tests run in a dedicated workflow.
+unit-test-ci:
+	@echo "🧪 Running CI unit tests for core + indexer..."
+	@$(MAKE) -C core unit-test
+	@$(MAKE) -C indexer unit-test
+
 integration-test:
 	@echo "🔗 Running integration tests for all projects..."
 	@$(MAKE) -C contra-escrow-program integration-test
 	@$(MAKE) -C contra-withdraw-program integration-test
+	@echo "🔗 Running contra integration test (with production build)..."
+	@cd integration && cargo test --test contra_integration -- --nocapture
+	@echo "🔗 Building escrow with test-tree for indexer tests..."
+	@$(MAKE) -C contra-escrow-program build-test
+	@echo "🔗 Running indexer integration test (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+
+# CI-focused integration target that avoids running program integration
+# suites already covered in the dedicated program workflow.
+integration-test-ci:
+	@echo "🔗 Running CI integration tests (non-program suites)..."
+	@echo "🔨 Building program artifacts once for integration crate tests..."
+	@$(MAKE) -C contra-escrow-program build
+	@$(MAKE) -C contra-withdraw-program build
 	@echo "🔗 Running contra integration test (with production build)..."
 	@cd integration && cargo test --test contra_integration -- --nocapture
 	@echo "🔗 Building escrow with test-tree for indexer tests..."
@@ -222,7 +243,9 @@ help:
 	@echo ""
 	@echo "🧪 Testing:"
 	@echo "  unit-test            - Run unit tests for all projects"
+	@echo "  unit-test-ci         - Run CI unit tests for core + indexer"
 	@echo "  integration-test     - Run integration tests for all projects"
+	@echo "  integration-test-ci  - Run CI integration tests without program integration suites"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""
 	@echo "📊 Coverage:"

@@ -64,6 +64,48 @@ pub async fn write_batch(
     }
 }
 
+/// Writes a batch of account settlements and transactions to both Postgres and Redis.
+///
+/// # DB-First, Cache-Second Semantics
+///
+/// This function implements a critical correctness pattern:
+///
+/// 1. **Postgres writes first** - The Postgres transaction MUST complete successfully
+///    before any Redis write is attempted. Postgres uses true ACID transactions with
+///    BEGIN/COMMIT semantics, ensuring atomic writes of slots, transactions, and accounts.
+///
+/// 2. **Redis writes are best-effort** - Redis acts as a write-through cache. Redis uses
+///    MULTI/EXEC (via `pipe.atomic()`), which is NOT a true transaction and can fail
+///    partway through. Redis write failures are logged but do NOT fail the batch operation.
+///
+/// 3. **Why this ordering matters for correctness**:
+///    - **Invariant C10 (DB as Source of Truth)**: Finalized state MUST come from Postgres,
+///      not Redis. If Postgres succeeds but Redis fails, reads can fall back to Postgres.
+///      If Redis succeeded but Postgres failed, we'd have cache entries with no DB backing.
+///    - **Invariant C1 (Atomic Slot Writes)**: A slot and all its transactions + account
+///      changes MUST be written atomically. Only Postgres transactions guarantee this.
+///      Redis MULTI/EXEC can fail partway through without rollback.
+///    - **Cache warming recovery**: On startup, Redis can be warmed from Postgres to
+///      recover from any previous divergence caused by Redis failures.
+///
+/// # Arguments
+///
+/// * `postgres_db` - The Postgres database connection (source of truth)
+/// * `redis_db` - The Redis cache connection (best-effort cache)
+/// * `account_settlements` - Account changes to write
+/// * `transactions` - Transactions to store
+/// * `block_info` - Optional block metadata
+/// * `slot` - Optional slot number to update
+///
+/// # Returns
+///
+/// * `Ok(())` if Postgres write succeeds (regardless of Redis outcome)
+/// * `Err(String)` only if the Postgres write fails
+///
+/// # Error Handling
+///
+/// - Postgres errors: Propagated to caller (this is a fatal error)
+/// - Redis errors: Logged with `warn!()` and swallowed (non-fatal)
 pub async fn write_batch_dual(
     postgres_db: &mut PostgresAccountsDB,
     redis_db: &mut RedisAccountsDB,
@@ -82,7 +124,9 @@ pub async fn write_batch_dual(
     let transactions_clone = transactions.clone();
     let block_info_clone = block_info.clone();
 
-    // Write to Postgres first - fail if this fails
+    // CRITICAL: Write to Postgres first - this MUST succeed for correctness.
+    // Postgres is the source of truth and provides ACID transaction guarantees.
+    // If this fails, the entire batch operation fails.
     write_batch_postgres(
         postgres_db,
         account_settlements,
@@ -92,7 +136,11 @@ pub async fn write_batch_dual(
     )
     .await?;
 
-    // Write to Redis best-effort - log but don't fail
+    // Write to Redis best-effort - this is a cache warm-up operation.
+    // Redis failures are logged but do NOT fail the batch because:
+    // 1. Postgres (source of truth) already succeeded
+    // 2. Reads can fall back to Postgres if Redis is stale/missing
+    // 3. Cache warming on startup can recover from Redis divergence
     if let Err(e) = write_batch_redis(
         redis_db,
         account_settlements,
@@ -102,7 +150,10 @@ pub async fn write_batch_dual(
     )
     .await
     {
-        warn!("Best-effort Redis write failed: {}", e);
+        warn!(
+            "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
+            e
+        );
     }
 
     Ok(())

@@ -24,7 +24,29 @@ pub struct BlockInfo {
     pub transaction_signatures: Vec<Signature>,
 }
 
-// The AccountsDB enum now uses match statements instead of enum_dispatch for most methods
+/// AccountsDB enum supporting multiple backend storage options
+///
+/// # Variants
+///
+/// * `Postgres` - PostgreSQL database only. Provides ACID transactions and is the
+///   source of truth for all finalized state.
+///
+/// * `Redis` - Redis cache only. Fast in-memory storage but lacks true transaction
+///   support. Uses MULTI/EXEC which can fail partway through without rollback.
+///
+/// * `Dual` - **DB-first, cache-second** dual backend configuration.
+///   - **PostgreSQL** is the primary database and source of truth
+///   - **Redis** is a best-effort write-through cache for performance
+///   - **Write semantics**: Postgres writes MUST succeed; Redis writes are logged-only if they fail
+///   - **Read semantics**: Try Redis first for speed, fall back to Postgres if missing/stale
+///   - **Recovery**: Cache warming on startup populates Redis from Postgres
+///
+///   This variant ensures correctness invariants:
+///   - **Invariant C10**: Finalized state comes from Postgres (source of truth)
+///   - **Invariant C1**: Atomic slot writes via Postgres transactions
+///   - **Cache divergence tolerance**: Redis can be stale/missing without affecting correctness
+///
+/// The AccountsDB enum now uses match statements instead of enum_dispatch for most methods
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum AccountsDB {

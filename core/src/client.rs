@@ -5,16 +5,6 @@ use {
     std::{fs, path::PathBuf},
 };
 
-const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
-
-fn find_withdraw_event_authority_pda() -> Pubkey {
-    Pubkey::find_program_address(
-        &[EVENT_AUTHORITY_SEED],
-        &contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
-    )
-    .0
-}
-
 #[derive(Debug)]
 pub struct RpcError {
     pub code: i64,
@@ -89,7 +79,6 @@ pub fn create_withdraw_funds(
 
     let from_pubkey = from.pubkey();
     let token_account = get_associated_token_address(&from_pubkey, mint);
-    let event_authority = find_withdraw_event_authority_pda();
 
     let withdraw_ix = WithdrawFundsBuilder::new()
         .user(from_pubkey)
@@ -97,8 +86,6 @@ pub fn create_withdraw_funds(
         .token_account(token_account)
         .token_program(spl_token::id())
         .associated_token_program(spl_associated_token_account::id())
-        .event_authority(event_authority)
-        .contra_withdraw_program(contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID)
         .amount(amount)
         .instruction();
 

@@ -9,6 +9,8 @@ import { mockTransactionSigner, TEST_ADDRESSES } from '../../setup/mocks';
 import { AccountRole } from '@solana/kit';
 import { TOKEN_PROGRAM_ADDRESS, ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
 
+const EVENT_AUTHORITY_PDA = '5FAjDRC1KH4k6pL5Qin7KBPmcyW4LLW6CviNXfeKDDwn';
+
 describe('withdraw_funds', () => {
     describe('Instruction data validation', () => {
         it('should encode instruction data with correct discriminator, amount, and destination', async () => {
@@ -20,8 +22,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: testAmount,
                 destination: testDestination,
             });
@@ -56,8 +56,6 @@ describe('withdraw_funds', () => {
                     user,
                     mint: TEST_ADDRESSES.MINT,
                     tokenAccount: TEST_ADDRESSES.WALLET,
-                    eventAuthority: TEST_ADDRESSES.WALLET,
-                    contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                     amount: testAmount,
                     destination: null,
                 });
@@ -73,8 +71,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: numberAmount,
                 destination: null,
             });
@@ -92,8 +88,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: testAmount,
                 destination: null,
             });
@@ -107,8 +101,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: testAmount,
                 destination: testDestination,
             });
@@ -124,8 +116,6 @@ describe('withdraw_funds', () => {
                     user,
                     mint: TEST_ADDRESSES.MINT,
                     tokenAccount: TEST_ADDRESSES.WALLET,
-                    eventAuthority: TEST_ADDRESSES.WALLET,
-                    contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                     amount: testAmount,
                     destination,
                 });
@@ -145,8 +135,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: testAmount,
                 destination: testDestination,
             });
@@ -169,8 +157,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: testAmount,
                 destination: null,
             });
@@ -200,8 +186,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: 1000000n,
                 destination: null,
             });
@@ -231,7 +215,7 @@ describe('withdraw_funds', () => {
 
             // Account 5: eventAuthority (Readonly)
             const eventAuthorityAccount = instruction.accounts[5];
-            expect(eventAuthorityAccount.address).toBe(TEST_ADDRESSES.WALLET);
+            expect(eventAuthorityAccount.address).toBe(EVENT_AUTHORITY_PDA);
 
             // Account 6: contraWithdrawProgram (Readonly)
             const contraWithdrawProgramAccount = instruction.accounts[6];
@@ -245,8 +229,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: 1000000n,
                 destination: null,
             });
@@ -287,8 +269,6 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                eventAuthority: TEST_ADDRESSES.WALLET,
-                contraWithdrawProgram: CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
                 amount: 1000000n,
                 destination: null,
             });

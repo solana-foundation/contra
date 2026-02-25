@@ -1,4 +1,4 @@
-use contra_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
+use contra_withdraw_program_client::instructions::WithdrawFundsBuilder;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -9,15 +9,6 @@ use spl_associated_token_account::get_associated_token_address;
 use std::{env, error::Error, str::FromStr};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
-
-fn find_event_authority_pda() -> Pubkey {
-    Pubkey::find_program_address(
-        &[EVENT_AUTHORITY_SEED],
-        &contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
-    )
-    .0
-}
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -62,24 +53,24 @@ fn main() -> Result<()> {
     println!("User pubkey: {}", user_keypair.pubkey());
 
     let user_ata = get_associated_token_address(&user_keypair.pubkey(), &mint);
-    let event_authority = find_event_authority_pda();
 
     println!("\n📍 Transaction details:");
     println!("User ATA (on Contra): {}", user_ata);
 
-    let instruction = WithdrawFunds {
-        user: user_keypair.pubkey(),
-        mint,
-        token_account: user_ata,
-        token_program: spl_token::ID,
-        associated_token_program: spl_associated_token_account::ID,
-        event_authority,
-        contra_withdraw_program: contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+    let mut withdraw_builder = WithdrawFundsBuilder::new();
+    let builder = withdraw_builder
+        .user(user_keypair.pubkey())
+        .mint(mint)
+        .token_account(user_ata)
+        .token_program(spl_token::ID)
+        .associated_token_program(spl_associated_token_account::ID)
+        .amount(amount);
+
+    if let Some(destination) = destination {
+        builder.destination(destination);
     }
-    .instruction(WithdrawFundsInstructionArgs {
-        amount,
-        destination,
-    });
+
+    let instruction = builder.instruction();
 
     let recent_blockhash = client.get_latest_blockhash()?;
     let transaction = Transaction::new_signed_with_payer(

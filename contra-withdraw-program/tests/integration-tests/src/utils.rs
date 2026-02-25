@@ -22,7 +22,6 @@ use spl_associated_token_account::{
 };
 
 const MIN_LAMPORTS: u64 = 500_000_000;
-const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const EVENT_IX_TAG_LE: [u8; 8] = [228, 69, 165, 46, 81, 203, 154, 29];
 const WITHDRAW_FUNDS_EVENT_DISCRIMINATOR: u8 = 0;
 
@@ -35,10 +34,6 @@ pub const INVALID_MINT_ERROR: u32 = ContraWithdrawProgramError::InvalidMint as u
 pub const ZERO_AMOUNT_ERROR: u32 = ContraWithdrawProgramError::ZeroAmount as u32;
 pub const INVALID_EVENT_AUTHORITY_ERROR: u32 =
     ContraWithdrawProgramError::InvalidEventAuthority as u32;
-
-pub fn find_event_authority_pda() -> Pubkey {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_WITHDRAW_PROGRAM_ID).0
-}
 
 pub fn parse_withdraw_event(transaction_metadata: &TransactionMetadata) -> Option<(u64, Pubkey)> {
     for inner_instruction_set in &transaction_metadata.inner_instructions {

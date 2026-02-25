@@ -5,23 +5,13 @@ use super::send_and_confirm_instructions;
 use super::test_types::{TransactionType, UserTransaction, BASE_AMOUNT, DEPOSITS_PER_USER};
 
 use contra_escrow_program_client::instructions::DepositBuilder;
-use contra_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
+use contra_withdraw_program_client::instructions::WithdrawFundsBuilder;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer};
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
-
-const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
-
-fn find_withdraw_event_authority_pda() -> Pubkey {
-    Pubkey::find_program_address(
-        &[EVENT_AUTHORITY_SEED],
-        &contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
-    )
-    .0
-}
 
 /// Execute all deposit transactions for a single user
 pub async fn execute_user_deposits(
@@ -99,21 +89,16 @@ pub async fn execute_user_withdrawal(
 ) -> Result<UserTransaction, String> {
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
-    let event_authority = find_withdraw_event_authority_pda();
 
-    let withdraw_ix = WithdrawFunds {
-        user: user.pubkey(),
-        mint,
-        token_account: user_ata,
-        token_program: TOKEN_PROGRAM_ID,
-        associated_token_program: spl_associated_token_account::ID,
-        event_authority,
-        contra_withdraw_program: contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
-    }
-    .instruction(WithdrawFundsInstructionArgs {
-        amount: total_deposited,
-        destination: Some(user.pubkey()),
-    });
+    let withdraw_ix = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint)
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(spl_associated_token_account::ID)
+        .amount(total_deposited)
+        .destination(user.pubkey())
+        .instruction();
 
     let signature =
         send_and_confirm_instructions(client, &[withdraw_ix], user, &[user], "Withdraw")

@@ -10,8 +10,9 @@ import {
     variablePdaSeedNode,
 } from 'codama';
 
-const WITHDRAW_PROGRAM_ID = 'J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi';
+const CONTRA_WITHDRAW_PROGRAM_ID = 'J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi';
 const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const EVENT_AUTHORITY_PDA = '5FAjDRC1KH4k6pL5Qin7KBPmcyW4LLW6CviNXfeKDDwn';
 
 function createAtaPdaValueNode(ownerAccount: string, mintAccount: string, tokenProgram: string) {
     return pdaValueNode(
@@ -36,12 +37,16 @@ export function setInstructionAccountDefaultValues(contraWithdrawCodama: Codama)
     contraWithdrawCodama.update(
         setInstructionAccountDefaultValuesVisitor([
             {
-                account: 'withdrawProgram',
-                defaultValue: publicKeyValueNode(WITHDRAW_PROGRAM_ID),
+                account: 'contraWithdrawProgram',
+                defaultValue: publicKeyValueNode(CONTRA_WITHDRAW_PROGRAM_ID),
             },
             {
                 account: 'associatedTokenProgram',
                 defaultValue: publicKeyValueNode(ATA_PROGRAM_ID),
+            },
+            {
+                account: 'eventAuthority',
+                defaultValue: publicKeyValueNode(EVENT_AUTHORITY_PDA),
             },
             {
                 account: 'tokenAccount',

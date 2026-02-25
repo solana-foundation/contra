@@ -1,9 +1,6 @@
 use crate::{
     assertions::assert_balance_changed,
-    utils::{
-        find_event_authority_pda, get_token_balance, TestContext, ATA_PROGRAM_ID,
-        CONTRA_WITHDRAW_PROGRAM_ID,
-    },
+    utils::{get_token_balance, TestContext, ATA_PROGRAM_ID},
 };
 use contra_withdraw_program_client::instructions::WithdrawFundsBuilder;
 use solana_sdk::{
@@ -28,15 +25,12 @@ pub fn assert_get_or_withdraw_funds(
     let user_balance_before = get_token_balance(context, &user_ata);
 
     let mut binding = WithdrawFundsBuilder::new();
-    let event_authority = find_event_authority_pda();
     let builder = binding
         .user(user.pubkey())
         .mint(*mint)
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority)
-        .contra_withdraw_program(CONTRA_WITHDRAW_PROGRAM_ID)
         .amount(amount);
 
     if let Some(destination) = destination {

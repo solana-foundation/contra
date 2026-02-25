@@ -21,17 +21,15 @@ pub async fn is_blockhash_valid_impl(
     let provided_hash = Hash::from_str(&blockhash)
         .map_err(|e| custom_error(-32602, format!("Invalid blockhash: {}", e)))?;
 
-    // Get the latest blockhash
-    let latest_hash = read_deps
-        .accounts_db
-        .get_latest_blockhash()
-        .await
-        .map_err(|e| custom_error(-32000, format!("Failed to get blockhash: {}", e)))?;
-
-    // Check if the blockhash matches the latest one
-    // In a production system, you'd want to check a range of recent blockhashes
-    // but for now we'll just check the latest one
-    let is_valid = provided_hash == latest_hash;
+    // Check if the blockhash is in the live blockhash window
+    // This validates against the full window maintained by the Dedup stage,
+    // not just the single latest blockhash, upholding security invariant C4
+    let is_valid = read_deps
+        .live_blockhashes
+        .read()
+        .unwrap()
+        .iter()
+        .any(|h| h == &provided_hash);
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

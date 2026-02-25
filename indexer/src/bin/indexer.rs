@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Indexer => run_indexer(figment, args.verbose).await,
         Mode::Operator => run_operator(figment, args.verbose).await,
-        Mode::Resync => Err("Resync mode not yet implemented".into()),
+        Mode::Resync => run_resync(figment, args.verbose).await,
     }
 }
 
@@ -360,4 +360,17 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     contra_indexer::operator::run(storage, common_config, operator_config).await?;
 
     Ok(())
+}
+
+async fn run_resync(figment: Figment, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(if verbose {
+            "info,contra_indexer=debug"
+        } else {
+            "info"
+        })
+        .init();
+
+    tracing::info!("Resync mode not yet implemented");
+    Err("Resync mode not yet implemented".into())
 }

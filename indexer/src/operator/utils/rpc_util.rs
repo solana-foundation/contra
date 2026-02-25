@@ -227,7 +227,7 @@ impl RpcClientWithRetry {
 
         self.with_retry("get_transaction", RetryPolicy::Idempotent, || async {
             self.rpc_client
-                .get_transaction_with_config(signature, config.clone())
+                .get_transaction_with_config(signature, config)
                 .await
         })
         .await

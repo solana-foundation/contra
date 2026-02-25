@@ -5,7 +5,7 @@ use crate::operator::{
 };
 use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
-use solana_sdk::instruction::Instruction;
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
 
@@ -235,6 +235,18 @@ impl MintToBuilder {
         self.token_program
     }
 
+    pub fn get_payer(&self) -> Option<Pubkey> {
+        self.payer
+    }
+
+    pub fn get_mint_authority(&self) -> Option<Pubkey> {
+        self.mint_authority
+    }
+
+    pub fn get_amount(&self) -> Option<u64> {
+        self.amount
+    }
+
     pub fn get_recipient_ata(&self) -> Option<Pubkey> {
         self.recipient_ata
     }
@@ -268,7 +280,7 @@ impl MintToBuilder {
         if let Some(memo) = self.idempotency_memo.as_deref() {
             instructions.push(Instruction {
                 program_id: spl_memo::id(),
-                accounts: vec![],
+                accounts: vec![AccountMeta::new_readonly(payer, true)],
                 data: memo.as_bytes().to_vec(),
             });
         }

@@ -3,6 +3,7 @@ use {
     redis::{aio::ConnectionManager, AsyncCommands, RedisResult},
     solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
+    url::Url,
 };
 
 #[derive(Clone)]
@@ -12,11 +13,20 @@ pub struct RedisAccountsDB {
 
 impl RedisAccountsDB {
     pub async fn new(redis_url: &str) -> Result<Self, String> {
+        // Parse URL to extract host/port without credentials for error messages
+        let sanitized_url = if let Ok(parsed) = url::Url::parse(redis_url) {
+            let host = parsed.host_str().unwrap_or("unknown");
+            let port = parsed.port().unwrap_or(6379);
+            format!("{}:{}", host, port)
+        } else {
+            "unknown".to_string()
+        };
+
         let client = redis::Client::open(redis_url)
-            .map_err(|e| format!("Failed to create Redis client: {}", e))?;
+            .map_err(|_| format!("Failed to create Redis client for {}", sanitized_url))?;
         let connection = ConnectionManager::new(client)
             .await
-            .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
+            .map_err(|_| format!("Failed to connect to Redis at {}", sanitized_url))?;
 
         let db = Self { connection };
         Ok(db)

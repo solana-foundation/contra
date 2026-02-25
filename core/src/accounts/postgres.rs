@@ -5,6 +5,7 @@ use {
     sqlx::{postgres::PgPoolOptions, PgPool},
     std::sync::Arc,
     tracing::{debug, info},
+    url::Url,
 };
 
 #[derive(Clone)]
@@ -18,7 +19,16 @@ impl PostgresAccountsDB {
         database_url: &str,
         read_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        info!("Connecting to PostgreSQL: {}", database_url);
+        // Parse URL to extract host/port without credentials
+        let sanitized_url = if let Ok(parsed) = url::Url::parse(database_url) {
+            let host = parsed.host_str().unwrap_or("unknown");
+            let port = parsed.port().unwrap_or(5432);
+            let db = parsed.path().trim_start_matches('/');
+            format!("{}:{}/{}", host, port, db)
+        } else {
+            "unknown".to_string()
+        };
+        info!("Connecting to PostgreSQL: {}", sanitized_url);
 
         // Create connection pool
         let pool = PgPoolOptions::new()

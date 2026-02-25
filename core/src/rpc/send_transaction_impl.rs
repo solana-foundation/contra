@@ -1,4 +1,5 @@
 use crate::rpc::{
+    constants::PACKET_DATA_SIZE,
     error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     WriteDeps,
 };
@@ -27,8 +28,6 @@ pub async fn send_transaction_impl(
         )
     })?;
 
-    // Check packet size limit (1232 bytes is Solana's PACKET_DATA_SIZE)
-    const PACKET_DATA_SIZE: usize = 1232;
     if tx_data.len() > PACKET_DATA_SIZE {
         return Err(custom_error(
             INVALID_PARAMS_CODE,

@@ -9,3 +9,6 @@ pub const MAX_SIGNATURES: usize = 256;
 
 /// Maximum JSON-RPC response size (10 MB).
 pub const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Maximum serialized transaction size (matches Solana's PACKET_DATA_SIZE).
+pub const PACKET_DATA_SIZE: usize = 1232;

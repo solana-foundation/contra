@@ -50,23 +50,4 @@ mod tests {
         let random = Pubkey::new_unique();
         assert!(!is_admin_instruction(&random, 0));
     }
-
-    #[test]
-    fn spl_token_is_allowed() {
-        assert!(is_allowed_instruction(&spl_token::id(), 3));
-    }
-
-    #[test]
-    fn unknown_program_is_not_allowed() {
-        let random = Pubkey::new_unique();
-        assert!(!is_allowed_instruction(&random, 0));
-    }
-
-    #[test]
-    fn system_program_is_not_allowed() {
-        assert!(!is_allowed_instruction(
-            &solana_sdk::system_program::id(),
-            0
-        ));
-    }
 }

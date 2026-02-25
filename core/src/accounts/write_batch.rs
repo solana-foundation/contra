@@ -375,6 +375,12 @@ mod tests {
         signature::{Keypair, Signer},
         system_transaction,
     };
+    use solana_svm::transaction_processing_result::ProcessedTransaction;
+    use solana_svm::transaction_execution_result::{
+        ExecutedTransaction, TransactionExecutionDetails,
+    };
+    use solana_svm::account_loader::LoadedTransaction;
+    use std::collections::HashMap;
 
     /// Test that write_batch_dual succeeds when Postgres writes complete
     /// but Redis is unavailable (connection fails).
@@ -446,7 +452,22 @@ mod tests {
         );
         let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
 
-        let processed = ProcessedTransaction::default();
+        let executed_tx = ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        };
+        let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
         let transactions = vec![(
             Signature::default(),
@@ -459,8 +480,11 @@ mod tests {
         let block_info = Some(BlockInfo {
             slot: 100,
             blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
+            parent_slot: 99,
             block_height: Some(100),
             block_time: Some(0),
+            transaction_signatures: vec![Signature::default()],
         });
 
         // Execute: Call write_batch_dual
@@ -552,7 +576,22 @@ mod tests {
             Hash::default(),
         );
         let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
-        let processed = ProcessedTransaction::default();
+        let executed_tx = ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        };
+        let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
         let transactions = vec![(
             Signature::default(),
@@ -565,8 +604,11 @@ mod tests {
         let block_info = Some(BlockInfo {
             slot: 100,
             blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
+            parent_slot: 99,
             block_height: Some(100),
             block_time: Some(0),
+            transaction_signatures: vec![Signature::default()],
         });
 
         // Execute: Call write_batch_dual with valid Postgres but failing Redis
@@ -663,7 +705,22 @@ mod tests {
             Hash::default(),
         );
         let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
-        let processed = ProcessedTransaction::default();
+        let executed_tx = ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        };
+        let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
         let transactions = vec![(
             Signature::default(),
@@ -676,8 +733,11 @@ mod tests {
         let block_info = Some(BlockInfo {
             slot: 200,
             blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
+            parent_slot: 199,
             block_height: Some(200),
             block_time: Some(0),
+            transaction_signatures: vec![Signature::default()],
         });
 
         // Execute: Call write_batch_dual with valid data

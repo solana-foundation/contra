@@ -18,6 +18,10 @@ pub async fn account_matches_owners(
         AccountsDB::Redis(redis_db) => {
             account_matches_owners_redis(redis_db, account, owners).await
         }
+        AccountsDB::Dual(postgres_db, _redis_db) => {
+            // For Dual mode, read from Postgres (source of truth)
+            account_matches_owners_postgres(postgres_db, account, owners).await
+        }
     }
 }
 

@@ -22,6 +22,11 @@ use solana_sdk::{
     transaction::SanitizedTransaction,
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
+use solana_svm::transaction_execution_result::{
+    ExecutedTransaction, TransactionExecutionDetails,
+};
+use solana_svm::account_loader::LoadedTransaction;
+use std::collections::HashMap;
 use std::env;
 
 /// Test that write_batch continues successfully when Redis is completely unavailable
@@ -108,7 +113,22 @@ async fn test_settle_worker_continues_with_redis_down() {
         Hash::default(),
     );
     let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
-    let processed = ProcessedTransaction::default();
+    let executed_tx = ExecutedTransaction {
+        loaded_transaction: LoadedTransaction {
+            accounts: vec![],
+            ..Default::default()
+        },
+        execution_details: TransactionExecutionDetails {
+            status: Ok(()),
+            log_messages: None,
+            inner_instructions: None,
+            return_data: None,
+            executed_units: 0,
+            accounts_data_len_delta: 0,
+        },
+        programs_modified_by_tx: HashMap::new(),
+    };
+    let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
     let transactions = vec![(
         Signature::default(),
@@ -121,8 +141,11 @@ async fn test_settle_worker_continues_with_redis_down() {
     let block_info = Some(BlockInfo {
         slot: 100,
         blockhash: Hash::default(),
+        previous_blockhash: Hash::default(),
+        parent_slot: 99,
         block_height: Some(100),
         block_time: Some(1234567890),
+        transaction_signatures: vec![Signature::default()],
     });
 
     // Execute: Call write_batch with Redis unavailable
@@ -246,7 +269,22 @@ async fn test_multiple_batches_with_redis_down() {
             Hash::default(),
         );
         let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
-        let processed = ProcessedTransaction::default();
+        let executed_tx = ExecutedTransaction {
+        loaded_transaction: LoadedTransaction {
+            accounts: vec![],
+            ..Default::default()
+        },
+        execution_details: TransactionExecutionDetails {
+            status: Ok(()),
+            log_messages: None,
+            inner_instructions: None,
+            return_data: None,
+            executed_units: 0,
+            accounts_data_len_delta: 0,
+        },
+        programs_modified_by_tx: HashMap::new(),
+    };
+    let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
         let transactions = vec![(
             Signature::default(),
@@ -259,8 +297,11 @@ async fn test_multiple_batches_with_redis_down() {
         let block_info = Some(BlockInfo {
             slot: 100 + i,
             blockhash: Hash::default(),
+            previous_blockhash: Hash::default(),
+            parent_slot: 99 + i,
             block_height: Some(100 + i),
             block_time: Some(1234567890),
+            transaction_signatures: vec![Signature::default()],
         });
 
         // Each batch should succeed despite Redis being down
@@ -366,7 +407,22 @@ async fn test_db_first_semantics_with_redis_down() {
         Hash::default(),
     );
     let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
-    let processed = ProcessedTransaction::default();
+    let executed_tx = ExecutedTransaction {
+        loaded_transaction: LoadedTransaction {
+            accounts: vec![],
+            ..Default::default()
+        },
+        execution_details: TransactionExecutionDetails {
+            status: Ok(()),
+            log_messages: None,
+            inner_instructions: None,
+            return_data: None,
+            executed_units: 0,
+            accounts_data_len_delta: 0,
+        },
+        programs_modified_by_tx: HashMap::new(),
+    };
+    let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
     let transactions = vec![(
         Signature::default(),
@@ -379,8 +435,11 @@ async fn test_db_first_semantics_with_redis_down() {
     let block_info = Some(BlockInfo {
         slot: 200,
         blockhash: Hash::default(),
+        previous_blockhash: Hash::default(),
+        parent_slot: 199,
         block_height: Some(200),
         block_time: Some(1234567890),
+        transaction_signatures: vec![Signature::default()],
     });
 
     // Execute write
@@ -514,7 +573,22 @@ async fn test_cache_warming_recovers_from_divergence() {
         Hash::default(),
     );
     let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(transaction);
-    let processed = ProcessedTransaction::default();
+    let executed_tx = ExecutedTransaction {
+        loaded_transaction: LoadedTransaction {
+            accounts: vec![],
+            ..Default::default()
+        },
+        execution_details: TransactionExecutionDetails {
+            status: Ok(()),
+            log_messages: None,
+            inner_instructions: None,
+            return_data: None,
+            executed_units: 0,
+            accounts_data_len_delta: 0,
+        },
+        programs_modified_by_tx: HashMap::new(),
+    };
+    let processed = ProcessedTransaction::Executed(Box::new(executed_tx));
 
     let test_slot = 300u64;
     let test_blockhash = Hash::new_unique();
@@ -531,8 +605,11 @@ async fn test_cache_warming_recovers_from_divergence() {
     let block_info = Some(BlockInfo {
         slot: test_slot,
         blockhash: test_blockhash,
+        previous_blockhash: Hash::default(),
+        parent_slot: test_slot - 1,
         block_height: Some(test_slot),
         block_time: Some(test_block_time),
+        transaction_signatures: vec![Signature::default()],
     });
 
     // Write batch: Postgres should succeed, Redis should fail (non-fatal)

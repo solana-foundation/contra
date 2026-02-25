@@ -3,6 +3,8 @@ use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
+use chrono;
+use serde_json;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::TokenAccountsFilter;
@@ -10,6 +12,8 @@ use solana_sdk::pubkey::Pubkey;
 use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -231,6 +235,130 @@ async fn fetch_on_chain_balances(
     }
 
     Ok(balances)
+}
+
+/// Configuration for webhook retry behavior
+const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
+const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
+const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Sends webhook alerts for balance mismatches with retry logic
+///
+/// Posts each mismatch to the configured webhook URL as a JSON payload with the format:
+/// ```json
+/// {
+///   "mint": "<mint_pubkey>",
+///   "on_chain_balance": 123,
+///   "db_balance": 456,
+///   "delta_bps": 789,
+///   "timestamp": "2024-01-01T12:00:00Z"
+/// }
+/// ```
+///
+/// Implements exponential backoff retry logic (up to 3 attempts) for transient HTTP errors.
+/// If the webhook URL is not configured (None), logs a warning and returns Ok without sending.
+///
+/// # Arguments
+/// * `webhook_url` - Optional webhook URL to POST alerts to
+/// * `mismatches` - Slice of balance mismatches to alert on
+///
+/// # Returns
+/// * `Ok(())` if all webhooks sent successfully (or no URL configured)
+/// * `Err(OperatorError::WebhookError)` if webhook delivery fails after retries
+async fn send_webhook_alert(
+    webhook_url: &Option<String>,
+    mismatches: &[BalanceMismatch],
+) -> Result<(), OperatorError> {
+    // If no webhook URL configured, log and return early
+    let url = match webhook_url {
+        Some(url) => url,
+        None => {
+            if !mismatches.is_empty() {
+                warn!(
+                    "Balance mismatch detected but no webhook URL configured (found {} mismatches)",
+                    mismatches.len()
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    // Send alert for each mismatch
+    for mismatch in mismatches {
+        send_single_webhook_alert(url, mismatch).await?;
+    }
+
+    Ok(())
+}
+
+/// Sends a single webhook alert with retry logic
+///
+/// Implements exponential backoff with configurable retry attempts.
+/// Logs warnings on failed attempts and errors on final failure.
+async fn send_single_webhook_alert(
+    url: &str,
+    mismatch: &BalanceMismatch,
+) -> Result<(), OperatorError> {
+    let client = reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
+
+    // Prepare JSON payload
+    let payload = serde_json::json!({
+        "mint": mismatch.mint.to_string(),
+        "on_chain_balance": mismatch.on_chain_balance,
+        "db_balance": mismatch.db_balance,
+        "delta_bps": mismatch.delta_bps,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let mut attempts = 0;
+    let mut last_error = String::new();
+
+    loop {
+        attempts += 1;
+
+        match client.post(url).json(&payload).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!(
+                        "Webhook alert sent for mint {} (delta: {} bps)",
+                        mismatch.mint, mismatch.delta_bps
+                    );
+                    return Ok(());
+                } else {
+                    last_error = format!("HTTP {}: {}", response.status(), response.text().await.unwrap_or_default());
+                }
+            }
+            Err(e) => {
+                last_error = format!("Request failed: {}", e);
+            }
+        }
+
+        if attempts >= WEBHOOK_MAX_ATTEMPTS {
+            error!(
+                "Failed to send webhook alert after {} attempts for mint {}: {}",
+                attempts, mismatch.mint, last_error
+            );
+            return Err(OperatorError::WebhookError(format!(
+                "Failed to send webhook alert after {} attempts: {}",
+                attempts, last_error
+            )));
+        }
+
+        // Exponential backoff with capped delay
+        let delay = WEBHOOK_BASE_DELAY * 2_u32.pow(attempts - 1);
+        let delay = delay.min(WEBHOOK_MAX_DELAY);
+
+        warn!(
+            "Webhook alert attempt {} failed for mint {}, retrying in {:?}: {}",
+            attempts, mismatch.mint, delay, last_error
+        );
+
+        sleep(delay).await;
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +627,161 @@ mod tests {
             mismatch.delta_bps > 0,
             "Should detect difference even with large values"
         );
+    }
+
+    #[tokio::test]
+    async fn test_send_webhook_alert_no_url() {
+        // Test with no webhook URL configured - should not fail
+        let mint = Pubkey::new_unique();
+        let mismatches = vec![BalanceMismatch {
+            mint,
+            on_chain_balance: 1000,
+            db_balance: 900,
+            delta_bps: 1000,
+        }];
+
+        let result = send_webhook_alert(&None, &mismatches).await;
+        assert!(result.is_ok(), "Should succeed when no webhook URL configured");
+    }
+
+    #[tokio::test]
+    async fn test_send_webhook_alert_empty_mismatches() {
+        // Test with empty mismatches - should succeed immediately
+        let webhook_url = Some("http://example.com/webhook".to_string());
+        let mismatches: Vec<BalanceMismatch> = vec![];
+
+        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        assert!(result.is_ok(), "Should succeed with empty mismatches");
+    }
+
+    #[tokio::test]
+    async fn test_send_webhook_alert_success() {
+        // Test successful webhook delivery with mockito
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let mint = Pubkey::new_unique();
+        let mismatches = vec![BalanceMismatch {
+            mint,
+            on_chain_balance: 1000,
+            db_balance: 900,
+            delta_bps: 1000,
+        }];
+
+        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        assert!(result.is_ok(), "Should successfully send webhook");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_webhook_alert_retry_then_success() {
+        // Test webhook retry logic - fail once, then succeed
+        let mut server = mockito::Server::new_async().await;
+
+        // First request fails with 500
+        let mock_fail = server
+            .mock("POST", "/")
+            .with_status(500)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Second request succeeds
+        let mock_success = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let mint = Pubkey::new_unique();
+        let mismatches = vec![BalanceMismatch {
+            mint,
+            on_chain_balance: 1000,
+            db_balance: 900,
+            delta_bps: 1000,
+        }];
+
+        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        assert!(result.is_ok(), "Should succeed after retry");
+
+        mock_fail.assert_async().await;
+        mock_success.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_webhook_alert_max_retries_exceeded() {
+        // Test webhook fails after max retries
+        let mut server = mockito::Server::new_async().await;
+
+        // All requests fail with 500
+        let mock = server
+            .mock("POST", "/")
+            .with_status(500)
+            .expect(3) // Should retry 3 times
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let mint = Pubkey::new_unique();
+        let mismatches = vec![BalanceMismatch {
+            mint,
+            on_chain_balance: 1000,
+            db_balance: 900,
+            delta_bps: 1000,
+        }];
+
+        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        assert!(result.is_err(), "Should fail after max retries");
+        assert!(
+            matches!(result.unwrap_err(), OperatorError::WebhookError(_)),
+            "Should return WebhookError"
+        );
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_webhook_alert_multiple_mismatches() {
+        // Test sending multiple webhook alerts
+        let mut server = mockito::Server::new_async().await;
+
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(2) // Should send 2 webhooks
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let mint1 = Pubkey::new_unique();
+        let mint2 = Pubkey::new_unique();
+        let mismatches = vec![
+            BalanceMismatch {
+                mint: mint1,
+                on_chain_balance: 1000,
+                db_balance: 900,
+                delta_bps: 1000,
+            },
+            BalanceMismatch {
+                mint: mint2,
+                on_chain_balance: 2000,
+                db_balance: 1800,
+                delta_bps: 1000,
+            },
+        ];
+
+        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        assert!(result.is_ok(), "Should successfully send all webhooks");
+
+        mock.assert_async().await;
     }
 }

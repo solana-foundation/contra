@@ -32,4 +32,10 @@ pub enum OperatorError {
 
     #[error("Channel send failed during shutdown")]
     ShutdownChannelSend,
+
+    #[error("RPC error: {0}")]
+    RpcError(String),
+
+    #[error("Webhook error: {0}")]
+    WebhookError(String),
 }

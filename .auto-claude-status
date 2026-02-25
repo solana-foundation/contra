@@ -1,0 +1,25 @@
+{
+  "active": true,
+  "spec": "011-automate-escrow-reconciliation-as-continuous-check",
+  "state": "building",
+  "subtasks": {
+    "completed": 9,
+    "total": 19,
+    "in_progress": 1,
+    "failed": 0
+  },
+  "phase": {
+    "current": "Reconciliation Core Logic",
+    "id": null,
+    "total": 5
+  },
+  "workers": {
+    "active": 0,
+    "max": 1
+  },
+  "session": {
+    "number": 10,
+    "started_at": "2026-02-25T19:32:21.056387"
+  },
+  "last_update": "2026-02-25T20:31:43.328966"
+}

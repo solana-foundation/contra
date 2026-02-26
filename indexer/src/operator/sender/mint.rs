@@ -804,7 +804,11 @@ mod tests {
             .token_program(spl_token::id())
             .amount(500);
 
-        let builder_with_id = MintToBuilderWithTxnId { builder, txn_id: 7 };
+        let builder_with_id = MintToBuilderWithTxnId {
+            builder,
+            txn_id: 7,
+            trace_id: "test".to_string(),
+        };
         let result = expected_mint_instruction(7, &builder_with_id).unwrap();
         assert_eq!(result.mint, mint);
         assert_eq!(result.recipient_ata, recipient_ata);
@@ -819,7 +823,11 @@ mod tests {
         builder.mint(Pubkey::new_unique());
         // missing recipient_ata, mint_authority, token_program, amount
 
-        let builder_with_id = MintToBuilderWithTxnId { builder, txn_id: 1 };
+        let builder_with_id = MintToBuilderWithTxnId {
+            builder,
+            txn_id: 1,
+            trace_id: "test".to_string(),
+        };
         assert!(expected_mint_instruction(1, &builder_with_id).is_none());
     }
 

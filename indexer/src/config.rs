@@ -259,6 +259,8 @@ pub struct OperatorConfig {
     pub channel_buffer_size: usize,
     /// RPC commitment level for operator transactions
     pub rpc_commitment: CommitmentLevel,
+    /// Webhook URL for alerting on failed transactions. Set via ALERT_WEBHOOK env var.
+    pub alert_webhook_url: Option<String>,
 }
 
 impl OperatorConfig {

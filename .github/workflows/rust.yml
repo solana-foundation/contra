@@ -79,12 +79,11 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          install-base-cargo-tools: "false"
-          setup-node: "false"
-          setup-pnpm: "false"
           setup-solana: "false"
-          install-dependencies: "false"
           build-programs: "false"
+
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Run cargo check
         run: cargo check --all-features
@@ -100,14 +99,13 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          install-base-cargo-tools: "false"
           install-system-dependencies: "false"
-          setup-node: "false"
-          setup-pnpm: "false"
           setup-solana: "false"
-          install-dependencies: "false"
           build-programs: "false"
           rust-components: rustfmt
+
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -123,13 +121,12 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          install-base-cargo-tools: "false"
-          setup-node: "false"
-          setup-pnpm: "false"
           setup-solana: "false"
-          install-dependencies: "false"
           build-programs: "false"
           rust-components: clippy
+
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
@@ -151,7 +148,7 @@ jobs:
         run: make integration-test-ci
 
   unit-tests:
-    name: Core + Indexer Unit Tests
+    name: Indexer Unit Tests
     needs: changes
     if: needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
@@ -161,12 +158,11 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          install-base-cargo-tools: "false"
-          setup-node: "false"
-          setup-pnpm: "false"
           setup-solana: "false"
-          install-dependencies: "false"
           build-programs: "false"
+
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Run core + indexer unit tests
         run: make unit-test-ci

@@ -3,7 +3,7 @@ name: TypeScript SDK Unit Tests
 on:
   workflow_call:
   push:
-    branches: [main]
+    branches: [main, hardening/pre-release-audit]
     paths:
       - "contra-escrow-program/clients/typescript/**"
       - ".github/workflows/sdk-unit.yml"
@@ -12,7 +12,7 @@ on:
       - "contra-escrow-program/package.json"
 
   pull_request:
-    branches: [main]
+    branches: [main, hardening/pre-release-audit]
     paths:
       - "contra-escrow-program/clients/typescript/**"
       - ".github/workflows/sdk-unit.yml"

@@ -2,7 +2,10 @@ use {
     crate::{accounts::traits::AccountsDB, nodes::node::WorkerHandle},
     anyhow::{ensure, Result},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
-    std::collections::{HashMap, HashSet, LinkedList},
+    std::{
+        collections::{HashMap, HashSet, LinkedList},
+        sync::{Arc, RwLock},
+    },
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
     tracing::{info, warn},
@@ -109,7 +112,7 @@ fn build_dedup_state(blocks: &[crate::accounts::traits::BlockInfo]) -> Result<De
     Ok((live_blockhashes, dedup_cache))
 }
 
-pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
+pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedList<Hash>>>) {
     let DedupArgs {
         max_blockhashes,
         mut input_rx,
@@ -119,11 +122,14 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
         initial_live_blockhashes,
         initial_dedup_cache,
     } = args;
+
+    let live_blockhashes = Arc::new(RwLock::new(initial_live_blockhashes));
+    let live_blockhashes_clone = Arc::clone(&live_blockhashes);
+
     let handle = tokio::spawn(async move {
         info!("Dedup stage started");
 
         let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = initial_dedup_cache;
-        let mut live_blockhashes: LinkedList<Hash> = initial_live_blockhashes;
 
         loop {
             tokio::select! {
@@ -131,9 +137,11 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
                 result = settled_blockhashes_rx.recv() => {
                     match result {
                         Some(blockhash) => {
-                            live_blockhashes.push_back(blockhash);
-                            while live_blockhashes.len() > max_blockhashes {
-                                if let Some(expired_blockhash) = live_blockhashes.pop_front() {
+                            let mut blockhashes = live_blockhashes_clone.write()
+                                .expect("blockhash lock poisoned");
+                            blockhashes.push_back(blockhash);
+                            while blockhashes.len() > max_blockhashes {
+                                if let Some(expired_blockhash) = blockhashes.pop_front() {
                                     dedup_cache.remove(&expired_blockhash);
                                 }
                             }
@@ -151,7 +159,9 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
 
-                            if !live_blockhashes.contains(&blockhash) {
+                            if !live_blockhashes_clone.read()
+                                .expect("blockhash lock poisoned")
+                                .contains(&blockhash) {
                                 warn!("Blockhash {} not found in live blockhashes", blockhash);
                                 continue;
                             }
@@ -199,7 +209,10 @@ pub async fn start_dedup(args: DedupArgs) -> WorkerHandle {
         info!("Dedup stopped");
     });
 
-    WorkerHandle::new("Dedup".to_string(), handle)
+    (
+        WorkerHandle::new("Dedup".to_string(), handle),
+        live_blockhashes,
+    )
 }
 
 #[cfg(test)]

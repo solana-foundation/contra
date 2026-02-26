@@ -1,6 +1,6 @@
 .PHONY: install build fmt generate-idl generate-clients
-.PHONY: unit-test integration-test all-test
-.PHONY: unit-coverage integration-coverage coverage-html all-coverage
+.PHONY: unit-test integration-test integration-test-no-build all-test
+.PHONY: unit-coverage integration-coverage integration-coverage-no-build coverage-html all-coverage
 .PHONY: build-devnet deploy-devnet
 
 # Install dependencies
@@ -44,10 +44,13 @@ unit-test:
 	pnpm test:unit
 	@cd program && cargo test
 
-# Run integration tests (includes build)
-integration-test: build
+# Run integration tests without build (for CI composition)
+integration-test-no-build:
 	@echo "Running integration tests for escrow program..."
 	@cd tests/integration-tests && cargo test -- --nocapture
+
+# Run integration tests (includes build)
+integration-test: build integration-test-no-build
 
 all-test: unit-test integration-test
 
@@ -56,10 +59,13 @@ unit-coverage:
 	@echo "Running unit tests with coverage..."
 	@cd program && cargo llvm-cov --lib --tests --lcov --output-path ../../coverage-escrow-unit.lcov
 
-# Run integration tests with coverage
-integration-coverage: build
+# Run integration tests with coverage without build (for CI composition)
+integration-coverage-no-build:
 	@echo "Running integration tests with coverage..."
 	@cd tests/integration-tests && cargo llvm-cov --lcov --output-path ../../../coverage-escrow-integration.lcov -- --nocapture
+
+# Run integration tests with coverage
+integration-coverage: build integration-coverage-no-build
 
 # Generate HTML coverage report
 coverage-html:
@@ -108,4 +114,3 @@ deploy-devnet: build-devnet
 		--program-id ../target/deploy/contra_escrow_program-keypair.json \
 		--keypair $(DEPLOYER_KEY) \
 		--url devnet
-

@@ -2,7 +2,7 @@
 # Delegates to subdirectory Makefiles
 
 .PHONY: install build fmt generate-idl generate-clients
-.PHONY: unit-test integration-test all-test
+.PHONY: unit-test unit-test-ci integration-test integration-test-ci integration-test-ci-build-test-tree integration-test-ci-prebuilt integration-test-ci-no-build all-test
 .PHONY: unit-coverage integration-coverage coverage-html all-coverage
 .PHONY: build-devnet deploy-devnet
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
@@ -50,6 +50,13 @@ unit-test:
 	@$(MAKE) -C core unit-test
 	@$(MAKE) -C indexer unit-test
 
+# CI-focused unit tests for non-program crates.
+# Program unit tests run in a dedicated workflow.
+unit-test-ci:
+	@echo "🧪 Running CI unit tests for core + indexer..."
+	@$(MAKE) -C core unit-test
+	@$(MAKE) -C indexer unit-test
+
 integration-test:
 	@echo "🔗 Running integration tests for all projects..."
 	@$(MAKE) -C contra-escrow-program integration-test
@@ -60,6 +67,34 @@ integration-test:
 	@$(MAKE) -C contra-escrow-program build-test
 	@echo "🔗 Running indexer integration test (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+
+# CI-focused integration target that avoids running program integration
+# suites already covered in the dedicated program workflow.
+integration-test-ci:
+	@echo "🔗 Running CI integration tests (non-program suites)..."
+	@echo "🔨 Building program artifacts once for integration crate tests..."
+	@$(MAKE) -C contra-escrow-program build
+	@$(MAKE) -C contra-withdraw-program build
+	@$(MAKE) integration-test-ci-build-test-tree
+
+# CI-focused integration target that assumes production program artifacts
+# and generated clients are already available.
+integration-test-ci-build-test-tree:
+	@$(MAKE) integration-test-ci-prebuilt
+	@echo "🔗 Building escrow with test-tree for indexer tests..."
+	@$(MAKE) -C contra-escrow-program build-test
+	@echo "🔗 Running indexer integration test (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+
+# CI-focused integration target that runs production-artifact integration tests only.
+integration-test-ci-prebuilt:
+	@echo "🔗 Running contra integration test (with production build)..."
+	@cd integration && cargo test --test contra_integration -- --nocapture
+
+# Backward-compatible alias for historical target name.
+integration-test-ci-no-build:
+	@echo "⚠️  Deprecated: use integration-test-ci-build-test-tree"
+	@$(MAKE) integration-test-ci-build-test-tree
 
 all-test: unit-test integration-test
 
@@ -222,7 +257,12 @@ help:
 	@echo ""
 	@echo "🧪 Testing:"
 	@echo "  unit-test            - Run unit tests for all projects"
+	@echo "  unit-test-ci         - Run CI unit tests for core + indexer"
 	@echo "  integration-test     - Run integration tests for all projects"
+	@echo "  integration-test-ci  - Build prod artifacts, build test-tree, and run CI integration suites"
+	@echo "  integration-test-ci-build-test-tree - Run contra integration, then build test-tree artifact and run indexer integration"
+	@echo "  integration-test-ci-prebuilt - Run contra integration using prebuilt production artifacts only"
+	@echo "  integration-test-ci-no-build - Deprecated alias to integration-test-ci-build-test-tree"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""
 	@echo "📊 Coverage:"

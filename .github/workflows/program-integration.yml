@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   integration-test:
-    name: Integration Tests
+    name: Program Integration Tests
     runs-on: contra-runner-1
     timeout-minutes: 20
     steps:

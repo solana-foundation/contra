@@ -10,6 +10,34 @@ inputs:
     description: "Additional cargo tools to install (comma-separated)"
     required: false
     default: ""
+  install-base-cargo-tools:
+    description: "Install base cargo tools (shank-cli, cargo-llvm-cov)"
+    required: false
+    default: "true"
+  install-system-dependencies:
+    description: "Install apt system dependencies"
+    required: false
+    default: "true"
+  setup-node:
+    description: "Setup Node.js runtime"
+    required: false
+    default: "true"
+  setup-pnpm:
+    description: "Setup pnpm and pnpm cache"
+    required: false
+    default: "true"
+  setup-solana:
+    description: "Setup Solana CLI"
+    required: false
+    default: "true"
+  install-dependencies:
+    description: "Run project dependency installation (make install)"
+    required: false
+    default: "true"
+  build-programs:
+    description: "Build programs and generate clients (make build)"
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -22,6 +50,7 @@ runs:
         echo "LLVM_COV_VERSION=0.6.21" >> $GITHUB_ENV
 
     - name: Install system dependencies
+      if: inputs.install-system-dependencies == 'true'
       shell: bash
       run: |
         sudo apt-get update
@@ -41,6 +70,7 @@ runs:
         toolchain: ${{ env.RUST_VERSION }}
 
     - name: Cache cargo binaries
+      if: inputs.install-base-cargo-tools == 'true'
       uses: actions/cache@v4
       id: cargo-bin-cache
       with:
@@ -50,11 +80,12 @@ runs:
         key: cargo-bins-v7-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-shank-${{ env.SHANK_VERSION }}-llvm-cov-${{ env.LLVM_COV_VERSION }}
 
     - name: Add cargo bin to PATH
+      if: inputs.install-base-cargo-tools == 'true' || inputs.install-cargo-tools != ''
       shell: bash
       run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Install base cargo tools
-      if: steps.cargo-bin-cache.outputs.cache-hit != 'true'
+      if: inputs.install-base-cargo-tools == 'true' && steps.cargo-bin-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         echo "Installing shank-cli@${SHANK_VERSION}..."
@@ -78,18 +109,22 @@ runs:
       with:
         cache-on-failure: true
 
+    # install-dependencies implies Node.js + pnpm prerequisites.
     - name: Setup Node.js
+      if: inputs.setup-node == 'true' || inputs.install-dependencies == 'true'
       uses: actions/setup-node@v4
       with:
         node-version: "22"
         registry-url: "https://registry.npmjs.org"
 
     - name: Setup pnpm
+      if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
       uses: pnpm/action-setup@v2
       with:
         version: 10.14.0
 
     - name: Setup pnpm cache
+      if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
       uses: actions/cache@v4
       with:
         path: ~/.pnpm-store
@@ -98,17 +133,21 @@ runs:
           ${{ runner.os }}-pnpm-
 
     - name: Setup Solana CLI
+      if: inputs.setup-solana == 'true'
       uses: ./.github/actions/setup-solana
 
     - name: Add Solana to PATH
+      if: inputs.setup-solana == 'true'
       shell: bash
       run: echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
 
     - name: Install dependencies
+      if: inputs.install-dependencies == 'true'
       shell: bash
       run: make install
 
     - name: Build program and generate clients
+      if: inputs.build-programs == 'true'
       shell: bash
       run: |
         echo "🔨 Building programs and generating clients..."

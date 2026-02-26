@@ -49,13 +49,15 @@ impl DbTransactionWriter {
 
     /// Handle a single transaction status update
     async fn handle_update(&self, update: TransactionStatusUpdate) {
+        let is_failed = update.status == TransactionStatus::Failed;
+
         if let Err(e) = self
             .storage
             .update_transaction_status(
                 update.transaction_id,
                 update.status,
                 update.counterpart_signature.clone(),
-                update.processed_at.unwrap_or_else(Utc::now),
+                update.processed_at.clone().unwrap_or_else(Utc::now),
             )
             .await
         {
@@ -71,22 +73,17 @@ impl DbTransactionWriter {
                 "Updated transaction {} to status {:?}",
                 update.transaction_id, update.status
             );
+        }
 
-            // Check if transaction failed and send alert
-            if update.status == TransactionStatus::Failed {
-                // Log failed transaction at ERROR level
-                error!(
-                    "Transaction {} FAILED",
-                    update.transaction_id
-                );
-                if let Some(err_msg) = &update.error_message {
-                    error!("Transaction {} error: {}", update.transaction_id, err_msg);
-                }
+        if is_failed {
+            // Log failed transaction at ERROR level for paging/alert pipeline visibility.
+            error!("Transaction {} FAILED", update.transaction_id);
+            if let Some(err_msg) = &update.error_message {
+                error!("Transaction {} error: {}", update.transaction_id, err_msg);
+            }
 
-                // Send webhook alert if configured
-                if let Some(webhook_url) = &self.webhook_url {
-                    self.send_webhook_alert(webhook_url, &update).await;
-                }
+            if let Some(webhook_url) = &self.webhook_url {
+                self.send_webhook_alert(webhook_url, &update).await;
             }
         }
     }
@@ -95,15 +92,15 @@ impl DbTransactionWriter {
     async fn send_webhook_alert(&self, webhook_url: &str, update: &TransactionStatusUpdate) {
         let processed_at = update
             .processed_at
-            .unwrap_or_else(Utc::now)
-            .to_rfc3339();
+            .as_ref()
+            .map_or_else(|| Utc::now().to_rfc3339(), |ts| ts.to_rfc3339());
         let timestamp = Utc::now().to_rfc3339();
 
         let payload = json!({
             "transaction_id": update.transaction_id,
             "status": "failed",
-            "counterpart_signature": update.counterpart_signature,
-            "error_message": update.error_message,
+            "counterpart_signature": update.counterpart_signature.clone(),
+            "error_message": update.error_message.clone(),
             "processed_at": processed_at,
             "timestamp": timestamp,
         });

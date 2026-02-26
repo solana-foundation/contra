@@ -118,6 +118,11 @@ jobs:
           setup-solana: "false"
           build-programs: "false"
 
+      - name: Create program placeholder for type checking
+        run: |
+          mkdir -p target/deploy
+          touch target/deploy/contra_withdraw_program.so
+
       - name: Generate clients
         run: make generate-clients
 
@@ -175,6 +180,11 @@ jobs:
           rust-components: clippy,rustfmt
           setup-solana: "false"
           build-programs: "false"
+
+      - name: Create program placeholder for type checking
+        run: |
+          mkdir -p target/deploy
+          touch target/deploy/contra_withdraw_program.so
 
       - name: Generate clients
         run: make generate-clients

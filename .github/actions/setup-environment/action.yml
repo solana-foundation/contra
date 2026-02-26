@@ -70,6 +70,7 @@ runs:
         toolchain: ${{ env.RUST_VERSION }}
 
     - name: Cache cargo binaries
+      if: inputs.install-base-cargo-tools == 'true'
       uses: actions/cache@v4
       id: cargo-bin-cache
       with:
@@ -79,6 +80,7 @@ runs:
         key: cargo-bins-v7-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-shank-${{ env.SHANK_VERSION }}-llvm-cov-${{ env.LLVM_COV_VERSION }}
 
     - name: Add cargo bin to PATH
+      if: inputs.install-base-cargo-tools == 'true' || inputs.install-cargo-tools != ''
       shell: bash
       run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 

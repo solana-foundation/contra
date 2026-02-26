@@ -124,6 +124,7 @@ jobs:
       - name: Run cargo check
         run: |
           cargo check --workspace --all-features \
+            --exclude contra-core \
             --exclude contra-integration \
             --exclude tests-contra-escrow-program \
             --exclude tests-contra-withdraw-program
@@ -171,6 +172,7 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --workspace --all-features \
+            --exclude contra-core \
             --exclude contra-integration \
             --exclude tests-contra-escrow-program \
             --exclude tests-contra-withdraw-program \

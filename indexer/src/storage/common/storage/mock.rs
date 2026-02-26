@@ -44,6 +44,10 @@ impl MockStorage {
         Ok(())
     }
 
+    pub async fn drop_tables(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     pub async fn insert_db_transaction(
         &self,
         _transaction: &DbTransaction,

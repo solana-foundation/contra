@@ -1,6 +1,7 @@
 pub use super::models::*;
 
 pub mod close;
+pub mod drop_tables;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
@@ -31,6 +32,11 @@ impl Storage {
     /// Initialize database schema
     pub async fn init_schema(&self) -> Result<(), StorageError> {
         init_schema::init_schema(self).await
+    }
+
+    /// Drop all database tables
+    pub async fn drop_tables(&self) -> Result<(), StorageError> {
+        drop_tables::drop_tables(self).await
     }
 
     /// Insert a new transaction

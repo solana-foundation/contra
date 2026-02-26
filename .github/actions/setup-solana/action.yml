@@ -4,18 +4,13 @@ description: "Install and cache Solana CLI"
 runs:
   using: "composite"
   steps:
-    - name: Get current week for cache key
-      id: week
-      shell: bash
-      run: echo "week=$(date +'%Y-W%U')" >> $GITHUB_OUTPUT
-
     - name: Cache Solana CLI installation
       uses: actions/cache@v4
       with:
         path: ~/.local/share/solana
-        key: solana-cli-stable-${{ runner.os }}-${{ steps.week.outputs.week }}
+        key: solana-cli-stable-${{ runner.os }}-${{ runner.arch }}-v2.2.19
         restore-keys: |
-          solana-cli-stable-${{ runner.os }}-
+          solana-cli-stable-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Install Solana CLI
       shell: bash

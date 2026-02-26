@@ -10,21 +10,103 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+concurrency:
+  group: rust-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check
+  changes:
+    name: Detect Changed Areas
+    runs-on: contra-runner-1
+    outputs:
+      rust_checks: ${{ steps.filter.outputs.rust_checks }}
+      integration: ${{ steps.filter.outputs.integration }}
+      core_indexer: ${{ steps.filter.outputs.core_indexer }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust_checks:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - '.github/actions/setup-solana/**'
+              - 'core/**'
+              - 'indexer/**'
+              - 'integration/**'
+              - 'test_utils/**'
+              - 'contra-escrow-program/**'
+              - 'contra-withdraw-program/**'
+            integration:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - '.github/actions/setup-solana/**'
+              - 'core/**'
+              - 'indexer/**'
+              - 'integration/**'
+              - 'test_utils/**'
+              - 'contra-escrow-program/**'
+              - 'contra-withdraw-program/**'
+            core_indexer:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - 'core/**'
+              - 'indexer/**'
+
+  build-artifacts:
+    name: Build Shared Artifacts
+    needs: changes
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
+        with:
+          build-programs: "false"
 
-      - name: Run cargo check
-        run: cargo check --all-features
+      - name: Build programs and generate clients
+        run: |
+          make -C contra-escrow-program build
+          make -C contra-withdraw-program build
 
-  fmt:
-    name: Format
+      - name: Package shared artifacts
+        run: |
+          tar -czf ci-build-artifacts.tgz \
+            target/deploy/contra_escrow_program.so \
+            target/deploy/contra_withdraw_program.so \
+            contra-escrow-program/idl \
+            contra-escrow-program/clients \
+            contra-withdraw-program/idl \
+            contra-withdraw-program/clients
+
+      - name: Upload shared artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-artifacts
+          path: ci-build-artifacts.tgz
+          retention-days: 1
+
+  check:
+    name: Check
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +115,24 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           rust-components: rustfmt
+          setup-solana: "false"
+          build-programs: "false"
 
-      - name: Check formatting
-        run: cargo fmt -- --check
+      - name: Generate clients
+        run: make generate-clients
 
-  clippy:
-    name: Clippy
+      - name: Run cargo check
+        run: |
+          cargo check --workspace --all-features \
+            --exclude contra-core \
+            --exclude contra-integration \
+            --exclude tests-contra-escrow-program \
+            --exclude tests-contra-withdraw-program
+
+  fmt:
+    name: Format
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
@@ -46,31 +140,100 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          rust-components: clippy
+          install-base-cargo-tools: "false"
+          install-system-dependencies: "false"
+          setup-solana: "false"
+          build-programs: "false"
+          rust-components: rustfmt
 
-      - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+      - name: Check formatting
+        run: |
+          cargo fmt \
+            -p contra-escrow-program \
+            -p tests-contra-escrow-program \
+            -p contra-withdraw-program \
+            -p tests-contra-withdraw-program \
+            -p contra-core \
+            -p contra-gateway \
+            -p contra-indexer \
+            -p contra-integration \
+            -p test_utils \
+            -p devnet-scripts \
+            -- --check
 
-  integration-test:
-    name: Integration Tests
+  clippy:
+    name: Clippy
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
+        with:
+          rust-components: clippy,rustfmt
+          setup-solana: "false"
+          build-programs: "false"
+
+      - name: Generate clients
+        run: make generate-clients
+
+      - name: Run clippy
+        run: |
+          cargo clippy --workspace --all-features \
+            --exclude contra-core \
+            --exclude contra-integration \
+            --exclude tests-contra-escrow-program \
+            --exclude tests-contra-withdraw-program \
+            -- -D warnings
+
+  integration-test:
+    name: Rust Integration Tests
+    needs: [changes, build-artifacts]
+    if: needs.changes.outputs.integration == 'true'
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          build-programs: "false"
+
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
 
       - name: Run integration tests
-        run: make integration-test
+        run: make integration-test-ci-build-test-tree
 
   unit-tests:
     name: Indexer Unit Tests
+    needs: [changes, build-artifacts]
+    if: needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
+        with:
+          rust-components: rustfmt
+          setup-solana: "false"
+          build-programs: "false"
 
-      - name: Run indexer unit tests (yellowstone)
-        run: make unit-test
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
+
+      - name: Run core + indexer unit tests
+        run: make unit-test-ci

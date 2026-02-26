@@ -25,6 +25,16 @@ pub struct AppState {
     pub admin_api_token: Option<String>,
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 async fn require_auth(
     State(state): State<AppState>,
     request: Request,
@@ -34,12 +44,13 @@ async fn require_auth(
         if request.uri().path() == "/health" {
             return Ok(next.run(request).await);
         }
-        let auth = request
+        let provided = request
             .headers()
             .get("authorization")
-            .and_then(|v| v.to_str().ok());
-        match auth {
-            Some(v) if v.strip_prefix("Bearer ").is_some_and(|t| t == token) => {
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match provided {
+            Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => {
                 Ok(next.run(request).await)
             }
             _ => Err(StatusCode::UNAUTHORIZED),

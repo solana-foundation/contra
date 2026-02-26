@@ -20,6 +20,11 @@ const DEMO = process.env.NEXT_PUBLIC_DEMO === "true"
 const BASE_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"
 
+// Token is exposed to the client bundle — acceptable because the dashboard
+// is an internal operator tool, not a public-facing app. The operator sets
+// both ADMIN_API_TOKEN on the API server and this value on the dashboard.
+const API_TOKEN = process.env.NEXT_PUBLIC_ADMIN_API_TOKEN
+
 type ApiResult<T> = { data: T; error: null } | { data: null; error: string }
 
 function ok<T>(data: T): ApiResult<T> {
@@ -28,8 +33,13 @@ function ok<T>(data: T): ApiResult<T> {
 
 async function apiFetch<T>(path: string): Promise<ApiResult<T>> {
   try {
+    const headers: Record<string, string> = {}
+    if (API_TOKEN) {
+      headers["Authorization"] = `Bearer ${API_TOKEN}`
+    }
     const res = await fetch(`${BASE_URL}${path}`, {
       cache: "no-store",
+      headers,
     })
     if (!res.ok) {
       return { data: null, error: `HTTP ${res.status}: ${res.statusText}` }

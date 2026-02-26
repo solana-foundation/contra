@@ -33,20 +33,24 @@ fn format_amount(raw: i64, decimals: i16) -> String {
     if decimals <= 2 {
         format!("{:.2}", val)
     } else {
-        // Use 2 decimal places for display
         let formatted = format!("{:.2}", val);
-        // Add thousands separators
         let parts: Vec<&str> = formatted.split('.').collect();
         let int_part = parts[0];
         let dec_part = parts.get(1).unwrap_or(&"00");
-        let with_commas = int_part
+
+        let (sign, digits) = if let Some(d) = int_part.strip_prefix('-') {
+            ("-", d)
+        } else {
+            ("", int_part)
+        };
+        let with_commas = digits
             .as_bytes()
             .rchunks(3)
             .rev()
             .map(|chunk| std::str::from_utf8(chunk).unwrap())
             .collect::<Vec<_>>()
             .join(",");
-        format!("{}.{}", with_commas, dec_part)
+        format!("{}{}.{}", sign, with_commas, dec_part)
     }
 }
 

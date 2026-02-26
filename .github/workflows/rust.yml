@@ -147,7 +147,19 @@ jobs:
           rust-components: rustfmt
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: |
+          cargo fmt \
+            -p contra-escrow-program \
+            -p tests-contra-escrow-program \
+            -p contra-withdraw-program \
+            -p tests-contra-withdraw-program \
+            -p contra-core \
+            -p contra-gateway \
+            -p contra-indexer \
+            -p contra-integration \
+            -p test_utils \
+            -p devnet-scripts \
+            -- --check
 
   clippy:
     name: Clippy

@@ -8,6 +8,7 @@ use solana_keychain::Signer;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
+use std::fmt::Display;
 
 /*
 Mint initialization is going to be done outside of the operator. There's a command that will add to the allowed mints on Solana mainnet
@@ -15,7 +16,7 @@ and will also initialize that mint on Contra. This simplifies our operator's cod
 validate mint existence on Contra.
 */
 
-pub fn mint_idempotency_memo(transaction_id: i64) -> String {
+pub fn mint_idempotency_memo(transaction_id: impl Display) -> String {
     format!("{MINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
 }
 
@@ -363,5 +364,26 @@ impl InitializeMintBuilder {
         .map_err(|e| ProgramError::InvalidBuilder {
             reason: format!("failed to build initialize_mint: {}", e),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mint_idempotency_memo;
+
+    #[test]
+    fn mint_idempotency_memo_supports_i64() {
+        assert_eq!(
+            mint_idempotency_memo(42_i64),
+            "contra:mint-idempotency:42".to_string()
+        );
+    }
+
+    #[test]
+    fn mint_idempotency_memo_supports_u64() {
+        assert_eq!(
+            mint_idempotency_memo(42_u64),
+            "contra:mint-idempotency:42".to_string()
+        );
     }
 }

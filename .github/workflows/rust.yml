@@ -71,7 +71,7 @@ jobs:
   build-artifacts:
     name: Build Shared Artifacts
     needs: changes
-    if: needs.changes.outputs.rust_checks == 'true' || needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true'
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +105,7 @@ jobs:
 
   check:
     name: Check
-    needs: [changes, build-artifacts]
+    needs: changes
     if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
@@ -118,13 +118,8 @@ jobs:
           setup-solana: "false"
           build-programs: "false"
 
-      - name: Download shared artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ci-build-artifacts
-
-      - name: Restore shared artifacts
-        run: tar -xzf ci-build-artifacts.tgz
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Run cargo check
         run: |
@@ -135,7 +130,7 @@ jobs:
 
   fmt:
     name: Format
-    needs: [changes, build-artifacts]
+    needs: changes
     if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
@@ -149,20 +144,15 @@ jobs:
           build-programs: "false"
           rust-components: rustfmt
 
-      - name: Download shared artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ci-build-artifacts
-
-      - name: Restore shared artifacts
-        run: tar -xzf ci-build-artifacts.tgz
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Check formatting
         run: cargo fmt -- --check
 
   clippy:
     name: Clippy
-    needs: [changes, build-artifacts]
+    needs: changes
     if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
@@ -175,13 +165,8 @@ jobs:
           setup-solana: "false"
           build-programs: "false"
 
-      - name: Download shared artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ci-build-artifacts
-
-      - name: Restore shared artifacts
-        run: tar -xzf ci-build-artifacts.tgz
+      - name: Generate clients
+        run: make generate-clients
 
       - name: Run clippy
         run: |

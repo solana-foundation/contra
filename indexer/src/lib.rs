@@ -1,3 +1,4 @@
+pub mod api;
 pub mod channel_utils;
 pub mod config;
 pub mod error;

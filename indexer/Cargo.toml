@@ -54,6 +54,8 @@ thiserror = { workspace = true }
 solana-client = { version = "2.3.10" }
 solana-rpc-client-api = { workspace = true }
 solana-transaction-status = { version = "2.3.10" }
+axum = { workspace = true }
+tower-http = { workspace = true }
 
 # Yellowstone gRPC (optional - enable with feature: datasource-yellowstone)
 yellowstone-grpc-client = { workspace = true, optional = true }
@@ -79,3 +81,7 @@ solana-test-validator = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+[[bin]]
+name = "api"
+path = "src/bin/api.rs"

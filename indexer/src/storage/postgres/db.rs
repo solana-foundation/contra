@@ -727,6 +727,247 @@ impl PostgresDb {
         .await
     }
 
+    // ── Admin API queries (read-only) ─────────────────────────────
+
+    pub async fn get_transaction_by_signature(
+        &self,
+        signature: &str,
+    ) -> Result<Option<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(
+            r#"
+            SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                   transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                   processed_at, counterpart_signature
+            FROM transactions WHERE signature = $1
+            "#,
+        )
+        .bind(signature)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn get_transactions_paginated(
+        &self,
+        page: i64,
+        per_page: i64,
+        status: Option<TransactionStatus>,
+        tx_type: Option<TransactionType>,
+    ) -> Result<(Vec<DbTransaction>, i64), sqlx::Error> {
+        let offset = (page - 1) * per_page;
+
+        // Build count query
+        let total: (i64,) =
+            match (status, tx_type) {
+                (Some(s), Some(t)) => sqlx::query_as(
+                    "SELECT COUNT(*) FROM transactions WHERE status = $1 AND transaction_type = $2",
+                )
+                .bind(s)
+                .bind(t)
+                .fetch_one(&self.pool)
+                .await?,
+                (Some(s), None) => {
+                    sqlx::query_as("SELECT COUNT(*) FROM transactions WHERE status = $1")
+                        .bind(s)
+                        .fetch_one(&self.pool)
+                        .await?
+                }
+                (None, Some(t)) => {
+                    sqlx::query_as("SELECT COUNT(*) FROM transactions WHERE transaction_type = $1")
+                        .bind(t)
+                        .fetch_one(&self.pool)
+                        .await?
+                }
+                (None, None) => {
+                    sqlx::query_as("SELECT COUNT(*) FROM transactions")
+                        .fetch_one(&self.pool)
+                        .await?
+                }
+            };
+
+        let rows = match (status, tx_type) {
+            (Some(s), Some(t)) => {
+                sqlx::query_as::<_, DbTransaction>(
+                    r#"
+                    SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                           transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                           processed_at, counterpart_signature
+                    FROM transactions
+                    WHERE status = $1 AND transaction_type = $2
+                    ORDER BY created_at DESC
+                    LIMIT $3 OFFSET $4
+                    "#,
+                )
+                .bind(s)
+                .bind(t)
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(s), None) => {
+                sqlx::query_as::<_, DbTransaction>(
+                    r#"
+                    SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                           transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                           processed_at, counterpart_signature
+                    FROM transactions
+                    WHERE status = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(s)
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(t)) => {
+                sqlx::query_as::<_, DbTransaction>(
+                    r#"
+                    SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                           transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                           processed_at, counterpart_signature
+                    FROM transactions
+                    WHERE transaction_type = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(t)
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as::<_, DbTransaction>(
+                    r#"
+                    SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                           transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                           processed_at, counterpart_signature
+                    FROM transactions
+                    ORDER BY created_at DESC
+                    LIMIT $1 OFFSET $2
+                    "#,
+                )
+                .bind(per_page)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok((rows, total.0))
+    }
+
+    pub async fn get_status_counts(&self) -> Result<Vec<(TransactionStatus, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (TransactionStatus, i64)>(
+            "SELECT status, COUNT(*) FROM transactions GROUP BY status",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_type_counts(&self) -> Result<Vec<(TransactionType, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (TransactionType, i64)>(
+            "SELECT transaction_type, COUNT(*) FROM transactions GROUP BY transaction_type",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_throughput_window(
+        &self,
+        interval_secs: i64,
+    ) -> Result<(i64, i64, Option<f64>), sqlx::Error> {
+        // Returns (completed, failed, avg_latency_ms) for the given interval
+        let row: (i64, i64, Option<f64>) = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0)::BIGINT,
+                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)::BIGINT,
+                AVG(
+                    CASE WHEN status = 'completed' AND processed_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (processed_at - created_at)) * 1000
+                    ELSE NULL END
+                )
+            FROM transactions
+            WHERE updated_at > NOW() - make_interval(secs => $1::double precision)
+            "#,
+        )
+        .bind(interval_secs as f64)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn get_recent_failures(&self, limit: i64) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(
+            r#"
+            SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                   transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                   processed_at, counterpart_signature
+            FROM transactions
+            WHERE status = 'failed'
+            ORDER BY updated_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_stuck_transactions(
+        &self,
+        threshold_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(
+            r#"
+            SELECT id, signature, slot, initiator, recipient, mint, amount, memo,
+                   transaction_type, withdrawal_nonce, status, created_at, updated_at,
+                   processed_at, counterpart_signature
+            FROM transactions
+            WHERE status IN ('pending', 'processing')
+              AND updated_at < NOW() - make_interval(secs => $1::double precision)
+            ORDER BY updated_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(threshold_secs as f64)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_24h_status_counts(
+        &self,
+    ) -> Result<Vec<(TransactionStatus, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (TransactionStatus, i64)>(
+            r#"
+            SELECT status, COUNT(*)
+            FROM transactions
+            WHERE created_at > NOW() - INTERVAL '24 hours'
+            GROUP BY status
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_all_mints(&self) -> Result<Vec<DbMint>, sqlx::Error> {
+        sqlx::query_as::<_, DbMint>("SELECT * FROM mints")
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub async fn close(&self) -> Result<(), sqlx::Error> {
         info!("Closing database connection pool...");
         self.pool.close().await;

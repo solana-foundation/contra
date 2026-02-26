@@ -7,6 +7,7 @@
 .PHONY: build-devnet deploy-devnet
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: profile help
+.PHONY: dashboard dashboard-demo
 
 # Default target
 all: build
@@ -201,6 +202,17 @@ deploy-devnet:
 	@$(MAKE) -C contra-escrow-program deploy-devnet DEPLOYER_KEY=$(DEPLOYER_KEY)
 	@$(MAKE) -C contra-withdraw-program deploy-devnet DEPLOYER_KEY=$(DEPLOYER_KEY)
 
+#############
+# Dashboard
+#############
+dashboard:
+	@echo "Starting admin dashboard..."
+	@cd admin-dashboard && pnpm dev
+
+dashboard-demo:
+	@echo "Starting admin dashboard (demo mode — mock data)..."
+	@cd admin-dashboard && NEXT_PUBLIC_DEMO=true pnpm dev
+
 profile:
 	@echo "🔥 Generating CU profiling report..."
 	python3 generate_profiling.py
@@ -239,6 +251,10 @@ help:
 	@echo "🚀 Devnet:"
 	@echo "  build-devnet         - Build programs for devnet"
 	@echo "  deploy-devnet        - Deploy programs to devnet (requires DEPLOYER_KEY)"
+	@echo ""
+	@echo "📊 Dashboard:"
+	@echo "  dashboard            - Start admin dashboard (needs API server)"
+	@echo "  dashboard-demo       - Start admin dashboard with mock data"
 	@echo ""
 	@echo "🔥 Profiling:"
 	@echo "  profile              - Generate CU profiling report"

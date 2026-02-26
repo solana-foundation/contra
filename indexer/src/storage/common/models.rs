@@ -55,7 +55,7 @@ pub struct DbTransaction {
 
 /// Per-mint balance aggregate used during startup reconciliation.
 /// Returned by the reconciliation storage query.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MintDbBalance {
     pub mint_address: String,
     pub token_program: String,

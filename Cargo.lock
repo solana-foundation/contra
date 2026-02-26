@@ -1761,6 +1761,7 @@ dependencies = [
  "solana-transaction-status 2.3.10",
  "solana-transaction-status-client-types 2.3.10",
  "spl-associated-token-account 7.0.0",
+ "spl-memo 6.0.0",
  "spl-token 8.0.0",
  "sqlx",
  "tokio",

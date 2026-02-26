@@ -79,11 +79,18 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          rust-components: rustfmt
           setup-solana: "false"
           build-programs: "false"
 
       - name: Generate clients
         run: make generate-clients
+
+      - name: Prepare placeholder SBF artifacts
+        run: |
+          mkdir -p target/deploy
+          : > target/deploy/contra_escrow_program.so
+          : > target/deploy/contra_withdraw_program.so
 
       - name: Run cargo check
         run: cargo check --all-features
@@ -121,12 +128,18 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          rust-components: clippy,rustfmt
           setup-solana: "false"
           build-programs: "false"
-          rust-components: clippy
 
       - name: Generate clients
         run: make generate-clients
+
+      - name: Prepare placeholder SBF artifacts
+        run: |
+          mkdir -p target/deploy
+          : > target/deploy/contra_escrow_program.so
+          : > target/deploy/contra_withdraw_program.so
 
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
@@ -158,11 +171,18 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          rust-components: rustfmt
           setup-solana: "false"
           build-programs: "false"
 
       - name: Generate clients
         run: make generate-clients
+
+      - name: Prepare placeholder SBF artifacts
+        run: |
+          mkdir -p target/deploy
+          : > target/deploy/contra_escrow_program.so
+          : > target/deploy/contra_withdraw_program.so
 
       - name: Run core + indexer unit tests
         run: make unit-test-ci

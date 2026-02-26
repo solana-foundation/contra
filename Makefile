@@ -77,19 +77,19 @@ integration-test-ci:
 	@$(MAKE) -C contra-withdraw-program build
 	@$(MAKE) integration-test-ci-build-test-tree
 
-# CI-focused integration target that builds the escrow test-tree artifact
-# before running prebuilt integration suites.
+# CI-focused integration target that assumes production program artifacts
+# and generated clients are already available.
 integration-test-ci-build-test-tree:
+	@$(MAKE) integration-test-ci-prebuilt
 	@echo "🔗 Building escrow with test-tree for indexer tests..."
 	@$(MAKE) -C contra-escrow-program build-test
-	@$(MAKE) integration-test-ci-prebuilt
+	@echo "🔗 Running indexer integration test (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
 
-# CI-focused integration target that assumes all required artifacts are already built.
+# CI-focused integration target that runs production-artifact integration tests only.
 integration-test-ci-prebuilt:
 	@echo "🔗 Running contra integration test (with production build)..."
 	@cd integration && cargo test --test contra_integration -- --nocapture
-	@echo "🔗 Running indexer integration test (with test-tree build)..."
-	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
 
 # Backward-compatible alias for historical target name.
 integration-test-ci-no-build:
@@ -260,8 +260,8 @@ help:
 	@echo "  unit-test-ci         - Run CI unit tests for core + indexer"
 	@echo "  integration-test     - Run integration tests for all projects"
 	@echo "  integration-test-ci  - Build prod artifacts, build test-tree, and run CI integration suites"
-	@echo "  integration-test-ci-build-test-tree - Build test-tree artifact then run prebuilt CI integration suites"
-	@echo "  integration-test-ci-prebuilt - Run CI integration suites using prebuilt artifacts only"
+	@echo "  integration-test-ci-build-test-tree - Run contra integration, then build test-tree artifact and run indexer integration"
+	@echo "  integration-test-ci-prebuilt - Run contra integration using prebuilt production artifacts only"
 	@echo "  integration-test-ci-no-build - Deprecated alias to integration-test-ci-build-test-tree"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""

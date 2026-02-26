@@ -68,9 +68,44 @@ jobs:
               - 'core/**'
               - 'indexer/**'
 
+  build-artifacts:
+    name: Build Shared Artifacts
+    needs: changes
+    if: needs.changes.outputs.rust_checks == 'true' || needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true'
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          build-programs: "false"
+
+      - name: Build programs and generate clients
+        run: |
+          make -C contra-escrow-program build
+          make -C contra-withdraw-program build
+
+      - name: Package shared artifacts
+        run: |
+          tar -czf ci-build-artifacts.tgz \
+            target/deploy/contra_escrow_program.so \
+            target/deploy/contra_withdraw_program.so \
+            contra-escrow-program/idl \
+            contra-escrow-program/clients \
+            contra-withdraw-program/idl \
+            contra-withdraw-program/clients
+
+      - name: Upload shared artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-artifacts
+          path: ci-build-artifacts.tgz
+          retention-days: 1
+
   check:
     name: Check
-    needs: changes
+    needs: [changes, build-artifacts]
     if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
@@ -83,21 +118,24 @@ jobs:
           setup-solana: "false"
           build-programs: "false"
 
-      - name: Generate clients
-        run: make generate-clients
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
 
-      - name: Prepare placeholder SBF artifacts
-        run: |
-          mkdir -p target/deploy
-          : > target/deploy/contra_escrow_program.so
-          : > target/deploy/contra_withdraw_program.so
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
 
       - name: Run cargo check
-        run: cargo check --all-features
+        run: |
+          cargo check --workspace --all-features \
+            --exclude contra-integration \
+            --exclude tests-contra-escrow-program \
+            --exclude tests-contra-withdraw-program
 
   fmt:
     name: Format
-    needs: changes
+    needs: [changes, build-artifacts]
     if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
@@ -111,15 +149,20 @@ jobs:
           build-programs: "false"
           rust-components: rustfmt
 
-      - name: Generate clients
-        run: make generate-clients
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
 
       - name: Check formatting
         run: cargo fmt -- --check
 
   clippy:
     name: Clippy
-    needs: changes
+    needs: [changes, build-artifacts]
     if: needs.changes.outputs.rust_checks == 'true'
     runs-on: contra-runner-1
     steps:
@@ -132,21 +175,25 @@ jobs:
           setup-solana: "false"
           build-programs: "false"
 
-      - name: Generate clients
-        run: make generate-clients
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
 
-      - name: Prepare placeholder SBF artifacts
-        run: |
-          mkdir -p target/deploy
-          : > target/deploy/contra_escrow_program.so
-          : > target/deploy/contra_withdraw_program.so
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
 
       - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: |
+          cargo clippy --workspace --all-features \
+            --exclude contra-integration \
+            --exclude tests-contra-escrow-program \
+            --exclude tests-contra-withdraw-program \
+            -- -D warnings
 
   integration-test:
     name: Rust Integration Tests
-    needs: changes
+    needs: [changes, build-artifacts]
     if: needs.changes.outputs.integration == 'true'
     runs-on: contra-runner-1
     steps:
@@ -157,12 +204,20 @@ jobs:
         with:
           build-programs: "false"
 
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
+
       - name: Run integration tests
-        run: make integration-test-ci
+        run: make integration-test-ci-no-build
 
   unit-tests:
     name: Indexer Unit Tests
-    needs: changes
+    needs: [changes, build-artifacts]
     if: needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
     steps:
@@ -175,14 +230,13 @@ jobs:
           setup-solana: "false"
           build-programs: "false"
 
-      - name: Generate clients
-        run: make generate-clients
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
 
-      - name: Prepare placeholder SBF artifacts
-        run: |
-          mkdir -p target/deploy
-          : > target/deploy/contra_escrow_program.so
-          : > target/deploy/contra_withdraw_program.so
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
 
       - name: Run core + indexer unit tests
         run: make unit-test-ci

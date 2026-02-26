@@ -2,7 +2,7 @@
 # Delegates to subdirectory Makefiles
 
 .PHONY: install build fmt generate-idl generate-clients
-.PHONY: unit-test unit-test-ci integration-test integration-test-ci all-test
+.PHONY: unit-test unit-test-ci integration-test integration-test-ci integration-test-ci-no-build all-test
 .PHONY: unit-coverage integration-coverage coverage-html all-coverage
 .PHONY: build-devnet deploy-devnet
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
@@ -75,6 +75,11 @@ integration-test-ci:
 	@echo "🔨 Building program artifacts once for integration crate tests..."
 	@$(MAKE) -C contra-escrow-program build
 	@$(MAKE) -C contra-withdraw-program build
+	@$(MAKE) integration-test-ci-no-build
+
+# CI-focused integration target that assumes production program artifacts
+# and generated clients are already available.
+integration-test-ci-no-build:
 	@echo "🔗 Running contra integration test (with production build)..."
 	@cd integration && cargo test --test contra_integration -- --nocapture
 	@echo "🔗 Building escrow with test-tree for indexer tests..."
@@ -246,6 +251,7 @@ help:
 	@echo "  unit-test-ci         - Run CI unit tests for core + indexer"
 	@echo "  integration-test     - Run integration tests for all projects"
 	@echo "  integration-test-ci  - Run CI integration tests without program integration suites"
+	@echo "  integration-test-ci-no-build - Run CI integration tests using prebuilt program artifacts"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""
 	@echo "📊 Coverage:"

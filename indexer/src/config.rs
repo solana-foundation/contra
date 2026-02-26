@@ -261,6 +261,22 @@ pub struct OperatorConfig {
     pub rpc_commitment: CommitmentLevel,
     /// Webhook URL for alerting on failed transactions. Set via ALERT_WEBHOOK env var.
     pub alert_webhook_url: Option<String>,
+    /// How often to run escrow balance reconciliation checks
+    #[serde(default = "default_reconciliation_interval")]
+    pub reconciliation_interval: std::time::Duration,
+    /// Tolerance threshold in basis points (100 bps = 1%)
+    #[serde(default = "default_reconciliation_tolerance")]
+    pub reconciliation_tolerance_bps: u16,
+    /// Webhook URL for reconciliation alerts (optional)
+    pub reconciliation_webhook_url: Option<String>,
+}
+
+fn default_reconciliation_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(5 * 60) // 5 minutes
+}
+
+fn default_reconciliation_tolerance() -> u16 {
+    10 // 10 basis points = 0.1%
 }
 
 impl OperatorConfig {

@@ -4,6 +4,7 @@ pub mod fetcher;
 #[allow(clippy::module_inception)]
 pub mod operator;
 pub mod processor;
+pub mod reconciliation;
 pub mod sender;
 pub mod utils;
 

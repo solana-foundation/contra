@@ -109,21 +109,22 @@ runs:
       with:
         cache-on-failure: true
 
+    # install-dependencies implies Node.js + pnpm prerequisites.
     - name: Setup Node.js
-      if: inputs.setup-node == 'true'
+      if: inputs.setup-node == 'true' || inputs.install-dependencies == 'true'
       uses: actions/setup-node@v4
       with:
         node-version: "lts/*"
         registry-url: "https://registry.npmjs.org"
 
     - name: Setup pnpm
-      if: inputs.setup-pnpm == 'true'
+      if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
       uses: pnpm/action-setup@v2
       with:
         version: 10.14.0
 
     - name: Setup pnpm cache
-      if: inputs.setup-pnpm == 'true'
+      if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
       uses: actions/cache@v4
       with:
         path: ~/.pnpm-store

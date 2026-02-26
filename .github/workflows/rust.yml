@@ -140,13 +140,11 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          install-base-cargo-tools: "false"
           install-system-dependencies: "false"
           setup-solana: "false"
           build-programs: "false"
           rust-components: rustfmt
-
-      - name: Generate clients
-        run: make generate-clients
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -200,7 +198,7 @@ jobs:
         run: tar -xzf ci-build-artifacts.tgz
 
       - name: Run integration tests
-        run: make integration-test-ci-no-build
+        run: make integration-test-ci-build-test-tree
 
   unit-tests:
     name: Indexer Unit Tests

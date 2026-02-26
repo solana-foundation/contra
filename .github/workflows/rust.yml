@@ -145,7 +145,7 @@ jobs:
         run: cargo clippy --all-features -- -D warnings
 
   integration-test:
-    name: Integration Tests
+    name: Rust Integration Tests
     needs: changes
     if: needs.changes.outputs.integration == 'true'
     runs-on: contra-runner-1

@@ -103,6 +103,7 @@ solana-transaction-status = "2.3.0"
 solana-transaction-status-client-types = "2.3.0"
 solana-timings = "2.3.0"
 spl-associated-token-account = "7.0.0"
+spl-memo = "6.0.0"
 spl-token = "8.0.0"
 spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }

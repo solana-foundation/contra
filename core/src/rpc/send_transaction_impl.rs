@@ -76,6 +76,7 @@ pub async fn send_transaction_impl(
             .all(|(program_id, _)| {
                 *program_id == spl_token::id()
                     || *program_id == spl_associated_token_account::id()
+                    || *program_id == spl_memo::id()
                     || *program_id == solana_sdk::system_program::id()
                     || *program_id == contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID
             });
@@ -94,7 +95,7 @@ pub async fn send_transaction_impl(
         );
         return Err(custom_error(
             INVALID_PARAMS_CODE,
-            "Only SPL token, ATA, System, and Withdraw program transactions are accepted",
+            "Only SPL token, ATA, Memo, System, and Withdraw program transactions are accepted",
         ));
     }
 
@@ -191,5 +192,26 @@ mod tests {
 
         let result = send_transaction_impl(&deps, encoded, None).await;
         assert!(result.is_ok(), "SPL token tx should pass allowlist");
+    }
+
+    #[tokio::test]
+    async fn memo_program_accepted() {
+        let payer = Keypair::new();
+        let memo_ix = Instruction {
+            program_id: spl_memo::id(),
+            accounts: vec![],
+            data: b"contra:mint-idempotency:42".to_vec(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[memo_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::default(),
+        );
+        let encoded = encode_tx(&tx);
+        let (deps, _rx) = make_write_deps();
+
+        let result = send_transaction_impl(&deps, encoded, None).await;
+        assert!(result.is_ok(), "Memo tx should pass allowlist");
     }
 }

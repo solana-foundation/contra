@@ -1,19 +1,24 @@
 use crate::error::ProgramError;
 use crate::operator::{
     is_mint_not_initialized_error, ConfirmationResult, SignerUtil, DEFAULT_CU_MINT,
-    DEFAULT_CU_RELEASE_FUNDS,
+    DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
-use solana_sdk::instruction::Instruction;
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
+use std::fmt::Display;
 
 /*
 Mint initialization is going to be done outside of the operator. There's a command that will add to the allowed mints on Solana mainnet
 and will also initialize that mint on Contra. This simplifies our operator's code and reduces the checks it needs to do if we'd want to
 validate mint existence on Contra.
 */
+
+pub fn mint_idempotency_memo(transaction_id: impl Display) -> String {
+    format!("{MINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
+}
 
 /// Retry policy for transaction submission
 /// Controls whether failed transaction sends should be retried
@@ -105,7 +110,7 @@ impl TransactionBuilder {
         match self {
             TransactionBuilder::ReleaseFunds(builder) => Some(builder.transaction_id),
             TransactionBuilder::InitializeMint(_) => None,
-            TransactionBuilder::Mint(builder) => Some(builder.txn_id as i64),
+            TransactionBuilder::Mint(builder) => Some(builder.txn_id),
             TransactionBuilder::ResetSmtRoot(_) => None,
         }
     }
@@ -125,8 +130,8 @@ impl TransactionBuilder {
     ///
     /// # Retry Policies by Transaction Type
     /// - **InitializeMint**: Idempotent retry - Safe to retry if mint already initialized.
-    /// - **Mint**: No retry - Minting is NOT idempotent. A duplicate send would create
-    ///   extra tokens, causing accounting errors. Only safe to retry after blockhash expires.
+    /// - **Mint**: No sender-level retry - retries happen only after memo-based idempotency
+    ///   verification to prevent duplicate issuance.
     /// - **ReleaseFunds**: Idempotent retry - Uses transaction nonce to prevent duplicates.
     ///   Safe to retry on transient network failures.
     /// - **ResetSmtRoot**: Idempotent retry - tree_index increments ensure idempotency.
@@ -173,6 +178,7 @@ pub struct MintToBuilder {
     mint_authority: Option<Pubkey>,
     token_program: Option<Pubkey>,
     amount: Option<u64>,
+    idempotency_memo: Option<String>,
 }
 
 impl MintToBuilder {
@@ -215,6 +221,11 @@ impl MintToBuilder {
         self
     }
 
+    pub fn idempotency_memo(&mut self, memo: String) -> &mut Self {
+        self.idempotency_memo = Some(memo);
+        self
+    }
+
     pub fn get_mint(&self) -> Option<Pubkey> {
         self.mint
     }
@@ -223,7 +234,23 @@ impl MintToBuilder {
         self.token_program
     }
 
-    /// Returns instructions: [create_ata_idempotent, mint_to]
+    pub fn get_payer(&self) -> Option<Pubkey> {
+        self.payer
+    }
+
+    pub fn get_mint_authority(&self) -> Option<Pubkey> {
+        self.mint_authority
+    }
+
+    pub fn get_amount(&self) -> Option<u64> {
+        self.amount
+    }
+
+    pub fn get_recipient_ata(&self) -> Option<Pubkey> {
+        self.recipient_ata
+    }
+
+    /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to]
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         let mint = self.mint.ok_or_else(|| ProgramError::InvalidBuilder {
             reason: "mint not set".to_string(),
@@ -240,15 +267,26 @@ impl MintToBuilder {
                 reason: "token_program not set".to_string(),
             })?;
 
-        Ok(vec![
+        let mut instructions = vec![
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &payer,
                 &recipient,
                 &mint,
                 &token_program,
             ),
-            self.instruction()?,
-        ])
+        ];
+
+        if let Some(memo) = self.idempotency_memo.as_deref() {
+            instructions.push(Instruction {
+                program_id: spl_memo::id(),
+                accounts: vec![AccountMeta::new_readonly(payer, true)],
+                data: memo.as_bytes().to_vec(),
+            });
+        }
+
+        instructions.push(self.instruction()?);
+
+        Ok(instructions)
     }
 
     pub fn instruction(&self) -> Result<Instruction, crate::error::ProgramError> {
@@ -285,7 +323,7 @@ impl MintToBuilder {
 #[derive(Clone, Debug, Default)]
 pub struct MintToBuilderWithTxnId {
     pub builder: MintToBuilder,
-    pub txn_id: u64,
+    pub txn_id: i64,
 }
 
 /// Builder for initialize_mint instruction (sent before first mint)
@@ -326,5 +364,26 @@ impl InitializeMintBuilder {
         .map_err(|e| ProgramError::InvalidBuilder {
             reason: format!("failed to build initialize_mint: {}", e),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mint_idempotency_memo;
+
+    #[test]
+    fn mint_idempotency_memo_supports_i64() {
+        assert_eq!(
+            mint_idempotency_memo(42_i64),
+            "contra:mint-idempotency:42".to_string()
+        );
+    }
+
+    #[test]
+    fn mint_idempotency_memo_supports_u64() {
+        assert_eq!(
+            mint_idempotency_memo(42_u64),
+            "contra:mint-idempotency:42".to_string()
+        );
     }
 }

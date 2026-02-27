@@ -71,6 +71,7 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
         let bpf_programs = [
             spl_token::id(),
             spl_associated_token_account::id(),
+            spl_memo::id(),
             contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
         ];
 

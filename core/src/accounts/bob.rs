@@ -133,6 +133,13 @@ impl BOB {
         );
         info!("Loaded rent sysvar");
 
+        // Load SPL Memo v3 program
+        let memo_v3_elf = include_bytes!("../../precompiles/spl_memo-3.0.0.so");
+        let (memo_v3_id, memo_v3_account) =
+            bpf_loader_program_account(&spl_memo::id(), memo_v3_elf, &rent);
+        precompiles.insert(memo_v3_id, AccountSharedData::from(memo_v3_account));
+        info!("Loaded SPL Memo v3 program");
+
         // Load Contra Withdraw program
         let withdraw_elf = include_bytes!("../../precompiles/contra_withdraw_program.so");
         // Convert from solana_pubkey::Pubkey to solana_sdk::pubkey::Pubkey

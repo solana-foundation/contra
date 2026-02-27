@@ -283,6 +283,40 @@ impl PostgresDb {
         Ok(())
     }
 
+    pub async fn drop_tables(&self) -> Result<(), sqlx::Error> {
+        info!("Dropping database tables...");
+
+        // Drop tables with CASCADE to handle dependencies
+        sqlx::query("DROP TABLE IF EXISTS transactions CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DROP TABLE IF EXISTS indexer_state CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DROP TABLE IF EXISTS mints CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        // Drop sequences
+        sqlx::query("DROP SEQUENCE IF EXISTS withdrawal_nonce_seq CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        // Drop enum types
+        sqlx::query("DROP TYPE IF EXISTS transaction_status CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DROP TYPE IF EXISTS transaction_type CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        info!("Database tables dropped successfully");
+        Ok(())
+    }
+
     pub async fn insert_transaction_internal(
         &self,
         transaction: &DbTransaction,

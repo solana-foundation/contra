@@ -12,8 +12,8 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 .PHONY: all help
 .PHONY: install build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test all-test
-.PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree
-.PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-no-build
+.PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
+.PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
 .PHONY: unit-coverage integration-coverage coverage-html all-coverage
 .PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
@@ -93,11 +93,19 @@ ci-integration-test-prebuilt:
 	@echo "Running contra integration test (with production build)..."
 	@cd integration && cargo test --test contra_integration -- --nocapture
 
+# CI-focused integration target that runs indexer integration tests only.
+ci-integration-test-indexer:
+	@echo "Building escrow with test-tree for indexer tests..."
+	@$(MAKE) -C contra-escrow-program build-test
+	@echo "Running indexer integration test (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+
 # Backward-compatible aliases.
 unit-test-ci: ci-unit-test
 integration-test-ci: ci-integration-test
 integration-test-ci-build-test-tree: ci-integration-test-build-test-tree
 integration-test-ci-prebuilt: ci-integration-test-prebuilt
+integration-test-ci-indexer: ci-integration-test-indexer
 integration-test-ci-no-build:
 	@echo "Deprecated: use integration-test-ci-build-test-tree"
 	@$(MAKE) ci-integration-test-build-test-tree
@@ -242,6 +250,7 @@ help:
 	@echo "  ci-integration-test  - Build prod artifacts, build test-tree, run CI integration suites"
 	@echo "  ci-integration-test-build-test-tree - Run prebuilt test, then test-tree indexer integration"
 	@echo "  ci-integration-test-prebuilt - Run contra integration using prebuilt production artifacts"
+	@echo "  ci-integration-test-indexer - Build test-tree artifact and run indexer integration only"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""
 	@echo "Coverage:"

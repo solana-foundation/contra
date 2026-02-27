@@ -39,6 +39,7 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           rust-components: llvm-tools-preview
+          build-programs: "false"
 
       - name: Run integration tests with coverage
         run: |

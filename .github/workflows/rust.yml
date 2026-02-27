@@ -198,8 +198,8 @@ jobs:
             --exclude tests-contra-withdraw-program \
             -- -D warnings
 
-  integration-test:
-    name: Rust Integration Tests
+  integration-test-contra:
+    name: Rust Integration Tests (Contra)
     needs: [changes, build-artifacts]
     if: needs.changes.outputs.integration == 'true'
     runs-on: contra-runner-1
@@ -209,6 +209,11 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          install-base-cargo-tools: "false"
+          setup-solana: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          install-dependencies: "false"
           build-programs: "false"
 
       - name: Download shared artifacts
@@ -219,8 +224,45 @@ jobs:
       - name: Restore shared artifacts
         run: tar -xzf ci-build-artifacts.tgz
 
-      - name: Run integration tests
-        run: make integration-test-ci-build-test-tree
+      - name: Warm testcontainers images
+        run: |
+          docker image inspect postgres:11-alpine >/dev/null 2>&1 || docker pull postgres:11-alpine
+          docker image inspect redis:5.0 >/dev/null 2>&1 || docker pull redis:5.0
+
+      - name: Run contra integration tests
+        run: make integration-test-ci-prebuilt
+
+  integration-test-indexer:
+    name: Rust Integration Tests (Indexer)
+    needs: [changes, build-artifacts]
+    if: needs.changes.outputs.integration == 'true'
+    runs-on: contra-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          install-base-cargo-tools: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          install-dependencies: "false"
+          build-programs: "false"
+
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
+
+      - name: Warm testcontainers images
+        run: |
+          docker image inspect postgres:11-alpine >/dev/null 2>&1 || docker pull postgres:11-alpine
+
+      - name: Run indexer integration tests
+        run: make integration-test-ci-indexer
 
   unit-tests:
     name: Indexer Unit Tests
@@ -233,6 +275,10 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
+          install-base-cargo-tools: "false"
+          setup-node: "false"
+          setup-pnpm: "false"
+          install-dependencies: "false"
           rust-components: rustfmt
           setup-solana: "false"
           build-programs: "false"

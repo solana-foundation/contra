@@ -2,7 +2,7 @@
 # Delegates to subdirectory Makefiles
 
 .PHONY: install build fmt generate-idl generate-clients
-.PHONY: unit-test unit-test-ci integration-test integration-test-ci integration-test-ci-build-test-tree integration-test-ci-prebuilt integration-test-ci-no-build all-test
+.PHONY: unit-test unit-test-ci integration-test integration-test-ci integration-test-ci-build-test-tree integration-test-ci-prebuilt integration-test-ci-indexer integration-test-ci-no-build all-test
 .PHONY: unit-coverage integration-coverage coverage-html all-coverage
 .PHONY: build-devnet deploy-devnet
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
@@ -90,6 +90,13 @@ integration-test-ci-build-test-tree:
 integration-test-ci-prebuilt:
 	@echo "🔗 Running contra integration test (with production build)..."
 	@cd integration && cargo test --test contra_integration -- --nocapture
+
+# CI-focused integration target that runs indexer integration tests only.
+integration-test-ci-indexer:
+	@echo "🔗 Building escrow with test-tree for indexer tests..."
+	@$(MAKE) -C contra-escrow-program build-test
+	@echo "🔗 Running indexer integration test (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
 
 # Backward-compatible alias for historical target name.
 integration-test-ci-no-build:
@@ -262,6 +269,7 @@ help:
 	@echo "  integration-test-ci  - Build prod artifacts, build test-tree, and run CI integration suites"
 	@echo "  integration-test-ci-build-test-tree - Run contra integration, then build test-tree artifact and run indexer integration"
 	@echo "  integration-test-ci-prebuilt - Run contra integration using prebuilt production artifacts only"
+	@echo "  integration-test-ci-indexer - Build test-tree artifact and run indexer integration only"
 	@echo "  integration-test-ci-no-build - Deprecated alias to integration-test-ci-build-test-tree"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""

@@ -28,10 +28,101 @@ use {
     },
     solana_sdk::{account::AccountSharedData, hash::Hash, pubkey::Pubkey},
     sqlx::{postgres::PgConnection, Connection},
-    std::sync::Arc,
-    testcontainers::runners::AsyncRunner,
+    std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,
+    tokio::sync::OnceCell,
 };
+
+struct SharedPostgres {
+    host: String,
+    port: u16,
+    _container: ContainerAsync<Postgres>,
+}
+
+static SHARED_POSTGRES: OnceCell<SharedPostgres> = OnceCell::const_new();
+static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn sanitize_db_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+
+    if out.is_empty() {
+        out.push_str("test");
+    }
+    if out.len() > 30 {
+        out.truncate(30);
+    }
+    if out.as_bytes()[0].is_ascii_digit() {
+        out.insert(0, 't');
+    }
+
+    out
+}
+
+async fn shared_postgres() -> &'static SharedPostgres {
+    SHARED_POSTGRES
+        .get_or_init(|| async {
+            let container = Postgres::default()
+                .with_db_name("postgres")
+                .with_user("postgres")
+                .with_password("password")
+                .start()
+                .await
+                .expect("Failed to start shared PostgreSQL test container");
+
+            let host = container
+                .get_host()
+                .await
+                .expect("Failed to resolve shared PostgreSQL host")
+                .to_string();
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("Failed to resolve shared PostgreSQL port");
+
+            SharedPostgres {
+                host,
+                port,
+                _container: container,
+            }
+        })
+        .await
+}
+
+async fn create_isolated_db_url(test_name: &str) -> String {
+    let shared = shared_postgres().await;
+    let suffix = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let db_name = format!("contra_{}_{}", sanitize_db_component(test_name), suffix);
+
+    let admin_url = format!(
+        "postgres://postgres:password@{}:{}/postgres",
+        shared.host, shared.port
+    );
+    let mut admin = PgConnection::connect(&admin_url)
+        .await
+        .expect("Failed to connect to shared PostgreSQL admin database");
+
+    let create_stmt = format!("CREATE DATABASE \"{}\"", db_name);
+    sqlx::query(&create_stmt)
+        .execute(&mut admin)
+        .await
+        .expect("Failed to create isolated integration-test database");
+
+    format!(
+        "postgres://postgres:password@{}:{}/{}",
+        shared.host, shared.port, db_name
+    )
+}
 
 fn slot_block_info(slot: u64) -> BlockInfo {
     BlockInfo {
@@ -57,19 +148,7 @@ fn bare_account(lamports: u64) -> AccountSharedData {
 /// in the same transaction were rolled back — no partial slot 2 data remains.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_batch_constraint_injection() {
-    let container = Postgres::default()
-        .with_db_name("contra_node")
-        .with_user("postgres")
-        .with_password("password")
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container");
-
-    let url = format!(
-        "postgres://postgres:password@{}:{}/contra_node",
-        container.get_host().await.unwrap(),
-        container.get_host_port_ipv4(5432).await.unwrap(),
-    );
+    let url = create_isolated_db_url("write_batch_constraint_injection").await;
 
     let mut db = AccountsDB::new(&url, false)
         .await
@@ -193,19 +272,7 @@ async fn test_write_batch_constraint_injection() {
 /// Postgres rolled back the in-flight transaction and no partial data remains.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_write_batch_process_kill_simulation() {
-    let container = Postgres::default()
-        .with_db_name("contra_node")
-        .with_user("postgres")
-        .with_password("password")
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container");
-
-    let url = format!(
-        "postgres://postgres:password@{}:{}/contra_node",
-        container.get_host().await.unwrap(),
-        container.get_host_port_ipv4(5432).await.unwrap(),
-    );
+    let url = create_isolated_db_url("write_batch_process_kill_simulation").await;
 
     // Initialize the schema via AccountsDB (creates all tables).
     let db = AccountsDB::new(&url, false)
@@ -331,19 +398,7 @@ async fn test_write_batch_process_kill_simulation() {
 /// the two writes are atomic and cannot be split by a crash.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_store_block_atomicity() {
-    let container = Postgres::default()
-        .with_db_name("contra_node")
-        .with_user("postgres")
-        .with_password("password")
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container");
-
-    let url = format!(
-        "postgres://postgres:password@{}:{}/contra_node",
-        container.get_host().await.unwrap(),
-        container.get_host_port_ipv4(5432).await.unwrap(),
-    );
+    let url = create_isolated_db_url("store_block_atomicity").await;
 
     let mut db = AccountsDB::new(&url, false)
         .await

@@ -1,5 +1,5 @@
 use crate::error::ContraWithdrawProgramError;
-use pinocchio::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
+use pinocchio::{account::AccountView, error::ProgramError, Address};
 use pinocchio_associated_token_account::ID as ATA_PROGRAM_ID;
 use pinocchio_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
 
@@ -13,7 +13,7 @@ use pinocchio_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
 /// # Returns
 /// * `Result<(), ProgramError>` - The result of the operation
 #[inline(always)]
-pub fn verify_signer(info: &AccountInfo, expect_writable: bool) -> Result<(), ProgramError> {
+pub fn verify_signer(info: &AccountView, expect_writable: bool) -> Result<(), ProgramError> {
     if !info.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -35,11 +35,11 @@ pub fn verify_signer(info: &AccountInfo, expect_writable: bool) -> Result<(), Pr
 /// * `Result<(), ProgramError>` - The result of the operation
 #[inline(always)]
 pub fn verify_owner_mutability(
-    info: &AccountInfo,
-    owner: &Pubkey,
+    info: &AccountView,
+    owner: &Address,
     expect_writable: bool,
 ) -> Result<(), ProgramError> {
-    if !info.is_owned_by(owner) {
+    if !info.owned_by(owner) {
         return Err(ProgramError::InvalidAccountOwner);
     }
     if expect_writable && !info.is_writable() {
@@ -57,8 +57,8 @@ pub fn verify_owner_mutability(
 /// # Returns
 /// * `Result<(), ProgramError>` - The result of the operation
 #[inline(always)]
-pub fn verify_ata_program(info: &AccountInfo) -> Result<(), ProgramError> {
-    if info.key().ne(&ATA_PROGRAM_ID) {
+pub fn verify_ata_program(info: &AccountView) -> Result<(), ProgramError> {
+    if info.address().ne(&ATA_PROGRAM_ID) {
         return Err(ProgramError::IncorrectProgramId);
     }
 
@@ -73,8 +73,8 @@ pub fn verify_ata_program(info: &AccountInfo) -> Result<(), ProgramError> {
 /// # Returns
 /// * `Result<(), ProgramError>` - The result of the operation
 #[inline(always)]
-pub fn verify_token_program(info: &AccountInfo) -> Result<(), ProgramError> {
-    if info.key().ne(&TOKEN_PROGRAM_ID) {
+pub fn verify_token_program(info: &AccountView) -> Result<(), ProgramError> {
+    if info.address().ne(&TOKEN_PROGRAM_ID) {
         return Err(ProgramError::IncorrectProgramId);
     }
 
@@ -82,8 +82,8 @@ pub fn verify_token_program(info: &AccountInfo) -> Result<(), ProgramError> {
 }
 
 #[inline(always)]
-pub fn verify_token_program_account(info: &AccountInfo) -> Result<(), ProgramError> {
-    if !info.is_owned_by(&TOKEN_PROGRAM_ID) {
+pub fn verify_token_program_account(info: &AccountView) -> Result<(), ProgramError> {
+    if !info.owned_by(&TOKEN_PROGRAM_ID) {
         return Err(ProgramError::InvalidAccountOwner);
     }
 
@@ -92,8 +92,17 @@ pub fn verify_token_program_account(info: &AccountInfo) -> Result<(), ProgramErr
 
 /// Verify account as a valid Mint account
 #[inline(always)]
-pub fn verify_mint_account(info: &AccountInfo) -> Result<(), ProgramError> {
-    let _ = Mint::from_account_info(info).map_err(|_| ContraWithdrawProgramError::InvalidMint)?;
+pub fn verify_mint_account(info: &AccountView) -> Result<(), ProgramError> {
+    if !info.owned_by(&TOKEN_PROGRAM_ID) {
+        return Err(ContraWithdrawProgramError::InvalidMint.into());
+    }
+
+    let data = info.try_borrow()?;
+    if data.len() < Mint::LEN {
+        return Err(ContraWithdrawProgramError::InvalidMint.into());
+    }
+
+    let _ = unsafe { Mint::from_bytes_unchecked(&data) };
 
     Ok(())
 }

@@ -19,11 +19,10 @@ use crate::{
     validate_event_accounts,
 };
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::{Seed, Signer},
-    program_error::ProgramError,
-    pubkey::Pubkey,
-    ProgramResult,
+    account::AccountView,
+    cpi::{Seed, Signer},
+    error::ProgramError,
+    Address, ProgramResult,
 };
 use pinocchio_token_2022::{instructions::Transfer as Transfer2022, ID as TOKEN_2022_PROGRAM_ID};
 
@@ -53,8 +52,8 @@ const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 32 + 8 + (TREE_HEIGHT * 32);
 /// * `transaction_nonce` (u64) - Transaction nonce to verify exclusion from current SMT
 /// * `sibling_proofs` ([[u8; 32]; 16]) - SMT sibling proofs for exclusion verification
 pub fn process_release_funds(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
@@ -78,10 +77,10 @@ pub fn process_release_funds(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate mint (Token or Token2022)
-    verify_account_owner(mint_info, token_program_info.key())?;
+    verify_account_owner(mint_info, token_program_info.address())?;
 
     // Validate instance exists and is properly formed
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let mut instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
@@ -89,19 +88,27 @@ pub fn process_release_funds(
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
     // Validate operator exists and is properly formed
-    let operator_pda_data = operator_pda_info.try_borrow_data()?;
+    let operator_pda_data = operator_pda_info.try_borrow()?;
     let operator_pda = Operator::try_from_bytes(&operator_pda_data)?;
 
     operator_pda
-        .validate_pda(instance_info.key(), operator_info.key(), operator_pda_info)
+        .validate_pda(
+            instance_info.address(),
+            operator_info.address(),
+            operator_pda_info,
+        )
         .map_err(|_| ContraEscrowProgramError::InvalidOperatorPda)?;
 
     // Validate allowed mint exists and is properly formed
-    let allowed_mint_data = allowed_mint_info.try_borrow_data()?;
+    let allowed_mint_data = allowed_mint_info.try_borrow()?;
     let allowed_mint = AllowedMint::try_from_bytes(&allowed_mint_data)?;
 
     allowed_mint
-        .validate_pda(instance_info.key(), mint_info.key(), allowed_mint_info)
+        .validate_pda(
+            instance_info.address(),
+            mint_info.address(),
+            allowed_mint_info,
+        )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
     // Validate user ATA exists and belongs to user
@@ -110,13 +117,13 @@ pub fn process_release_funds(
     // Validate instance ATA exists and belongs to instance
     validate_ata(
         instance_ata_info,
-        instance_info.key(),
+        instance_info.address(),
         mint_info,
         token_program_info,
     )?;
 
     // Validate Token2022 mint extensions (if Token2022)
-    if token_program_info.key() == &TOKEN_2022_PROGRAM_ID {
+    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
         validate_token2022_extensions(mint_info)?;
     }
 
@@ -155,7 +162,7 @@ pub fn process_release_funds(
         from: instance_ata_info,
         to: user_ata_info,
         authority: instance_info,
-        token_program: token_program_info.key(),
+        token_program: token_program_info.address(),
         amount: args.amount,
     }
     .invoke_signed(&[signer])?;
@@ -166,16 +173,16 @@ pub fn process_release_funds(
     // Write updated instance back to account
     let updated_instance_data = instance.to_bytes();
     instance_info
-        .try_borrow_mut_data()?
+        .try_borrow_mut()?
         .copy_from_slice(&updated_instance_data);
 
     // Emit ReleaseFunds event
     let event = ReleaseFundsEvent::new(
         instance.instance_seed,
-        *operator_info.key(),
+        *operator_info.address(),
         args.amount,
         args.user,
-        *mint_info.key(),
+        *mint_info.address(),
         args.new_withdrawal_root,
     );
     emit_event(
@@ -202,7 +209,7 @@ pub fn process_release_funds(
 
 struct ReleaseFundsArgs {
     amount: u64,
-    user: Pubkey,
+    user: Address,
     new_withdrawal_root: [u8; 32],
     transaction_nonce: u64,
     sibling_proofs: [[u8; 32]; TREE_HEIGHT],
@@ -224,7 +231,7 @@ fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramErro
     // Parse user
     let mut user_bytes = [0u8; 32];
     user_bytes.copy_from_slice(&data[offset..offset + 32]);
-    let user = Pubkey::from(user_bytes);
+    let user = Address::new_from_array(user_bytes);
     offset += 32;
 
     // Parse new_root
@@ -264,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_process_release_funds_instruction_data_valid() {
-        let user_key = Pubkey::default();
+        let user_key = Address::new_from_array([0u8; 32]);
         let new_root = [1u8; 32];
         let transaction_nonce = 42u64;
         let amount = 1000u64;

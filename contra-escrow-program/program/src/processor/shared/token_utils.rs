@@ -1,9 +1,4 @@
-use pinocchio::{
-    account_info::AccountInfo,
-    program_error::ProgramError,
-    pubkey::{find_program_address, Pubkey},
-    ProgramResult,
-};
+use pinocchio::{account::AccountView, address::Address, error::ProgramError, ProgramResult};
 use pinocchio_associated_token_account::instructions::CreateIdempotent;
 use pinocchio_token::{
     state::{Mint as TokenMint, TokenAccount},
@@ -33,23 +28,23 @@ use crate::error::ContraEscrowProgramError;
 /// * `ProgramResult` - Success if validation passes and ATA exists
 #[inline(always)]
 pub fn validate_ata(
-    ata_info: &AccountInfo,
-    wallet_key: &Pubkey,
-    mint_info: &AccountInfo,
-    token_program_info: &AccountInfo,
+    ata_info: &AccountView,
+    wallet_key: &Address,
+    mint_info: &AccountView,
+    token_program_info: &AccountView,
 ) -> ProgramResult {
     // Validate ATA address is correct for this wallet + mint
-    let expected_ata = find_program_address(
+    let expected_ata = Address::find_program_address(
         &[
             wallet_key.as_ref(),
-            token_program_info.key().as_ref(),
-            mint_info.key().as_ref(),
+            token_program_info.address().as_ref(),
+            mint_info.address().as_ref(),
         ],
         &pinocchio_associated_token_account::ID,
     )
     .0;
 
-    if ata_info.key() != &expected_ata || ata_info.data_is_empty() {
+    if ata_info.address() != &expected_ata || ata_info.is_data_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -70,30 +65,30 @@ pub fn validate_ata(
 /// * `ProgramResult` - Success if validation passes and creation (if needed) succeeds
 #[inline(always)]
 pub fn get_or_create_ata(
-    ata_info: &AccountInfo,
-    wallet_info: &AccountInfo,
-    mint_info: &AccountInfo,
-    payer_info: &AccountInfo,
-    system_program_info: &AccountInfo,
-    token_program_info: &AccountInfo,
+    ata_info: &AccountView,
+    wallet_info: &AccountView,
+    mint_info: &AccountView,
+    payer_info: &AccountView,
+    system_program_info: &AccountView,
+    token_program_info: &AccountView,
 ) -> ProgramResult {
     // Validate ATA address is correct for this wallet + mint
-    let expected_ata = find_program_address(
+    let expected_ata = Address::find_program_address(
         &[
-            wallet_info.key().as_ref(),
-            token_program_info.key().as_ref(),
-            mint_info.key().as_ref(),
+            wallet_info.address().as_ref(),
+            token_program_info.address().as_ref(),
+            mint_info.address().as_ref(),
         ],
         &pinocchio_associated_token_account::ID,
     )
     .0;
 
-    if ata_info.key() != &expected_ata {
+    if ata_info.address() != &expected_ata {
         return Err(ContraEscrowProgramError::InvalidAta.into());
     }
 
     // Create ATA if it doesn't exist
-    if ata_info.data_is_empty() {
+    if ata_info.is_data_empty() {
         CreateIdempotent {
             funding_account: payer_info,
             account: ata_info,
@@ -110,15 +105,15 @@ pub fn get_or_create_ata(
 
 // Get token account balance
 #[inline(always)]
-pub fn get_token_account_balance(info: &AccountInfo) -> Result<u64, ProgramError> {
-    if info.owner() == &TOKEN_PROGRAM_ID {
-        return Ok(TokenAccount::from_account_info(info)
-            .map_err(|_| ContraEscrowProgramError::InvalidTokenAccount)?
-            .amount());
-    } else if info.owner() == &TOKEN_2022_PROGRAM_ID {
-        return Ok(Token2022Account::from_account_info(info)
-            .map_err(|_| ContraEscrowProgramError::InvalidTokenAccount)?
-            .amount());
+pub fn get_token_account_balance(info: &AccountView) -> Result<u64, ProgramError> {
+    if info.owned_by(&TOKEN_PROGRAM_ID) {
+        let data = info.try_borrow()?;
+        let account = unsafe { TokenAccount::from_bytes_unchecked(&data) };
+        return Ok(account.amount());
+    } else if info.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        let data = info.try_borrow()?;
+        let account = unsafe { Token2022Account::from_bytes_unchecked(&data) };
+        return Ok(account.amount());
     }
 
     Err(ContraEscrowProgramError::InvalidTokenAccount.into())
@@ -132,14 +127,14 @@ pub fn get_token_account_balance(info: &AccountInfo) -> Result<u64, ProgramError
 /// # Returns
 /// * `Result<u8, ProgramError>` - The mint decimals
 #[inline(always)]
-pub fn get_mint_decimals(mint_info: &AccountInfo) -> Result<u8, ProgramError> {
-    if mint_info.owner() == &TOKEN_PROGRAM_ID {
-        let mint = TokenMint::from_account_info(mint_info)
-            .map_err(|_| ContraEscrowProgramError::InvalidMint)?;
+pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
+    if mint_info.owned_by(&TOKEN_PROGRAM_ID) {
+        let data = mint_info.try_borrow()?;
+        let mint = unsafe { TokenMint::from_bytes_unchecked(&data) };
         return Ok(mint.decimals());
-    } else if mint_info.owner() == &TOKEN_2022_PROGRAM_ID {
-        let mint = Token2022Mint::from_account_info(mint_info)
-            .map_err(|_| ContraEscrowProgramError::InvalidMint)?;
+    } else if mint_info.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        let data = mint_info.try_borrow()?;
+        let mint = unsafe { Token2022Mint::from_bytes_unchecked(&data) };
         return Ok(mint.decimals());
     }
 
@@ -155,8 +150,8 @@ pub fn get_mint_decimals(mint_info: &AccountInfo) -> Result<u8, ProgramError> {
 /// # Returns
 /// * `ProgramResult` - Success if no dangerous extensions, error if dangerous extensions found
 #[inline(always)]
-pub fn validate_token2022_extensions(mint_info: &AccountInfo) -> ProgramResult {
-    let data = mint_info.try_borrow_data()?;
+pub fn validate_token2022_extensions(mint_info: &AccountView) -> ProgramResult {
+    let data = mint_info.try_borrow()?;
 
     // Parse mint with extensions directly
     let mint = StateWithExtensions::<Token2022MintState>::unpack(&data)

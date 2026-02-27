@@ -13,9 +13,7 @@ use crate::{
     state::{AllowedMint, Instance},
     validate_event_accounts,
 };
-use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
-};
+use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 /// Processes the BlockMint instruction.
 ///
@@ -32,8 +30,8 @@ use pinocchio::{
 /// # Instruction Data
 /// * None - No instruction data required
 pub fn process_block_mint(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
     let [payer_info, admin_info, instance_info, mint_info, allowed_mint_info, system_program_info, event_authority_info, program_info] =
@@ -53,35 +51,41 @@ pub fn process_block_mint(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate instance exists and admin has authority
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    instance.validate_admin(admin_info.key())?;
+    instance.validate_admin(admin_info.address())?;
 
     // Validate allowed mint account exists and is correct PDA
-    let allowed_mint_data = allowed_mint_info.try_borrow_data()?;
+    let allowed_mint_data = allowed_mint_info.try_borrow()?;
     let allowed_mint = AllowedMint::try_from_bytes(&allowed_mint_data)?;
 
     allowed_mint
-        .validate_pda(instance_info.key(), mint_info.key(), allowed_mint_info)
+        .validate_pda(
+            instance_info.address(),
+            mint_info.address(),
+            allowed_mint_info,
+        )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
     // Close the AllowedMint account
     drop(allowed_mint_data);
 
     let payer_lamports = payer_info.lamports();
-    *payer_info.try_borrow_mut_lamports().unwrap() = payer_lamports
-        .checked_add(allowed_mint_info.lamports())
-        .unwrap();
-    *allowed_mint_info.try_borrow_mut_lamports().unwrap() = 0;
+    payer_info.set_lamports(
+        payer_lamports
+            .checked_add(allowed_mint_info.lamports())
+            .unwrap(),
+    );
+    allowed_mint_info.set_lamports(0);
     allowed_mint_info.close()?;
 
     // Emit BlockMint event
-    let event = BlockMintEvent::new(instance.instance_seed, *mint_info.key());
+    let event = BlockMintEvent::new(instance.instance_seed, *mint_info.address());
     emit_event(
         program_id,
         event_authority_info,

@@ -1,22 +1,21 @@
-use pinocchio::{
-    account_info::AccountInfo, entrypoint, program_error::ProgramError, pubkey::Pubkey,
-    ProgramResult,
-};
+use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, ProgramResult};
 
 use crate::{
     processor::{
         process_add_operator, process_allow_mint, process_block_mint, process_create_instance,
-        process_deposit, process_emit_event, process_release_funds, process_remove_operator,
-        process_reset_smt_root, process_set_new_admin,
+        process_deposit, process_release_funds, process_remove_operator, process_reset_smt_root,
+        process_set_new_admin,
     },
     state::discriminator::ContraEscrowInstructionDiscriminators,
 };
 
+use crate::processor::process_emit_event::process_emit_event;
+
 entrypoint!(process_instruction);
 
 pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let (discriminator, instruction_data) = instruction_data

@@ -1,6 +1,6 @@
 extern crate alloc;
 
-use pinocchio::pubkey::Pubkey;
+use pinocchio::Address as Pubkey;
 use shank::ShankInstruction;
 
 /// Instructions for the Solana Contra Withdraw Program.

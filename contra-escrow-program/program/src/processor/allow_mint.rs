@@ -19,12 +19,11 @@ use crate::{
     validate_event_accounts,
 };
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::Seed,
-    program_error::ProgramError,
-    pubkey::Pubkey,
+    account::AccountView,
+    cpi::Seed,
+    error::ProgramError,
     sysvars::{rent::Rent, Sysvar},
-    ProgramResult,
+    Address, ProgramResult,
 };
 use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
@@ -45,8 +44,8 @@ use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 /// # Instruction Data
 /// * `bump` (u8) - Bump for the allowed mint PDA
 pub fn process_allow_mint(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
@@ -71,8 +70,8 @@ pub fn process_allow_mint(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate mint (Token or Token2022, check for disallowed extensions)
-    verify_account_owner(mint_info, token_program_info.key())?;
-    if token_program_info.key() == &TOKEN_2022_PROGRAM_ID {
+    verify_account_owner(mint_info, token_program_info.address())?;
+    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
         validate_token2022_extensions(mint_info)?;
     }
 
@@ -80,14 +79,14 @@ pub fn process_allow_mint(
     let mint_decimals = get_mint_decimals(mint_info)?;
 
     // Validate instance
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    instance.validate_admin(admin_info.key())?;
+    instance.validate_admin(admin_info.address())?;
 
     // Create ATA for instance PDA and this mint (idempotent)
     get_or_create_ata(
@@ -102,7 +101,11 @@ pub fn process_allow_mint(
     // Create AllowedMint struct and validate PDA
     let allowed_mint = AllowedMint::new(args.bump)?;
     allowed_mint
-        .validate_pda(instance_info.key(), mint_info.key(), allowed_mint_info)
+        .validate_pda(
+            instance_info.address(),
+            mint_info.address(),
+            allowed_mint_info,
+        )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
     let bump_seed = [args.bump];
@@ -110,8 +113,8 @@ pub fn process_allow_mint(
     // Create the AllowedMint account
     let allowed_mint_seeds = [
         Seed::from(ALLOWED_MINT_SEED),
-        Seed::from(instance_info.key().as_ref()),
-        Seed::from(mint_info.key().as_ref()),
+        Seed::from(instance_info.address().as_ref()),
+        Seed::from(mint_info.address().as_ref()),
         Seed::from(&bump_seed),
     ];
 
@@ -130,11 +133,11 @@ pub fn process_allow_mint(
     let allowed_mint_data = allowed_mint.to_bytes();
 
     // Write the serialized data to the account
-    let mut data_slice = allowed_mint_info.try_borrow_mut_data()?;
+    let mut data_slice = allowed_mint_info.try_borrow_mut()?;
     data_slice[..allowed_mint_data.len()].copy_from_slice(&allowed_mint_data);
 
     // Emit AllowMint event
-    let event = AllowMintEvent::new(instance.instance_seed, *mint_info.key(), mint_decimals);
+    let event = AllowMintEvent::new(instance.instance_seed, *mint_info.address(), mint_decimals);
     emit_event(
         program_id,
         event_authority_info,

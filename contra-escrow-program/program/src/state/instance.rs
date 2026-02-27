@@ -9,8 +9,8 @@ use crate::processor::validate_pda_account;
 use crate::validate_discriminator;
 use crate::ID as CONTRA_ESCROW_PROGRAM_ID;
 use alloc::vec::Vec;
-use pinocchio::account_info::AccountInfo;
-use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
+use pinocchio::account::AccountView;
+use pinocchio::{error::ProgramError, Address as Pubkey};
 use shank::ShankAccount;
 
 /// Seeds: [b"instance", instance_seed.as_ref()]
@@ -64,7 +64,7 @@ impl Instance {
         })
     }
 
-    pub fn validate_pda(&self, account_info: &AccountInfo) -> Result<(), ProgramError> {
+    pub fn validate_pda(&self, account_info: &AccountView) -> Result<(), ProgramError> {
         validate_pda_account(
             &[INSTANCE_SEED, self.instance_seed.as_ref()],
             &CONTRA_ESCROW_PROGRAM_ID,
@@ -105,12 +105,18 @@ impl Instance {
         let version = data[offset];
         offset += 1;
 
-        let instance_seed = Pubkey::try_from(&data[offset..offset + 32])
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let instance_seed = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
         offset += 32;
 
-        let admin = Pubkey::try_from(&data[offset..offset + 32])
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let admin = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
         offset += 32;
 
         let mut withdrawal_transactions_root = [0u8; 32];
@@ -141,8 +147,8 @@ mod tests {
 
     #[test]
     fn test_new_constructor() {
-        let admin = Pubkey::default();
-        let instance_seed = Pubkey::default();
+        let admin = Pubkey::new_from_array([0u8; 32]);
+        let instance_seed = Pubkey::new_from_array([0u8; 32]);
         let instance = Instance::new(1, instance_seed, admin).unwrap();
 
         assert_eq!(instance.version, INSTANCE_VERSION);

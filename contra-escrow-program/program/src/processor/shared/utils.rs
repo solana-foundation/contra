@@ -29,7 +29,7 @@ macro_rules! validate_discriminator {
 macro_rules! validate_event_accounts {
     ($event_authority_info:expr, $program_info:expr) => {
         use $crate::constants::event_authority_pda;
-        if $event_authority_info.key() != &event_authority_pda::ID {
+        if $event_authority_info.address() != &event_authority_pda::ID {
             return Err($crate::error::ContraEscrowProgramError::InvalidEventAuthority.into());
         }
         $crate::processor::shared::account_check::verify_current_program($program_info)?;

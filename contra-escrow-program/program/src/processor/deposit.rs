@@ -16,9 +16,7 @@ use crate::{
     state::{AllowedMint, Instance},
     validate_event_accounts,
 };
-use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
-};
+use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 use pinocchio_token_2022::{instructions::Transfer as Transfer2022, ID as TOKEN_2022_PROGRAM_ID};
 
@@ -42,8 +40,8 @@ use pinocchio_token_2022::{instructions::Transfer as Transfer2022, ID as TOKEN_2
 /// * `amount` (u64) - Amount of tokens to deposit
 /// * `recipient` (Option<Pubkey>) - Optional recipient for contra tracking
 pub fn process_deposit(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
@@ -66,10 +64,10 @@ pub fn process_deposit(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate mint (Token or Token2022)
-    verify_account_owner(mint_info, token_program_info.key())?;
+    verify_account_owner(mint_info, token_program_info.address())?;
 
     // Validate instance exists and is properly formed
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
@@ -77,17 +75,21 @@ pub fn process_deposit(
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
     // Validate allowed mint exists and is properly formed
-    let allowed_mint_data = allowed_mint_info.try_borrow_data()?;
+    let allowed_mint_data = allowed_mint_info.try_borrow()?;
     let allowed_mint = AllowedMint::try_from_bytes(&allowed_mint_data)?;
 
     allowed_mint
-        .validate_pda(instance_info.key(), mint_info.key(), allowed_mint_info)
+        .validate_pda(
+            instance_info.address(),
+            mint_info.address(),
+            allowed_mint_info,
+        )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
     // Validate user ATA exists and belongs to user
     validate_ata(
         user_ata_info,
-        user_info.key(),
+        user_info.address(),
         mint_info,
         token_program_info,
     )?;
@@ -95,7 +97,7 @@ pub fn process_deposit(
     // Validate instance ATA exists and belongs to instance
     validate_ata(
         instance_ata_info,
-        instance_info.key(),
+        instance_info.address(),
         mint_info,
         token_program_info,
     )?;
@@ -107,7 +109,7 @@ pub fn process_deposit(
     // - Active delegates: Token program handles correctly, once transferred it's a non issue
     // - Close authority: Can't affect successful transfers
     // The mint-level extensions are the real security concern for escrow
-    if token_program_info.key() == &TOKEN_2022_PROGRAM_ID {
+    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
         validate_token2022_extensions(mint_info)?;
     }
 
@@ -119,20 +121,20 @@ pub fn process_deposit(
         to: instance_ata_info,
         authority: user_info,
         amount: args.amount,
-        token_program: token_program_info.key(),
+        token_program: token_program_info.address(),
     }
     .invoke_signed(&[])?;
 
     // Determine recipient for event (use provided recipient or default to user)
-    let recipient = args.recipient.unwrap_or(*user_info.key());
+    let recipient = args.recipient.unwrap_or(*user_info.address());
 
     // Emit Deposit event
     let event = DepositEvent::new(
         instance.instance_seed,
-        *user_info.key(),
+        *user_info.address(),
         args.amount,
         recipient,
-        *mint_info.key(),
+        *mint_info.address(),
     );
     emit_event(
         program_id,
@@ -159,7 +161,7 @@ pub fn process_deposit(
 struct DepositArgs {
     amount: u64,
     /// Optional recipient for Contra tracking, is the wallet address, not the ATA (if None, defaults to user)
-    recipient: Option<Pubkey>,
+    recipient: Option<Address>,
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<DepositArgs, ProgramError> {
@@ -183,7 +185,7 @@ fn process_instruction_data(data: &[u8]) -> Result<DepositArgs, ProgramError> {
 
         let mut recipient_bytes = [0u8; 32];
         recipient_bytes.copy_from_slice(&data[offset..offset + 32]);
-        Some(Pubkey::from(recipient_bytes))
+        Some(Address::new_from_array(recipient_bytes))
     } else {
         None
     };
@@ -199,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_process_deposit_instruction_data_with_recipient() {
-        let recipient_key = Pubkey::default();
+        let recipient_key = Address::new_from_array([0u8; 32]);
         let mut instruction_data = vec![];
 
         instruction_data.extend_from_slice(&1000u64.to_le_bytes());

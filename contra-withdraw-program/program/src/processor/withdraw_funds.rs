@@ -1,8 +1,6 @@
 extern crate alloc;
 
-use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
-};
+use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 use crate::{
     error::ContraWithdrawProgramError,
@@ -27,8 +25,8 @@ use pinocchio_token::instructions::Burn;
 /// * `amount` (u64) - Amount of tokens to withdraw
 /// * `destination` (Pubkey) - Destination public key
 pub fn process_withdraw_funds(
-    _program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    _program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
@@ -52,7 +50,7 @@ pub fn process_withdraw_funds(
 
     validate_ata(
         token_account_info,
-        user_info.key(),
+        user_info.address(),
         mint_info,
         token_program_info,
     )?;
@@ -66,7 +64,7 @@ pub fn process_withdraw_funds(
     }
     .invoke()?;
 
-    let destination = args.destination.unwrap_or(*user_info.key());
+    let destination = args.destination.unwrap_or(*user_info.address());
 
     // Log event
     let withdraw_funds_event = WithdrawFundsEvent {
@@ -81,7 +79,7 @@ pub fn process_withdraw_funds(
 #[derive(Debug, Clone, PartialEq)]
 pub struct WithdrawFundsArgs {
     pub amount: u64,
-    pub destination: Option<Pubkey>,
+    pub destination: Option<Address>,
 }
 
 fn process_instruction_data(instruction_data: &[u8]) -> Result<WithdrawFundsArgs, ProgramError> {
@@ -105,7 +103,7 @@ fn process_instruction_data(instruction_data: &[u8]) -> Result<WithdrawFundsArgs
 
         let mut destination_bytes = [0u8; 32];
         destination_bytes.copy_from_slice(&instruction_data[offset..offset + 32]);
-        Some(Pubkey::from(destination_bytes))
+        Some(Address::new_from_array(destination_bytes))
     } else {
         None
     };

@@ -1,9 +1,4 @@
-use pinocchio::{
-    account_info::AccountInfo,
-    program_error::ProgramError,
-    pubkey::{find_program_address, Pubkey},
-    ProgramResult,
-};
+use pinocchio::{account::AccountView, address::Address, error::ProgramError, ProgramResult};
 
 /// Validates an Associated Token Account address.
 ///
@@ -17,23 +12,23 @@ use pinocchio::{
 /// * `ProgramResult` - Success if validation passes and ATA exists
 #[inline(always)]
 pub fn validate_ata(
-    ata_info: &AccountInfo,
-    wallet_key: &Pubkey,
-    mint_info: &AccountInfo,
-    token_program_info: &AccountInfo,
+    ata_info: &AccountView,
+    wallet_key: &Address,
+    mint_info: &AccountView,
+    token_program_info: &AccountView,
 ) -> ProgramResult {
     // Validate ATA address is correct for this wallet + mint
-    let expected_ata = find_program_address(
+    let expected_ata = Address::find_program_address(
         &[
             wallet_key.as_ref(),
-            token_program_info.key().as_ref(),
-            mint_info.key().as_ref(),
+            token_program_info.address().as_ref(),
+            mint_info.address().as_ref(),
         ],
         &pinocchio_associated_token_account::ID,
     )
     .0;
 
-    if ata_info.key() != &expected_ata || ata_info.data_is_empty() {
+    if ata_info.address() != &expected_ata || ata_info.is_data_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
 

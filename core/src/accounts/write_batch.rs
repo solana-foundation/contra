@@ -170,7 +170,7 @@ async fn write_batch_postgres(
     Ok(())
 }
 
-async fn write_batch_redis(
+pub(crate) async fn write_batch_redis(
     db: &mut RedisAccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],
     transactions: Vec<(

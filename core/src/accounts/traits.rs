@@ -8,7 +8,6 @@ use {
         signature::Signature, transaction::SanitizedTransaction,
     },
     solana_svm::transaction_processing_result::ProcessedTransaction,
-    url::Url,
 };
 
 /// Block metadata stored in the database
@@ -27,7 +26,15 @@ pub struct BlockInfo {
     pub transaction_recent_blockhashes: Vec<Hash>,
 }
 
-// The AccountsDB enum now uses match statements instead of enum_dispatch for most methods
+/// AccountsDB enum supporting multiple backend storage options
+///
+/// # Variants
+///
+/// * `Postgres` - PostgreSQL database only. Provides ACID transactions and is the
+///   source of truth for all finalized state.
+///
+/// * `Redis` - Redis cache only. Fast in-memory storage but lacks true transaction
+///   support. Uses MULTI/EXEC which can fail partway through without rollback.
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum AccountsDB {
@@ -132,22 +139,25 @@ impl AccountsDB {
 
 impl AccountsDB {
     pub async fn new(accountsdb_connection_url: &str, read_only: bool) -> Result<Self> {
-        let url = Url::parse(accountsdb_connection_url).unwrap();
-        match url.scheme() {
-            "postgresql" | "postgres" => Ok(AccountsDB::Postgres(
+        if accountsdb_connection_url.starts_with("postgresql://")
+            || accountsdb_connection_url.starts_with("postgres://")
+        {
+            Ok(AccountsDB::Postgres(
                 PostgresAccountsDB::new(accountsdb_connection_url, read_only)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e))?,
-            )),
-            "redis" => Ok(AccountsDB::Redis(
+            ))
+        } else if accountsdb_connection_url.starts_with("redis://") {
+            Ok(AccountsDB::Redis(
                 RedisAccountsDB::new(accountsdb_connection_url)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?,
-            )),
-            other => Err(anyhow::anyhow!(
+            ))
+        } else {
+            Err(anyhow::anyhow!(
                 "Unsupported accountsdb connection URL scheme: {}",
-                other
-            )),
+                accountsdb_connection_url
+            ))
         }
     }
 }

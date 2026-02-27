@@ -1,8 +1,12 @@
 use {
     crate::{
-        accounts::{traits::BlockInfo, AccountsDB},
+        accounts::{
+            postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::BlockInfo, AccountsDB,
+        },
         nodes::node::WorkerHandle,
     },
+    anyhow::{anyhow, Context, Result},
+    redis::AsyncCommands,
     solana_hash::Hash,
     solana_rpc_client_types::response::RpcPerfSample,
     solana_sdk::{
@@ -46,6 +50,66 @@ struct LastBlock {
     blockhash: Hash,
 }
 
+/// Warm the Redis cache by reading from Postgres and writing to Redis
+/// This is called on startup to ensure Redis has the latest state from Postgres
+pub async fn warm_redis_cache(
+    postgres_db: &PostgresAccountsDB,
+    redis_db: &RedisAccountsDB,
+) -> Result<()> {
+    info!("Warming Redis cache from Postgres...");
+
+    // Read latest_slot from Postgres
+    let pool = postgres_db.pool.clone();
+    let slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
+        .fetch_one(pool.as_ref())
+        .await
+        .context("Failed to query latest slot from Postgres")?;
+
+    if let Some(slot_value) = slot {
+        let slot_u64 = slot_value as u64;
+
+        // Write latest_slot to Redis
+        let mut conn = redis_db.connection.clone();
+        conn.set::<_, _, ()>("latest_slot", slot_u64)
+            .await
+            .map_err(|e| anyhow!("Failed to write latest_slot to Redis: {}", e))?;
+
+        info!("Warmed Redis cache: latest_slot = {}", slot_u64);
+    } else {
+        warn!("No blocks found in Postgres - skipping latest_slot cache warming");
+    }
+
+    // Read latest_blockhash from Postgres
+    let blockhash_bytes: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT value FROM metadata WHERE key = 'latest_blockhash'")
+            .fetch_optional(pool.as_ref())
+            .await
+            .context("Failed to query latest blockhash from Postgres")?;
+
+    if let Some(bytes) = blockhash_bytes {
+        // Convert bytes to Hash and then to string for Redis storage
+        let hash_array: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid blockhash bytes length: {}", bytes.len()))?;
+        let hash = Hash::new_from_array(hash_array);
+        let hash_str = hash.to_string();
+
+        // Write latest_blockhash to Redis
+        let mut conn = redis_db.connection.clone();
+        conn.set::<_, _, ()>("latest_blockhash", hash_str.clone())
+            .await
+            .map_err(|e| anyhow!("Failed to write latest_blockhash to Redis: {}", e))?;
+
+        info!("Warmed Redis cache: latest_blockhash = {}", hash_str);
+    } else {
+        warn!("No blockhash found in Postgres metadata - skipping latest_blockhash cache warming");
+    }
+
+    info!("Redis cache warming completed successfully");
+    Ok(())
+}
+
 pub struct SettleArgs {
     pub execution_results_rx: mpsc::UnboundedReceiver<(
         LoadAndExecuteSanitizedTransactionsOutput,
@@ -87,6 +151,42 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
                 .await
                 .unwrap();
+
+            let mut redis_db: Option<RedisAccountsDB> = match std::env::var("REDIS_URL") {
+                Ok(redis_url) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        RedisAccountsDB::new(&redis_url),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) => {
+                            info!("Redis cache enabled");
+                            Some(r)
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Redis unavailable ({}), running Postgres-only", e);
+                            None
+                        }
+                        Err(_) => {
+                            warn!("Redis connection timed out, running Postgres-only");
+                            None
+                        }
+                    }
+                }
+                Err(_) => {
+                    info!("REDIS_URL not set, running Postgres-only");
+                    None
+                }
+            };
+
+            // Warm Redis cache from Postgres on startup
+            if let (AccountsDB::Postgres(ref pg), Some(ref redis)) = (&accounts_db, &redis_db) {
+                if let Err(e) = warm_redis_cache(pg, redis).await {
+                    warn!("Cache warming failed (non-fatal): {}", e);
+                }
+            }
+
             let last_slot = accounts_db.get_latest_slot().await.ok().flatten();
             let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
 
@@ -126,7 +226,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 tokio::select! {
                     // Settle transactions every BLOCKTIME_MS
                     _ = blocktime_interval.tick() => {
-                        if let Ok(settle_result) = settle_transactions(last_block.clone(), &mut accounts_db, &processing_results).await {
+                        if let Ok(settle_result) = settle_transactions(last_block.clone(), &mut accounts_db, redis_db.as_mut(), &processing_results).await {
                             // Track performance metrics
                             let num_txs = processing_results.len() as u64;
                             perf_num_transactions += num_txs;
@@ -232,6 +332,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
 async fn settle_transactions(
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
+    redis_db: Option<&mut RedisAccountsDB>,
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
 ) -> Result<SettleResult, Box<dyn std::error::Error>> {
     let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> = HashMap::new();
@@ -351,14 +452,171 @@ async fn settle_transactions(
         transaction_recent_blockhashes: block_transaction_recent_blockhashes,
     };
 
-    // Use write_batch for atomic writes
+    // Write to Postgres (source of truth, fatal on failure)
     accounts_db
-        .write_batch(&accounts_vec, transactions_for_db, Some(block_info))
+        .write_batch(
+            &accounts_vec,
+            transactions_for_db.clone(),
+            Some(block_info.clone()),
+        )
         .await?;
+
+    // Write to Redis best-effort (non-fatal)
+    if let Some(redis) = redis_db {
+        if let Err(e) = crate::accounts::write_batch::write_batch_redis(
+            redis,
+            &accounts_vec,
+            transactions_for_db,
+            Some(block_info),
+        )
+        .await
+        {
+            warn!(
+                "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
+                e
+            );
+        }
+    }
 
     Ok(SettleResult {
         slot: next_slot,
         blockhash: next_blockhash,
         account_settlements: accounts_vec,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redis::AsyncCommands;
+    use solana_hash::Hash;
+
+    /// Test that cache warming reads from Postgres and writes to Redis correctly.
+    ///
+    /// This test verifies:
+    /// 1. Reads latest_slot from Postgres (MAX(slot) from blocks table)
+    /// 2. Writes latest_slot to Redis
+    /// 3. Reads latest_blockhash from Postgres metadata table
+    /// 4. Writes latest_blockhash to Redis
+    ///
+    /// Note: This is an integration test that requires:
+    /// - TEST_POSTGRES_URL environment variable with a test database
+    /// - TEST_REDIS_URL environment variable with a test Redis instance
+    #[tokio::test]
+    #[ignore] // Requires database setup
+    async fn test_cache_warming() {
+        use std::env;
+
+        // Setup: Get test database URLs from environment
+        let postgres_url = env::var("TEST_POSTGRES_URL").unwrap_or_else(|_| {
+            "postgresql://contra:contra@localhost:5432/contra_test".to_string()
+        });
+        let redis_url =
+            env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+        // Create Postgres connection
+        let postgres_db = match PostgresAccountsDB::new(&postgres_url, false).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: Cannot connect to test Postgres: {}", e);
+                return;
+            }
+        };
+
+        // Create Redis connection
+        let redis_db = match RedisAccountsDB::new(&redis_url).await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Skipping test: Cannot connect to test Redis: {}", e);
+                return;
+            }
+        };
+
+        // Setup test data in Postgres
+        let test_slot = 12345u64;
+        let test_blockhash = Hash::default();
+        let test_blockhash_bytes = test_blockhash.to_bytes();
+
+        let pool = postgres_db.pool.clone();
+
+        // Insert test block with slot
+        let insert_result = sqlx::query(
+            "INSERT INTO blocks (slot, blockhash, previous_blockhash, parent_slot, block_time)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (slot) DO NOTHING",
+        )
+        .bind(test_slot as i64)
+        .bind(test_blockhash_bytes.to_vec())
+        .bind(test_blockhash_bytes.to_vec())
+        .bind(0i64)
+        .bind(0i64)
+        .execute(pool.as_ref())
+        .await;
+
+        if let Err(e) = insert_result {
+            eprintln!(
+                "Skipping test: Cannot insert test data into Postgres: {}",
+                e
+            );
+            return;
+        }
+
+        // Insert test blockhash into metadata
+        let metadata_result = sqlx::query(
+            "INSERT INTO metadata (key, value)
+             VALUES ('latest_blockhash', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(test_blockhash_bytes.to_vec())
+        .execute(pool.as_ref())
+        .await;
+
+        if let Err(e) = metadata_result {
+            eprintln!("Skipping test: Cannot insert metadata into Postgres: {}", e);
+            return;
+        }
+
+        // Execute: Call warm_redis_cache
+        let result = warm_redis_cache(&postgres_db, &redis_db).await;
+
+        // Verify: Function should succeed
+        assert!(
+            result.is_ok(),
+            "warm_redis_cache should succeed. Got error: {:?}",
+            result.err()
+        );
+
+        // Verify: Check that Redis was populated correctly
+        let mut conn = redis_db.connection.clone();
+
+        // Check latest_slot in Redis
+        let redis_slot: Option<u64> = conn.get("latest_slot").await.ok();
+        assert_eq!(
+            redis_slot,
+            Some(test_slot),
+            "Redis should contain the correct latest_slot"
+        );
+
+        // Check latest_blockhash in Redis
+        let redis_blockhash_str: Option<String> = conn.get("latest_blockhash").await.ok();
+        assert_eq!(
+            redis_blockhash_str,
+            Some(test_blockhash.to_string()),
+            "Redis should contain the correct latest_blockhash"
+        );
+
+        // Cleanup: Remove test data from Postgres
+        let _ = sqlx::query("DELETE FROM blocks WHERE slot = $1")
+            .bind(test_slot as i64)
+            .execute(pool.as_ref())
+            .await;
+
+        let _ = sqlx::query("DELETE FROM metadata WHERE key = 'latest_blockhash'")
+            .execute(pool.as_ref())
+            .await;
+
+        // Cleanup: Remove test data from Redis
+        let _: Result<(), _> = conn.del("latest_slot").await;
+        let _: Result<(), _> = conn.del("latest_blockhash").await;
+    }
 }

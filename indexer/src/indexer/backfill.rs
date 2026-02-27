@@ -156,17 +156,14 @@ pub async fn fill_slot_range(
 
             send_guaranteed(
                 instruction_tx,
-                ProcessorMessage::SlotComplete {
-                    slot,
-                    program_type,
-                },
+                ProcessorMessage::SlotComplete { slot, program_type },
                 "SlotComplete marker (backfill)",
             )
             .await
             .map_err(|e| DataSourceError::from(BackfillError::ChannelSend(e)))?;
         }
 
-        if processed_count % 1000 == 0 {
+        if processed_count.is_multiple_of(1000) {
             let progress = ((processed_count as f64 / gap as f64) * 100.0) as u32;
             info!(
                 "Backfill progress for {:?}: {}/{} slots ({}%)",
@@ -245,12 +242,11 @@ impl BackfillService {
             last_checkpoint
         };
 
-        let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
-            BackfillError::SlotFetchFailed {
-                slot: 0,
-                source: e,
-            }
-        })?;
+        let current_slot = self
+            .rpc_poller
+            .get_latest_slot()
+            .await
+            .map_err(|e| BackfillError::SlotFetchFailed { slot: 0, source: e })?;
 
         match validate_gap(current_slot, from_slot, self.config.max_gap_slots)
             .map_err(DataSourceError::from)?
@@ -361,5 +357,191 @@ mod tests {
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0], vec![101]);
+    }
+
+    // ============================================================================
+    // fill_slot_range Integration Tests
+    // ============================================================================
+
+    #[cfg(feature = "datasource-rpc")]
+    mod fill_slot_range_tests {
+        use super::*;
+        use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+        use mockito::Server;
+        use serde_json::json;
+        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_transaction_status::UiTransactionEncoding;
+        use tokio::sync::mpsc;
+
+        fn empty_block_json() -> serde_json::Value {
+            json!({
+                "blockhash": "TestBlockHash11111111111111111111111111111",
+                "parentSlot": 0,
+                "transactions": []
+            })
+        }
+
+        fn mock_get_block_success(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": empty_block_json(),
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        fn mock_get_block_skipped(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32009, "message": "Slot was skipped" },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        fn mock_get_block_error(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32600, "message": "Invalid request" },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        #[tokio::test]
+        async fn fill_slot_range_empty_blocks() {
+            let mut server = Server::new_async().await;
+
+            let _m1 = mock_get_block_success(&mut server, 101);
+            let _m2 = mock_get_block_success(&mut server, 102);
+            let _m3 = mock_get_block_success(&mut server, 103);
+
+            let poller = RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            );
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 103, 10, ProgramType::Escrow, None, &tx).await;
+
+            assert_eq!(result.unwrap(), 3);
+            drop(tx);
+
+            let mut messages = vec![];
+            while let Some(msg) = rx.recv().await {
+                messages.push(msg);
+            }
+
+            assert_eq!(messages.len(), 3);
+            for (i, msg) in messages.iter().enumerate() {
+                match msg {
+                    ProcessorMessage::SlotComplete { slot, .. } => {
+                        assert_eq!(*slot, 101 + i as u64);
+                    }
+                    ProcessorMessage::Instruction(_) => {
+                        panic!("Expected no Instruction messages for empty blocks");
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn fill_slot_range_skipped_slots() {
+            let mut server = Server::new_async().await;
+
+            let _m1 = mock_get_block_skipped(&mut server, 101);
+            let _m2 = mock_get_block_skipped(&mut server, 102);
+
+            let poller = RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            );
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            assert_eq!(result.unwrap(), 2);
+            drop(tx);
+
+            let mut messages = vec![];
+            while let Some(msg) = rx.recv().await {
+                messages.push(msg);
+            }
+
+            assert_eq!(messages.len(), 2);
+            for msg in &messages {
+                assert!(matches!(msg, ProcessorMessage::SlotComplete { .. }));
+            }
+        }
+
+        #[tokio::test]
+        async fn fill_slot_range_block_fetch_error() {
+            let mut server = Server::new_async().await;
+
+            let _m1 = mock_get_block_error(&mut server, 101);
+
+            let poller = RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            );
+
+            let (tx, _rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 101, 10, ProgramType::Escrow, None, &tx).await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn fill_slot_range_no_slots_in_range() {
+            let server = Server::new_async().await;
+
+            let poller = RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            );
+
+            let (tx, _rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 100, 10, ProgramType::Escrow, None, &tx).await;
+
+            assert_eq!(result.unwrap(), 0);
+        }
     }
 }

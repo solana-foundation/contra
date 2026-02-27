@@ -6,9 +6,9 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
 #[cfg(feature = "datasource-rpc")]
 use tracing::warn;
+use tracing::{debug, error, info};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::convert_from::create_message;
 use yellowstone_grpc_proto::geyser::{
@@ -95,11 +95,13 @@ async fn try_fill_reconnect_gap(
     escrow_instance_id: Option<Pubkey>,
     instruction_tx: &InstructionSender,
 ) -> Result<u64, DataSourceError> {
-    let current_slot = rpc_poller.get_latest_slot().await.map_err(|e| {
-        DataSourceError::GapFillFailed {
-            reason: format!("Failed to get latest slot: {}", e),
-        }
-    })?;
+    let current_slot =
+        rpc_poller
+            .get_latest_slot()
+            .await
+            .map_err(|e| DataSourceError::GapFillFailed {
+                reason: format!("Failed to get latest slot: {}", e),
+            })?;
 
     match validate_gap(current_slot, last_seen_slot, max_gap_slots) {
         Ok(None) => {
@@ -257,6 +259,7 @@ impl DataSource for YellowstoneSource {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_stream(
     endpoint: &str,
     x_token: Option<String>,
@@ -413,6 +416,183 @@ async fn connect_and_stream(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "datasource-rpc"))]
+mod tests {
+    use super::*;
+    use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+    use mockito::Server;
+    use serde_json::json;
+    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_transaction_status::UiTransactionEncoding;
+    use tokio::sync::mpsc;
+
+    fn empty_block_json() -> serde_json::Value {
+        json!({
+            "blockhash": "TestBlockHash11111111111111111111111111111",
+            "parentSlot": 0,
+            "transactions": []
+        })
+    }
+
+    fn mock_get_slot(server: &mut Server, slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getSlot"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": slot,
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    fn mock_get_slot_error(server: &mut Server) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getSlot"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "Invalid request" },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    fn mock_get_block_success(server: &mut Server, slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": empty_block_json(),
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    #[tokio::test]
+    async fn try_fill_reconnect_gap_no_gap() {
+        let mut server = Server::new_async().await;
+
+        let _m = mock_get_slot(&mut server, 100);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let result =
+            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
+
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn try_fill_reconnect_gap_fills_gap() {
+        let mut server = Server::new_async().await;
+
+        let _m_slot = mock_get_slot(&mut server, 103);
+        let _m1 = mock_get_block_success(&mut server, 101);
+        let _m2 = mock_get_block_success(&mut server, 102);
+        let _m3 = mock_get_block_success(&mut server, 103);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let result =
+            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
+
+        assert_eq!(result.unwrap(), 3);
+        drop(tx);
+
+        let mut slots = vec![];
+        while let Some(msg) = rx.recv().await {
+            if let ProcessorMessage::SlotComplete { slot, .. } = msg {
+                slots.push(slot);
+            }
+        }
+
+        assert_eq!(slots, vec![101, 102, 103]);
+    }
+
+    #[tokio::test]
+    async fn try_fill_reconnect_gap_too_large() {
+        let mut server = Server::new_async().await;
+
+        let _m = mock_get_slot(&mut server, 200);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let result =
+            try_fill_reconnect_gap(100, &poller, 10, 10, ProgramType::Escrow, None, &tx).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("Gap too large"),
+            "Expected 'Gap too large' in error: {}",
+            err_str
+        );
+    }
+
+    #[tokio::test]
+    async fn try_fill_reconnect_gap_rpc_failure() {
+        let mut server = Server::new_async().await;
+
+        let _m = mock_get_slot_error(&mut server);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let result =
+            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("Failed to get latest slot"),
+            "Expected 'Failed to get latest slot' in error: {}",
+            err_str
+        );
+    }
 }
 
 async fn handle_transaction(

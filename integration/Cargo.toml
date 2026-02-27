@@ -19,6 +19,10 @@ path = "tests/indexer/reconciliation.rs"
 name = "mint_idempotency_integration"
 path = "tests/indexer/mint_idempotency.rs"
 
+[[test]]
+name = "gap_detection_integration"
+path = "tests/indexer/gap_detection.rs"
+
 [features]
 test-tree = ["contra-indexer/test-tree"]
 

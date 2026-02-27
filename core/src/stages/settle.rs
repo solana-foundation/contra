@@ -152,16 +152,30 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 .await
                 .unwrap();
 
-            let redis_url =
-                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-            let mut redis_db: Option<RedisAccountsDB> = match RedisAccountsDB::new(&redis_url).await
-            {
-                Ok(r) => {
-                    info!("Redis cache enabled");
-                    Some(r)
+            let mut redis_db: Option<RedisAccountsDB> = match std::env::var("REDIS_URL") {
+                Ok(redis_url) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        RedisAccountsDB::new(&redis_url),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) => {
+                            info!("Redis cache enabled");
+                            Some(r)
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Redis unavailable ({}), running Postgres-only", e);
+                            None
+                        }
+                        Err(_) => {
+                            warn!("Redis connection timed out, running Postgres-only");
+                            None
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Redis unavailable ({}), running Postgres-only", e);
+                Err(_) => {
+                    info!("REDIS_URL not set, running Postgres-only");
                     None
                 }
             };

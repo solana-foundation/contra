@@ -54,6 +54,7 @@ solana-transaction-error = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
 spl-associated-token-account = { workspace = true }
+spl-memo = { workspace = true }
 spl-token = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }

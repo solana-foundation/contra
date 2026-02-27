@@ -12,5 +12,5 @@ pub use db_transaction_writer::DbTransactionWriter;
 pub use fetcher::run_fetcher;
 pub use operator::run;
 pub use processor::run_processor;
-pub use sender::{run_sender, TransactionStatusUpdate};
+pub use sender::{find_existing_mint_signature, run_sender, TransactionStatusUpdate};
 pub use utils::*;

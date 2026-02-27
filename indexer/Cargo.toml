@@ -33,6 +33,7 @@ solana-sdk = { workspace = true }
 solana-system-interface = { workspace = true }
 spl-token = { workspace = true }
 spl-associated-token-account = { workspace = true }
+spl-memo = { workspace = true }
 sqlx = { workspace = true, features = [
     "runtime-tokio-rustls",
     "postgres",

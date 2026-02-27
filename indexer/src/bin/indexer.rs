@@ -111,6 +111,12 @@ enum Mode {
     Indexer,
     /// Run as an operator
     Operator,
+    /// Run as a resync operation
+    Resync {
+        /// Genesis slot to start from (default: 0)
+        #[arg(long, default_value = "0")]
+        genesis_slot: u64,
+    },
 }
 
 const INDEXER_PREFIX: &str = "INDEXER";
@@ -171,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Indexer => run_indexer(figment, args.verbose).await,
         Mode::Operator => run_operator(figment, args.verbose).await,
+        Mode::Resync { genesis_slot } => run_resync(figment, args.verbose, genesis_slot).await,
     }
 }
 
@@ -356,6 +363,97 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
 
     contra_indexer::operator::run(storage, common_config, operator_config).await?;
+
+    Ok(())
+}
+
+async fn run_resync(
+    figment: Figment,
+    verbose: bool,
+    genesis_slot: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(if verbose {
+            "info,contra_indexer=debug"
+        } else {
+            "info"
+        })
+        .init();
+
+    let common: CommonSection = figment.extract_inner("common")?;
+    let storage: StorageSection = figment.extract_inner("storage")?;
+    let indexer: IndexerSection = figment.extract_inner("indexer")?;
+
+    // Get DATABASE_URL from environment
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL environment variable required")?;
+
+    let postgres_config = PostgresConfig {
+        database_url,
+        max_connections: storage.max_connections,
+    };
+
+    // Initialize storage
+    let storage_instance: Arc<contra_indexer::storage::Storage> = match storage.storage_type {
+        StorageType::Postgres => Arc::new(contra_indexer::storage::Storage::Postgres(
+            contra_indexer::storage::PostgresDb::new(&postgres_config).await?,
+        )),
+    };
+
+    // Initialize RPC poller
+    let rpc_url = indexer
+        .backfill
+        .rpc_url
+        .clone()
+        .unwrap_or_else(|| common.rpc_url.clone());
+    let rpc_encoding = indexer
+        .rpc_polling
+        .as_ref()
+        .and_then(|rpc| rpc.encoding)
+        .unwrap_or(UiTransactionEncoding::Json);
+    let rpc_commitment = indexer
+        .rpc_polling
+        .as_ref()
+        .and_then(|rpc| rpc.commitment)
+        .unwrap_or(CommitmentLevel::Finalized);
+
+    let rpc_poller = Arc::new(
+        contra_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(
+            rpc_url,
+            rpc_encoding,
+            rpc_commitment,
+        ),
+    );
+
+    // Parse escrow instance ID if provided
+    let escrow_instance_id = common
+        .escrow_instance_id
+        .map(|id_str| {
+            Pubkey::from_str(&id_str).map_err(|e| format!("Invalid escrow instance ID: {}", e))
+        })
+        .transpose()?;
+
+    // Build backfill config base
+    let backfill_config_base = BackfillConfig {
+        enabled: true,
+        exit_after_backfill: false,
+        rpc_url: indexer.backfill.rpc_url.unwrap_or(common.rpc_url.clone()),
+        batch_size: indexer.backfill.batch_size,
+        max_gap_slots: u64::MAX,
+        start_slot: Some(genesis_slot),
+    };
+
+    // Create ResyncService
+    let resync_service = contra_indexer::indexer::resync::ResyncService::new(
+        storage_instance,
+        rpc_poller,
+        common.program_type,
+        backfill_config_base,
+        escrow_instance_id,
+    );
+
+    // Run resync
+    resync_service.run(genesis_slot).await?;
 
     Ok(())
 }

@@ -34,6 +34,3 @@ integration/.yellowstone-grpc/
 .local/
 
 indexer/config/devnet/
-
-# Auto Claude data directory
-.auto-claude/

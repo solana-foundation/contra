@@ -1,6 +1,6 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::OperatorError;
-use crate::operator::instruction_util::{MintToBuilder, TransactionBuilder};
+use crate::operator::instruction_util::{mint_idempotency_memo, MintToBuilder, TransactionBuilder};
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
@@ -263,11 +263,12 @@ pub async fn process_deposit_funds(
             .payer(processor_state.admin_pubkey)
             .mint_authority(processor_state.admin_pubkey)
             .token_program(token_program)
-            .amount(transaction.amount as u64);
+            .amount(transaction.amount as u64)
+            .idempotency_memo(mint_idempotency_memo(transaction.id));
 
         let wrapped = TransactionBuilder::Mint(Box::new(MintToBuilderWithTxnId {
             builder,
-            txn_id: transaction.id as u64,
+            txn_id: transaction.id,
         }));
 
         send_guaranteed(&sender_tx, wrapped, "processed deposit")

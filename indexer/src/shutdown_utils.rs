@@ -288,6 +288,7 @@ pub async fn shutdown_operator(
     processor_handle: tokio::task::JoinHandle<()>,
     sender_handle: tokio::task::JoinHandle<()>,
     storage_writer_handle: tokio::task::JoinHandle<()>,
+    reconciliation_handle: tokio::task::JoinHandle<()>,
     batch_size: u16,
     db_poll_interval: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -304,6 +305,7 @@ pub async fn shutdown_operator(
             processor_handle,
             sender_handle,
             storage_writer_handle,
+            reconciliation_handle,
             batch_size,
             db_poll_interval,
             &config,
@@ -354,6 +356,7 @@ async fn perform_operator_shutdown_stages(
     processor_handle: tokio::task::JoinHandle<()>,
     sender_handle: tokio::task::JoinHandle<()>,
     storage_writer_handle: tokio::task::JoinHandle<()>,
+    reconciliation_handle: tokio::task::JoinHandle<()>,
     batch_size: u16,
     db_poll_interval: Duration,
     config: &ShutdownConfig,
@@ -433,9 +436,28 @@ async fn perform_operator_shutdown_stages(
         }
     }
 
-    // Stage 6: Add buffer time before storage close for safety
+    // Stage 6: Drain reconciliation loop
+    info!("Stage 6: Waiting for reconciliation loop to drain...");
+    let reconciliation_result = tokio::time::timeout(
+        Duration::from_secs(config.storage_writer_drain_timeout_secs),
+        reconciliation_handle,
+    )
+    .await;
+
+    match reconciliation_result {
+        Ok(Ok(_)) => info!("Reconciliation loop drained successfully"),
+        Ok(Err(e)) => warn!("Reconciliation loop error: {:?}", e),
+        Err(_) => {
+            warn!(
+                "Reconciliation loop drain timed out after {}s",
+                config.storage_writer_drain_timeout_secs
+            );
+        }
+    }
+
+    // Stage 7: Add buffer time before storage close for safety
     info!(
-        "Stage 6: Waiting {}s buffer time before storage close...",
+        "Stage 7: Waiting {}s buffer time before storage close...",
         config.shutdown_buffer_time_secs
     );
     tokio::time::sleep(Duration::from_secs(config.shutdown_buffer_time_secs)).await;

@@ -144,6 +144,10 @@ impl MockStorage {
         Ok(self.mint_balances.lock().unwrap().clone())
     }
 
+    pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
+        Ok(self.mint_balances.lock().unwrap().clone())
+    }
+
     pub async fn close(&self) -> Result<(), StorageError> {
         Ok(())
     }

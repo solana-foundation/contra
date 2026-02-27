@@ -1,7 +1,8 @@
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::operator::{
-    fetcher, processor, sender, DbTransactionWriter, RetryConfig, RpcClientWithRetry,
+    fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
+    RpcClientWithRetry,
 };
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
@@ -10,7 +11,7 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn run(
     storage: Arc<Storage>,
@@ -100,9 +101,10 @@ pub async fn run(
     let sender_storage = storage.clone();
     let sender_commitment = config.rpc_commitment;
     let sender_source_rpc = source_rpc_client.clone();
+    let sender_common_config = common_config.clone();
     let sender_handle = tokio::spawn(async move {
         if let Err(e) = sender::run_sender(
-            &common_config,
+            &sender_common_config,
             sender_commitment,
             sender_rx,
             storage_tx,
@@ -116,6 +118,36 @@ pub async fn run(
             tracing::error!("Sender error: {}", e);
         }
     });
+
+    // Start reconciliation task for escrow operators only.
+    // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
+    let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
+    {
+        if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
+            let reconciliation_storage = storage.clone();
+            let reconciliation_config = config.clone();
+            let reconciliation_rpc = rpc_client.clone();
+            let reconciliation_token = cancellation_token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = reconciliation::run_reconciliation(
+                    reconciliation_storage,
+                    reconciliation_config,
+                    reconciliation_rpc,
+                    reconciliation_escrow,
+                    reconciliation_token,
+                )
+                .await
+                {
+                    tracing::error!("Reconciliation error: {}", e);
+                }
+            })
+        } else {
+            warn!("Skipping reconciliation: escrow_instance_id is not configured");
+            tokio::spawn(async {})
+        }
+    } else {
+        tokio::spawn(async {})
+    };
 
     info!("Operator started, waiting for shutdown signal...");
 
@@ -133,6 +165,7 @@ pub async fn run(
         processor_handle,
         sender_handle,
         storage_writer_handle,
+        reconciliation_handle,
         config.batch_size,
         config.db_poll_interval,
     )

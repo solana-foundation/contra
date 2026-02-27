@@ -88,6 +88,20 @@ struct OperatorSection {
     channel_buffer_size: usize,
     #[serde(default)]
     rpc_commitment: Option<CommitmentLevel>,
+    #[serde(default = "default_reconciliation_interval_secs")]
+    reconciliation_interval_secs: u64,
+    #[serde(default = "default_reconciliation_tolerance_bps")]
+    reconciliation_tolerance_bps: u16,
+    #[serde(default)]
+    reconciliation_webhook_url: Option<String>,
+}
+
+fn default_reconciliation_interval_secs() -> u64 {
+    5 * 60
+}
+
+fn default_reconciliation_tolerance_bps() -> u16 {
+    10
 }
 
 #[derive(Parser, Debug)]
@@ -357,6 +371,9 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
             .rpc_commitment
             .unwrap_or(CommitmentLevel::Confirmed),
         alert_webhook_url: std::env::var("ALERT_WEBHOOK").ok(),
+        reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
+        reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
+        reconciliation_webhook_url: operator.reconciliation_webhook_url,
     };
 
     // Validate signer configuration early (from environment variables)

@@ -4,6 +4,7 @@ mod state;
 mod transaction;
 pub mod types;
 
+pub use mint::find_existing_mint_signature;
 pub use types::TransactionStatusUpdate;
 
 use crate::error::OperatorError;

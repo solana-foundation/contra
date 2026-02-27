@@ -16,10 +16,9 @@ use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
 use chrono;
 use serde_json;
-use solana_account_decoder::UiAccountEncoding;
-use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
+use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,13 +60,7 @@ pub async fn run_reconciliation(
         }
 
         // Perform reconciliation check
-        match perform_reconciliation_check(
-            &storage,
-            &config,
-            &rpc_client,
-            escrow_instance_id,
-        )
-        .await
+        match perform_reconciliation_check(&storage, &config, &rpc_client, escrow_instance_id).await
         {
             Ok(_) => {
                 // Reconciliation check completed successfully
@@ -77,8 +70,14 @@ pub async fn run_reconciliation(
             }
         }
 
-        // Sleep between reconciliation checks
-        tokio::time::sleep(config.reconciliation_interval).await;
+        // Sleep between checks, but break immediately when cancellation is signaled.
+        tokio::select! {
+            _ = tokio::time::sleep(config.reconciliation_interval) => {},
+            _ = cancellation_token.cancelled() => {
+                info!("Reconciliation received cancellation signal during sleep, stopping...");
+                break;
+            }
+        }
     }
 
     info!("Reconciliation stopped gracefully");
@@ -102,17 +101,23 @@ async fn perform_reconciliation_check(
     let on_chain_balances = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
 
     // Step 2: Query database for completed transaction balances per mint
-    let db_balance_results = storage.get_escrow_balances_by_mint().await
-        .map_err(|e| OperatorError::StorageError(format!("Failed to query database balances: {}", e)))?;
+    let db_balance_results = storage
+        .get_escrow_balances_by_mint()
+        .await
+        .map_err(OperatorError::Storage)?;
 
     // Convert DB results to HashMap<Pubkey, u64> for comparison
     let mut db_balances = std::collections::HashMap::new();
     for balance_result in db_balance_results {
-        let mint = balance_result.mint_address.parse::<Pubkey>()
-            .map_err(|e| OperatorError::StorageError(format!("Invalid mint address: {}", e)))?;
+        let mint = balance_result.mint_address.parse::<Pubkey>().map_err(|e| {
+            OperatorError::InvalidPubkey {
+                pubkey: balance_result.mint_address.clone(),
+                reason: e.to_string(),
+            }
+        })?;
 
         // Calculate net balance (deposits - withdrawals)
-        let net_balance = if balance_result.total_deposits >= balance_result.total_withdrawals {
+        let net_balance_i64 = if balance_result.total_deposits >= balance_result.total_withdrawals {
             balance_result.total_deposits - balance_result.total_withdrawals
         } else {
             // This shouldn't happen in a properly functioning system, but handle it gracefully
@@ -125,6 +130,7 @@ async fn perform_reconciliation_check(
             0 // Treat as zero balance for comparison
         };
 
+        let net_balance = net_balance_i64 as u64;
         db_balances.insert(mint, net_balance);
     }
 
@@ -146,10 +152,7 @@ async fn perform_reconciliation_check(
         for mismatch in &mismatches {
             error!(
                 "Mismatch for mint {}: on-chain={}, db={}, delta={} bps",
-                mismatch.mint,
-                mismatch.on_chain_balance,
-                mismatch.db_balance,
-                mismatch.delta_bps
+                mismatch.mint, mismatch.on_chain_balance, mismatch.db_balance, mismatch.delta_bps
             );
         }
 
@@ -186,7 +189,7 @@ pub struct BalanceMismatch {
 ///
 /// # Returns
 /// * `Vec<BalanceMismatch>` - List of mismatches exceeding tolerance, empty if all balances reconcile
-pub(crate) fn compare_balances(
+pub fn compare_balances(
     on_chain_balances: &HashMap<Pubkey, u64>,
     db_balances: &HashMap<Pubkey, u64>,
     tolerance_bps: u16,
@@ -194,7 +197,8 @@ pub(crate) fn compare_balances(
     let mut mismatches = Vec::new();
 
     // Collect all unique mints from both sources
-    let mut all_mints: std::collections::HashSet<Pubkey> = on_chain_balances.keys().copied().collect();
+    let mut all_mints: std::collections::HashSet<Pubkey> =
+        on_chain_balances.keys().copied().collect();
     all_mints.extend(db_balances.keys().copied());
 
     for mint in all_mints {
@@ -256,48 +260,51 @@ async fn fetch_on_chain_balances(
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
 ) -> Result<HashMap<Pubkey, u64>, OperatorError> {
-    let token_program_id = spl_token::id();
-
-    // Fetch all token accounts owned by the escrow for the SPL Token program
-    let accounts = rpc_client
-        .with_retry(
-            "get_token_accounts_by_owner",
-            RetryPolicy::Idempotent,
-            || async {
-                rpc_client
-                    .rpc_client
-                    .get_token_accounts_by_owner(
-                        &escrow_instance_id,
-                        TokenAccountsFilter::ProgramId(token_program_id),
-                    )
-                    .await
-            },
-        )
-        .await
-        .map_err(|e| {
-            OperatorError::RpcError(format!("Failed to fetch token accounts: {}", e))
-        })?;
-
     let mut balances = HashMap::new();
+    let token_programs = [spl_token::id(), spl_token_2022::id()];
 
-    // Parse each token account and aggregate balances by mint
-    for keyed_account in accounts {
-        // Decode the account data from base64
-        let account_data = keyed_account
-            .account
-            .data
-            .decode()
-            .ok_or_else(|| {
+    for token_program_id in token_programs {
+        // Fetch all token accounts owned by the escrow for each supported token program
+        let accounts = rpc_client
+            .with_retry(
+                "get_token_accounts_by_owner",
+                RetryPolicy::Idempotent,
+                || async {
+                    rpc_client
+                        .rpc_client
+                        .get_token_accounts_by_owner(
+                            &escrow_instance_id,
+                            TokenAccountsFilter::ProgramId(token_program_id),
+                        )
+                        .await
+                },
+            )
+            .await
+            .map_err(|e| {
+                OperatorError::RpcError(format!(
+                    "Failed to fetch token accounts for program {}: {}",
+                    token_program_id, e
+                ))
+            })?;
+
+        // Parse each token account and aggregate balances by mint
+        for keyed_account in accounts {
+            // Decode the account data from base64
+            let account_data = keyed_account.account.data.decode().ok_or_else(|| {
                 OperatorError::RpcError("Failed to decode token account data".to_string())
             })?;
 
-        // Unpack the SPL token account structure
-        let token_account = TokenAccount::unpack(&account_data).map_err(|e| {
-            OperatorError::RpcError(format!("Failed to parse token account: {}", e))
-        })?;
+            // Unpack the token account structure
+            let token_account = TokenAccount::unpack(&account_data).map_err(|e| {
+                OperatorError::RpcError(format!(
+                    "Failed to parse token account for program {}: {}",
+                    token_program_id, e
+                ))
+            })?;
 
-        // Sum balances for each mint (handles multiple token accounts for the same mint)
-        *balances.entry(token_account.mint).or_insert(0) += token_account.amount;
+            // Sum balances for each mint (handles multiple token accounts for the same mint)
+            *balances.entry(token_account.mint).or_insert(0) += token_account.amount;
+        }
     }
 
     Ok(balances)
@@ -332,7 +339,7 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// # Returns
 /// * `Ok(())` if all webhooks sent successfully (or no URL configured)
 /// * `Err(OperatorError::WebhookError)` if webhook delivery fails after retries
-pub(crate) async fn send_webhook_alert(
+pub async fn send_webhook_alert(
     webhook_url: &Option<String>,
     mismatches: &[BalanceMismatch],
 ) -> Result<(), OperatorError> {
@@ -381,27 +388,25 @@ async fn send_single_webhook_alert(
     });
 
     let mut attempts = 0;
-    let mut last_error = String::new();
 
     loop {
         attempts += 1;
 
-        match client.post(url).json(&payload).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!(
-                        "Webhook alert sent for mint {} (delta: {} bps)",
-                        mismatch.mint, mismatch.delta_bps
-                    );
-                    return Ok(());
-                } else {
-                    last_error = format!("HTTP {}: {}", response.status(), response.text().await.unwrap_or_default());
-                }
+        let last_error = match client.post(url).json(&payload).send().await {
+            Ok(response) if response.status().is_success() => {
+                info!(
+                    "Webhook alert sent for mint {} (delta: {} bps)",
+                    mismatch.mint, mismatch.delta_bps
+                );
+                return Ok(());
             }
-            Err(e) => {
-                last_error = format!("Request failed: {}", e);
-            }
-        }
+            Ok(response) => format!(
+                "HTTP {}: {}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            ),
+            Err(e) => format!("Request failed: {}", e),
+        };
 
         if attempts >= WEBHOOK_MAX_ATTEMPTS {
             error!(
@@ -534,11 +539,7 @@ mod tests {
         db.insert(mint, 0);
 
         let mismatches = compare_balances(&on_chain, &db, 10);
-        assert_eq!(
-            mismatches.len(),
-            0,
-            "Both zero should have no mismatches"
-        );
+        assert_eq!(mismatches.len(), 0, "Both zero should have no mismatches");
     }
 
     #[test]
@@ -637,12 +638,20 @@ mod tests {
         db.insert(mint, 99900); // 0.1% = 10 bps
 
         let mismatches = compare_balances(&on_chain, &db, 9);
-        assert_eq!(mismatches.len(), 1, "Should detect 10 bps with 9 bps tolerance");
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "Should detect 10 bps with 9 bps tolerance"
+        );
         assert_eq!(mismatches[0].delta_bps, 10);
 
         // Test edge case: exactly at tolerance threshold
         let mismatches = compare_balances(&on_chain, &db, 10);
-        assert_eq!(mismatches.len(), 0, "Should not detect 10 bps with 10 bps tolerance");
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "Should not detect 10 bps with 10 bps tolerance"
+        );
     }
 
     #[test]
@@ -707,7 +716,10 @@ mod tests {
         }];
 
         let result = send_webhook_alert(&None, &mismatches).await;
-        assert!(result.is_ok(), "Should succeed when no webhook URL configured");
+        assert!(
+            result.is_ok(),
+            "Should succeed when no webhook URL configured"
+        );
     }
 
     #[tokio::test]
@@ -889,7 +901,11 @@ mod tests {
         assert_eq!(mismatches[0].delta_bps, 1);
 
         let mismatches = compare_balances(&on_chain, &db, 1);
-        assert_eq!(mismatches.len(), 0, "1 bps should be within 1 bps tolerance");
+        assert_eq!(
+            mismatches.len(),
+            0,
+            "1 bps should be within 1 bps tolerance"
+        );
     }
 
     #[test]
@@ -904,7 +920,11 @@ mod tests {
         db.insert(mint, 9);
 
         let mismatches = compare_balances(&on_chain, &db, 999);
-        assert_eq!(mismatches.len(), 1, "10% difference should exceed 9.99% tolerance");
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "10% difference should exceed 9.99% tolerance"
+        );
         assert_eq!(mismatches[0].delta_bps, 1000);
     }
 
@@ -999,11 +1019,7 @@ mod tests {
 
         // Delta = 1 / 10,001 * 10,000 = 0.9999... bps (rounds down to 0)
         let mismatches = compare_balances(&on_chain, &db, 0);
-        assert_eq!(
-            mismatches.len(),
-            0,
-            "Should round down to 0 bps"
-        );
+        assert_eq!(mismatches.len(), 0, "Should round down to 0 bps");
     }
 
     #[test]
@@ -1151,10 +1167,8 @@ mod tests {
         assert_eq!(mismatches.len(), 3);
 
         // Verify delta values
-        let deltas: HashMap<Pubkey, u64> = mismatches
-            .iter()
-            .map(|m| (m.mint, m.delta_bps))
-            .collect();
+        let deltas: HashMap<Pubkey, u64> =
+            mismatches.iter().map(|m| (m.mint, m.delta_bps)).collect();
 
         assert_eq!(deltas[&mint1], 50, "0.5% should be 50 bps");
         assert_eq!(deltas[&mint2], 25, "0.25% should be 25 bps");

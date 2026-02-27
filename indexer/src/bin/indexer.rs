@@ -88,11 +88,20 @@ struct OperatorSection {
     channel_buffer_size: usize,
     #[serde(default)]
     rpc_commitment: Option<CommitmentLevel>,
-    #[serde(default)]
+    #[serde(default = "default_reconciliation_interval_secs")]
     reconciliation_interval_secs: u64,
-    #[serde(default)]
+    #[serde(default = "default_reconciliation_tolerance_bps")]
     reconciliation_tolerance_bps: u16,
+    #[serde(default)]
     reconciliation_webhook_url: Option<String>,
+}
+
+fn default_reconciliation_interval_secs() -> u64 {
+    5 * 60
+}
+
+fn default_reconciliation_tolerance_bps() -> u16 {
+    10
 }
 
 #[derive(Parser, Debug)]

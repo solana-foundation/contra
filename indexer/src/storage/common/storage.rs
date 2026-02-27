@@ -146,9 +146,7 @@ impl Storage {
     /// Query escrow balances by mint for continuous reconciliation checks.
     /// Only counts **completed** transactions for both deposits and withdrawals.
     /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
-    pub async fn get_escrow_balances_by_mint(
-        &self,
-    ) -> Result<Vec<MintDbBalance>, StorageError> {
+    pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
     }
 

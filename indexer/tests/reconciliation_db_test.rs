@@ -33,7 +33,10 @@ async fn start_postgres(
 
     let host = container.get_host().await?;
     let port = container.get_host_port_ipv4(5432).await?;
-    let db_url = format!("postgres://postgres:password@{}:{}/reconciliation_test", host, port);
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/reconciliation_test",
+        host, port
+    );
 
     let pool = PgPool::connect(&db_url).await?;
     let storage = Storage::Postgres(
@@ -112,15 +115,78 @@ async fn test_only_completed_transactions_counted() -> Result<(), Box<dyn std::e
 
     // Insert transactions with different statuses
     // Completed transactions: should be counted
-    insert_transaction(&pool, "completed_deposit_1", &mint, 1_000_000, "deposit", "completed", 100).await?;
-    insert_transaction(&pool, "completed_deposit_2", &mint, 500_000, "deposit", "completed", 101).await?;
-    insert_transaction(&pool, "completed_withdrawal_1", &mint, 300_000, "withdrawal", "completed", 102).await?;
+    insert_transaction(
+        &pool,
+        "completed_deposit_1",
+        &mint,
+        1_000_000,
+        "deposit",
+        "completed",
+        100,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "completed_deposit_2",
+        &mint,
+        500_000,
+        "deposit",
+        "completed",
+        101,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "completed_withdrawal_1",
+        &mint,
+        300_000,
+        "withdrawal",
+        "completed",
+        102,
+    )
+    .await?;
 
     // Non-completed transactions: should NOT be counted
-    insert_transaction(&pool, "pending_deposit", &mint, 2_000_000, "deposit", "pending", 103).await?;
-    insert_transaction(&pool, "processing_deposit", &mint, 1_000_000, "deposit", "processing", 104).await?;
-    insert_transaction(&pool, "failed_deposit", &mint, 500_000, "deposit", "failed", 105).await?;
-    insert_transaction(&pool, "pending_withdrawal", &mint, 100_000, "withdrawal", "pending", 106).await?;
+    insert_transaction(
+        &pool,
+        "pending_deposit",
+        &mint,
+        2_000_000,
+        "deposit",
+        "pending",
+        103,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "processing_deposit",
+        &mint,
+        1_000_000,
+        "deposit",
+        "processing",
+        104,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "failed_deposit",
+        &mint,
+        500_000,
+        "deposit",
+        "failed",
+        105,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "pending_withdrawal",
+        &mint,
+        100_000,
+        "withdrawal",
+        "pending",
+        106,
+    )
+    .await?;
 
     // Query balances
     let balances = storage.get_escrow_balances_by_mint().await?;
@@ -133,10 +199,16 @@ async fn test_only_completed_transactions_counted() -> Result<(), Box<dyn std::e
     assert_eq!(balance.token_program, token_program);
 
     // Expected: completed deposits = 1,000,000 + 500,000 = 1,500,000
-    assert_eq!(balance.total_deposits, 1_500_000, "only completed deposits should be counted");
+    assert_eq!(
+        balance.total_deposits, 1_500_000,
+        "only completed deposits should be counted"
+    );
 
     // Expected: completed withdrawals = 300,000
-    assert_eq!(balance.total_withdrawals, 300_000, "only completed withdrawals should be counted");
+    assert_eq!(
+        balance.total_withdrawals, 300_000,
+        "only completed withdrawals should be counted"
+    );
 
     Ok(())
 }
@@ -155,14 +227,68 @@ async fn test_multiple_mints_aggregated_independently() -> Result<(), Box<dyn st
     insert_mint(&pool, &mint2, 9, &token_program).await?;
 
     // Mint 1 transactions
-    insert_transaction(&pool, "mint1_deposit_1", &mint1, 1_000_000, "deposit", "completed", 100).await?;
-    insert_transaction(&pool, "mint1_deposit_2", &mint1, 2_000_000, "deposit", "completed", 101).await?;
-    insert_transaction(&pool, "mint1_withdrawal_1", &mint1, 500_000, "withdrawal", "completed", 102).await?;
+    insert_transaction(
+        &pool,
+        "mint1_deposit_1",
+        &mint1,
+        1_000_000,
+        "deposit",
+        "completed",
+        100,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "mint1_deposit_2",
+        &mint1,
+        2_000_000,
+        "deposit",
+        "completed",
+        101,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "mint1_withdrawal_1",
+        &mint1,
+        500_000,
+        "withdrawal",
+        "completed",
+        102,
+    )
+    .await?;
 
     // Mint 2 transactions
-    insert_transaction(&pool, "mint2_deposit_1", &mint2, 5_000_000, "deposit", "completed", 103).await?;
-    insert_transaction(&pool, "mint2_withdrawal_1", &mint2, 1_000_000, "withdrawal", "completed", 104).await?;
-    insert_transaction(&pool, "mint2_withdrawal_2", &mint2, 500_000, "withdrawal", "completed", 105).await?;
+    insert_transaction(
+        &pool,
+        "mint2_deposit_1",
+        &mint2,
+        5_000_000,
+        "deposit",
+        "completed",
+        103,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "mint2_withdrawal_1",
+        &mint2,
+        1_000_000,
+        "withdrawal",
+        "completed",
+        104,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "mint2_withdrawal_2",
+        &mint2,
+        500_000,
+        "withdrawal",
+        "completed",
+        105,
+    )
+    .await?;
 
     // Query balances
     let balances = storage.get_escrow_balances_by_mint().await?;
@@ -171,16 +297,31 @@ async fn test_multiple_mints_aggregated_independently() -> Result<(), Box<dyn st
     assert_eq!(balances.len(), 2, "expected two mints");
 
     // Find each mint's balance
-    let balance1 = balances.iter().find(|b| b.mint_address == mint1).expect("mint1 not found");
-    let balance2 = balances.iter().find(|b| b.mint_address == mint2).expect("mint2 not found");
+    let balance1 = balances
+        .iter()
+        .find(|b| b.mint_address == mint1)
+        .expect("mint1 not found");
+    let balance2 = balances
+        .iter()
+        .find(|b| b.mint_address == mint2)
+        .expect("mint2 not found");
 
     // Verify mint1
-    assert_eq!(balance1.total_deposits, 3_000_000, "mint1: 1M + 2M deposits");
-    assert_eq!(balance1.total_withdrawals, 500_000, "mint1: 500K withdrawals");
+    assert_eq!(
+        balance1.total_deposits, 3_000_000,
+        "mint1: 1M + 2M deposits"
+    );
+    assert_eq!(
+        balance1.total_withdrawals, 500_000,
+        "mint1: 500K withdrawals"
+    );
 
     // Verify mint2
     assert_eq!(balance2.total_deposits, 5_000_000, "mint2: 5M deposits");
-    assert_eq!(balance2.total_withdrawals, 1_500_000, "mint2: 1M + 500K withdrawals");
+    assert_eq!(
+        balance2.total_withdrawals, 1_500_000,
+        "mint2: 1M + 500K withdrawals"
+    );
 
     Ok(())
 }
@@ -219,7 +360,11 @@ async fn test_empty_database() -> Result<(), Box<dyn std::error::Error>> {
     // Query balances with no mints
     let balances = storage.get_escrow_balances_by_mint().await?;
 
-    assert_eq!(balances.len(), 0, "empty database should return no balances");
+    assert_eq!(
+        balances.len(),
+        0,
+        "empty database should return no balances"
+    );
 
     Ok(())
 }
@@ -238,9 +383,36 @@ async fn test_large_amounts() -> Result<(), Box<dyn std::error::Error>> {
     // Use large amounts close to i64::MAX / 4 to test overflow protection
     let large_amount = i64::MAX / 4;
 
-    insert_transaction(&pool, "large_deposit_1", &mint, large_amount, "deposit", "completed", 100).await?;
-    insert_transaction(&pool, "large_deposit_2", &mint, large_amount, "deposit", "completed", 101).await?;
-    insert_transaction(&pool, "large_withdrawal", &mint, large_amount / 2, "withdrawal", "completed", 102).await?;
+    insert_transaction(
+        &pool,
+        "large_deposit_1",
+        &mint,
+        large_amount,
+        "deposit",
+        "completed",
+        100,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "large_deposit_2",
+        &mint,
+        large_amount,
+        "deposit",
+        "completed",
+        101,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "large_withdrawal",
+        &mint,
+        large_amount / 2,
+        "withdrawal",
+        "completed",
+        102,
+    )
+    .await?;
 
     // Query balances
     let balances = storage.get_escrow_balances_by_mint().await?;
@@ -248,8 +420,16 @@ async fn test_large_amounts() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(balances.len(), 1, "expected one mint");
 
     let balance = &balances[0];
-    assert_eq!(balance.total_deposits, large_amount * 2, "large deposits summed correctly");
-    assert_eq!(balance.total_withdrawals, large_amount / 2, "large withdrawal counted correctly");
+    assert_eq!(
+        balance.total_deposits,
+        large_amount * 2,
+        "large deposits summed correctly"
+    );
+    assert_eq!(
+        balance.total_withdrawals,
+        large_amount / 2,
+        "large withdrawal counted correctly"
+    );
 
     Ok(())
 }
@@ -269,8 +449,26 @@ async fn test_different_token_programs() -> Result<(), Box<dyn std::error::Error
     insert_mint(&pool, &mint2, 9, &token_2022_program).await?;
 
     // Add transactions
-    insert_transaction(&pool, "mint1_deposit", &mint1, 1_000_000, "deposit", "completed", 100).await?;
-    insert_transaction(&pool, "mint2_deposit", &mint2, 2_000_000, "deposit", "completed", 101).await?;
+    insert_transaction(
+        &pool,
+        "mint1_deposit",
+        &mint1,
+        1_000_000,
+        "deposit",
+        "completed",
+        100,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "mint2_deposit",
+        &mint2,
+        2_000_000,
+        "deposit",
+        "completed",
+        101,
+    )
+    .await?;
 
     // Query balances
     let balances = storage.get_escrow_balances_by_mint().await?;
@@ -278,11 +476,23 @@ async fn test_different_token_programs() -> Result<(), Box<dyn std::error::Error
     assert_eq!(balances.len(), 2, "expected two mints");
 
     // Verify token programs are correctly returned
-    let balance1 = balances.iter().find(|b| b.mint_address == mint1).expect("mint1 not found");
-    let balance2 = balances.iter().find(|b| b.mint_address == mint2).expect("mint2 not found");
+    let balance1 = balances
+        .iter()
+        .find(|b| b.mint_address == mint1)
+        .expect("mint1 not found");
+    let balance2 = balances
+        .iter()
+        .find(|b| b.mint_address == mint2)
+        .expect("mint2 not found");
 
-    assert_eq!(balance1.token_program, token_program, "mint1 should use SPL Token");
-    assert_eq!(balance2.token_program, token_2022_program, "mint2 should use Token-2022");
+    assert_eq!(
+        balance1.token_program, token_program,
+        "mint1 should use SPL Token"
+    );
+    assert_eq!(
+        balance2.token_program, token_2022_program,
+        "mint2 should use Token-2022"
+    );
 
     Ok(())
 }
@@ -299,9 +509,36 @@ async fn test_withdrawals_exceed_deposits() -> Result<(), Box<dyn std::error::Er
     insert_mint(&pool, &mint, 6, &token_program).await?;
 
     // Deposits less than withdrawals (shouldn't happen in practice, but query should handle it)
-    insert_transaction(&pool, "deposit", &mint, 500_000, "deposit", "completed", 100).await?;
-    insert_transaction(&pool, "withdrawal_1", &mint, 300_000, "withdrawal", "completed", 101).await?;
-    insert_transaction(&pool, "withdrawal_2", &mint, 400_000, "withdrawal", "completed", 102).await?;
+    insert_transaction(
+        &pool,
+        "deposit",
+        &mint,
+        500_000,
+        "deposit",
+        "completed",
+        100,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "withdrawal_1",
+        &mint,
+        300_000,
+        "withdrawal",
+        "completed",
+        101,
+    )
+    .await?;
+    insert_transaction(
+        &pool,
+        "withdrawal_2",
+        &mint,
+        400_000,
+        "withdrawal",
+        "completed",
+        102,
+    )
+    .await?;
 
     // Query balances
     let balances = storage.get_escrow_balances_by_mint().await?;
@@ -309,8 +546,14 @@ async fn test_withdrawals_exceed_deposits() -> Result<(), Box<dyn std::error::Er
     assert_eq!(balances.len(), 1, "expected one mint");
 
     let balance = &balances[0];
-    assert_eq!(balance.total_deposits, 500_000, "deposits counted correctly");
-    assert_eq!(balance.total_withdrawals, 700_000, "withdrawals counted correctly");
+    assert_eq!(
+        balance.total_deposits, 500_000,
+        "deposits counted correctly"
+    );
+    assert_eq!(
+        balance.total_withdrawals, 700_000,
+        "withdrawals counted correctly"
+    );
     // Net balance would be -200_000 (deposits - withdrawals), but we just store the raw totals
 
     Ok(())

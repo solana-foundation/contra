@@ -63,7 +63,7 @@ channel_buffer_size = 100
 #   ADMIN_PRIVY_APP_ID, ADMIN_PRIVY_APP_SECRET, ADMIN_PRIVY_WALLET_ID
 #   OPERATOR_PRIVY_* (same pattern)
 
-[reconciliation]
+# Reconciliation settings (part of [operator])
 # How often to run escrow balance reconciliation checks (in seconds)
 # Default: 300 seconds (5 minutes)
 reconciliation_interval_secs = 300

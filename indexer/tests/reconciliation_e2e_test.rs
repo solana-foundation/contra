@@ -10,14 +10,13 @@
 
 use contra_indexer::{
     config::OperatorConfig,
-    operator::reconciliation::{self, compare_balances, send_webhook_alert, BalanceMismatch},
+    operator::reconciliation::{compare_balances, send_webhook_alert},
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };
 use solana_sdk::pubkey::Pubkey;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -27,14 +26,8 @@ use testcontainers_modules::postgres::Postgres;
 /// Start a fresh Postgres container, initialize schema, and return (pool, Storage, container).
 /// The container must be kept alive for the duration of the test.
 async fn start_postgres(
-) -> Result<
-    (
-        PgPool,
-        Storage,
-        testcontainers::ContainerAsync<Postgres>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(PgPool, Storage, testcontainers::ContainerAsync<Postgres>), Box<dyn std::error::Error>>
+{
     let container = Postgres::default()
         .with_db_name("reconciliation_e2e_test")
         .with_user("postgres")
@@ -112,17 +105,15 @@ async fn insert_transaction(
 }
 
 /// Create a test OperatorConfig with specified reconciliation settings.
-fn create_test_config(
-    tolerance_bps: u16,
-    webhook_url: Option<String>,
-) -> OperatorConfig {
+fn create_test_config(tolerance_bps: u16, webhook_url: Option<String>) -> OperatorConfig {
     OperatorConfig {
         db_poll_interval: Duration::from_secs(1),
-        max_batch_size: 10,
-        max_retries: 3,
-        retry_delay_secs: 1,
-        transaction_timeout_secs: 30,
-        storage_writer_drain_timeout_secs: 10,
+        batch_size: 10,
+        retry_max_attempts: 3,
+        retry_base_delay: Duration::from_secs(1),
+        channel_buffer_size: 100,
+        rpc_commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed,
+        alert_webhook_url: None,
         reconciliation_interval: Duration::from_secs(300),
         reconciliation_tolerance_bps: tolerance_bps,
         reconciliation_webhook_url: webhook_url,
@@ -141,8 +132,7 @@ fn create_test_config(
 /// - No webhook alert sent
 /// - Reconciliation succeeds
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reconciliation_success_within_tolerance(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_reconciliation_success_within_tolerance() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique().to_string();
@@ -193,9 +183,9 @@ async fn test_reconciliation_success_within_tolerance(
 /// - Mismatch detected (1000 bps > 10 bps tolerance)
 /// - Webhook alert sent with correct data
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reconciliation_detects_mismatch_and_alerts(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _pg) = start_postgres().await?;
+async fn test_reconciliation_detects_mismatch_and_alerts() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, _storage, _pg) = start_postgres().await?;
 
     // Set up mock webhook server
     let mut webhook_server = mockito::Server::new_async().await;
@@ -238,8 +228,8 @@ async fn test_reconciliation_detects_mismatch_and_alerts(
 /// - Mint1: no alert (exact match)
 /// - Mint2: webhook alert sent (1000 bps > 10 bps tolerance)
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reconciliation_multiple_mints_mixed_results(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_reconciliation_multiple_mints_mixed_results() -> Result<(), Box<dyn std::error::Error>>
+{
     let (pool, storage, _pg) = start_postgres().await?;
 
     let mint1 = Pubkey::new_unique().to_string();
@@ -310,8 +300,7 @@ async fn test_reconciliation_multiple_mints_mixed_results(
 /// - Mismatch detected but no HTTP request made
 /// - Warning logged instead of webhook alert
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reconciliation_no_webhook_url_configured(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_reconciliation_no_webhook_url_configured() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique().to_string();
@@ -510,8 +499,7 @@ async fn test_reconciliation_ignores_non_completed_transactions(
 /// Expected:
 /// - Webhook retried and eventually succeeds
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reconciliation_webhook_retry_logic(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_reconciliation_webhook_retry_logic() -> Result<(), Box<dyn std::error::Error>> {
     // Set up mock webhook server that fails first, then succeeds
     let mut webhook_server = mockito::Server::new_async().await;
 
@@ -618,7 +606,7 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
             .mint_address
             .parse::<Pubkey>()
             .expect("valid mint address");
-        let net_balance = balance_result.total_deposits - balance_result.total_withdrawals;
+        let net_balance = (balance_result.total_deposits - balance_result.total_withdrawals) as u64;
         db_balances.insert(mint, net_balance);
     }
 
@@ -710,8 +698,7 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
 /// 2. compare_balances returns no mismatches
 /// 3. No webhook alert sent
 #[tokio::test(flavor = "multi_thread")]
-async fn test_e2e_reconciliation_success_no_alert(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_e2e_reconciliation_success_no_alert() -> Result<(), Box<dyn std::error::Error>> {
     // ── Step 1: Set up database ────────────────────────────────────────────────
 
     let (pool, storage, _pg) = start_postgres().await?;
@@ -742,7 +729,7 @@ async fn test_e2e_reconciliation_success_no_alert(
             .mint_address
             .parse::<Pubkey>()
             .expect("valid mint");
-        let net_balance = balance_result.total_deposits - balance_result.total_withdrawals;
+        let net_balance = (balance_result.total_deposits - balance_result.total_withdrawals) as u64;
         db_balances.insert(mint_key, net_balance);
     }
 
@@ -757,11 +744,7 @@ async fn test_e2e_reconciliation_success_no_alert(
     let mismatches = compare_balances(&on_chain_balances, &db_balances, tolerance_bps);
 
     // Should have NO mismatches
-    assert_eq!(
-        mismatches.len(),
-        0,
-        "exact match should have no mismatches"
-    );
+    assert_eq!(mismatches.len(), 0, "exact match should have no mismatches");
 
     // ── Step 5: Verify no webhook sent ────────────────────────────────────────
 

@@ -90,7 +90,11 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
         .mint_authority(authority.pubkey())
         .token_program(spl_token::id())
         .amount(amount);
-    let builder_with_id = MintToBuilderWithTxnId { builder, txn_id };
+    let builder_with_id = MintToBuilderWithTxnId {
+        builder,
+        txn_id,
+        trace_id: "mint-idempotency-test".to_string(),
+    };
 
     let result = find_existing_mint_signature(&rpc_client, &builder_with_id)
         .await
@@ -108,6 +112,7 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
     let builder_with_wrong_id = MintToBuilderWithTxnId {
         builder: builder2,
         txn_id: 999,
+        trace_id: "mint-idempotency-test".to_string(),
     };
 
     let result2 = find_existing_mint_signature(&rpc_client, &builder_with_wrong_id)
@@ -126,6 +131,7 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
     let builder_wrong_amount = MintToBuilderWithTxnId {
         builder: builder3,
         txn_id,
+        trace_id: "mint-idempotency-test".to_string(),
     };
 
     let result3 = find_existing_mint_signature(&rpc_client, &builder_wrong_amount)

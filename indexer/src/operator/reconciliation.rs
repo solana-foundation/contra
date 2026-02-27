@@ -14,8 +14,7 @@ use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
-use chrono;
-use serde_json;
+use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
@@ -23,9 +22,13 @@ use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
+const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
+const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs periodic escrow balance reconciliation checks
 ///
@@ -52,6 +55,12 @@ pub async fn run_reconciliation(
         config.reconciliation_tolerance_bps
     );
 
+    let webhook_client = WebhookClient::new(
+        WEBHOOK_TIMEOUT,
+        WebhookRetryConfig::new(WEBHOOK_MAX_ATTEMPTS, WEBHOOK_BASE_DELAY, WEBHOOK_MAX_DELAY),
+    )
+    .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
+
     loop {
         // Check for cancellation
         if cancellation_token.is_cancelled() {
@@ -60,7 +69,14 @@ pub async fn run_reconciliation(
         }
 
         // Perform reconciliation check
-        match perform_reconciliation_check(&storage, &config, &rpc_client, escrow_instance_id).await
+        match perform_reconciliation_check(
+            &storage,
+            &config,
+            &rpc_client,
+            escrow_instance_id,
+            &webhook_client,
+        )
+        .await
         {
             Ok(_) => {
                 // Reconciliation check completed successfully
@@ -96,6 +112,7 @@ async fn perform_reconciliation_check(
     config: &OperatorConfig,
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    webhook_client: &WebhookClient,
 ) -> Result<(), OperatorError> {
     // Step 1: Fetch on-chain balances from Solana RPC
     let on_chain_balances = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
@@ -156,7 +173,12 @@ async fn perform_reconciliation_check(
             );
         }
 
-        send_webhook_alert(&config.reconciliation_webhook_url, &mismatches).await?;
+        send_webhook_alert(
+            &config.reconciliation_webhook_url,
+            &mismatches,
+            webhook_client,
+        )
+        .await?;
     } else {
         info!("Balance reconciliation successful: all mints within tolerance");
     }
@@ -306,12 +328,6 @@ async fn fetch_on_chain_balances(
     Ok(balances)
 }
 
-/// Configuration for webhook retry behavior
-const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
-const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
-const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
-const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Sends webhook alerts for balance mismatches with retry logic
 ///
 /// Posts each mismatch to the configured webhook URL as a JSON payload with the format:
@@ -331,6 +347,7 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// # Arguments
 /// * `webhook_url` - Optional webhook URL to POST alerts to
 /// * `mismatches` - Slice of balance mismatches to alert on
+/// * `webhook_client` - Shared webhook client for HTTP delivery
 ///
 /// # Returns
 /// * `Ok(())` if all webhooks sent successfully (or no URL configured)
@@ -338,6 +355,7 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn send_webhook_alert(
     webhook_url: &Option<String>,
     mismatches: &[BalanceMismatch],
+    webhook_client: &WebhookClient,
 ) -> Result<(), OperatorError> {
     // If no webhook URL configured, log and return early
     let url = match webhook_url {
@@ -355,77 +373,40 @@ pub async fn send_webhook_alert(
 
     // Send alert for each mismatch
     for mismatch in mismatches {
-        send_single_webhook_alert(url, mismatch).await?;
+        let payload = serde_json::json!({
+            "mint": mismatch.mint.to_string(),
+            "on_chain_balance": mismatch.on_chain_balance,
+            "db_balance": mismatch.db_balance,
+            "delta_bps": mismatch.delta_bps,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+
+        let context = format!("mint {} (delta {} bps)", mismatch.mint, mismatch.delta_bps);
+
+        webhook_client
+            .post_json(url, &payload, &context)
+            .await
+            .map_err(|error| {
+                error!(
+                    "Failed to send webhook alert after {} attempts for mint {}: {}",
+                    error.attempts(),
+                    mismatch.mint,
+                    error.message()
+                );
+                OperatorError::WebhookError(format!(
+                    "Failed to send webhook alert after {} attempts: {}",
+                    error.attempts(),
+                    error.message()
+                ))
+            })?;
+
+        info!(
+            "Webhook alert sent for mint {} (delta: {} bps)",
+            mismatch.mint, mismatch.delta_bps
+        );
     }
 
     Ok(())
-}
-
-/// Sends a single webhook alert with retry logic
-///
-/// Implements exponential backoff with configurable retry attempts.
-/// Logs warnings on failed attempts and errors on final failure.
-async fn send_single_webhook_alert(
-    url: &str,
-    mismatch: &BalanceMismatch,
-) -> Result<(), OperatorError> {
-    let client = reqwest::Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
-        .build()
-        .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
-
-    // Prepare JSON payload
-    let payload = serde_json::json!({
-        "mint": mismatch.mint.to_string(),
-        "on_chain_balance": mismatch.on_chain_balance,
-        "db_balance": mismatch.db_balance,
-        "delta_bps": mismatch.delta_bps,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
-    let mut attempts = 0;
-
-    loop {
-        attempts += 1;
-
-        let last_error = match client.post(url).json(&payload).send().await {
-            Ok(response) if response.status().is_success() => {
-                info!(
-                    "Webhook alert sent for mint {} (delta: {} bps)",
-                    mismatch.mint, mismatch.delta_bps
-                );
-                return Ok(());
-            }
-            Ok(response) => format!(
-                "HTTP {}: {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            ),
-            Err(e) => format!("Request failed: {}", e),
-        };
-
-        if attempts >= WEBHOOK_MAX_ATTEMPTS {
-            error!(
-                "Failed to send webhook alert after {} attempts for mint {}: {}",
-                attempts, mismatch.mint, last_error
-            );
-            return Err(OperatorError::WebhookError(format!(
-                "Failed to send webhook alert after {} attempts: {}",
-                attempts, last_error
-            )));
-        }
-
-        // Exponential backoff with capped delay
-        let delay = WEBHOOK_BASE_DELAY * 2_u32.pow(attempts - 1);
-        let delay = delay.min(WEBHOOK_MAX_DELAY);
-
-        warn!(
-            "Webhook alert attempt {} failed for mint {}, retrying in {:?}: {}",
-            attempts, mismatch.mint, delay, last_error
-        );
-
-        sleep(delay).await;
-    }
 }
 
 #[cfg(test)]
@@ -438,7 +419,7 @@ mod tests {
         // This test verifies that the fetch_on_chain_balances function exists and compiles
         // Integration testing with a real RPC client would require a test validator
         // and is better suited for integration tests rather than unit tests
-        assert!(true, "fetch_on_chain_balances function compiles");
+        let _function = fetch_on_chain_balances;
     }
 
     #[test]
@@ -694,6 +675,14 @@ mod tests {
         assert_eq!(mismatches.len(), 0);
     }
 
+    fn test_webhook_client() -> WebhookClient {
+        WebhookClient::new(
+            Duration::from_secs(10),
+            WebhookRetryConfig::new(3, Duration::from_millis(500), Duration::from_secs(5)),
+        )
+        .expect("test webhook client")
+    }
+
     #[tokio::test]
     async fn test_send_webhook_alert_no_url() {
         // Test with no webhook URL configured - should not fail
@@ -705,7 +694,8 @@ mod tests {
             delta_bps: 1000,
         }];
 
-        let result = send_webhook_alert(&None, &mismatches).await;
+        let client = test_webhook_client();
+        let result = send_webhook_alert(&None, &mismatches, &client).await;
         assert!(
             result.is_ok(),
             "Should succeed when no webhook URL configured"
@@ -718,7 +708,8 @@ mod tests {
         let webhook_url = Some("http://example.com/webhook".to_string());
         let mismatches: Vec<BalanceMismatch> = vec![];
 
-        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        let client = test_webhook_client();
+        let result = send_webhook_alert(&webhook_url, &mismatches, &client).await;
         assert!(result.is_ok(), "Should succeed with empty mismatches");
     }
 
@@ -742,7 +733,8 @@ mod tests {
             delta_bps: 1000,
         }];
 
-        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        let client = test_webhook_client();
+        let result = send_webhook_alert(&webhook_url, &mismatches, &client).await;
         assert!(result.is_ok(), "Should successfully send webhook");
 
         mock.assert_async().await;
@@ -778,7 +770,8 @@ mod tests {
             delta_bps: 1000,
         }];
 
-        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        let client = test_webhook_client();
+        let result = send_webhook_alert(&webhook_url, &mismatches, &client).await;
         assert!(result.is_ok(), "Should succeed after retry");
 
         mock_fail.assert_async().await;
@@ -807,7 +800,8 @@ mod tests {
             delta_bps: 1000,
         }];
 
-        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        let client = test_webhook_client();
+        let result = send_webhook_alert(&webhook_url, &mismatches, &client).await;
         assert!(result.is_err(), "Should fail after max retries");
         assert!(
             matches!(result.unwrap_err(), OperatorError::WebhookError(_)),
@@ -847,7 +841,8 @@ mod tests {
             },
         ];
 
-        let result = send_webhook_alert(&webhook_url, &mismatches).await;
+        let client = test_webhook_client();
+        let result = send_webhook_alert(&webhook_url, &mismatches, &client).await;
         assert!(result.is_ok(), "Should successfully send all webhooks");
 
         mock.assert_async().await;

@@ -54,6 +54,7 @@ pub async fn generate_mint(
     Ok(mint.pubkey())
 }
 
+#[allow(dead_code)]
 pub async fn mint_to_owner(
     client: &RpcClient,
     payer: &Keypair,

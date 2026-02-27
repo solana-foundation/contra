@@ -8,6 +8,7 @@
 //!
 //! Uses testcontainers for isolated Postgres instances and mockito for webhook server.
 
+use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
 use contra_indexer::{
     config::OperatorConfig,
     operator::reconciliation::{compare_balances, send_webhook_alert},
@@ -666,7 +667,7 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
             r#"{{"mint":"{}","on_chain_balance":1800000,"db_balance":2000000,"delta_bps":{},"timestamp":"#,
             mint2,
             mismatch.delta_bps
-        ).into()))
+        )))
         .with_status(200)
         .create_async()
         .await;
@@ -674,7 +675,12 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
     // ── Step 6: Send webhook alert ─────────────────────────────────────────────
 
     let webhook_url = Some(webhook_server.url());
-    let result = send_webhook_alert(&webhook_url, &mismatches).await;
+    let webhook_client = WebhookClient::new(
+        Duration::from_secs(10),
+        WebhookRetryConfig::new(3, Duration::from_millis(500), Duration::from_secs(5)),
+    )
+    .expect("webhook client");
+    let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
 
     // Verify webhook was sent successfully
     assert!(
@@ -758,7 +764,12 @@ async fn test_e2e_reconciliation_success_no_alert() -> Result<(), Box<dyn std::e
         .await;
 
     let webhook_url = Some(webhook_server.url());
-    let result = send_webhook_alert(&webhook_url, &mismatches).await;
+    let webhook_client = WebhookClient::new(
+        Duration::from_secs(10),
+        WebhookRetryConfig::new(3, Duration::from_millis(500), Duration::from_secs(5)),
+    )
+    .expect("webhook client");
+    let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
 
     assert!(result.is_ok(), "send_webhook_alert should succeed");
 

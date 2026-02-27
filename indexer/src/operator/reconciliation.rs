@@ -25,6 +25,11 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
+const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
+const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Runs periodic escrow balance reconciliation checks
 ///
 /// Validates that on-chain escrow holdings equal total user liabilities in the database.
@@ -49,11 +54,6 @@ pub async fn run_reconciliation(
         "Tolerance threshold: {} basis points",
         config.reconciliation_tolerance_bps
     );
-
-    const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
-    const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
-    const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
-    const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
     let webhook_client = WebhookClient::new(
         WEBHOOK_TIMEOUT,

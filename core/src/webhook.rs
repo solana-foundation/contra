@@ -8,9 +8,9 @@ use tracing::warn;
 /// Retry and timeout configuration for webhook delivery.
 #[derive(Debug, Clone, Copy)]
 pub struct WebhookRetryConfig {
-    pub max_attempts: u32,
-    pub base_delay: Duration,
-    pub max_delay: Duration,
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
 }
 
 impl WebhookRetryConfig {
@@ -24,6 +24,18 @@ impl WebhookRetryConfig {
 
     pub fn single_attempt() -> Self {
         Self::new(1, Duration::ZERO, Duration::ZERO)
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    pub fn base_delay(&self) -> Duration {
+        self.base_delay
+    }
+
+    pub fn max_delay(&self) -> Duration {
+        self.max_delay
     }
 
     fn retry_delay(&self, attempts: u32) -> Duration {
@@ -143,6 +155,6 @@ mod tests {
     #[test]
     fn retry_config_clamps_attempts_to_one() {
         let config = WebhookRetryConfig::new(0, Duration::from_millis(10), Duration::from_secs(1));
-        assert_eq!(config.max_attempts, 1);
+        assert_eq!(config.max_attempts(), 1);
     }
 }

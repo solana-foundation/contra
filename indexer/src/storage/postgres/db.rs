@@ -58,6 +58,11 @@ impl PostgresDb {
     }
 
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
+        // Ensure pgcrypto is available for gen_random_uuid()
+        sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#)
+            .execute(&self.pool)
+            .await?;
+
         // Create enum type for transaction status
         sqlx::query(
             r#"

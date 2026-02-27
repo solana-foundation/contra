@@ -251,7 +251,7 @@ async fn test_write_batch_process_kill_simulation() {
     // The bytes content doesn't matter here — we're only asserting these rows
     // are absent after the connection is killed, not reading their values back.
     let pubkey_slot2 = Pubkey::new_unique();
-    let dummy_bytes = vec![0u8; 32];
+    let dummy_bytes = [0u8; 32];
 
     sqlx::query("INSERT INTO accounts (pubkey, data) VALUES ($1, $2)")
         .bind(&pubkey_slot2.to_bytes()[..])

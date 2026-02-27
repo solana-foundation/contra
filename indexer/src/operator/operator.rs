@@ -87,7 +87,8 @@ pub async fn run(
 
     // Start storage writer task (receives updates from sender)
     let writer_storage = storage.clone();
-    let storage_writer = DbTransactionWriter::new(writer_storage, storage_rx);
+    let storage_writer =
+        DbTransactionWriter::new(writer_storage, storage_rx, config.alert_webhook_url.clone());
     let storage_writer_handle = tokio::spawn(async move {
         if let Err(e) = storage_writer.start().await {
             tracing::error!("Storage writer error: {}", e);

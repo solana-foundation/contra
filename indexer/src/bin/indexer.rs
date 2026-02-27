@@ -349,6 +349,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         rpc_commitment: operator
             .rpc_commitment
             .unwrap_or(CommitmentLevel::Confirmed),
+        alert_webhook_url: std::env::var("ALERT_WEBHOOK").ok(),
     };
 
     // Validate signer configuration early (from environment variables)

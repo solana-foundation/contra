@@ -57,6 +57,7 @@ pub async fn start_l1_to_contra_operator(
         retry_base_delay: Duration::from_secs(1),
         channel_buffer_size: 100,
         rpc_commitment: CommitmentLevel::Confirmed,
+        alert_webhook_url: None,
     };
 
     // Set up environment variables for the operator signer
@@ -115,6 +116,7 @@ pub async fn start_contra_to_l1_operator(
         retry_base_delay: Duration::from_secs(1),
         channel_buffer_size: 100,
         rpc_commitment: CommitmentLevel::Confirmed,
+        alert_webhook_url: None,
     };
 
     // Set up environment variables for the operator signer

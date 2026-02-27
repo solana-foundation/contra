@@ -406,11 +406,22 @@ async fn run_resync(
         .rpc_url
         .clone()
         .unwrap_or_else(|| common.rpc_url.clone());
+    let rpc_encoding = indexer
+        .rpc_polling
+        .as_ref()
+        .and_then(|rpc| rpc.encoding)
+        .unwrap_or(UiTransactionEncoding::Json);
+    let rpc_commitment = indexer
+        .rpc_polling
+        .as_ref()
+        .and_then(|rpc| rpc.commitment)
+        .unwrap_or(CommitmentLevel::Finalized);
 
     let rpc_poller = Arc::new(
         contra_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(
             rpc_url,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            rpc_encoding,
+            rpc_commitment,
         ),
     );
 

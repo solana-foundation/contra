@@ -116,11 +116,7 @@ impl ResyncService {
             }));
         }
 
-        let total_slots = if current_slot > genesis_slot {
-            current_slot - genesis_slot
-        } else {
-            0
-        };
+        let total_slots = current_slot.saturating_sub(genesis_slot);
 
         info!(
             "Starting backfill from slot {} to slot {} ({} slots to process)...",

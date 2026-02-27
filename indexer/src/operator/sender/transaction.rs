@@ -10,13 +10,15 @@ use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
     cleanup_mint_builder, find_existing_mint_signature, try_jit_mint_initialization,
 };
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
-use super::types::{InstructionWithSigners, SenderState, TransactionStatusUpdate};
+use super::types::{
+    InstructionWithSigners, SenderState, TransactionContext, TransactionStatusUpdate,
+};
 
 impl SenderState {
     /// Handle incoming transaction builder (either ReleaseFunds or Mint)
@@ -127,99 +129,104 @@ pub async fn handle_transaction_submission(
     tx_builder: TransactionBuilder,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    let transaction_id = tx_builder.transaction_id();
-    let withdrawal_nonce = tx_builder.withdrawal_nonce();
+    let ctx = TransactionContext {
+        transaction_id: tx_builder.transaction_id(),
+        withdrawal_nonce: tx_builder.withdrawal_nonce(),
+        trace_id: tx_builder.trace_id(),
+    };
     let retry_policy = tx_builder.retry_policy();
     let compute_unit_price = tx_builder.compute_unit_price();
     let extra_error_checks_policy = &tx_builder.extra_error_checks_policy();
 
-    if let TransactionBuilder::Mint(builder_with_txn_id) = &tx_builder {
-        match find_existing_mint_signature(&state.rpc_client, builder_with_txn_id).await {
-            Ok(Some(existing_signature)) => {
-                handle_success(
+    let span = info_span!(
+        "tx",
+        trace_id = ctx.trace_id.as_deref().unwrap_or("none"),
+        nonce = ctx.withdrawal_nonce.map(|n| n as i64),
+    );
+
+    async {
+        if let TransactionBuilder::Mint(builder_with_txn_id) = &tx_builder {
+            match find_existing_mint_signature(&state.rpc_client, builder_with_txn_id).await {
+                Ok(Some(existing_signature)) => {
+                    handle_success(state, &ctx, existing_signature, storage_tx).await;
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    error!(
+                        "Mint idempotency lookup failed for transaction_id {}: {}",
+                        builder_with_txn_id.txn_id, e
+                    );
+                    send_fatal_error(storage_tx, &ctx, &e).await;
+                    return;
+                }
+            }
+        }
+
+        match state.handle_transaction_builder(tx_builder.clone()).await {
+            Ok(instruction) => {
+                info!("Transaction instruction ready for submission");
+                send_and_confirm(
                     state,
-                    Some(builder_with_txn_id.txn_id),
-                    None,
-                    existing_signature,
+                    instruction,
+                    compute_unit_price,
+                    &ctx,
+                    retry_policy,
+                    extra_error_checks_policy,
                     storage_tx,
                 )
                 .await;
-                return;
             }
-            Ok(None) => {}
-            Err(e) => {
-                error!(
-                    "Mint idempotency lookup failed for transaction_id {}: {}",
-                    builder_with_txn_id.txn_id, e
-                );
-                send_fatal_error(storage_tx, Some(builder_with_txn_id.txn_id), &e).await;
-                return;
-            }
-        }
-    }
-
-    match state.handle_transaction_builder(tx_builder.clone()).await {
-        Ok(instruction) => {
-            info!("Transaction instruction ready for submission");
-            send_and_confirm(
-                state,
-                instruction,
-                compute_unit_price,
-                transaction_id,
-                withdrawal_nonce,
-                retry_policy,
-                extra_error_checks_policy,
-                storage_tx,
-            )
-            .await;
-        }
-        Err(OperatorError::Program(ProgramError::RotationPending { in_flight_count })) => {
-            info!(
-                "Rotation pending, waiting for {} in-flight txs to settle",
-                in_flight_count
-            );
-            // ResetSmtRoot is queued in pending_rotation, will be processed when ready
-        }
-        Err(OperatorError::Program(ProgramError::TreeIndexMismatch {
-            nonce,
-            expected_tree_index,
-            current_tree_index,
-        })) => {
-            if let TransactionBuilder::ReleaseFunds(builder_with_nonce) = tx_builder {
+            Err(OperatorError::Program(ProgramError::RotationPending { in_flight_count })) => {
                 info!(
-                    "Tree index mismatch: nonce {} expects {} but current is {} - queuing for retry",
-                    nonce, expected_tree_index, current_tree_index
+                    "Rotation pending, waiting for {} in-flight txs to settle",
+                    in_flight_count
                 );
-                state.rotation_retry_queue.push((
-                    nonce,
-                    builder_with_nonce.transaction_id,
-                    builder_with_nonce.builder,
-                ));
-            } else {
-                error!("TreeIndexMismatch for non-ReleaseFunds transaction");
+            }
+            Err(OperatorError::Program(ProgramError::TreeIndexMismatch {
+                nonce,
+                expected_tree_index,
+                current_tree_index,
+            })) => {
+                if let TransactionBuilder::ReleaseFunds(builder_with_nonce) = tx_builder {
+                    info!(
+                        "Tree index mismatch: nonce {} expects {} but current is {} - queuing for retry",
+                        nonce, expected_tree_index, current_tree_index
+                    );
+                    state.rotation_retry_queue.push((
+                        TransactionContext {
+                            transaction_id: Some(builder_with_nonce.transaction_id),
+                            withdrawal_nonce: Some(builder_with_nonce.nonce),
+                            trace_id: Some(builder_with_nonce.trace_id),
+                        },
+                        builder_with_nonce.builder,
+                    ));
+                } else {
+                    error!("TreeIndexMismatch for non-ReleaseFunds transaction");
+                }
+            }
+            Err(e) => {
+                error!("Failed to build transaction: {}", e);
+                send_fatal_error(storage_tx, &ctx, &e.to_string()).await;
             }
         }
-        Err(e) => {
-            error!("Failed to build transaction: {}", e);
-            send_fatal_error(storage_tx, transaction_id, &e.to_string()).await;
-        }
     }
+    .instrument(span)
+    .await;
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Sign, send, confirm, and handle the result
 pub(super) async fn send_and_confirm(
     state: &mut SenderState,
     instruction: InstructionWithSigners,
     compute_unit_price: Option<u64>,
-    transaction_id: Option<i64>,
-    withdrawal_nonce: Option<u64>,
+    ctx: &TransactionContext,
     retry_policy: RetryPolicy,
     extra_error_checks_policy: &ExtraErrorCheckPolicy,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     // Check retry limit - only for idempotent operations that can be retried at sender level
-    if let Some(nonce) = withdrawal_nonce {
+    if let Some(nonce) = ctx.withdrawal_nonce {
         match retry_policy {
             RetryPolicy::Idempotent => {
                 let attempts = state.retry_counts.get(&nonce).copied().unwrap_or(0);
@@ -228,7 +235,7 @@ pub(super) async fn send_and_confirm(
                         "Max retries ({}) exceeded for withdrawal_nonce {}",
                         state.retry_max_attempts, nonce
                     );
-                    send_fatal_error(storage_tx, transaction_id, "Max retries exceeded").await;
+                    send_fatal_error(storage_tx, ctx, "Max retries exceeded").await;
                     return;
                 }
                 state.retry_counts.insert(nonce, attempts + 1);
@@ -240,8 +247,6 @@ pub(super) async fn send_and_confirm(
                 );
             }
             RetryPolicy::None => {
-                // Non-idempotent operations: only one attempt at sender level
-                // (RPC layer may retry the same transaction, which is safe)
                 info!("Sending non-idempotent transaction - single sender-level attempt");
             }
         }
@@ -255,7 +260,6 @@ pub(super) async fn send_and_confirm(
 
             let commitment_config = CommitmentConfig::confirmed();
 
-            // Retry logic (line 627) handles polling via recursive send_and_confirm calls
             let result = check_transaction_status(
                 state.rpc_client.clone(),
                 &signature,
@@ -269,8 +273,7 @@ pub(super) async fn send_and_confirm(
                 result,
                 signature,
                 compute_unit_price,
-                transaction_id,
-                withdrawal_nonce,
+                ctx,
                 instruction,
                 retry_policy,
                 extra_error_checks_policy,
@@ -280,21 +283,19 @@ pub(super) async fn send_and_confirm(
         }
         Err(e) => {
             error!("Failed to send transaction: {}", e);
-            cleanup_failed_transaction(state, withdrawal_nonce);
-            send_fatal_error(storage_tx, transaction_id, &e.to_string()).await;
+            cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+            send_fatal_error(storage_tx, ctx, &e.to_string()).await;
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Route confirmation results to appropriate handlers
 fn handle_confirmation_result<'a>(
     state: &'a mut SenderState,
     result: Result<ConfirmationResult, crate::error::TransactionError>,
     signature: Signature,
     compute_unit_price: Option<u64>,
-    transaction_id: Option<i64>,
-    withdrawal_nonce: Option<u64>,
+    ctx: &'a TransactionContext,
     instruction: InstructionWithSigners,
     retry_policy: RetryPolicy,
     extra_error_checks_policy: &'a ExtraErrorCheckPolicy,
@@ -303,52 +304,42 @@ fn handle_confirmation_result<'a>(
     Box::pin(async move {
         match result {
             Ok(ConfirmationResult::Confirmed) => {
-                handle_success(
-                    state,
-                    transaction_id,
-                    withdrawal_nonce,
-                    signature,
-                    storage_tx,
-                )
-                .await;
+                handle_success(state, ctx, signature, storage_tx).await;
             }
             Ok(ConfirmationResult::Failed(Some(ContraEscrowProgramError::InvalidSmtProof))) => {
                 warn!("InvalidSmtProof - removing nonce and rebuilding with fresh proof");
-                // Remove nonce from SMT so rebuild can re-insert with fresh proof
                 if let (Some(nonce), Some(ref mut smt_state)) =
-                    (withdrawal_nonce, state.smt_state.as_mut())
+                    (ctx.withdrawal_nonce, state.smt_state.as_mut())
                 {
                     smt_state.smt_state.remove_nonce(nonce);
                 }
                 if let Some(new_instruction) =
-                    rebuild_with_regenerated_proof(state, withdrawal_nonce, instruction).await
+                    rebuild_with_regenerated_proof(state, ctx.withdrawal_nonce, instruction).await
                 {
                     send_and_confirm(
                         state,
                         new_instruction,
                         compute_unit_price,
-                        transaction_id,
-                        withdrawal_nonce,
+                        ctx,
                         retry_policy,
                         extra_error_checks_policy,
                         storage_tx,
                     )
                     .await;
                 } else {
-                    cleanup_failed_transaction(state, withdrawal_nonce);
-                    send_fatal_error(storage_tx, transaction_id, "Failed to rebuild proof").await;
+                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                    send_fatal_error(storage_tx, ctx, "Failed to rebuild proof").await;
                 }
             }
             Ok(ConfirmationResult::Failed(Some(
                 ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
             ))) => {
                 error!("InvalidTransactionNonce - fatal error");
-                cleanup_failed_transaction(state, withdrawal_nonce);
-                send_fatal_error(storage_tx, transaction_id, "Invalid nonce for tree index").await;
+                cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                send_fatal_error(storage_tx, ctx, "Invalid nonce for tree index").await;
             }
             Ok(ConfirmationResult::MintNotInitialized) => {
-                // Mint account not initialized - attempt JIT initialization
-                if let Some(txn_id) = transaction_id {
+                if let Some(txn_id) = ctx.transaction_id {
                     if state.mint_builders.contains_key(&txn_id) {
                         warn!("Mint account not initialized - attempting JIT initialization");
 
@@ -360,81 +351,61 @@ fn handle_confirmation_result<'a>(
                                 state,
                                 new_instruction,
                                 compute_unit_price,
-                                transaction_id,
-                                withdrawal_nonce,
+                                ctx,
                                 retry_policy,
                                 extra_error_checks_policy,
                                 storage_tx,
                             )
                             .await;
                         } else {
-                            // JIT failed - fatal error
-                            cleanup_failed_transaction(state, withdrawal_nonce);
-                            send_fatal_error(
-                                storage_tx,
-                                transaction_id,
-                                "Mint initialization failed",
-                            )
-                            .await;
+                            cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                            send_fatal_error(storage_tx, ctx, "Mint initialization failed").await;
                         }
                     } else {
-                        // Not a Mint transaction but got MintNotInitialized - shouldn't happen
                         error!("MintNotInitialized error for non-Mint transaction");
-                        cleanup_failed_transaction(state, withdrawal_nonce);
-                        send_fatal_error(storage_tx, transaction_id, "Unexpected mint error").await;
+                        cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                        send_fatal_error(storage_tx, ctx, "Unexpected mint error").await;
                     }
                 } else {
-                    // No transaction_id - fatal error
                     error!("MintNotInitialized error without transaction_id");
-                    cleanup_failed_transaction(state, withdrawal_nonce);
-                    send_fatal_error(storage_tx, transaction_id, "Mint initialization failed")
-                        .await;
+                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                    send_fatal_error(storage_tx, ctx, "Mint initialization failed").await;
                 }
             }
-            Ok(ConfirmationResult::Retry) => {
-                // Transaction was sent but confirmation polling failed
-                // (either single timeout or exhausted all retry attempts)
-                // Status is UNKNOWN - transaction might still be processing on-chain
-                match retry_policy {
-                    RetryPolicy::None => {
-                        // Non-idempotent operations: Cannot safely retry because transaction
-                        // might still be processing.
-                        error!("Confirmation failed for non-idempotent operation - status unknown, cannot retry");
-                        cleanup_failed_transaction(state, withdrawal_nonce);
-                        send_fatal_error(
-                            storage_tx,
-                            transaction_id,
-                            "Confirmation failed - transaction status unknown, unsafe to retry",
-                        )
-                        .await;
-                    }
-                    RetryPolicy::Idempotent => {
-                        // Idempotent operations: Safe to retry because nonce prevents duplicates
-                        // even if the original transaction eventually processes
-                        warn!("Confirmation failed for idempotent operation - retrying (nonce protects against duplicates)");
-                        send_and_confirm(
-                            state,
-                            instruction,
-                            compute_unit_price,
-                            transaction_id,
-                            withdrawal_nonce,
-                            retry_policy,
-                            extra_error_checks_policy,
-                            storage_tx,
-                        )
-                        .await;
-                    }
+            Ok(ConfirmationResult::Retry) => match retry_policy {
+                RetryPolicy::None => {
+                    error!("Confirmation failed for non-idempotent operation - status unknown, cannot retry");
+                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                    send_fatal_error(
+                        storage_tx,
+                        ctx,
+                        "Confirmation failed - transaction status unknown, unsafe to retry",
+                    )
+                    .await;
                 }
-            }
+                RetryPolicy::Idempotent => {
+                    warn!("Confirmation failed for idempotent operation - retrying (nonce protects against duplicates)");
+                    send_and_confirm(
+                        state,
+                        instruction,
+                        compute_unit_price,
+                        ctx,
+                        retry_policy,
+                        extra_error_checks_policy,
+                        storage_tx,
+                    )
+                    .await;
+                }
+            },
             Ok(ConfirmationResult::Failed(program_error)) => {
                 error!("Other program error: {:?}", program_error);
-                cleanup_failed_transaction(state, withdrawal_nonce);
-                send_fatal_error(storage_tx, transaction_id, &format!("{:?}", program_error)).await;
+                cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                send_fatal_error(storage_tx, ctx, &format!("{:?}", program_error)).await;
             }
             Err(e) => {
                 error!("Confirmation error: {}", e);
-                cleanup_failed_transaction(state, withdrawal_nonce);
-                send_fatal_error(storage_tx, transaction_id, &e.to_string()).await;
+                cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                send_fatal_error(storage_tx, ctx, &e.to_string()).await;
             }
         }
     })
@@ -443,25 +414,25 @@ fn handle_confirmation_result<'a>(
 /// Handle successful transaction confirmation
 pub(super) async fn handle_success(
     state: &mut SenderState,
-    transaction_id: Option<i64>,
-    withdrawal_nonce: Option<u64>,
+    ctx: &TransactionContext,
     signature: Signature,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    info!("✅ Transaction confirmed: {}", signature);
+    info!("Transaction confirmed: {}", signature);
 
     // Handle ReleaseFunds (withdrawal nonce-based) transactions
-    if let (Some(nonce), Some(ref mut smt_state)) = (withdrawal_nonce, state.smt_state.as_mut()) {
+    if let (Some(nonce), Some(ref mut smt_state)) = (ctx.withdrawal_nonce, state.smt_state.as_mut())
+    {
         smt_state.nonce_to_builder.remove(&nonce);
         state.retry_counts.remove(&nonce);
         info!("Cleaned up state for withdrawal_nonce {}", nonce);
 
-        // Send success to storage (using transaction_id for DB update)
-        if let Some(txn_id) = transaction_id {
+        if let Some(txn_id) = ctx.transaction_id {
             send_guaranteed(
                 storage_tx,
                 TransactionStatusUpdate {
                     transaction_id: txn_id,
+                    trace_id: ctx.trace_id.clone(),
                     status: TransactionStatus::Completed,
                     counterpart_signature: Some(signature.to_string()),
                     processed_at: Some(Utc::now()),
@@ -474,16 +445,16 @@ pub(super) async fn handle_success(
         }
     }
     // Handle Mint (transaction_id-based) transactions
-    else if let Some(transaction_id) = transaction_id {
+    else if let Some(transaction_id) = ctx.transaction_id {
         info!("Updating database for transaction_id {}", transaction_id);
 
         cleanup_mint_builder(state, Some(transaction_id));
 
-        // Send success to storage
         send_guaranteed(
             storage_tx,
             TransactionStatusUpdate {
                 transaction_id,
+                trace_id: ctx.trace_id.clone(),
                 status: TransactionStatus::Completed,
                 counterpart_signature: Some(signature.to_string()),
                 processed_at: Some(Utc::now()),
@@ -492,7 +463,7 @@ pub(super) async fn handle_success(
             "transaction status update",
         )
         .await
-        .ok(); // Log error but don't fail
+        .ok();
     }
     // Handle ResetSmtRoot (no transaction_id) - update local SMT tree index
     else if let Some(ref mut smt_state) = state.smt_state {
@@ -508,14 +479,15 @@ pub(super) async fn handle_success(
 /// Helper for fatal errors (Failed status, no signature)
 pub(super) async fn send_fatal_error(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-    transaction_id: Option<i64>,
+    ctx: &TransactionContext,
     error_msg: &str,
 ) {
-    if let Some(transaction_id) = transaction_id {
+    if let Some(transaction_id) = ctx.transaction_id {
         send_guaranteed(
             storage_tx,
             TransactionStatusUpdate {
                 transaction_id,
+                trace_id: ctx.trace_id.clone(),
                 status: TransactionStatus::Failed,
                 counterpart_signature: None,
                 processed_at: Some(Utc::now()),

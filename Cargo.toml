@@ -119,6 +119,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2.5.7"
+uuid = { version = "1", features = ["v4"] }
 yellowstone-grpc-client = "9.0.1"
 yellowstone-grpc-proto = { version = "9.0.1", features = ["convert"] }
 contra-core = { path = "core" }

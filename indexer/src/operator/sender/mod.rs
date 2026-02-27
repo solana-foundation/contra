@@ -81,10 +81,13 @@ pub async fn run_sender(
                 }
 
                 // Process any transactions that were blocked by rotation
-                while let Some((nonce, transaction_id, builder)) = state.rotation_retry_queue.pop() {
-                    info!("Retrying blocked nonce {} after rotation", nonce);
+                while let Some((ctx, builder)) = state.rotation_retry_queue.pop() {
+                    let nonce = ctx.withdrawal_nonce.expect("rotation retry must have nonce");
+                    let transaction_id = ctx.transaction_id.expect("rotation retry must have transaction_id");
+                    let trace_id = ctx.trace_id.expect("rotation retry must have trace_id");
+                    info!(trace_id = %trace_id, "Retrying blocked nonce {} after rotation", nonce);
                     let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(
-                        ReleaseFundsBuilderWithNonce { builder, nonce, transaction_id },
+                        ReleaseFundsBuilderWithNonce { builder, nonce, transaction_id, trace_id },
                     ));
                     handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
                 }

@@ -50,7 +50,7 @@ impl DbTransactionWriter {
     /// Handle a single transaction status update
     async fn handle_update(&self, update: TransactionStatusUpdate) {
         let is_failed = update.status == TransactionStatus::Failed;
-
+        let trace_id = update.trace_id.as_deref().unwrap_or("none");
         if let Err(e) = self
             .storage
             .update_transaction_status(
@@ -62,16 +62,16 @@ impl DbTransactionWriter {
             .await
         {
             error!(
-                "Failed to update transaction {} status: {}",
-                update.transaction_id, e
+                trace_id = trace_id,
+                "Failed to update transaction {} status: {}", update.transaction_id, e
             );
             if let Some(err_msg) = &update.error_message {
-                error!("Transaction error was: {}", err_msg);
+                error!(trace_id = trace_id, "Transaction error was: {}", err_msg);
             }
         } else {
             info!(
-                "Updated transaction {} to status {:?}",
-                update.transaction_id, update.status
+                trace_id = trace_id,
+                "Updated transaction {} to status {:?}", update.transaction_id, update.status
             );
         }
 
@@ -98,6 +98,7 @@ impl DbTransactionWriter {
 
         let payload = json!({
             "transaction_id": update.transaction_id,
+            "trace_id": update.trace_id.clone(),
             "status": "failed",
             "counterpart_signature": update.counterpart_signature.clone(),
             "error_message": update.error_message.clone(),
@@ -143,6 +144,7 @@ mod tests {
     fn create_test_update(status: TransactionStatus) -> TransactionStatusUpdate {
         TransactionStatusUpdate {
             transaction_id: 12345,
+            trace_id: Some("trace_test_123".to_string()),
             status,
             counterpart_signature: Some("test_signature_123".to_string()),
             error_message: Some("Test error message".to_string()),
@@ -210,6 +212,7 @@ mod tests {
             .match_header("content-type", "application/json")
             .match_body(mockito::Matcher::PartialJson(json!({
                 "transaction_id": 12345_i64,
+                "trace_id": "trace_test_123",
                 "status": "failed",
                 "counterpart_signature": "test_signature_123",
                 "error_message": "Test error message",

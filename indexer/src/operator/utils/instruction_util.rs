@@ -115,8 +115,15 @@ impl TransactionBuilder {
         }
     }
 
-    /// Get the withdrawal nonce for SMT/nonce-based operations
-    /// Returns nonce only for ReleaseFunds (withdrawal) transactions
+    pub fn trace_id(&self) -> Option<String> {
+        match self {
+            TransactionBuilder::ReleaseFunds(b) => Some(b.trace_id.clone()),
+            TransactionBuilder::Mint(b) => Some(b.trace_id.clone()),
+            TransactionBuilder::InitializeMint(_) => None,
+            TransactionBuilder::ResetSmtRoot(_) => None,
+        }
+    }
+
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
             TransactionBuilder::ReleaseFunds(builder) => Some(builder.nonce),
@@ -161,10 +168,9 @@ impl TransactionBuilder {
 #[derive(Clone, Debug)]
 pub struct ReleaseFundsBuilderWithNonce {
     pub builder: ReleaseFundsBuilder,
-    // Nonce is the transaction id but for withdrawals only
-    // So that deposits don't count for the SMT tree rotation
     pub nonce: u64,
     pub transaction_id: i64,
+    pub trace_id: String,
 }
 
 /// Builder for simple SPL token mint instructions (deposit flow)
@@ -330,10 +336,11 @@ impl MintToBuilder {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MintToBuilderWithTxnId {
     pub builder: MintToBuilder,
     pub txn_id: i64,
+    pub trace_id: String,
 }
 
 /// Builder for initialize_mint instruction (sent before first mint)

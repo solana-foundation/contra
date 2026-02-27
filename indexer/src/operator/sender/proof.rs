@@ -7,7 +7,7 @@ use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{error, info, warn};
 
-use super::types::{InstructionWithSigners, SenderSMTState, SenderState};
+use super::types::{InstructionWithSigners, SenderSMTState, SenderState, TransactionContext};
 
 impl SenderSMTState {
     pub(super) fn handle_release_funds_transaction(
@@ -20,6 +20,7 @@ impl SenderSMTState {
     ) -> Result<InstructionWithSigners, OperatorError> {
         let nonce = builder_with_nonce.nonce;
         let transaction_id = builder_with_nonce.transaction_id;
+        let trace_id = builder_with_nonce.trace_id;
         let mut builder = builder_with_nonce.builder;
 
         // Check if this nonce expects a different tree than current local tree
@@ -41,8 +42,12 @@ impl SenderSMTState {
         }
 
         // Store incomplete builder for potential retry
-        self.nonce_to_builder
-            .insert(nonce, (transaction_id, builder.clone()));
+        let ctx = TransactionContext {
+            transaction_id: Some(transaction_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(trace_id),
+        };
+        self.nonce_to_builder.insert(nonce, (ctx, builder.clone()));
 
         // Check if nonce already exists
         if self.smt_state.contains_nonce(nonce) {
@@ -123,7 +128,7 @@ pub(super) async fn rebuild_with_regenerated_proof(
         return None;
     };
 
-    let Some((transaction_id, builder)) = smt_state.nonce_to_builder.get(&nonce).cloned() else {
+    let Some((ctx, builder)) = smt_state.nonce_to_builder.get(&nonce).cloned() else {
         error!("No cached builder found for nonce {}", nonce);
         return None;
     };
@@ -136,7 +141,10 @@ pub(super) async fn rebuild_with_regenerated_proof(
     let builder_with_nonce = Box::new(ReleaseFundsBuilderWithNonce {
         builder,
         nonce,
-        transaction_id,
+        transaction_id: ctx
+            .transaction_id
+            .expect("rebuild must have transaction_id"),
+        trace_id: ctx.trace_id.expect("rebuild must have trace_id"),
     });
 
     match smt_state.handle_release_funds_transaction(

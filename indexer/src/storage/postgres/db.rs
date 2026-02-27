@@ -25,6 +25,7 @@ mod transaction_cols {
     pub const UPDATED_AT: &str = "updated_at";
     pub const PROCESSED_AT: &str = "processed_at";
     pub const COUNTERPART_SIGNATURE: &str = "counterpart_signature";
+    pub const TRACE_ID: &str = "trace_id";
 }
 
 #[derive(Clone)]
@@ -57,6 +58,11 @@ impl PostgresDb {
     }
 
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
+        // Ensure pgcrypto is available for gen_random_uuid()
+        sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#)
+            .execute(&self.pool)
+            .await?;
+
         // Create enum type for transaction status
         sqlx::query(
             r#"
@@ -102,7 +108,8 @@ impl PostgresDb {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 processed_at TIMESTAMPTZ,
-                counterpart_signature TEXT
+                counterpart_signature TEXT,
+                trace_id TEXT NOT NULL DEFAULT gen_random_uuid()::text
             );
             "#,
         )
@@ -139,6 +146,32 @@ impl PostgresDb {
         // Add unique index for signatures and counterpart_signature
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_signature ON transactions (signature)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Idempotent migration: add trace_id to existing databases
+        info!("Running trace_id migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS trace_id TEXT;
+                UPDATE transactions SET trace_id = gen_random_uuid()::text WHERE trace_id IS NULL;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'transactions' AND column_name = 'trace_id' AND is_nullable = 'YES'
+                ) THEN
+                    ALTER TABLE transactions ALTER COLUMN trace_id SET NOT NULL;
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("trace_id migration complete");
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -337,8 +370,8 @@ impl PostgresDb {
         let result: Option<(i64,)> = sqlx::query_as(&format!(
             r#"
             INSERT INTO transactions (
-                {}, {}, {}, {}, {}, {}, {}, {}, {}
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT ({}) DO NOTHING
             RETURNING {}
             "#,
@@ -351,6 +384,7 @@ impl PostgresDb {
             transaction_cols::MEMO,
             transaction_cols::TRANSACTION_TYPE,
             transaction_cols::STATUS,
+            transaction_cols::TRACE_ID,
             transaction_cols::SIGNATURE,
             transaction_cols::ID,
         ))
@@ -363,6 +397,7 @@ impl PostgresDb {
         .bind(&transaction.memo)
         .bind(transaction.transaction_type)
         .bind(transaction.status)
+        .bind(&transaction.trace_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -416,8 +451,8 @@ impl PostgresDb {
             let result: Option<(i64,)> = sqlx::query_as(&format!(
                 r#"
                 INSERT INTO transactions (
-                    {}, {}, {}, {}, {}, {}, {}, {}, {}
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT ({}) DO NOTHING
                 RETURNING {}
                 "#,
@@ -430,6 +465,7 @@ impl PostgresDb {
                 transaction_cols::MEMO,
                 transaction_cols::TRANSACTION_TYPE,
                 transaction_cols::STATUS,
+                transaction_cols::TRACE_ID,
                 transaction_cols::SIGNATURE,
                 transaction_cols::ID,
             ))
@@ -442,6 +478,7 @@ impl PostgresDb {
             .bind(&transaction.memo)
             .bind(transaction.transaction_type)
             .bind(transaction.status)
+            .bind(&transaction.trace_id)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -474,7 +511,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -482,6 +519,7 @@ impl PostgresDb {
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
             transaction_cols::SLOT,
             transaction_cols::INITIATOR,
             transaction_cols::RECIPIENT,
@@ -518,7 +556,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -526,6 +564,7 @@ impl PostgresDb {
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
             transaction_cols::SLOT,
             transaction_cols::INITIATOR,
             transaction_cols::RECIPIENT,
@@ -599,7 +638,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -608,6 +647,7 @@ impl PostgresDb {
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
             transaction_cols::SLOT,
             transaction_cols::INITIATOR,
             transaction_cols::RECIPIENT,

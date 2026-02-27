@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, info_span, Instrument};
 
 pub struct ProcessorState {
     pub admin_pubkey: Pubkey,
@@ -155,79 +155,93 @@ pub async fn process_release_funds(
         .ok_or(OperatorError::MissingBuilder)?;
 
     while let Some(transaction) = fetcher_rx.recv().await {
-        let nonce = transaction
-            .withdrawal_nonce
-            .expect("withdrawal transaction must have withdrawal_nonce") as u64;
+        let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
-        // Check if we need to rotate the tree before processing this transaction
-        if nonce > 0 && nonce.is_multiple_of(MAX_TREE_LEAVES as u64) {
-            info!("Tree rotation boundary detected at nonce {}", nonce);
+        async {
+            let nonce = transaction
+                .withdrawal_nonce
+                .expect("withdrawal transaction must have withdrawal_nonce")
+                as u64;
 
-            // Send ResetSmtRoot transaction BEFORE the boundary nonce
-            let mut rotation_builder = ResetSmtRootBuilder::new();
-            rotation_builder
+            // Check if we need to rotate the tree before processing this transaction
+            if nonce > 0 && nonce.is_multiple_of(MAX_TREE_LEAVES as u64) {
+                info!("Tree rotation boundary detected at nonce {}", nonce);
+
+                // Send ResetSmtRoot transaction BEFORE the boundary nonce
+                let mut rotation_builder = ResetSmtRootBuilder::new();
+                rotation_builder
+                    .payer(processor_state.admin_pubkey)
+                    .operator(release_funds_state.operator_pubkey)
+                    .instance(release_funds_state.instance_pda)
+                    .operator_pda(release_funds_state.operator_pda)
+                    .event_authority(release_funds_state.event_authority_pda);
+
+                let rotation_tx = TransactionBuilder::ResetSmtRoot(Box::new(rotation_builder));
+
+                send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
+                    .await
+                    .map_err(OperatorError::ChannelSend)?;
+
+                info!("Sent ResetSmtRoot transaction for tree rotation");
+            }
+
+            let mut builder = ReleaseFundsBuilder::new();
+
+            let mint =
+                Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+                    pubkey: transaction.mint.clone(),
+                    reason: e.to_string(),
+                })?;
+            let recipient = Pubkey::from_str(&transaction.recipient).map_err(|e| {
+                OperatorError::InvalidPubkey {
+                    pubkey: transaction.recipient.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+
+            // Fetch mint metadata from cache (or storage if not cached)
+            let mint_metadata = processor_state.mint_cache.get_mint_metadata(&mint).await?;
+            let token_program = mint_metadata.token_program;
+
+            let allowed_mint_pda = release_funds_state.get_allowed_mint_pda(&mint);
+            let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
+
+            let recipient_ata =
+                get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
+
+            // Sibling proofs and  New withdrawal root not set, will be set by sender
+            builder
                 .payer(processor_state.admin_pubkey)
                 .operator(release_funds_state.operator_pubkey)
                 .instance(release_funds_state.instance_pda)
                 .operator_pda(release_funds_state.operator_pda)
-                .event_authority(release_funds_state.event_authority_pda);
+                .mint(mint)
+                .allowed_mint(allowed_mint_pda)
+                .user_ata(recipient_ata)
+                .instance_ata(instance_ata)
+                .token_program(token_program)
+                .amount(transaction.amount as u64)
+                .user(recipient)
+                .transaction_nonce(nonce);
 
-            let rotation_tx = TransactionBuilder::ResetSmtRoot(Box::new(rotation_builder));
+            info!("Processing withdrawal");
 
-            send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
+            let wrapped =
+                TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
+                    builder,
+                    nonce,
+                    transaction_id: transaction.id,
+                    trace_id: transaction.trace_id.clone(),
+                }));
+
+            send_guaranteed(&sender_tx, wrapped, "processed release funds")
                 .await
                 .map_err(OperatorError::ChannelSend)?;
 
-            info!("Sent ResetSmtRoot transaction for tree rotation");
+            Ok::<(), OperatorError>(())
         }
-
-        let mut builder = ReleaseFundsBuilder::new();
-
-        let mint =
-            Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
-                pubkey: transaction.mint.clone(),
-                reason: e.to_string(),
-            })?;
-        let recipient =
-            Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
-                pubkey: transaction.recipient.clone(),
-                reason: e.to_string(),
-            })?;
-
-        // Fetch mint metadata from cache (or storage if not cached)
-        let mint_metadata = processor_state.mint_cache.get_mint_metadata(&mint).await?;
-        let token_program = mint_metadata.token_program;
-
-        let allowed_mint_pda = release_funds_state.get_allowed_mint_pda(&mint);
-        let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
-
-        let recipient_ata =
-            get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-
-        // Sibling proofs and  New withdrawal root not set, will be set by sender
-        builder
-            .payer(processor_state.admin_pubkey)
-            .operator(release_funds_state.operator_pubkey)
-            .instance(release_funds_state.instance_pda)
-            .operator_pda(release_funds_state.operator_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint_pda)
-            .user_ata(recipient_ata)
-            .instance_ata(instance_ata)
-            .token_program(token_program)
-            .amount(transaction.amount as u64)
-            .user(recipient)
-            .transaction_nonce(nonce);
-
-        let wrapped = TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
-            builder,
-            nonce,
-            transaction_id: transaction.id,
-        }));
-
-        send_guaranteed(&sender_tx, wrapped, "processed release funds")
-            .await
-            .map_err(OperatorError::ChannelSend)?;
+        .instrument(span)
+        .await?;
     }
 
     Ok(())
@@ -239,41 +253,53 @@ pub async fn process_deposit_funds(
     sender_tx: mpsc::Sender<TransactionBuilder>,
 ) -> Result<(), OperatorError> {
     while let Some(transaction) = fetcher_rx.recv().await {
-        let mint =
-            Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
-                pubkey: transaction.mint.clone(),
-                reason: e.to_string(),
+        let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
+
+        async {
+            let mint =
+                Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+                    pubkey: transaction.mint.clone(),
+                    reason: e.to_string(),
+                })?;
+            let recipient = Pubkey::from_str(&transaction.recipient).map_err(|e| {
+                OperatorError::InvalidPubkey {
+                    pubkey: transaction.recipient.clone(),
+                    reason: e.to_string(),
+                }
             })?;
-        let recipient =
-            Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
-                pubkey: transaction.recipient.clone(),
-                reason: e.to_string(),
-            })?;
 
-        let token_program = processor_state.mint_cache.get_contra_token_program();
+            let token_program = processor_state.mint_cache.get_contra_token_program();
 
-        let recipient_ata =
-            get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
+            let recipient_ata =
+                get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
 
-        let mut builder = MintToBuilder::new();
-        builder
-            .mint(mint)
-            .recipient(recipient)
-            .recipient_ata(recipient_ata)
-            .payer(processor_state.admin_pubkey)
-            .mint_authority(processor_state.admin_pubkey)
-            .token_program(token_program)
-            .amount(transaction.amount as u64)
-            .idempotency_memo(mint_idempotency_memo(transaction.id));
+            let mut builder = MintToBuilder::new();
+            builder
+                .mint(mint)
+                .recipient(recipient)
+                .recipient_ata(recipient_ata)
+                .payer(processor_state.admin_pubkey)
+                .mint_authority(processor_state.admin_pubkey)
+                .token_program(token_program)
+                .amount(transaction.amount as u64)
+                .idempotency_memo(mint_idempotency_memo(transaction.id));
 
-        let wrapped = TransactionBuilder::Mint(Box::new(MintToBuilderWithTxnId {
-            builder,
-            txn_id: transaction.id,
-        }));
+            info!("Processing deposit");
 
-        send_guaranteed(&sender_tx, wrapped, "processed deposit")
-            .await
-            .map_err(OperatorError::ChannelSend)?;
+            let wrapped = TransactionBuilder::Mint(Box::new(MintToBuilderWithTxnId {
+                builder,
+                txn_id: transaction.id,
+                trace_id: transaction.trace_id.clone(),
+            }));
+
+            send_guaranteed(&sender_tx, wrapped, "processed deposit")
+                .await
+                .map_err(OperatorError::ChannelSend)?;
+
+            Ok::<(), OperatorError>(())
+        }
+        .instrument(span)
+        .await?;
     }
 
     Ok(())

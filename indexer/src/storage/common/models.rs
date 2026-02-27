@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Type;
+use uuid::Uuid;
 
 /// Type of a transaction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -36,6 +37,7 @@ pub enum TransactionStatus {
 pub struct DbTransaction {
     pub id: i64,
     pub signature: String,
+    pub trace_id: String,
     pub slot: i64,
     pub initiator: String,
     pub recipient: String,
@@ -98,6 +100,7 @@ pub struct DbTransactionBuilder {
     recipient: Option<String>,
     memo: Option<String>,
     transaction_type: Option<TransactionType>,
+    trace_id: Option<String>,
 }
 
 impl DbTransactionBuilder {
@@ -111,6 +114,7 @@ impl DbTransactionBuilder {
             recipient: None,
             memo: None,
             transaction_type: None,
+            trace_id: None,
         }
     }
 
@@ -134,11 +138,17 @@ impl DbTransactionBuilder {
         self
     }
 
+    pub fn trace_id(mut self, trace_id: String) -> Self {
+        self.trace_id = Some(trace_id);
+        self
+    }
+
     pub fn build(self) -> DbTransaction {
         let now = Utc::now();
         DbTransaction {
             id: 0,
             signature: self.signature,
+            trace_id: self.trace_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             slot: self.slot,
             initiator: self.initiator.expect("initiator is required"),
             recipient: self.recipient.expect("recipient is required"),

@@ -42,8 +42,12 @@ pub async fn run_fetcher(
                 if !transactions.is_empty() {
                     info!("Fetched {} pending transactions", transactions.len());
 
-                    // Send each transaction to processor with guaranteed delivery
                     for transaction in transactions {
+                        info!(
+                            trace_id = %transaction.trace_id,
+                            signature = %transaction.signature,
+                            "Sending transaction to processor"
+                        );
                         if let Err(e) = send_guaranteed(
                             &processor_tx,
                             transaction.clone(),

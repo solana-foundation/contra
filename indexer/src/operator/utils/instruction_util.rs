@@ -250,6 +250,16 @@ impl MintToBuilder {
         self.recipient_ata
     }
 
+    pub fn try_as_expected_mint(&self) -> Option<(Pubkey, Pubkey, Pubkey, Pubkey, u64)> {
+        Some((
+            self.mint?,
+            self.recipient_ata?,
+            self.mint_authority?,
+            self.token_program?,
+            self.amount?,
+        ))
+    }
+
     /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to]
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         let mint = self.mint.ok_or_else(|| ProgramError::InvalidBuilder {

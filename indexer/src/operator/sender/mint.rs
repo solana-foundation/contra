@@ -235,63 +235,14 @@ fn expected_mint_instruction(
     transaction_id: i64,
     builder_with_txn_id: &MintToBuilderWithTxnId,
 ) -> Option<ExpectedMintInstruction> {
-    let builder = &builder_with_txn_id.builder;
-
-    let mint = match builder.get_mint() {
-        Some(mint) => mint,
-        None => {
+    let (mint, recipient_ata, mint_authority, token_program, amount) =
+        builder_with_txn_id.builder.try_as_expected_mint().or_else(|| {
             warn!(
-                "Cannot run mint idempotency check for transaction_id {}: mint not set",
+                "Cannot run mint idempotency check for transaction_id {}: builder fields incomplete",
                 transaction_id
             );
-            return None;
-        }
-    };
-
-    let recipient_ata = match builder.get_recipient_ata() {
-        Some(recipient_ata) => recipient_ata,
-        None => {
-            warn!(
-                "Cannot run mint idempotency check for transaction_id {}: recipient_ata not set",
-                transaction_id
-            );
-            return None;
-        }
-    };
-
-    let mint_authority = match builder.get_mint_authority() {
-        Some(mint_authority) => mint_authority,
-        None => {
-            warn!(
-                "Cannot run mint idempotency check for transaction_id {}: mint_authority not set",
-                transaction_id
-            );
-            return None;
-        }
-    };
-
-    let token_program = match builder.get_token_program() {
-        Some(token_program) => token_program,
-        None => {
-            warn!(
-                "Cannot run mint idempotency check for transaction_id {}: token_program not set",
-                transaction_id
-            );
-            return None;
-        }
-    };
-
-    let amount = match builder.get_amount() {
-        Some(amount) => amount,
-        None => {
-            warn!(
-                "Cannot run mint idempotency check for transaction_id {}: amount not set",
-                transaction_id
-            );
-            return None;
-        }
-    };
-
+            None
+        })?;
     Some(ExpectedMintInstruction {
         mint,
         recipient_ata,
@@ -456,6 +407,22 @@ fn parsed_instruction_has_expected_mint(
     amount == Some(expected_mint.amount)
 }
 
+fn accounts_and_amount_match(
+    program_id: &Pubkey,
+    mint: &Pubkey,
+    recipient_ata: &Pubkey,
+    mint_authority: &Pubkey,
+    instruction_data: &[u8],
+    expected: &ExpectedMintInstruction,
+) -> bool {
+    *program_id == expected.token_program
+        && *mint == expected.mint
+        && *recipient_ata == expected.recipient_ata
+        && *mint_authority == expected.mint_authority
+        && parse_token_instruction_mint_amount(program_id, instruction_data)
+            == Some(expected.amount)
+}
+
 fn partially_decoded_instruction_has_expected_mint(
     partially_decoded: &UiPartiallyDecodedInstruction,
     expected_mint: &ExpectedMintInstruction,
@@ -463,47 +430,38 @@ fn partially_decoded_instruction_has_expected_mint(
     let Some(program_id) = parse_pubkey(&partially_decoded.program_id) else {
         return false;
     };
-
-    if program_id != expected_mint.token_program {
-        return false;
-    }
-
     let Some(mint) = partially_decoded
         .accounts
         .first()
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
     let Some(recipient_ata) = partially_decoded
         .accounts
         .get(1)
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
     let Some(mint_authority) = partially_decoded
         .accounts
         .get(2)
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
-
-    if mint != expected_mint.mint
-        || recipient_ata != expected_mint.recipient_ata
-        || mint_authority != expected_mint.mint_authority
-    {
+    let Ok(data) = bs58::decode(&partially_decoded.data).into_vec() else {
         return false;
-    }
-
-    bs58::decode(&partially_decoded.data)
-        .into_vec()
-        .ok()
-        .and_then(|instruction_data| {
-            parse_token_instruction_mint_amount(&program_id, &instruction_data)
-        })
-        == Some(expected_mint.amount)
+    };
+    accounts_and_amount_match(
+        &program_id,
+        &mint,
+        &recipient_ata,
+        &mint_authority,
+        &data,
+        expected_mint,
+    )
 }
 
 fn raw_instruction_has_expected_mint(
@@ -514,54 +472,45 @@ fn raw_instruction_has_expected_mint(
     let Some(program_id) = raw_message
         .account_keys
         .get(instruction.program_id_index as usize)
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
-
-    if program_id != expected_mint.token_program {
-        return false;
-    }
-
     let Some(mint) = instruction
         .accounts
         .first()
-        .and_then(|index| raw_message.account_keys.get(*index as usize))
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|i| raw_message.account_keys.get(*i as usize))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
     let Some(recipient_ata) = instruction
         .accounts
         .get(1)
-        .and_then(|index| raw_message.account_keys.get(*index as usize))
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|i| raw_message.account_keys.get(*i as usize))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
     let Some(mint_authority) = instruction
         .accounts
         .get(2)
-        .and_then(|index| raw_message.account_keys.get(*index as usize))
-        .and_then(|account| parse_pubkey(account))
+        .and_then(|i| raw_message.account_keys.get(*i as usize))
+        .and_then(|a| parse_pubkey(a))
     else {
         return false;
     };
-
-    if mint != expected_mint.mint
-        || recipient_ata != expected_mint.recipient_ata
-        || mint_authority != expected_mint.mint_authority
-    {
+    let Ok(data) = bs58::decode(&instruction.data).into_vec() else {
         return false;
-    }
-
-    bs58::decode(&instruction.data)
-        .into_vec()
-        .ok()
-        .and_then(|instruction_data| {
-            parse_token_instruction_mint_amount(&program_id, &instruction_data)
-        })
-        == Some(expected_mint.amount)
+    };
+    accounts_and_amount_match(
+        &program_id,
+        &mint,
+        &recipient_ata,
+        &mint_authority,
+        &data,
+        expected_mint,
+    )
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {

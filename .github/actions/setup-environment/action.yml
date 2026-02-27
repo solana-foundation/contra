@@ -108,6 +108,7 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         cache-on-failure: true
+        cache-bin: false
 
     # install-dependencies implies Node.js + pnpm prerequisites.
     - name: Setup Node.js
@@ -121,13 +122,19 @@ runs:
       if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
       uses: pnpm/action-setup@v2
       with:
-        version: 10.14.0
+        version: 10.15.1
+
+    - name: Get pnpm store directory
+      if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
+      id: pnpm-store
+      shell: bash
+      run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
     - name: Setup pnpm cache
       if: inputs.setup-pnpm == 'true' || inputs.install-dependencies == 'true'
       uses: actions/cache@v4
       with:
-        path: ~/.pnpm-store
+        path: ${{ steps.pnpm-store.outputs.STORE_PATH }}
         key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
         restore-keys: |
           ${{ runner.os }}-pnpm-

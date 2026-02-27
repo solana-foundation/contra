@@ -3,7 +3,8 @@ use crate::operator::utils::instruction_util::{
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{
-    sign_and_send_transaction, SignerUtil, MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+    sign_and_send_transaction, RpcClientWithRetry, SignerUtil,
+    MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
 };
 use serde_json::Value;
 use solana_keychain::SolanaSigner;
@@ -146,8 +147,8 @@ pub(super) async fn try_jit_mint_initialization(
 
 /// Check recent ATA signatures for an already-confirmed mint carrying this transaction's
 /// deterministic idempotency memo.
-pub(super) async fn find_existing_mint_signature(
-    state: &SenderState,
+pub async fn find_existing_mint_signature(
+    rpc_client: &RpcClientWithRetry,
     builder_with_txn_id: &MintToBuilderWithTxnId,
 ) -> Result<Option<Signature>, String> {
     let transaction_id = builder_with_txn_id.txn_id;
@@ -156,8 +157,7 @@ pub(super) async fn find_existing_mint_signature(
     };
     let expected_memo = mint_idempotency_memo(transaction_id);
 
-    let signatures = match state
-        .rpc_client
+    let signatures = match rpc_client
         .get_signatures_for_address(
             &expected_mint.recipient_ata,
             MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
@@ -202,7 +202,7 @@ pub(super) async fn find_existing_mint_signature(
             }
         };
 
-        let transaction = match state.rpc_client.get_transaction(&signature).await {
+        let transaction = match rpc_client.get_transaction(&signature).await {
             Ok(transaction) => transaction,
             Err(e) => {
                 return Err(format!(
@@ -593,12 +593,84 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 #[cfg(test)]
 mod tests {
     use super::{
-        instruction_has_expected_mint, memo_matches, strip_memo_length_prefix,
-        ExpectedMintInstruction,
+        accounts_and_amount_match, expected_mint_instruction, instruction_has_expected_mint,
+        memo_matches, parse_token_instruction_mint_amount,
+        partially_decoded_instruction_has_expected_mint, raw_instruction_has_expected_mint,
+        strip_memo_length_prefix, transaction_matches_expected_mint, ExpectedMintInstruction,
     };
+    use crate::operator::utils::instruction_util::{MintToBuilder, MintToBuilderWithTxnId};
     use solana_sdk::pubkey::Pubkey;
     use solana_transaction_status::parse_instruction::ParsedInstruction;
-    use solana_transaction_status::{UiInstruction, UiParsedInstruction};
+    use solana_transaction_status::{
+        option_serializer::OptionSerializer, parse_accounts::ParsedAccount,
+        EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
+        EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiInstruction, UiMessage,
+        UiParsedInstruction, UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
+        UiTransaction, UiTransactionStatusMeta,
+    };
+
+    fn make_expected() -> (Pubkey, Pubkey, Pubkey, ExpectedMintInstruction) {
+        let mint = Pubkey::new_unique();
+        let recipient_ata = Pubkey::new_unique();
+        let mint_authority = Pubkey::new_unique();
+        let expected = ExpectedMintInstruction {
+            mint,
+            recipient_ata,
+            mint_authority,
+            token_program: spl_token::id(),
+            amount: 1000,
+        };
+        (mint, recipient_ata, mint_authority, expected)
+    }
+
+    fn build_test_transaction_parsed(
+        signers: &[Pubkey],
+        instructions: Vec<UiInstruction>,
+        meta_err: Option<solana_sdk::transaction::TransactionError>,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        let account_keys: Vec<ParsedAccount> = signers
+            .iter()
+            .map(|pk| ParsedAccount {
+                pubkey: pk.to_string(),
+                writable: true,
+                signer: true,
+                source: None,
+            })
+            .collect();
+
+        EncodedConfirmedTransactionWithStatusMeta {
+            slot: 0,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig".to_string()],
+                    message: UiMessage::Parsed(UiParsedMessage {
+                        account_keys,
+                        recent_blockhash: "11111111111111111111111111111111".to_string(),
+                        instructions,
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    err: meta_err,
+                    status: Ok(()),
+                    fee: 5000,
+                    pre_balances: vec![],
+                    post_balances: vec![],
+                    inner_instructions: OptionSerializer::None,
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::None,
+                    post_token_balances: OptionSerializer::None,
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::Skip,
+                    return_data: OptionSerializer::Skip,
+                    compute_units_consumed: OptionSerializer::Skip,
+                    cost_units: OptionSerializer::Skip,
+                }),
+                version: None,
+            },
+            block_time: None,
+        }
+    }
 
     #[test]
     fn strip_memo_length_prefix_handles_formatted_values() {
@@ -717,5 +789,366 @@ mod tests {
         }));
 
         assert!(instruction_has_expected_mint(&instruction, &expected));
+    }
+
+    #[test]
+    fn expected_mint_instruction_complete_builder() {
+        let mint = Pubkey::new_unique();
+        let recipient_ata = Pubkey::new_unique();
+        let mint_authority = Pubkey::new_unique();
+        let mut builder = MintToBuilder::new();
+        builder
+            .mint(mint)
+            .recipient_ata(recipient_ata)
+            .mint_authority(mint_authority)
+            .token_program(spl_token::id())
+            .amount(500);
+
+        let builder_with_id = MintToBuilderWithTxnId { builder, txn_id: 7 };
+        let result = expected_mint_instruction(7, &builder_with_id).unwrap();
+        assert_eq!(result.mint, mint);
+        assert_eq!(result.recipient_ata, recipient_ata);
+        assert_eq!(result.mint_authority, mint_authority);
+        assert_eq!(result.token_program, spl_token::id());
+        assert_eq!(result.amount, 500);
+    }
+
+    #[test]
+    fn expected_mint_instruction_incomplete_builder() {
+        let mut builder = MintToBuilder::new();
+        builder.mint(Pubkey::new_unique());
+        // missing recipient_ata, mint_authority, token_program, amount
+
+        let builder_with_id = MintToBuilderWithTxnId { builder, txn_id: 1 };
+        assert!(expected_mint_instruction(1, &builder_with_id).is_none());
+    }
+
+    #[test]
+    fn accounts_and_amount_match_all_fields() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+        assert!(accounts_and_amount_match(
+            &spl_token::id(),
+            &mint,
+            &recipient_ata,
+            &mint_authority,
+            &data,
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn accounts_and_amount_match_rejects_each_field() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+
+        // wrong program
+        assert!(!accounts_and_amount_match(
+            &Pubkey::new_unique(),
+            &mint,
+            &recipient_ata,
+            &mint_authority,
+            &data,
+            &expected,
+        ));
+
+        // wrong mint
+        assert!(!accounts_and_amount_match(
+            &spl_token::id(),
+            &Pubkey::new_unique(),
+            &recipient_ata,
+            &mint_authority,
+            &data,
+            &expected,
+        ));
+
+        // wrong recipient_ata
+        assert!(!accounts_and_amount_match(
+            &spl_token::id(),
+            &mint,
+            &Pubkey::new_unique(),
+            &mint_authority,
+            &data,
+            &expected,
+        ));
+
+        // wrong mint_authority
+        assert!(!accounts_and_amount_match(
+            &spl_token::id(),
+            &mint,
+            &recipient_ata,
+            &Pubkey::new_unique(),
+            &data,
+            &expected,
+        ));
+
+        // wrong amount
+        let wrong_data = spl_token::instruction::TokenInstruction::MintTo { amount: 9999 }.pack();
+        assert!(!accounts_and_amount_match(
+            &spl_token::id(),
+            &mint,
+            &recipient_ata,
+            &mint_authority,
+            &wrong_data,
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn parse_token_instruction_mint_amount_spl_token() {
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 42 }.pack();
+        assert_eq!(
+            parse_token_instruction_mint_amount(&spl_token::id(), &data),
+            Some(42)
+        );
+
+        let data_checked = spl_token::instruction::TokenInstruction::MintToChecked {
+            amount: 77,
+            decimals: 6,
+        }
+        .pack();
+        assert_eq!(
+            parse_token_instruction_mint_amount(&spl_token::id(), &data_checked),
+            Some(77)
+        );
+    }
+
+    #[test]
+    fn parse_token_instruction_mint_amount_spl_token_2022() {
+        let data = spl_token_2022::instruction::TokenInstruction::MintTo { amount: 100 }.pack();
+        assert_eq!(
+            parse_token_instruction_mint_amount(&spl_token_2022::id(), &data),
+            Some(100)
+        );
+
+        let data_checked = spl_token_2022::instruction::TokenInstruction::MintToChecked {
+            amount: 200,
+            decimals: 9,
+        }
+        .pack();
+        assert_eq!(
+            parse_token_instruction_mint_amount(&spl_token_2022::id(), &data_checked),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn parse_token_instruction_mint_amount_rejects_transfer() {
+        let data = spl_token::instruction::TokenInstruction::Transfer { amount: 50 }.pack();
+        assert_eq!(
+            parse_token_instruction_mint_amount(&spl_token::id(), &data),
+            None
+        );
+    }
+
+    #[test]
+    fn partially_decoded_mint_happy_path() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+        let partially_decoded = UiPartiallyDecodedInstruction {
+            program_id: spl_token::id().to_string(),
+            accounts: vec![
+                mint.to_string(),
+                recipient_ata.to_string(),
+                mint_authority.to_string(),
+            ],
+            data: bs58::encode(&data).into_string(),
+            stack_height: None,
+        };
+        assert!(partially_decoded_instruction_has_expected_mint(
+            &partially_decoded,
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn partially_decoded_mint_wrong_amount() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 9999 }.pack();
+        let partially_decoded = UiPartiallyDecodedInstruction {
+            program_id: spl_token::id().to_string(),
+            accounts: vec![
+                mint.to_string(),
+                recipient_ata.to_string(),
+                mint_authority.to_string(),
+            ],
+            data: bs58::encode(&data).into_string(),
+            stack_height: None,
+        };
+        assert!(!partially_decoded_instruction_has_expected_mint(
+            &partially_decoded,
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn raw_instruction_mint_happy_path() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+        let raw_message = UiRawMessage {
+            header: solana_sdk::message::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![
+                mint_authority.to_string(),
+                spl_token::id().to_string(),
+                mint.to_string(),
+                recipient_ata.to_string(),
+            ],
+            recent_blockhash: "11111111111111111111111111111111".to_string(),
+            instructions: vec![],
+            address_table_lookups: None,
+        };
+        let compiled = UiCompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![2, 3, 0],
+            data: bs58::encode(&data).into_string(),
+            stack_height: None,
+        };
+        assert!(raw_instruction_has_expected_mint(
+            &raw_message,
+            &compiled,
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn raw_instruction_mint_wrong_program() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+        let wrong_program = Pubkey::new_unique();
+        let raw_message = UiRawMessage {
+            header: solana_sdk::message::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![
+                mint_authority.to_string(),
+                wrong_program.to_string(),
+                mint.to_string(),
+                recipient_ata.to_string(),
+            ],
+            recent_blockhash: "11111111111111111111111111111111".to_string(),
+            instructions: vec![],
+            address_table_lookups: None,
+        };
+        let compiled = UiCompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![2, 3, 0],
+            data: bs58::encode(&data).into_string(),
+            stack_height: None,
+        };
+        assert!(!raw_instruction_has_expected_mint(
+            &raw_message,
+            &compiled,
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn transaction_matches_expected_mint_parsed_happy_path() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let memo_text = "contra:mint-idempotency:42";
+
+        let memo_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-memo".to_string(),
+            program_id: spl_memo::id().to_string(),
+            parsed: serde_json::Value::String(memo_text.to_string()),
+            stack_height: None,
+        }));
+        let mint_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-token".to_string(),
+            program_id: spl_token::id().to_string(),
+            parsed: serde_json::json!({
+                "type": "mintTo",
+                "info": {
+                    "mint": mint.to_string(),
+                    "account": recipient_ata.to_string(),
+                    "mintAuthority": mint_authority.to_string(),
+                    "amount": "1000",
+                }
+            }),
+            stack_height: None,
+        }));
+
+        let tx = build_test_transaction_parsed(&[mint_authority], vec![memo_ix, mint_ix], None);
+
+        assert!(transaction_matches_expected_mint(&tx, memo_text, &expected));
+    }
+
+    #[test]
+    fn transaction_matches_expected_mint_rejects_failed_tx() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let memo_text = "contra:mint-idempotency:42";
+
+        let memo_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-memo".to_string(),
+            program_id: spl_memo::id().to_string(),
+            parsed: serde_json::Value::String(memo_text.to_string()),
+            stack_height: None,
+        }));
+        let mint_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-token".to_string(),
+            program_id: spl_token::id().to_string(),
+            parsed: serde_json::json!({
+                "type": "mintTo",
+                "info": {
+                    "mint": mint.to_string(),
+                    "account": recipient_ata.to_string(),
+                    "mintAuthority": mint_authority.to_string(),
+                    "amount": "1000",
+                }
+            }),
+            stack_height: None,
+        }));
+
+        let tx = build_test_transaction_parsed(
+            &[mint_authority],
+            vec![memo_ix, mint_ix],
+            Some(solana_sdk::transaction::TransactionError::AccountNotFound),
+        );
+
+        assert!(!transaction_matches_expected_mint(
+            &tx, memo_text, &expected
+        ));
+    }
+
+    #[test]
+    fn transaction_matches_expected_mint_rejects_wrong_memo() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let expected_memo = "contra:mint-idempotency:42";
+
+        let wrong_memo_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-memo".to_string(),
+            program_id: spl_memo::id().to_string(),
+            parsed: serde_json::Value::String("contra:mint-idempotency:999".to_string()),
+            stack_height: None,
+        }));
+        let mint_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-token".to_string(),
+            program_id: spl_token::id().to_string(),
+            parsed: serde_json::json!({
+                "type": "mintTo",
+                "info": {
+                    "mint": mint.to_string(),
+                    "account": recipient_ata.to_string(),
+                    "mintAuthority": mint_authority.to_string(),
+                    "amount": "1000",
+                }
+            }),
+            stack_height: None,
+        }));
+
+        let tx =
+            build_test_transaction_parsed(&[mint_authority], vec![wrong_memo_ix, mint_ix], None);
+
+        assert!(!transaction_matches_expected_mint(
+            &tx,
+            expected_memo,
+            &expected,
+        ));
     }
 }

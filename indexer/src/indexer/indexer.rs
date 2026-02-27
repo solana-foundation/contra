@@ -185,13 +185,50 @@ pub async fn run(
                 yellowstone_config.endpoint, yellowstone_config.commitment
             );
 
-            Box::new(YellowstoneSource::new(
+            let source = YellowstoneSource::new(
                 yellowstone_config.endpoint.clone(),
                 yellowstone_config.x_token.clone(),
                 yellowstone_config.commitment.clone(),
                 common_config.program_type,
                 common_config.escrow_instance_id,
-            ))
+            );
+
+            #[cfg(feature = "datasource-rpc")]
+            let source = {
+                use solana_sdk::commitment_config::CommitmentLevel as SdkCommitmentLevel;
+                use solana_transaction_status::UiTransactionEncoding;
+
+                let encoding = indexer_config
+                    .rpc_polling
+                    .as_ref()
+                    .map(|c| c.encoding)
+                    .unwrap_or(UiTransactionEncoding::Json);
+
+                let commitment = match yellowstone_config.commitment.to_lowercase().as_str() {
+                    "processed" => SdkCommitmentLevel::Processed,
+                    "finalized" => SdkCommitmentLevel::Finalized,
+                    _ => SdkCommitmentLevel::Confirmed,
+                };
+
+                let gap_rpc_poller = Arc::new(RpcPoller::new(
+                    indexer_config.backfill.rpc_url.clone(),
+                    encoding,
+                    commitment,
+                ));
+
+                info!(
+                    "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
+                    indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
+                );
+
+                source.with_gap_detection(
+                    gap_rpc_poller,
+                    indexer_config.backfill.max_gap_slots,
+                    indexer_config.backfill.batch_size,
+                )
+            };
+
+            Box::new(source)
         }
 
         // Catch-all for disabled features

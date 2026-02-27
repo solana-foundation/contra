@@ -58,6 +58,9 @@ pub async fn start_l1_to_contra_operator(
         channel_buffer_size: 100,
         rpc_commitment: CommitmentLevel::Confirmed,
         alert_webhook_url: None,
+        reconciliation_interval: Duration::from_secs(5 * 60),
+        reconciliation_tolerance_bps: 10,
+        reconciliation_webhook_url: None,
     };
 
     // Set up environment variables for the operator signer
@@ -117,6 +120,9 @@ pub async fn start_contra_to_l1_operator(
         channel_buffer_size: 100,
         rpc_commitment: CommitmentLevel::Confirmed,
         alert_webhook_url: None,
+        reconciliation_interval: Duration::from_secs(5 * 60),
+        reconciliation_tolerance_bps: 10,
+        reconciliation_webhook_url: None,
     };
 
     // Set up environment variables for the operator signer

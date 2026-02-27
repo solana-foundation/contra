@@ -11,9 +11,7 @@ use crate::{
     state::{discriminator::AccountSerialize, Instance, Operator},
     validate_event_accounts,
 };
-use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
-};
+use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 /// Processes the ResetSmtRoot instruction.
 ///
@@ -25,8 +23,8 @@ use pinocchio::{
 /// 4. `[]` event_authority - Event authority PDA for emitting events
 /// 5. `[]` contra_escrow_program - Current program for CPI
 pub fn process_reset_smt_root(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
     let [payer_info, operator_info, instance_info, operator_pda_info, event_authority_info, program_info] =
@@ -45,7 +43,7 @@ pub fn process_reset_smt_root(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate instance exists and is properly formed
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let mut instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
@@ -53,11 +51,15 @@ pub fn process_reset_smt_root(
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
     // Validate operator exists and is properly formed
-    let operator_pda_data = operator_pda_info.try_borrow_data()?;
+    let operator_pda_data = operator_pda_info.try_borrow()?;
     let operator_pda = Operator::try_from_bytes(&operator_pda_data)?;
 
     operator_pda
-        .validate_pda(instance_info.key(), operator_info.key(), operator_pda_info)
+        .validate_pda(
+            instance_info.address(),
+            operator_info.address(),
+            operator_pda_info,
+        )
         .map_err(|_| ContraEscrowProgramError::InvalidOperatorPda)?;
 
     drop(instance_data);
@@ -72,11 +74,11 @@ pub fn process_reset_smt_root(
     // Write updated instance back to account
     let updated_instance_data = instance.to_bytes();
     instance_info
-        .try_borrow_mut_data()?
+        .try_borrow_mut()?
         .copy_from_slice(&updated_instance_data);
 
     // Emit ResetSmtRoot event
-    let event = ResetSmtRootEvent::new(instance.instance_seed, *operator_info.key());
+    let event = ResetSmtRootEvent::new(instance.instance_seed, *operator_info.address());
     emit_event(
         program_id,
         event_authority_info,

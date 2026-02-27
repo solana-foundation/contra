@@ -13,9 +13,7 @@ use crate::{
     state::{Instance, Operator},
     validate_event_accounts,
 };
-use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
-};
+use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 /// Processes the RemoveOperator instruction.
 ///
@@ -32,8 +30,8 @@ use pinocchio::{
 /// # Instruction Data
 /// * None - No instruction data required
 pub fn process_remove_operator(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
     let [payer_info, admin_info, instance_info, operator_info, operator_pda_info, system_program_info, event_authority_info, program_info] =
@@ -53,33 +51,39 @@ pub fn process_remove_operator(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate instance exists and admin has authority
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    instance.validate_admin(admin_info.key())?;
+    instance.validate_admin(admin_info.address())?;
 
     // Validate operator account exists and is correct PDA
-    let operator_data = operator_pda_info.try_borrow_data()?;
+    let operator_data = operator_pda_info.try_borrow()?;
     let operator = Operator::try_from_bytes(&operator_data)?;
 
-    operator.validate_pda(instance_info.key(), operator_info.key(), operator_pda_info)?;
+    operator.validate_pda(
+        instance_info.address(),
+        operator_info.address(),
+        operator_pda_info,
+    )?;
 
     // Close the Operator account
     drop(operator_data);
 
     let payer_lamports = payer_info.lamports();
-    *payer_info.try_borrow_mut_lamports().unwrap() = payer_lamports
-        .checked_add(operator_pda_info.lamports())
-        .unwrap();
-    *operator_pda_info.try_borrow_mut_lamports().unwrap() = 0;
+    payer_info.set_lamports(
+        payer_lamports
+            .checked_add(operator_pda_info.lamports())
+            .unwrap(),
+    );
+    operator_pda_info.set_lamports(0);
     operator_pda_info.close()?;
 
     // Emit RemoveOperator event
-    let event = RemoveOperatorEvent::new(instance.instance_seed, *operator_info.key());
+    let event = RemoveOperatorEvent::new(instance.instance_seed, *operator_info.address());
     emit_event(
         program_id,
         event_authority_info,

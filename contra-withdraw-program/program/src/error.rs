@@ -1,4 +1,4 @@
-use pinocchio::program_error::ProgramError;
+use pinocchio::error::ProgramError;
 use thiserror::Error;
 
 /// Errors that may be returned by the Contra Withdraw Program.

@@ -17,12 +17,11 @@ use crate::{
     validate_event_accounts,
 };
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::Seed,
-    program_error::ProgramError,
-    pubkey::Pubkey,
+    account::AccountView,
+    cpi::Seed,
+    error::ProgramError,
     sysvars::{rent::Rent, Sysvar},
-    ProgramResult,
+    Address, ProgramResult,
 };
 
 /// Processes the AddOperator instruction.
@@ -40,8 +39,8 @@ use pinocchio::{
 /// # Instruction Data
 /// * `bump` (u8) - Bump for the operator PDA
 pub fn process_add_operator(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
@@ -64,26 +63,30 @@ pub fn process_add_operator(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate instance
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    instance.validate_admin(admin_info.key())?;
+    instance.validate_admin(admin_info.address())?;
 
     // Create Operator struct and validate PDA
     let operator = Operator::new(args.bump)?;
-    operator.validate_pda(instance_info.key(), operator_pda.key(), operator_pda_info)?;
+    operator.validate_pda(
+        instance_info.address(),
+        operator_pda.address(),
+        operator_pda_info,
+    )?;
 
     let bump_seed = [args.bump];
 
     // Create the Operator account
     let operator_seeds = [
         Seed::from(OPERATOR_SEED),
-        Seed::from(instance_info.key().as_ref()),
-        Seed::from(operator_pda.key().as_ref()),
+        Seed::from(instance_info.address().as_ref()),
+        Seed::from(operator_pda.address().as_ref()),
         Seed::from(&bump_seed),
     ];
 
@@ -102,11 +105,11 @@ pub fn process_add_operator(
     let operator_data = operator.to_bytes();
 
     // Write the serialized data to the account
-    let mut data_slice = operator_pda_info.try_borrow_mut_data()?;
+    let mut data_slice = operator_pda_info.try_borrow_mut()?;
     data_slice[..operator_data.len()].copy_from_slice(&operator_data);
 
     // Emit AddOperator event
-    let event = AddOperatorEvent::new(instance.instance_seed, *operator_pda.key());
+    let event = AddOperatorEvent::new(instance.instance_seed, *operator_pda.address());
     emit_event(
         program_id,
         event_authority_info,

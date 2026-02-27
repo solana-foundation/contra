@@ -1,9 +1,8 @@
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::{AccountMeta, Instruction, Seed, Signer},
-    program::invoke_signed,
-    pubkey::Pubkey,
-    ProgramResult,
+    account::AccountView,
+    cpi::{invoke_signed, Seed, Signer},
+    instruction::{InstructionAccount, InstructionView},
+    Address, ProgramResult,
 };
 
 use crate::{
@@ -23,13 +22,13 @@ use crate::{
 ///
 /// Returns `ContraEscrowProgramError::InvalidEventAuthority` if the event authority PDA is invalid.
 pub fn emit_event(
-    program_id: &Pubkey,
-    event_authority_info: &AccountInfo,
-    program_info: &AccountInfo,
+    program_id: &Address,
+    event_authority_info: &AccountView,
+    program_info: &AccountView,
     event_data: &[u8],
 ) -> ProgramResult {
     // Check that event authority PDA is valid.
-    if event_authority_info.key().ne(&event_authority_pda::ID) {
+    if event_authority_info.address().ne(&event_authority_pda::ID) {
         return Err(ContraEscrowProgramError::InvalidEventAuthority.into());
     }
 
@@ -40,11 +39,15 @@ pub fn emit_event(
 
     let signer = Signer::from(&signer_seeds);
 
+    let accounts = [InstructionAccount::readonly_signer(
+        event_authority_info.address(),
+    )];
+
     // CPI to emit_event ix on same program to store event data in ix arg.
     invoke_signed(
-        &Instruction {
+        &InstructionView {
             program_id,
-            accounts: &[AccountMeta::new(event_authority_info.key(), false, true)],
+            accounts: &accounts,
             data: event_data,
         },
         &[event_authority_info, program_info],

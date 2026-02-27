@@ -1,6 +1,6 @@
 use crate::ID as CONTRA_ESCROW_PROGRAM_ID;
 use const_crypto::ed25519;
-use pinocchio::pubkey::Pubkey;
+use pinocchio::Address;
 
 // Seeds
 pub const INSTANCE_SEED: &[u8] = b"instance";
@@ -53,9 +53,11 @@ pub mod event_authority_pda {
 
     use super::*;
 
-    const EVENT_AUTHORITY_AND_BUMP: ([u8; 32], u8) =
-        ed25519::derive_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID);
+    const EVENT_AUTHORITY_AND_BUMP: ([u8; 32], u8) = ed25519::derive_program_address(
+        &[EVENT_AUTHORITY_SEED],
+        CONTRA_ESCROW_PROGRAM_ID.as_array(),
+    );
 
-    pub const ID: Pubkey = EVENT_AUTHORITY_AND_BUMP.0;
+    pub const ID: Address = Address::new_from_array(EVENT_AUTHORITY_AND_BUMP.0);
     pub const BUMP: u8 = EVENT_AUTHORITY_AND_BUMP.1;
 }

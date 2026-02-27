@@ -16,12 +16,11 @@ use crate::{
     validate_event_accounts,
 };
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::Seed,
-    program_error::ProgramError,
-    pubkey::Pubkey,
+    account::AccountView,
+    cpi::Seed,
+    error::ProgramError,
     sysvars::{rent::Rent, Sysvar},
-    ProgramResult,
+    Address, ProgramResult,
 };
 
 /// Processes the CreateInstance instruction.
@@ -30,7 +29,7 @@ use pinocchio::{
 /// 0. `[signer, writable]` payer - Pays for the account creation
 /// 1. `[signer]` admin - Admin of the instance
 /// 2. `[signer]` instance_seed - Instance seed signer for PDA derivation
-/// 3. `[writable]` instance - Instance PDA to be created  
+/// 3. `[writable]` instance - Instance PDA to be created
 /// 4. `[]` system_program - System program for account creation
 /// 5. `[signer]` event_authority - Event authority PDA for emitting events
 /// 6. `[]` contra_escrow_program - Current program for CPI
@@ -38,8 +37,8 @@ use pinocchio::{
 /// # Instruction Data
 /// * `bump` (u8) - Bump for the instance PDA
 pub fn process_create_instance(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
@@ -63,7 +62,11 @@ pub fn process_create_instance(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Create Instance struct and validate PDA
-    let instance = Instance::new(args.bump, *instance_seed_info.key(), *admin_info.key())?;
+    let instance = Instance::new(
+        args.bump,
+        *instance_seed_info.address(),
+        *admin_info.address(),
+    )?;
     instance.validate_pda(instance_info)?;
 
     let bump_seed = [args.bump];
@@ -90,11 +93,11 @@ pub fn process_create_instance(
     let instance_data = instance.to_bytes();
 
     // Write the serialized data to the account
-    let mut data_slice = instance_info.try_borrow_mut_data()?;
+    let mut data_slice = instance_info.try_borrow_mut()?;
     data_slice[..instance_data.len()].copy_from_slice(&instance_data);
 
     // Emit CreateInstance event
-    let event = CreateInstanceEvent::new(*instance_seed_info.key(), *admin_info.key());
+    let event = CreateInstanceEvent::new(*instance_seed_info.address(), *admin_info.address());
     emit_event(
         program_id,
         event_authority_info,

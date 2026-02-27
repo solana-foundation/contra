@@ -10,9 +10,7 @@ use crate::{
     state::{discriminator::AccountSerialize, Instance},
     validate_event_accounts,
 };
-use pinocchio::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey, ProgramResult,
-};
+use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 /// Processes the SetNewAdmin instruction.
 ///
@@ -27,8 +25,8 @@ use pinocchio::{
 /// # Instruction Data
 /// * None - No instruction data required
 pub fn process_set_new_admin(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
     let [payer_info, current_admin_info, instance_info, new_admin_info, event_authority_info, program_info] =
@@ -48,27 +46,27 @@ pub fn process_set_new_admin(
     validate_event_accounts!(event_authority_info, program_info);
 
     // Validate instance exists and current admin has authority
-    let instance_data = instance_info.try_borrow_data()?;
+    let instance_data = instance_info.try_borrow()?;
     let mut instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    instance.validate_admin(current_admin_info.key())?;
+    instance.validate_admin(current_admin_info.address())?;
 
     // Store the old admin for the event
     let old_admin = instance.admin;
 
     // Update the instance with the new admin
-    instance.admin = *new_admin_info.key();
+    instance.admin = *new_admin_info.address();
 
     // Serialize updated instance and write back to account
     let updated_instance_data = instance.to_bytes();
 
     drop(instance_data);
 
-    let mut data_slice = instance_info.try_borrow_mut_data()?;
+    let mut data_slice = instance_info.try_borrow_mut()?;
     data_slice[..updated_instance_data.len()].copy_from_slice(&updated_instance_data);
 
     // Emit SetNewAdmin event

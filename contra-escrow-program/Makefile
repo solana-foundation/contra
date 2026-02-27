@@ -1,7 +1,15 @@
-.PHONY: install build fmt generate-idl generate-clients
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -euo pipefail -c
+.DEFAULT_GOAL := build
+
+PROGRAM_SO := ../target/deploy/contra_escrow_program.so
+PROGRAM_KEYPAIR := ../target/deploy/contra_escrow_program-keypair.json
+PROGRAM_ENV_KEY := ESCROW_PROGRAM_ID
+
+.PHONY: install build build-test fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
 .PHONY: unit-coverage integration-coverage integration-coverage-no-build coverage-html all-coverage
-.PHONY: build-devnet deploy-devnet
+.PHONY: build-localnet build-devnet deploy-devnet
 
 # Install dependencies
 install:
@@ -9,14 +17,12 @@ install:
 
 # Build the program
 build:
-	make generate-idl
-	make generate-clients
+	$(MAKE) generate-clients
 	cargo-build-sbf
 
 # Build the program with test-tree feature for integration tests
 build-test:
-	make generate-idl
-	make generate-clients
+	$(MAKE) generate-clients
 	cd program && cargo-build-sbf --features test-tree
 
 # Format / lint code
@@ -79,19 +85,10 @@ all-coverage: unit-coverage integration-coverage coverage-html
 # Localnet
 #############
 build-localnet:
-	make generate-idl
-	make generate-clients
+	$(MAKE) generate-clients
 	cargo-build-sbf
 	@echo "Updating .env.local with program IDs..."
-	@ESCROW_ID=$$(solana-keygen pubkey ../target/deploy/contra_escrow_program-keypair.json); \
-	if [ -f ../.env.local ]; then \
-		sed -i.bak "s/^ESCROW_PROGRAM_ID=.*/ESCROW_PROGRAM_ID=$$ESCROW_ID/" ../.env.local && \
-		rm ../.env.local.bak; \
-		echo "✅ Updated .env.local with ESCROW_PROGRAM_ID=$$ESCROW_ID"; \
-	else \
-		echo "ESCROW_PROGRAM_ID=$$ESCROW_ID" > ../.env.local; \
-		echo "✅ Created .env.local with ESCROW_PROGRAM_ID=$$ESCROW_ID"; \
-	fi
+	@../scripts/update-program-env.sh ../.env.local $(PROGRAM_ENV_KEY) $(PROGRAM_KEYPAIR)
 
 #############
 # Devnet
@@ -99,8 +96,7 @@ build-localnet:
 
 # Build the program with devnet feature
 build-devnet:
-	make generate-idl
-	make generate-clients
+	$(MAKE) generate-clients
 	cargo-build-sbf
 
 # Deploy to devnet
@@ -110,7 +106,7 @@ deploy-devnet: build-devnet
 		echo "Error: DEPLOYER_KEY parameter is required. Usage: make deploy-devnet DEPLOYER_KEY=/path/to/deployer-keypair.json"; \
 		exit 1; \
 	fi
-	solana program deploy ../target/deploy/contra_escrow_program.so \
-		--program-id ../target/deploy/contra_escrow_program-keypair.json \
+	solana program deploy $(PROGRAM_SO) \
+		--program-id $(PROGRAM_KEYPAIR) \
 		--keypair $(DEPLOYER_KEY) \
 		--url devnet

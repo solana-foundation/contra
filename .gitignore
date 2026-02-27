@@ -34,4 +34,3 @@ integration/.yellowstone-grpc/
 .local/
 
 indexer/config/devnet/
-

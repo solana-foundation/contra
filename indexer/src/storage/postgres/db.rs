@@ -761,6 +761,41 @@ impl PostgresDb {
         .await
     }
 
+    /// Query escrow balances by mint for continuous reconciliation checks.
+    /// Only counts **completed** transactions for both deposits and withdrawals.
+    /// This provides a conservative view based on finalized database state,
+    /// suitable for comparing against on-chain escrow ATA balances.
+    ///
+    /// Returns per-mint aggregate balances where:
+    /// - `total_deposits`: sum of completed deposit amounts
+    /// - `total_withdrawals`: sum of completed withdrawal amounts
+    ///
+    /// Expected net on-chain balance = total_deposits - total_withdrawals
+    pub async fn get_escrow_balances_by_mint_internal(
+        &self,
+    ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
+        sqlx::query_as::<_, MintDbBalance>(
+            r#"
+            SELECT
+                m.mint_address,
+                m.token_program,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'deposit' AND t.status = 'completed' THEN t.amount ELSE 0 END),
+                    0
+                )::BIGINT AS total_deposits,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
+                    0
+                )::BIGINT AS total_withdrawals
+            FROM mints m
+            LEFT JOIN transactions t ON t.mint = m.mint_address
+            GROUP BY m.mint_address, m.token_program
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn close(&self) -> Result<(), sqlx::Error> {
         info!("Closing database connection pool...");
         self.pool.close().await;

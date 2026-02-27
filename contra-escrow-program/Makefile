@@ -22,7 +22,6 @@ build:
 
 # Build the program with test-tree feature for integration tests
 build-test:
-	$(MAKE) generate-clients
 	cd program && cargo-build-sbf --features test-tree
 
 # Format / lint code

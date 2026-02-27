@@ -2,9 +2,9 @@ use super::test_context::ContraContext;
 use solana_sdk::{
     hash::Hash,
     signature::{Keypair, Signer},
-    system_instruction,
     transaction::Transaction,
 };
+use solana_system_interface::instruction as system_instruction;
 use std::time::Duration;
 use tokio::time::sleep;
 

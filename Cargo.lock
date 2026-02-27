@@ -1836,6 +1836,7 @@ dependencies = [
  "chrono",
  "clap 4.5.48",
  "const-crypto",
+ "contra-core",
  "contra-escrow-program-client",
  "contra-withdraw-program-client",
  "figment",

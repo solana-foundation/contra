@@ -57,7 +57,7 @@ impl DbTransactionWriter {
                 update.transaction_id,
                 update.status,
                 update.counterpart_signature.clone(),
-                update.processed_at.clone().unwrap_or_else(Utc::now),
+                update.processed_at.unwrap_or_else(Utc::now),
             )
             .await
         {

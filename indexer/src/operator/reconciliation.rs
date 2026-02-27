@@ -218,11 +218,7 @@ pub fn compare_balances(
             u64::MAX // Use max to ensure it exceeds any tolerance
         } else {
             // Calculate percentage difference in basis points
-            let diff = if on_chain > db {
-                on_chain - db
-            } else {
-                db - on_chain
-            };
+            let diff = on_chain.abs_diff(db);
             // Use u128 to avoid overflow during multiplication
             ((diff as u128 * 10000) / on_chain as u128) as u64
         };

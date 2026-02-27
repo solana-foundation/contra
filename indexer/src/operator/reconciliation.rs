@@ -14,8 +14,7 @@ use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
-use chrono;
-use serde_json;
+use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
@@ -23,7 +22,6 @@ use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -353,79 +351,48 @@ pub async fn send_webhook_alert(
         }
     };
 
+    let webhook_client = WebhookClient::new(
+        WEBHOOK_TIMEOUT,
+        WebhookRetryConfig::new(WEBHOOK_MAX_ATTEMPTS, WEBHOOK_BASE_DELAY, WEBHOOK_MAX_DELAY),
+    )
+    .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
+
     // Send alert for each mismatch
     for mismatch in mismatches {
-        send_single_webhook_alert(url, mismatch).await?;
+        let payload = serde_json::json!({
+            "mint": mismatch.mint.to_string(),
+            "on_chain_balance": mismatch.on_chain_balance,
+            "db_balance": mismatch.db_balance,
+            "delta_bps": mismatch.delta_bps,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+
+        let context = format!("mint {} (delta {} bps)", mismatch.mint, mismatch.delta_bps);
+
+        webhook_client
+            .post_json(url, &payload, &context)
+            .await
+            .map_err(|error| {
+                error!(
+                    "Failed to send webhook alert after {} attempts for mint {}: {}",
+                    error.attempts(),
+                    mismatch.mint,
+                    error.message()
+                );
+                OperatorError::WebhookError(format!(
+                    "Failed to send webhook alert after {} attempts: {}",
+                    error.attempts(),
+                    error.message()
+                ))
+            })?;
+
+        info!(
+            "Webhook alert sent for mint {} (delta: {} bps)",
+            mismatch.mint, mismatch.delta_bps
+        );
     }
 
     Ok(())
-}
-
-/// Sends a single webhook alert with retry logic
-///
-/// Implements exponential backoff with configurable retry attempts.
-/// Logs warnings on failed attempts and errors on final failure.
-async fn send_single_webhook_alert(
-    url: &str,
-    mismatch: &BalanceMismatch,
-) -> Result<(), OperatorError> {
-    let client = reqwest::Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
-        .build()
-        .map_err(|e| OperatorError::WebhookError(format!("Failed to create HTTP client: {}", e)))?;
-
-    // Prepare JSON payload
-    let payload = serde_json::json!({
-        "mint": mismatch.mint.to_string(),
-        "on_chain_balance": mismatch.on_chain_balance,
-        "db_balance": mismatch.db_balance,
-        "delta_bps": mismatch.delta_bps,
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
-    let mut attempts = 0;
-
-    loop {
-        attempts += 1;
-
-        let last_error = match client.post(url).json(&payload).send().await {
-            Ok(response) if response.status().is_success() => {
-                info!(
-                    "Webhook alert sent for mint {} (delta: {} bps)",
-                    mismatch.mint, mismatch.delta_bps
-                );
-                return Ok(());
-            }
-            Ok(response) => format!(
-                "HTTP {}: {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            ),
-            Err(e) => format!("Request failed: {}", e),
-        };
-
-        if attempts >= WEBHOOK_MAX_ATTEMPTS {
-            error!(
-                "Failed to send webhook alert after {} attempts for mint {}: {}",
-                attempts, mismatch.mint, last_error
-            );
-            return Err(OperatorError::WebhookError(format!(
-                "Failed to send webhook alert after {} attempts: {}",
-                attempts, last_error
-            )));
-        }
-
-        // Exponential backoff with capped delay
-        let delay = WEBHOOK_BASE_DELAY * 2_u32.pow(attempts - 1);
-        let delay = delay.min(WEBHOOK_MAX_DELAY);
-
-        warn!(
-            "Webhook alert attempt {} failed for mint {}, retrying in {:?}: {}",
-            attempts, mismatch.mint, delay, last_error
-        );
-
-        sleep(delay).await;
-    }
 }
 
 #[cfg(test)]
@@ -438,7 +405,7 @@ mod tests {
         // This test verifies that the fetch_on_chain_balances function exists and compiles
         // Integration testing with a real RPC client would require a test validator
         // and is better suited for integration tests rather than unit tests
-        assert!(true, "fetch_on_chain_balances function compiles");
+        let _function = fetch_on_chain_balances;
     }
 
     #[test]

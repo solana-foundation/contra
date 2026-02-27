@@ -23,6 +23,7 @@ hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }
 rand = { workspace = true }
 redis = { workspace = true }
+reqwest = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

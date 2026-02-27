@@ -666,7 +666,7 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
             r#"{{"mint":"{}","on_chain_balance":1800000,"db_balance":2000000,"delta_bps":{},"timestamp":"#,
             mint2,
             mismatch.delta_bps
-        ).into()))
+        )))
         .with_status(200)
         .create_async()
         .await;

@@ -3,8 +3,10 @@ use crate::operator::sender::TransactionStatusUpdate;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::Storage;
 use chrono::Utc;
+use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -13,7 +15,7 @@ use tracing::{error, info, warn};
 pub struct DbTransactionWriter {
     storage: Arc<Storage>,
     update_rx: mpsc::Receiver<TransactionStatusUpdate>,
-    client: reqwest::Client,
+    webhook_client: WebhookClient,
     webhook_url: Option<String>,
 }
 
@@ -23,14 +25,15 @@ impl DbTransactionWriter {
         update_rx: mpsc::Receiver<TransactionStatusUpdate>,
         webhook_url: Option<String>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("Failed to build HTTP client");
+        let webhook_client = WebhookClient::new(
+            Duration::from_secs(10),
+            WebhookRetryConfig::single_attempt(),
+        )
+        .expect("Failed to build webhook HTTP client");
         Self {
             storage,
             update_rx,
-            client,
+            webhook_client,
             webhook_url,
         }
     }
@@ -106,28 +109,20 @@ impl DbTransactionWriter {
             "timestamp": timestamp,
         });
 
-        match self.client.post(webhook_url).json(&payload).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!(
-                        "Webhook alert sent successfully for transaction {}",
-                        update.transaction_id
-                    );
-                } else {
-                    warn!(
-                        "Webhook alert returned non-success status {} for transaction {}: {:?}",
-                        response.status(),
-                        update.transaction_id,
-                        response.text().await
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to send webhook alert for transaction {}: {}",
-                    update.transaction_id, e
-                );
-            }
+        let context = format!("transaction {}", update.transaction_id);
+        match self
+            .webhook_client
+            .post_json(webhook_url, &payload, &context)
+            .await
+        {
+            Ok(_) => info!(
+                "Webhook alert sent successfully for transaction {}",
+                update.transaction_id
+            ),
+            Err(error) => warn!(
+                "Failed to send webhook alert for transaction {}: {}",
+                update.transaction_id, error
+            ),
         }
     }
 }

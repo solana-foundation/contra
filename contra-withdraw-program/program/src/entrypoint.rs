@@ -1,7 +1,4 @@
-use pinocchio::{
-    account_info::AccountInfo, entrypoint, program_error::ProgramError, pubkey::Pubkey,
-    ProgramResult,
-};
+use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, ProgramResult};
 
 use crate::{
     discriminator::ContraWithdrawInstructionDiscriminators, processor::process_withdraw_funds,
@@ -10,8 +7,8 @@ use crate::{
 entrypoint!(process_instruction);
 
 pub fn process_instruction(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
+    program_id: &Address,
+    accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let (discriminator, instruction_data) = instruction_data

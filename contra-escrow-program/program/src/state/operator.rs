@@ -7,8 +7,8 @@ use crate::validate_discriminator;
 use crate::ID as CONTRA_ESCROW_PROGRAM_ID;
 use alloc::vec;
 use alloc::vec::Vec;
-use pinocchio::account_info::AccountInfo;
-use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
+use pinocchio::account::AccountView;
+use pinocchio::{error::ProgramError, Address};
 use shank::ShankAccount;
 
 /// Seeds: [b"operator", instance_pda, wallet_pubkey]
@@ -50,9 +50,9 @@ impl Operator {
 
     pub fn validate_pda(
         &self,
-        instance_pda: &Pubkey,
-        wallet: &Pubkey,
-        account_info: &AccountInfo,
+        instance_pda: &Address,
+        wallet: &Address,
+        account_info: &AccountView,
     ) -> Result<(), ProgramError> {
         validate_pda_account(
             &[OPERATOR_SEED, instance_pda.as_ref(), wallet.as_ref()],

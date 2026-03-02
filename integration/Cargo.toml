@@ -23,12 +23,17 @@ path = "tests/indexer/mint_idempotency.rs"
 name = "gap_detection_integration"
 path = "tests/indexer/gap_detection.rs"
 
+[[test]]
+name = "truncate_integration"
+path = "tests/contra/truncate.rs"
+
 [features]
 test-tree = ["contra-indexer/test-tree"]
 
 [dependencies]
 anyhow = "1.0.100"
 base64 = { workspace = true }
+bincode = { workspace = true }
 chrono = { workspace = true }
 contra-core = { path = "../core" }
 contra-escrow-program-client = { path = "../contra-escrow-program/clients/rust" }

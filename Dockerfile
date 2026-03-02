@@ -106,6 +106,7 @@ RUN useradd -m -u 1000 -s /bin/bash contra
 # Copy the binaries from builder
 COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/node
 COPY --from=builder /usr/src/contra/target/release/activity /usr/local/bin/activity
+COPY --from=builder /usr/src/contra/target/release/admin /usr/local/bin/admin
 COPY --from=builder /usr/src/contra/target/release/gateway /usr/local/bin/gateway
 COPY --from=builder /usr/src/contra/target/release/indexer /usr/local/bin/indexer
 COPY --from=builder /usr/src/contra/target/release/streamer /usr/local/bin/streamer

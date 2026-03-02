@@ -23,6 +23,7 @@ pub mod store_block;
 pub mod store_performance_sample;
 pub mod traits;
 pub mod transaction_count;
+pub mod truncate;
 pub mod types;
 pub mod utils;
 pub mod write_batch;

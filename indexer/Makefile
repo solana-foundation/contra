@@ -2,7 +2,7 @@
 .PHONY: compose-indexer compose-operator compose-all
 .PHONY: start-validator run-yellowstone run-rpc run-operator
 .PHONY: unit-test all-test
-.PHONY: unit-coverage coverage-html
+.PHONY: unit-coverage coverage-html all-coverage
 .PHONY: run-mock-transactions
 .PHONY: yellowstone-clone build-yellowstone-plugin clean-yellowstone
 
@@ -144,6 +144,9 @@ coverage-html:
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
 	@cargo llvm-cov test --no-report --lib --features datasource-rpc
 	@cargo llvm-cov report --html --output-dir ../coverage/coverage-indexer-html
+
+## Run all coverage tasks
+all-coverage: unit-coverage coverage-html
 
 ## Test all
 all-test: unit-test

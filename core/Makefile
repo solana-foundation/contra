@@ -1,5 +1,5 @@
 .PHONY: build fmt unit-test
-.PHONY: unit-coverage coverage-html
+.PHONY: unit-coverage coverage-html all-coverage
 
 # Build the contra-core library and binaries
 build:
@@ -28,3 +28,6 @@ coverage-html:
 	@echo "Generating HTML coverage report for contra-core..."
 	@mkdir -p ../coverage
 	@cargo llvm-cov --lib --html --output-dir ../coverage/coverage-core-html
+
+# Run all coverage tasks
+all-coverage: unit-coverage coverage-html

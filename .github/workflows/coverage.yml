@@ -1,4 +1,4 @@
-name: Combined Coverage Report
+name: Coverage Report
 
 on:
   workflow_run:
@@ -9,11 +9,11 @@ on:
   push:
     branches: [main, feat/coverage-ci, hardening/pre-release-audit]
     paths:
-      - ".github/workflows/program-coverage.yml"
+      - ".github/workflows/coverage.yml"
   pull_request:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - ".github/workflows/program-coverage.yml"
+      - ".github/workflows/coverage.yml"
 
 env:
   CARGO_TERM_COLOR: always

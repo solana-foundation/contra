@@ -157,4 +157,62 @@ mod tests {
         let config = WebhookRetryConfig::new(0, Duration::from_millis(10), Duration::from_secs(1));
         assert_eq!(config.max_attempts(), 1);
     }
+
+    #[test]
+    fn default_retry_config() {
+        let config = WebhookRetryConfig::default();
+        assert_eq!(config.max_attempts(), 3);
+        assert_eq!(config.base_delay(), Duration::from_millis(500));
+        assert_eq!(config.max_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn single_attempt_config() {
+        let config = WebhookRetryConfig::single_attempt();
+        assert_eq!(config.max_attempts(), 1);
+        assert_eq!(config.base_delay(), Duration::ZERO);
+        assert_eq!(config.max_delay(), Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_delay_exponential_backoff() {
+        let config =
+            WebhookRetryConfig::new(5, Duration::from_millis(100), Duration::from_secs(10));
+        // attempt 1: base * 2^0 = 100ms
+        assert_eq!(config.retry_delay(1), Duration::from_millis(100));
+        // attempt 2: base * 2^1 = 200ms
+        assert_eq!(config.retry_delay(2), Duration::from_millis(200));
+        // attempt 3: base * 2^2 = 400ms
+        assert_eq!(config.retry_delay(3), Duration::from_millis(400));
+    }
+
+    #[test]
+    fn retry_delay_capped_at_max() {
+        let config = WebhookRetryConfig::new(10, Duration::from_secs(1), Duration::from_secs(5));
+        // attempt 5: base * 2^4 = 16s, but capped at 5s
+        assert_eq!(config.retry_delay(5), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn webhook_delivery_error_display() {
+        let err = WebhookDeliveryError::new(3, "HTTP 500".to_string());
+        assert_eq!(err.attempts(), 3);
+        assert_eq!(err.message(), "HTTP 500");
+        let display = format!("{}", err);
+        assert!(display.contains("3 attempt(s)"));
+        assert!(display.contains("HTTP 500"));
+    }
+
+    #[test]
+    fn webhook_delivery_error_is_error_trait() {
+        let err = WebhookDeliveryError::new(1, "timeout".to_string());
+        // Verify it implements Error (source returns None by default)
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[tokio::test]
+    async fn webhook_client_new_succeeds() {
+        let client = WebhookClient::new(Duration::from_secs(5), WebhookRetryConfig::default());
+        assert!(client.is_ok());
+    }
 }

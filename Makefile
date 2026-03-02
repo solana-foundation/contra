@@ -14,7 +14,7 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 .PHONY: unit-test integration-test all-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
-.PHONY: unit-coverage integration-coverage coverage-html all-coverage
+.PHONY: unit-coverage integration-coverage coverage-html all-coverage ci-unit-coverage
 .PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
@@ -114,7 +114,7 @@ all-test: unit-test integration-test
 
 unit-coverage:
 	@echo "Running unit tests with coverage..."
-	@for dir in $(PROGRAM_DIRS); do \
+	@for dir in $(PROGRAM_DIRS) $(RUST_DIRS); do \
 		$(MAKE) -C $$dir unit-coverage; \
 	done
 
@@ -126,15 +126,20 @@ integration-coverage:
 
 coverage-html:
 	@echo "Generating HTML coverage reports..."
-	@for dir in $(PROGRAM_DIRS); do \
+	@for dir in $(PROGRAM_DIRS) $(RUST_DIRS); do \
 		$(MAKE) -C $$dir coverage-html; \
 	done
 
 all-coverage:
 	@echo "Running all coverage tasks..."
-	@for dir in $(PROGRAM_DIRS); do \
+	@for dir in $(PROGRAM_DIRS) $(RUST_DIRS); do \
 		$(MAKE) -C $$dir all-coverage; \
 	done
+
+ci-unit-coverage:
+	@echo "Running CI unit tests with coverage for core + indexer..."
+	@$(MAKE) -C core unit-coverage
+	@$(MAKE) -C indexer unit-coverage
 
 #############
 # Integration Test Setup
@@ -246,6 +251,7 @@ help:
 	@echo "Testing:"
 	@echo "  unit-test            - Run unit tests for all projects"
 	@echo "  ci-unit-test         - Run CI unit tests for core + indexer"
+	@echo "  ci-unit-coverage     - Run CI unit tests with coverage for core + indexer"
 	@echo "  integration-test     - Run integration tests for all projects"
 	@echo "  ci-integration-test  - Build prod artifacts, build test-tree, run CI integration suites"
 	@echo "  ci-integration-test-build-test-tree - Run prebuilt test, then test-tree indexer integration"

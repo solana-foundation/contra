@@ -2,7 +2,7 @@ name: Combined Coverage Report
 
 on:
   workflow_run:
-    workflows: ["Program Unit Tests", "Program Integration Tests"]
+    workflows: ["Program Unit Tests", "Program Integration Tests", "Rust Checks"]
     types:
       - completed
   workflow_dispatch:
@@ -52,6 +52,14 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
+      - name: Download rust unit coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-unit-coverage-reports
+          path: coverage-artifacts/rust-unit
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
 
       - name: Setup coverage tools
         run: |
@@ -59,50 +67,52 @@ jobs:
           npm install -g lcov-result-merger
           sudo apt-get update && sudo apt-get install -y bc jq
 
-      - name: Combine Rust coverage reports
+      - name: Combine coverage reports
         run: |
-          if [ -f coverage-artifacts/unit/coverage-unit.lcov ] && [ -f coverage-artifacts/integration/coverage-integration.lcov ]; then
-            echo "Combining Rust coverage reports..."
+          # Merge all available lcov files into a single combined report
+          if ls coverage-artifacts/**/*.lcov 1>/dev/null 2>&1; then
+            echo "Combining coverage reports..."
             lcov-result-merger 'coverage-artifacts/**/*.lcov' coverage-combined.lcov
-            echo "✅ Combined coverage report generated"
+            echo "Combined coverage report generated"
           else
-            echo "⚠️ Some coverage reports are missing, skipping combination"
+            echo "No coverage reports found, skipping combination"
           fi
 
       - name: Generate coverage summary
         id: coverage-summary
         run: |
-          echo "📊 Coverage Summary Report"
-          echo "========================="
-          
+          echo "Coverage Summary Report"
+          echo "======================="
+
           # Initialize coverage summary
           COVERAGE_SUMMARY=""
-          
-          # Parse Rust Unit Test coverage
-          if [ -f coverage-artifacts/unit/coverage-unit.lcov ]; then
-            echo "## Rust Unit Tests"
-            LINES_FOUND=$(grep -E "^LF:" coverage-artifacts/unit/coverage-unit.lcov | awk -F: '{sum += $2} END {print sum}')
-            LINES_HIT=$(grep -E "^LH:" coverage-artifacts/unit/coverage-unit.lcov | awk -F: '{sum += $2} END {print sum}')
-            if [ "$LINES_FOUND" -gt 0 ]; then
-              RUST_UNIT_COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_FOUND" | bc)
-              echo "Rust Unit Tests: ${RUST_UNIT_COV}%"
-              COVERAGE_SUMMARY="${COVERAGE_SUMMARY}**Rust Unit Tests:** ${RUST_UNIT_COV}%\n"
+
+          # Helper: parse an lcov file and append to summary
+          parse_lcov() {
+            local file="$1" label="$2"
+            if [ -f "$file" ]; then
+              LINES_FOUND=$(grep -E "^LF:" "$file" | awk -F: '{sum += $2} END {print sum}')
+              LINES_HIT=$(grep -E "^LH:" "$file" | awk -F: '{sum += $2} END {print sum}')
+              if [ "$LINES_FOUND" -gt 0 ]; then
+                COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_FOUND" | bc)
+                echo "${label}: ${COV}%"
+                COVERAGE_SUMMARY="${COVERAGE_SUMMARY}**${label}:** ${COV}%\n"
+              fi
             fi
-          fi
-          
-          # Parse Rust Integration Test coverage  
-          if [ -f coverage-artifacts/integration/coverage-integration.lcov ]; then
-            echo "## Rust Integration Tests"
-            LINES_FOUND=$(grep -E "^LF:" coverage-artifacts/integration/coverage-integration.lcov | awk -F: '{sum += $2} END {print sum}')
-            LINES_HIT=$(grep -E "^LH:" coverage-artifacts/integration/coverage-integration.lcov | awk -F: '{sum += $2} END {print sum}')
-            if [ "$LINES_FOUND" -gt 0 ]; then
-              RUST_INT_COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_FOUND" | bc)
-              echo "Rust Integration Tests: ${RUST_INT_COV}%"
-              COVERAGE_SUMMARY="${COVERAGE_SUMMARY}**Rust Integration Tests:** ${RUST_INT_COV}%\n"
-            fi
-          fi
-          
-          
+          }
+
+          # Program unit coverage (downloaded into coverage-artifacts/unit/coverage/)
+          parse_lcov "coverage-artifacts/unit/coverage/coverage-escrow-unit.lcov" "Escrow Unit Tests"
+          parse_lcov "coverage-artifacts/unit/coverage/coverage-withdraw-unit.lcov" "Withdraw Unit Tests"
+
+          # Program integration coverage (downloaded into coverage-artifacts/integration/coverage/)
+          parse_lcov "coverage-artifacts/integration/coverage/coverage-escrow-integration.lcov" "Escrow Integration Tests"
+          parse_lcov "coverage-artifacts/integration/coverage/coverage-withdraw-integration.lcov" "Withdraw Integration Tests"
+
+          # Core + indexer unit coverage (downloaded into coverage-artifacts/rust-unit/coverage/)
+          parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-core-unit.lcov" "Core Unit Tests"
+          parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-indexer-unit.lcov" "Indexer Unit Tests"
+
           # Save summary for PR comment
           echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_OUTPUT
           echo -e "$COVERAGE_SUMMARY" >> $GITHUB_OUTPUT

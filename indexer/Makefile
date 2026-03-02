@@ -2,6 +2,7 @@
 .PHONY: compose-indexer compose-operator compose-all
 .PHONY: start-validator run-yellowstone run-rpc run-operator
 .PHONY: unit-test all-test
+.PHONY: unit-coverage coverage-html
 .PHONY: run-mock-transactions
 .PHONY: yellowstone-clone build-yellowstone-plugin clean-yellowstone
 
@@ -123,6 +124,24 @@ unit-test:
 	@echo "→ Testing rpc datasource..."
 	@cargo test --lib --features datasource-rpc
 	@echo "✅ All datasources tested"
+
+## Run unit tests with coverage (accumulates both feature variants)
+unit-coverage:
+	@echo "Running unit tests with coverage for indexer..."
+	@cargo llvm-cov clean --workspace
+	@echo "→ Coverage: yellowstone datasource..."
+	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
+	@echo "→ Coverage: rpc datasource..."
+	@cargo llvm-cov test --no-report --lib --features datasource-rpc
+	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov
+
+## Generate HTML coverage report (accumulates both feature variants)
+coverage-html:
+	@echo "Generating HTML coverage report for indexer..."
+	@cargo llvm-cov clean --workspace
+	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
+	@cargo llvm-cov test --no-report --lib --features datasource-rpc
+	@cargo llvm-cov report --html --output-dir ../coverage/coverage-indexer-html
 
 ## Test all
 all-test: unit-test

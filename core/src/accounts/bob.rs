@@ -325,6 +325,30 @@ impl TransactionProcessingCallback for BOB {
 }
 
 #[cfg(test)]
+pub(crate) fn create_test_bob() -> (BOB, mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>) {
+    use {
+        crate::accounts::{AccountsDB, PostgresAccountsDB},
+        sqlx::postgres::PgPoolOptions,
+        std::sync::Arc,
+    };
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://test@localhost:1/test")
+        .expect("connect_lazy should not fail");
+    let db = AccountsDB::Postgres(PostgresAccountsDB {
+        pool: Arc::new(pool),
+        read_only: true,
+    });
+    let (tx, rx) = mpsc::unbounded_channel();
+    let bob = BOB {
+        accounts: HashMap::new(),
+        precompiles: HashMap::new(),
+        settled_accounts_rx: rx,
+        accounts_db: db,
+    };
+    (bob, tx)
+}
+
+#[cfg(test)]
 mod tests {
     use {
         super::*,

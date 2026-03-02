@@ -96,3 +96,107 @@ pub async fn run_fetcher(
     info!("Fetcher stopped gracefully");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::common::models::{DbTransaction, TransactionStatus};
+    use crate::storage::common::storage::mock::MockStorage;
+    use chrono::Utc;
+    use std::time::Duration;
+
+    fn test_config() -> OperatorConfig {
+        OperatorConfig {
+            db_poll_interval: Duration::from_millis(50),
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay: Duration::from_millis(100),
+            channel_buffer_size: 100,
+            rpc_commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed,
+            alert_webhook_url: None,
+            reconciliation_interval: Duration::from_secs(300),
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url: None,
+        }
+    }
+
+    fn make_test_transaction(sig: &str) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id: 1,
+            signature: sig.to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "init".to_string(),
+            recipient: "recv".to_string(),
+            mint: "mint".to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status: TransactionStatus::Pending,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_first_poll_exits_ok() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let (tx, _rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+        token.cancel(); // cancel immediately
+
+        let result = run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pending_transactions_sent_to_channel() {
+        let mock = MockStorage::new();
+        let txn = make_test_transaction("sig1");
+        mock.pending_transactions.lock().unwrap().push(txn);
+
+        let storage = Arc::new(Storage::Mock(mock));
+        let (tx, mut rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move {
+            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token_clone).await
+        });
+
+        // Wait for the transaction to come through
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for transaction")
+            .expect("channel closed");
+        assert_eq!(received.signature, "sig1");
+
+        token.cancel();
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn channel_closed_returns_error() {
+        let mock = MockStorage::new();
+        let txn = make_test_transaction("sig2");
+        mock.pending_transactions.lock().unwrap().push(txn);
+
+        let storage = Arc::new(Storage::Mock(mock));
+        let (tx, rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+
+        drop(rx); // close receiver
+
+        let result = run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token).await;
+
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("Channel closed"), "got: {}", err_str);
+    }
+}

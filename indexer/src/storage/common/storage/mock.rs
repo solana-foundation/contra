@@ -12,6 +12,8 @@ pub struct MockStorage {
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
+    pub pending_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
+    pub inserted_transactions: std::sync::Arc<Mutex<Vec<Vec<DbTransaction>>>>,
 }
 
 impl MockStorage {
@@ -57,9 +59,26 @@ impl MockStorage {
 
     pub async fn insert_db_transactions_batch(
         &self,
-        _transactions: &[DbTransaction],
+        transactions: &[DbTransaction],
     ) -> Result<Vec<i64>, StorageError> {
-        Ok(vec![])
+        if self
+            .should_fail
+            .lock()
+            .unwrap()
+            .get("insert_db_transactions_batch")
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(StorageError::DatabaseError {
+                message: "Simulated insert_db_transactions_batch failure".to_string(),
+            });
+        }
+        self.inserted_transactions
+            .lock()
+            .unwrap()
+            .push(transactions.to_vec());
+        let ids: Vec<i64> = (1..=transactions.len() as i64).collect();
+        Ok(ids)
     }
 
     pub async fn get_pending_db_transactions(
@@ -75,7 +94,9 @@ impl MockStorage {
         _transaction_type: TransactionType,
         _limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        Ok(vec![])
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let result = pending.drain(..).collect();
+        Ok(result)
     }
 
     pub async fn get_committed_checkpoint(
@@ -126,7 +147,23 @@ impl MockStorage {
         Ok(())
     }
 
-    pub async fn upsert_mints_batch(&self, _mints: &[DbMint]) -> Result<(), StorageError> {
+    pub async fn upsert_mints_batch(&self, mints: &[DbMint]) -> Result<(), StorageError> {
+        if self
+            .should_fail
+            .lock()
+            .unwrap()
+            .get("upsert_mints_batch")
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(StorageError::DatabaseError {
+                message: "Simulated upsert_mints_batch failure".to_string(),
+            });
+        }
+        let mut store = self.mints.lock().unwrap();
+        for mint in mints {
+            store.insert(mint.mint_address.clone(), mint.clone());
+        }
         Ok(())
     }
 

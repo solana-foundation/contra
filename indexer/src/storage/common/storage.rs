@@ -174,3 +174,183 @@ impl Storage {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use mock::MockStorage;
+
+    fn make_mock_storage() -> (Storage, MockStorage) {
+        let mock = MockStorage::new();
+        let storage = Storage::Mock(mock.clone());
+        (storage, mock)
+    }
+
+    fn make_db_transaction() -> DbTransaction {
+        DbTransaction {
+            id: 0,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: "recipient".to_string(),
+            mint: "mint_addr".to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status: TransactionStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn init_schema_ok() {
+        let (storage, _) = make_mock_storage();
+        assert!(storage.init_schema().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn drop_tables_ok() {
+        let (storage, _) = make_mock_storage();
+        assert!(storage.drop_tables().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_ok() {
+        let (storage, _) = make_mock_storage();
+        assert!(storage.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn insert_db_transaction_returns_id() {
+        let (storage, _) = make_mock_storage();
+        let txn = make_db_transaction();
+        let id = storage.insert_db_transaction(&txn).await.unwrap();
+        assert_eq!(id, 1);
+    }
+
+    #[tokio::test]
+    async fn insert_db_transactions_batch_returns_sequential_ids() {
+        let (storage, _) = make_mock_storage();
+        let txns = vec![make_db_transaction(), make_db_transaction()];
+        let ids = storage.insert_db_transactions_batch(&txns).await.unwrap();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn get_pending_db_transactions_empty() {
+        let (storage, _) = make_mock_storage();
+        let txns = storage
+            .get_pending_db_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert!(txns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_and_lock_pending_transactions_drains() {
+        let (storage, mock) = make_mock_storage();
+        let txn = make_db_transaction();
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+
+        let result = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].signature, "test_sig");
+
+        // Second call should return empty (drained)
+        let result2 = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert!(result2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_transaction_status_ok() {
+        let (storage, _) = make_mock_storage();
+        assert!(storage
+            .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn upsert_mints_batch_stores_mints() {
+        let (storage, mock) = make_mock_storage();
+        let mint = DbMint::new("mint1".to_string(), 6, "TokenkegQf".to_string());
+        storage.upsert_mints_batch(&[mint]).await.unwrap();
+
+        let stored = mock.mints.lock().unwrap();
+        assert!(stored.contains_key("mint1"));
+    }
+
+    #[tokio::test]
+    async fn get_mint_existing() {
+        let (storage, mock) = make_mock_storage();
+        let mint = DbMint::new("mint1".to_string(), 6, "TokenkegQf".to_string());
+        mock.mints.lock().unwrap().insert("mint1".to_string(), mint);
+
+        let result = storage.get_mint("mint1").await.unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().decimals, 6);
+    }
+
+    #[tokio::test]
+    async fn get_mint_missing() {
+        let (storage, _) = make_mock_storage();
+        let result = storage.get_mint("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_mint_balances_for_reconciliation_empty() {
+        let (storage, _) = make_mock_storage();
+        let result = storage
+            .get_mint_balances_for_reconciliation()
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_mint_balances_for_reconciliation_with_data() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_mint_balances(vec![MintDbBalance {
+            mint_address: "mint1".to_string(),
+            token_program: "tp".to_string(),
+            total_deposits: 100,
+            total_withdrawals: 50,
+        }]);
+        let result = storage
+            .get_mint_balances_for_reconciliation()
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].total_deposits, 100);
+    }
+
+    #[tokio::test]
+    async fn get_escrow_balances_by_mint_empty() {
+        let (storage, _) = make_mock_storage();
+        let result = storage.get_escrow_balances_by_mint().await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_completed_withdrawal_nonces_empty() {
+        let (storage, _) = make_mock_storage();
+        let result = storage
+            .get_completed_withdrawal_nonces(0, 100)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+}

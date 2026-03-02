@@ -199,3 +199,97 @@ pub fn parse_program_error(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::transaction::TransactionError;
+
+    // ====================================================================
+    // is_mint_not_initialized_error
+    // ====================================================================
+
+    #[test]
+    fn mint_not_init_invalid_account_data() {
+        let err = TransactionError::InstructionError(0, InstructionError::InvalidAccountData);
+        let result = is_mint_not_initialized_error(&err);
+        assert!(matches!(
+            result,
+            Some(ConfirmationResult::MintNotInitialized)
+        ));
+    }
+
+    #[test]
+    fn mint_not_init_uninitialized_account() {
+        let err = TransactionError::InstructionError(0, InstructionError::UninitializedAccount);
+        let result = is_mint_not_initialized_error(&err);
+        assert!(matches!(
+            result,
+            Some(ConfirmationResult::MintNotInitialized)
+        ));
+    }
+
+    #[test]
+    fn mint_not_init_incorrect_program_id() {
+        let err = TransactionError::InstructionError(0, InstructionError::IncorrectProgramId);
+        let result = is_mint_not_initialized_error(&err);
+        assert!(matches!(
+            result,
+            Some(ConfirmationResult::MintNotInitialized)
+        ));
+    }
+
+    #[test]
+    fn mint_not_init_custom_error_returns_none() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(42));
+        assert!(is_mint_not_initialized_error(&err).is_none());
+    }
+
+    #[test]
+    fn mint_not_init_non_instruction_error_returns_none() {
+        let err = TransactionError::InsufficientFundsForFee;
+        assert!(is_mint_not_initialized_error(&err).is_none());
+    }
+
+    // ====================================================================
+    // parse_program_error
+    // ====================================================================
+
+    #[test]
+    fn parse_custom_12_invalid_smt_proof() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
+        let result = parse_program_error(&err);
+        assert!(matches!(
+            result,
+            Some(ContraEscrowProgramError::InvalidSmtProof)
+        ));
+    }
+
+    #[test]
+    fn parse_custom_13_invalid_nonce() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(13));
+        let result = parse_program_error(&err);
+        assert!(matches!(
+            result,
+            Some(ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex)
+        ));
+    }
+
+    #[test]
+    fn parse_custom_99_returns_none() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(99));
+        assert!(parse_program_error(&err).is_none());
+    }
+
+    #[test]
+    fn parse_non_custom_returns_none() {
+        let err = TransactionError::InstructionError(0, InstructionError::InvalidAccountData);
+        assert!(parse_program_error(&err).is_none());
+    }
+
+    #[test]
+    fn parse_non_instruction_error_returns_none() {
+        let err = TransactionError::InsufficientFundsForFee;
+        assert!(parse_program_error(&err).is_none());
+    }
+}

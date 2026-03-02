@@ -169,11 +169,6 @@ async fn test_truncate_apply_mode_e2e() -> Result<()> {
     assert_eq!(report.first_available_block, Some(3));
     assert!(report.backup_check.pg_dump_ok);
     assert!(report.backup_check.has_valid_backup());
-    assert!(report.vacuumed_tables.contains(&"blocks".to_string()));
-    assert!(report.vacuumed_tables.contains(&"transactions".to_string()));
-    assert!(report
-        .vacuumed_tables
-        .contains(&"account_history".to_string()));
 
     assert_eq!(count_rows(pool.as_ref(), "blocks").await?, 3);
     assert_eq!(count_rows(pool.as_ref(), "transactions").await?, 3);
@@ -241,7 +236,6 @@ async fn test_truncate_dry_run_e2e() -> Result<()> {
     assert_eq!(report.blocks_deleted, 2);
     assert_eq!(report.transactions_deleted, 2);
     assert_eq!(report.account_history_rows_deleted, 2);
-    assert!(report.vacuumed_tables.is_empty());
     assert!(report.backup_check.pg_dump_ok);
 
     assert_eq!(count_rows(pool.as_ref(), "blocks").await?, 5);

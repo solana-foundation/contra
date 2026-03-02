@@ -8,11 +8,10 @@ use {
         path::{Path, PathBuf},
         time::{Duration, SystemTime},
     },
-    tracing::warn,
 };
 
 const FIRST_AVAILABLE_BLOCK_KEY: &str = "first_available_block";
-const SLOT_COLUMN_CANDIDATES: &[&str] = &["slot", "updated_slot", "last_updated_slot"];
+const ACCOUNT_HISTORY_TABLE: &str = "account_history";
 
 #[derive(Debug, Clone)]
 pub struct TruncateOptions {
@@ -30,10 +29,8 @@ pub struct TruncateReport {
     pub blocks_deleted: u64,
     pub transactions_deleted: u64,
     pub account_history_rows_deleted: u64,
-    pub account_history_tables_touched: Vec<String>,
     pub backup_check: BackupCheckResult,
     pub first_available_block: Option<u64>,
-    pub vacuumed_tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -57,12 +54,6 @@ impl BackupCheckResult {
             pg_dump_reason: "Skipped: no rows eligible for truncation".to_string(),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct AccountHistoryTable {
-    name: String,
-    slot_column: String,
 }
 
 pub async fn truncate_slots(
@@ -90,13 +81,12 @@ pub async fn truncate_slots(
     };
 
     let truncate_before_slot = compute_truncate_before_slot(latest_slot, options.keep_slots);
-    let account_history_tables = discover_account_history_tables(pool.as_ref()).await?;
-    let account_history_rows_to_delete = count_account_history_rows_before(
-        pool.as_ref(),
-        &account_history_tables,
-        truncate_before_slot,
-    )
-    .await?;
+    let has_account_history = table_exists(pool.as_ref(), ACCOUNT_HISTORY_TABLE).await?;
+    let account_history_rows_to_delete = if has_account_history {
+        count_account_history_rows_before(pool.as_ref(), truncate_before_slot).await?
+    } else {
+        0
+    };
     let blocks_to_delete = count_blocks_before(pool.as_ref(), truncate_before_slot).await?;
 
     let should_truncate = blocks_to_delete > 0 || account_history_rows_to_delete > 0;
@@ -104,10 +94,6 @@ pub async fn truncate_slots(
     let mut report = TruncateReport {
         latest_slot: Some(latest_slot),
         truncate_before_slot: Some(truncate_before_slot),
-        account_history_tables_touched: account_history_tables
-            .iter()
-            .map(|t| t.name.clone())
-            .collect(),
         first_available_block: query_first_available_slot(pool.as_ref()).await?,
         ..TruncateReport::default()
     };
@@ -157,9 +143,11 @@ pub async fn truncate_slots(
     report.blocks_deleted = blocks_deleted;
     report.transactions_deleted = transactions_deleted;
 
-    let account_history_rows_deleted =
-        truncate_account_history_rows(pool.as_ref(), &account_history_tables, truncate_before_slot)
-            .await?;
+    let account_history_rows_deleted = if has_account_history {
+        truncate_account_history_rows(pool.as_ref(), truncate_before_slot).await?
+    } else {
+        0
+    };
     report.account_history_rows_deleted = account_history_rows_deleted;
 
     report.first_available_block = set_first_available_block_metadata(
@@ -168,21 +156,12 @@ pub async fn truncate_slots(
     )
     .await?;
 
-    let mut vacuum_targets = Vec::new();
     if blocks_deleted > 0 || transactions_deleted > 0 {
-        vacuum_targets.push("blocks".to_string());
-        vacuum_targets.push("transactions".to_string());
+        run_vacuum(pool.as_ref(), &["blocks", "transactions"]).await?;
     }
     if account_history_rows_deleted > 0 {
-        for table in &account_history_tables {
-            vacuum_targets.push(table.name.clone());
-        }
+        run_vacuum(pool.as_ref(), &[ACCOUNT_HISTORY_TABLE]).await?;
     }
-    vacuum_targets.sort();
-    vacuum_targets.dedup();
-
-    run_vacuum(pool.as_ref(), &vacuum_targets).await?;
-    report.vacuumed_tables = vacuum_targets;
 
     Ok(report)
 }
@@ -301,103 +280,35 @@ async fn process_block_batches(
     Ok((total_blocks, total_transactions))
 }
 
-async fn discover_account_history_tables(pool: &PgPool) -> Result<Vec<AccountHistoryTable>> {
-    let rows = sqlx::query(
-        "SELECT table_name
-         FROM information_schema.tables
-         WHERE table_schema = 'public'
-           AND table_name IN ('account_history', 'accounts_history')",
-    )
-    .fetch_all(pool)
-    .await
-    .context("Failed to discover account history tables")?;
-
-    let mut tables = Vec::new();
-
-    for row in rows {
-        let table_name: String = row.get("table_name");
-        let columns = sqlx::query(
-            "SELECT column_name
-             FROM information_schema.columns
-             WHERE table_schema = 'public'
-               AND table_name = $1",
-        )
-        .bind(&table_name)
-        .fetch_all(pool)
+async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool> {
+    let oid = sqlx::query_scalar::<_, Option<i64>>("SELECT to_regclass($1)::oid::bigint")
+        .bind(table_name)
+        .fetch_one(pool)
         .await
-        .with_context(|| format!("Failed to inspect columns for table {}", table_name))?;
-
-        let column_set: HashSet<String> = columns
-            .into_iter()
-            .map(|column_row| column_row.get::<String, _>("column_name"))
-            .collect();
-
-        let maybe_slot_column = SLOT_COLUMN_CANDIDATES
-            .iter()
-            .find(|candidate| column_set.contains(**candidate))
-            .map(|s| (*s).to_string());
-
-        match maybe_slot_column {
-            Some(slot_column) => tables.push(AccountHistoryTable {
-                name: table_name,
-                slot_column,
-            }),
-            None => warn!(
-                "Skipping account history table '{}' because no slot column was found among {:?}",
-                table_name, SLOT_COLUMN_CANDIDATES
-            ),
-        }
-    }
-
-    Ok(tables)
+        .with_context(|| format!("Failed to check existence of table {}", table_name))?;
+    Ok(oid.is_some())
 }
 
 async fn count_account_history_rows_before(
     pool: &PgPool,
-    tables: &[AccountHistoryTable],
     truncate_before_slot: u64,
 ) -> Result<u64> {
-    let mut total_rows = 0_u64;
-
-    for table in tables {
-        let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE {} < $1",
-            quote_ident(&table.name),
-            quote_ident(&table.slot_column)
-        );
-        let rows = sqlx::query_scalar::<_, i64>(&sql)
+    let count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM account_history WHERE slot < $1")
             .bind(truncate_before_slot as i64)
             .fetch_one(pool)
             .await
-            .with_context(|| format!("Failed counting rows for {}", table.name))?;
-        total_rows += rows as u64;
-    }
-
-    Ok(total_rows)
+            .context("Failed counting account_history rows")?;
+    Ok(count as u64)
 }
 
-async fn truncate_account_history_rows(
-    pool: &PgPool,
-    tables: &[AccountHistoryTable],
-    truncate_before_slot: u64,
-) -> Result<u64> {
-    let mut total_deleted = 0_u64;
-
-    for table in tables {
-        let sql = format!(
-            "DELETE FROM {} WHERE {} < $1",
-            quote_ident(&table.name),
-            quote_ident(&table.slot_column)
-        );
-        let result = sqlx::query(&sql)
-            .bind(truncate_before_slot as i64)
-            .execute(pool)
-            .await
-            .with_context(|| format!("Failed deleting old rows from {}", table.name))?;
-        total_deleted += result.rows_affected();
-    }
-
-    Ok(total_deleted)
+async fn truncate_account_history_rows(pool: &PgPool, truncate_before_slot: u64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM account_history WHERE slot < $1")
+        .bind(truncate_before_slot as i64)
+        .execute(pool)
+        .await
+        .context("Failed deleting old account_history rows")?;
+    Ok(result.rows_affected())
 }
 
 async fn set_first_available_block_metadata(
@@ -428,9 +339,9 @@ async fn set_first_available_block_metadata(
     }
 }
 
-async fn run_vacuum(pool: &PgPool, table_names: &[String]) -> Result<()> {
+async fn run_vacuum(pool: &PgPool, table_names: &[&str]) -> Result<()> {
     for table_name in table_names {
-        let sql = format!("VACUUM (ANALYZE) {}", quote_ident(table_name));
+        let sql = format!("VACUUM (ANALYZE) {}", table_name);
         pool.execute(sql.as_str())
             .await
             .with_context(|| format!("Failed to VACUUM table {}", table_name))?;
@@ -515,22 +426,37 @@ fn check_pg_dump_recency(pg_dump_path: Option<&Path>, max_backup_age: Duration) 
         return (false, "No pg_dump path supplied".to_string());
     };
 
-    let latest_backup = match latest_backup_time(path) {
-        Ok(value) => value,
-        Err(e) => return (false, e.to_string()),
+    if !path.is_file() {
+        return (
+            false,
+            format!("pg_dump path '{}' is not a file", path.display()),
+        );
+    }
+
+    let modified = match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                false,
+                format!(
+                    "Unable to read modified time for '{}': {}",
+                    path.display(),
+                    e
+                ),
+            )
+        }
     };
 
-    let age = match SystemTime::now().duration_since(latest_backup.1) {
-        Ok(duration) => duration,
-        Err(_) => Duration::from_secs(0),
-    };
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::from_secs(0));
 
     if age > max_backup_age {
         return (
             false,
             format!(
-                "Latest pg_dump artifact '{}' is {} seconds old (max allowed: {})",
-                latest_backup.0.display(),
+                "pg_dump artifact '{}' is {} seconds old (max allowed: {})",
+                path.display(),
                 age.as_secs(),
                 max_backup_age.as_secs()
             ),
@@ -541,69 +467,10 @@ fn check_pg_dump_recency(pg_dump_path: Option<&Path>, max_backup_age: Duration) 
         true,
         format!(
             "Recent pg_dump artifact '{}' found (age {} seconds)",
-            latest_backup.0.display(),
+            path.display(),
             age.as_secs()
         ),
     )
-}
-
-fn latest_backup_time(path: &Path) -> Result<(PathBuf, SystemTime)> {
-    if !path.exists() {
-        return Err(anyhow!("pg_dump path '{}' does not exist", path.display()));
-    }
-
-    if path.is_file() {
-        let modified = fs::metadata(path)
-            .with_context(|| format!("Unable to read metadata for '{}'", path.display()))?
-            .modified()
-            .with_context(|| format!("Unable to read modified time for '{}'", path.display()))?;
-        return Ok((path.to_path_buf(), modified));
-    }
-
-    if !path.is_dir() {
-        return Err(anyhow!(
-            "pg_dump path '{}' is neither a file nor a directory",
-            path.display()
-        ));
-    }
-
-    let mut latest: Option<(PathBuf, SystemTime)> = None;
-
-    for entry in fs::read_dir(path)
-        .with_context(|| format!("Unable to read pg_dump directory '{}'", path.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("Unable to read entry in '{}'", path.display()))?;
-        let entry_path = entry.path();
-
-        if !entry_path.is_file() {
-            continue;
-        }
-
-        let modified = entry
-            .metadata()
-            .with_context(|| format!("Unable to read metadata for '{}'", entry_path.display()))?
-            .modified()
-            .with_context(|| {
-                format!(
-                    "Unable to read modified time for '{}'",
-                    entry_path.display()
-                )
-            })?;
-
-        let should_replace = latest
-            .as_ref()
-            .map(|(_, ts)| modified > *ts)
-            .unwrap_or(true);
-        if should_replace {
-            latest = Some((entry_path, modified));
-        }
-    }
-
-    latest.context(format!(
-        "No backup files found in pg_dump directory '{}'",
-        path.display()
-    ))
 }
 
 async fn count_blocks_before(pool: &PgPool, truncate_before_slot: u64) -> Result<u64> {
@@ -633,10 +500,6 @@ async fn query_first_available_slot(pool: &PgPool) -> Result<Option<u64>> {
         .await
         .context("Failed to query first available slot")?;
     Ok(first_available_slot.map(|slot| slot as u64))
-}
-
-fn quote_ident(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn is_noop_archive_command(command: &str) -> bool {

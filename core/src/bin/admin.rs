@@ -116,10 +116,6 @@ async fn run(args: Args) -> Result<()> {
                 batch_size: truncate_args.batch_size,
                 dry_run: truncate_args.dry_run,
             };
-            if options.batch_size == 0 {
-                return Err(anyhow!("batch_size must be greater than 0"));
-            }
-
             let report = truncate_slots(&db, &options).await?;
             print_report(&report, truncate_args.dry_run);
         }
@@ -158,21 +154,5 @@ fn print_report(report: &TruncateReport, dry_run: bool) {
         "account_history_rows_deleted: {}",
         report.account_history_rows_deleted
     );
-    println!(
-        "account_history_tables: {}",
-        if report.account_history_tables_touched.is_empty() {
-            "(none)".to_string()
-        } else {
-            report.account_history_tables_touched.join(", ")
-        }
-    );
     println!("first_available_block: {:?}", report.first_available_block);
-    println!(
-        "vacuumed_tables: {}",
-        if report.vacuumed_tables.is_empty() {
-            "(none)".to_string()
-        } else {
-            report.vacuumed_tables.join(", ")
-        }
-    );
 }

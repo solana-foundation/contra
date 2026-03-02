@@ -37,15 +37,8 @@ async fn get_first_available_block_postgres(db: &PostgresAccountsDB) -> Result<u
 }
 
 fn decode_first_available_block(value: &[u8]) -> Option<u64> {
-    if value.len() == 8 {
-        let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(value);
-        return Some(u64::from_le_bytes(bytes));
-    }
-
-    std::str::from_utf8(value)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    let bytes: [u8; 8] = value.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
 }
 
 async fn get_first_available_block_redis(db: &RedisAccountsDB) -> Result<u64> {
@@ -67,12 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_first_available_block_supports_text_values() {
-        assert_eq!(decode_first_available_block(b"12345"), Some(12345));
-    }
-
-    #[test]
-    fn decode_first_available_block_rejects_invalid_values() {
-        assert_eq!(decode_first_available_block(b"not-a-slot"), None);
+    fn decode_first_available_block_rejects_wrong_length() {
+        assert_eq!(decode_first_available_block(b"short"), None);
     }
 }

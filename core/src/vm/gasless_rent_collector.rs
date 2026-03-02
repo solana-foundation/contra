@@ -60,12 +60,12 @@ mod tests {
     use solana_svm_rent_collector::svm_rent_collector::SVMRentCollector;
 
     #[test]
+    #[allow(deprecated)]
     fn test_collect_rent_returns_zero() {
         let collector = GaslessRentCollector::new();
         let pubkey = Pubkey::new_unique();
         let mut account = AccountSharedData::new(1000, 100, &Pubkey::new_unique());
 
-        #[allow(deprecated)]
         let info = collector.collect_rent(&pubkey, &mut account);
         assert_eq!(info.rent_amount, 0);
         assert_eq!(info.account_data_len_reclaimed, 0);

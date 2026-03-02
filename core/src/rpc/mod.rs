@@ -39,7 +39,7 @@ mod tests {
     use crate::test_helpers::create_test_sanitized_transaction;
     use solana_rpc_client_types::response::RpcPerfSample;
     use solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
+        account::AccountSharedData,
         hash::Hash,
         pubkey::Pubkey,
         signature::Keypair,
@@ -49,7 +49,7 @@ mod tests {
         ExecutedTransaction, TransactionExecutionDetails,
     };
     use solana_svm::transaction_processing_result::ProcessedTransaction;
-    use std::collections::{HashMap, HashSet, LinkedList};
+    use std::collections::{HashMap, LinkedList};
     use std::sync::{Arc, RwLock};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;

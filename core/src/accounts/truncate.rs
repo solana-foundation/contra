@@ -12,6 +12,8 @@ use {
 
 const FIRST_AVAILABLE_BLOCK_KEY: &str = "first_available_block";
 const ACCOUNT_HISTORY_TABLE: &str = "account_history";
+const TRUNCATE_ADVISORY_LOCK_ID: i64 = 0x434F4E_54525543; // "CONTRUC" as hex
+const MAX_BIND_PARAMS: usize = 60_000;
 
 #[derive(Debug, Clone)]
 pub struct TruncateOptions {
@@ -68,7 +70,31 @@ pub async fn truncate_slots(
     }
 
     let pool = db.pool.clone();
-    let latest_slot = query_latest_slot(pool.as_ref()).await?;
+
+    let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+        .bind(TRUNCATE_ADVISORY_LOCK_ID)
+        .fetch_one(pool.as_ref())
+        .await
+        .context("Failed to acquire advisory lock")?;
+    if !acquired {
+        return Err(anyhow!(
+            "Another truncation process is already running (advisory lock held)"
+        ));
+    }
+
+    let result = truncate_slots_inner(pool.as_ref(), options).await;
+
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(TRUNCATE_ADVISORY_LOCK_ID)
+        .execute(pool.as_ref())
+        .await
+        .context("Failed to release advisory lock")?;
+
+    result
+}
+
+async fn truncate_slots_inner(pool: &PgPool, options: &TruncateOptions) -> Result<TruncateReport> {
+    let latest_slot = query_latest_slot(pool).await?;
 
     let Some(latest_slot) = latest_slot else {
         return Ok(TruncateReport {
@@ -81,20 +107,20 @@ pub async fn truncate_slots(
     };
 
     let truncate_before_slot = compute_truncate_before_slot(latest_slot, options.keep_slots);
-    let has_account_history = table_exists(pool.as_ref(), ACCOUNT_HISTORY_TABLE).await?;
+    let has_account_history = table_exists(pool, ACCOUNT_HISTORY_TABLE).await?;
     let account_history_rows_to_delete = if has_account_history {
-        count_account_history_rows_before(pool.as_ref(), truncate_before_slot).await?
+        count_account_history_rows_before(pool, truncate_before_slot).await?
     } else {
         0
     };
-    let blocks_to_delete = count_blocks_before(pool.as_ref(), truncate_before_slot).await?;
+    let blocks_to_delete = count_blocks_before(pool, truncate_before_slot).await?;
 
     let should_truncate = blocks_to_delete > 0 || account_history_rows_to_delete > 0;
 
     let mut report = TruncateReport {
         latest_slot: Some(latest_slot),
         truncate_before_slot: Some(truncate_before_slot),
-        first_available_block: query_first_available_slot(pool.as_ref()).await?,
+        first_available_block: query_first_available_slot(pool).await?,
         ..TruncateReport::default()
     };
 
@@ -104,7 +130,7 @@ pub async fn truncate_slots(
     }
 
     let backup_check = verify_backup_readiness(
-        pool.as_ref(),
+        pool,
         options.pg_dump_path.as_deref(),
         options.max_backup_age,
     )
@@ -120,47 +146,34 @@ pub async fn truncate_slots(
     }
 
     if options.dry_run {
-        let (_, tx_count) = process_block_batches(
-            pool.as_ref(),
-            truncate_before_slot,
-            options.batch_size,
-            true,
-        )
-        .await?;
+        let (_, tx_count) =
+            process_block_batches(pool, truncate_before_slot, options.batch_size, true).await?;
         report.blocks_deleted = blocks_to_delete;
         report.transactions_deleted = tx_count;
         report.account_history_rows_deleted = account_history_rows_to_delete;
         return Ok(report);
     }
 
-    let (blocks_deleted, transactions_deleted) = process_block_batches(
-        pool.as_ref(),
-        truncate_before_slot,
-        options.batch_size,
-        false,
-    )
-    .await?;
+    let (blocks_deleted, transactions_deleted) =
+        process_block_batches(pool, truncate_before_slot, options.batch_size, false).await?;
     report.blocks_deleted = blocks_deleted;
     report.transactions_deleted = transactions_deleted;
 
     let account_history_rows_deleted = if has_account_history {
-        truncate_account_history_rows(pool.as_ref(), truncate_before_slot).await?
+        truncate_account_history_rows(pool, truncate_before_slot).await?
     } else {
         0
     };
     report.account_history_rows_deleted = account_history_rows_deleted;
 
-    report.first_available_block = set_first_available_block_metadata(
-        pool.as_ref(),
-        query_first_available_slot(pool.as_ref()).await?,
-    )
-    .await?;
+    report.first_available_block =
+        set_first_available_block_metadata(pool, query_first_available_slot(pool).await?).await?;
 
     if blocks_deleted > 0 || transactions_deleted > 0 {
-        run_vacuum(pool.as_ref(), &["blocks", "transactions"]).await?;
+        run_vacuum(pool, &["blocks", "transactions"]).await?;
     }
     if account_history_rows_deleted > 0 {
-        run_vacuum(pool.as_ref(), &[ACCOUNT_HISTORY_TABLE]).await?;
+        run_vacuum(pool, &[ACCOUNT_HISTORY_TABLE]).await?;
     }
 
     Ok(report)
@@ -245,18 +258,21 @@ async fn process_block_batches(
             .context("Failed to begin truncation transaction")?;
 
         if !signatures.is_empty() {
-            let mut builder: QueryBuilder<'_, Postgres> =
-                QueryBuilder::new("DELETE FROM transactions WHERE signature IN (");
-            let mut separated = builder.separated(", ");
-            for signature in signatures {
-                separated.push_bind(signature);
+            let sig_vec: Vec<Vec<u8>> = signatures.into_iter().collect();
+            for chunk in sig_vec.chunks(MAX_BIND_PARAMS) {
+                let mut builder: QueryBuilder<'_, Postgres> =
+                    QueryBuilder::new("DELETE FROM transactions WHERE signature IN (");
+                let mut separated = builder.separated(", ");
+                for signature in chunk {
+                    separated.push_bind(signature.clone());
+                }
+                separated.push_unseparated(")");
+                builder
+                    .build()
+                    .execute(&mut *tx)
+                    .await
+                    .context("Failed to delete old transactions")?;
             }
-            separated.push_unseparated(")");
-            builder
-                .build()
-                .execute(&mut *tx)
-                .await
-                .context("Failed to delete old transactions")?;
         }
 
         let mut builder: QueryBuilder<'_, Postgres> =

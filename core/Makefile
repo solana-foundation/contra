@@ -20,9 +20,11 @@ unit-test:
 # Run unit tests with coverage
 unit-coverage:
 	@echo "Running unit tests with coverage for contra-core..."
+	@mkdir -p ../coverage
 	@cargo llvm-cov --lib --lcov --output-path ../coverage/coverage-core-unit.lcov
 
 # Generate HTML coverage report
 coverage-html:
 	@echo "Generating HTML coverage report for contra-core..."
+	@mkdir -p ../coverage
 	@cargo llvm-cov --lib --html --output-dir ../coverage/coverage-core-html

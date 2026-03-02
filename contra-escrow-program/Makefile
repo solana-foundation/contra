@@ -62,11 +62,13 @@ all-test: unit-test integration-test
 # Run unit tests with coverage
 unit-coverage:
 	@echo "Running unit tests with coverage..."
+	@mkdir -p ../coverage
 	@cd program && cargo llvm-cov --lib --tests --lcov --output-path ../../coverage/coverage-escrow-unit.lcov
 
 # Run integration tests with coverage without build (for CI composition)
 integration-coverage-no-build:
 	@echo "Running integration tests with coverage..."
+	@mkdir -p ../coverage
 	@cd tests/integration-tests && cargo llvm-cov --lcov --output-path ../../../coverage/coverage-escrow-integration.lcov -- --nocapture
 
 # Run integration tests with coverage
@@ -75,6 +77,7 @@ integration-coverage: build integration-coverage-no-build
 # Generate HTML coverage report
 coverage-html:
 	@echo "Generating HTML coverage report..."
+	@mkdir -p ../coverage
 	@cd program && cargo llvm-cov --html --output-dir ../../coverage/coverage-escrow-html
 
 # Run all coverage tasks

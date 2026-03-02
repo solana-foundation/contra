@@ -128,6 +128,7 @@ unit-test:
 ## Run unit tests with coverage (accumulates both feature variants)
 unit-coverage:
 	@echo "Running unit tests with coverage for indexer..."
+	@mkdir -p ../coverage
 	@cargo llvm-cov clean --workspace
 	@echo "→ Coverage: yellowstone datasource..."
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
@@ -138,6 +139,7 @@ unit-coverage:
 ## Generate HTML coverage report (accumulates both feature variants)
 coverage-html:
 	@echo "Generating HTML coverage report for indexer..."
+	@mkdir -p ../coverage
 	@cargo llvm-cov clean --workspace
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
 	@cargo llvm-cov test --no-report --lib --features datasource-rpc

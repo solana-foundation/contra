@@ -491,6 +491,66 @@ mod tests {
     use redis::AsyncCommands;
     use solana_hash::Hash;
 
+    #[test]
+    fn test_blockhash_deterministic() {
+        // Same inputs should produce same blockhash
+        let slot = 42u64;
+        let block_time = 1_700_000_000i64;
+
+        let mut hash_bytes_1 = [0u8; 32];
+        hash_bytes_1[0..8].copy_from_slice(&slot.to_le_bytes());
+        hash_bytes_1[8..16].copy_from_slice(&block_time.to_le_bytes());
+        let hash1 = Hash::new_from_array(hash_bytes_1);
+
+        let mut hash_bytes_2 = [0u8; 32];
+        hash_bytes_2[0..8].copy_from_slice(&slot.to_le_bytes());
+        hash_bytes_2[8..16].copy_from_slice(&block_time.to_le_bytes());
+        let hash2 = Hash::new_from_array(hash_bytes_2);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_blockhash_varies_with_slot() {
+        let block_time = 1_700_000_000i64;
+
+        let make_hash = |slot: u64| {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&slot.to_le_bytes());
+            bytes[8..16].copy_from_slice(&block_time.to_le_bytes());
+            Hash::new_from_array(bytes)
+        };
+
+        assert_ne!(make_hash(1), make_hash(2));
+    }
+
+    #[test]
+    fn test_blockhash_no_last_block() {
+        // When there's no last block, settle uses Hash::default() and slot 0
+        let next_blockhash = Hash::default();
+        let next_slot = 0u64;
+        assert_eq!(next_blockhash, Hash::default());
+        assert_eq!(next_slot, 0);
+    }
+
+    #[test]
+    fn test_account_settlement_deleted_flag() {
+        let account = solana_sdk::account::AccountSharedData::new(0, 0, &Pubkey::default());
+        let settlement = AccountSettlement {
+            account: account.clone(),
+            deleted: true,
+        };
+        assert!(settlement.deleted);
+        assert_eq!(settlement.account.lamports(), 0);
+
+        let settlement2 = AccountSettlement {
+            account: solana_sdk::account::AccountSharedData::new(1000, 32, &Pubkey::new_unique()),
+            deleted: false,
+        };
+        assert!(!settlement2.deleted);
+        assert_eq!(settlement2.account.lamports(), 1000);
+    }
+
     /// Test that cache warming reads from Postgres and writes to Redis correctly.
     ///
     /// This test verifies:

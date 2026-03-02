@@ -117,6 +117,7 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
     WorkerHandle::new("Sequencer".to_string(), handle)
 }
 
+/// Visible to tests in this crate.
 fn process_and_send_batches(
     scheduler: &mut Scheduler,
     transactions: &[SanitizedTransaction],
@@ -160,4 +161,56 @@ fn process_and_send_batches(
     }
 
     batches_sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::create_test_sanitized_transaction;
+    use solana_sdk::signature::Keypair;
+
+    #[test]
+    fn test_single_tx_produces_batch() {
+        let mut scheduler = Scheduler::new_dag();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+
+        let from = Keypair::new();
+        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+
+        let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx);
+        assert!(sent >= 1);
+
+        // Should have received at least one batch
+        let batch = batch_rx.try_recv();
+        assert!(batch.is_ok());
+        assert!(!batch.unwrap().transactions.is_empty());
+    }
+
+    #[test]
+    fn test_empty_no_batches() {
+        let mut scheduler = Scheduler::new_dag();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+
+        let sent = process_and_send_batches(&mut scheduler, &[], &batch_tx);
+        assert_eq!(sent, 0);
+        assert!(batch_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_channel_closed_partial() {
+        let mut scheduler = Scheduler::new_dag();
+        let (batch_tx, batch_rx) = mpsc::unbounded_channel();
+
+        // Drop the receiver so sends will fail after the first
+        drop(batch_rx);
+
+        let from = Keypair::new();
+        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+
+        // Should not panic, just return 0 since channel is closed
+        let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx);
+        assert_eq!(sent, 0);
+    }
 }

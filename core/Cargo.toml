@@ -68,4 +68,7 @@ url = { workspace = true }
 [dev-dependencies]
 serial_test = "3.2.0"
 solana-logger = { workspace = true }
+tempfile = "3"
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

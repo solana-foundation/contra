@@ -18,3 +18,34 @@ pub fn read_not_enabled() -> ErrorObjectOwned {
 pub fn write_not_enabled() -> ErrorObjectOwned {
     custom_error(-32001, "Write operations not enabled")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_custom_error() {
+        let err = custom_error(-32000, "test error");
+        assert_eq!(err.code(), -32000);
+        assert_eq!(err.message(), "test error");
+    }
+
+    #[test]
+    fn test_read_not_enabled_code() {
+        let err = read_not_enabled();
+        assert_eq!(err.code(), -32002);
+        assert!(err.message().contains("Read"));
+    }
+
+    #[test]
+    fn test_write_not_enabled_code() {
+        let err = write_not_enabled();
+        assert_eq!(err.code(), -32001);
+        assert!(err.message().contains("Write"));
+    }
+
+    #[test]
+    fn test_json_rpc_server_error_constant() {
+        assert_eq!(JSON_RPC_SERVER_ERROR, -32000);
+    }
+}

@@ -19,7 +19,7 @@ use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
 use tracing::warn;
 
-const SPL_TOKEN_ID: Pubkey = spl_token::id();
+pub(crate) const SPL_TOKEN_ID: Pubkey = spl_token::id();
 
 // SPL Token instruction types
 const INSTRUCTION_INITIALIZE_MINT: u8 = 0;
@@ -82,6 +82,22 @@ impl AdminVm {
             },
             programs_modified_by_tx: HashMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn test_create_mint_account(
+        decimals: u8,
+        mint_authority: &[u8],
+        freeze_authority: Option<&[u8]>,
+    ) -> AccountSharedData {
+        Self::create_mint_account(decimals, mint_authority, freeze_authority)
+    }
+
+    #[cfg(test)]
+    pub fn test_create_executed_transaction(
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> ExecutedTransaction {
+        Self::create_executed_transaction(accounts)
     }
 
     pub fn load_and_execute_sanitized_transactions<CB: TransactionProcessingCallback>(
@@ -161,6 +177,99 @@ impl AdminVm {
             // TODO: Not implemented
             balance_collector: None,
             processing_results,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::account::ReadableAccount;
+    use spl_token::solana_program::program_pack::Pack;
+    use spl_token::state::Mint;
+
+    #[test]
+    fn test_create_mint_account_roundtrip() {
+        let authority = Pubkey::new_unique();
+        let account = AdminVm::create_mint_account(6, &authority.to_bytes(), None);
+
+        let mint = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint.decimals, 6);
+        assert!(mint.is_initialized);
+        assert_eq!(mint.supply, 0);
+        assert_eq!(mint.mint_authority, COption::Some(authority));
+        assert_eq!(mint.freeze_authority, COption::None);
+    }
+
+    #[test]
+    fn test_initialize_mint_with_freeze_authority() {
+        let authority = Pubkey::new_unique();
+        let freeze = Pubkey::new_unique();
+        let account =
+            AdminVm::create_mint_account(9, &authority.to_bytes(), Some(&freeze.to_bytes()));
+
+        let mint = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint.decimals, 9);
+        assert_eq!(mint.freeze_authority, COption::Some(freeze));
+    }
+
+    #[test]
+    fn test_create_executed_transaction_defaults() {
+        let executed = AdminVm::create_executed_transaction(vec![]);
+        assert!(executed.execution_details.status.is_ok());
+        assert_eq!(executed.execution_details.executed_units, 0);
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    #[test]
+    fn test_load_and_execute_unsupported_program() {
+        let vm = AdminVm::default();
+        // Build a SanitizedTransaction with a non-SPL program
+        let from = solana_sdk::signature::Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = crate::test_helpers::create_test_sanitized_transaction(&from, &to, 100);
+
+        let check_results = crate::processor::get_transaction_check_results(1);
+        let env = solana_svm::transaction_processor::TransactionProcessingEnvironment::default();
+        let config = solana_svm::transaction_processor::TransactionProcessingConfig::default();
+
+        // Use a dummy callback
+        struct DummyCb;
+        impl solana_svm_callback::TransactionProcessingCallback for DummyCb {
+            fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<AccountSharedData> {
+                None
+            }
+            fn account_matches_owners(
+                &self,
+                _account: &Pubkey,
+                _owners: &[Pubkey],
+            ) -> Option<usize> {
+                None
+            }
+        }
+        impl solana_svm_callback::InvokeContextCallback for DummyCb {}
+
+        let output = vm.load_and_execute_sanitized_transactions(
+            &DummyCb,
+            &[tx],
+            check_results,
+            &env,
+            &config,
+        );
+
+        // Should still produce a result (with empty accounts since program is unsupported)
+        assert_eq!(output.processing_results.len(), 1);
+        let result = output
+            .processing_results
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        match result {
+            ProcessedTransaction::Executed(executed) => {
+                assert!(executed.loaded_transaction.accounts.is_empty());
+            }
+            _ => panic!("Expected Executed variant"),
         }
     }
 }

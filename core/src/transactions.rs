@@ -50,4 +50,19 @@ mod tests {
         let random = Pubkey::new_unique();
         assert!(!is_admin_instruction(&random, 0));
     }
+
+    #[test]
+    fn test_is_allowed_instruction_spl_token() {
+        // SPL token transfer (type 3) should be allowed
+        assert!(is_allowed_instruction(&spl_token::id(), 3));
+        // SPL token initialize mint (type 0) should also be allowed
+        assert!(is_allowed_instruction(&spl_token::id(), 0));
+    }
+
+    #[test]
+    fn test_is_allowed_instruction_unknown() {
+        let random = Pubkey::new_unique();
+        assert!(!is_allowed_instruction(&random, 0));
+        assert!(!is_allowed_instruction(&random, 3));
+    }
 }

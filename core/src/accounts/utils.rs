@@ -100,3 +100,36 @@ pub fn encode_transaction_data(data: &[u8], encoding: UiTransactionEncoding) -> 
         UiTransactionEncoding::JsonParsed => STANDARD.encode(data),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_base58() {
+        let data = b"hello";
+        let encoded = encode_transaction_data(data, UiTransactionEncoding::Base58);
+        assert_eq!(encoded, bs58::encode(b"hello").into_string());
+        // Verify roundtrip
+        let decoded = bs58::decode(&encoded).into_vec().unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn test_encode_base64() {
+        let data = b"hello";
+        let encoded = encode_transaction_data(data, UiTransactionEncoding::Base64);
+        assert_eq!(encoded, STANDARD.encode(b"hello"));
+        // Verify roundtrip
+        let decoded = STANDARD.decode(&encoded).unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn test_encode_binary_same_as_base64() {
+        let data = b"test data";
+        let base64 = encode_transaction_data(data, UiTransactionEncoding::Base64);
+        let binary = encode_transaction_data(data, UiTransactionEncoding::Binary);
+        assert_eq!(base64, binary);
+    }
+}

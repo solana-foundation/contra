@@ -145,3 +145,71 @@ impl StoredTransaction {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::{
+        message::Message,
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use solana_system_interface::instruction as system_instruction;
+
+    fn make_stored_transaction() -> StoredTransaction {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let ix = system_instruction::transfer(&from.pubkey(), &to, 100);
+        let msg = Message::new(&[ix], Some(&from.pubkey()));
+        let tx = Transaction::new(&[&from], msg, solana_sdk::hash::Hash::default());
+
+        StoredTransaction {
+            slot: 42,
+            block_time: 1_700_000_000,
+            transaction: tx.into(),
+            meta: UiTransactionStatusMeta {
+                err: None,
+                status: Ok(()),
+                fee: 5000,
+                pre_balances: vec![100_000, 0],
+                post_balances: vec![94_900, 100],
+                inner_instructions: None.into(),
+                log_messages: None.into(),
+                pre_token_balances: None.into(),
+                post_token_balances: None.into(),
+                rewards: None.into(),
+                loaded_addresses: None.into(),
+                return_data: None.into(),
+                compute_units_consumed: Some(200).into(),
+                cost_units: None.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_transaction_with_status_meta_complete() {
+        let stored = make_stored_transaction();
+        let tx_with_meta = stored.transaction_with_status_meta();
+
+        match tx_with_meta {
+            TransactionWithStatusMeta::Complete(versioned) => {
+                assert_eq!(versioned.meta.fee, 5000);
+                assert_eq!(versioned.meta.pre_balances, vec![100_000, 0]);
+                assert_eq!(versioned.meta.post_balances, vec![94_900, 100]);
+            }
+            _ => panic!("Expected Complete variant"),
+        }
+    }
+
+    #[test]
+    fn test_ui_to_meta_basic() {
+        let stored = make_stored_transaction();
+        let meta = stored.ui_to_transaction_status_meta();
+
+        assert!(meta.status.is_ok());
+        assert_eq!(meta.fee, 5000);
+        assert_eq!(meta.pre_balances.len(), 2);
+        assert_eq!(meta.post_balances.len(), 2);
+        assert_eq!(meta.compute_units_consumed, Some(200));
+    }
+}

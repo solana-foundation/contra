@@ -150,3 +150,28 @@ pub fn get_transaction_check_results(
         len
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fork_graph_always_unknown() {
+        let fg = ContraForkGraph {};
+        assert_eq!(fg.relationship(0, 1), BlockRelation::Unknown);
+        assert_eq!(fg.relationship(100, 200), BlockRelation::Unknown);
+        assert_eq!(fg.relationship(0, 0), BlockRelation::Unknown);
+    }
+
+    #[test]
+    fn test_check_results_len() {
+        let results = get_transaction_check_results(5);
+        assert_eq!(results.len(), 5);
+        for r in &results {
+            assert!(r.is_ok());
+        }
+
+        let empty = get_transaction_check_results(0);
+        assert!(empty.is_empty());
+    }
+}

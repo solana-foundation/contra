@@ -60,10 +60,10 @@ jobs:
         with:
           name: integration-coverage-reports
           path: |
-            contra-escrow-program/coverage-*.lcov
-            contra-escrow-program/coverage-html-*/
-            contra-withdraw-program/coverage-*.lcov
-            contra-withdraw-program/coverage-html-*/
+            coverage/coverage-escrow-integration.lcov
+            coverage/coverage-escrow-html/
+            coverage/coverage-withdraw-integration.lcov
+            coverage/coverage-withdraw-html/
           retention-days: 30
 
       - name: Show failure logs

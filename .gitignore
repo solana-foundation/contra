@@ -34,3 +34,7 @@ integration/.yellowstone-grpc/
 .local/
 
 indexer/config/devnet/
+
+# Test coverage
+coverage/
+coverage-*.lcov

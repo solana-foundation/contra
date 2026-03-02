@@ -265,7 +265,7 @@ jobs:
         run: make integration-test-ci-indexer
 
   unit-tests:
-    name: Indexer Unit Tests
+    name: Core + Indexer Unit Coverage
     needs: [changes, build-artifacts]
     if: needs.changes.outputs.core_indexer == 'true'
     runs-on: contra-runner-1
@@ -275,11 +275,10 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          install-base-cargo-tools: "false"
           setup-node: "false"
           setup-pnpm: "false"
           install-dependencies: "false"
-          rust-components: rustfmt
+          rust-components: rustfmt,llvm-tools-preview
           setup-solana: "false"
           build-programs: "false"
 
@@ -291,5 +290,15 @@ jobs:
       - name: Restore shared artifacts
         run: tar -xzf ci-build-artifacts.tgz
 
-      - name: Run core + indexer unit tests
-        run: make unit-test-ci
+      - name: Run core + indexer unit tests with coverage
+        run: make ci-unit-coverage
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-unit-coverage-reports
+          path: |
+            coverage/coverage-core-unit.lcov
+            coverage/coverage-indexer-unit.lcov
+          retention-days: 7

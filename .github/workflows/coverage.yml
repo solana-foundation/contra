@@ -7,6 +7,10 @@ on:
       - completed
   workflow_dispatch:
 
+concurrency:
+  group: coverage-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_LOG: info
@@ -146,9 +150,11 @@ jobs:
       - name: Post coverage comment on PR
         if: github.event.workflow_run.event == 'pull_request'
         uses: actions/github-script@v7
+        env:
+          COVERAGE_SUMMARY: ${{ steps.coverage-summary.outputs.COVERAGE_SUMMARY }}
         with:
           script: |
-            const coverageSummary = `${{ steps.coverage-summary.outputs.COVERAGE_SUMMARY }}`;
+            const coverageSummary = process.env.COVERAGE_SUMMARY;
 
             const comment = `## Coverage Report
 

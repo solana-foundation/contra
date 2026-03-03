@@ -84,7 +84,7 @@ COPY indexer ./indexer
 
 # Resolve the symlink: copy the built .so into core/precompiles/
 # (the source symlink points to target/deploy/ which exists in the builder)
-RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
+RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
 
 RUN cargo build --release \
     -p contra-core \
@@ -104,7 +104,7 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1000 -s /bin/bash contra
 
 # Copy the binaries from builder
-COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/node
+COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/contra-node
 COPY --from=builder /usr/src/contra/target/release/activity /usr/local/bin/activity
 COPY --from=builder /usr/src/contra/target/release/admin /usr/local/bin/admin
 COPY --from=builder /usr/src/contra/target/release/gateway /usr/local/bin/gateway

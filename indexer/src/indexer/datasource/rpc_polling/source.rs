@@ -10,6 +10,7 @@ use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use crate::metrics;
 use tracing::{debug, error, info};
 
 pub struct RpcPollingSource {
@@ -97,8 +98,11 @@ impl DataSource for RpcPollingSource {
                     Ok(slots) => slots,
                     Err(e) => {
                         {
-                            // Scope error to ensure it's dropped before await
                             error!("Failed to get slots to process: {}", e);
+                            let pt_label = format!("{:?}", program_type);
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[pt_label.as_str(), "get_slots"])
+                                .inc();
                         }
                         tokio::time::sleep(Duration::from_millis(error_retry_interval_ms)).await;
                         continue;
@@ -158,6 +162,10 @@ impl DataSource for RpcPollingSource {
                         }
                         Err(e) => {
                             error!("Failed to fetch block {}: {}", slot, e);
+                            let pt_label = format!("{:?}", program_type);
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[pt_label.as_str(), "get_block"])
+                                .inc();
                         }
                     }
 

@@ -1,4 +1,6 @@
+use crate::config::ProgramType;
 use crate::error::StorageError;
+use crate::metrics;
 use crate::operator::sender::TransactionStatusUpdate;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::Storage;
@@ -17,6 +19,7 @@ pub struct DbTransactionWriter {
     update_rx: mpsc::Receiver<TransactionStatusUpdate>,
     webhook_client: WebhookClient,
     webhook_url: Option<String>,
+    program_type: ProgramType,
 }
 
 impl DbTransactionWriter {
@@ -24,6 +27,7 @@ impl DbTransactionWriter {
         storage: Arc<Storage>,
         update_rx: mpsc::Receiver<TransactionStatusUpdate>,
         webhook_url: Option<String>,
+        program_type: ProgramType,
     ) -> Self {
         let webhook_client = WebhookClient::new(
             Duration::from_secs(10),
@@ -35,6 +39,7 @@ impl DbTransactionWriter {
             update_rx,
             webhook_client,
             webhook_url,
+            program_type,
         }
     }
 
@@ -54,6 +59,7 @@ impl DbTransactionWriter {
     async fn handle_update(&self, update: TransactionStatusUpdate) {
         let is_failed = update.status == TransactionStatus::Failed;
         let trace_id = update.trace_id.as_deref().unwrap_or("none");
+        let pt = format!("{:?}", self.program_type);
         if let Err(e) = self
             .storage
             .update_transaction_status(
@@ -68,6 +74,9 @@ impl DbTransactionWriter {
                 trace_id = trace_id,
                 "Failed to update transaction {} status: {}", update.transaction_id, e
             );
+            metrics::OPERATOR_DB_UPDATE_ERRORS
+                .with_label_values(&[&pt])
+                .inc();
             if let Some(err_msg) = &update.error_message {
                 error!(trace_id = trace_id, "Transaction error was: {}", err_msg);
             }
@@ -76,6 +85,9 @@ impl DbTransactionWriter {
                 trace_id = trace_id,
                 "Updated transaction {} to status {:?}", update.transaction_id, update.status
             );
+            metrics::OPERATOR_DB_UPDATES
+                .with_label_values(&[&pt, &format!("{:?}", update.status)])
+                .inc();
         }
 
         if is_failed {
@@ -131,6 +143,7 @@ impl DbTransactionWriter {
 mod tests {
     use super::*;
     use crate::storage::common::models::TransactionStatus;
+    use crate::config::ProgramType;
     use crate::storage::common::storage::mock::MockStorage;
     use chrono::Utc;
     use mockito::Server;
@@ -161,7 +174,7 @@ mod tests {
         // Create DbTransactionWriter with mock webhook URL
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
 
         // Create a failed transaction update
         let update = create_test_update(TransactionStatus::Failed);
@@ -187,7 +200,7 @@ mod tests {
         // Create DbTransactionWriter with mock webhook URL
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
 
         // Create a failed transaction update
         let update = create_test_update(TransactionStatus::Failed);
@@ -218,7 +231,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
 
         let update = create_test_update(TransactionStatus::Failed);
 
@@ -235,7 +248,7 @@ mod tests {
         // Create DbTransactionWriter with invalid webhook URL
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, Some(invalid_url.to_string()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(invalid_url.to_string()), ProgramType::Escrow);
 
         // Create a failed transaction update
         let update = create_test_update(TransactionStatus::Failed);
@@ -251,7 +264,7 @@ mod tests {
         // Create DbTransactionWriter with NO webhook URL (None)
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, None);
+        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Escrow);
 
         // Create a failed transaction update
         let update = create_test_update(TransactionStatus::Failed);
@@ -271,7 +284,7 @@ mod tests {
         // Create DbTransactionWriter with invalid webhook URL
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, Some(invalid_url.to_string()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(invalid_url.to_string()), ProgramType::Escrow);
 
         // Create a failed transaction update
         let update = create_test_update(TransactionStatus::Failed);

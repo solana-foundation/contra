@@ -46,6 +46,7 @@ impl SenderState {
             retry_max_attempts,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
+            program_type: config.program_type,
         })
     }
 

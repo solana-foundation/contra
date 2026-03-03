@@ -4,12 +4,12 @@ This guide covers deploying Contra to [Railway](https://railway.com) as a multi-
 
 ## Architecture
 
-All services are built from a single Dockerfile that produces five binaries: `node`, `gateway`, `indexer`, `activity`, and `streamer`. Each Railway service runs the same Docker image with a different start command and environment variables.
+All services are built from a single Dockerfile that produces five binaries: `contra-node`, `gateway`, `indexer`, `activity`, and `streamer`. Each Railway service runs the same Docker image with a different start command and environment variables.
 
 | Railway Service | Binary | Role |
 |---|---|---|
-| `write-node` | `node` | Core write node (processes transactions) |
-| `read-node` | `node` | Core read node (serves queries) |
+| `write-node` | `contra-node` | Core write node (processes transactions) |
+| `read-node` | `contra-node` | Core read node (serves queries) |
 | `gateway` | `gateway` | Routes requests between write and read nodes |
 | `streamer` | `streamer` | WebSocket server streaming real-time Contra transactions to frontends |
 | `indexer-solana` | `indexer` | Indexes Solana transactions via Yellowstone gRPC |
@@ -73,8 +73,8 @@ Set the start command for each service in the Railway dashboard under **Settings
 
 | Service | Start Command |
 |---|---|
-| `write-node` | `/usr/local/bin/node` |
-| `read-node` | `/usr/local/bin/node` |
+| `write-node` | `/usr/local/bin/contra-node` |
+| `read-node` | `/usr/local/bin/contra-node` |
 | `gateway` | `/usr/local/bin/gateway` |
 | `indexer-solana` | `/usr/local/bin/indexer --config /etc/contra/config/railway/indexer-solana.toml -v indexer` |
 | `indexer-contra` | `/usr/local/bin/indexer --config /etc/contra/config/railway/indexer-contra.toml -v indexer` |
@@ -157,7 +157,8 @@ The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and mu
 | Variable | Value |
 |---|---|
 | `DATABASE_URL` | `postgres://user:pass@host:port/indexer` |
-| `COMMON_RPC_URL` | Solana RPC endpoint |
+| `COMMON_RPC_URL` | `http://${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8899` (Contra — where mint txs are sent) |
+| `COMMON_SOURCE_RPC_URL` | Solana RPC endpoint (devnet — where escrow state is read) |
 | `COMMON_ESCROW_INSTANCE_ID` | Escrow instance pubkey |
 | `ADMIN_SIGNER` | `memory` (or `vault` / `turnkey` / `privy`) |
 | `ADMIN_PRIVATE_KEY` | Admin private key (base58) |
@@ -387,4 +388,4 @@ console.log(result);
 
 - **Removed** `VOLUME` directive (Railway bans it; use Railway volumes instead)
 - **Added** `COPY indexer/config /etc/contra/config` to include config files in the runtime image
-- **Added** `RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so` to resolve the symlink during Docker build (the source `core/precompiles/contra_withdraw_program.so` is a symlink to `../../target/deploy/` which only exists after the program is built in the builder stage)
+- **Added** `RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so` to resolve the symlink during Docker build (the source `core/precompiles/contra_withdraw_program.so` is a symlink to `../../target/deploy/` which only exists after the program is built in the builder stage)

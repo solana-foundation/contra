@@ -10,6 +10,7 @@ use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::mpsc;
+use crate::metrics;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
@@ -252,6 +253,9 @@ pub(super) async fn send_and_confirm(
         }
     }
 
+    let pt = format!("{:?}", state.program_type);
+    let send_start = std::time::Instant::now();
+
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
         .await
     {
@@ -268,6 +272,17 @@ pub(super) async fn send_and_confirm(
             )
             .await;
 
+            let result_label = match &result {
+                Ok(ConfirmationResult::Confirmed) => "success",
+                _ => "failure",
+            };
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt.as_str(), result_label])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTIONS_SUBMITTED
+                .with_label_values(&[pt.as_str(), result_label])
+                .inc();
+
             handle_confirmation_result(
                 state,
                 result,
@@ -282,6 +297,12 @@ pub(super) async fn send_and_confirm(
             .await;
         }
         Err(e) => {
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt.as_str(), "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTIONS_SUBMITTED
+                .with_label_values(&[pt.as_str(), "error"])
+                .inc();
             error!("Failed to send transaction: {}", e);
             cleanup_failed_transaction(state, ctx.withdrawal_nonce);
             send_fatal_error(storage_tx, ctx, &e.to_string()).await;

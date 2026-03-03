@@ -6,6 +6,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
+use crate::metrics;
 #[cfg(feature = "datasource-rpc")]
 use tracing::warn;
 use tracing::{debug, error, info};
@@ -198,6 +199,10 @@ impl DataSource for YellowstoneSource {
                             "Yellowstone gRPC error: {}, reconnecting in 5s...",
                             error_msg
                         );
+                        let pt_label = format!("{:?}", program_type);
+                        metrics::INDEXER_RPC_ERRORS
+                            .with_label_values(&[pt_label.as_str(), "stream"])
+                            .inc();
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
                 }
@@ -405,6 +410,10 @@ async fn connect_and_stream(
             },
             Err(error) => {
                 error!("Geyser stream error: {error:?}");
+                let pt_label = format!("{:?}", program_type);
+                metrics::INDEXER_RPC_ERRORS
+                    .with_label_values(&[pt_label.as_str(), "stream"])
+                    .inc();
                 return Err(DataSourceRpcError::Protocol {
                     reason: format!("Stream error: {:?}", error),
                 }.into());

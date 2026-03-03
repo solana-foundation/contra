@@ -16,6 +16,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use crate::metrics;
 use tracing::{debug, error, info};
 
 /// Transaction processor that converts instructions to transactions and saves to DB
@@ -100,9 +101,16 @@ impl TransactionProcessor {
                         mints.len(),
                         slot
                     );
+                    let pt = format!("{:?}", program_type);
+                    metrics::INDEXER_MINTS_SAVED
+                        .with_label_values(&[&pt])
+                        .inc_by(mints.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save mints from slot {}: {}", slot, e);
+                    metrics::INDEXER_SLOT_SAVE_ERRORS
+                        .with_label_values(&[&format!("{:?}", program_type)])
+                        .inc();
                     send_checkpoint = false;
                 }
             }
@@ -126,10 +134,16 @@ impl TransactionProcessor {
                         ids.len(),
                         slot
                     );
+                    let pt = format!("{:?}", program_type);
+                    metrics::INDEXER_TRANSACTIONS_SAVED
+                        .with_label_values(&[&pt])
+                        .inc_by(ids.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save transactions from slot {}: {}", slot, e);
-                    // Don't send checkpoint if DB save failed
+                    metrics::INDEXER_SLOT_SAVE_ERRORS
+                        .with_label_values(&[&format!("{:?}", program_type)])
+                        .inc();
                     send_checkpoint = false;
                 }
             }
@@ -150,7 +164,16 @@ impl TransactionProcessor {
                 .await;
 
                 match res {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        let pt = format!("{:?}", program_type);
+                        metrics::INDEXER_SLOTS_PROCESSED
+                            .with_label_values(&[&pt])
+                            .inc();
+                        metrics::INDEXER_CURRENT_SLOT
+                            .with_label_values(&[&pt])
+                            .set(slot as f64);
+                        break;
+                    }
                     Err(e) => {
                         attempt += 1;
                         error!(

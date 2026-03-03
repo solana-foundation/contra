@@ -7,6 +7,7 @@ use crate::ProgramType;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use crate::metrics;
 use tracing::{error, info, warn};
 
 /// Fetches pending transactions from the database and sends them to the processor
@@ -41,6 +42,9 @@ pub async fn run_fetcher(
             Ok(transactions) => {
                 if !transactions.is_empty() {
                     info!("Fetched {} pending transactions", transactions.len());
+                    metrics::OPERATOR_TRANSACTIONS_FETCHED
+                        .with_label_values(&[&format!("{:?}", program_type)])
+                        .inc_by(transactions.len() as f64);
 
                     for transaction in transactions {
                         info!(

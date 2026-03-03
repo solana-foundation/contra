@@ -10,5 +10,4 @@ pub mod transactions;
 mod vm;
 pub mod webhook;
 
-#[cfg(test)]
-pub(crate) mod test_helpers;
+pub mod test_helpers;

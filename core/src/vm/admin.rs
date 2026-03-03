@@ -98,7 +98,10 @@ impl AdminVm {
             for (program_id, instruction) in tx.program_instructions_iter() {
                 match *program_id {
                     SPL_TOKEN_ID => {
-                        let instruction_type = instruction.data.first().unwrap();
+                        let Some(instruction_type) = instruction.data.first() else {
+                            warn!("[admin-vm] SPL Token instruction has empty data, skipping");
+                            continue;
+                        };
                         match *instruction_type {
                             INSTRUCTION_INITIALIZE_MINT => {
                                 // Parse InitializeMint instruction
@@ -294,18 +297,27 @@ mod tests {
     }
 
     #[test]
-    fn test_spl_empty_data_panics() {
-        // SPL Token instruction with empty data → panics on .first().unwrap()
+    fn test_spl_empty_data_skips_gracefully() {
+        // SPL Token instruction with empty data → skips without panic
         let tx = make_spl_tx(spl_token::id(), &[1], vec![]);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_admin_vm(&[tx])));
-        assert!(
-            result.is_err(),
-            "Expected panic on empty SPL instruction data"
-        );
+        let output = run_admin_vm(&[tx]);
+        assert_eq!(output.processing_results.len(), 1);
+        let result = output
+            .processing_results
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        match result {
+            ProcessedTransaction::Executed(executed) => {
+                assert!(executed.loaded_transaction.accounts.is_empty());
+            }
+            _ => panic!("Expected Executed variant"),
+        }
     }
 
     #[test]
-    fn test_spl_out_of_bounds_account_index_panics() {
+    fn test_spl_compiled_indices_prevent_oob() {
         // InitializeMint instruction where accounts[0] = 255 (way out of bounds)
         // data: [0 (InitializeMint), decimals, 32 bytes mint_authority]
         let mut data = vec![0u8; 34]; // type=0, decimals=6, then 32 bytes authority

@@ -93,11 +93,10 @@ impl MockStorage {
                 message: "Simulated insert_db_transactions_batch failure".to_string(),
             });
         }
-        self.inserted_transactions
-            .lock()
-            .unwrap()
-            .push(transactions.to_vec());
-        let ids: Vec<i64> = (1..=transactions.len() as i64).collect();
+        let mut store = self.inserted_transactions.lock().unwrap();
+        let base = store.iter().map(|b| b.len()).sum::<usize>() as i64;
+        store.push(transactions.to_vec());
+        let ids: Vec<i64> = (base + 1..=base + transactions.len() as i64).collect();
         Ok(ids)
     }
 

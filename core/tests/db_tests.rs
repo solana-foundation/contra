@@ -3,21 +3,19 @@
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 //! Requires Docker to be running.
 
-use contra_core::accounts::{traits::BlockInfo, AccountsDB};
+use contra_core::accounts::AccountsDB;
 use contra_core::stages::AccountSettlement;
+use contra_core::test_helpers::{create_test_block_info, create_test_sanitized_transaction};
 use solana_rpc_client_types::response::RpcPerfSample;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount},
     hash::Hash,
-    message::Message,
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::{SanitizedTransaction, Transaction},
+    signature::Keypair,
 };
 use solana_svm::transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails};
 use solana_svm::transaction_processing_result::ProcessedTransaction;
-use solana_system_interface::instruction as system_instruction;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -45,32 +43,8 @@ async fn start_postgres() -> (AccountsDB, testcontainers::ContainerAsync<Postgre
     (db, container)
 }
 
-fn make_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
-    BlockInfo {
-        slot,
-        blockhash,
-        previous_blockhash: Hash::default(),
-        parent_slot: slot.saturating_sub(1),
-        block_height: Some(slot),
-        block_time: Some(1_700_000_000 + slot as i64),
-        transaction_signatures: vec![],
-        transaction_recent_blockhashes: vec![],
-    }
-}
-
 fn make_account(lamports: u64, owner: &Pubkey) -> AccountSharedData {
     AccountSharedData::new(lamports, 0, owner)
-}
-
-fn create_test_sanitized_transaction(
-    from: &Keypair,
-    to: &Pubkey,
-    amount: u64,
-) -> SanitizedTransaction {
-    let instruction = system_instruction::transfer(&from.pubkey(), to, amount);
-    let message = Message::new(&[instruction], Some(&from.pubkey()));
-    let transaction = Transaction::new(&[from], message, Hash::default());
-    SanitizedTransaction::try_from_legacy_transaction(transaction, &HashSet::new()).unwrap()
 }
 
 fn make_executed_tx(accounts: Vec<(Pubkey, AccountSharedData)>) -> ProcessedTransaction {
@@ -169,7 +143,7 @@ async fn test_store_and_get_block() {
     let (mut db, _pg) = start_postgres().await;
 
     let blockhash = Hash::new_unique();
-    let block = make_block_info(42, blockhash);
+    let block = create_test_block_info(42, blockhash);
 
     db.store_block(block).await.unwrap();
 
@@ -186,7 +160,7 @@ async fn test_get_blocks_range() {
     let (mut db, _pg) = start_postgres().await;
 
     for slot in [5, 10, 15, 20, 25] {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }
@@ -199,7 +173,7 @@ async fn test_get_blocks_range() {
 async fn test_get_block_time() {
     let (mut db, _pg) = start_postgres().await;
 
-    let block = make_block_info(7, Hash::new_unique());
+    let block = create_test_block_info(7, Hash::new_unique());
     let expected_time = block.block_time;
     db.store_block(block).await.unwrap();
 
@@ -212,7 +186,7 @@ async fn test_get_first_available_block() {
     let (mut db, _pg) = start_postgres().await;
 
     for slot in [5, 10, 15] {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }
@@ -226,7 +200,7 @@ async fn test_get_blocks_in_range() {
     let (mut db, _pg) = start_postgres().await;
 
     for slot in [1, 2, 3, 4, 5] {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }
@@ -254,7 +228,7 @@ async fn test_write_batch_accounts_and_transactions() {
     let sig = *sanitized_tx.signature();
     let processed = make_executed_tx(vec![(pk, account.clone())]);
 
-    let block = make_block_info(1, Hash::new_unique());
+    let block = create_test_block_info(1, Hash::new_unique());
 
     let settlements = vec![(
         pk,
@@ -335,7 +309,7 @@ async fn test_write_batch_increments_tx_count() {
             (sig1, &tx1, 1, 100, &processed1),
             (sig2, &tx2, 1, 100, &processed2),
         ],
-        Some(make_block_info(1, Hash::new_unique())),
+        Some(create_test_block_info(1, Hash::new_unique())),
     )
     .await
     .unwrap();
@@ -357,7 +331,7 @@ async fn test_get_transaction_roundtrip() {
     db.write_batch(
         &[],
         vec![(sig, &sanitized_tx, 5, 1_700_000_005, &processed)],
-        Some(make_block_info(5, Hash::new_unique())),
+        Some(create_test_block_info(5, Hash::new_unique())),
     )
     .await
     .unwrap();
@@ -374,7 +348,7 @@ async fn test_latest_blockhash_after_write_batch() {
     let (mut db, _pg) = start_postgres().await;
 
     let blockhash = Hash::new_unique();
-    let block = make_block_info(10, blockhash);
+    let block = create_test_block_info(10, blockhash);
 
     db.write_batch(&[], vec![], Some(block)).await.unwrap();
 
@@ -387,7 +361,7 @@ async fn test_latest_slot() {
     let (mut db, _pg) = start_postgres().await;
 
     // store_block stores block data; get_latest_slot queries MAX(slot) FROM blocks
-    db.store_block(make_block_info(100, Hash::new_unique()))
+    db.store_block(create_test_block_info(100, Hash::new_unique()))
         .await
         .unwrap();
 
@@ -483,14 +457,16 @@ async fn test_latest_blockhash_after_store_block() {
     let (mut db, _pg) = start_postgres().await;
 
     let blockhash = Hash::new_unique();
-    db.store_block(make_block_info(1, blockhash)).await.unwrap();
+    db.store_block(create_test_block_info(1, blockhash))
+        .await
+        .unwrap();
 
     let latest = db.get_latest_blockhash().await.unwrap();
     assert_eq!(latest, blockhash);
 
     // Store another block and verify it updates
     let blockhash2 = Hash::new_unique();
-    db.store_block(make_block_info(2, blockhash2))
+    db.store_block(create_test_block_info(2, blockhash2))
         .await
         .unwrap();
     let latest2 = db.get_latest_blockhash().await.unwrap();
@@ -613,7 +589,7 @@ async fn test_truncate_nothing_to_delete() {
 
     // Store 5 blocks at slots 1-5
     for slot in 1..=5 {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }
@@ -644,7 +620,7 @@ async fn test_truncate_dry_run_with_pg_dump() {
 
     // Store 10 blocks at slots 1-10
     for slot in 1..=10 {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }
@@ -682,7 +658,7 @@ async fn test_truncate_actually_deletes_blocks() {
 
     // Store 10 blocks at slots 1-10
     for slot in 1..=10 {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }
@@ -731,7 +707,7 @@ async fn test_truncate_deletes_associated_transactions() {
         let sig = *tx.signature();
         let processed = make_executed_tx(vec![]);
 
-        let mut block = make_block_info(slot, Hash::new_unique());
+        let mut block = create_test_block_info(slot, Hash::new_unique());
         block.transaction_signatures = vec![sig];
 
         db.write_batch(
@@ -770,7 +746,7 @@ async fn test_truncate_fails_without_backup() {
 
     // Store blocks to trigger truncation
     for slot in 1..=10 {
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(create_test_block_info(slot, Hash::new_unique()))
             .await
             .unwrap();
     }

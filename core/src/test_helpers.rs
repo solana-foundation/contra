@@ -23,7 +23,6 @@ pub fn create_test_sanitized_transaction(
 }
 
 /// Create a BlockInfo with sensible defaults for a given slot.
-#[allow(dead_code)]
 pub fn create_test_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
     BlockInfo {
         slot,

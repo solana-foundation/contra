@@ -386,10 +386,15 @@ mod tests {
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage),
         };
+        // Keep tx alive so channel isn't closed — error must come from missing state
         let (_tx, rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, _sender_rx) = mpsc::channel(1);
 
         let result = process_release_funds(&mut ps, rx, sender_tx).await;
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(crate::error::OperatorError::MissingBuilder)),
+            "expected MissingBuilder, got: {:?}",
+            result
+        );
     }
 }

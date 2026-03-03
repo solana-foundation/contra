@@ -227,11 +227,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_db_transaction_returns_id() {
-        let (storage, _) = make_mock_storage();
+    async fn insert_db_transaction_records_and_returns_id() {
+        let (storage, mock) = make_mock_storage();
         let txn = make_db_transaction();
         let id = storage.insert_db_transaction(&txn).await.unwrap();
         assert_eq!(id, 1);
+
+        let recorded = mock.inserted_single_transactions.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].signature, "test_sig");
+    }
+
+    #[tokio::test]
+    async fn insert_db_transaction_respects_should_fail() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_should_fail("insert_db_transaction", true);
+        let txn = make_db_transaction();
+        assert!(storage.insert_db_transaction(&txn).await.is_err());
     }
 
     #[tokio::test]
@@ -250,6 +262,54 @@ mod tests {
             .await
             .unwrap();
         assert!(txns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_pending_db_transactions_filters_by_type() {
+        let (storage, mock) = make_mock_storage();
+        let deposit = make_db_transaction(); // Deposit
+        let mut withdrawal = make_db_transaction();
+        withdrawal.transaction_type = TransactionType::Withdrawal;
+        withdrawal.signature = "withdrawal_sig".to_string();
+
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            pending.push(deposit);
+            pending.push(withdrawal);
+        }
+
+        let deposits = storage
+            .get_pending_db_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert_eq!(deposits.len(), 1);
+        assert_eq!(deposits[0].signature, "test_sig");
+
+        let withdrawals = storage
+            .get_pending_db_transactions(TransactionType::Withdrawal, 10)
+            .await
+            .unwrap();
+        assert_eq!(withdrawals.len(), 1);
+        assert_eq!(withdrawals[0].signature, "withdrawal_sig");
+    }
+
+    #[tokio::test]
+    async fn get_pending_db_transactions_respects_limit() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            for i in 0..5 {
+                let mut txn = make_db_transaction();
+                txn.signature = format!("sig_{i}");
+                pending.push(txn);
+            }
+        }
+
+        let txns = storage
+            .get_pending_db_transactions(TransactionType::Deposit, 2)
+            .await
+            .unwrap();
+        assert_eq!(txns.len(), 2);
     }
 
     #[tokio::test]
@@ -274,12 +334,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_transaction_status_ok() {
-        let (storage, _) = make_mock_storage();
+    async fn get_and_lock_filters_type_and_respects_limit() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            for i in 0..3 {
+                let mut txn = make_db_transaction();
+                txn.signature = format!("dep_{i}");
+                pending.push(txn);
+            }
+            let mut w = make_db_transaction();
+            w.transaction_type = TransactionType::Withdrawal;
+            w.signature = "wd_0".to_string();
+            pending.push(w);
+        }
+
+        // Lock only 2 deposits
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 2)
+            .await
+            .unwrap();
+        assert_eq!(locked.len(), 2);
+
+        // 1 deposit + 1 withdrawal remain
+        let remaining = mock.pending_transactions.lock().unwrap();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_transaction_status_records_params() {
+        let (storage, mock) = make_mock_storage();
+        let now = Utc::now();
+        storage
+            .update_transaction_status(
+                42,
+                TransactionStatus::Completed,
+                Some("sig_abc".to_string()),
+                now,
+            )
+            .await
+            .unwrap();
+
+        let updates = mock.status_updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 42);
+        assert_eq!(updates[0].1, TransactionStatus::Completed);
+        assert_eq!(updates[0].2.as_deref(), Some("sig_abc"));
+    }
+
+    #[tokio::test]
+    async fn update_transaction_status_respects_should_fail() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_should_fail("update_transaction_status", true);
         assert!(storage
             .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now())
             .await
-            .is_ok());
+            .is_err());
     }
 
     #[tokio::test]

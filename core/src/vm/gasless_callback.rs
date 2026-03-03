@@ -51,7 +51,7 @@ impl<'a> TransactionProcessingCallback for GaslessCallback<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::bob::create_test_bob;
+    use crate::test_helpers::create_test_bob;
     use solana_svm_callback::TransactionProcessingCallback;
 
     #[tokio::test]

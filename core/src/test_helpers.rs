@@ -1,3 +1,4 @@
+use crate::accounts::traits::BlockInfo;
 use solana_sdk::{
     hash::Hash,
     message::Message,
@@ -6,8 +7,6 @@ use solana_sdk::{
 };
 use solana_system_interface::instruction as system_instruction;
 use std::collections::HashSet;
-
-use crate::accounts::traits::BlockInfo;
 
 /// Create a SanitizedTransaction transferring SOL between two keypairs.
 pub fn create_test_sanitized_transaction(
@@ -34,4 +33,30 @@ pub fn create_test_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
         transaction_signatures: vec![],
         transaction_recent_blockhashes: vec![],
     }
+}
+
+/// Create a BOB with empty state and a dummy (non-connecting) Postgres pool.
+/// The pool uses a bogus URL — any accidental DB call will fail with a
+/// connection timeout. Only for unit tests that stay in-memory.
+#[cfg(test)]
+pub(crate) fn create_test_bob() -> (
+    crate::accounts::bob::BOB,
+    tokio::sync::mpsc::UnboundedSender<
+        Vec<(solana_sdk::pubkey::Pubkey, crate::stages::AccountSettlement)>,
+    >,
+) {
+    use crate::accounts::{AccountsDB, PostgresAccountsDB};
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://test@localhost:1/test")
+        .expect("connect_lazy should not fail");
+    let db = AccountsDB::Postgres(PostgresAccountsDB {
+        pool: Arc::new(pool),
+        read_only: true,
+    });
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let bob = crate::accounts::bob::BOB::new_test(rx, db);
+    (bob, tx)
 }

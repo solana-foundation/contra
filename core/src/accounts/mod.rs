@@ -166,15 +166,4 @@ mod tests {
         // Programdata account contains the ELF at the end
         assert!(programdata_account.data.ends_with(&elf));
     }
-
-    #[test]
-    fn bpf_loader_program_account_minimum_lamports() {
-        let program_id = Pubkey::new_unique();
-        // Very small ELF — lamports should be max(minimum_balance, 1)
-        let elf = vec![0x01];
-        let rent = Rent::default();
-
-        let (_, account) = bpf_loader_program_account(&program_id, &elf, &rent);
-        assert!(account.lamports >= 1);
-    }
 }

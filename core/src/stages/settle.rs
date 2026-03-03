@@ -690,6 +690,45 @@ mod tests {
         assert!(result.account_settlements.is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_fees_only_records_signature_no_accounts() {
+        use solana_svm::account_loader::FeesOnlyTransaction;
+        use solana_svm::rollback_accounts::RollbackAccounts;
+
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let sig = *tx.signature();
+
+        // FeesOnly: transaction loaded but failed to execute (e.g., insufficient funds).
+        // SVM rolls back accounts and deducts fees, but no account changes are settled.
+        let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
+            load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
+            rollback_accounts: RollbackAccounts::FeePayerOnly {
+                fee_payer_account: solana_sdk::account::AccountSharedData::new(
+                    900,
+                    0,
+                    &solana_sdk_ids::system_program::ID,
+                ),
+            },
+            fee_details: Default::default(),
+        }));
+        let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(fees_only), tx)];
+
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
+
+        // Signature should be recorded in the block
+        let block = db.get_block(result.slot).await.unwrap();
+        assert!(block.transaction_signatures.contains(&sig));
+
+        // No account settlements — fees-only transactions don't modify accounts
+        assert!(result.account_settlements.is_empty());
+    }
+
     /// Test that cache warming reads from Postgres and writes to Redis correctly.
     ///
     /// This test verifies:

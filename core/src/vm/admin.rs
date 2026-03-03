@@ -84,22 +84,6 @@ impl AdminVm {
         }
     }
 
-    #[cfg(test)]
-    pub fn test_create_mint_account(
-        decimals: u8,
-        mint_authority: &[u8],
-        freeze_authority: Option<&[u8]>,
-    ) -> AccountSharedData {
-        Self::create_mint_account(decimals, mint_authority, freeze_authority)
-    }
-
-    #[cfg(test)]
-    pub fn test_create_executed_transaction(
-        accounts: Vec<(Pubkey, AccountSharedData)>,
-    ) -> ExecutedTransaction {
-        Self::create_executed_transaction(accounts)
-    }
-
     pub fn load_and_execute_sanitized_transactions<CB: TransactionProcessingCallback>(
         &self,
         _callbacks: &CB,

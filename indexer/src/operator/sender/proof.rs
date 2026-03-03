@@ -334,6 +334,7 @@ mod tests {
             .insert(5, (ctx, ReleaseFundsBuilder::new()));
         state.smt_state = Some(smt);
         state.retry_counts.insert(5, 2);
+        state.remint_cache.insert(5, make_test_remint_info(1, "t"));
 
         cleanup_failed_transaction(&mut state, Some(5));
 
@@ -341,6 +342,7 @@ mod tests {
         assert!(!smt.smt_state.contains_nonce(5));
         assert!(!smt.nonce_to_builder.contains_key(&5));
         assert!(!state.retry_counts.contains_key(&5));
+        assert!(!state.remint_cache.contains_key(&5));
     }
 
     #[test]

@@ -328,4 +328,59 @@ mod tests {
         // This verifies that webhook failures (network errors, 404, timeouts)
         // are logged but don't crash the transaction status update process
     }
+
+    #[tokio::test]
+    async fn test_webhook_payload_for_failed_reminted_status() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "transaction_id": 12345_i64,
+                "status": "failed_reminted",
+                "remint_signature": "remint_sig_abc",
+                "remint_status": "success",
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+
+        let update = TransactionStatusUpdate {
+            transaction_id: 12345,
+            trace_id: Some("trace_test_remint".to_string()),
+            status: TransactionStatus::FailedReminted,
+            counterpart_signature: None,
+            error_message: Some("withdrawal failed".to_string()),
+            processed_at: Some(Utc::now()),
+            remint_signature: Some("remint_sig_abc".to_string()),
+        };
+
+        writer.send_webhook_alert(&server.url(), &update).await;
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_failed_reminted_triggers_alerting() {
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, None);
+
+        let update = TransactionStatusUpdate {
+            transaction_id: 99,
+            trace_id: Some("trace_remint".to_string()),
+            status: TransactionStatus::FailedReminted,
+            counterpart_signature: None,
+            error_message: Some("release_funds failed".to_string()),
+            processed_at: Some(Utc::now()),
+            remint_signature: Some("sig123".to_string()),
+        };
+
+        // Should complete without panic — FailedReminted hits the alerting path
+        // even when no webhook URL is configured
+        writer.handle_update(update).await;
+    }
 }

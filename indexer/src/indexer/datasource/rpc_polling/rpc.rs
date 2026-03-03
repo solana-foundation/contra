@@ -333,6 +333,7 @@ mod tests {
                 })
                 .to_string(),
             )
+            .expect(1)
             .create_async()
             .await;
 
@@ -351,6 +352,7 @@ mod tests {
                 })
                 .to_string(),
             )
+            .expect(1)
             .create_async()
             .await;
 
@@ -373,6 +375,7 @@ mod tests {
                 })
                 .to_string(),
             )
+            .expect(1)
             .create_async()
             .await;
 

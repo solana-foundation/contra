@@ -691,3 +691,158 @@ pub(super) async fn send_fatal_error(
         .ok();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::MintCache;
+    use crate::storage::common::storage::mock::MockStorage;
+    use crate::storage::Storage;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use std::sync::Once;
+
+    static INIT_TEST_SIGNER: Once = Once::new();
+    fn ensure_test_signer() {
+        INIT_TEST_SIGNER.call_once(|| {
+            // Generate a throwaway keypair for tests that hit SignerUtil
+            let kp = solana_sdk::signer::keypair::Keypair::new();
+            let b58 = bs58::encode(kp.to_bytes()).into_string();
+            std::env::set_var("ADMIN_SIGNER", "memory");
+            std::env::set_var("ADMIN_PRIVATE_KEY", &b58);
+        });
+    }
+
+    fn make_sender_state() -> SenderState {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            crate::operator::RetryConfig::default(),
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ));
+        SenderState {
+            rpc_client: rpc,
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: MintCache::new(storage),
+            retry_max_attempts: 3,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            remint_cache: HashMap::new(),
+        }
+    }
+
+    fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
+        WithdrawalRemintInfo {
+            transaction_id: txn_id,
+            trace_id: format!("trace-{txn_id}"),
+            mint: solana_sdk::pubkey::Pubkey::new_unique(),
+            user: solana_sdk::pubkey::Pubkey::new_unique(),
+            user_ata: solana_sdk::pubkey::Pubkey::new_unique(),
+            token_program: spl_token::id(),
+            amount: 5000,
+        }
+    }
+
+    // ── handle_permanent_failure ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn permanent_failure_non_withdrawal_sends_failed_status() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let ctx = TransactionContext {
+            transaction_id: Some(42),
+            withdrawal_nonce: None, // not a withdrawal
+            trace_id: Some("trace-42".to_string()),
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "some error").await;
+
+        let update = storage_rx.try_recv().expect("should receive status update");
+        assert_eq!(update.transaction_id, 42);
+        assert_eq!(update.status, TransactionStatus::Failed);
+        assert_eq!(update.error_message.as_deref(), Some("some error"));
+        assert!(update.remint_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_withdrawal_no_cache_sends_failed_status() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Withdrawal nonce but nothing in remint_cache
+        let ctx = TransactionContext {
+            transaction_id: Some(7),
+            withdrawal_nonce: Some(99),
+            trace_id: Some("trace-7".to_string()),
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "max retries").await;
+
+        let update = storage_rx.try_recv().expect("should receive status update");
+        assert_eq!(update.status, TransactionStatus::Failed);
+        assert_eq!(update.error_message.as_deref(), Some("max retries"));
+        assert!(update.remint_signature.is_none());
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_withdrawal_with_cache_attempts_remint_and_reports_combined_error() {
+        ensure_test_signer();
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Populate remint cache — attempt_remint will fail (no real RPC)
+        state.remint_cache.insert(5, make_remint_info(10));
+
+        let ctx = TransactionContext {
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        let update = storage_rx.try_recv().expect("should receive status update");
+        assert_eq!(update.status, TransactionStatus::Failed);
+
+        // Error should contain both original and remint failure
+        let err = update.error_message.as_deref().unwrap();
+        assert!(
+            err.contains("release_funds failed"),
+            "should contain original error: {err}"
+        );
+        assert!(
+            err.contains("remint failed"),
+            "should contain remint failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_drains_remint_cache() {
+        ensure_test_signer();
+        let mut state = make_sender_state();
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        state.remint_cache.insert(5, make_remint_info(10));
+        assert!(state.remint_cache.contains_key(&5));
+
+        let ctx = TransactionContext {
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "error").await;
+
+        assert!(
+            !state.remint_cache.contains_key(&5),
+            "remint_cache entry should be consumed"
+        );
+    }
+}

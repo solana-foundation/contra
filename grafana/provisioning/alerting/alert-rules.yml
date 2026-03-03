@@ -1,0 +1,40 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: indexer-lag-alerts
+    folder: Contra Alerts
+    interval: 10s
+    rules:
+      - uid: indexer-lag-10s
+        title: "Indexer lag exceeds 10 seconds"
+        condition: C
+        for: 30s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} is {{ $values.A }} seconds behind chain tip"
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (contra_indexer_chain_tip_slot - contra_indexer_current_slot) * 0.4
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [10]
+              refId: C

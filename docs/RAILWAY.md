@@ -398,6 +398,7 @@ The grafana service needs these env vars to resolve datasource provisioning:
 | `POSTGRES_INDEXER_DB` | Indexer database name | `indexer` |
 | `POSTGRES_USER` | Postgres username | `postgres` |
 | `POSTGRES_PASSWORD` | Postgres password | *(from Railway Postgres instance)* |
+| `ALERT_WEBHOOK_URL` | Webhook URL for Grafana alerts | `https://hooks.slack.com/...` |
 
 ### Dashboards
 

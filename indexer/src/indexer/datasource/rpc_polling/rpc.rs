@@ -310,32 +310,69 @@ mod tests {
     async fn test_get_blocks_batch_multiple_blocks() {
         let mut server = Server::new_async().await;
 
-        // Mock expects 3 requests - mockito will match them in order
-        let _m1 = mock_rpc_success(
-            &mut server,
-            r#"{
-                "blockhash": "Block100",
-                "parentSlot": 99,
-                "transactions": []
-            }"#,
-        )
-        .await
-        .expect(1);
+        // Use body matchers so each mock responds to its specific slot,
+        // regardless of the order concurrent requests arrive.
+        let _m1 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [100]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": "Block100",
+                        "parentSlot": 99,
+                        "transactions": []
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
 
-        let _m2 = mock_rpc_error(&mut server, -32009, "Slot was skipped")
-            .await
-            .expect(1);
+        let _m2 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [101]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32009, "message": "Slot was skipped" },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
 
-        let _m3 = mock_rpc_success(
-            &mut server,
-            r#"{
-                "blockhash": "Block102",
-                "parentSlot": 101,
-                "transactions": []
-            }"#,
-        )
-        .await
-        .expect(1);
+        let _m3 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [102]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": "Block102",
+                        "parentSlot": 101,
+                        "transactions": []
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
 
         let poller = RpcPoller::new(
             server.url(),

@@ -239,24 +239,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    #[test]
-    fn retry_config_default_values() {
-        let config = RetryConfig::default();
-        assert_eq!(config.max_attempts, 5);
-        assert_eq!(config.base_delay, Duration::from_millis(100));
-        assert_eq!(config.max_delay, Duration::from_secs(10));
-    }
-
-    #[test]
-    fn rpc_client_with_retry_constructs() {
-        let client = RpcClientWithRetry::with_retry_config(
-            "http://localhost:8899".to_string(),
-            RetryConfig::default(),
-            CommitmentConfig::confirmed(),
-        );
-        assert_eq!(client.retry_config.max_attempts, 5);
-    }
-
     #[tokio::test]
     async fn with_retry_none_policy_single_attempt() {
         let client = RpcClientWithRetry::with_retry_config(

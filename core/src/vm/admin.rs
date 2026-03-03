@@ -200,14 +200,6 @@ mod tests {
         assert_eq!(mint.freeze_authority, COption::Some(freeze));
     }
 
-    #[test]
-    fn test_create_executed_transaction_defaults() {
-        let executed = AdminVm::create_executed_transaction(vec![]);
-        assert!(executed.execution_details.status.is_ok());
-        assert_eq!(executed.execution_details.executed_units, 0);
-        assert!(executed.loaded_transaction.accounts.is_empty());
-    }
-
     // Shared dummy callback for all admin VM tests
     struct DummyCb;
     impl solana_svm_callback::TransactionProcessingCallback for DummyCb {

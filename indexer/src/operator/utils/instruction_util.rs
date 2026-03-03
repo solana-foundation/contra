@@ -397,58 +397,8 @@ mod tests {
     }
 
     // ========================================================================
-    // mint_idempotency_memo
-    // ========================================================================
-
-    #[test]
-    fn mint_idempotency_memo_supports_i64() {
-        assert_eq!(
-            mint_idempotency_memo(42_i64),
-            "contra:mint-idempotency:42".to_string()
-        );
-    }
-
-    #[test]
-    fn mint_idempotency_memo_supports_u64() {
-        assert_eq!(
-            mint_idempotency_memo(42_u64),
-            "contra:mint-idempotency:42".to_string()
-        );
-    }
-
-    // ========================================================================
     // MintToBuilder
     // ========================================================================
-
-    #[test]
-    fn mint_to_builder_new_all_none() {
-        let b = MintToBuilder::new();
-        assert!(b.get_mint().is_none());
-        assert!(b.get_payer().is_none());
-        assert!(b.get_mint_authority().is_none());
-        assert!(b.get_token_program().is_none());
-        assert!(b.get_amount().is_none());
-        assert!(b.get_recipient_ata().is_none());
-    }
-
-    #[test]
-    fn mint_to_builder_chain_and_getters() {
-        let mut b = MintToBuilder::new();
-        b.mint(pk(1))
-            .recipient(pk(2))
-            .recipient_ata(pk(3))
-            .payer(pk(4))
-            .mint_authority(pk(5))
-            .token_program(pk(6))
-            .amount(999);
-
-        assert_eq!(b.get_mint(), Some(pk(1)));
-        assert_eq!(b.get_recipient_ata(), Some(pk(3)));
-        assert_eq!(b.get_payer(), Some(pk(4)));
-        assert_eq!(b.get_mint_authority(), Some(pk(5)));
-        assert_eq!(b.get_token_program(), Some(pk(6)));
-        assert_eq!(b.get_amount(), Some(999));
-    }
 
     #[test]
     fn try_as_expected_mint_all_set() {

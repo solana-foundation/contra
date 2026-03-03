@@ -35,7 +35,12 @@ pub async fn run_fetcher(
             info!("Fetcher received cancellation signal, stopping...");
             break;
         }
-        // Fetch pending withdrawals with row-level locking
+        if let Ok(count) = storage.count_pending_transactions(transaction_type).await {
+            metrics::OPERATOR_BACKLOG_DEPTH
+                .with_label_values(&[program_type.as_label()])
+                .set(count as f64);
+        }
+
         match storage
             .get_and_lock_pending_transactions(transaction_type, config.batch_size as i64)
             .await

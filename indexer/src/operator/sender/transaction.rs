@@ -208,6 +208,9 @@ pub async fn handle_transaction_submission(
                 }
             }
             Err(e) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[state.program_type.as_label(), "build_error"])
+                    .inc();
                 error!("Failed to build transaction: {}", e);
                 send_fatal_error(storage_tx, &ctx, &e.to_string()).await;
             }
@@ -233,6 +236,9 @@ pub(super) async fn send_and_confirm(
             RetryPolicy::Idempotent => {
                 let attempts = state.retry_counts.get(&nonce).copied().unwrap_or(0);
                 if attempts >= state.retry_max_attempts {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[state.program_type.as_label(), "max_retries_exceeded"])
+                        .inc();
                     error!(
                         "Max retries ({}) exceeded for withdrawal_nonce {}",
                         state.retry_max_attempts, nonce
@@ -280,9 +286,6 @@ pub(super) async fn send_and_confirm(
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, result_label])
                 .observe(send_start.elapsed().as_secs_f64());
-            metrics::OPERATOR_TRANSACTIONS_SUBMITTED
-                .with_label_values(&[pt, result_label])
-                .inc();
 
             handle_confirmation_result(
                 state,
@@ -301,8 +304,8 @@ pub(super) async fn send_and_confirm(
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, "error"])
                 .observe(send_start.elapsed().as_secs_f64());
-            metrics::OPERATOR_TRANSACTIONS_SUBMITTED
-                .with_label_values(&[pt, "error"])
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "rpc_send_error"])
                 .inc();
             error!("Failed to send transaction: {}", e);
             cleanup_failed_transaction(state, ctx.withdrawal_nonce);
@@ -324,11 +327,15 @@ fn handle_confirmation_result<'a>(
     storage_tx: &'a mpsc::Sender<TransactionStatusUpdate>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
+        let pt = state.program_type.as_label();
         match result {
             Ok(ConfirmationResult::Confirmed) => {
                 handle_success(state, ctx, signature, storage_tx).await;
             }
             Ok(ConfirmationResult::Failed(Some(ContraEscrowProgramError::InvalidSmtProof))) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "invalid_smt_proof"])
+                    .inc();
                 warn!("InvalidSmtProof - removing nonce and rebuilding with fresh proof");
                 if let (Some(nonce), Some(ref mut smt_state)) =
                     (ctx.withdrawal_nonce, state.smt_state.as_mut())
@@ -356,11 +363,17 @@ fn handle_confirmation_result<'a>(
             Ok(ConfirmationResult::Failed(Some(
                 ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
             ))) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "invalid_nonce_for_tree_index"])
+                    .inc();
                 error!("InvalidTransactionNonce - fatal error");
                 cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                 send_fatal_error(storage_tx, ctx, "Invalid nonce for tree index").await;
             }
             Ok(ConfirmationResult::MintNotInitialized) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "mint_not_initialized"])
+                    .inc();
                 if let Some(txn_id) = ctx.transaction_id {
                     if state.mint_builders.contains_key(&txn_id) {
                         warn!("Mint account not initialized - attempting JIT initialization");
@@ -396,6 +409,9 @@ fn handle_confirmation_result<'a>(
             }
             Ok(ConfirmationResult::Retry) => match retry_policy {
                 RetryPolicy::None => {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "confirmation_timeout_non_idempotent"])
+                        .inc();
                     error!("Confirmation failed for non-idempotent operation - status unknown, cannot retry");
                     cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                     send_fatal_error(
@@ -406,6 +422,9 @@ fn handle_confirmation_result<'a>(
                     .await;
                 }
                 RetryPolicy::Idempotent => {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "confirmation_timeout"])
+                        .inc();
                     warn!("Confirmation failed for idempotent operation - retrying (nonce protects against duplicates)");
                     send_and_confirm(
                         state,
@@ -420,11 +439,17 @@ fn handle_confirmation_result<'a>(
                 }
             },
             Ok(ConfirmationResult::Failed(program_error)) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "program_error"])
+                    .inc();
                 error!("Other program error: {:?}", program_error);
                 cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                 send_fatal_error(storage_tx, ctx, &format!("{:?}", program_error)).await;
             }
             Err(e) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "confirmation_error"])
+                    .inc();
                 error!("Confirmation error: {}", e);
                 cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                 send_fatal_error(storage_tx, ctx, &e.to_string()).await;
@@ -469,6 +494,10 @@ pub(super) async fn handle_success(
     // Handle Mint (transaction_id-based) transactions
     else if let Some(transaction_id) = ctx.transaction_id {
         info!("Updating database for transaction_id {}", transaction_id);
+
+        metrics::OPERATOR_MINTS_SENT
+            .with_label_values(&[state.program_type.as_label()])
+            .inc();
 
         cleanup_mint_builder(state, Some(transaction_id));
 

@@ -843,6 +843,23 @@ impl PostgresDb {
         Ok(())
     }
 
+    pub async fn count_pending_transactions_internal(
+        &self,
+        transaction_type: TransactionType,
+    ) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM transactions WHERE {} = $1 AND {} = $2",
+            transaction_cols::STATUS,
+            transaction_cols::TRANSACTION_TYPE,
+        ))
+        .bind(TransactionStatus::Pending)
+        .bind(transaction_type)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
     pub async fn get_completed_withdrawal_nonces_internal(
         &self,
         min_nonce: i64,

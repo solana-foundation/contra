@@ -61,8 +61,11 @@ impl TransactionProcessor {
                     self.current_slot_instructions.push(instruction_meta);
                 }
                 ProcessorMessage::SlotComplete { slot, program_type } => {
-                    // Finalize this slot (save txns + send checkpoint)
+                    let start = std::time::Instant::now();
                     self.finalize_and_checkpoint(slot, program_type).await;
+                    metrics::INDEXER_SLOT_PROCESSING_DURATION
+                        .with_label_values(&[program_type.as_label()])
+                        .observe(start.elapsed().as_secs_f64());
                 }
             }
         }

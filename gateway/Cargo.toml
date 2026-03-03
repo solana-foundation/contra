@@ -8,6 +8,7 @@ path = "src/lib.rs"
 
 [dependencies]
 clap = { workspace = true }
+contra-metrics = { path = "../metrics" }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }

@@ -22,7 +22,7 @@ Services **not** deployed to Railway:
 - **PostgreSQL** -- use a Railway-managed Postgres instance instead
 - **Solana Validator** -- connect to mainnet/devnet RPC
 - **Activity Generator** -- load testing tool, not for production
-- **Prometheus/Grafana/cAdvisor** -- monitoring stack, add later if needed
+- **cAdvisor** -- container metrics collector, not available on Railway (no Docker socket access)
 
 ## Prerequisites
 
@@ -373,6 +373,49 @@ console.log(result);
 "
 ```
 
+## Observability
+
+Prometheus and Grafana run as Railway services alongside the application services. The setup differs from local `docker-compose` in a few ways.
+
+### Differences from Local
+
+| Concern | Local (`docker-compose`) | Railway |
+|---|---|---|
+| Prometheus config | Single `prometheus.yml` with `${HOST_SUFFIX}` placeholders; `HOST_SUFFIX=` (empty) locally | `HOST_SUFFIX=.railway.internal` on Railway |
+| Prometheus datasource URL | `http://prometheus:9090` (compose network) | `http://prometheus.railway.internal:9090` (set via `PROMETHEUS_URL` env var on grafana) |
+| Postgres datasource URL | `postgres-indexer:5432` (compose network) | `postgres-nrto.railway.internal:5432` (set via `POSTGRES_INDEXER_HOST` env var on grafana) |
+| cAdvisor container metrics | Available (Docker socket mounted) | Not available (no Docker socket on Railway) |
+| Grafana dashboards | Mounted as read-only volume | Baked into Docker image via `Dockerfile.grafana` |
+
+### Grafana Environment Variables
+
+The grafana service needs these env vars to resolve datasource provisioning:
+
+| Variable | Purpose | Example |
+|---|---|---|
+| `PROMETHEUS_URL` | Prometheus datasource URL | `http://prometheus.railway.internal:9090` |
+| `POSTGRES_INDEXER_HOST` | Indexer Postgres hostname | `postgres-nrto.railway.internal` |
+| `POSTGRES_INDEXER_DB` | Indexer database name | `indexer` |
+| `POSTGRES_USER` | Postgres username | `postgres` |
+| `POSTGRES_PASSWORD` | Postgres password | *(from Railway Postgres instance)* |
+
+### Dashboards
+
+| Dashboard | Panels | Datasources |
+|---|---|---|
+| Contra Indexer | Infrastructure (CPU, memory, network, restarts), indexer metrics (slots, transactions, errors, lag), lag gauge | Prometheus |
+| Contra Operator | Infrastructure, operator metrics (fetched, backlog, sent, errors, DB updates), Solana RPC, withdrawal status breakdown, pending withdrawals over time | Prometheus, Postgres |
+| Contra RPC | Gateway request rates, latency, errors | Prometheus |
+
+### Deploying Observability Services
+
+```bash
+railway up --service prometheus
+railway up --service grafana
+```
+
+Prometheus uses `Dockerfile.prometheus` which runs `envsubst` at startup to interpolate `${HOST_SUFFIX}` into the config. Set `HOST_SUFFIX=.railway.internal` on the Railway prometheus service. No custom start command is needed — the Dockerfile handles it.
+
 ## Files Added for Railway
 
 | File | Purpose |
@@ -383,6 +426,13 @@ console.log(result);
 | `indexer/config/railway/operator-solana.toml` | Operator config (escrow program) |
 | `indexer/config/railway/operator-contra.toml` | Operator config (withdraw program) |
 | `admin-ui/Dockerfile` | Separate Dockerfile for the React/Vite admin UI |
+| `Dockerfile.grafana` | Grafana image with dashboards and provisioning baked in |
+| `Dockerfile.prometheus` | Prometheus image with `envsubst` entrypoint for `HOST_SUFFIX` interpolation |
+| `grafana/provisioning/datasources/prometheus.yml` | Grafana Prometheus datasource provisioning |
+| `grafana/provisioning/datasources/postgres.yml` | Grafana Postgres datasource provisioning (indexer DB) |
+| `grafana/dashboards/contra-indexer.json` | Indexer dashboard (infrastructure + indexer metrics + lag) |
+| `grafana/dashboards/contra-operator.json` | Operator dashboard (operator metrics + withdrawals) |
+| `grafana/dashboards/contra-rpc.json` | RPC/Gateway dashboard |
 
 ## Dockerfile Changes for Railway
 

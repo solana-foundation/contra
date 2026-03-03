@@ -95,19 +95,24 @@ impl DataSource for RpcPollingSource {
                     break;
                 }
                 // Get slots to process
-                let slots = match poller.get_slots_to_process(current_slot, batch_size).await {
-                    Ok(slots) => slots,
-                    Err(e) => {
-                        {
-                            error!("Failed to get slots to process: {}", e);
-                            metrics::INDEXER_RPC_ERRORS
-                                .with_label_values(&[program_type.as_label(), "get_slots"])
-                                .inc();
+                let (slots, chain_tip) =
+                    match poller.get_slots_to_process(current_slot, batch_size).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            {
+                                error!("Failed to get slots to process: {}", e);
+                                metrics::INDEXER_RPC_ERRORS
+                                    .with_label_values(&[program_type.as_label(), "get_slots"])
+                                    .inc();
+                            }
+                            tokio::time::sleep(Duration::from_millis(error_retry_interval_ms))
+                                .await;
+                            continue;
                         }
-                        tokio::time::sleep(Duration::from_millis(error_retry_interval_ms)).await;
-                        continue;
-                    }
-                };
+                    };
+                metrics::INDEXER_CHAIN_TIP_SLOT
+                    .with_label_values(&[program_type.as_label()])
+                    .set(chain_tip as f64);
 
                 // If no slots available, wait and retry
                 if slots.is_empty() {

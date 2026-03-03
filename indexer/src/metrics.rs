@@ -46,6 +46,34 @@ counter_vec!(
     &["program_type", "error_type"]
 );
 
+gauge_vec!(
+    INDEXER_CHAIN_TIP_SLOT,
+    "contra_indexer_chain_tip_slot",
+    "Latest slot on the Solana chain as seen by the datasource",
+    &["program_type"]
+);
+
+gauge_vec!(
+    INDEXER_BACKFILL_SLOTS_REMAINING,
+    "contra_indexer_backfill_slots_remaining",
+    "Remaining slots to backfill (0 when not backfilling)",
+    &["program_type"]
+);
+
+counter_vec!(
+    INDEXER_DATASOURCE_RECONNECTS,
+    "contra_indexer_datasource_reconnects_total",
+    "Total Yellowstone gRPC reconnections",
+    &["program_type"]
+);
+
+histogram_vec!(
+    INDEXER_SLOT_PROCESSING_DURATION,
+    "contra_indexer_slot_processing_duration_seconds",
+    "Time to process and checkpoint a slot",
+    &["program_type"]
+);
+
 // ---------------------------------------------------------------------------
 // Operator metrics
 // ---------------------------------------------------------------------------
@@ -55,13 +83,6 @@ counter_vec!(
     "contra_operator_transactions_fetched_total",
     "Total transactions fetched from the database",
     &["program_type"]
-);
-
-counter_vec!(
-    OPERATOR_TRANSACTIONS_SUBMITTED,
-    "contra_operator_transactions_submitted_total",
-    "Total transactions submitted to blockchain",
-    &["program_type", "status"]
 );
 
 counter_vec!(
@@ -85,6 +106,27 @@ histogram_vec!(
     &["program_type", "result"]
 );
 
+counter_vec!(
+    OPERATOR_TRANSACTION_ERRORS,
+    "contra_operator_transaction_errors_total",
+    "Total transaction errors by reason (includes retried errors)",
+    &["program_type", "error_reason"]
+);
+
+counter_vec!(
+    OPERATOR_MINTS_SENT,
+    "contra_operator_mints_sent_total",
+    "Total mint transactions successfully confirmed",
+    &["program_type"]
+);
+
+gauge_vec!(
+    OPERATOR_BACKLOG_DEPTH,
+    "contra_operator_backlog_depth",
+    "Number of pending transactions in the database",
+    &["program_type"]
+);
+
 pub fn init() {
     contra_metrics::init_metrics!(
         INDEXER_SLOTS_PROCESSED,
@@ -93,10 +135,16 @@ pub fn init() {
         INDEXER_SLOT_SAVE_ERRORS,
         INDEXER_CURRENT_SLOT,
         INDEXER_RPC_ERRORS,
+        INDEXER_CHAIN_TIP_SLOT,
+        INDEXER_BACKFILL_SLOTS_REMAINING,
+        INDEXER_DATASOURCE_RECONNECTS,
+        INDEXER_SLOT_PROCESSING_DURATION,
         OPERATOR_TRANSACTIONS_FETCHED,
-        OPERATOR_TRANSACTIONS_SUBMITTED,
         OPERATOR_DB_UPDATES,
         OPERATOR_DB_UPDATE_ERRORS,
         OPERATOR_RPC_SEND_DURATION,
+        OPERATOR_TRANSACTION_ERRORS,
+        OPERATOR_MINTS_SENT,
+        OPERATOR_BACKLOG_DEPTH,
     );
 }

@@ -143,21 +143,13 @@ pub(super) async fn rebuild_with_regenerated_proof(
         .expect("rebuild must have transaction_id");
     let trace_id = ctx.trace_id.expect("rebuild must have trace_id");
 
-    let remint_info = state.remint_cache.get(&nonce).cloned().unwrap_or_else(|| {
-        warn!(
-            "Missing remint_info for rebuild nonce {} - using defaults",
+    let remint_info = state.remint_cache.get(&nonce).cloned();
+    if remint_info.is_none() {
+        error!(
+            "Missing remint_info for rebuild nonce {} - remint will not be possible on failure",
             nonce
         );
-        crate::operator::utils::instruction_util::WithdrawalRemintInfo {
-            transaction_id,
-            trace_id: trace_id.clone(),
-            mint: solana_sdk::pubkey::Pubkey::default(),
-            user: solana_sdk::pubkey::Pubkey::default(),
-            user_ata: solana_sdk::pubkey::Pubkey::default(),
-            token_program: solana_sdk::pubkey::Pubkey::default(),
-            amount: 0,
-        }
-    });
+    }
 
     let builder_with_nonce = Box::new(ReleaseFundsBuilderWithNonce {
         builder,
@@ -188,7 +180,7 @@ pub(super) async fn rebuild_with_regenerated_proof(
 /// Cleanup SMT state and caches when transaction fails
 ///
 /// Removes the nonce from local SMT to keep it in sync with on-chain state.
-/// Also clears builder cache and retry counts.
+/// Also clears builder cache, retry counts, and remint cache.
 pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<u64>) {
     if let (Some(nonce), Some(ref mut smt_state)) = (nonce, state.smt_state.as_mut()) {
         if smt_state.smt_state.remove_nonce(nonce) {
@@ -196,6 +188,9 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
         }
         smt_state.nonce_to_builder.remove(&nonce);
         state.retry_counts.remove(&nonce);
+    }
+    if let Some(nonce) = nonce {
+        state.remint_cache.remove(&nonce);
     }
 
     mint::cleanup_mint_builder(state, nonce.map(|n| n as i64));
@@ -376,7 +371,7 @@ mod tests {
             nonce,
             transaction_id: 1,
             trace_id: "t".to_string(),
-            remint_info: make_test_remint_info(1, "t"),
+            remint_info: Some(make_test_remint_info(1, "t")),
         });
 
         let result =
@@ -401,7 +396,7 @@ mod tests {
             nonce: 3,
             transaction_id: 1,
             trace_id: "t".to_string(),
-            remint_info: make_test_remint_info(1, "t"),
+            remint_info: Some(make_test_remint_info(1, "t")),
         });
 
         let result =
@@ -418,7 +413,7 @@ mod tests {
             nonce: 0,
             transaction_id: 42,
             trace_id: "trace-42".to_string(),
-            remint_info: make_test_remint_info(42, "trace-42"),
+            remint_info: Some(make_test_remint_info(42, "trace-42")),
         });
 
         let result = smt.handle_release_funds_transaction(
@@ -453,7 +448,7 @@ mod tests {
                 nonce,
                 transaction_id: nonce as i64,
                 trace_id: format!("t-{nonce}"),
-                remint_info: make_test_remint_info(nonce as i64, &format!("t-{nonce}")),
+                remint_info: Some(make_test_remint_info(nonce as i64, &format!("t-{nonce}"))),
             });
             smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None)
                 .unwrap();

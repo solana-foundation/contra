@@ -117,7 +117,11 @@ impl DbTransactionWriter {
 
         let status_str = match update.status {
             TransactionStatus::FailedReminted => "failed_reminted",
-            _ => "failed",
+            TransactionStatus::Failed => "failed",
+            other => {
+                error!("Unexpected alertable status in webhook: {:?}", other);
+                "failed"
+            }
         };
 
         let remint_status: Option<&str> = if update.remint_signature.is_some() {

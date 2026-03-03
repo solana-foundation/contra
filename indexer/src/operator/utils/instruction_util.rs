@@ -178,7 +178,7 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub nonce: u64,
     pub transaction_id: i64,
     pub trace_id: String,
-    pub remint_info: WithdrawalRemintInfo,
+    pub remint_info: Option<WithdrawalRemintInfo>,
 }
 
 /// Builder for simple SPL token mint instructions (deposit flow)

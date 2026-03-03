@@ -49,11 +49,11 @@ impl SenderState {
 
         match tx_builder {
             TransactionBuilder::ReleaseFunds(builder_with_nonce) => {
-                // Cache remint info before SMT processing (which consumes the builder)
-                self.remint_cache.insert(
-                    builder_with_nonce.nonce,
-                    builder_with_nonce.remint_info.clone(),
-                );
+                // Cache remint info for potential recovery on permanent failure
+                if let Some(ref info) = builder_with_nonce.remint_info {
+                    self.remint_cache
+                        .insert(builder_with_nonce.nonce, info.clone());
+                }
 
                 // Initialize SMT state lazily if needed
                 if self.smt_state.is_none() {
@@ -535,8 +535,9 @@ pub(super) async fn handle_success(
 }
 
 /// Attempt to remint burned Contra tokens back to user after permanent withdrawal failure.
-/// Uses the same MintToBuilder + idempotency memo pattern as the deposit flow.
-/// Single attempt — does not retry on failure.
+/// Attempt to remint burned Contra tokens back to user after permanent withdrawal failure.
+/// Builds a MintTo instruction with an idempotency memo (same pattern as deposits).
+/// No sender-level retry — RPC-level retries may still occur via RpcClientWithRetry.
 async fn attempt_remint(
     state: &SenderState,
     info: &WithdrawalRemintInfo,
@@ -544,7 +545,7 @@ async fn attempt_remint(
     let memo = remint_idempotency_memo(info.transaction_id);
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
-    // Check idempotency first — maybe we already reminted in a previous run
+    // Build remint transaction with idempotency memo to prevent duplicate mints across restarts
     let mut builder = MintToBuilder::new();
     builder
         .mint(info.mint)
@@ -592,9 +593,9 @@ async fn attempt_remint(
 
 /// Handle permanent transaction failure with automatic remint for withdrawals.
 ///
-/// For withdrawal transactions: extracts remint info BEFORE cleanup (which destroys
-/// the builder cache), attempts to remint burned Contra tokens, then reports
-/// FailedReminted or Failed status accordingly.
+/// For withdrawal transactions: removes remint info from cache, runs cleanup
+/// (which removes the nonce from SMT and builder caches), then attempts to
+/// remint burned Contra tokens. Reports FailedReminted or Failed accordingly.
 ///
 /// For non-withdrawal transactions: delegates to send_fatal_error.
 pub(super) async fn handle_permanent_failure(
@@ -623,7 +624,7 @@ pub(super) async fn handle_permanent_failure(
                 signature
             );
             if let Some(transaction_id) = ctx.transaction_id {
-                send_guaranteed(
+                if let Err(e) = send_guaranteed(
                     storage_tx,
                     TransactionStatusUpdate {
                         transaction_id,
@@ -637,7 +638,18 @@ pub(super) async fn handle_permanent_failure(
                     "transaction status update",
                 )
                 .await
-                .ok();
+                {
+                    error!(
+                        "Failed to send FailedReminted status for txn {}: {}. \
+                         Remint sig {} confirmed on-chain but not recorded.",
+                        transaction_id, e, signature
+                    );
+                }
+            } else {
+                error!(
+                    "Remint succeeded (sig: {}) but no transaction_id to record status",
+                    signature
+                );
             }
         }
         Err(remint_error) => {

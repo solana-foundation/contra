@@ -523,17 +523,6 @@ pub async fn cleanup_after_backfill(
     Ok(())
 }
 
-/// Wait for a task to complete with periodic progress logging
-/// Returns success if task completes within timeout, error otherwise
-#[cfg(test)]
-pub(crate) async fn wait_with_progress_test<T>(
-    handle: tokio::task::JoinHandle<T>,
-    timeout: Duration,
-    task_name: &str,
-) -> Result<(), ()> {
-    wait_with_progress(handle, timeout, task_name).await
-}
-
 async fn wait_with_progress<T>(
     mut handle: tokio::task::JoinHandle<T>,
     timeout: Duration,
@@ -576,6 +565,14 @@ async fn wait_with_progress<T>(
 mod tests {
     use super::*;
     use crate::storage::common::storage::mock::MockStorage;
+
+    async fn wait_with_progress_test<T>(
+        handle: tokio::task::JoinHandle<T>,
+        timeout: Duration,
+        task_name: &str,
+    ) -> Result<(), ()> {
+        wait_with_progress(handle, timeout, task_name).await
+    }
 
     // ====================================================================
     // ShutdownConfig::default()

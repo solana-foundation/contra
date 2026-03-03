@@ -300,8 +300,8 @@ impl BOB {
 
 #[cfg(test)]
 impl BOB {
-    /// Create a BOB with empty accounts/precompiles and a dummy (non-connecting) DB pool.
-    /// Only for use in unit tests that don't touch the database.
+    /// Test-only constructor — needs private field access so it lives on the type.
+    /// The actual test helper that sets up the dummy DB pool is in test_helpers.rs.
     pub(crate) fn new_test(
         settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
         accounts_db: AccountsDB,

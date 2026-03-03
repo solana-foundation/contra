@@ -7,6 +7,10 @@
 .PHONY: yellowstone-clone build-yellowstone-plugin clean-yellowstone
 
 # Configuration
+# Files excluded from coverage — error enums, constants, CLI entrypoints, models.
+# These inflate the denominator without meaningful test value.
+COV_IGNORE := --ignore-filename-regex '(error/|constants\.rs|bin/|models\.rs|shutdown_utils\.rs)'
+
 CONTRA_ESCROW_PROGRAM_ID ?= GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
 CONTRA_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 CONTRA_ESCROW_PROGRAM_SO ?= ../target/deploy/contra_escrow_program.so
@@ -134,7 +138,7 @@ unit-coverage:
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
 	@echo "→ Coverage: rpc datasource..."
 	@cargo llvm-cov test --no-report --lib --features datasource-rpc
-	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov
+	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov $(COV_IGNORE)
 
 ## Generate HTML coverage report (accumulates both feature variants)
 coverage-html:
@@ -143,7 +147,7 @@ coverage-html:
 	@cargo llvm-cov clean --workspace
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
 	@cargo llvm-cov test --no-report --lib --features datasource-rpc
-	@cargo llvm-cov report --html --output-dir ../coverage/coverage-indexer-html
+	@cargo llvm-cov report --html --output-dir ../coverage/coverage-indexer-html $(COV_IGNORE)
 
 ## Run all coverage tasks
 all-coverage: unit-coverage coverage-html

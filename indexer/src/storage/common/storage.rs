@@ -175,6 +175,9 @@ impl Storage {
     }
 }
 
+/// MockStorage behavior tests — only test non-trivial mock logic (filtering, recording, failure).
+/// Tautological tests (mock returns Ok → assert Ok) are intentionally omitted.
+/// Real storage behavior is covered by postgres_db_test.rs integration tests.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,133 +211,39 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn init_schema_ok() {
-        let (storage, _) = make_mock_storage();
-        assert!(storage.init_schema().await.is_ok());
-    }
+    // ── insert recording + failure ───────────────────────────────────
 
     #[tokio::test]
-    async fn drop_tables_ok() {
-        let (storage, _) = make_mock_storage();
-        assert!(storage.drop_tables().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn close_ok() {
-        let (storage, _) = make_mock_storage();
-        assert!(storage.close().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn insert_db_transaction_records_and_returns_id() {
+    async fn insert_db_transaction_records_and_returns_incremental_ids() {
         let (storage, mock) = make_mock_storage();
-        let txn = make_db_transaction();
-        let id = storage.insert_db_transaction(&txn).await.unwrap();
-        assert_eq!(id, 1);
+        let id1 = storage
+            .insert_db_transaction(&make_db_transaction())
+            .await
+            .unwrap();
+        let id2 = storage
+            .insert_db_transaction(&make_db_transaction())
+            .await
+            .unwrap();
+        assert_ne!(id1, id2);
 
         let recorded = mock.inserted_single_transactions.lock().unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].signature, "test_sig");
+        assert_eq!(recorded.len(), 2);
     }
 
     #[tokio::test]
     async fn insert_db_transaction_respects_should_fail() {
         let (storage, mock) = make_mock_storage();
         mock.set_should_fail("insert_db_transaction", true);
-        let txn = make_db_transaction();
-        assert!(storage.insert_db_transaction(&txn).await.is_err());
+        assert!(storage
+            .insert_db_transaction(&make_db_transaction())
+            .await
+            .is_err());
     }
 
-    #[tokio::test]
-    async fn insert_db_transactions_batch_returns_sequential_ids() {
-        let (storage, _) = make_mock_storage();
-        let txns = vec![make_db_transaction(), make_db_transaction()];
-        let ids = storage.insert_db_transactions_batch(&txns).await.unwrap();
-        assert_eq!(ids, vec![1, 2]);
-    }
+    // ── pending transaction filtering ────────────────────────────────
 
     #[tokio::test]
-    async fn get_pending_db_transactions_empty() {
-        let (storage, _) = make_mock_storage();
-        let txns = storage
-            .get_pending_db_transactions(TransactionType::Deposit, 10)
-            .await
-            .unwrap();
-        assert!(txns.is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_pending_db_transactions_filters_by_type() {
-        let (storage, mock) = make_mock_storage();
-        let deposit = make_db_transaction(); // Deposit
-        let mut withdrawal = make_db_transaction();
-        withdrawal.transaction_type = TransactionType::Withdrawal;
-        withdrawal.signature = "withdrawal_sig".to_string();
-
-        {
-            let mut pending = mock.pending_transactions.lock().unwrap();
-            pending.push(deposit);
-            pending.push(withdrawal);
-        }
-
-        let deposits = storage
-            .get_pending_db_transactions(TransactionType::Deposit, 10)
-            .await
-            .unwrap();
-        assert_eq!(deposits.len(), 1);
-        assert_eq!(deposits[0].signature, "test_sig");
-
-        let withdrawals = storage
-            .get_pending_db_transactions(TransactionType::Withdrawal, 10)
-            .await
-            .unwrap();
-        assert_eq!(withdrawals.len(), 1);
-        assert_eq!(withdrawals[0].signature, "withdrawal_sig");
-    }
-
-    #[tokio::test]
-    async fn get_pending_db_transactions_respects_limit() {
-        let (storage, mock) = make_mock_storage();
-        {
-            let mut pending = mock.pending_transactions.lock().unwrap();
-            for i in 0..5 {
-                let mut txn = make_db_transaction();
-                txn.signature = format!("sig_{i}");
-                pending.push(txn);
-            }
-        }
-
-        let txns = storage
-            .get_pending_db_transactions(TransactionType::Deposit, 2)
-            .await
-            .unwrap();
-        assert_eq!(txns.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn get_and_lock_pending_transactions_drains() {
-        let (storage, mock) = make_mock_storage();
-        let txn = make_db_transaction();
-        mock.pending_transactions.lock().unwrap().push(txn.clone());
-
-        let result = storage
-            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].signature, "test_sig");
-
-        // Second call should return empty (drained)
-        let result2 = storage
-            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
-            .await
-            .unwrap();
-        assert!(result2.is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_and_lock_filters_type_and_respects_limit() {
+    async fn get_pending_filters_by_type_and_respects_limit() {
         let (storage, mock) = make_mock_storage();
         {
             let mut pending = mock.pending_transactions.lock().unwrap();
@@ -349,7 +258,40 @@ mod tests {
             pending.push(w);
         }
 
-        // Lock only 2 deposits
+        // Only deposits, capped at 2
+        let deps = storage
+            .get_pending_db_transactions(TransactionType::Deposit, 2)
+            .await
+            .unwrap();
+        assert_eq!(deps.len(), 2);
+
+        // Withdrawal type returns only the withdrawal
+        let wds = storage
+            .get_pending_db_transactions(TransactionType::Withdrawal, 10)
+            .await
+            .unwrap();
+        assert_eq!(wds.len(), 1);
+        assert_eq!(wds[0].signature, "wd_0");
+    }
+
+    // ── lock + drain filtering ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_and_lock_drains_matched_leaves_rest() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            for i in 0..3 {
+                let mut txn = make_db_transaction();
+                txn.signature = format!("dep_{i}");
+                pending.push(txn);
+            }
+            let mut w = make_db_transaction();
+            w.transaction_type = TransactionType::Withdrawal;
+            w.signature = "wd_0".to_string();
+            pending.push(w);
+        }
+
         let locked = storage
             .get_and_lock_pending_transactions(TransactionType::Deposit, 2)
             .await
@@ -359,7 +301,17 @@ mod tests {
         // 1 deposit + 1 withdrawal remain
         let remaining = mock.pending_transactions.lock().unwrap();
         assert_eq!(remaining.len(), 2);
+
+        // Second lock of deposits gets the last one
+        drop(remaining);
+        let locked2 = storage
+            .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+            .await
+            .unwrap();
+        assert_eq!(locked2.len(), 1);
     }
+
+    // ── status update recording ──────────────────────────────────────
 
     #[tokio::test]
     async fn update_transaction_status_records_params() {
@@ -390,77 +342,5 @@ mod tests {
             .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now())
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn upsert_mints_batch_stores_mints() {
-        let (storage, mock) = make_mock_storage();
-        let mint = DbMint::new("mint1".to_string(), 6, "TokenkegQf".to_string());
-        storage.upsert_mints_batch(&[mint]).await.unwrap();
-
-        let stored = mock.mints.lock().unwrap();
-        assert!(stored.contains_key("mint1"));
-    }
-
-    #[tokio::test]
-    async fn get_mint_existing() {
-        let (storage, mock) = make_mock_storage();
-        let mint = DbMint::new("mint1".to_string(), 6, "TokenkegQf".to_string());
-        mock.mints.lock().unwrap().insert("mint1".to_string(), mint);
-
-        let result = storage.get_mint("mint1").await.unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().decimals, 6);
-    }
-
-    #[tokio::test]
-    async fn get_mint_missing() {
-        let (storage, _) = make_mock_storage();
-        let result = storage.get_mint("nonexistent").await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_mint_balances_for_reconciliation_empty() {
-        let (storage, _) = make_mock_storage();
-        let result = storage
-            .get_mint_balances_for_reconciliation()
-            .await
-            .unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_mint_balances_for_reconciliation_with_data() {
-        let (storage, mock) = make_mock_storage();
-        mock.set_mint_balances(vec![MintDbBalance {
-            mint_address: "mint1".to_string(),
-            token_program: "tp".to_string(),
-            total_deposits: 100,
-            total_withdrawals: 50,
-        }]);
-        let result = storage
-            .get_mint_balances_for_reconciliation()
-            .await
-            .unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].total_deposits, 100);
-    }
-
-    #[tokio::test]
-    async fn get_escrow_balances_by_mint_empty() {
-        let (storage, _) = make_mock_storage();
-        let result = storage.get_escrow_balances_by_mint().await.unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn get_completed_withdrawal_nonces_empty() {
-        let (storage, _) = make_mock_storage();
-        let result = storage
-            .get_completed_withdrawal_nonces(0, 100)
-            .await
-            .unwrap();
-        assert!(result.is_empty());
     }
 }

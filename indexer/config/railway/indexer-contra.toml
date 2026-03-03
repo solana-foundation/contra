@@ -21,7 +21,7 @@ error_retry_interval_ms = 5000
 batch_size = 50
 
 [indexer.backfill]
-enabled = false
+enabled = true
 backfill_only = false
 batch_size = 100
 max_gap_slots = 10000000

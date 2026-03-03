@@ -20,6 +20,30 @@ use tracing::{error, info, warn};
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
 
+const KNOWN_RPC_METHODS: &[&str] = &[
+    "sendTransaction",
+    "getAccountInfo",
+    "getSlot",
+    "getBlock",
+    "getTransaction",
+    "getRecentBlockhash",
+    "getTokenAccountBalance",
+    "getLatestBlockhash",
+    "getSignatureStatuses",
+    "getTransactionCount",
+    "getFirstAvailableBlock",
+    "getBlocks",
+    "getEpochInfo",
+    "getEpochSchedule",
+    "getRecentPerformanceSamples",
+    "getBlockTime",
+    "getVoteAccounts",
+    "getSupply",
+    "getSlotLeaders",
+    "isBlockhashValid",
+    "simulateTransaction",
+];
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "contra-gateway")]
 #[command(about = "JSON RPC gateway that routes requests to write or read nodes")]
@@ -275,6 +299,12 @@ impl Gateway {
             }
         };
 
+        let method_label = if KNOWN_RPC_METHODS.contains(&method) {
+            method
+        } else {
+            "unknown"
+        };
+
         // Route based on method
         let (target_url, target_label) = if method == "sendTransaction" {
             info!("Routing sendTransaction to write node");
@@ -293,10 +323,10 @@ impl Gateway {
                     .with_label_values(&["url_parse"])
                     .inc();
                 metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method, target_label, "500"])
+                    .with_label_values(&[method_label, target_label, "500"])
                     .inc();
                 metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method, target_label])
+                    .with_label_values(&[method_label, target_label])
                     .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
@@ -316,10 +346,10 @@ impl Gateway {
                     .with_label_values(&["request_build"])
                     .inc();
                 metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method, target_label, "500"])
+                    .with_label_values(&[method_label, target_label, "500"])
                     .inc();
                 metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method, target_label])
+                    .with_label_values(&[method_label, target_label])
                     .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
@@ -335,10 +365,10 @@ impl Gateway {
                     response.status()
                 );
                 metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method, target_label, &status])
+                    .with_label_values(&[method_label, target_label, &status])
                     .inc();
                 metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method, target_label])
+                    .with_label_values(&[method_label, target_label])
                     .observe(start.elapsed().as_secs_f64());
                 // Response body is streamed directly without reading into memory
                 let (mut parts, body) = response.into_parts();
@@ -365,10 +395,10 @@ impl Gateway {
                     .with_label_values(&["backend_error"])
                     .inc();
                 metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method, target_label, "502"])
+                    .with_label_values(&[method_label, target_label, "502"])
                     .inc();
                 metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method, target_label])
+                    .with_label_values(&[method_label, target_label])
                     .observe(start.elapsed().as_secs_f64());
                 Ok(self.error_response(StatusCode::BAD_GATEWAY, None))
             }

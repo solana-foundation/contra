@@ -10,8 +10,8 @@ const MIME = {
 };
 http.createServer((req, res) => {
   const url = req.url.split("?")[0];
-  let fp = path.join(DIST, url === "/" ? "index.html" : url);
-  if (!fs.existsSync(fp) || fs.statSync(fp).isDirectory()) fp = path.join(DIST, "index.html");
+  let fp = path.resolve(DIST, url === "/" ? "index.html" : "." + url);
+  if (!fp.startsWith(DIST) || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()) fp = path.join(DIST, "index.html");
   const ext = path.extname(fp);
   res.writeHead(200, {"Content-Type": MIME[ext] || "application/octet-stream"});
   fs.createReadStream(fp).pipe(res);

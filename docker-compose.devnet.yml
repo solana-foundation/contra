@@ -339,19 +339,17 @@ services:
 
   # Prometheus for metrics collection
   prometheus:
-    image: prom/prometheus:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus
     container_name: contra-prometheus
     restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
+    environment:
+      - HOST_SUFFIX=
     networks:
       - contra-network
 

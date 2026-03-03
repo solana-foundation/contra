@@ -138,13 +138,33 @@ pub(super) async fn rebuild_with_regenerated_proof(
         nonce
     );
 
+    let transaction_id = ctx
+        .transaction_id
+        .expect("rebuild must have transaction_id");
+    let trace_id = ctx.trace_id.expect("rebuild must have trace_id");
+
+    let remint_info = state.remint_cache.get(&nonce).cloned().unwrap_or_else(|| {
+        warn!(
+            "Missing remint_info for rebuild nonce {} - using defaults",
+            nonce
+        );
+        crate::operator::utils::instruction_util::WithdrawalRemintInfo {
+            transaction_id,
+            trace_id: trace_id.clone(),
+            mint: solana_sdk::pubkey::Pubkey::default(),
+            user: solana_sdk::pubkey::Pubkey::default(),
+            user_ata: solana_sdk::pubkey::Pubkey::default(),
+            token_program: solana_sdk::pubkey::Pubkey::default(),
+            amount: 0,
+        }
+    });
+
     let builder_with_nonce = Box::new(ReleaseFundsBuilderWithNonce {
         builder,
         nonce,
-        transaction_id: ctx
-            .transaction_id
-            .expect("rebuild must have transaction_id"),
-        trace_id: ctx.trace_id.expect("rebuild must have trace_id"),
+        transaction_id,
+        trace_id,
+        remint_info,
     });
 
     match smt_state.handle_release_funds_transaction(
@@ -192,6 +212,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+
     /// Build a minimal SenderState for testing (no RPC needed)
     fn make_sender_state() -> SenderState {
         let mock = MockStorage::new();
@@ -213,6 +235,19 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+        }
+    }
+
+    fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
+        WithdrawalRemintInfo {
+            transaction_id,
+            trace_id: trace_id.to_string(),
+            mint: Pubkey::new_unique(),
+            user: Pubkey::new_unique(),
+            user_ata: Pubkey::new_unique(),
+            token_program: spl_token::id(),
+            amount: 1000,
         }
     }
 
@@ -341,6 +376,7 @@ mod tests {
             nonce,
             transaction_id: 1,
             trace_id: "t".to_string(),
+            remint_info: make_test_remint_info(1, "t"),
         });
 
         let result =
@@ -365,6 +401,7 @@ mod tests {
             nonce: 3,
             transaction_id: 1,
             trace_id: "t".to_string(),
+            remint_info: make_test_remint_info(1, "t"),
         });
 
         let result =
@@ -381,6 +418,7 @@ mod tests {
             nonce: 0,
             transaction_id: 42,
             trace_id: "trace-42".to_string(),
+            remint_info: make_test_remint_info(42, "trace-42"),
         });
 
         let result = smt.handle_release_funds_transaction(
@@ -415,6 +453,7 @@ mod tests {
                 nonce,
                 transaction_id: nonce as i64,
                 trace_id: format!("t-{nonce}"),
+                remint_info: make_test_remint_info(nonce as i64, &format!("t-{nonce}")),
             });
             smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None)
                 .unwrap();

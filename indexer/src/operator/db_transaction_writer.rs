@@ -58,7 +58,10 @@ impl DbTransactionWriter {
 
     /// Handle a single transaction status update
     async fn handle_update(&self, update: TransactionStatusUpdate) {
-        let is_failed = update.status == TransactionStatus::Failed;
+        let is_alertable = matches!(
+            update.status,
+            TransactionStatus::Failed | TransactionStatus::FailedReminted
+        );
         let trace_id = update.trace_id.as_deref().unwrap_or("none");
         let pt = self.program_type.as_label();
         if let Err(e) = self
@@ -91,9 +94,9 @@ impl DbTransactionWriter {
                 .inc();
         }
 
-        if is_failed {
+        if is_alertable {
             // Log failed transaction at ERROR level for paging/alert pipeline visibility.
-            error!("Transaction {} FAILED", update.transaction_id);
+            error!("Transaction {} {:?}", update.transaction_id, update.status);
             if let Some(err_msg) = &update.error_message {
                 error!("Transaction {} error: {}", update.transaction_id, err_msg);
             }
@@ -112,14 +115,27 @@ impl DbTransactionWriter {
             .map_or_else(|| Utc::now().to_rfc3339(), |ts| ts.to_rfc3339());
         let timestamp = Utc::now().to_rfc3339();
 
+        let status_str = match update.status {
+            TransactionStatus::FailedReminted => "failed_reminted",
+            _ => "failed",
+        };
+
+        let remint_status: Option<&str> = if update.remint_signature.is_some() {
+            Some("success")
+        } else {
+            None
+        };
+
         let payload = json!({
             "transaction_id": update.transaction_id,
             "trace_id": update.trace_id.clone(),
-            "status": "failed",
+            "status": status_str,
             "counterpart_signature": update.counterpart_signature.clone(),
             "error_message": update.error_message.clone(),
             "processed_at": processed_at,
             "timestamp": timestamp,
+            "remint_signature": update.remint_signature.clone(),
+            "remint_status": remint_status,
         });
 
         let context = format!("transaction {}", update.transaction_id);
@@ -158,6 +174,7 @@ mod tests {
             counterpart_signature: Some("test_signature_123".to_string()),
             error_message: Some("Test error message".to_string()),
             processed_at: Some(Utc::now()),
+            remint_signature: None,
         }
     }
 

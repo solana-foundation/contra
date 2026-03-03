@@ -10,7 +10,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::operator::utils::instruction_util::MintToBuilder;
+use crate::operator::utils::instruction_util::{MintToBuilder, WithdrawalRemintInfo};
 
 #[derive(Clone, Debug)]
 pub struct TransactionContext {
@@ -28,6 +28,8 @@ pub struct TransactionStatusUpdate {
     pub counterpart_signature: Option<String>,
     pub processed_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
+    /// Signature of the remint transaction (only set for FailedReminted status)
+    pub remint_signature: Option<String>,
 }
 
 /// Sender state tracking SMT and pending transactions
@@ -44,6 +46,9 @@ pub struct SenderState {
     /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
     pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,
     pub program_type: ProgramType,
+    /// Cached remint info for withdrawal transactions, keyed by nonce.
+    /// Extracted before cleanup_failed_transaction removes builder from SMT cache.
+    pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
 }
 
 pub struct SenderSMTState {

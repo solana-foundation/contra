@@ -312,6 +312,15 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Add failed_reminted status for withdrawal remint recovery
+        sqlx::query(
+            r#"
+            ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'failed_reminted';
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }

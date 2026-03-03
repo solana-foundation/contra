@@ -1832,7 +1832,6 @@ name = "contra-indexer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum 0.8.4",
  "base64 0.21.7",
  "borsh 1.5.7",
  "bs58",
@@ -1841,12 +1840,12 @@ dependencies = [
  "const-crypto",
  "contra-core",
  "contra-escrow-program-client",
+ "contra-metrics",
  "contra-withdraw-program-client",
  "figment",
  "futures 0.3.31",
  "mockito",
  "once_cell",
- "prometheus",
  "reqwest 0.11.27",
  "rustls 0.23.31",
  "serde",
@@ -1914,6 +1913,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "contra-metrics"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.4",
+ "once_cell",
+ "prometheus",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

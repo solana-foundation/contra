@@ -4,13 +4,14 @@ use crate::config::ProgramType;
 use crate::error::DataSourceError;
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
 use crate::indexer::datasource::rpc_polling::decoder;
+use crate::metrics;
 use async_trait::async_trait;
+use contra_metrics::MetricLabel;
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use crate::metrics;
 use tracing::{debug, error, info};
 
 pub struct RpcPollingSource {
@@ -99,9 +100,8 @@ impl DataSource for RpcPollingSource {
                     Err(e) => {
                         {
                             error!("Failed to get slots to process: {}", e);
-                            let pt_label = format!("{:?}", program_type);
                             metrics::INDEXER_RPC_ERRORS
-                                .with_label_values(&[pt_label.as_str(), "get_slots"])
+                                .with_label_values(&[program_type.as_label(), "get_slots"])
                                 .inc();
                         }
                         tokio::time::sleep(Duration::from_millis(error_retry_interval_ms)).await;
@@ -162,9 +162,8 @@ impl DataSource for RpcPollingSource {
                         }
                         Err(e) => {
                             error!("Failed to fetch block {}: {}", slot, e);
-                            let pt_label = format!("{:?}", program_type);
                             metrics::INDEXER_RPC_ERRORS
-                                .with_label_values(&[pt_label.as_str(), "get_block"])
+                                .with_label_values(&[program_type.as_label(), "get_block"])
                                 .inc();
                         }
                     }

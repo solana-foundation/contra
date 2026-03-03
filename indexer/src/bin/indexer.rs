@@ -209,7 +209,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
     contra_indexer::metrics::init();
-    contra_indexer::metrics::start_metrics_server(metrics_port).await;
+    contra_metrics::start_metrics_server(metrics_port).await;
 
     let common: CommonSection = figment.extract_inner("common")?;
     let storage: StorageSection = figment.extract_inner("storage")?;
@@ -333,7 +333,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
     contra_indexer::metrics::init();
-    contra_indexer::metrics::start_metrics_server(metrics_port).await;
+    contra_metrics::start_metrics_server(metrics_port).await;
 
     let common: CommonSection = figment.extract_inner("common")?;
     let storage_section: StorageSection = figment.extract_inner("storage")?;

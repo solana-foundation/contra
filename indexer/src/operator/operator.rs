@@ -130,7 +130,9 @@ pub async fn run(
         if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
             let reconciliation_storage = storage.clone();
             let reconciliation_config = config.clone();
-            let reconciliation_rpc = source_rpc_client.clone().unwrap_or_else(|| rpc_client.clone());
+            let reconciliation_rpc = source_rpc_client
+                .clone()
+                .unwrap_or_else(|| rpc_client.clone());
             let reconciliation_token = cancellation_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = reconciliation::run_reconciliation(

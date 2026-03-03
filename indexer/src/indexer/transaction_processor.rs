@@ -1,3 +1,4 @@
+use crate::metrics;
 use crate::{
     channel_utils::send_guaranteed,
     config::ProgramType,
@@ -14,9 +15,9 @@ use crate::{
         Storage,
     },
 };
+use contra_metrics::MetricLabel;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::metrics;
 use tracing::{debug, error, info};
 
 /// Transaction processor that converts instructions to transactions and saves to DB
@@ -101,15 +102,14 @@ impl TransactionProcessor {
                         mints.len(),
                         slot
                     );
-                    let pt = format!("{:?}", program_type);
                     metrics::INDEXER_MINTS_SAVED
-                        .with_label_values(&[&pt])
+                        .with_label_values(&[program_type.as_label()])
                         .inc_by(mints.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save mints from slot {}: {}", slot, e);
                     metrics::INDEXER_SLOT_SAVE_ERRORS
-                        .with_label_values(&[&format!("{:?}", program_type)])
+                        .with_label_values(&[program_type.as_label()])
                         .inc();
                     send_checkpoint = false;
                 }
@@ -134,15 +134,14 @@ impl TransactionProcessor {
                         ids.len(),
                         slot
                     );
-                    let pt = format!("{:?}", program_type);
                     metrics::INDEXER_TRANSACTIONS_SAVED
-                        .with_label_values(&[&pt])
+                        .with_label_values(&[program_type.as_label()])
                         .inc_by(ids.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save transactions from slot {}: {}", slot, e);
                     metrics::INDEXER_SLOT_SAVE_ERRORS
-                        .with_label_values(&[&format!("{:?}", program_type)])
+                        .with_label_values(&[program_type.as_label()])
                         .inc();
                     send_checkpoint = false;
                 }
@@ -165,12 +164,11 @@ impl TransactionProcessor {
 
                 match res {
                     Ok(_) => {
-                        let pt = format!("{:?}", program_type);
                         metrics::INDEXER_SLOTS_PROCESSED
-                            .with_label_values(&[&pt])
+                            .with_label_values(&[program_type.as_label()])
                             .inc();
                         metrics::INDEXER_CURRENT_SLOT
-                            .with_label_values(&[&pt])
+                            .with_label_values(&[program_type.as_label()])
                             .set(slot as f64);
                         break;
                     }

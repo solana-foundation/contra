@@ -1,16 +1,17 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::{OperatorError, ProgramError};
+use crate::metrics;
 use crate::operator::utils::instruction_util::TransactionBuilder;
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy};
 use crate::storage::common::models::TransactionStatus;
 use chrono::Utc;
 use contra_escrow_program_client::errors::ContraEscrowProgramError;
+use contra_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::mpsc;
-use crate::metrics;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
@@ -253,7 +254,7 @@ pub(super) async fn send_and_confirm(
         }
     }
 
-    let pt = format!("{:?}", state.program_type);
+    let pt = state.program_type.as_label();
     let send_start = std::time::Instant::now();
 
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
@@ -277,10 +278,10 @@ pub(super) async fn send_and_confirm(
                 _ => "failure",
             };
             metrics::OPERATOR_RPC_SEND_DURATION
-                .with_label_values(&[pt.as_str(), result_label])
+                .with_label_values(&[pt, result_label])
                 .observe(send_start.elapsed().as_secs_f64());
             metrics::OPERATOR_TRANSACTIONS_SUBMITTED
-                .with_label_values(&[pt.as_str(), result_label])
+                .with_label_values(&[pt, result_label])
                 .inc();
 
             handle_confirmation_result(
@@ -298,10 +299,10 @@ pub(super) async fn send_and_confirm(
         }
         Err(e) => {
             metrics::OPERATOR_RPC_SEND_DURATION
-                .with_label_values(&[pt.as_str(), "error"])
+                .with_label_values(&[pt, "error"])
                 .observe(send_start.elapsed().as_secs_f64());
             metrics::OPERATOR_TRANSACTIONS_SUBMITTED
-                .with_label_values(&[pt.as_str(), "error"])
+                .with_label_values(&[pt, "error"])
                 .inc();
             error!("Failed to send transaction: {}", e);
             cleanup_failed_transaction(state, ctx.withdrawal_nonce);

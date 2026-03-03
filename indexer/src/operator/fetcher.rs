@@ -1,13 +1,14 @@
 use crate::channel_utils::send_guaranteed;
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
+use crate::metrics;
 use crate::storage::common::models::{DbTransaction, TransactionType};
 use crate::storage::Storage;
 use crate::ProgramType;
+use contra_metrics::MetricLabel;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use crate::metrics;
 use tracing::{error, info, warn};
 
 /// Fetches pending transactions from the database and sends them to the processor
@@ -43,7 +44,7 @@ pub async fn run_fetcher(
                 if !transactions.is_empty() {
                     info!("Fetched {} pending transactions", transactions.len());
                     metrics::OPERATOR_TRANSACTIONS_FETCHED
-                        .with_label_values(&[&format!("{:?}", program_type)])
+                        .with_label_values(&[program_type.as_label()])
                         .inc_by(transactions.len() as f64);
 
                     for transaction in transactions {

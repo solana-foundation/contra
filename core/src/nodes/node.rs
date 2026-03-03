@@ -353,4 +353,57 @@ mod tests {
             "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)"
         );
     }
+
+    #[test]
+    fn test_node_config_defaults() {
+        let config = NodeConfig::default();
+        assert_eq!(config.port, 8899);
+        assert_eq!(config.sigverify_queue_size, 1000);
+        assert_eq!(config.sigverify_workers, 4);
+        assert_eq!(config.max_connections, 100);
+        assert_eq!(config.max_tx_per_batch, 64);
+        assert_eq!(config.transaction_expiration_ms, 15000);
+        assert_eq!(config.blocktime_ms, 100);
+        assert_eq!(config.perf_sample_period_secs, 60);
+        assert!(matches!(config.mode, NodeMode::Aio));
+    }
+
+    #[test]
+    fn test_max_blockhashes_calculation() {
+        let config = NodeConfig {
+            transaction_expiration_ms: 15000,
+            blocktime_ms: 100,
+            ..Default::default()
+        };
+        assert_eq!(config.max_blockhashes(), 150);
+
+        let config2 = NodeConfig {
+            transaction_expiration_ms: 1000,
+            blocktime_ms: 500,
+            ..Default::default()
+        };
+        assert_eq!(config2.max_blockhashes(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_worker_handle_name() {
+        let handle = WorkerHandle::new("test-worker".to_string(), tokio::spawn(async {}));
+        assert_eq!(handle.name(), "test-worker");
+    }
+
+    #[test]
+    fn test_node_mode_variants() {
+        // Ensure all variants are distinct
+        assert_ne!(NodeMode::Read, NodeMode::Write);
+        assert_ne!(NodeMode::Write, NodeMode::Aio);
+        assert_ne!(NodeMode::Read, NodeMode::Aio);
+    }
+
+    #[test]
+    fn test_node_mode_read_skips_write_validation_check() {
+        // Verify the validation logic: Read mode does NOT match Write | Aio
+        assert!(!matches!(NodeMode::Read, NodeMode::Write | NodeMode::Aio));
+        assert!(matches!(NodeMode::Write, NodeMode::Write | NodeMode::Aio));
+        assert!(matches!(NodeMode::Aio, NodeMode::Write | NodeMode::Aio));
+    }
 }

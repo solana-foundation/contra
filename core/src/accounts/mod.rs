@@ -116,3 +116,65 @@ pub fn bpf_loader_upgradeable_program_accounts(
 }
 
 pub use {postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::rent::Rent;
+
+    #[test]
+    fn bpf_loader_program_account_creates_executable() {
+        let program_id = Pubkey::new_unique();
+        let elf = vec![0xEF; 128];
+        let rent = Rent::default();
+
+        let (key, account) = bpf_loader_program_account(&program_id, &elf, &rent);
+
+        assert_eq!(key, program_id);
+        assert!(account.executable);
+        assert_eq!(account.owner, bpf_loader::id());
+        assert_eq!(account.data, elf);
+        assert!(account.lamports >= rent.minimum_balance(elf.len()));
+    }
+
+    #[test]
+    fn bpf_loader_upgradeable_creates_two_accounts() {
+        let program_id = Pubkey::new_unique();
+        let elf = vec![0xAB; 256];
+        let rent = Rent::default();
+
+        let accounts = bpf_loader_upgradeable_program_accounts(&program_id, &elf, &rent);
+
+        // First account is the main program account
+        let (key, program_account) = &accounts[0];
+        assert_eq!(key, &program_id);
+        assert!(program_account.executable);
+        assert_eq!(
+            program_account.owner,
+            solana_sdk_ids::bpf_loader_upgradeable::id()
+        );
+
+        // Second account is the programdata account
+        let (programdata_key, programdata_account) = &accounts[1];
+        let expected_programdata = get_program_data_address(&program_id);
+        assert_eq!(programdata_key, &expected_programdata);
+        assert!(!programdata_account.executable);
+        assert_eq!(
+            programdata_account.owner,
+            solana_sdk_ids::bpf_loader_upgradeable::id()
+        );
+        // Programdata account contains the ELF at the end
+        assert!(programdata_account.data.ends_with(&elf));
+    }
+
+    #[test]
+    fn bpf_loader_program_account_minimum_lamports() {
+        let program_id = Pubkey::new_unique();
+        // Very small ELF — lamports should be max(minimum_balance, 1)
+        let elf = vec![0x01];
+        let rent = Rent::default();
+
+        let (_, account) = bpf_loader_program_account(&program_id, &elf, &rent);
+        assert!(account.lamports >= 1);
+    }
+}

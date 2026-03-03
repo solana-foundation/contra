@@ -544,3 +544,252 @@ async fn test_latest_blockhash_empty_db() {
     let result = db.get_latest_blockhash().await;
     assert!(result.is_err());
 }
+
+// ── Truncation ────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_rejects_zero_keep_slots() {
+    let (db, _pg) = start_postgres().await;
+
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 0,
+        max_backup_age: std::time::Duration::from_secs(300),
+        pg_dump_path: None,
+        batch_size: 100,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let result = contra_core::accounts::truncate::truncate_slots(pg, &opts).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("keep_slots"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_rejects_zero_batch_size() {
+    let (db, _pg) = start_postgres().await;
+
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 10,
+        max_backup_age: std::time::Duration::from_secs(300),
+        pg_dump_path: None,
+        batch_size: 0,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let result = contra_core::accounts::truncate::truncate_slots(pg, &opts).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("batch_size"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_empty_db_returns_none() {
+    let (db, _pg) = start_postgres().await;
+
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 10,
+        max_backup_age: std::time::Duration::from_secs(300),
+        pg_dump_path: None,
+        batch_size: 100,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+            .await
+            .unwrap();
+        assert_eq!(report.latest_slot, None);
+        assert_eq!(report.truncate_before_slot, None);
+        assert_eq!(report.blocks_deleted, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_nothing_to_delete() {
+    let (mut db, _pg) = start_postgres().await;
+
+    // Store 5 blocks at slots 1-5
+    for slot in 1..=5 {
+        db.store_block(make_block_info(slot, Hash::new_unique()))
+            .await
+            .unwrap();
+    }
+
+    // Keep all 5 slots — nothing should be truncated
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 10,
+        max_backup_age: std::time::Duration::from_secs(300),
+        pg_dump_path: None,
+        batch_size: 100,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+            .await
+            .unwrap();
+        assert_eq!(report.latest_slot, Some(5));
+        assert_eq!(report.blocks_deleted, 0);
+        // Backup check should be "skipped"
+        assert!(!report.backup_check.has_valid_backup());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_dry_run_with_pg_dump() {
+    let (mut db, _pg) = start_postgres().await;
+
+    // Store 10 blocks at slots 1-10
+    for slot in 1..=10 {
+        db.store_block(make_block_info(slot, Hash::new_unique()))
+            .await
+            .unwrap();
+    }
+
+    // Create a recent pg_dump file
+    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
+
+    // Keep 5 slots → truncate before slot 6 → blocks 1-5 should be counted
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 5,
+        max_backup_age: std::time::Duration::from_secs(3600),
+        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
+        batch_size: 100,
+        dry_run: true,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+            .await
+            .unwrap();
+        assert_eq!(report.latest_slot, Some(10));
+        assert_eq!(report.truncate_before_slot, Some(6));
+        assert_eq!(report.blocks_deleted, 5);
+        assert!(report.backup_check.pg_dump_ok);
+
+        // Dry run: blocks should still exist
+        assert!(db.get_block(1).await.is_some());
+        assert!(db.get_block(5).await.is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_actually_deletes_blocks() {
+    let (mut db, _pg) = start_postgres().await;
+
+    // Store 10 blocks at slots 1-10
+    for slot in 1..=10 {
+        db.store_block(make_block_info(slot, Hash::new_unique()))
+            .await
+            .unwrap();
+    }
+
+    // Create a recent pg_dump file for backup verification
+    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
+
+    // Keep 5 → truncate before slot 6 → delete blocks 1-5
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 5,
+        max_backup_age: std::time::Duration::from_secs(3600),
+        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
+        batch_size: 100,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+            .await
+            .unwrap();
+        assert_eq!(report.blocks_deleted, 5);
+        assert_eq!(report.transactions_deleted, 0);
+
+        // Old blocks should be gone
+        assert!(db.get_block(1).await.is_none());
+        assert!(db.get_block(5).await.is_none());
+        // Recent blocks should still exist
+        assert!(db.get_block(6).await.is_some());
+        assert!(db.get_block(10).await.is_some());
+
+        // first_available_block should be updated
+        assert!(report.first_available_block.is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_deletes_associated_transactions() {
+    let (mut db, _pg) = start_postgres().await;
+
+    let from = Keypair::new();
+    let to = Pubkey::new_unique();
+
+    // Store blocks with transactions at slots 1-4
+    for slot in 1..=4 {
+        let tx = create_test_sanitized_transaction(&from, &to, slot * 10);
+        let sig = *tx.signature();
+        let processed = make_executed_tx(vec![]);
+
+        let mut block = make_block_info(slot, Hash::new_unique());
+        block.transaction_signatures = vec![sig];
+
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, slot, 1_700_000_000 + slot as i64, &processed)],
+            Some(block),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Create pg_dump for backup verification
+    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
+
+    // Keep 2 → truncate before slot 3 → delete blocks 1,2 and their transactions
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 2,
+        max_backup_age: std::time::Duration::from_secs(3600),
+        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
+        batch_size: 2,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+            .await
+            .unwrap();
+        assert_eq!(report.blocks_deleted, 2);
+        assert_eq!(report.transactions_deleted, 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_truncate_fails_without_backup() {
+    let (mut db, _pg) = start_postgres().await;
+
+    // Store blocks to trigger truncation
+    for slot in 1..=10 {
+        db.store_block(make_block_info(slot, Hash::new_unique()))
+            .await
+            .unwrap();
+    }
+
+    // No pg_dump_path, and testcontainers Postgres has no WAL archiving
+    let opts = contra_core::accounts::truncate::TruncateOptions {
+        keep_slots: 5,
+        max_backup_age: std::time::Duration::from_secs(300),
+        pg_dump_path: None,
+        batch_size: 100,
+        dry_run: false,
+    };
+
+    if let AccountsDB::Postgres(ref pg) = db {
+        let result = contra_core::accounts::truncate::truncate_slots(pg, &opts).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Backup verification failed"));
+    }
+}

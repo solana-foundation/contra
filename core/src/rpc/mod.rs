@@ -38,12 +38,7 @@ mod tests {
     use crate::accounts::{traits::BlockInfo, AccountsDB};
     use crate::test_helpers::create_test_sanitized_transaction;
     use solana_rpc_client_types::response::RpcPerfSample;
-    use solana_sdk::{
-        account::AccountSharedData,
-        hash::Hash,
-        pubkey::Pubkey,
-        signature::Keypair,
-    };
+    use solana_sdk::{account::AccountSharedData, hash::Hash, pubkey::Pubkey, signature::Keypair};
     use solana_svm::account_loader::LoadedTransaction;
     use solana_svm::transaction_execution_result::{
         ExecutedTransaction, TransactionExecutionDetails,

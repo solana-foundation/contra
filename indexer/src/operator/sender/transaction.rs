@@ -2,7 +2,8 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::utils::instruction_util::{
-    remint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
+    remint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId, TransactionBuilder,
+    WithdrawalRemintInfo,
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, SignerUtil};
@@ -17,7 +18,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
-    cleanup_mint_builder, find_existing_mint_signature, try_jit_mint_initialization,
+    cleanup_mint_builder, find_existing_mint_signature, find_existing_mint_signature_with_memo,
+    try_jit_mint_initialization,
 };
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
@@ -562,7 +564,34 @@ async fn attempt_remint(
         .mint_authority(admin_pubkey)
         .token_program(info.token_program)
         .amount(info.amount)
-        .idempotency_memo(memo);
+        .idempotency_memo(memo.clone());
+
+    // Check for an already-confirmed remint before sending (guards against duplicate
+    // remints when the operator restarts after a successful remint but before the
+    // FailedReminted status is persisted to the database).
+    let builder_for_lookup = MintToBuilderWithTxnId {
+        builder: builder.clone(),
+        txn_id: info.transaction_id,
+        trace_id: info.trace_id.clone(),
+    };
+    match find_existing_mint_signature_with_memo(&state.rpc_client, &builder_for_lookup, &memo)
+        .await
+    {
+        Ok(Some(existing_signature)) => {
+            info!(
+                "Remint already confirmed for transaction {}: {}",
+                info.transaction_id, existing_signature
+            );
+            return Ok(existing_signature);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                "Remint idempotency lookup failed for transaction {}: {} — proceeding with send",
+                info.transaction_id, e
+            );
+        }
+    }
 
     let instructions = builder
         .instructions()

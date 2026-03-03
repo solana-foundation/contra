@@ -331,6 +331,10 @@ pub(crate) fn create_test_bob() -> (BOB, mpsc::UnboundedSender<Vec<(Pubkey, Acco
         sqlx::postgres::PgPoolOptions,
         std::sync::Arc,
     };
+    // NOTE: This is a lazy (non-connecting) pool with a bogus URL. It exists
+    // only to satisfy BOB's AccountsDB field. Any test that accidentally
+    // triggers a real DB query will get a connection-timeout error rather
+    // than a helpful message — keep tests in-memory only.
     let pool = PgPoolOptions::new()
         .connect_lazy("postgres://test@localhost:1/test")
         .expect("connect_lazy should not fail");

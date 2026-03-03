@@ -18,7 +18,8 @@ pub fn create_test_sanitized_transaction(
     let instruction = system_instruction::transfer(&from.pubkey(), to, amount);
     let message = Message::new(&[instruction], Some(&from.pubkey()));
     let transaction = Transaction::new(&[from], message, Hash::default());
-    SanitizedTransaction::try_from_legacy_transaction(transaction, &HashSet::new()).unwrap()
+    SanitizedTransaction::try_from_legacy_transaction(transaction, &HashSet::new())
+        .expect("failed to create SanitizedTransaction from test legacy transaction")
 }
 
 /// Create a BlockInfo with sensible defaults for a given slot.

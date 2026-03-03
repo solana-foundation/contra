@@ -35,10 +35,18 @@ pub async fn run_fetcher(
             info!("Fetcher received cancellation signal, stopping...");
             break;
         }
-        if let Ok(count) = storage.count_pending_transactions(transaction_type).await {
-            metrics::OPERATOR_BACKLOG_DEPTH
-                .with_label_values(&[program_type.as_label()])
-                .set(count as f64);
+        match storage.count_pending_transactions(transaction_type).await {
+            Ok(count) => {
+                metrics::OPERATOR_BACKLOG_DEPTH
+                    .with_label_values(&[program_type.as_label()])
+                    .set(count as f64);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to count pending transactions for backlog metric: {}",
+                    e
+                );
+            }
         }
 
         match storage

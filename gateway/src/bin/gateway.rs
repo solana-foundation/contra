@@ -11,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9101);
     contra_gateway::metrics::init();
-    contra_metrics::start_metrics_server(metrics_port).await;
+    contra_metrics::start_metrics_server(metrics_port);
 
     rustls::crypto::ring::default_provider()
         .install_default()

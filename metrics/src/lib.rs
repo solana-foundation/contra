@@ -40,7 +40,7 @@ pub trait MetricLabel {
     fn as_label(&self) -> &'static str;
 }
 
-pub async fn start_metrics_server(port: u16) {
+pub fn start_metrics_server(port: u16) {
     use prometheus::{Encoder, TextEncoder};
 
     async fn metrics_handler() -> ([(axum::http::header::HeaderName, &'static str); 1], Vec<u8>) {
@@ -63,7 +63,15 @@ pub async fn start_metrics_server(port: u16) {
     tracing::info!("Metrics server listening on {}", addr);
 
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!("Metrics server error: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to bind metrics server on {}: {}", addr, e);
+            }
+        }
     });
 }

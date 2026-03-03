@@ -1,9 +1,11 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
-use crate::operator::utils::instruction_util::TransactionBuilder;
+use crate::operator::utils::instruction_util::{
+    remint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
+};
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
-use crate::operator::{sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy};
+use crate::operator::{sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, SignerUtil};
 use crate::storage::common::models::TransactionStatus;
 use chrono::Utc;
 use contra_escrow_program_client::errors::ContraEscrowProgramError;
@@ -47,6 +49,12 @@ impl SenderState {
 
         match tx_builder {
             TransactionBuilder::ReleaseFunds(builder_with_nonce) => {
+                // Cache remint info before SMT processing (which consumes the builder)
+                self.remint_cache.insert(
+                    builder_with_nonce.nonce,
+                    builder_with_nonce.remint_info.clone(),
+                );
+
                 // Initialize SMT state lazily if needed
                 if self.smt_state.is_none() {
                     self.initialize_smt_state().await?;
@@ -236,7 +244,7 @@ pub(super) async fn send_and_confirm(
                         "Max retries ({}) exceeded for withdrawal_nonce {}",
                         state.retry_max_attempts, nonce
                     );
-                    send_fatal_error(storage_tx, ctx, "Max retries exceeded").await;
+                    handle_permanent_failure(state, ctx, storage_tx, "Max retries exceeded").await;
                     return;
                 }
                 state.retry_counts.insert(nonce, attempts + 1);
@@ -301,8 +309,7 @@ pub(super) async fn send_and_confirm(
                 .with_label_values(&[pt, "rpc_send_error"])
                 .inc();
             error!("Failed to send transaction: {}", e);
-            cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-            send_fatal_error(storage_tx, ctx, &e.to_string()).await;
+            handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await;
         }
     }
 }
@@ -349,8 +356,8 @@ fn handle_confirmation_result<'a>(
                     )
                     .await;
                 } else {
-                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                    send_fatal_error(storage_tx, ctx, "Failed to rebuild proof").await;
+                    handle_permanent_failure(state, ctx, storage_tx, "Failed to rebuild proof")
+                        .await;
                 }
             }
             Ok(ConfirmationResult::Failed(Some(
@@ -360,8 +367,8 @@ fn handle_confirmation_result<'a>(
                     .with_label_values(&[pt, "invalid_nonce_for_tree_index"])
                     .inc();
                 error!("InvalidTransactionNonce - fatal error");
-                cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                send_fatal_error(storage_tx, ctx, "Invalid nonce for tree index").await;
+                handle_permanent_failure(state, ctx, storage_tx, "Invalid nonce for tree index")
+                    .await;
             }
             Ok(ConfirmationResult::MintNotInitialized) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
@@ -386,18 +393,23 @@ fn handle_confirmation_result<'a>(
                             )
                             .await;
                         } else {
-                            cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                            send_fatal_error(storage_tx, ctx, "Mint initialization failed").await;
+                            handle_permanent_failure(
+                                state,
+                                ctx,
+                                storage_tx,
+                                "Mint initialization failed",
+                            )
+                            .await;
                         }
                     } else {
                         error!("MintNotInitialized error for non-Mint transaction");
-                        cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                        send_fatal_error(storage_tx, ctx, "Unexpected mint error").await;
+                        handle_permanent_failure(state, ctx, storage_tx, "Unexpected mint error")
+                            .await;
                     }
                 } else {
                     error!("MintNotInitialized error without transaction_id");
-                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                    send_fatal_error(storage_tx, ctx, "Mint initialization failed").await;
+                    handle_permanent_failure(state, ctx, storage_tx, "Mint initialization failed")
+                        .await;
                 }
             }
             Ok(ConfirmationResult::Retry) => match retry_policy {
@@ -406,10 +418,10 @@ fn handle_confirmation_result<'a>(
                         .with_label_values(&[pt, "confirmation_timeout_non_idempotent"])
                         .inc();
                     error!("Confirmation failed for non-idempotent operation - status unknown, cannot retry");
-                    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                    send_fatal_error(
-                        storage_tx,
+                    handle_permanent_failure(
+                        state,
                         ctx,
+                        storage_tx,
                         "Confirmation failed - transaction status unknown, unsafe to retry",
                     )
                     .await;
@@ -436,16 +448,15 @@ fn handle_confirmation_result<'a>(
                     .with_label_values(&[pt, "program_error"])
                     .inc();
                 error!("Other program error: {:?}", program_error);
-                cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                send_fatal_error(storage_tx, ctx, &format!("{:?}", program_error)).await;
+                handle_permanent_failure(state, ctx, storage_tx, &format!("{:?}", program_error))
+                    .await;
             }
             Err(e) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "confirmation_error"])
                     .inc();
                 error!("Confirmation error: {}", e);
-                cleanup_failed_transaction(state, ctx.withdrawal_nonce);
-                send_fatal_error(storage_tx, ctx, &e.to_string()).await;
+                handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await;
             }
         }
     })
@@ -465,6 +476,7 @@ pub(super) async fn handle_success(
     {
         smt_state.nonce_to_builder.remove(&nonce);
         state.retry_counts.remove(&nonce);
+        state.remint_cache.remove(&nonce);
         info!("Cleaned up state for withdrawal_nonce {}", nonce);
 
         if let Some(txn_id) = ctx.transaction_id {
@@ -477,6 +489,7 @@ pub(super) async fn handle_success(
                     counterpart_signature: Some(signature.to_string()),
                     processed_at: Some(Utc::now()),
                     error_message: None,
+                    remint_signature: None,
                 },
                 "transaction status update",
             )
@@ -503,6 +516,7 @@ pub(super) async fn handle_success(
                 counterpart_signature: Some(signature.to_string()),
                 processed_at: Some(Utc::now()),
                 error_message: None,
+                remint_signature: None,
             },
             "transaction status update",
         )
@@ -517,6 +531,120 @@ pub(super) async fn handle_success(
             "Tree rotation complete! Updated local SMT to tree_index {}",
             new_tree_index
         );
+    }
+}
+
+/// Attempt to remint burned Contra tokens back to user after permanent withdrawal failure.
+/// Uses the same MintToBuilder + idempotency memo pattern as the deposit flow.
+/// Single attempt — does not retry on failure.
+async fn attempt_remint(
+    state: &SenderState,
+    info: &WithdrawalRemintInfo,
+) -> Result<Signature, String> {
+    let memo = remint_idempotency_memo(info.transaction_id);
+    let admin_pubkey = SignerUtil::admin_signer().pubkey();
+
+    // Check idempotency first — maybe we already reminted in a previous run
+    let mut builder = MintToBuilder::new();
+    builder
+        .mint(info.mint)
+        .recipient(info.user)
+        .recipient_ata(info.user_ata)
+        .payer(admin_pubkey)
+        .mint_authority(admin_pubkey)
+        .token_program(info.token_program)
+        .amount(info.amount)
+        .idempotency_memo(memo);
+
+    let instructions = builder
+        .instructions()
+        .map_err(|e| format!("Failed to build remint instructions: {}", e))?;
+
+    let ix = InstructionWithSigners {
+        instructions,
+        fee_payer: admin_pubkey,
+        signers: vec![SignerUtil::admin_signer()],
+        compute_unit_price: None,
+        compute_budget: None,
+    };
+
+    let signature = sign_and_send_transaction(state.rpc_client.clone(), ix, RetryPolicy::None)
+        .await
+        .map_err(|e| format!("Failed to send remint transaction: {}", e))?;
+
+    let result = check_transaction_status(
+        state.rpc_client.clone(),
+        &signature,
+        CommitmentConfig::confirmed(),
+        &ExtraErrorCheckPolicy::None,
+    )
+    .await
+    .map_err(|e| format!("Failed to confirm remint transaction: {}", e))?;
+
+    match result {
+        ConfirmationResult::Confirmed => {
+            info!("Remint confirmed: {}", signature);
+            Ok(signature)
+        }
+        other => Err(format!("Remint not confirmed: {:?}", other)),
+    }
+}
+
+/// Handle permanent transaction failure with automatic remint for withdrawals.
+///
+/// For withdrawal transactions: extracts remint info BEFORE cleanup (which destroys
+/// the builder cache), attempts to remint burned Contra tokens, then reports
+/// FailedReminted or Failed status accordingly.
+///
+/// For non-withdrawal transactions: delegates to send_fatal_error.
+pub(super) async fn handle_permanent_failure(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    error_msg: &str,
+) {
+    // Extract remint info BEFORE cleanup destroys builder cache
+    let remint_info = ctx
+        .withdrawal_nonce
+        .and_then(|nonce| state.remint_cache.remove(&nonce));
+
+    cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+
+    let Some(info) = remint_info else {
+        // Not a withdrawal — use normal fatal error path
+        send_fatal_error(storage_tx, ctx, error_msg).await;
+        return;
+    };
+
+    match attempt_remint(state, &info).await {
+        Ok(signature) => {
+            info!(
+                "Withdrawal failed but tokens reminted successfully: {}",
+                signature
+            );
+            if let Some(transaction_id) = ctx.transaction_id {
+                send_guaranteed(
+                    storage_tx,
+                    TransactionStatusUpdate {
+                        transaction_id,
+                        trace_id: ctx.trace_id.clone(),
+                        status: TransactionStatus::FailedReminted,
+                        counterpart_signature: None,
+                        processed_at: Some(Utc::now()),
+                        error_message: Some(error_msg.to_string()),
+                        remint_signature: Some(signature.to_string()),
+                    },
+                    "transaction status update",
+                )
+                .await
+                .ok();
+            }
+        }
+        Err(remint_error) => {
+            error!("Remint also failed: {}", remint_error);
+            let combined = format!("{} | remint failed: {}", error_msg, remint_error);
+            send_fatal_error(storage_tx, ctx, &combined).await;
+        }
     }
 }
 
@@ -536,6 +664,7 @@ pub(super) async fn send_fatal_error(
                 counterpart_signature: None,
                 processed_at: Some(Utc::now()),
                 error_message: Some(error_msg.to_string()),
+                remint_signature: None,
             },
             "transaction status update",
         )

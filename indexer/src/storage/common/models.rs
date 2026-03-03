@@ -29,6 +29,9 @@ pub enum TransactionStatus {
     Processing,
     Completed,
     Failed,
+    // Withdrawal failed permanently but burned Contra tokens were reminted back to user
+    #[sqlx(rename = "failed_reminted")]
+    FailedReminted,
 }
 
 /// DbTransaction domain model

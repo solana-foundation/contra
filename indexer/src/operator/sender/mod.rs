@@ -8,7 +8,7 @@ pub use mint::find_existing_mint_signature;
 pub use types::TransactionStatusUpdate;
 
 use crate::error::OperatorError;
-use crate::operator::utils::instruction_util::TransactionBuilder;
+use crate::operator::utils::instruction_util::{TransactionBuilder, WithdrawalRemintInfo};
 use crate::operator::ReleaseFundsBuilderWithNonce;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::storage::Storage;
@@ -84,10 +84,23 @@ pub async fn run_sender(
                 while let Some((ctx, builder)) = state.rotation_retry_queue.pop() {
                     let nonce = ctx.withdrawal_nonce.expect("rotation retry must have nonce");
                     let transaction_id = ctx.transaction_id.expect("rotation retry must have transaction_id");
-                    let trace_id = ctx.trace_id.expect("rotation retry must have trace_id");
+                    let trace_id = ctx.trace_id.clone().expect("rotation retry must have trace_id");
+                    let remint_info = state.remint_cache.get(&nonce).cloned().unwrap_or_else(|| {
+                        // Should not happen — remint_cache is populated before TreeIndexMismatch
+                        tracing::warn!("Missing remint_info for rotation retry nonce {}", nonce);
+                        WithdrawalRemintInfo {
+                            transaction_id,
+                            trace_id: trace_id.clone(),
+                            mint: solana_sdk::pubkey::Pubkey::default(),
+                            user: solana_sdk::pubkey::Pubkey::default(),
+                            user_ata: solana_sdk::pubkey::Pubkey::default(),
+                            token_program: solana_sdk::pubkey::Pubkey::default(),
+                            amount: 0,
+                        }
+                    });
                     info!(trace_id = %trace_id, "Retrying blocked nonce {} after rotation", nonce);
                     let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(
-                        ReleaseFundsBuilderWithNonce { builder, nonce, transaction_id, trace_id },
+                        ReleaseFundsBuilderWithNonce { builder, nonce, transaction_id, trace_id, remint_info },
                     ));
                     handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
                 }

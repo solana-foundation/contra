@@ -233,3 +233,143 @@ impl RpcClientWithRetry {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn retry_config_default_values() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_attempts, 5);
+        assert_eq!(config.base_delay, Duration::from_millis(100));
+        assert_eq!(config.max_delay, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn rpc_client_with_retry_constructs() {
+        let client = RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        assert_eq!(client.retry_config.max_attempts, 5);
+    }
+
+    #[tokio::test]
+    async fn with_retry_none_policy_single_attempt() {
+        let client = RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("test_op", RetryPolicy::None, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, client_error::Error>(42)
+                }
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn with_retry_none_policy_propagates_error() {
+        let client = RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("test_op", RetryPolicy::None, || async {
+                Err::<u32, Box<client_error::Error>>(Box::new(
+                    client_error::Error::new_with_request(
+                        client_error::ErrorKind::Custom("test error".to_string()),
+                        solana_rpc_client_api::request::RpcRequest::GetBalance,
+                    ),
+                ))
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn with_retry_idempotent_succeeds_on_second_try() {
+        let client = RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig {
+                max_attempts: 3,
+                base_delay: Duration::from_millis(1), // fast for tests
+                max_delay: Duration::from_millis(10),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("test_op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    let count = cc.fetch_add(1, Ordering::SeqCst);
+                    if count == 0 {
+                        Err::<u32, Box<client_error::Error>>(Box::new(
+                            client_error::Error::new_with_request(
+                                client_error::ErrorKind::Custom("transient".to_string()),
+                                solana_rpc_client_api::request::RpcRequest::GetBalance,
+                            ),
+                        ))
+                    } else {
+                        Ok(99)
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn with_retry_idempotent_exhausts_attempts() {
+        let client = RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig {
+                max_attempts: 2,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(10),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("test_op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, Box<client_error::Error>>(Box::new(
+                        client_error::Error::new_with_request(
+                            client_error::ErrorKind::Custom("always fail".to_string()),
+                            solana_rpc_client_api::request::RpcRequest::GetBalance,
+                        ),
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+}

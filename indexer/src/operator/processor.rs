@@ -252,7 +252,7 @@ pub async fn process_release_funds(
                     nonce,
                     transaction_id: transaction.id,
                     trace_id: transaction.trace_id.clone(),
-                    remint_info,
+                    remint_info: Some(remint_info),
                 }));
 
             send_guaranteed(&sender_tx, wrapped, "processed release funds")

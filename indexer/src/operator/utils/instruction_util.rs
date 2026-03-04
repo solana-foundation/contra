@@ -407,7 +407,6 @@ impl InitializeMintBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::mint_idempotency_memo;
     use super::*;
     use contra_escrow_program_client::instructions::ResetSmtRootBuilder;
     use solana_sdk::pubkey::Pubkey;

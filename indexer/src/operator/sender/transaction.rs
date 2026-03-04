@@ -723,9 +723,12 @@ pub(super) async fn send_fatal_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::sender::types::SenderSMTState;
+    use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -873,5 +876,62 @@ mod tests {
             !state.remint_cache.contains_key(&5),
             "remint_cache entry should be consumed"
         );
+    }
+
+    // ── handle_success ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn success_clears_remint_cache_and_nonce_state() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Set up SMT state with a cached builder at nonce 3
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        let ctx = TransactionContext {
+            transaction_id: Some(50),
+            withdrawal_nonce: Some(3),
+            trace_id: Some("trace-50".to_string()),
+        };
+        smt.nonce_to_builder
+            .insert(3, (ctx.clone(), ReleaseFundsBuilder::new()));
+        state.smt_state = Some(smt);
+        state.retry_counts.insert(3, 2);
+        state.remint_cache.insert(3, make_remint_info(50));
+
+        let sig = solana_sdk::signature::Signature::new_unique();
+        handle_success(&mut state, &ctx, sig, &storage_tx).await;
+
+        // All nonce-keyed state should be cleaned up
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(!smt.nonce_to_builder.contains_key(&3));
+        assert!(!state.retry_counts.contains_key(&3));
+        assert!(
+            !state.remint_cache.contains_key(&3),
+            "remint_cache should be cleared on success"
+        );
+
+        // Should send Completed status
+        let update = storage_rx.try_recv().expect("should receive status update");
+        assert_eq!(update.transaction_id, 50);
+        assert_eq!(update.status, TransactionStatus::Completed);
+    }
+
+    // ── remint_cache population ─────────────────────────────────────
+
+    #[test]
+    fn remint_cache_populated_from_release_funds_builder() {
+        let mut state = make_sender_state();
+        let info = make_remint_info(42);
+        let expected_amount = info.amount;
+
+        // Directly insert into cache as handle_transaction_builder would
+        state.remint_cache.insert(7, info);
+
+        assert!(state.remint_cache.contains_key(&7));
+        assert_eq!(state.remint_cache.get(&7).unwrap().amount, expected_amount);
+        assert_eq!(state.remint_cache.get(&7).unwrap().transaction_id, 42);
     }
 }

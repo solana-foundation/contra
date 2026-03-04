@@ -541,4 +541,40 @@ mod tests {
         assert_eq!(rebuilt.fee_payer, fee_payer);
         assert_eq!(rebuilt.compute_unit_price, Some(1000));
     }
+
+    #[tokio::test]
+    async fn rebuild_propagates_cached_remint_info() {
+        let mut state = make_sender_state();
+        let mut smt = make_smt_state(0);
+
+        let builder = make_release_funds_builder();
+        let ctx = TransactionContext {
+            transaction_id: Some(1),
+            withdrawal_nonce: Some(0),
+            trace_id: Some("t".to_string()),
+        };
+        smt.nonce_to_builder.insert(0, (ctx, builder));
+        state.smt_state = Some(smt);
+
+        // Seed remint_cache so rebuild can propagate it
+        let remint = make_test_remint_info(1, "t");
+        let expected_mint = remint.mint;
+        state.remint_cache.insert(0, remint);
+
+        let ix = InstructionWithSigners {
+            instructions: vec![],
+            fee_payer: Pubkey::new_unique(),
+            signers: vec![],
+            compute_unit_price: None,
+            compute_budget: None,
+        };
+
+        let result = rebuild_with_regenerated_proof(&mut state, Some(0), ix).await;
+        assert!(result.is_some());
+
+        // Verify remint_cache is still present (rebuild reads but doesn't drain)
+        let cached = state.remint_cache.get(&0);
+        assert!(cached.is_some(), "remint_cache should survive rebuild");
+        assert_eq!(cached.unwrap().mint, expected_mint);
+    }
 }

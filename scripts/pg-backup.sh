@@ -93,9 +93,11 @@ prune_old_wal() {
     return
   fi
 
-  # backup_label contains the start WAL location; pg_archivecleanup handles the rest
-  if [ -f "${oldest_backup}/backup_label" ]; then
-    wal_file="$(grep 'START WAL LOCATION' "${oldest_backup}/backup_label" | sed 's/.*file \([^ )]*\).*/\1/')"
+  # backup_label is inside base.tar.gz when using -Ft format
+  if [ -f "${oldest_backup}/base.tar.gz" ]; then
+    wal_file="$(tar -xzOf "${oldest_backup}/base.tar.gz" backup_label 2>/dev/null \
+      | grep 'START WAL LOCATION' \
+      | sed 's/.*file \([^ )]*\).*/\1/')"
     if [ -n "${wal_file}" ]; then
       echo "[$(date -Iseconds)] Pruning WAL segments older than ${wal_file} ..."
       pg_archivecleanup "${WAL_ARCHIVE_DIR}" "${wal_file}" || \

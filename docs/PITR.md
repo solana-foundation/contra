@@ -106,7 +106,7 @@ docker run --rm \
   alpine sh -c "
     cat >> /data/postgresql.auto.conf << 'EOF'
 restore_command = 'cp /wal_archive/%f %p'
-recovery_target_time = '2026-03-04 12:00:00 UTC'
+recovery_target_time = '<YYYY-MM-DD HH:MM:SS UTC>'
 recovery_target_action = 'promote'
 EOF
     touch /data/recovery.signal

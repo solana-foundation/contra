@@ -529,6 +529,7 @@ mod tests {
             nonce: 42,
             transaction_id: 7,
             trace_id: "trace-rf".to_string(),
+            remint_info: None,
         }))
     }
 

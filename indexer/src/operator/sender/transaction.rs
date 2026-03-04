@@ -754,6 +754,7 @@ mod tests {
             retry_max_attempts: 3,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
+            program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
         }
     }

@@ -23,8 +23,15 @@ use super::mint::{
 };
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
-    InstructionWithSigners, SenderState, TransactionContext, TransactionStatusUpdate,
+    InstructionWithSigners, PendingRemint, SenderState, TransactionContext, TransactionStatusUpdate,
 };
+
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// Safety delay before checking finality and reminting.
+/// Solana finalized ≈ 32 slots × 400ms = ~12.8s. We use 2.5× safety factor.
+const FINALITY_SAFETY_DELAY: Duration = Duration::from_secs(32);
 
 impl SenderState {
     /// Handle incoming transaction builder (either ReleaseFunds or Mint)
@@ -272,6 +279,15 @@ pub(super) async fn send_and_confirm(
         Ok(signature) => {
             info!("Transaction sent with signature: {}", signature);
 
+            // Stash signature for finality check on withdrawal failure path
+            if let Some(nonce) = ctx.withdrawal_nonce {
+                state
+                    .pending_signatures
+                    .entry(nonce)
+                    .or_default()
+                    .push(signature);
+            }
+
             let commitment_config = CommitmentConfig::confirmed();
 
             let result = check_transaction_status(
@@ -479,6 +495,7 @@ pub(super) async fn handle_success(
         smt_state.nonce_to_builder.remove(&nonce);
         state.retry_counts.remove(&nonce);
         state.remint_cache.remove(&nonce);
+        state.pending_signatures.remove(&nonce);
         info!("Cleaned up state for withdrawal_nonce {}", nonce);
 
         if let Some(txn_id) = ctx.transaction_id {
@@ -619,11 +636,12 @@ async fn attempt_remint(
     }
 }
 
-/// Handle permanent transaction failure with automatic remint for withdrawals.
+/// Handle permanent transaction failure with deferred remint for withdrawals.
 ///
 /// For withdrawal transactions: removes remint info from cache, runs cleanup
-/// (which removes the nonce from SMT and builder caches), then attempts to
-/// remint burned Contra tokens. Reports FailedReminted or Failed accordingly.
+/// (which removes the nonce from SMT and builder caches), then queues a deferred
+/// remint that will execute after the Solana finality window passes. This prevents
+/// double-spend if the original withdrawal lands on-chain after our polling window.
 ///
 /// For non-withdrawal transactions: delegates to send_fatal_error.
 pub(super) async fn handle_permanent_failure(
@@ -637,6 +655,12 @@ pub(super) async fn handle_permanent_failure(
         .withdrawal_nonce
         .and_then(|nonce| state.remint_cache.remove(&nonce));
 
+    // Collect stashed signatures for finality check
+    let signatures = ctx
+        .withdrawal_nonce
+        .and_then(|nonce| state.pending_signatures.remove(&nonce))
+        .unwrap_or_default();
+
     cleanup_failed_transaction(state, ctx.withdrawal_nonce);
 
     let Some(info) = remint_info else {
@@ -645,22 +669,225 @@ pub(super) async fn handle_permanent_failure(
         return;
     };
 
-    match attempt_remint(state, &info).await {
+    // Zero signatures means sign_and_send itself failed — we have nothing to verify.
+    // The RPC may have broadcast the tx before erroring, so blind remint is unsafe.
+    if signatures.is_empty() {
+        error!(
+            "No signatures to verify for nonce {:?} — cannot safely remint, sending to ManualReview",
+            ctx.withdrawal_nonce,
+        );
+        if let Some(transaction_id) = ctx.transaction_id {
+            send_guaranteed(
+                storage_tx,
+                TransactionStatusUpdate {
+                    transaction_id,
+                    trace_id: ctx.trace_id.clone(),
+                    status: TransactionStatus::ManualReview,
+                    counterpart_signature: None,
+                    processed_at: Some(Utc::now()),
+                    error_message: Some(format!(
+                        "{} | no signatures to verify — remint unsafe",
+                        error_msg
+                    )),
+                    remint_signature: None,
+                },
+                "transaction status update",
+            )
+            .await
+            .ok();
+        }
+        return;
+    }
+
+    // Write Failed status immediately so the txn isn't stuck in Processing if we crash
+    // during the finality window. The deferred remint will overwrite to FailedReminted
+    // or ManualReview once it completes.
+    if let Some(transaction_id) = ctx.transaction_id {
+        send_guaranteed(
+            storage_tx,
+            TransactionStatusUpdate {
+                transaction_id,
+                trace_id: ctx.trace_id.clone(),
+                status: TransactionStatus::Failed,
+                counterpart_signature: None,
+                processed_at: Some(Utc::now()),
+                error_message: Some(error_msg.to_string()),
+                remint_signature: None,
+            },
+            "transaction status update",
+        )
+        .await
+        .ok();
+    }
+
+    let deadline = Instant::now() + FINALITY_SAFETY_DELAY;
+    info!(
+        "Remint deferred for finality check ({}s) — {} signature(s) to verify for nonce {:?}",
+        FINALITY_SAFETY_DELAY.as_secs(),
+        signatures.len(),
+        ctx.withdrawal_nonce,
+    );
+
+    state.pending_remints.push(PendingRemint {
+        ctx: ctx.clone(),
+        remint_info: info,
+        signatures,
+        original_error: error_msg.to_string(),
+        deadline,
+        finality_check_attempts: 0,
+    });
+}
+
+/// Maximum number of finality-check retries before giving up and sending to ManualReview.
+const MAX_FINALITY_CHECK_ATTEMPTS: u32 = 3;
+
+/// Process matured entries in the deferred remint queue.
+/// Called from the sender loop tick. For each matured entry, checks whether any
+/// previously sent withdrawal signature reached finalized commitment. If so, the
+/// withdrawal actually succeeded and we report Completed. Otherwise we attempt remint.
+pub async fn process_pending_remints(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    let now = Instant::now();
+
+    // Partition: matured entries get processed, immature stay in the queue
+    let mut remaining = Vec::new();
+    let mut matured = Vec::new();
+    for entry in state.pending_remints.drain(..) {
+        if entry.deadline <= now {
+            matured.push(entry);
+        } else {
+            remaining.push(entry);
+        }
+    }
+
+    for entry in matured {
+        let nonce_label = entry
+            .ctx
+            .withdrawal_nonce
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".to_string());
+
+        match state
+            .rpc_client
+            .get_signature_statuses(&entry.signatures)
+            .await
+        {
+            Ok(response) => {
+                let mut found_finalized = false;
+                for (i, status_opt) in response.value.iter().enumerate() {
+                    if let Some(status) = status_opt {
+                        if status.satisfies_commitment(CommitmentConfig::finalized())
+                            && status.err.is_none()
+                        {
+                            info!(
+                                "Withdrawal nonce {} actually finalized (sig: {}) — skipping remint",
+                                nonce_label, entry.signatures[i]
+                            );
+                            if let Some(transaction_id) = entry.ctx.transaction_id {
+                                send_guaranteed(
+                                    storage_tx,
+                                    TransactionStatusUpdate {
+                                        transaction_id,
+                                        trace_id: entry.ctx.trace_id.clone(),
+                                        status: TransactionStatus::Completed,
+                                        counterpart_signature: Some(
+                                            entry.signatures[i].to_string(),
+                                        ),
+                                        processed_at: Some(Utc::now()),
+                                        error_message: None,
+                                        remint_signature: None,
+                                    },
+                                    "transaction status update",
+                                )
+                                .await
+                                .ok();
+                            }
+                            found_finalized = true;
+                            break;
+                        }
+                    }
+                }
+                if found_finalized {
+                    continue;
+                }
+                // No sig finalized → proceed to remint
+                info!(
+                    "No finalized withdrawal for nonce {} — attempting remint",
+                    nonce_label
+                );
+                execute_deferred_remint(state, &entry, storage_tx).await;
+            }
+            Err(e) => {
+                let attempt = entry.finality_check_attempts + 1;
+                if attempt >= MAX_FINALITY_CHECK_ATTEMPTS {
+                    error!(
+                        "Finality check for nonce {} failed after {} attempts — \
+                         cannot verify withdrawal status, sending to ManualReview: {}",
+                        nonce_label, attempt, e
+                    );
+                    if let Some(transaction_id) = entry.ctx.transaction_id {
+                        send_guaranteed(
+                            storage_tx,
+                            TransactionStatusUpdate {
+                                transaction_id,
+                                trace_id: entry.ctx.trace_id.clone(),
+                                status: TransactionStatus::ManualReview,
+                                counterpart_signature: None,
+                                processed_at: Some(Utc::now()),
+                                error_message: Some(format!(
+                                    "{} | finality check failed after {} attempts: {}",
+                                    entry.original_error, attempt, e
+                                )),
+                                remint_signature: None,
+                            },
+                            "transaction status update",
+                        )
+                        .await
+                        .ok();
+                    }
+                } else {
+                    warn!(
+                        "Finality check for nonce {} failed (attempt {}/{}) — \
+                         re-queuing with extended deadline: {}",
+                        nonce_label, attempt, MAX_FINALITY_CHECK_ATTEMPTS, e
+                    );
+                    remaining.push(PendingRemint {
+                        finality_check_attempts: attempt,
+                        deadline: Instant::now() + FINALITY_SAFETY_DELAY,
+                        ..entry
+                    });
+                }
+            }
+        }
+    }
+
+    state.pending_remints = remaining;
+}
+
+/// Execute the actual remint for a matured PendingRemint entry.
+async fn execute_deferred_remint(
+    state: &SenderState,
+    entry: &PendingRemint,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    match attempt_remint(state, &entry.remint_info).await {
         Ok(signature) => {
             info!(
                 "Withdrawal failed but tokens reminted successfully: {}",
                 signature
             );
-            if let Some(transaction_id) = ctx.transaction_id {
+            if let Some(transaction_id) = entry.ctx.transaction_id {
                 if let Err(e) = send_guaranteed(
                     storage_tx,
                     TransactionStatusUpdate {
                         transaction_id,
-                        trace_id: ctx.trace_id.clone(),
+                        trace_id: entry.ctx.trace_id.clone(),
                         status: TransactionStatus::FailedReminted,
                         counterpart_signature: None,
                         processed_at: Some(Utc::now()),
-                        error_message: Some(error_msg.to_string()),
+                        error_message: Some(entry.original_error.clone()),
                         remint_signature: Some(signature.to_string()),
                     },
                     "transaction status update",
@@ -682,8 +909,24 @@ pub(super) async fn handle_permanent_failure(
         }
         Err(remint_error) => {
             error!("Remint also failed: {}", remint_error);
-            let combined = format!("{} | remint failed: {}", error_msg, remint_error);
-            send_fatal_error(storage_tx, ctx, &combined).await;
+            let combined = format!("{} | remint failed: {}", entry.original_error, remint_error);
+            if let Some(transaction_id) = entry.ctx.transaction_id {
+                send_guaranteed(
+                    storage_tx,
+                    TransactionStatusUpdate {
+                        transaction_id,
+                        trace_id: entry.ctx.trace_id.clone(),
+                        status: TransactionStatus::ManualReview,
+                        counterpart_signature: None,
+                        processed_at: Some(Utc::now()),
+                        error_message: Some(combined),
+                        remint_signature: None,
+                    },
+                    "transaction status update",
+                )
+                .await
+                .ok();
+            }
         }
     }
 }
@@ -716,7 +959,7 @@ pub(super) async fn send_fatal_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::sender::types::SenderSMTState;
+    use crate::operator::sender::types::{PendingRemint, SenderSMTState};
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
@@ -724,6 +967,7 @@ mod tests {
     use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::time::Instant;
 
     use std::sync::Once;
 
@@ -759,6 +1003,8 @@ mod tests {
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
         }
     }
 
@@ -817,13 +1063,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_failure_withdrawal_with_cache_attempts_remint_and_reports_combined_error() {
-        ensure_test_signer();
+    async fn permanent_failure_withdrawal_with_cache_defers_remint() {
         let mut state = make_sender_state();
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
-        // Populate remint cache — attempt_remint will fail (no real RPC)
+        // Populate remint cache and some pending signatures
         state.remint_cache.insert(5, make_remint_info(10));
+        let sig = Signature::new_unique();
+        state.pending_signatures.insert(5, vec![sig]);
 
         let ctx = TransactionContext {
             transaction_id: Some(10),
@@ -833,18 +1080,143 @@ mod tests {
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
 
-        let update = storage_rx.try_recv().expect("should receive status update");
+        // Should receive an immediate Failed status (crash safety)
+        let update = storage_rx.try_recv().expect("should receive Failed status");
+        assert_eq!(update.transaction_id, 10);
         assert_eq!(update.status, TransactionStatus::Failed);
 
-        // Error should contain both original and remint failure
+        // No further status updates yet — remint is deferred
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "should NOT send a second status update"
+        );
+
+        // Entry should be in pending_remints
+        assert_eq!(state.pending_remints.len(), 1);
+        let entry = &state.pending_remints[0];
+        assert_eq!(entry.ctx.transaction_id, Some(10));
+        assert_eq!(entry.signatures.len(), 1);
+        assert_eq!(entry.signatures[0], sig);
+        assert_eq!(entry.original_error, "release_funds failed");
+        assert_eq!(entry.finality_check_attempts, 0);
+
+        // remint_cache and pending_signatures should be drained
+        assert!(!state.remint_cache.contains_key(&5));
+        assert!(!state.pending_signatures.contains_key(&5));
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_zero_sigs_sends_manual_review() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Remint cache present but NO pending signatures (sign_and_send itself failed)
+        state.remint_cache.insert(5, make_remint_info(10));
+        // Note: not inserting into pending_signatures
+
+        let ctx = TransactionContext {
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "rpc send error").await;
+
+        // Should go straight to ManualReview — no deferred remint
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive ManualReview status");
+        assert_eq!(update.transaction_id, 10);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
         let err = update.error_message.as_deref().unwrap();
         assert!(
-            err.contains("release_funds failed"),
-            "should contain original error: {err}"
+            err.contains("no signatures to verify"),
+            "should mention no sigs: {err}"
+        );
+
+        // Nothing queued
+        assert!(
+            state.pending_remints.is_empty(),
+            "should not queue deferred remint with zero sigs"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_pending_remints_requeues_on_rpc_error() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Push a matured entry — RPC will fail (no real endpoint)
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(20),
+                withdrawal_nonce: Some(8),
+                trace_id: Some("trace-20".to_string()),
+            },
+            remint_info: make_remint_info(20),
+            signatures: vec![Signature::new_unique()],
+            original_error: "max retries".to_string(),
+            deadline: Instant::now() - Duration::from_secs(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // RPC error on first attempt → re-queued, not resolved
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "should NOT send status on first RPC failure"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "should re-queue entry after RPC error"
+        );
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn process_pending_remints_manual_review_after_max_rpc_failures() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Push entry already at max attempts — next RPC failure triggers ManualReview
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(20),
+                withdrawal_nonce: Some(8),
+                trace_id: Some("trace-20".to_string()),
+            },
+            remint_info: make_remint_info(20),
+            signatures: vec![Signature::new_unique()],
+            original_error: "max retries".to_string(),
+            deadline: Instant::now() - Duration::from_secs(1),
+            finality_check_attempts: 2, // MAX_FINALITY_CHECK_ATTEMPTS - 1
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx.try_recv().expect("should receive status update");
+        assert_eq!(update.transaction_id, 20);
+        assert_eq!(
+            update.status,
+            TransactionStatus::ManualReview,
+            "exhausted finality check retries should produce ManualReview"
+        );
+
+        let err = update.error_message.as_deref().unwrap();
+        assert!(
+            err.contains("finality check failed"),
+            "should mention finality check failure: {err}"
         );
         assert!(
-            err.contains("remint failed"),
-            "should contain remint failure: {err}"
+            err.contains("max retries"),
+            "should contain original error: {err}"
+        );
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "should not re-queue after max attempts"
         );
     }
 
@@ -893,6 +1265,9 @@ mod tests {
         state.smt_state = Some(smt);
         state.retry_counts.insert(3, 2);
         state.remint_cache.insert(3, make_remint_info(50));
+        state
+            .pending_signatures
+            .insert(3, vec![Signature::new_unique()]);
 
         let sig = solana_sdk::signature::Signature::new_unique();
         handle_success(&mut state, &ctx, sig, &storage_tx).await;
@@ -905,6 +1280,10 @@ mod tests {
             !state.remint_cache.contains_key(&3),
             "remint_cache should be cleared on success"
         );
+        assert!(
+            !state.pending_signatures.contains_key(&3),
+            "pending_signatures should be cleared on success"
+        );
 
         // Should send Completed status
         let update = storage_rx.try_recv().expect("should receive status update");
@@ -913,6 +1292,62 @@ mod tests {
     }
 
     // ── remint_cache population ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn process_pending_remints_skips_immature() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Push an entry with a future deadline
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(30),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-30".to_string()),
+            },
+            remint_info: make_remint_info(30),
+            signatures: vec![Signature::new_unique()],
+            original_error: "timeout".to_string(),
+            deadline: Instant::now() + Duration::from_secs(600),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Nothing should be processed
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "immature entry should not be processed"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "immature entry should remain in queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_and_confirm_stashes_withdrawal_signature() {
+        let mut state = make_sender_state();
+        let nonce = 42u64;
+
+        // Simulate what send_and_confirm does: stash a signature
+        let sig = Signature::new_unique();
+        state.pending_signatures.entry(nonce).or_default().push(sig);
+
+        assert!(state.pending_signatures.contains_key(&nonce));
+        assert_eq!(state.pending_signatures[&nonce].len(), 1);
+        assert_eq!(state.pending_signatures[&nonce][0], sig);
+
+        // Stash another (simulating a retry)
+        let sig2 = Signature::new_unique();
+        state
+            .pending_signatures
+            .entry(nonce)
+            .or_default()
+            .push(sig2);
+        assert_eq!(state.pending_signatures[&nonce].len(), 2);
+    }
 
     #[test]
     fn remint_cache_populated_from_release_funds_builder() {

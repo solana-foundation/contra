@@ -7,8 +7,10 @@ use chrono::{DateTime, Utc};
 use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::time::Instant;
 
 use crate::operator::utils::instruction_util::{MintToBuilder, WithdrawalRemintInfo};
 
@@ -49,6 +51,22 @@ pub struct SenderState {
     /// Cached remint info for withdrawal transactions, keyed by nonce.
     /// Extracted before cleanup_failed_transaction removes builder from SMT cache.
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
+    /// Signatures sent per withdrawal nonce, used for finality checks before reminting.
+    pub pending_signatures: HashMap<u64, Vec<Signature>>,
+    /// Deferred remint queue — entries are processed after their deadline matures.
+    pub pending_remints: Vec<PendingRemint>,
+}
+
+/// A remint deferred until Solana finality window passes, allowing us to verify
+/// that the original withdrawal definitively did not land before reminting.
+pub struct PendingRemint {
+    pub ctx: TransactionContext,
+    pub remint_info: WithdrawalRemintInfo,
+    pub signatures: Vec<Signature>,
+    pub original_error: String,
+    pub deadline: Instant,
+    /// Number of times the finality check has been retried (e.g. due to RPC errors).
+    pub finality_check_attempts: u32,
 }
 
 pub struct SenderSMTState {

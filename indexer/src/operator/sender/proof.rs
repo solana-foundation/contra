@@ -233,6 +233,8 @@ mod tests {
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
         }
     }
 

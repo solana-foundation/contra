@@ -80,6 +80,9 @@ pub async fn run_sender(
                     handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
                 }
 
+                // Process matured deferred remints
+                transaction::process_pending_remints(&mut state, &storage_tx).await;
+
                 // Process any transactions that were blocked by rotation
                 while let Some((ctx, builder)) = state.rotation_retry_queue.pop() {
                     let nonce = ctx.withdrawal_nonce.expect("rotation retry must have nonce");

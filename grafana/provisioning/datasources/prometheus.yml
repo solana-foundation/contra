@@ -5,6 +5,6 @@ datasources:
     uid: prometheus
     type: prometheus
     access: proxy
-    url: ${PROMETHEUS_URL:-http://prometheus:9090}
+    url: $PROMETHEUS_URL
     isDefault: true
-    editable: true
+    editable: false

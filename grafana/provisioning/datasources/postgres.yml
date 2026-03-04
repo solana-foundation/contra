@@ -14,4 +14,4 @@ datasources:
       database: ${POSTGRES_INDEXER_DB}
       sslmode: disable
       postgresVersion: 1600
-    editable: true
+    editable: false

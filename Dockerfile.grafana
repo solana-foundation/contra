@@ -5,3 +5,4 @@ COPY grafana/dashboards /var/lib/grafana/dashboards
 
 ENV GF_USERS_ALLOW_SIGN_UP=false
 ENV ALERT_WEBHOOK_URL=http://localhost:9/no-op
+ENV PROMETHEUS_URL=http://prometheus:9090

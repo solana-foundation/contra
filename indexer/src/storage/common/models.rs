@@ -32,6 +32,9 @@ pub enum TransactionStatus {
     // Withdrawal failed permanently but burned Contra tokens were reminted back to user
     #[sqlx(rename = "failed_reminted")]
     FailedReminted,
+    // Remint attempted but could not confirm — requires manual investigation
+    #[sqlx(rename = "manual_review")]
+    ManualReview,
 }
 
 /// DbTransaction domain model

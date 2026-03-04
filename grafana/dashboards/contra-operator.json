@@ -390,16 +390,15 @@
       "fieldConfig": {
         "defaults": {
           "decimals": 4,
-          "unit": "sol",
+          "unit": "none",
           "custom": {
             "thresholdsStyle": { "mode": "line" }
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "red", "value": 0.5 },
-              { "color": "green", "value": 0.5 }
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.5 }
             ]
           }
         },

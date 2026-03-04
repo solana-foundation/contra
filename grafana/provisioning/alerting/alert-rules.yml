@@ -134,7 +134,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: contra_feepayer_balance_lamports / 1e9
+              expr: contra_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
               instant: true
               refId: A
           - refId: C

@@ -157,4 +157,185 @@ mod tests {
         let config = WebhookRetryConfig::new(0, Duration::from_millis(10), Duration::from_secs(1));
         assert_eq!(config.max_attempts(), 1);
     }
+
+    #[test]
+    fn retry_delay_exponential_backoff() {
+        let config =
+            WebhookRetryConfig::new(5, Duration::from_millis(100), Duration::from_secs(10));
+        // attempt 1: base * 2^0 = 100ms
+        assert_eq!(config.retry_delay(1), Duration::from_millis(100));
+        // attempt 2: base * 2^1 = 200ms
+        assert_eq!(config.retry_delay(2), Duration::from_millis(200));
+        // attempt 3: base * 2^2 = 400ms
+        assert_eq!(config.retry_delay(3), Duration::from_millis(400));
+    }
+
+    #[test]
+    fn retry_delay_capped_at_max() {
+        let config = WebhookRetryConfig::new(10, Duration::from_secs(1), Duration::from_secs(5));
+        // attempt 5: base * 2^4 = 16s, but capped at 5s
+        assert_eq!(config.retry_delay(5), Duration::from_secs(5));
+    }
+
+    // ── post_json retry logic (wiremock) ──────────────────────────────────────
+
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    #[derive(Serialize)]
+    struct TestPayload {
+        msg: String,
+    }
+
+    #[tokio::test]
+    async fn post_json_success_on_first_attempt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            WebhookClient::new(Duration::from_secs(5), WebhookRetryConfig::single_attempt())
+                .unwrap();
+
+        let result = client
+            .post_json(&server.uri(), &TestPayload { msg: "hi".into() }, "test")
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn post_json_retries_then_succeeds() {
+        let server = MockServer::start().await;
+
+        // First attempt: 500, second attempt: 200
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = WebhookClient::new(
+            Duration::from_secs(5),
+            // 2 attempts, no delay for test speed
+            WebhookRetryConfig::new(2, Duration::ZERO, Duration::ZERO),
+        )
+        .unwrap();
+
+        let result = client
+            .post_json(
+                &server.uri(),
+                &TestPayload {
+                    msg: "retry".into(),
+                },
+                "test",
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn post_json_exhausts_retries() {
+        let server = MockServer::start().await;
+
+        // Always return 500
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = WebhookClient::new(
+            Duration::from_secs(5),
+            WebhookRetryConfig::new(3, Duration::ZERO, Duration::ZERO),
+        )
+        .unwrap();
+
+        let result = client
+            .post_json(
+                &server.uri(),
+                &TestPayload { msg: "fail".into() },
+                "test-ctx",
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.attempts(), 3);
+        assert!(err.message().contains("500"));
+        assert!(err.message().contains("server error"));
+    }
+
+    #[tokio::test]
+    async fn post_json_single_attempt_no_retry() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            WebhookClient::new(Duration::from_secs(5), WebhookRetryConfig::single_attempt())
+                .unwrap();
+
+        let result = client
+            .post_json(&server.uri(), &TestPayload { msg: "once".into() }, "test")
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_json_empty_error_body() {
+        let server = MockServer::start().await;
+
+        // 502 with no body
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client =
+            WebhookClient::new(Duration::from_secs(5), WebhookRetryConfig::single_attempt())
+                .unwrap();
+
+        let result = client
+            .post_json(&server.uri(), &TestPayload { msg: "x".into() }, "test")
+            .await;
+        let err = result.unwrap_err();
+        // Empty body → "HTTP 502 Bad Gateway" (no colon-separated body)
+        assert!(err.message().contains("HTTP 502"), "got: {}", err.message());
+        assert!(!err.message().contains(": ") || err.message().ends_with("Gateway"));
+    }
+
+    #[tokio::test]
+    async fn post_json_connection_refused() {
+        // No server running on this port
+        let client =
+            WebhookClient::new(Duration::from_secs(1), WebhookRetryConfig::single_attempt())
+                .unwrap();
+
+        let result = client
+            .post_json(
+                "http://127.0.0.1:1",
+                &TestPayload { msg: "nope".into() },
+                "test",
+            )
+            .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.attempts(), 1);
+        assert!(
+            err.message().contains("request failed"),
+            "got: {}",
+            err.message()
+        );
+    }
 }

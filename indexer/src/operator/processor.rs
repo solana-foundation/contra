@@ -304,3 +304,97 @@ pub async fn process_deposit_funds(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::find_allowed_mint_pda;
+
+    fn make_release_funds_state() -> ReleaseFundsState {
+        ReleaseFundsState {
+            instance_pda: Pubkey::new_unique(),
+            operator_pubkey: Pubkey::new_unique(),
+            operator_pda: Pubkey::new_unique(),
+            event_authority_pda: Pubkey::new_unique(),
+            allowed_mints: HashMap::new(),
+            instance_atas: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn get_allowed_mint_pda_derives_and_caches() {
+        let mut state = make_release_funds_state();
+        let mint = Pubkey::new_unique();
+
+        let pda1 = state.get_allowed_mint_pda(&mint);
+        let pda2 = state.get_allowed_mint_pda(&mint);
+
+        assert_eq!(pda1, pda2);
+        assert_eq!(pda1, find_allowed_mint_pda(&state.instance_pda, &mint));
+        assert_eq!(state.allowed_mints.len(), 1);
+    }
+
+    #[test]
+    fn get_allowed_mint_pda_different_mints() {
+        let mut state = make_release_funds_state();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+
+        assert_ne!(
+            state.get_allowed_mint_pda(&mint_a),
+            state.get_allowed_mint_pda(&mint_b)
+        );
+        assert_eq!(state.allowed_mints.len(), 2);
+    }
+
+    #[test]
+    fn get_instance_ata_derives_and_caches() {
+        let mut state = make_release_funds_state();
+        let mint = Pubkey::new_unique();
+        let tp = spl_token::id();
+
+        let ata1 = state.get_instance_ata(&mint, &tp);
+        let ata2 = state.get_instance_ata(&mint, &tp);
+
+        assert_eq!(ata1, ata2);
+        let expected =
+            get_associated_token_address_with_program_id(&state.instance_pda, &mint, &tp);
+        assert_eq!(ata1, expected);
+        assert_eq!(state.instance_atas.len(), 1);
+    }
+
+    #[test]
+    fn get_instance_ata_different_mints() {
+        let mut state = make_release_funds_state();
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let tp = spl_token::id();
+
+        assert_ne!(
+            state.get_instance_ata(&mint_a, &tp),
+            state.get_instance_ata(&mint_b, &tp)
+        );
+        assert_eq!(state.instance_atas.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn process_release_funds_missing_state_errors() {
+        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+        // Keep tx alive so channel isn't closed — error must come from missing state
+        let (_tx, rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, _sender_rx) = mpsc::channel(1);
+
+        let result = process_release_funds(&mut ps, rx, sender_tx).await;
+        assert!(
+            matches!(result, Err(crate::error::OperatorError::MissingBuilder)),
+            "expected MissingBuilder, got: {:?}",
+            result
+        );
+    }
+}

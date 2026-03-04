@@ -535,10 +535,108 @@ mod tests {
     }
 
     #[test]
+    fn compute_cutoff_slot_saturating() {
+        assert_eq!(compute_truncate_before_slot(0, 1), 0);
+        assert_eq!(compute_truncate_before_slot(0, 100), 0);
+        assert_eq!(compute_truncate_before_slot(5, 5), 1);
+    }
+
+    #[test]
     fn noop_archive_command_detection_is_strict() {
         assert!(is_noop_archive_command("/bin/true"));
         assert!(is_noop_archive_command(" true "));
         assert!(is_noop_archive_command("':'"));
+        assert!(is_noop_archive_command(""));
+        assert!(is_noop_archive_command("  "));
+        assert!(is_noop_archive_command(":"));
+        assert!(is_noop_archive_command("\"true\""));
+        assert!(is_noop_archive_command("'/bin/true'"));
         assert!(!is_noop_archive_command("cp %p /backups/%f"));
+        assert!(!is_noop_archive_command("wal-g wal-push %p"));
+    }
+
+    #[test]
+    fn backup_check_result_has_valid_backup() {
+        // Neither ok
+        let check = BackupCheckResult::default();
+        assert!(!check.has_valid_backup());
+
+        // WAL ok only
+        let check = BackupCheckResult {
+            wal_archive_ok: true,
+            ..Default::default()
+        };
+        assert!(check.has_valid_backup());
+
+        // pg_dump ok only
+        let check = BackupCheckResult {
+            pg_dump_ok: true,
+            ..Default::default()
+        };
+        assert!(check.has_valid_backup());
+
+        // Both ok
+        let check = BackupCheckResult {
+            wal_archive_ok: true,
+            pg_dump_ok: true,
+            ..Default::default()
+        };
+        assert!(check.has_valid_backup());
+    }
+
+    #[test]
+    fn backup_check_result_skipped() {
+        let check = BackupCheckResult::skipped();
+        assert!(!check.has_valid_backup());
+        assert!(check.wal_archive_reason.contains("Skipped"));
+        assert!(check.pg_dump_reason.contains("Skipped"));
+    }
+
+    #[test]
+    fn check_pg_dump_no_path() {
+        let (ok, reason) = check_pg_dump_recency(None, Duration::from_secs(60));
+        assert!(!ok);
+        assert!(reason.contains("No pg_dump path"));
+    }
+
+    #[test]
+    fn check_pg_dump_nonexistent_file() {
+        let path = PathBuf::from("/nonexistent/backup.sql");
+        let (ok, reason) = check_pg_dump_recency(Some(&path), Duration::from_secs(60));
+        assert!(!ok);
+        assert!(reason.contains("is not a file"));
+    }
+
+    #[test]
+    fn check_pg_dump_recent_file() {
+        // Create a temp file — its mtime is "now", so it's recent
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (ok, reason) = check_pg_dump_recency(Some(tmp.path()), Duration::from_secs(3600));
+        assert!(ok, "Expected recent file to pass, got: {}", reason);
+        assert!(reason.contains("Recent pg_dump"));
+    }
+
+    #[test]
+    fn truncate_options_fields() {
+        let opts = TruncateOptions {
+            keep_slots: 100,
+            max_backup_age: Duration::from_secs(300),
+            pg_dump_path: Some(PathBuf::from("/tmp/backup.sql")),
+            batch_size: 500,
+            dry_run: true,
+        };
+        assert_eq!(opts.keep_slots, 100);
+        assert!(opts.dry_run);
+    }
+
+    #[test]
+    fn truncate_report_default() {
+        let report = TruncateReport::default();
+        assert_eq!(report.latest_slot, None);
+        assert_eq!(report.truncate_before_slot, None);
+        assert_eq!(report.blocks_deleted, 0);
+        assert_eq!(report.transactions_deleted, 0);
+        assert_eq!(report.account_history_rows_deleted, 0);
+        assert_eq!(report.first_available_block, None);
     }
 }

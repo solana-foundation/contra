@@ -298,6 +298,23 @@ impl BOB {
     }
 }
 
+#[cfg(test)]
+impl BOB {
+    /// Test-only constructor — needs private field access so it lives on the type.
+    /// The actual test helper that sets up the dummy DB pool is in test_helpers.rs.
+    pub(crate) fn new_test(
+        settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
+        accounts_db: AccountsDB,
+    ) -> Self {
+        Self {
+            accounts: HashMap::new(),
+            precompiles: HashMap::new(),
+            settled_accounts_rx,
+            accounts_db,
+        }
+    }
+}
+
 impl InvokeContextCallback for BOB {}
 
 impl TransactionProcessingCallback for BOB {
@@ -326,36 +343,10 @@ impl TransactionProcessingCallback for BOB {
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        crate::accounts::{AccountsDB, PostgresAccountsDB},
-        solana_svm_callback::TransactionProcessingCallback,
-        sqlx::postgres::PgPoolOptions,
-        std::sync::Arc,
-    };
-
-    /// Creates a dummy AccountsDB backed by a lazily-connected pool.
-    /// No real connection is ever established because none of these tests
-    /// call through to the database.
-    fn dummy_accounts_db() -> AccountsDB {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://test@localhost:1/test")
-            .expect("connect_lazy should not fail");
-        AccountsDB::Postgres(PostgresAccountsDB {
-            pool: Arc::new(pool),
-            read_only: true,
-        })
-    }
+    use {super::*, solana_svm_callback::TransactionProcessingCallback};
 
     fn create_test_bob() -> (BOB, mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let bob = BOB {
-            accounts: HashMap::new(),
-            precompiles: HashMap::new(),
-            settled_accounts_rx: rx,
-            accounts_db: dummy_accounts_db(),
-        };
-        (bob, tx)
+        crate::test_helpers::create_test_bob()
     }
 
     fn make_account(lamports: u64, data: &[u8], owner: &Pubkey) -> AccountSharedData {

@@ -14,15 +14,18 @@ use super::utils::{restart_contra, send_and_confirm, start_contra, token_balance
 use crate::helpers::get_free_port;
 use crate::setup;
 
-/// Verify that dedup state survives a node restart.
+/// Verify that dedup state and chain continuity survive a node restart.
 ///
 /// Flow:
 ///   1. Start a fresh Contra node backed by the provided Postgres DB.
 ///   2. Create a mint, token accounts for Alice and Bob, mint 1_000_000 to Alice.
-///   3. Transfer 250_000 from Alice to Bob — record balances and tx count.
+///   3. Transfer 250_000 from Alice to Bob — record balances, tx count, and slot.
 ///   4. Restart the node (same DB, same port).
-///   5. Re-submit the exact same transfer transaction (same signature + blockhash).
-///   6. Assert balances unchanged and tx count did not increase.
+///   5. Assert slot height is restored to at least the pre-restart value.
+///   6. Re-submit the exact same transfer transaction (same signature + blockhash).
+///   7. Assert balances unchanged and tx count did not increase (dedup works).
+///   8. Send a new transfer with a fresh blockhash and confirm it succeeds
+///      (blockhash window was restored and the node can continue processing).
 pub async fn run_dedup_persistence_test(db_url: String) {
     println!("\n=== Dedup Persistence Test ===");
 
@@ -127,9 +130,28 @@ pub async fn run_dedup_persistence_test(db_url: String) {
         alice_balance_before, bob_balance_before, tx_count_before
     );
 
+    // Record pre-restart slot height
+    let slot_before = client.get_slot().await.unwrap();
+    println!("  Pre-restart slot: {}", slot_before);
+
     // --- Restart the node with the same DB ---
-    let (new_handles, _) = restart_contra(handles, node_config).await.unwrap();
+    let (new_handles, rpc_url) = restart_contra(handles, node_config).await.unwrap();
+    // Recreate the client so it doesn't reuse a stale HTTP connection to the old process
+    let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
     println!("  Node restarted");
+
+    // --- Assert: slot height restored ---
+    let slot_after_restart = client.get_slot().await.unwrap();
+    assert!(
+        slot_after_restart >= slot_before,
+        "Slot must be >= pre-restart value ({} vs {})",
+        slot_after_restart,
+        slot_before
+    );
+    println!(
+        "  Post-restart slot: {} (pre-restart: {})",
+        slot_after_restart, slot_before
+    );
 
     // --- Re-submit the exact same transfer transaction ---
     println!("  Re-submitting transfer tx after restart...");
@@ -161,6 +183,51 @@ pub async fn run_dedup_persistence_test(db_url: String) {
         alice_balance_after, bob_balance_after, tx_count_after
     );
     println!("  PASS: dedup state persisted across restart");
+
+    // --- Assert: node can continue processing with fresh blockhash ---
+    println!("  Sending new transfer after restart...");
+    let fresh_blockhash = client.get_latest_blockhash().await.unwrap();
+    let new_transfer_tx = setup::transfer_tokens_transaction(
+        &alice,
+        &bob.pubkey(),
+        &mint.pubkey(),
+        100_000,
+        fresh_blockhash,
+    );
+    send_and_confirm(&client, &new_transfer_tx).await;
+
+    sleep(Duration::from_millis(300)).await;
+
+    let alice_final = token_balance(&client, &alice_ata).await.unwrap();
+    let bob_final = token_balance(&client, &bob_ata).await.unwrap();
+    let tx_count_final = client.get_transaction_count().await.unwrap();
+
+    assert_eq!(
+        alice_final, 650_000,
+        "Alice should have 650_000 after new post-restart transfer"
+    );
+    assert_eq!(
+        bob_final, 350_000,
+        "Bob should have 350_000 after new post-restart transfer"
+    );
+    assert!(
+        tx_count_final > tx_count_before,
+        "Transaction count must increase after new post-restart transfer"
+    );
+
+    let slot_final = client.get_slot().await.unwrap();
+    assert!(
+        slot_final > slot_after_restart,
+        "Slot must advance after new post-restart transaction ({} vs {})",
+        slot_final,
+        slot_after_restart
+    );
+
+    println!(
+        "  Post-new-tx — Alice: {}, Bob: {}, tx_count: {}, slot: {}",
+        alice_final, bob_final, tx_count_final, slot_final
+    );
+    println!("  PASS: node resumed processing with restored blockhash window");
 
     new_handles.shutdown().await;
 }

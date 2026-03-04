@@ -299,28 +299,6 @@ impl NodeHandles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::{Keypair, Signer};
-
-    #[test]
-    fn test_sequencer_config_with_admin_keys() {
-        let admin1 = Keypair::new().pubkey();
-        let admin2 = Keypair::new().pubkey();
-
-        let config = NodeConfig {
-            admin_keys: vec![admin1, admin2],
-            ..Default::default()
-        };
-
-        assert_eq!(config.admin_keys.len(), 2);
-        assert!(config.admin_keys.contains(&admin1));
-        assert!(config.admin_keys.contains(&admin2));
-    }
-
-    #[test]
-    fn test_node_config_default_has_no_admin_keys() {
-        let config = NodeConfig::default();
-        assert!(config.admin_keys.is_empty());
-    }
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_blocktime() {

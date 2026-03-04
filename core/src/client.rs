@@ -180,3 +180,81 @@ pub fn load_keypair(path: &PathBuf) -> Result<Keypair, Box<dyn std::error::Error
     Keypair::try_from(keypair_bytes.as_slice())
         .map_err(|e| format!("Failed to create keypair: {}", e).into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_create_spl_transfer_structure() {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+
+        let tx = create_spl_transfer(&from, &to, &mint, 1000, blockhash);
+        assert_eq!(tx.message.recent_blockhash, blockhash);
+        assert_eq!(tx.message.instructions.len(), 1);
+        // The fee payer should be the from keypair
+        let fee_payer = tx.message.account_keys[0];
+        assert_eq!(fee_payer, from.pubkey());
+    }
+
+    #[test]
+    fn test_create_spl_burn_structure() {
+        let from = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+
+        let tx = create_spl_burn(&from, &mint, 500, blockhash);
+        assert_eq!(tx.message.recent_blockhash, blockhash);
+        assert_eq!(tx.message.instructions.len(), 1);
+    }
+
+    #[test]
+    fn test_create_admin_initialize_mint_structure() {
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let blockhash = Hash::new_unique();
+
+        let tx = create_admin_initialize_mint(&admin, &mint, 6, blockhash);
+        assert_eq!(tx.message.recent_blockhash, blockhash);
+        // InitializeMint instruction
+        assert_eq!(tx.message.instructions.len(), 1);
+    }
+
+    #[test]
+    fn test_load_keypair_valid() {
+        let kp = Keypair::new();
+        let bytes = kp.to_bytes().to_vec();
+        let json = serde_json::to_string(&bytes).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &json).unwrap();
+
+        let loaded = load_keypair(&tmp.path().to_path_buf()).unwrap();
+        assert_eq!(loaded.pubkey(), kp.pubkey());
+    }
+
+    #[test]
+    fn test_load_keypair_invalid_length() {
+        let bytes: Vec<u8> = vec![0u8; 32]; // too short
+        let json = serde_json::to_string(&bytes).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &json).unwrap();
+
+        let result = load_keypair(&tmp.path().to_path_buf());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Invalid keypair length"));
+    }
+
+    #[test]
+    fn test_load_keypair_invalid_json() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "not json at all").unwrap();
+
+        let result = load_keypair(&tmp.path().to_path_buf());
+        assert!(result.is_err());
+    }
+}

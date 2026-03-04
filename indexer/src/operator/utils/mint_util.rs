@@ -329,14 +329,6 @@ mod tests {
         assert_eq!(cache.cache_size(), 2);
     }
 
-    #[test]
-    fn test_get_contra_token_program() {
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let cache = MintCache::new(storage);
-
-        assert_eq!(cache.get_contra_token_program(), TOKEN_PROGRAM_ID);
-    }
-
     #[tokio::test]
     async fn test_rpc_fallback_spl_token() {
         let mint = create_test_mint();

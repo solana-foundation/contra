@@ -180,3 +180,329 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
 
     mint::cleanup_mint_builder(state, nonce.map(|n| n as i64));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::utils::smt_util::SmtState;
+    use crate::operator::MintCache;
+    use crate::storage::common::storage::mock::MockStorage;
+    use crate::storage::Storage;
+    use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// Build a minimal SenderState for testing (no RPC needed)
+    fn make_sender_state() -> SenderState {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            crate::operator::RetryConfig::default(),
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ));
+        SenderState {
+            rpc_client: rpc.clone(),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: MintCache::new(storage),
+            retry_max_attempts: 3,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: crate::config::ProgramType::Escrow,
+        }
+    }
+
+    fn make_smt_state(tree_index: u64) -> SenderSMTState {
+        SenderSMTState {
+            smt_state: SmtState::new(tree_index),
+            nonce_to_builder: HashMap::new(),
+        }
+    }
+
+    fn make_release_funds_builder() -> ReleaseFundsBuilder {
+        let mut b = ReleaseFundsBuilder::new();
+        let pk = Pubkey::new_unique();
+        b.payer(pk)
+            .operator(pk)
+            .instance(pk)
+            .operator_pda(pk)
+            .mint(pk)
+            .allowed_mint(pk)
+            .user_ata(pk)
+            .instance_ata(pk)
+            .token_program(spl_token::id())
+            .user(pk)
+            .amount(1000)
+            .transaction_nonce(0);
+        b
+    }
+
+    // ── take_pending_rotation_if_ready ────────────────────────────────
+
+    #[test]
+    fn rotation_returns_none_when_no_pending() {
+        let mut state = make_sender_state();
+        assert!(take_pending_rotation_if_ready(&mut state).is_none());
+    }
+
+    #[test]
+    fn rotation_returns_builder_when_no_inflight() {
+        let mut state = make_sender_state();
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        // No smt_state means no in-flight
+        let result = take_pending_rotation_if_ready(&mut state);
+        assert!(result.is_some());
+        assert!(state.pending_rotation.is_none(), "should be taken");
+    }
+
+    #[test]
+    fn rotation_blocked_by_inflight_transactions() {
+        let mut state = make_sender_state();
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+
+        // Add smt_state with an in-flight nonce
+        let mut smt = make_smt_state(0);
+        let ctx = TransactionContext {
+            transaction_id: Some(1),
+            withdrawal_nonce: Some(0),
+            trace_id: Some("t".to_string()),
+        };
+        smt.nonce_to_builder
+            .insert(0, (ctx, ReleaseFundsBuilder::new()));
+        state.smt_state = Some(smt);
+
+        assert!(take_pending_rotation_if_ready(&mut state).is_none());
+        assert!(state.pending_rotation.is_some(), "should NOT be taken yet");
+    }
+
+    #[test]
+    fn rotation_ready_after_inflight_cleared() {
+        let mut state = make_sender_state();
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.smt_state = Some(make_smt_state(0)); // empty nonce_to_builder
+
+        assert!(take_pending_rotation_if_ready(&mut state).is_some());
+    }
+
+    // ── cleanup_failed_transaction ───────────────────────────────────
+
+    #[test]
+    fn cleanup_removes_nonce_from_smt_and_caches() {
+        let mut state = make_sender_state();
+        let mut smt = make_smt_state(0);
+        smt.smt_state.insert_nonce(5);
+        let ctx = TransactionContext {
+            transaction_id: Some(1),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("t".to_string()),
+        };
+        smt.nonce_to_builder
+            .insert(5, (ctx, ReleaseFundsBuilder::new()));
+        state.smt_state = Some(smt);
+        state.retry_counts.insert(5, 2);
+
+        cleanup_failed_transaction(&mut state, Some(5));
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(!smt.smt_state.contains_nonce(5));
+        assert!(!smt.nonce_to_builder.contains_key(&5));
+        assert!(!state.retry_counts.contains_key(&5));
+    }
+
+    #[test]
+    fn cleanup_with_none_nonce_is_noop() {
+        let mut state = make_sender_state();
+        state.smt_state = Some(make_smt_state(0));
+        cleanup_failed_transaction(&mut state, None);
+        // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn cleanup_without_smt_state_is_noop() {
+        let mut state = make_sender_state();
+        cleanup_failed_transaction(&mut state, Some(5));
+    }
+
+    // ── handle_release_funds_transaction ──────────────────────────────
+
+    #[test]
+    fn handle_release_funds_tree_index_mismatch() {
+        let mut smt = make_smt_state(0); // tree_index 0
+
+        let builder = make_release_funds_builder();
+        // Nonce in tree_index 1 range (>= MAX_TREE_LEAVES)
+        let nonce = MAX_TREE_LEAVES as u64;
+        let bwn = Box::new(ReleaseFundsBuilderWithNonce {
+            builder,
+            nonce,
+            transaction_id: 1,
+            trace_id: "t".to_string(),
+        });
+
+        let result =
+            smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None);
+        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(OperatorError::Program(
+                ProgramError::TreeIndexMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn handle_release_funds_duplicate_nonce_errors() {
+        let mut smt = make_smt_state(0);
+        smt.smt_state.insert_nonce(3); // pre-insert
+
+        let builder = make_release_funds_builder();
+        let bwn = Box::new(ReleaseFundsBuilderWithNonce {
+            builder,
+            nonce: 3,
+            transaction_id: 1,
+            trace_id: "t".to_string(),
+        });
+
+        let result =
+            smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_release_funds_success_inserts_nonce_and_caches_builder() {
+        let mut smt = make_smt_state(0);
+        let builder = make_release_funds_builder();
+        let bwn = Box::new(ReleaseFundsBuilderWithNonce {
+            builder,
+            nonce: 0,
+            transaction_id: 42,
+            trace_id: "trace-42".to_string(),
+        });
+
+        let result = smt.handle_release_funds_transaction(
+            bwn,
+            Pubkey::new_unique(),
+            vec![],
+            Some(5000),
+            Some(200_000),
+        );
+        assert!(result.is_ok());
+
+        // Nonce inserted into SMT
+        assert!(smt.smt_state.contains_nonce(0));
+        // Builder cached for potential retry
+        assert!(smt.nonce_to_builder.contains_key(&0));
+
+        let ix = result.unwrap();
+        assert_eq!(ix.instructions.len(), 1);
+        assert_eq!(ix.compute_unit_price, Some(5000));
+        assert_eq!(ix.compute_budget, Some(200_000));
+    }
+
+    #[test]
+    fn handle_release_funds_multiple_nonces_produces_different_roots() {
+        let mut smt = make_smt_state(0);
+
+        let build_and_insert = |smt: &mut SenderSMTState, nonce: u64| -> [u8; 32] {
+            let mut builder = make_release_funds_builder();
+            builder.transaction_nonce(nonce);
+            let bwn = Box::new(ReleaseFundsBuilderWithNonce {
+                builder,
+                nonce,
+                transaction_id: nonce as i64,
+                trace_id: format!("t-{nonce}"),
+            });
+            smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None)
+                .unwrap();
+            smt.smt_state.current_root()
+        };
+
+        let root_after_0 = build_and_insert(&mut smt, 0);
+        let root_after_1 = build_and_insert(&mut smt, 1);
+
+        assert_ne!(root_after_0, root_after_1);
+    }
+
+    // ── rebuild_with_regenerated_proof ────────────────────────────────
+
+    #[tokio::test]
+    async fn rebuild_returns_none_when_nonce_is_none() {
+        let mut state = make_sender_state();
+        let ix = InstructionWithSigners {
+            instructions: vec![],
+            fee_payer: Pubkey::new_unique(),
+            signers: vec![],
+            compute_unit_price: None,
+            compute_budget: None,
+        };
+        assert!(rebuild_with_regenerated_proof(&mut state, None, ix)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_returns_none_without_smt_state() {
+        let mut state = make_sender_state();
+        let ix = InstructionWithSigners {
+            instructions: vec![],
+            fee_payer: Pubkey::new_unique(),
+            signers: vec![],
+            compute_unit_price: None,
+            compute_budget: None,
+        };
+        assert!(rebuild_with_regenerated_proof(&mut state, Some(0), ix)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_returns_none_when_no_cached_builder() {
+        let mut state = make_sender_state();
+        state.smt_state = Some(make_smt_state(0));
+        let ix = InstructionWithSigners {
+            instructions: vec![],
+            fee_payer: Pubkey::new_unique(),
+            signers: vec![],
+            compute_unit_price: None,
+            compute_budget: None,
+        };
+        assert!(rebuild_with_regenerated_proof(&mut state, Some(99), ix)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_success_with_cached_builder() {
+        let mut state = make_sender_state();
+        let mut smt = make_smt_state(0);
+
+        // Cache a builder at nonce 0
+        let builder = make_release_funds_builder();
+        let ctx = TransactionContext {
+            transaction_id: Some(1),
+            withdrawal_nonce: Some(0),
+            trace_id: Some("t".to_string()),
+        };
+        smt.nonce_to_builder.insert(0, (ctx, builder));
+        state.smt_state = Some(smt);
+
+        let fee_payer = Pubkey::new_unique();
+        let ix = InstructionWithSigners {
+            instructions: vec![],
+            fee_payer,
+            signers: vec![],
+            compute_unit_price: Some(1000),
+            compute_budget: Some(300_000),
+        };
+
+        let result = rebuild_with_regenerated_proof(&mut state, Some(0), ix).await;
+        assert!(result.is_some());
+        let rebuilt = result.unwrap();
+        assert_eq!(rebuilt.fee_payer, fee_payer);
+        assert_eq!(rebuilt.compute_unit_price, Some(1000));
+    }
+}

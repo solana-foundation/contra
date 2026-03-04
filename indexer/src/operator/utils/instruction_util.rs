@@ -386,21 +386,259 @@ impl InitializeMintBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::mint_idempotency_memo;
+    use super::*;
+    use contra_escrow_program_client::instructions::ResetSmtRootBuilder;
+    use solana_sdk::pubkey::Pubkey;
+
+    fn pk(i: u8) -> Pubkey {
+        let mut b = [0u8; 32];
+        b[0] = i;
+        Pubkey::new_from_array(b)
+    }
+
+    // ========================================================================
+    // MintToBuilder
+    // ========================================================================
 
     #[test]
-    fn mint_idempotency_memo_supports_i64() {
-        assert_eq!(
-            mint_idempotency_memo(42_i64),
-            "contra:mint-idempotency:42".to_string()
-        );
+    fn try_as_expected_mint_all_set() {
+        let mut b = MintToBuilder::new();
+        b.mint(pk(1))
+            .recipient_ata(pk(3))
+            .mint_authority(pk(5))
+            .token_program(pk(6))
+            .amount(100);
+        let result = b.try_as_expected_mint();
+        assert!(result.is_some());
+        let (mint, ata, auth, tp, amt) = result.unwrap();
+        assert_eq!(mint, pk(1));
+        assert_eq!(ata, pk(3));
+        assert_eq!(auth, pk(5));
+        assert_eq!(tp, pk(6));
+        assert_eq!(amt, 100);
     }
 
     #[test]
-    fn mint_idempotency_memo_supports_u64() {
+    fn try_as_expected_mint_missing_field() {
+        let mut b = MintToBuilder::new();
+        b.mint(pk(1)).recipient_ata(pk(3));
+        // missing mint_authority, token_program, amount
+        assert!(b.try_as_expected_mint().is_none());
+    }
+
+    fn fully_configured_builder() -> MintToBuilder {
+        let mut b = MintToBuilder::new();
+        b.mint(pk(1))
+            .recipient(pk(2))
+            .recipient_ata(pk(3))
+            .payer(pk(4))
+            .mint_authority(pk(5))
+            .token_program(spl_token::id())
+            .amount(500);
+        b
+    }
+
+    #[test]
+    fn instructions_with_memo_returns_3() {
+        let mut b = fully_configured_builder();
+        b.idempotency_memo("test:memo".to_string());
+        let ixs = b.instructions().unwrap();
+        assert_eq!(ixs.len(), 3);
+        // first = create_ata, second = memo, third = mint_to
+        assert_eq!(ixs[1].program_id, spl_memo::id());
+    }
+
+    #[test]
+    fn instructions_without_memo_returns_2() {
+        let b = fully_configured_builder();
+        let ixs = b.instructions().unwrap();
+        assert_eq!(ixs.len(), 2);
+    }
+
+    #[test]
+    fn instructions_missing_required_field_errors() {
+        let b = MintToBuilder::new(); // nothing set
+        let result = b.instructions();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn instruction_success() {
+        let b = fully_configured_builder();
+        let ix = b.instruction();
+        assert!(ix.is_ok());
+    }
+
+    #[test]
+    fn instruction_missing_mint_errors() {
+        let mut b = MintToBuilder::new();
+        b.recipient_ata(pk(3))
+            .mint_authority(pk(5))
+            .token_program(spl_token::id())
+            .amount(500);
+        let result = b.instruction();
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // InitializeMintBuilder
+    // ========================================================================
+
+    #[test]
+    fn initialize_mint_builder_instruction_ok() {
+        let builder = InitializeMintBuilder::new(pk(1), 6, pk(2), spl_token::id(), pk(3));
+        let ix = builder.instruction();
+        assert!(ix.is_ok());
+    }
+
+    // ========================================================================
+    // TransactionBuilder enum methods
+    // ========================================================================
+
+    fn make_release_funds_builder() -> TransactionBuilder {
+        let mut inner = ReleaseFundsBuilder::new();
+        inner
+            .payer(pk(1))
+            .operator(pk(2))
+            .instance(pk(3))
+            .operator_pda(pk(4))
+            .mint(pk(5))
+            .allowed_mint(pk(6))
+            .user_ata(pk(7))
+            .instance_ata(pk(8))
+            .token_program(spl_token::id())
+            .associated_token_program(spl_associated_token_account::id())
+            .event_authority(pk(10))
+            .contra_escrow_program(pk(11))
+            .amount(100)
+            .user(pk(12))
+            .new_withdrawal_root([0u8; 32])
+            .transaction_nonce(42)
+            .sibling_proofs([0u8; 512]);
+        TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
+            builder: inner.clone(),
+            nonce: 42,
+            transaction_id: 7,
+            trace_id: "trace-rf".to_string(),
+        }))
+    }
+
+    fn make_mint_builder() -> TransactionBuilder {
+        TransactionBuilder::Mint(Box::new(MintToBuilderWithTxnId {
+            builder: fully_configured_builder(),
+            txn_id: 10,
+            trace_id: "trace-mint".to_string(),
+        }))
+    }
+
+    fn make_init_mint_builder() -> TransactionBuilder {
+        TransactionBuilder::InitializeMint(Box::new(InitializeMintBuilder::new(
+            pk(1),
+            6,
+            pk(2),
+            spl_token::id(),
+            pk(3),
+        )))
+    }
+
+    fn make_reset_smt_builder() -> TransactionBuilder {
+        let mut inner = ResetSmtRootBuilder::new();
+        inner
+            .payer(pk(1))
+            .operator(pk(2))
+            .instance(pk(3))
+            .operator_pda(pk(4))
+            .event_authority(pk(5))
+            .contra_escrow_program(pk(6));
+        TransactionBuilder::ResetSmtRoot(Box::new(inner.clone()))
+    }
+
+    #[test]
+    fn compute_unit_price_per_variant() {
+        assert_eq!(make_release_funds_builder().compute_unit_price(), Some(1));
+        assert_eq!(make_init_mint_builder().compute_unit_price(), None);
+        assert_eq!(make_mint_builder().compute_unit_price(), None);
+        assert_eq!(make_reset_smt_builder().compute_unit_price(), Some(1));
+    }
+
+    #[test]
+    fn compute_budget_per_variant() {
         assert_eq!(
-            mint_idempotency_memo(42_u64),
-            "contra:mint-idempotency:42".to_string()
+            make_release_funds_builder().compute_budget(),
+            DEFAULT_CU_RELEASE_FUNDS
         );
+        assert_eq!(make_init_mint_builder().compute_budget(), DEFAULT_CU_MINT);
+        assert_eq!(make_mint_builder().compute_budget(), DEFAULT_CU_MINT);
+        assert_eq!(make_reset_smt_builder().compute_budget(), DEFAULT_CU_MINT);
+    }
+
+    #[test]
+    fn transaction_id_per_variant() {
+        assert_eq!(make_release_funds_builder().transaction_id(), Some(7));
+        assert_eq!(make_init_mint_builder().transaction_id(), None);
+        assert_eq!(make_mint_builder().transaction_id(), Some(10));
+        assert_eq!(make_reset_smt_builder().transaction_id(), None);
+    }
+
+    #[test]
+    fn trace_id_per_variant() {
+        assert_eq!(
+            make_release_funds_builder().trace_id(),
+            Some("trace-rf".to_string())
+        );
+        assert_eq!(make_init_mint_builder().trace_id(), None);
+        assert_eq!(
+            make_mint_builder().trace_id(),
+            Some("trace-mint".to_string())
+        );
+        assert_eq!(make_reset_smt_builder().trace_id(), None);
+    }
+
+    #[test]
+    fn withdrawal_nonce_per_variant() {
+        assert_eq!(make_release_funds_builder().withdrawal_nonce(), Some(42));
+        assert_eq!(make_init_mint_builder().withdrawal_nonce(), None);
+        assert_eq!(make_mint_builder().withdrawal_nonce(), None);
+        assert_eq!(make_reset_smt_builder().withdrawal_nonce(), None);
+    }
+
+    #[test]
+    fn retry_policy_per_variant() {
+        assert!(matches!(
+            make_release_funds_builder().retry_policy(),
+            RetryPolicy::Idempotent
+        ));
+        assert!(matches!(
+            make_init_mint_builder().retry_policy(),
+            RetryPolicy::Idempotent
+        ));
+        assert!(matches!(
+            make_mint_builder().retry_policy(),
+            RetryPolicy::None
+        ));
+        assert!(matches!(
+            make_reset_smt_builder().retry_policy(),
+            RetryPolicy::Idempotent
+        ));
+    }
+
+    #[test]
+    fn extra_error_checks_policy_per_variant() {
+        assert!(matches!(
+            make_release_funds_builder().extra_error_checks_policy(),
+            ExtraErrorCheckPolicy::None
+        ));
+        assert!(matches!(
+            make_init_mint_builder().extra_error_checks_policy(),
+            ExtraErrorCheckPolicy::None
+        ));
+        assert!(matches!(
+            make_mint_builder().extra_error_checks_policy(),
+            ExtraErrorCheckPolicy::Extra(_)
+        ));
+        assert!(matches!(
+            make_reset_smt_builder().extra_error_checks_policy(),
+            ExtraErrorCheckPolicy::None
+        ));
     }
 }

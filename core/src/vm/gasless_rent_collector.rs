@@ -52,3 +52,42 @@ impl SVMRentCollector for GaslessRentCollector {
         RentDue::Exempt
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::account::ReadableAccount;
+    use solana_svm_rent_collector::svm_rent_collector::SVMRentCollector;
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_collect_rent_returns_zero() {
+        let collector = GaslessRentCollector::new();
+        let pubkey = Pubkey::new_unique();
+        let mut account = AccountSharedData::new(1000, 100, &Pubkey::new_unique());
+
+        let info = collector.collect_rent(&pubkey, &mut account);
+        assert_eq!(info.rent_amount, 0);
+        assert_eq!(info.account_data_len_reclaimed, 0);
+        // Account should be unchanged
+        assert_eq!(account.lamports(), 1000);
+    }
+
+    #[test]
+    fn test_get_rent_zero_values() {
+        let collector = GaslessRentCollector::new();
+        let rent = collector.get_rent();
+        assert_eq!(rent.lamports_per_byte_year, 0);
+        assert_eq!(rent.burn_percent, 0);
+    }
+
+    #[test]
+    fn test_get_rent_due_always_exempt() {
+        let collector = GaslessRentCollector::new();
+        assert_eq!(collector.get_rent_due(0, 0, 0), RentDue::Exempt);
+        assert_eq!(
+            collector.get_rent_due(1_000_000, 1024, 100),
+            RentDue::Exempt
+        );
+    }
+}

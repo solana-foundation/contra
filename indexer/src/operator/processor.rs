@@ -1,5 +1,5 @@
 use crate::channel_utils::send_guaranteed;
-use crate::error::OperatorError;
+use crate::error::{OperatorError, ProgramError};
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
 };
@@ -211,9 +211,18 @@ pub async fn process_release_funds(
                 .user_ata(recipient_ata)
                 .instance_ata(instance_ata)
                 .token_program(token_program)
-                .amount(transaction.amount as u64)
                 .user(recipient)
                 .transaction_nonce(nonce);
+
+            let amount = u64::try_from(transaction.amount).map_err(|_| {
+                OperatorError::Program(ProgramError::InvalidBuilder {
+                    reason: format!(
+                        "negative withdrawal amount {} for transaction {}",
+                        transaction.amount, transaction.id
+                    ),
+                })
+            })?;
+            builder.amount(amount);
 
             // Build remint info for token recovery on permanent failure.
             // Uses Contra token program (not mainnet) since remint happens on Contra.
@@ -230,7 +239,7 @@ pub async fn process_release_funds(
                 user: recipient,
                 user_ata: remint_user_ata,
                 token_program: contra_token_program,
-                amount: transaction.amount as u64,
+                amount,
             };
 
             info!("Processing withdrawal");

@@ -48,6 +48,8 @@ impl SenderState {
             pending_rotation: None,
             program_type: config.program_type,
             remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
         })
     }
 

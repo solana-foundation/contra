@@ -4,3 +4,4 @@ COPY grafana/provisioning /etc/grafana/provisioning
 COPY grafana/dashboards /var/lib/grafana/dashboards
 
 ENV GF_USERS_ALLOW_SIGN_UP=false
+ENV ALERT_WEBHOOK_URL=http://localhost:9/no-op

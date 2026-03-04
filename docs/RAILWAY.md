@@ -4,12 +4,12 @@ This guide covers deploying Contra to [Railway](https://railway.com) as a multi-
 
 ## Architecture
 
-All services are built from a single Dockerfile that produces five binaries: `node`, `gateway`, `indexer`, `activity`, and `streamer`. Each Railway service runs the same Docker image with a different start command and environment variables.
+All services are built from a single Dockerfile that produces five binaries: `contra-node`, `gateway`, `indexer`, `activity`, and `streamer`. Each Railway service runs the same Docker image with a different start command and environment variables.
 
 | Railway Service | Binary | Role |
 |---|---|---|
-| `write-node` | `node` | Core write node (processes transactions) |
-| `read-node` | `node` | Core read node (serves queries) |
+| `write-node` | `contra-node` | Core write node (processes transactions) |
+| `read-node` | `contra-node` | Core read node (serves queries) |
 | `gateway` | `gateway` | Routes requests between write and read nodes |
 | `streamer` | `streamer` | WebSocket server streaming real-time Contra transactions to frontends |
 | `indexer-solana` | `indexer` | Indexes Solana transactions via Yellowstone gRPC |
@@ -22,7 +22,7 @@ Services **not** deployed to Railway:
 - **PostgreSQL** -- use a Railway-managed Postgres instance instead
 - **Solana Validator** -- connect to mainnet/devnet RPC
 - **Activity Generator** -- load testing tool, not for production
-- **Prometheus/Grafana/cAdvisor** -- monitoring stack, add later if needed
+- **cAdvisor** -- container metrics collector, not available on Railway (no Docker socket access)
 
 ## Prerequisites
 
@@ -73,8 +73,8 @@ Set the start command for each service in the Railway dashboard under **Settings
 
 | Service | Start Command |
 |---|---|
-| `write-node` | `/usr/local/bin/node` |
-| `read-node` | `/usr/local/bin/node` |
+| `write-node` | `/usr/local/bin/contra-node` |
+| `read-node` | `/usr/local/bin/contra-node` |
 | `gateway` | `/usr/local/bin/gateway` |
 | `indexer-solana` | `/usr/local/bin/indexer --config /etc/contra/config/railway/indexer-solana.toml -v indexer` |
 | `indexer-contra` | `/usr/local/bin/indexer --config /etc/contra/config/railway/indexer-contra.toml -v indexer` |
@@ -157,7 +157,8 @@ The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and mu
 | Variable | Value |
 |---|---|
 | `DATABASE_URL` | `postgres://user:pass@host:port/indexer` |
-| `COMMON_RPC_URL` | Solana RPC endpoint |
+| `COMMON_RPC_URL` | `http://${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8899` (Contra — where mint txs are sent) |
+| `COMMON_SOURCE_RPC_URL` | Solana RPC endpoint (devnet — where escrow state is read) |
 | `COMMON_ESCROW_INSTANCE_ID` | Escrow instance pubkey |
 | `ADMIN_SIGNER` | `memory` (or `vault` / `turnkey` / `privy`) |
 | `ADMIN_PRIVATE_KEY` | Admin private key (base58) |
@@ -372,6 +373,50 @@ console.log(result);
 "
 ```
 
+## Observability
+
+Prometheus and Grafana run as Railway services alongside the application services. The setup differs from local `docker-compose` in a few ways.
+
+### Differences from Local
+
+| Concern | Local (`docker-compose`) | Railway |
+|---|---|---|
+| Prometheus config | Single `prometheus.yml` with `${HOST_SUFFIX}` placeholders; `HOST_SUFFIX=` (empty) locally | `HOST_SUFFIX=.railway.internal` on Railway |
+| Prometheus datasource URL | `http://prometheus:9090` (compose network) | `http://prometheus.railway.internal:9090` (set via `PROMETHEUS_URL` env var on grafana) |
+| Postgres datasource URL | `postgres-indexer:5432` (compose network) | `postgres-nrto.railway.internal:5432` (set via `POSTGRES_INDEXER_HOST` env var on grafana) |
+| cAdvisor container metrics | Available (Docker socket mounted) | Not available (no Docker socket on Railway) |
+| Grafana dashboards | Mounted as read-only volume | Baked into Docker image via `Dockerfile.grafana` |
+
+### Grafana Environment Variables
+
+The grafana service needs these env vars to resolve datasource provisioning:
+
+| Variable | Purpose | Example |
+|---|---|---|
+| `PROMETHEUS_URL` | Prometheus datasource URL | `http://prometheus.railway.internal:9090` |
+| `POSTGRES_INDEXER_HOST` | Indexer Postgres hostname | `postgres-nrto.railway.internal` |
+| `POSTGRES_INDEXER_DB` | Indexer database name | `indexer` |
+| `POSTGRES_USER` | Postgres username | `postgres` |
+| `POSTGRES_PASSWORD` | Postgres password | *(from Railway Postgres instance)* |
+| `ALERT_WEBHOOK_URL` | Webhook URL for Grafana alerts | `https://hooks.slack.com/...` |
+
+### Dashboards
+
+| Dashboard | Panels | Datasources |
+|---|---|---|
+| Contra Indexer | Infrastructure (CPU, memory, network, restarts), indexer metrics (slots, transactions, errors, lag), lag gauge | Prometheus |
+| Contra Operator | Infrastructure, operator metrics (fetched, backlog, sent, errors, DB updates), Solana RPC, withdrawal status breakdown, pending withdrawals over time | Prometheus, Postgres |
+| Contra RPC | Gateway request rates, latency, errors | Prometheus |
+
+### Deploying Observability Services
+
+```bash
+railway up --service prometheus
+railway up --service grafana
+```
+
+Prometheus uses `Dockerfile.prometheus` which runs `envsubst` at startup to interpolate `${HOST_SUFFIX}` into the config. Set `HOST_SUFFIX=.railway.internal` on the Railway prometheus service. No custom start command is needed — the Dockerfile handles it.
+
 ## Files Added for Railway
 
 | File | Purpose |
@@ -382,9 +427,16 @@ console.log(result);
 | `indexer/config/railway/operator-solana.toml` | Operator config (escrow program) |
 | `indexer/config/railway/operator-contra.toml` | Operator config (withdraw program) |
 | `admin-ui/Dockerfile` | Separate Dockerfile for the React/Vite admin UI |
+| `Dockerfile.grafana` | Grafana image with dashboards and provisioning baked in |
+| `Dockerfile.prometheus` | Prometheus image with `envsubst` entrypoint for `HOST_SUFFIX` interpolation |
+| `grafana/provisioning/datasources/prometheus.yml` | Grafana Prometheus datasource provisioning |
+| `grafana/provisioning/datasources/postgres.yml` | Grafana Postgres datasource provisioning (indexer DB) |
+| `grafana/dashboards/contra-indexer.json` | Indexer dashboard (infrastructure + indexer metrics + lag) |
+| `grafana/dashboards/contra-operator.json` | Operator dashboard (operator metrics + withdrawals) |
+| `grafana/dashboards/contra-rpc.json` | RPC/Gateway dashboard |
 
 ## Dockerfile Changes for Railway
 
 - **Removed** `VOLUME` directive (Railway bans it; use Railway volumes instead)
 - **Added** `COPY indexer/config /etc/contra/config` to include config files in the runtime image
-- **Added** `RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so` to resolve the symlink during Docker build (the source `core/precompiles/contra_withdraw_program.so` is a symlink to `../../target/deploy/` which only exists after the program is built in the builder stage)
+- **Added** `RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so` to resolve the symlink during Docker build (the source `core/precompiles/contra_withdraw_program.so` is a symlink to `../../target/deploy/` which only exists after the program is built in the builder stage)

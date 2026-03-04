@@ -8,6 +8,7 @@ SHELL := /usr/bin/env bash
 PROGRAM_DIRS := contra-escrow-program contra-withdraw-program
 RUST_DIRS := core indexer
 FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
+OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
 .PHONY: install build fmt generate-idl generate-clients
@@ -18,7 +19,7 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 .PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
-.PHONY: profile
+.PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
 
 all: build
 
@@ -234,6 +235,31 @@ profile:
 	@python3 generate_profiling.py
 	@echo "CU profiling report generated: profiling_report.md"
 
+#############
+# Observability
+#############
+obs-up:
+	@echo "Starting observability stack (docker-compose.yml)..."
+	@docker compose -f docker-compose.yml up -d $(OBS_SERVICES)
+
+obs-down:
+	@echo "Stopping observability stack (docker-compose.yml)..."
+	@docker compose -f docker-compose.yml stop $(OBS_SERVICES)
+
+obs-logs:
+	@docker compose -f docker-compose.yml logs -f --tail=200 $(OBS_SERVICES)
+
+obs-devnet-up:
+	@echo "Starting observability stack (docker-compose.devnet.yml)..."
+	@docker compose -f docker-compose.devnet.yml up -d $(OBS_SERVICES)
+
+obs-devnet-down:
+	@echo "Stopping observability stack (docker-compose.devnet.yml)..."
+	@docker compose -f docker-compose.devnet.yml stop $(OBS_SERVICES)
+
+obs-devnet-logs:
+	@docker compose -f docker-compose.devnet.yml logs -f --tail=200 $(OBS_SERVICES)
+
 help:
 	@echo "Contra Programs - Available targets:"
 	@echo ""
@@ -276,3 +302,11 @@ help:
 	@echo ""
 	@echo "Profiling:"
 	@echo "  profile              - Generate CU profiling report"
+	@echo ""
+	@echo "Observability:"
+	@echo "  obs-up               - Start cadvisor/prometheus/grafana (docker-compose.yml)"
+	@echo "  obs-down             - Stop cadvisor/prometheus/grafana (docker-compose.yml)"
+	@echo "  obs-logs             - Tail observability logs (docker-compose.yml)"
+	@echo "  obs-devnet-up        - Start cadvisor/prometheus/grafana (docker-compose.devnet.yml)"
+	@echo "  obs-devnet-down      - Stop cadvisor/prometheus/grafana (docker-compose.devnet.yml)"
+	@echo "  obs-devnet-logs      - Tail observability logs (docker-compose.devnet.yml)"

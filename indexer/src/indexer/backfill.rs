@@ -1,3 +1,4 @@
+use crate::metrics;
 use crate::{
     channel_utils::send_guaranteed,
     config::{BackfillConfig, ProgramType},
@@ -11,6 +12,7 @@ use crate::{
     },
     storage::Storage,
 };
+use contra_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,6 +98,10 @@ pub async fn fill_slot_range(
     let mut processed_count: u64 = 0;
     let gap = to_slot - from_slot;
 
+    metrics::INDEXER_BACKFILL_SLOTS_REMAINING
+        .with_label_values(&[program_type.as_label()])
+        .set(gap as f64);
+
     let all_batches = calculate_batches(from_slot, to_slot, batch_size);
 
     for slots in all_batches {
@@ -163,6 +169,10 @@ pub async fn fill_slot_range(
             .map_err(|e| DataSourceError::from(BackfillError::ChannelSend(e)))?;
         }
 
+        metrics::INDEXER_BACKFILL_SLOTS_REMAINING
+            .with_label_values(&[program_type.as_label()])
+            .set((gap - processed_count) as f64);
+
         if processed_count.is_multiple_of(1000) {
             let progress = ((processed_count as f64 / gap as f64) * 100.0) as u32;
             info!(
@@ -171,6 +181,10 @@ pub async fn fill_slot_range(
             );
         }
     }
+
+    metrics::INDEXER_BACKFILL_SLOTS_REMAINING
+        .with_label_values(&[program_type.as_label()])
+        .set(0.0);
 
     info!(
         "Backfill complete for {:?}. Processed {} slots from {} to {}",

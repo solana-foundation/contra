@@ -1,3 +1,4 @@
+use crate::metrics;
 use crate::{
     channel_utils::send_guaranteed,
     config::ProgramType,
@@ -14,6 +15,7 @@ use crate::{
         Storage,
     },
 };
+use contra_metrics::MetricLabel;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -59,8 +61,11 @@ impl TransactionProcessor {
                     self.current_slot_instructions.push(instruction_meta);
                 }
                 ProcessorMessage::SlotComplete { slot, program_type } => {
-                    // Finalize this slot (save txns + send checkpoint)
+                    let start = std::time::Instant::now();
                     self.finalize_and_checkpoint(slot, program_type).await;
+                    metrics::INDEXER_SLOT_PROCESSING_DURATION
+                        .with_label_values(&[program_type.as_label()])
+                        .observe(start.elapsed().as_secs_f64());
                 }
             }
         }
@@ -100,9 +105,15 @@ impl TransactionProcessor {
                         mints.len(),
                         slot
                     );
+                    metrics::INDEXER_MINTS_SAVED
+                        .with_label_values(&[program_type.as_label()])
+                        .inc_by(mints.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save mints from slot {}: {}", slot, e);
+                    metrics::INDEXER_SLOT_SAVE_ERRORS
+                        .with_label_values(&[program_type.as_label()])
+                        .inc();
                     send_checkpoint = false;
                 }
             }
@@ -126,10 +137,15 @@ impl TransactionProcessor {
                         ids.len(),
                         slot
                     );
+                    metrics::INDEXER_TRANSACTIONS_SAVED
+                        .with_label_values(&[program_type.as_label()])
+                        .inc_by(ids.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save transactions from slot {}: {}", slot, e);
-                    // Don't send checkpoint if DB save failed
+                    metrics::INDEXER_SLOT_SAVE_ERRORS
+                        .with_label_values(&[program_type.as_label()])
+                        .inc();
                     send_checkpoint = false;
                 }
             }
@@ -150,7 +166,15 @@ impl TransactionProcessor {
                 .await;
 
                 match res {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        metrics::INDEXER_SLOTS_PROCESSED
+                            .with_label_values(&[program_type.as_label()])
+                            .inc();
+                        metrics::INDEXER_CURRENT_SLOT
+                            .with_label_values(&[program_type.as_label()])
+                            .set(slot as f64);
+                        break;
+                    }
                     Err(e) => {
                         attempt += 1;
                         error!(

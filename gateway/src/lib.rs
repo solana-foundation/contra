@@ -1,3 +1,5 @@
+pub mod metrics;
+
 use clap::Parser;
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -11,11 +13,36 @@ use jsonrpsee::types::error::INVALID_REQUEST_CODE;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
+
+const KNOWN_RPC_METHODS: &[&str] = &[
+    "sendTransaction",
+    "getAccountInfo",
+    "getSlot",
+    "getBlock",
+    "getTransaction",
+    "getRecentBlockhash",
+    "getTokenAccountBalance",
+    "getLatestBlockhash",
+    "getSignatureStatuses",
+    "getTransactionCount",
+    "getFirstAvailableBlock",
+    "getBlocks",
+    "getEpochInfo",
+    "getEpochSchedule",
+    "getRecentPerformanceSamples",
+    "getBlockTime",
+    "getVoteAccounts",
+    "getSupply",
+    "getSlotLeaders",
+    "isBlockhashValid",
+    "simulateTransaction",
+];
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "contra-gateway")]
@@ -113,6 +140,8 @@ impl Gateway {
         Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
         hyper::Error,
     > {
+        let start = Instant::now();
+
         // Handle CORS preflight requests
         if req.method() == hyper::Method::OPTIONS {
             return Ok(Response::builder()
@@ -151,6 +180,15 @@ impl Gateway {
 
         // Only accept POST requests
         if req.method() != hyper::Method::POST {
+            metrics::GATEWAY_ERRORS_TOTAL
+                .with_label_values(&["method_not_allowed"])
+                .inc();
+            metrics::GATEWAY_REQUESTS_TOTAL
+                .with_label_values(&["unknown", "none", "405"])
+                .inc();
+            metrics::GATEWAY_REQUEST_DURATION
+                .with_label_values(&["unknown", "none"])
+                .observe(start.elapsed().as_secs_f64());
             return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, None));
         }
 
@@ -166,6 +204,15 @@ impl Gateway {
                         "Request body too large: Content-Length {} exceeds limit of {} bytes",
                         len, MAX_BODY_SIZE
                     );
+                    metrics::GATEWAY_ERRORS_TOTAL
+                        .with_label_values(&["payload_too_large"])
+                        .inc();
+                    metrics::GATEWAY_REQUESTS_TOTAL
+                        .with_label_values(&["unknown", "none", "413"])
+                        .inc();
+                    metrics::GATEWAY_REQUEST_DURATION
+                        .with_label_values(&["unknown", "none"])
+                        .observe(start.elapsed().as_secs_f64());
                     return Ok(self.error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Some(Self::payload_too_large_body()),
@@ -188,12 +235,30 @@ impl Gateway {
                         "Request body exceeded size limit of {} bytes",
                         MAX_BODY_SIZE
                     );
+                    metrics::GATEWAY_ERRORS_TOTAL
+                        .with_label_values(&["payload_too_large"])
+                        .inc();
+                    metrics::GATEWAY_REQUESTS_TOTAL
+                        .with_label_values(&["unknown", "none", "413"])
+                        .inc();
+                    metrics::GATEWAY_REQUEST_DURATION
+                        .with_label_values(&["unknown", "none"])
+                        .observe(start.elapsed().as_secs_f64());
                     return Ok(self.error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Some(Self::payload_too_large_body()),
                     ));
                 }
                 warn!("Failed to read request body: {}", e);
+                metrics::GATEWAY_ERRORS_TOTAL
+                    .with_label_values(&["bad_json"])
+                    .inc();
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&["unknown", "none", "400"])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&["unknown", "none"])
+                    .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::BAD_REQUEST, None));
             }
         };
@@ -203,6 +268,15 @@ impl Gateway {
             Ok(json) => json,
             Err(e) => {
                 warn!("Invalid JSON: {}", e);
+                metrics::GATEWAY_ERRORS_TOTAL
+                    .with_label_values(&["bad_json"])
+                    .inc();
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&["unknown", "none", "400"])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&["unknown", "none"])
+                    .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::BAD_REQUEST, None));
             }
         };
@@ -212,17 +286,32 @@ impl Gateway {
             Some(method) => method,
             None => {
                 warn!("Missing or invalid 'method' field in JSON-RPC request");
+                metrics::GATEWAY_ERRORS_TOTAL
+                    .with_label_values(&["invalid_method"])
+                    .inc();
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&["unknown", "none", "400"])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&["unknown", "none"])
+                    .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::BAD_REQUEST, None));
             }
         };
 
+        let method_label = if KNOWN_RPC_METHODS.contains(&method) {
+            method
+        } else {
+            "unknown"
+        };
+
         // Route based on method
-        let target_url = if method == "sendTransaction" {
+        let (target_url, target_label) = if method == "sendTransaction" {
             info!("Routing sendTransaction to write node");
-            &self.write_url
+            (&self.write_url, "write")
         } else {
             info!("Routing {} to read node", method);
-            &self.read_url
+            (&self.read_url, "read")
         };
 
         // Parse target URL
@@ -230,6 +319,15 @@ impl Gateway {
             Ok(uri) => uri,
             Err(e) => {
                 error!("Invalid target URL {}: {}", target_url, e);
+                metrics::GATEWAY_ERRORS_TOTAL
+                    .with_label_values(&["url_parse"])
+                    .inc();
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&[method_label, target_label, "500"])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&[method_label, target_label])
+                    .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
         };
@@ -244,6 +342,15 @@ impl Gateway {
             Ok(req) => req,
             Err(e) => {
                 error!("Failed to build forwarded request: {}", e);
+                metrics::GATEWAY_ERRORS_TOTAL
+                    .with_label_values(&["request_build"])
+                    .inc();
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&[method_label, target_label, "500"])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&[method_label, target_label])
+                    .observe(start.elapsed().as_secs_f64());
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
         };
@@ -251,11 +358,18 @@ impl Gateway {
         // Forward the request and stream the response directly (no buffering!)
         match self.client.request(forwarded_req).await {
             Ok(response) => {
+                let status = response.status().as_u16().to_string();
                 info!(
                     "Forwarded to {} - Status: {}",
                     target_url,
                     response.status()
                 );
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&[method_label, target_label, &status])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&[method_label, target_label])
+                    .observe(start.elapsed().as_secs_f64());
                 // Response body is streamed directly without reading into memory
                 let (mut parts, body) = response.into_parts();
                 // Add CORS headers to the response
@@ -277,6 +391,15 @@ impl Gateway {
             }
             Err(e) => {
                 error!("Failed to forward request to {}: {}", target_url, e);
+                metrics::GATEWAY_ERRORS_TOTAL
+                    .with_label_values(&["backend_error"])
+                    .inc();
+                metrics::GATEWAY_REQUESTS_TOTAL
+                    .with_label_values(&[method_label, target_label, "502"])
+                    .inc();
+                metrics::GATEWAY_REQUEST_DURATION
+                    .with_label_values(&[method_label, target_label])
+                    .observe(start.elapsed().as_secs_f64());
                 Ok(self.error_response(StatusCode::BAD_GATEWAY, None))
             }
         }

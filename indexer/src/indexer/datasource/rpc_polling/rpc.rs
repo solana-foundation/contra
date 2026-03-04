@@ -120,20 +120,20 @@ impl RpcPoller {
             })
     }
 
-    /// Get slot range to process
+    /// Get slot range to process, returning (slots, chain_tip)
     pub async fn get_slots_to_process(
         &self,
         from_slot: u64,
         max_slots: usize,
-    ) -> Result<Vec<u64>, DataSourceRpcError> {
+    ) -> Result<(Vec<u64>, u64), DataSourceRpcError> {
         let latest_slot = self.get_latest_slot().await?;
 
         if from_slot >= latest_slot {
-            return Ok(vec![]);
+            return Ok((vec![], latest_slot));
         }
 
         let to_slot = std::cmp::min(from_slot + max_slots as u64, latest_slot);
-        Ok((from_slot..to_slot).collect())
+        Ok(((from_slot..to_slot).collect(), latest_slot))
     }
 }
 
@@ -279,10 +279,11 @@ mod tests {
         let result = poller.get_slots_to_process(100, 30).await;
 
         assert!(result.is_ok());
-        let slots = result.unwrap();
+        let (slots, chain_tip) = result.unwrap();
         assert_eq!(slots.len(), 30);
         assert_eq!(slots[0], 100);
         assert_eq!(slots[29], 129);
+        assert_eq!(chain_tip, 150);
     }
 
     #[tokio::test]
@@ -298,8 +299,9 @@ mod tests {
         let result = poller.get_slots_to_process(100, 30).await;
 
         assert!(result.is_ok());
-        let slots = result.unwrap();
+        let (slots, chain_tip) = result.unwrap();
         assert!(slots.is_empty());
+        assert_eq!(chain_tip, 100);
     }
 
     // ============================================================================

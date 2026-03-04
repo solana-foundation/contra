@@ -63,7 +63,7 @@ services:
       - CONTRA_ADMIN_KEYS=${CONTRA_ADMIN_KEYS}
     ports:
       - "${CONTRA_WRITE_PORT}:${CONTRA_WRITE_PORT}"
-    command: ["/usr/local/bin/node"]
+    command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
 
@@ -138,7 +138,7 @@ services:
       - CONTRA_MODE=read
     ports:
       - "${CONTRA_READ_PORT}:${CONTRA_READ_PORT}"
-    command: ["/usr/local/bin/node"]
+    command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
 
@@ -200,6 +200,7 @@ services:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      - METRICS_PORT=9100
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       - INDEXER_YELLOWSTONE_ENDPOINT=${DEVNET_YELLOWSTONE_ENDPOINT}
       - INDEXER_YELLOWSTONE_TOKEN=${INDEXER_YELLOWSTONE_TOKEN}
@@ -236,6 +237,7 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${GATEWAY_URL}
       - INDEXER_BACKFILL_RPC_URL=${GATEWAY_URL}
+      - METRICS_PORT=9100
     command:
       - /bin/sh
       - -c
@@ -269,6 +271,7 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - METRICS_PORT=9100
     command:
       - /bin/sh
       - -c
@@ -303,6 +306,7 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - METRICS_PORT=9100
     command:
       - /bin/sh
       - -c
@@ -318,7 +322,7 @@ services:
 
   # cAdvisor for container metrics
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: contra-cadvisor
     restart: unless-stopped
     ports:
@@ -335,19 +339,17 @@ services:
 
   # Prometheus for metrics collection
   prometheus:
-    image: prom/prometheus:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus
     container_name: contra-prometheus
     restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
+    environment:
+      - HOST_SUFFIX=
     networks:
       - contra-network
 
@@ -360,9 +362,12 @@ services:
       - "37429:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     networks:
       - contra-network
 

@@ -1,0 +1,11 @@
+[package]
+name = "contra-metrics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+once_cell = { workspace = true }
+prometheus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

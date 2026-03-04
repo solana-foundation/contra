@@ -50,6 +50,7 @@ COPY contra-withdraw-program/clients/rust/Cargo.toml ./contra-withdraw-program/c
 COPY integration/Cargo.toml ./integration/
 COPY test_utils/Cargo.toml ./test_utils/
 COPY scripts/devnet/Cargo.toml ./scripts/devnet/
+COPY metrics/Cargo.toml ./metrics/
 
 # Create dummy lib.rs files for workspace members we're not building
 RUN mkdir -p contra-escrow-program/program/src contra-escrow-program/tests/integration-tests/src \
@@ -57,14 +58,14 @@ RUN mkdir -p contra-escrow-program/program/src contra-escrow-program/tests/integ
     contra-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
     contra-escrow-program/clients/rust/src contra-withdraw-program/clients/rust/src \
-    core/src
+    core/src metrics/src
 RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/integration-tests/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/program/src/lib.rs \
     contra-withdraw-program/tests/integration-tests/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/clients/rust/src/lib.rs \
-    core/src/lib.rs
+    core/src/lib.rs metrics/src/lib.rs
 
 # Build the project with the dummy files. We can cache this layer.
 RUN cargo build --release
@@ -81,10 +82,11 @@ RUN make -C contra-withdraw-program build
 COPY core ./core
 COPY gateway ./gateway
 COPY indexer ./indexer
+COPY metrics ./metrics
 
 # Resolve the symlink: copy the built .so into core/precompiles/
 # (the source symlink points to target/deploy/ which exists in the builder)
-RUN cp -f target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
+RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
 
 RUN cargo build --release \
     -p contra-core \
@@ -104,7 +106,7 @@ RUN apt-get update && apt-get install -y \
 RUN useradd -m -u 1000 -s /bin/bash contra
 
 # Copy the binaries from builder
-COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/node
+COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/contra-node
 COPY --from=builder /usr/src/contra/target/release/activity /usr/local/bin/activity
 COPY --from=builder /usr/src/contra/target/release/admin /usr/local/bin/admin
 COPY --from=builder /usr/src/contra/target/release/gateway /usr/local/bin/gateway

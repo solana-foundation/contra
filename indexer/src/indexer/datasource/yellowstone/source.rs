@@ -1,4 +1,6 @@
+use crate::metrics;
 use async_trait::async_trait;
+use contra_metrics::MetricLabel;
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use solana_sdk::message::VersionedMessage;
@@ -191,6 +193,9 @@ impl DataSource for YellowstoneSource {
                 {
                     Ok(_) => {
                         info!("Yellowstone gRPC stream ended, reconnecting...");
+                        metrics::INDEXER_DATASOURCE_RECONNECTS
+                            .with_label_values(&[program_type.as_label()])
+                            .inc();
                     }
                     Err(e) => {
                         let error_msg = format!("{}", e);
@@ -198,6 +203,12 @@ impl DataSource for YellowstoneSource {
                             "Yellowstone gRPC error: {}, reconnecting in 5s...",
                             error_msg
                         );
+                        metrics::INDEXER_RPC_ERRORS
+                            .with_label_values(&[program_type.as_label(), "stream"])
+                            .inc();
+                        metrics::INDEXER_DATASOURCE_RECONNECTS
+                            .with_label_values(&[program_type.as_label()])
+                            .inc();
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
                 }
@@ -371,6 +382,9 @@ async fn connect_and_stream(
                 }
                 Some(UpdateOneof::BlockMeta(block_meta)) => {
                     last_seen_slot.store(block_meta.slot, Ordering::Relaxed);
+                    metrics::INDEXER_CHAIN_TIP_SLOT
+                        .with_label_values(&[program_type.as_label()])
+                        .set(block_meta.slot as f64);
                     debug!("Yellowstone BlockMeta for slot {}", block_meta.slot);
 
                     let res = send_guaranteed(
@@ -405,6 +419,9 @@ async fn connect_and_stream(
             },
             Err(error) => {
                 error!("Geyser stream error: {error:?}");
+                metrics::INDEXER_RPC_ERRORS
+                    .with_label_values(&[program_type.as_label(), "stream"])
+                    .inc();
                 return Err(DataSourceRpcError::Protocol {
                     reason: format!("Stream error: {:?}", error),
                 }.into());

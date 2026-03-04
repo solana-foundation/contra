@@ -63,7 +63,7 @@ services:
       - CONTRA_ADMIN_KEYS=${CONTRA_ADMIN_KEYS}
     ports:
       - "${CONTRA_WRITE_PORT}:${CONTRA_WRITE_PORT}"
-    command: ["/usr/local/bin/node"]
+    command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
 
@@ -138,7 +138,7 @@ services:
       - CONTRA_MODE=read
     ports:
       - "${CONTRA_READ_PORT}:${CONTRA_READ_PORT}"
-    command: ["/usr/local/bin/node"]
+    command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
 
@@ -157,6 +157,7 @@ services:
       - GATEWAY_PORT=${GATEWAY_PORT}
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
+      - METRICS_PORT=9101
     ports:
       - "${GATEWAY_PORT}:${GATEWAY_PORT}"
     command: ["/usr/local/bin/gateway"]
@@ -303,6 +304,9 @@ services:
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
+      - INDEXER_YELLOWSTONE_ENDPOINT=http://validator:10000
+      - METRICS_PORT=9100
     volumes:
       - ./indexer/config:/config:ro
     command:
@@ -334,6 +338,7 @@ services:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
+      - METRICS_PORT=9100
     volumes:
       - ./indexer/config:/config:ro
     command:
@@ -365,6 +370,7 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - METRICS_PORT=9100
     volumes:
       - ./indexer/config:/config:ro
     command:
@@ -396,6 +402,7 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - METRICS_PORT=9100
     volumes:
       - ./indexer/config:/config:ro
     command:
@@ -411,7 +418,7 @@ services:
 
   # cAdvisor for container metrics
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: contra-cadvisor
     restart: unless-stopped
     ports:
@@ -428,19 +435,17 @@ services:
 
   # Prometheus for metrics collection
   prometheus:
-    image: prom/prometheus:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus
     container_name: contra-prometheus
     restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
+    environment:
+      - HOST_SUFFIX=
     networks:
       - contra-network
 
@@ -453,9 +458,17 @@ services:
       - "37429:3000"
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - POSTGRES_INDEXER_DB=${POSTGRES_INDEXER_DB}
+      - POSTGRES_INDEXER_HOST=${POSTGRES_INDEXER_HOST:-postgres-indexer}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     networks:
       - contra-network
 

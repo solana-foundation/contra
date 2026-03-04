@@ -19,6 +19,15 @@ pub enum ProgramType {
     Withdraw,
 }
 
+impl contra_metrics::MetricLabel for ProgramType {
+    fn as_label(&self) -> &'static str {
+        match self {
+            ProgramType::Escrow => "escrow",
+            ProgramType::Withdraw => "withdraw",
+        }
+    }
+}
+
 impl ProgramType {
     pub fn to_pubkey(&self) -> Pubkey {
         match self {

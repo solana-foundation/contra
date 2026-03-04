@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: Postgres (Indexer)
+    uid: postgres-indexer
+    type: postgres
+    access: proxy
+    url: ${POSTGRES_INDEXER_HOST}:5432
+    database: ${POSTGRES_INDEXER_DB}
+    user: ${POSTGRES_USER}
+    secureJsonData:
+      password: ${POSTGRES_PASSWORD}
+    jsonData:
+      database: ${POSTGRES_INDEXER_DB}
+      sslmode: disable
+      postgresVersion: 1600
+    editable: false

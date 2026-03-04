@@ -22,9 +22,7 @@
 use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
-    operator::{
-        account_util::find_instance_pda, rpc_util::RpcClientWithRetry, RetryConfig, RetryPolicy,
-    },
+    operator::{rpc_util::RpcClientWithRetry, RetryConfig, RetryPolicy},
     storage::Storage,
 };
 use contra_core::rpc::error::INVALID_PARAMS_CODE;
@@ -71,14 +69,14 @@ pub async fn run_startup_reconciliation(
     program_type: ProgramType,
     storage: &Storage,
     rpc_url: &str,
-    escrow_instance_seed: &Pubkey,
+    instance_pda: &Pubkey,
 ) -> Result<(), IndexerError> {
     if program_type != ProgramType::Escrow {
         info!("Startup reconciliation skipped (program_type is not Escrow)");
         return Ok(());
     }
 
-    let instance_pda = find_instance_pda(escrow_instance_seed);
+    let instance_pda = *instance_pda;
     info!(
         instance_pda = %instance_pda,
         "Running startup reconciliation"

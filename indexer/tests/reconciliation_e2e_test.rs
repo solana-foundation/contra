@@ -237,7 +237,11 @@ async fn test_reconciliation_detects_mismatch_and_alerts() -> Result<(), Box<dyn
     )
     .expect("webhook client");
     let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
-    assert!(result.is_ok(), "webhook alert should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "webhook alert should succeed: {:?}",
+        result.err()
+    );
 
     webhook_mock.assert_async().await;
 
@@ -557,7 +561,11 @@ async fn test_reconciliation_webhook_retry_logic() -> Result<(), Box<dyn std::er
     )
     .expect("webhook client");
     let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
-    assert!(result.is_ok(), "should succeed after retry: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "should succeed after retry: {:?}",
+        result.err()
+    );
 
     mock_fail.assert_async().await;
     mock_success.assert_async().await;

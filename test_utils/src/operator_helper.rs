@@ -61,6 +61,7 @@ pub async fn start_l1_to_contra_operator(
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
         reconciliation_webhook_url: None,
+        feepayer_monitor_interval: Duration::from_secs(60),
     };
 
     // Set up environment variables for the operator signer
@@ -123,6 +124,7 @@ pub async fn start_contra_to_l1_operator(
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
         reconciliation_webhook_url: None,
+        feepayer_monitor_interval: Duration::from_secs(60),
     };
 
     // Set up environment variables for the operator signer

@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod db_transaction_writer;
+pub mod feepayer_monitor;
 pub mod fetcher;
 #[allow(clippy::module_inception)]
 pub mod operator;

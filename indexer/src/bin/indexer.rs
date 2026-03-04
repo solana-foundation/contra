@@ -94,6 +94,8 @@ struct OperatorSection {
     reconciliation_tolerance_bps: u16,
     #[serde(default)]
     reconciliation_webhook_url: Option<String>,
+    #[serde(default = "default_feepayer_monitor_interval_secs")]
+    feepayer_monitor_interval_secs: u64,
 }
 
 fn default_reconciliation_interval_secs() -> u64 {
@@ -102,6 +104,10 @@ fn default_reconciliation_interval_secs() -> u64 {
 
 fn default_reconciliation_tolerance_bps() -> u16 {
     10
+}
+
+fn default_feepayer_monitor_interval_secs() -> u64 {
+    60
 }
 
 #[derive(Parser, Debug)]
@@ -388,6 +394,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
         reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
         reconciliation_webhook_url: operator.reconciliation_webhook_url,
+        feepayer_monitor_interval: Duration::from_secs(operator.feepayer_monitor_interval_secs),
     };
 
     // Validate signer configuration early (from environment variables)

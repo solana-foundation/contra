@@ -1,7 +1,7 @@
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::operator::{
-    fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
+    feepayer_monitor, fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
     RpcClientWithRetry,
 };
 use crate::shutdown_utils::shutdown_operator;
@@ -155,6 +155,32 @@ pub async fn run(
         tokio::spawn(async {})
     };
 
+    // Start feepayer balance monitor for escrow operators only.
+    // Monitors SOL balance of the feepayer wallet used for ReleaseFunds transactions.
+    let feepayer_monitor_handle =
+        if common_config.program_type == crate::config::ProgramType::Escrow {
+            let feepayer_config = config.clone();
+            let feepayer_rpc = source_rpc_client
+                .clone()
+                .unwrap_or_else(|| rpc_client.clone());
+            let feepayer_program_type = common_config.program_type;
+            let feepayer_token = cancellation_token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = feepayer_monitor::run_feepayer_monitor(
+                    feepayer_config,
+                    feepayer_rpc,
+                    feepayer_program_type,
+                    feepayer_token,
+                )
+                .await
+                {
+                    tracing::error!("Feepayer monitor error: {}", e);
+                }
+            })
+        } else {
+            tokio::spawn(async {})
+        };
+
     info!("Operator started, waiting for shutdown signal...");
 
     // Wait for shutdown signal
@@ -172,6 +198,7 @@ pub async fn run(
         sender_handle,
         storage_writer_handle,
         reconciliation_handle,
+        feepayer_monitor_handle,
         config.batch_size,
         config.db_poll_interval,
     )

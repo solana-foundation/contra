@@ -278,6 +278,9 @@ pub struct OperatorConfig {
     pub reconciliation_tolerance_bps: u16,
     /// Webhook URL for reconciliation alerts (optional)
     pub reconciliation_webhook_url: Option<String>,
+    /// How often to check the feepayer SOL balance (escrow operators only)
+    #[serde(default = "default_feepayer_monitor_interval")]
+    pub feepayer_monitor_interval: std::time::Duration,
 }
 
 fn default_reconciliation_interval() -> std::time::Duration {
@@ -286,6 +289,10 @@ fn default_reconciliation_interval() -> std::time::Duration {
 
 fn default_reconciliation_tolerance() -> u16 {
     10 // 10 basis points = 0.1%
+}
+
+fn default_feepayer_monitor_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
 }
 
 impl OperatorConfig {

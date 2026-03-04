@@ -34,6 +34,23 @@ scrape_configs:
     static_configs:
       - targets: ['gateway${HOST_SUFFIX}:9101']
 
+  - job_name: 'blackbox-http'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://write-node${HOST_SUFFIX}:8900/health
+          - http://read-node${HOST_SUFFIX}:8901/health
+          - http://streamer${HOST_SUFFIX}:8902/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter${HOST_SUFFIX}:9115
+
   # Prometheus self-monitoring
   - job_name: 'prometheus'
     static_configs:

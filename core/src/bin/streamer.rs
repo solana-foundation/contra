@@ -69,7 +69,7 @@ struct StreamedTransaction {
 )]
 struct Args {
     /// Port to listen on
-    #[arg(short, long, env = "PORT")]
+    #[arg(short, long, env = "STREAMER_PORT")]
     port: Option<u16>,
 
     /// PostgreSQL connection URL (Contra read replica — for mint/burn/transfer)

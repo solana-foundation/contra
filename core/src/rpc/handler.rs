@@ -30,40 +30,35 @@ pub async fn handle_request(
 
     let response = match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") => {
-            // Health check endpoint for monitoring and load balancers.
-            // Returns 200 with slot when the node is responsive, 503 otherwise.
-            let slot_request = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
-            match rpc_module.raw_json_request(slot_request, 1024).await {
+            let health_request = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule"}"#;
+            match rpc_module.raw_json_request(health_request, 1024).await {
                 Ok((resp, _)) => {
-                    match serde_json::from_str::<serde_json::Value>(&resp)
+                    if serde_json::from_str::<serde_json::Value>(&resp)
                         .ok()
-                        .and_then(|v| v.get("result").and_then(|r| r.as_u64()))
+                        .and_then(|v| v.get("result").cloned())
+                        .is_some()
                     {
-                        Some(slot) => Response::builder()
+                        Response::builder()
                             .status(StatusCode::OK)
                             .header("Content-Type", "application/json")
-                            .body(Full::new(Bytes::from(format!(
-                                r#"{{"status":"ok","slot":{}}}"#,
-                                slot
-                            ))))
-                            .unwrap(),
-                        None => {
-                            tracing::warn!(
-                                "Health check: getSlot returned unexpected response: {}",
-                                resp
-                            );
-                            Response::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .header("Content-Type", "application/json")
-                                .body(Full::new(Bytes::from(
-                                    r#"{"status":"degraded","error":"unexpected getSlot response"}"#,
-                                )))
-                                .unwrap()
-                        }
+                            .body(Full::new(Bytes::from(r#"{"status":"ok"}"#)))
+                            .unwrap()
+                    } else {
+                        tracing::warn!(
+                            "Health check: getEpochSchedule returned unexpected response: {}",
+                            resp
+                        );
+                        Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("Content-Type", "application/json")
+                            .body(Full::new(Bytes::from(
+                                r#"{"status":"degraded","error":"unexpected getEpochSchedule response"}"#,
+                            )))
+                            .unwrap()
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Health check: getSlot RPC call failed: {}", e);
+                    tracing::error!("Health check: getEpochSchedule RPC call failed: {}", e);
                     Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .header("Content-Type", "application/json")

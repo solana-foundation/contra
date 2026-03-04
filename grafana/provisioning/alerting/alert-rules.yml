@@ -38,3 +38,76 @@ groups:
                     type: gt
                     params: [10]
               refId: C
+
+  - orgId: 1
+    name: service-down-alerts
+    folder: Contra Alerts
+    interval: 10s
+    rules:
+      - uid: service-down-scrape
+        title: "Contra service down (scrape target unreachable)"
+        condition: C
+        for: 30s
+        noDataState: Alerting
+        execErrState: Error
+        annotations:
+          summary: "Service {{ $labels.job }} is down (Prometheus scrape failed)"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: up{job=~"gateway|indexer-solana|indexer-contra|operator-solana|operator-contra"}
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+              refId: C
+
+      - uid: service-down-probe
+        title: "Contra service down (health probe failed)"
+        condition: C
+        for: 30s
+        noDataState: Alerting
+        execErrState: Error
+        annotations:
+          summary: "Service {{ $labels.instance }} is down (health check failed)"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: probe_success{job="blackbox-http"}
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+              refId: C

@@ -65,7 +65,10 @@ railway add --service operator-solana
 railway add --service operator-contra
 railway add --service streamer
 railway add --service admin-ui
+railway add --service blackbox-exporter
 ```
+
+The `blackbox-exporter` service uses the Docker image `prom/blackbox-exporter:latest` directly (not the repo Dockerfile). In Railway, set **Settings > Build > Docker Image** to `prom/blackbox-exporter:latest`. No env vars, start command, or volumes needed -- it listens on port 9115.
 
 ## Start Commands
 
@@ -408,12 +411,23 @@ The grafana service needs these env vars to resolve datasource provisioning:
 | Contra Operator | Infrastructure, operator metrics (fetched, backlog, sent, errors, DB updates), Solana RPC, withdrawal status breakdown, pending withdrawals over time | Prometheus, Postgres |
 | Contra RPC | Gateway request rates, latency, errors | Prometheus |
 
+### Alerting
+
+Grafana alert rules fire when any Contra service becomes unreachable:
+
+- **Scrape-based** (`service-down-scrape`) -- alerts when `up` metric drops to 0 for gateway, indexer-solana, indexer-contra, operator-solana, or operator-contra (services that expose Prometheus metrics).
+- **Probe-based** (`service-down-probe`) -- alerts when blackbox-exporter's HTTP probe fails for write-node, read-node, or streamer `/health` endpoints.
+
+Both rules use a 30s pending period. Worst-case detection is ~55s (15s scrape + 10s eval + 30s pending). Alerts auto-resolve when services recover. The existing webhook contact point (`ALERT_WEBHOOK_URL`) handles all alerts.
+
 ### Deploying Observability Services
 
 ```bash
 railway up --service prometheus
 railway up --service grafana
 ```
+
+The `blackbox-exporter` service uses a stock Docker image -- no code deploy needed. Create it in the Railway dashboard with image `prom/blackbox-exporter:latest`.
 
 Prometheus uses `Dockerfile.prometheus` which runs `envsubst` at startup to interpolate `${HOST_SUFFIX}` into the config. Set `HOST_SUFFIX=.railway.internal` on the Railway prometheus service. No custom start command is needed — the Dockerfile handles it.
 
@@ -434,6 +448,7 @@ Prometheus uses `Dockerfile.prometheus` which runs `envsubst` at startup to inte
 | `grafana/dashboards/contra-indexer.json` | Indexer dashboard (infrastructure + indexer metrics + lag) |
 | `grafana/dashboards/contra-operator.json` | Operator dashboard (operator metrics + withdrawals) |
 | `grafana/dashboards/contra-rpc.json` | RPC/Gateway dashboard |
+| `grafana/provisioning/alerting/alert-rules.yml` | Grafana alert rules (indexer lag + service-down) |
 
 ## Dockerfile Changes for Railway
 

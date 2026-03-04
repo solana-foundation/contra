@@ -698,15 +698,12 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
     let webhook_mock = webhook_server
         .mock("POST", "/")
         .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::JsonString(
-            serde_json::json!({
-                "mint": mint2.to_string(),
-                "on_chain_balance": 1_800_000u64,
-                "db_balance": 2_000_000u64,
-                "delta_bps": mismatch.delta_bps,
-            })
-            .to_string(),
-        ))
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "mint": mint2.to_string(),
+            "on_chain_balance": 1_800_000u64,
+            "db_balance": 2_000_000u64,
+            "delta_bps": mismatch.delta_bps,
+        })))
         .with_status(200)
         .create_async()
         .await;

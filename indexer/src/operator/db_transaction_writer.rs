@@ -347,7 +347,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
 
         let update = TransactionStatusUpdate {
             transaction_id: 12345,
@@ -367,7 +367,7 @@ mod tests {
     async fn test_failed_reminted_triggers_alerting() {
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, None);
+        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Escrow);
 
         let update = TransactionStatusUpdate {
             transaction_id: 99,

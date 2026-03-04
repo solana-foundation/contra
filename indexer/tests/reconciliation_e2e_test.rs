@@ -11,7 +11,7 @@
 use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
 use contra_indexer::{
     config::OperatorConfig,
-    operator::reconciliation::{compare_balances, send_webhook_alert},
+    operator::reconciliation::{compare_balances, send_webhook_alert, BalanceMismatch},
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };
@@ -187,33 +187,63 @@ async fn test_reconciliation_success_within_tolerance() -> Result<(), Box<dyn st
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reconciliation_detects_mismatch_and_alerts() -> Result<(), Box<dyn std::error::Error>>
 {
-    let (_pool, _storage, _pg) = start_postgres().await?;
+    let (pool, storage, _pg) = start_postgres().await?;
 
-    // Set up mock webhook server
+    let mint = Pubkey::new_unique();
+    let token_program = spl_token::id().to_string();
+
+    insert_mint(&pool, &mint.to_string(), 6, &token_program).await?;
+    insert_transaction(
+        &pool,
+        "deposit_1",
+        &mint.to_string(),
+        1_000_000,
+        "deposit",
+        "completed",
+        100,
+    )
+    .await?;
+
+    let db_balance_results = storage.get_escrow_balances_by_mint().await?;
+    let mut db_balances = HashMap::new();
+    for balance_result in db_balance_results {
+        let mint_key = balance_result
+            .mint_address
+            .parse::<Pubkey>()
+            .expect("valid mint");
+        let net_balance = (balance_result.total_deposits - balance_result.total_withdrawals) as u64;
+        db_balances.insert(mint_key, net_balance);
+    }
+
+    let mut on_chain_balances = HashMap::new();
+    on_chain_balances.insert(mint, 900_000u64);
+
+    let tolerance_bps = 10;
+    let mismatches = compare_balances(&on_chain_balances, &db_balances, tolerance_bps);
+    assert_eq!(mismatches.len(), 1, "expected one mismatch");
+
     let mut webhook_server = mockito::Server::new_async().await;
     let webhook_mock = webhook_server
         .mock("POST", "/")
         .match_header("content-type", "application/json")
         .with_status(200)
+        .expect(1)
         .create_async()
         .await;
 
-    let config = create_test_config(10, Some(webhook_server.url()));
-
-    // Verify config
-    assert_eq!(config.reconciliation_tolerance_bps, 10);
-    assert_eq!(
-        config.reconciliation_webhook_url,
-        Some(webhook_server.url())
+    let webhook_url = Some(webhook_server.url());
+    let webhook_client = WebhookClient::new(
+        Duration::from_secs(10),
+        WebhookRetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50)),
+    )
+    .expect("webhook client");
+    let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
+    assert!(
+        result.is_ok(),
+        "webhook alert should succeed: {:?}",
+        result.err()
     );
 
-    // In a real E2E test, we would:
-    // 1. Insert mint and transactions in DB (deposits = 1,000,000)
-    // 2. Mock RPC endpoint to return on-chain balance of 900,000
-    // 3. Call perform_reconciliation_check
-    // 4. Verify webhook was called with correct mismatch data
-
-    // For now, verify webhook server is ready
     webhook_mock.assert_async().await;
 
     Ok(())
@@ -502,10 +532,8 @@ async fn test_reconciliation_ignores_non_completed_transactions(
 /// - Webhook retried and eventually succeeds
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reconciliation_webhook_retry_logic() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up mock webhook server that fails first, then succeeds
     let mut webhook_server = mockito::Server::new_async().await;
 
-    // First request fails with 500
     let mock_fail = webhook_server
         .mock("POST", "/")
         .with_status(500)
@@ -513,7 +541,6 @@ async fn test_reconciliation_webhook_retry_logic() -> Result<(), Box<dyn std::er
         .create_async()
         .await;
 
-    // Second request succeeds
     let mock_success = webhook_server
         .mock("POST", "/")
         .with_status(200)
@@ -521,16 +548,25 @@ async fn test_reconciliation_webhook_retry_logic() -> Result<(), Box<dyn std::er
         .create_async()
         .await;
 
-    let config = create_test_config(10, Some(webhook_server.url()));
+    let mismatches = vec![BalanceMismatch {
+        mint: Pubkey::new_unique(),
+        on_chain_balance: 1_000,
+        db_balance: 900,
+        delta_bps: 1_000,
+    }];
 
-    // Verify webhook server is ready
-    assert!(config.reconciliation_webhook_url.is_some());
-
-    // In a real E2E test, we would:
-    // 1. Set up DB with mismatch condition
-    // 2. Mock RPC to return mismatched balance
-    // 3. Call perform_reconciliation_check
-    // 4. Verify webhook was retried (first fail, then success)
+    let webhook_url = Some(webhook_server.url());
+    let webhook_client = WebhookClient::new(
+        Duration::from_secs(10),
+        WebhookRetryConfig::new(2, Duration::from_millis(10), Duration::from_millis(50)),
+    )
+    .expect("webhook client");
+    let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
+    assert!(
+        result.is_ok(),
+        "should succeed after retry: {:?}",
+        result.err()
+    );
 
     mock_fail.assert_async().await;
     mock_success.assert_async().await;
@@ -660,15 +696,15 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
 
     let mut webhook_server = mockito::Server::new_async().await;
 
-    // Match the exact JSON payload structure
     let webhook_mock = webhook_server
         .mock("POST", "/")
         .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::JsonString(format!(
-            r#"{{"mint":"{}","on_chain_balance":1800000,"db_balance":2000000,"delta_bps":{},"timestamp":"#,
-            mint2,
-            mismatch.delta_bps
-        )))
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "mint": mint2.to_string(),
+            "on_chain_balance": 1_800_000u64,
+            "db_balance": 2_000_000u64,
+            "delta_bps": mismatch.delta_bps,
+        })))
         .with_status(200)
         .create_async()
         .await;
@@ -678,19 +714,17 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
     let webhook_url = Some(webhook_server.url());
     let webhook_client = WebhookClient::new(
         Duration::from_secs(10),
-        WebhookRetryConfig::new(3, Duration::from_millis(500), Duration::from_secs(5)),
+        WebhookRetryConfig::new(3, Duration::from_millis(10), Duration::from_millis(50)),
     )
     .expect("webhook client");
     let result = send_webhook_alert(&webhook_url, &mismatches, &webhook_client).await;
 
-    // Verify webhook was sent successfully
     assert!(
         result.is_ok(),
         "webhook alert should be sent successfully: {:?}",
         result.err()
     );
 
-    // Verify webhook was actually called with correct data
     webhook_mock.assert_async().await;
 
     println!("✓ E2E test passed: database query → comparison → webhook alert");

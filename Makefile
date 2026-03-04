@@ -100,6 +100,8 @@ ci-integration-test-indexer:
 	@$(MAKE) -C contra-escrow-program build-test
 	@echo "Running indexer integration test (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+	@echo "Running reconciliation e2e tests..."
+	@cd indexer && cargo test --test reconciliation_e2e_test -- --nocapture
 
 # Backward-compatible aliases.
 unit-test-ci: ci-unit-test

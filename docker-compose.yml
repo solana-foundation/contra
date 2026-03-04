@@ -416,6 +416,14 @@ services:
     networks:
       - contra-network
 
+  # Blackbox Exporter for HTTP health probing
+  blackbox-exporter:
+    image: prom/blackbox-exporter:latest
+    container_name: contra-blackbox-exporter
+    restart: unless-stopped
+    networks:
+      - contra-network
+
   # cAdvisor for container metrics
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1

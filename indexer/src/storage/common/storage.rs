@@ -1,6 +1,7 @@
 pub use super::models::*;
 
 pub mod close;
+pub mod count_pending_transactions;
 pub mod drop_tables;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
@@ -154,6 +155,13 @@ impl Storage {
     /// Waits for active connections to complete and closes the pool
     pub async fn close(&self) -> Result<(), StorageError> {
         close::close(self).await
+    }
+
+    pub async fn count_pending_transactions(
+        &self,
+        transaction_type: TransactionType,
+    ) -> Result<i64, StorageError> {
+        count_pending_transactions::count_pending_transactions(self, transaction_type).await
     }
 
     /// Get completed withdrawal nonces in the given range [min_nonce, max_nonce)

@@ -1,9 +1,11 @@
 use crate::channel_utils::send_guaranteed;
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
+use crate::metrics;
 use crate::storage::common::models::{DbTransaction, TransactionType};
 use crate::storage::Storage;
 use crate::ProgramType;
+use contra_metrics::MetricLabel;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -33,7 +35,20 @@ pub async fn run_fetcher(
             info!("Fetcher received cancellation signal, stopping...");
             break;
         }
-        // Fetch pending withdrawals with row-level locking
+        match storage.count_pending_transactions(transaction_type).await {
+            Ok(count) => {
+                metrics::OPERATOR_BACKLOG_DEPTH
+                    .with_label_values(&[program_type.as_label()])
+                    .set(count as f64);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to count pending transactions for backlog metric: {}",
+                    e
+                );
+            }
+        }
+
         match storage
             .get_and_lock_pending_transactions(transaction_type, config.batch_size as i64)
             .await
@@ -41,6 +56,9 @@ pub async fn run_fetcher(
             Ok(transactions) => {
                 if !transactions.is_empty() {
                     info!("Fetched {} pending transactions", transactions.len());
+                    metrics::OPERATOR_TRANSACTIONS_FETCHED
+                        .with_label_values(&[program_type.as_label()])
+                        .inc_by(transactions.len() as f64);
 
                     for transaction in transactions {
                         info!(

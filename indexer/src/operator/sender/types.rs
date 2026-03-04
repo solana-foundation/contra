@@ -1,3 +1,4 @@
+use crate::config::ProgramType;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
@@ -42,6 +43,7 @@ pub struct SenderState {
     pub rotation_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
     /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
     pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,
+    pub program_type: ProgramType,
 }
 
 pub struct SenderSMTState {

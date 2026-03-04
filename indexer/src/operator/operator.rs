@@ -88,8 +88,12 @@ pub async fn run(
 
     // Start storage writer task (receives updates from sender)
     let writer_storage = storage.clone();
-    let storage_writer =
-        DbTransactionWriter::new(writer_storage, storage_rx, config.alert_webhook_url.clone());
+    let storage_writer = DbTransactionWriter::new(
+        writer_storage,
+        storage_rx,
+        config.alert_webhook_url.clone(),
+        common_config.program_type,
+    );
     let storage_writer_handle = tokio::spawn(async move {
         if let Err(e) = storage_writer.start().await {
             tracing::error!("Storage writer error: {}", e);
@@ -126,7 +130,9 @@ pub async fn run(
         if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
             let reconciliation_storage = storage.clone();
             let reconciliation_config = config.clone();
-            let reconciliation_rpc = rpc_client.clone();
+            let reconciliation_rpc = source_rpc_client
+                .clone()
+                .unwrap_or_else(|| rpc_client.clone());
             let reconciliation_token = cancellation_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = reconciliation::run_reconciliation(

@@ -152,6 +152,13 @@ impl MockStorage {
         Ok(())
     }
 
+    pub async fn count_pending_transactions(
+        &self,
+        _transaction_type: TransactionType,
+    ) -> Result<i64, StorageError> {
+        Ok(0)
+    }
+
     pub fn get_completed_withdrawal_nonces(
         &self,
         _min_nonce: u64,

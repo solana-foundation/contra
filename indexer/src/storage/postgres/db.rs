@@ -321,6 +321,15 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Add manual_review status for unconfirmed remints requiring investigation
+        sqlx::query(
+            r#"
+            ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'manual_review';
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }

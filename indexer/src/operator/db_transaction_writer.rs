@@ -60,7 +60,9 @@ impl DbTransactionWriter {
     async fn handle_update(&self, update: TransactionStatusUpdate) {
         let is_alertable = matches!(
             update.status,
-            TransactionStatus::Failed | TransactionStatus::FailedReminted
+            TransactionStatus::Failed
+                | TransactionStatus::FailedReminted
+                | TransactionStatus::ManualReview
         );
         let trace_id = update.trace_id.as_deref().unwrap_or("none");
         let pt = self.program_type.as_label();
@@ -118,6 +120,7 @@ impl DbTransactionWriter {
         let status_str = match update.status {
             TransactionStatus::FailedReminted => "failed_reminted",
             TransactionStatus::Failed => "failed",
+            TransactionStatus::ManualReview => "manual_review",
             other => {
                 error!("Unexpected alertable status in webhook: {:?}", other);
                 "failed"
@@ -357,6 +360,58 @@ mod tests {
             error_message: Some("withdrawal failed".to_string()),
             processed_at: Some(Utc::now()),
             remint_signature: Some("remint_sig_abc".to_string()),
+        };
+
+        writer.send_webhook_alert(&server.url(), &update).await;
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_manual_review_triggers_alerting() {
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Escrow);
+
+        let update = TransactionStatusUpdate {
+            transaction_id: 77,
+            trace_id: Some("trace_manual_review".to_string()),
+            status: TransactionStatus::ManualReview,
+            counterpart_signature: None,
+            error_message: Some("release failed | remint failed: confirmation timeout".to_string()),
+            processed_at: Some(Utc::now()),
+            remint_signature: None,
+        };
+
+        // Should complete without panic — ManualReview hits the alerting path
+        writer.handle_update(update).await;
+    }
+
+    #[tokio::test]
+    async fn test_webhook_payload_for_manual_review_status() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "transaction_id": 77_i64,
+                "status": "manual_review",
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
+
+        let update = TransactionStatusUpdate {
+            transaction_id: 77,
+            trace_id: Some("trace_manual_review".to_string()),
+            status: TransactionStatus::ManualReview,
+            counterpart_signature: None,
+            error_message: Some("release failed | remint failed: timeout".to_string()),
+            processed_at: Some(Utc::now()),
+            remint_signature: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;

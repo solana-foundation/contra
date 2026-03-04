@@ -190,6 +190,8 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
         state.retry_counts.remove(&nonce);
     }
     if let Some(nonce) = nonce {
+        // Note: when called from handle_permanent_failure, remint_cache is
+        // already drained. This removal is defensive for any other call site.
         state.remint_cache.remove(&nonce);
     }
 

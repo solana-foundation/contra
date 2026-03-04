@@ -111,3 +111,42 @@ groups:
                     type: lt
                     params: [1]
               refId: C
+
+  - orgId: 1
+    name: feepayer-alerts
+    folder: Contra Alerts
+    interval: 1m
+    rules:
+      - uid: feepayer-low-balance
+        title: "Feepayer SOL balance below 0.5"
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Feepayer balance is {{ $values.A }} SOL — top up immediately"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: contra_feepayer_balance_lamports / 1e9
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [0.5]
+              refId: C

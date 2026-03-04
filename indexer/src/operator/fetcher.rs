@@ -117,6 +117,7 @@ mod tests {
             reconciliation_interval: Duration::from_secs(300),
             reconciliation_tolerance_bps: 10,
             reconciliation_webhook_url: None,
+            feepayer_monitor_interval: Duration::from_secs(60),
         }
     }
 

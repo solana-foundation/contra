@@ -127,6 +127,13 @@ gauge_vec!(
     &["program_type"]
 );
 
+gauge_vec!(
+    FEEPAYER_BALANCE_LAMPORTS,
+    "contra_feepayer_balance_lamports",
+    "Current SOL balance of the escrow operator feepayer wallet in lamports",
+    &["program_type"]
+);
+
 pub fn init() {
     contra_metrics::init_metrics!(
         INDEXER_SLOTS_PROCESSED,
@@ -146,5 +153,6 @@ pub fn init() {
         OPERATOR_TRANSACTION_ERRORS,
         OPERATOR_MINTS_SENT,
         OPERATOR_BACKLOG_DEPTH,
+        FEEPAYER_BALANCE_LAMPORTS,
     );
 }

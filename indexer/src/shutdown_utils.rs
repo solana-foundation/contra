@@ -289,6 +289,7 @@ pub async fn shutdown_operator(
     sender_handle: tokio::task::JoinHandle<()>,
     storage_writer_handle: tokio::task::JoinHandle<()>,
     reconciliation_handle: tokio::task::JoinHandle<()>,
+    feepayer_monitor_handle: tokio::task::JoinHandle<()>,
     batch_size: u16,
     db_poll_interval: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -306,6 +307,7 @@ pub async fn shutdown_operator(
             sender_handle,
             storage_writer_handle,
             reconciliation_handle,
+            feepayer_monitor_handle,
             batch_size,
             db_poll_interval,
             &config,
@@ -357,6 +359,7 @@ async fn perform_operator_shutdown_stages(
     sender_handle: tokio::task::JoinHandle<()>,
     storage_writer_handle: tokio::task::JoinHandle<()>,
     reconciliation_handle: tokio::task::JoinHandle<()>,
+    feepayer_monitor_handle: tokio::task::JoinHandle<()>,
     batch_size: u16,
     db_poll_interval: Duration,
     config: &ShutdownConfig,
@@ -436,7 +439,7 @@ async fn perform_operator_shutdown_stages(
         }
     }
 
-    // Stage 6: Drain reconciliation loop
+    // Stage 6: Drain reconciliation and feepayer monitor loops
     info!("Stage 6: Waiting for reconciliation loop to drain...");
     let reconciliation_result = tokio::time::timeout(
         Duration::from_secs(config.storage_writer_drain_timeout_secs),
@@ -450,6 +453,24 @@ async fn perform_operator_shutdown_stages(
         Err(_) => {
             warn!(
                 "Reconciliation loop drain timed out after {}s",
+                config.storage_writer_drain_timeout_secs
+            );
+        }
+    }
+
+    info!("Stage 6b: Waiting for feepayer monitor to drain...");
+    let feepayer_result = tokio::time::timeout(
+        Duration::from_secs(config.storage_writer_drain_timeout_secs),
+        feepayer_monitor_handle,
+    )
+    .await;
+
+    match feepayer_result {
+        Ok(Ok(_)) => info!("Feepayer monitor drained successfully"),
+        Ok(Err(e)) => warn!("Feepayer monitor error: {:?}", e),
+        Err(_) => {
+            warn!(
+                "Feepayer monitor drain timed out after {}s",
                 config.storage_writer_drain_timeout_secs
             );
         }

@@ -13,7 +13,7 @@ use crate::{
     },
     require_len,
     state::{discriminator::AccountSerialize, Instance},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{
     account::AccountView,
@@ -48,30 +48,23 @@ pub fn process_create_instance(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(admin_info, false)?;
     verify_signer(instance_seed_info, false)?;
-
     verify_system_account(instance_info, true)?;
-
-    // Verify programs
     verify_system_program(system_program_info)?;
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Create Instance struct and validate PDA
     let instance = Instance::new(
         args.bump,
         *instance_seed_info.address(),
         *admin_info.address(),
-    )?;
+    );
     instance.validate_pda(instance_info)?;
 
     let bump_seed = [args.bump];
-
-    // Create the Instance account
     let instance_seeds = [
         Seed::from(INSTANCE_SEED),
         Seed::from(instance.instance_seed.as_ref()),
@@ -89,14 +82,10 @@ pub fn process_create_instance(
         None,
     )?;
 
-    // Initialize Instance data
     let instance_data = instance.to_bytes();
-
-    // Write the serialized data to the account
     let mut data_slice = instance_info.try_borrow_mut()?;
     data_slice[..instance_data.len()].copy_from_slice(&instance_data);
 
-    // Emit CreateInstance event
     let event = CreateInstanceEvent::new(*instance_seed_info.address(), *admin_info.address());
     emit_event(
         program_id,
@@ -113,12 +102,8 @@ struct CreateInstanceArgs {
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<CreateInstanceArgs, ProgramError> {
-    require_len!(data, 1); // bump(1)
-
-    // Read bump (first byte)
-    let bump = data[0];
-
-    Ok(CreateInstanceArgs { bump })
+    require_len!(data, 1);
+    Ok(CreateInstanceArgs { bump: data[0] })
 }
 
 #[cfg(test)]

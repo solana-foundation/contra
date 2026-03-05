@@ -94,8 +94,7 @@ pub async fn mint_to_owner(
     Ok(ata)
 }
 
-#[allow(unused)]
-/// Get token account balance for a specific user and mint
+#[allow(dead_code)]
 pub async fn get_token_balance(
     client: &RpcClient,
     owner: &Pubkey,

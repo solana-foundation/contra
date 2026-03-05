@@ -33,7 +33,6 @@ pub fn init_tracing() {
     });
 }
 
-/// Start a node with the given configuration
 pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
     let port = config.port;
     let node_handles = run_node(config)
@@ -48,7 +47,6 @@ pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
     Ok((node_handles, url))
 }
 
-/// Poll until a transaction is visible, up to 3 seconds.
 pub async fn confirm_transaction(client: &RpcClient, sig: Signature) {
     for _ in 0..30 {
         match client
@@ -63,14 +61,11 @@ pub async fn confirm_transaction(client: &RpcClient, sig: Signature) {
     panic!("Transaction {} not confirmed within 3 seconds", sig);
 }
 
-/// Send a transaction and poll until it is visible.
 pub async fn send_and_confirm(client: &RpcClient, tx: &Transaction) {
     let sig = client.send_transaction(tx).await.unwrap();
     confirm_transaction(client, sig).await;
 }
 
-/// Return the parsed token balance of a token account.
-/// Returns Err if the account does not exist or the balance cannot be parsed.
 pub async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> Result<u64> {
     let balance = client
         .get_token_account_balance(token_account)
@@ -79,8 +74,6 @@ pub async fn token_balance(client: &RpcClient, token_account: &Pubkey) -> Result
     balance.amount.parse::<u64>().map_err(anyhow::Error::from)
 }
 
-/// Shut down an existing node and restart it with the same config.
-/// Used by the dedup-persistence test to simulate a process restart.
 pub async fn restart_contra(
     handles: NodeHandles,
     config: NodeConfig,

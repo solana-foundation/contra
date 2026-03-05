@@ -7,7 +7,6 @@ use pinocchio::{
 };
 use pinocchio_system::instructions::{Allocate, Assign, CreateAccount, Transfer};
 
-/// Create a PDA account for the given seeds.
 pub fn create_pda_account<const N: usize>(
     payer: &AccountView,
     rent: &Rent,
@@ -18,10 +17,7 @@ pub fn create_pda_account<const N: usize>(
     min_rent_space: Option<usize>,
 ) -> ProgramResult {
     let signers = [Signer::from(&new_pda_signer_seeds)];
-    let rent_space = match min_rent_space {
-        Some(min_space) => min_space.max(space),
-        None => space,
-    };
+    let rent_space = min_rent_space.map_or(space, |min| min.max(space));
     let required_lamports = rent.try_minimum_balance(rent_space)?.max(1);
 
     if new_pda_account.lamports() > 0 {

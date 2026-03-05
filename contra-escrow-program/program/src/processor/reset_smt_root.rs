@@ -9,7 +9,7 @@ use crate::{
         verify_current_program, verify_mutability,
     },
     state::{discriminator::AccountSerialize, Instance, Operator},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
@@ -40,9 +40,8 @@ pub fn process_reset_smt_root(
 
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate instance exists and is properly formed
     let instance_data = instance_info.try_borrow()?;
     let mut instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -50,7 +49,6 @@ pub fn process_reset_smt_root(
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    // Validate operator exists and is properly formed
     let operator_pda_data = operator_pda_info.try_borrow()?;
     let operator_pda = Operator::try_from_bytes(&operator_pda_data)?;
 
@@ -64,20 +62,17 @@ pub fn process_reset_smt_root(
 
     drop(instance_data);
 
-    // Reset withdrawal transactions root to empty tree root
     instance.withdrawal_transactions_root = EMPTY_TREE_ROOT;
     instance.current_tree_index = instance
         .current_tree_index
         .checked_add(1)
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
-    // Write updated instance back to account
     let updated_instance_data = instance.to_bytes();
     instance_info
         .try_borrow_mut()?
         .copy_from_slice(&updated_instance_data);
 
-    // Emit ResetSmtRoot event
     let event = ResetSmtRootEvent::new(instance.instance_seed, *operator_info.address());
     emit_event(
         program_id,

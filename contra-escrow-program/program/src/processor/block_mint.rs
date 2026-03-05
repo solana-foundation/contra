@@ -11,7 +11,7 @@ use crate::{
         verify_current_program,
     },
     state::{AllowedMint, Instance},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
@@ -40,17 +40,13 @@ pub fn process_block_mint(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(admin_info, false)?;
-
-    // Verify programs
     verify_system_program(system_program_info)?;
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate instance exists and admin has authority
     let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -60,7 +56,6 @@ pub fn process_block_mint(
 
     instance.validate_admin(admin_info.address())?;
 
-    // Validate allowed mint account exists and is correct PDA
     let allowed_mint_data = allowed_mint_info.try_borrow()?;
     let allowed_mint = AllowedMint::try_from_bytes(&allowed_mint_data)?;
 
@@ -72,7 +67,6 @@ pub fn process_block_mint(
         )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
-    // Close the AllowedMint account
     drop(allowed_mint_data);
 
     let payer_lamports = payer_info.lamports();
@@ -84,7 +78,6 @@ pub fn process_block_mint(
     allowed_mint_info.set_lamports(0);
     allowed_mint_info.close()?;
 
-    // Emit BlockMint event
     let event = BlockMintEvent::new(instance.instance_seed, *mint_info.address());
     emit_event(
         program_id,

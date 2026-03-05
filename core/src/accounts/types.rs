@@ -46,6 +46,28 @@ impl StoredTransaction {
         confirmed_tx_with_meta.encode(*encoding, max_supported_transaction_version)
     }
 
+    fn convert_token_balances(
+        balances: Vec<solana_transaction_status::UiTransactionTokenBalance>,
+    ) -> Vec<TransactionTokenBalance> {
+        use solana_transaction_status_client_types::option_serializer::OptionSerializer;
+        balances
+            .into_iter()
+            .map(|balance| TransactionTokenBalance {
+                account_index: balance.account_index,
+                mint: balance.mint,
+                ui_token_amount: balance.ui_token_amount,
+                owner: match balance.owner {
+                    OptionSerializer::Some(s) => s,
+                    _ => String::new(),
+                },
+                program_id: match balance.program_id {
+                    OptionSerializer::Some(s) => s,
+                    _ => String::new(),
+                },
+            })
+            .collect()
+    }
+
     fn ui_to_transaction_status_meta(&self) -> TransactionStatusMeta {
         TransactionStatusMeta {
             status: self.meta.status.clone(),
@@ -80,42 +102,16 @@ impl StoredTransaction {
                     .collect()
             }),
             log_messages: self.meta.log_messages.clone().into(),
-            pre_token_balances: self.meta.pre_token_balances.clone().map(|balances| {
-                balances
-                    .into_iter()
-                    .map(|balance| TransactionTokenBalance {
-                        account_index: balance.account_index,
-                        mint: balance.mint,
-                        ui_token_amount: balance.ui_token_amount,
-                        owner: match balance.owner {
-                            solana_transaction_status_client_types::option_serializer::OptionSerializer::Some(s) => s,
-                            _ => String::new(),
-                        },
-                        program_id: match balance.program_id {
-                            solana_transaction_status_client_types::option_serializer::OptionSerializer::Some(s) => s,
-                            _ => String::new(),
-                        },
-                    })
-                    .collect()
-            }),
-            post_token_balances: self.meta.post_token_balances.clone().map(|balances| {
-                balances
-                    .into_iter()
-                    .map(|balance| TransactionTokenBalance {
-                        account_index: balance.account_index,
-                        mint: balance.mint,
-                        ui_token_amount: balance.ui_token_amount,
-                        owner: match balance.owner {
-                            solana_transaction_status_client_types::option_serializer::OptionSerializer::Some(s) => s,
-                            _ => String::new(),
-                        },
-                        program_id: match balance.program_id {
-                            solana_transaction_status_client_types::option_serializer::OptionSerializer::Some(s) => s,
-                            _ => String::new(),
-                        },
-                    })
-                    .collect()
-            }),
+            pre_token_balances: self
+                .meta
+                .pre_token_balances
+                .clone()
+                .map(Self::convert_token_balances),
+            post_token_balances: self
+                .meta
+                .post_token_balances
+                .clone()
+                .map(Self::convert_token_balances),
             rewards: self.meta.rewards.clone().into(),
             loaded_addresses: self
                 .meta
@@ -134,12 +130,17 @@ impl StoredTransaction {
                         .collect(),
                 })
                 .unwrap_or_default(),
-            return_data: self.meta.return_data.clone().map(|return_data| TransactionReturnData {
-                program_id: Pubkey::try_from(return_data.program_id.as_str()).unwrap_or_default(),
-                data: base64::engine::general_purpose::STANDARD
-                    .decode(&return_data.data.0)
-                    .unwrap_or_default(),
-            }),
+            return_data: self
+                .meta
+                .return_data
+                .clone()
+                .map(|return_data| TransactionReturnData {
+                    program_id: Pubkey::try_from(return_data.program_id.as_str())
+                        .unwrap_or_default(),
+                    data: base64::engine::general_purpose::STANDARD
+                        .decode(&return_data.data.0)
+                        .unwrap_or_default(),
+                }),
             compute_units_consumed: self.meta.compute_units_consumed.clone().into(),
             cost_units: None,
         }

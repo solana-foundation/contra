@@ -1,4 +1,5 @@
-pub use once_cell::sync::Lazy;
+pub use std::sync::LazyLock as Lazy;
+
 pub use prometheus;
 pub use prometheus::{CounterVec, GaugeVec, HistogramVec};
 
@@ -40,26 +41,23 @@ pub trait MetricLabel {
     fn as_label(&self) -> &'static str;
 }
 
+async fn metrics_handler() -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    let body = prometheus::TextEncoder::new()
+        .encode_to_string(&prometheus::gather())
+        .unwrap();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}
+
 pub fn start_metrics_server(port: u16) {
-    use prometheus::{Encoder, TextEncoder};
-
-    async fn metrics_handler() -> ([(axum::http::header::HeaderName, &'static str); 1], Vec<u8>) {
-        let encoder = TextEncoder::new();
-        let metric_families = prometheus::gather();
-        let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/plain; version=0.0.4",
-            )],
-            buffer,
-        )
-    }
-
     let app = axum::Router::new().route("/metrics", axum::routing::get(metrics_handler));
-
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+
     tracing::info!("Metrics server listening on {}", addr);
 
     tokio::spawn(async move {

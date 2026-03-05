@@ -93,14 +93,11 @@ pub async fn run_sender(
                 }
             }
             tx_builder = processor_rx.recv() => {
-                match tx_builder {
-                    Some(tx_builder) => {
-                        handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
-                    }
-                    None => {
-                        info!("Sender channel closed");
-                        break;
-                    }
+                if let Some(tx_builder) = tx_builder {
+                    handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
+                } else {
+                    info!("Sender channel closed");
+                    break;
                 }
             }
         }

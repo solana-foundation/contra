@@ -3,13 +3,11 @@ use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, 
 use crate::{
     processor::{
         process_add_operator, process_allow_mint, process_block_mint, process_create_instance,
-        process_deposit, process_release_funds, process_remove_operator, process_reset_smt_root,
-        process_set_new_admin,
+        process_deposit, process_emit_event::process_emit_event, process_release_funds,
+        process_remove_operator, process_reset_smt_root, process_set_new_admin,
     },
     state::discriminator::ContraEscrowInstructionDiscriminators,
 };
-
-use crate::processor::process_emit_event::process_emit_event;
 
 entrypoint!(process_instruction);
 

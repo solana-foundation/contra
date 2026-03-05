@@ -754,16 +754,12 @@ impl PostgresDb {
         &self,
         mint_address: &str,
     ) -> Result<Option<DbMint>, StorageError> {
-        let mint = sqlx::query_as::<_, DbMint>(
-            r#"
-            SELECT * FROM mints WHERE mint_address = $1
-            "#,
+        Ok(
+            sqlx::query_as::<_, DbMint>("SELECT * FROM mints WHERE mint_address = $1")
+                .bind(mint_address)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(mint_address)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(mint)
     }
 
     /// Return per-mint aggregate balances for startup reconciliation.

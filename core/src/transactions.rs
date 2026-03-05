@@ -5,16 +5,8 @@ use std::sync::LazyLock;
 const SPL_INITIALIZE_MINT: u8 = 0;
 
 /// A lazy-initialized static mapping from program_id (Pubkey) to a HashSet of admin instruction types (u8)
-pub static ADMIN_INSTRUCTIONS_MAP: LazyLock<HashMap<Pubkey, HashSet<u8>>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    // Add SPL Token admin instructions
-    map.insert(spl_token::id(), {
-        let mut set = HashSet::new();
-        set.insert(SPL_INITIALIZE_MINT);
-        set
-    });
-    map
-});
+pub static ADMIN_INSTRUCTIONS_MAP: LazyLock<HashMap<Pubkey, HashSet<u8>>> =
+    LazyLock::new(|| HashMap::from([(spl_token::id(), HashSet::from([SPL_INITIALIZE_MINT]))]));
 
 /// Checks if an instruction is an admin-only instruction
 pub fn is_admin_instruction(program_id: &Pubkey, instruction_type: u8) -> bool {

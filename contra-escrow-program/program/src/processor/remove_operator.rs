@@ -11,7 +11,7 @@ use crate::{
         verify_current_program,
     },
     state::{Instance, Operator},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
@@ -40,17 +40,13 @@ pub fn process_remove_operator(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(admin_info, false)?;
-
-    // Verify programs
     verify_system_program(system_program_info)?;
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate instance exists and admin has authority
     let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -60,7 +56,6 @@ pub fn process_remove_operator(
 
     instance.validate_admin(admin_info.address())?;
 
-    // Validate operator account exists and is correct PDA
     let operator_data = operator_pda_info.try_borrow()?;
     let operator = Operator::try_from_bytes(&operator_data)?;
 
@@ -70,7 +65,6 @@ pub fn process_remove_operator(
         operator_pda_info,
     )?;
 
-    // Close the Operator account
     drop(operator_data);
 
     let payer_lamports = payer_info.lamports();
@@ -82,7 +76,6 @@ pub fn process_remove_operator(
     operator_pda_info.set_lamports(0);
     operator_pda_info.close()?;
 
-    // Emit RemoveOperator event
     let event = RemoveOperatorEvent::new(instance.instance_seed, *operator_info.address());
     emit_event(
         program_id,

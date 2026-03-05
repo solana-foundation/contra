@@ -111,14 +111,11 @@ pub mod rpc_blocks {
         }
     }
 
-    /// Create account keys with a program ID at the specified index
     pub fn create_account_keys_with_program(program_id: &str, program_index: usize) -> Vec<String> {
-        let mut keys = vec![];
-        for i in 0..program_index {
-            keys.push(pubkey::test_pubkey(i as u8).to_string());
-        }
-        keys.push(program_id.to_string());
-        keys
+        (0..program_index)
+            .map(|i| pubkey::test_pubkey(i as u8).to_string())
+            .chain(std::iter::once(program_id.to_string()))
+            .collect()
     }
 }
 

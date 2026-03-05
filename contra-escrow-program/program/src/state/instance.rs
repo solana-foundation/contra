@@ -53,15 +53,15 @@ impl Instance {
         32 + // withdrawal_transactions_root
         8; // current_tree_index
 
-    pub fn new(bump: u8, instance_seed: Pubkey, admin: Pubkey) -> Result<Self, ProgramError> {
-        Ok(Self {
+    pub fn new(bump: u8, instance_seed: Pubkey, admin: Pubkey) -> Self {
+        Self {
             bump,
             version: INSTANCE_VERSION,
             instance_seed,
             admin,
             withdrawal_transactions_root: EMPTY_TREE_ROOT,
             current_tree_index: 0,
-        })
+        }
     }
 
     pub fn validate_pda(&self, account_info: &AccountView) -> Result<(), ProgramError> {
@@ -70,8 +70,8 @@ impl Instance {
             &CONTRA_ESCROW_PROGRAM_ID,
             self.bump,
             account_info,
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     }
 
     pub fn validate_admin(&self, provided_admin: &Pubkey) -> Result<(), ProgramError> {
@@ -149,7 +149,7 @@ mod tests {
     fn test_new_constructor() {
         let admin = Pubkey::new_from_array([0u8; 32]);
         let instance_seed = Pubkey::new_from_array([0u8; 32]);
-        let instance = Instance::new(1, instance_seed, admin).unwrap();
+        let instance = Instance::new(1, instance_seed, admin);
 
         assert_eq!(instance.version, INSTANCE_VERSION);
         assert_eq!(instance.admin, admin);

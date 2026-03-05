@@ -393,23 +393,15 @@ async fn settle_transactions(
                     executed_tx.loaded_transaction.accounts.iter().enumerate()
                 {
                     if sanitized_transaction.is_writable(index) {
-                        if account_data.lamports() == 0 && account_data.data().is_empty() {
-                            final_accounts_actual.insert(
-                                *pubkey,
-                                AccountSettlement {
-                                    account: account_data.clone(),
-                                    deleted: true,
-                                },
-                            );
-                        } else {
-                            final_accounts_actual.insert(
-                                *pubkey,
-                                AccountSettlement {
-                                    account: account_data.clone(),
-                                    deleted: false,
-                                },
-                            );
-                        }
+                        let deleted =
+                            account_data.lamports() == 0 && account_data.data().is_empty();
+                        final_accounts_actual.insert(
+                            *pubkey,
+                            AccountSettlement {
+                                account: account_data.clone(),
+                                deleted,
+                            },
+                        );
                     }
                 }
 

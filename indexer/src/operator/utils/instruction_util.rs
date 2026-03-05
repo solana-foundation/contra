@@ -73,10 +73,8 @@ impl TransactionBuilder {
 
     pub fn compute_unit_price(&self) -> Option<u64> {
         match self {
-            Self::ReleaseFunds(_) => Some(1),
-            Self::InitializeMint(_) => None,
-            Self::Mint(_) => None,
-            Self::ResetSmtRoot(_) => Some(1),
+            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => Some(1),
+            Self::InitializeMint(_) | Self::Mint(_) => None,
         }
     }
 
@@ -85,22 +83,16 @@ impl TransactionBuilder {
     pub fn compute_budget(&self) -> Option<u32> {
         match self {
             Self::ReleaseFunds(_) => DEFAULT_CU_RELEASE_FUNDS,
-            Self::InitializeMint(_) => DEFAULT_CU_MINT,
-            Self::Mint(_) => DEFAULT_CU_MINT,
-            Self::ResetSmtRoot(_) => DEFAULT_CU_MINT,
+            Self::InitializeMint(_) | Self::Mint(_) | Self::ResetSmtRoot(_) => DEFAULT_CU_MINT,
         }
     }
 
     pub fn signers(&self) -> Vec<&'static Signer> {
         match self {
-            Self::ReleaseFunds(_) => {
+            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => {
                 vec![SignerUtil::admin_signer(), SignerUtil::operator_signer()]
             }
-            Self::InitializeMint(_) => vec![SignerUtil::admin_signer()],
-            Self::Mint(_) => vec![SignerUtil::admin_signer()],
-            Self::ResetSmtRoot(_) => {
-                vec![SignerUtil::admin_signer(), SignerUtil::operator_signer()]
-            }
+            Self::InitializeMint(_) | Self::Mint(_) => vec![SignerUtil::admin_signer()],
         }
     }
 
@@ -108,28 +100,24 @@ impl TransactionBuilder {
     /// Returns the DB id for all transaction types with a DB record
     pub fn transaction_id(&self) -> Option<i64> {
         match self {
-            TransactionBuilder::ReleaseFunds(builder) => Some(builder.transaction_id),
-            TransactionBuilder::InitializeMint(_) => None,
-            TransactionBuilder::Mint(builder) => Some(builder.txn_id),
-            TransactionBuilder::ResetSmtRoot(_) => None,
+            Self::ReleaseFunds(builder) => Some(builder.transaction_id),
+            Self::Mint(builder) => Some(builder.txn_id),
+            Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
         }
     }
 
     pub fn trace_id(&self) -> Option<String> {
         match self {
-            TransactionBuilder::ReleaseFunds(b) => Some(b.trace_id.clone()),
-            TransactionBuilder::Mint(b) => Some(b.trace_id.clone()),
-            TransactionBuilder::InitializeMint(_) => None,
-            TransactionBuilder::ResetSmtRoot(_) => None,
+            Self::ReleaseFunds(b) => Some(b.trace_id.clone()),
+            Self::Mint(b) => Some(b.trace_id.clone()),
+            Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
         }
     }
 
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
-            TransactionBuilder::ReleaseFunds(builder) => Some(builder.nonce),
-            TransactionBuilder::InitializeMint(_) => None,
-            TransactionBuilder::Mint(_) => None,
-            TransactionBuilder::ResetSmtRoot(_) => None,
+            Self::ReleaseFunds(builder) => Some(builder.nonce),
+            Self::InitializeMint(_) | Self::Mint(_) | Self::ResetSmtRoot(_) => None,
         }
     }
 
@@ -145,22 +133,21 @@ impl TransactionBuilder {
     ///   Safe to retry on transient network failures.
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
-            Self::ReleaseFunds(_) => RetryPolicy::Idempotent,
-            Self::InitializeMint(_) => RetryPolicy::Idempotent,
             Self::Mint(_) => RetryPolicy::None,
-            Self::ResetSmtRoot(_) => RetryPolicy::Idempotent,
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::ResetSmtRoot(_) => {
+                RetryPolicy::Idempotent
+            }
         }
     }
 
-    /// Get extra error checks for this transaction type
     pub fn extra_error_checks_policy(&self) -> ExtraErrorCheckPolicy {
         match self {
-            Self::ReleaseFunds(_) => ExtraErrorCheckPolicy::None,
-            Self::InitializeMint(_) => ExtraErrorCheckPolicy::None,
             Self::Mint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
             }
-            Self::ResetSmtRoot(_) => ExtraErrorCheckPolicy::None,
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::ResetSmtRoot(_) => {
+                ExtraErrorCheckPolicy::None
+            }
         }
     }
 }

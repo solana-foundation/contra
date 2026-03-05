@@ -67,6 +67,7 @@ jobs:
               - '.github/actions/setup-environment/**'
               - 'core/**'
               - 'indexer/**'
+              - 'gateway/**'
 
   build-artifacts:
     name: Build Shared Artifacts
@@ -198,8 +199,8 @@ jobs:
             --exclude tests-contra-withdraw-program \
             -- -D warnings
 
-  integration-test-contra:
-    name: Rust Integration Tests (Contra)
+  integration-tests:
+    name: Rust Integration Tests + E2E Coverage
     needs: [changes, build-artifacts]
     if: needs.changes.outputs.integration == 'true'
     runs-on: contra-runner-1
@@ -209,7 +210,7 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          install-base-cargo-tools: "false"
+          rust-components: llvm-tools-preview
           setup-solana: "false"
           setup-node: "false"
           setup-pnpm: "false"
@@ -229,40 +230,29 @@ jobs:
           docker image inspect postgres:11-alpine >/dev/null 2>&1 || docker pull postgres:11-alpine
           docker image inspect redis:5.0 >/dev/null 2>&1 || docker pull redis:5.0
 
-      - name: Run contra integration tests
-        run: make integration-test-ci-prebuilt
+      - name: Run contra integration tests with coverage
+        run: make -C integration integration-coverage-contra
 
-  integration-test-indexer:
-    name: Rust Integration Tests (Indexer)
-    needs: [changes, build-artifacts]
-    if: needs.changes.outputs.integration == 'true'
-    runs-on: contra-runner-1
-    steps:
-      - uses: actions/checkout@v4
+      - name: Build escrow with test-tree for indexer tests
+        run: make -C contra-escrow-program build-test
 
-      - name: Setup environment
-        uses: ./.github/actions/setup-environment
-        with:
-          install-base-cargo-tools: "false"
-          setup-node: "false"
-          setup-pnpm: "false"
-          install-dependencies: "false"
-          build-programs: "false"
+      - name: Run indexer integration tests with coverage
+        run: make -C integration integration-coverage-indexer
 
-      - name: Download shared artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: ci-build-artifacts
-
-      - name: Restore shared artifacts
-        run: tar -xzf ci-build-artifacts.tgz
-
-      - name: Warm testcontainers images
+      - name: Generate combined E2E coverage report
         run: |
-          docker image inspect postgres:11-alpine >/dev/null 2>&1 || docker pull postgres:11-alpine
+          mkdir -p coverage
+          cd integration && cargo llvm-cov report --lcov \
+            --ignore-filename-regex '(^tests/|/test_utils/|\.cargo/registry)' \
+            --output-path ../coverage/coverage-integration-e2e.lcov
 
-      - name: Run indexer integration tests
-        run: make integration-test-ci-indexer
+      - name: Upload E2E coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-coverage-reports
+          path: coverage/coverage-integration-e2e.lcov
+          retention-days: 7
 
   unit-tests:
     name: Core + Indexer Unit Coverage
@@ -301,4 +291,5 @@ jobs:
           path: |
             coverage/coverage-core-unit.lcov
             coverage/coverage-indexer-unit.lcov
+            coverage/coverage-gateway-unit.lcov
           retention-days: 7

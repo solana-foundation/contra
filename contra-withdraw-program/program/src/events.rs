@@ -19,3 +19,25 @@ impl WithdrawFundsEvent {
         data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_withdraw_funds_event_to_bytes() {
+        let destination = Pubkey::new_from_array([0u8; 32]);
+        let amount = 1000u64;
+
+        let event = WithdrawFundsEvent {
+            amount,
+            destination,
+        };
+
+        let bytes = event.to_bytes();
+
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(&bytes[..8], &amount.to_le_bytes());
+        assert_eq!(&bytes[8..], destination.as_ref());
+    }
+}

@@ -97,3 +97,88 @@ fn parse_instruction_data(data: &[u8]) -> Result<WithdrawFundsArgs, ProgramError
         destination,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+
+    use super::*;
+    use crate::ID as CONTRA_WITHDRAW_PROGRAM_ID;
+    use alloc::vec;
+
+    #[test]
+    fn test_parse_instruction_data_valid_with_destination() {
+        let destination_key = Address::new_from_array([0u8; 32]);
+        let mut instruction_data = vec![];
+
+        instruction_data.extend_from_slice(&1000u64.to_le_bytes());
+        instruction_data.push(1);
+        instruction_data.extend_from_slice(destination_key.as_ref());
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert!(result.is_ok());
+        let args = result.unwrap();
+        assert_eq!(args.amount, 1000);
+        assert_eq!(args.destination, Some(destination_key));
+    }
+
+    #[test]
+    fn test_parse_instruction_data_valid_without_destination() {
+        let mut instruction_data = vec![];
+
+        instruction_data.extend_from_slice(&500u64.to_le_bytes());
+        instruction_data.push(0);
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert!(result.is_ok());
+        let args = result.unwrap();
+        assert_eq!(args.amount, 500);
+        assert_eq!(args.destination, None);
+    }
+
+    #[test]
+    fn test_parse_instruction_data_insufficient_length() {
+        let instruction_data = vec![1, 2, 3];
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_parse_instruction_data_empty() {
+        let instruction_data = vec![];
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_parse_instruction_data_zero_amount() {
+        let mut instruction_data = vec![];
+
+        instruction_data.extend_from_slice(&0u64.to_le_bytes());
+        instruction_data.push(0);
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert!(result.is_ok());
+        let args = result.unwrap();
+        assert_eq!(args.amount, 0);
+        assert_eq!(args.destination, None);
+    }
+
+    #[test]
+    fn test_process_withdraw_funds_empty_accounts() {
+        let instruction_data = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let accounts = [];
+
+        let result =
+            process_withdraw_funds(&CONTRA_WITHDRAW_PROGRAM_ID, &accounts, &instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
+    }
+}

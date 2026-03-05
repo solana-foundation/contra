@@ -2,7 +2,7 @@ name: Coverage Report
 
 on:
   workflow_run:
-    workflows: ["Program Unit Tests", "Program Integration Tests", "Rust Checks"]
+    workflows: ["Program Unit Tests", "Rust Checks", "TypeScript SDK Unit Tests"]
     types:
       - completed
   workflow_dispatch:
@@ -40,8 +40,8 @@ jobs:
             const branch = context.payload.workflow_run?.head_branch || context.ref.replace(/^refs\/heads\//, '');
             const workflows = {
               'program-unit.yml': 'unit_run_id',
-              'program-integration.yml': 'integration_run_id',
               'rust.yml': 'rust_run_id',
+              'sdk-unit.yml': 'ts_run_id',
             };
             for (const [filename, output] of Object.entries(workflows)) {
               try {
@@ -75,16 +75,6 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
-      - name: Download program integration coverage
-        if: steps.find-runs.outputs.integration_run_id
-        uses: actions/download-artifact@v4
-        with:
-          name: integration-coverage-reports
-          path: coverage-artifacts/integration
-          run-id: ${{ steps.find-runs.outputs.integration_run_id }}
-          github-token: ${{ github.token }}
-        continue-on-error: true
-
       - name: Download rust unit coverage
         if: steps.find-runs.outputs.rust_run_id
         uses: actions/download-artifact@v4
@@ -95,10 +85,55 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
+      - name: Download E2E integration coverage
+        if: steps.find-runs.outputs.rust_run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-coverage-reports
+          path: coverage-artifacts/e2e
+          run-id: ${{ steps.find-runs.outputs.rust_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Download escrow TS coverage
+        if: steps.find-runs.outputs.ts_run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: ts-unit-coverage-contra-escrow-program
+          path: coverage-artifacts/ts-escrow
+          run-id: ${{ steps.find-runs.outputs.ts_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Download withdraw TS coverage
+        if: steps.find-runs.outputs.ts_run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: ts-unit-coverage-contra-withdraw-program
+          path: coverage-artifacts/ts-withdraw
+          run-id: ${{ steps.find-runs.outputs.ts_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
       - name: Setup coverage tools
         run: |
           npm install -g lcov-result-merger
           sudo apt-get update && sudo apt-get install -y bc jq
+
+      - name: Normalize and filter coverage files
+        run: |
+          # Rename lcov.info files to .lcov for consistent globbing
+          find coverage-artifacts -name 'lcov.info' | while read f; do
+            dir=$(dirname "$f")
+            mv "$f" "$dir/coverage.lcov"
+          done
+          # Remove empty coverage files
+          find coverage-artifacts -name '*.lcov' | while read f; do
+            if [ ! -s "$f" ]; then
+              echo "WARNING: Removing empty coverage file: $f"
+              rm "$f"
+            fi
+          done
 
       - name: Combine coverage reports
         run: |
@@ -120,7 +155,7 @@ jobs:
 
           parse_lcov() {
             local file="$1" label="$2"
-            if [ -f "$file" ]; then
+            if [ -f "$file" ] && [ -s "$file" ]; then
               LINES_FOUND=$(grep -E "^LF:" "$file" | awk -F: '{sum += $2} END {print sum}')
               LINES_HIT=$(grep -E "^LH:" "$file" | awk -F: '{sum += $2} END {print sum}')
               if [ "$LINES_FOUND" -gt 0 ]; then
@@ -135,13 +170,17 @@ jobs:
           parse_lcov "coverage-artifacts/unit/coverage/coverage-escrow-unit.lcov" "Escrow Unit Tests"
           parse_lcov "coverage-artifacts/unit/coverage/coverage-withdraw-unit.lcov" "Withdraw Unit Tests"
 
-          # Program integration coverage
-          parse_lcov "coverage-artifacts/integration/coverage/coverage-escrow-integration.lcov" "Escrow Integration Tests"
-          parse_lcov "coverage-artifacts/integration/coverage/coverage-withdraw-integration.lcov" "Withdraw Integration Tests"
-
-          # Core + indexer unit coverage
+          # Core + indexer + gateway unit coverage
           parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-core-unit.lcov" "Core Unit Tests"
           parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-indexer-unit.lcov" "Indexer Unit Tests"
+          parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-gateway-unit.lcov" "Gateway Unit Tests"
+
+          # E2E integration coverage
+          parse_lcov "coverage-artifacts/e2e/coverage-integration-e2e.lcov" "E2E Integration Tests"
+
+          # TypeScript SDK coverage
+          parse_lcov "coverage-artifacts/ts-escrow/coverage.lcov" "Escrow TS SDK Tests"
+          parse_lcov "coverage-artifacts/ts-withdraw/coverage.lcov" "Withdraw TS SDK Tests"
 
           echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_OUTPUT
           echo -e "$COVERAGE_SUMMARY" >> $GITHUB_OUTPUT
@@ -166,6 +205,7 @@ jobs:
             Coverage reports have been generated for all test suites:
             - [Combined Coverage Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
             - Individual test coverage artifacts available in workflow runs
+            - Program integration test coverage is tracked via semantic analysis in \`TEST_COVERAGE.md\`
 
             </details>`;
 

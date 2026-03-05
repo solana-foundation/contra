@@ -8,7 +8,7 @@ PROGRAM_ENV_KEY := WITHDRAW_PROGRAM_ID
 
 .PHONY: install build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
-.PHONY: unit-coverage integration-coverage integration-coverage-no-build coverage-html all-coverage
+.PHONY: unit-coverage coverage-html all-coverage
 .PHONY: build-localnet build-devnet deploy-devnet
 
 # Install dependencies
@@ -61,15 +61,6 @@ unit-coverage:
 	@mkdir -p ../coverage
 	@cd program && cargo llvm-cov --lib --tests --lcov --output-path ../../coverage/coverage-withdraw-unit.lcov
 
-# Run integration tests with coverage without build (for CI composition)
-integration-coverage-no-build:
-	@echo "Running integration tests with coverage..."
-	@mkdir -p ../coverage
-	@cd tests/integration-tests && cargo llvm-cov --lcov --output-path ../../../coverage/coverage-withdraw-integration.lcov -- --nocapture
-
-# Run integration tests with coverage
-integration-coverage: build integration-coverage-no-build
-
 # Generate HTML coverage report
 coverage-html:
 	@echo "Generating HTML coverage report..."
@@ -77,7 +68,7 @@ coverage-html:
 	@cd program && cargo llvm-cov --html --output-dir ../../coverage/coverage-withdraw-html
 
 # Run all coverage tasks
-all-coverage: unit-coverage integration-coverage coverage-html
+all-coverage: unit-coverage coverage-html
 
 #############
 # Localnet

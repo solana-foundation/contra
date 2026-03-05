@@ -128,7 +128,6 @@ async fn test_signature_statuses_only_with_postgres() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_with_redis() {
-    // Setup tracing for debugging
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -330,43 +329,26 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
 }
 
 async fn test_suite(contra_ctx: &ContraContext, l1_ctx: &L1Context) {
-    // Run precompile accounts test first to ensure they're available
     run_precompile_accounts_test(contra_ctx).await;
     run_spl_token_test(contra_ctx, l1_ctx, spl_token::ID).await;
     run_spl_token_test(contra_ctx, l1_ctx, spl_token_2022::ID).await;
-    // Run the tx replay test
     run_tx_replay_test(contra_ctx).await;
-    // Run transaction count test
     run_transaction_count_test(contra_ctx).await;
-    // Run get transaction test
     run_get_transaction_test(contra_ctx).await;
-    // Run first available block test
     run_first_available_block_test(contra_ctx).await;
-    // Run get blocks test
     run_get_blocks_test(contra_ctx).await;
-    // Run get signature statuses test
     run_get_signature_statuses_test(contra_ctx).await;
-    // Run get block time test
     run_get_block_time_test(contra_ctx).await;
-    // Run get slot leaders test
     run_get_slot_leaders_test(contra_ctx).await;
-    // CORS test disabled - CORS is now handled by the gateway, not the RPC nodes
-    // run_cors_test(contra_ctx).await;
-    // Run epoch info test
     run_epoch_info_test(contra_ctx).await;
-    // Run epoch schedule test
     run_epoch_schedule_test(contra_ctx).await;
-    // Run vote accounts test
     run_vote_accounts_test(contra_ctx).await;
-    // Run get supply test
     run_get_supply_test(contra_ctx).await;
-    // Run blockhash validation test
     run_blockhash_validation_test(contra_ctx).await;
-    // Run security tests
     run_non_admin_sending_admin_instruction_test(contra_ctx).await;
     run_empty_transaction_test(contra_ctx).await;
     run_mixed_transaction_test(contra_ctx).await;
-    // Run performance samples test (should be last to collect all samples)
+    // Must be last to collect all samples
     run_performance_samples_test(contra_ctx).await;
 }
 

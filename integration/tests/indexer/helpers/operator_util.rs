@@ -1,10 +1,8 @@
 #![allow(dead_code)]
 
-/// Operator-specific utilities for integration tests
 use super::db;
 use super::test_types::WAIT_TIMEOUT_SECS;
 
-/// Wait for operator to complete processing transactions with progress logging
 pub async fn wait_for_operator_completion(
     pool: &sqlx::PgPool,
     expected_count: usize,

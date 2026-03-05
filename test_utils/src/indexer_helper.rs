@@ -22,29 +22,20 @@ impl IndexerHandle {
     }
 }
 
-/// Start the Contra indexer
-/// If geyser_endpoint is Some, uses Yellowstone datasource; otherwise uses RPC polling
-/// Returns the indexer handle and storage instance
+/// Start the Contra indexer.
+/// If geyser_endpoint is Some, uses Yellowstone datasource; otherwise uses RPC polling.
 pub async fn start_contra_indexer(
     geyser_endpoint: Option<String>,
     rpc_url: String,
     database_url: String,
 ) -> Result<(IndexerHandle, Storage), Box<dyn std::error::Error>> {
-    // Initialize storage first so we can return it for test assertions
-    let storage = Arc::new(Storage::Postgres(
-        PostgresDb::new(&PostgresConfig {
-            database_url: database_url.clone(),
-            max_connections: 50,
-        })
-        .await?,
-    ));
-    storage.init_schema().await?;
-
-    // Build config structs similar to cli.rs
     let postgres_config = PostgresConfig {
         database_url,
         max_connections: 50,
     };
+
+    let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
+    storage.init_schema().await?;
 
     let rpc_polling_config = RpcPollingConfig {
         poll_interval_ms: 200,
@@ -55,13 +46,12 @@ pub async fn start_contra_indexer(
         commitment: CommitmentLevel::Finalized,
     };
 
-    // Configure yellowstone only if geyser endpoint is provided
     let (datasource_type, yellowstone_config) = if let Some(endpoint) = geyser_endpoint {
         (
             DatasourceType::Yellowstone,
             Some(YellowstoneConfig {
                 endpoint,
-                x_token: None, // not needed for local test validator
+                x_token: None,
                 commitment: "finalized".to_string(),
             }),
         )
@@ -98,58 +88,43 @@ pub async fn start_contra_indexer(
     indexer_config.validate()?;
     common_config.validate()?;
 
-    // Spawn contra_indexer::run in a background task
     let indexer_handle = tokio::spawn(async move {
         if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
             eprintln!("Indexer error: {}", e);
         }
     });
 
-    // Give indexer time to initialize
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Clone storage for test assertions (the Arc makes this cheap)
-    let storage_for_tests = (*storage).clone();
 
     Ok((
         IndexerHandle {
             _handles: vec![indexer_handle],
         },
-        storage_for_tests,
+        (*storage).clone(),
     ))
 }
 
-/// Start the L1 indexer using Yellowstone geyser
-/// Returns the indexer handle, storage instance, and the postgres container
+/// Start the L1 indexer using Yellowstone geyser.
 pub async fn start_l1_indexer(
     geyser_endpoint: String,
     rpc_url: String,
     database_url: String,
     escrow_instance_id: Option<Pubkey>,
 ) -> Result<(IndexerHandle, Storage), Box<dyn std::error::Error>> {
-    // Initialize storage first so we can return it for test assertions
-    let storage = Arc::new(Storage::Postgres(
-        PostgresDb::new(&PostgresConfig {
-            database_url: database_url.clone(),
-            max_connections: 50,
-        })
-        .await?,
-    ));
-    storage.init_schema().await?;
-
-    // Build config structs similar to cli.rs
     let postgres_config = PostgresConfig {
-        database_url: database_url.clone(),
+        database_url,
         max_connections: 50,
     };
 
+    let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
+    storage.init_schema().await?;
+
     let yellowstone_config = YellowstoneConfig {
         endpoint: geyser_endpoint,
-        x_token: None, // not needed for local test validator
+        x_token: None,
         commitment: "finalized".to_string(),
     };
 
-    // RPC polling config is needed for backfill even when using Yellowstone
     let rpc_polling_config = RpcPollingConfig {
         poll_interval_ms: 200,
         error_retry_interval_ms: 1000,
@@ -188,23 +163,18 @@ pub async fn start_l1_indexer(
     common_config.validate()?;
     indexer_config.validate()?;
 
-    // Spawn contra_indexer::run in a background task
     let indexer_handle = tokio::spawn(async move {
         if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
             eprintln!("L1 Indexer error: {}", e);
         }
     });
 
-    // Give indexer time to initialize
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Clone storage for test assertions (the Arc makes this cheap)
-    let storage_for_tests = (*storage).clone();
 
     Ok((
         IndexerHandle {
             _handles: vec![indexer_handle],
         },
-        storage_for_tests,
+        (*storage).clone(),
     ))
 }

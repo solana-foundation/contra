@@ -25,7 +25,6 @@ use {
 
 use contra_indexer::storage::Storage;
 
-/// Contra context for interacting with the Contra node
 pub struct ContraContext {
     pub write_client: RpcClient,
     pub read_client: RpcClient,
@@ -93,8 +92,6 @@ impl ContraContext {
         }
     }
 
-    /// Send a transaction to Contra and check if it landed within the given duration.
-    /// Returns Some(signature) if the transaction landed, None if it didn't.
     pub async fn send_and_check(
         &self,
         tx: &Transaction,
@@ -105,15 +102,9 @@ impl ContraContext {
             .await
             .map_err(|e| anyhow::anyhow!("Send transaction failed: {}", e))?;
 
-        // Wait for the specified duration
         sleep(wait_duration).await;
 
-        // Check if transaction exists
-        match self.get_transaction(&sig).await {
-            Ok(Some(_)) => Ok(Some(sig)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.get_transaction(&sig).await.map(|opt| opt.map(|_| sig))
     }
 
     pub async fn check_transaction_exists(&self, signature: Signature) {
@@ -203,7 +194,6 @@ impl ContraContext {
     }
 }
 
-/// L1 context for interacting with the test validator
 pub struct L1Context {
     pub client: RpcClient,
     pub operator_key: Keypair,
@@ -230,40 +220,36 @@ impl L1Context {
     }
 
     pub async fn get_latest_blockhash(&self) -> Result<Hash> {
-        let blockhash = self.client.get_latest_blockhash().await?;
-        Ok(blockhash)
+        self.client
+            .get_latest_blockhash()
+            .await
+            .map_err(anyhow::Error::from)
     }
 
-    /// Get SOL balance of an account
     pub async fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
-        let balance = self
-            .client
+        self.client
             .get_balance(pubkey)
             .await
-            .map_err(anyhow::Error::from)?;
-        Ok(balance)
+            .map_err(anyhow::Error::from)
     }
 
-    /// Get token account balance
     pub async fn get_token_balance(&self, token_account: &Pubkey) -> Result<u64> {
-        let amount = self
-            .client
+        self.client
             .get_token_account_balance(token_account)
             .await
             .map_err(anyhow::Error::from)?
             .amount
             .parse::<u64>()
-            .map_err(anyhow::Error::from)?;
-        Ok(amount)
+            .map_err(anyhow::Error::from)
     }
 
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<Signature> {
-        let sig = self.client.send_and_confirm_transaction(tx).await?;
-        Ok(sig)
+        self.client
+            .send_and_confirm_transaction(tx)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
-    /// Fund an account with SOL from the faucet (test validator mint keypair)
-    /// Returns the signature of the transfer transaction
     pub async fn fund_account(&self, pubkey: &Pubkey, lamports: u64) -> Result<Signature> {
         let blockhash = self.client.get_latest_blockhash().await?;
 
@@ -279,25 +265,19 @@ impl L1Context {
         self.send_transaction(&tx).await
     }
 
-    /// Create a new SPL token mint on the L1 (test validator)
-    /// Returns the signature of the creation transaction
     pub async fn create_mint(
         &self,
         mint_keypair: &Keypair,
         mint_authority: &Pubkey,
         decimals: u8,
     ) -> Result<Signature> {
-        // Get blockhash from validator
         let blockhash = self.client.get_latest_blockhash().await?;
-
-        // Calculate rent-exempt minimum for mint account
         let mint_rent = self
             .client
             .get_minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN)
             .await?;
 
-        // Create and initialize mint
-        let create_mint_tx = Transaction::new_signed_with_payer(
+        let tx = Transaction::new_signed_with_payer(
             &[
                 system_instruction::create_account(
                     &self.operator_key.pubkey(),
@@ -319,33 +299,25 @@ impl L1Context {
             blockhash,
         );
 
-        let sig = self
-            .client
-            .send_and_confirm_transaction(&create_mint_tx)
-            .await?;
-
-        Ok(sig)
+        self.client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
-    /// Create a new Token-2022 mint on the L1 (test validator)
-    /// Returns the signature of the creation transaction
     pub async fn create_t22_mint(
         &self,
         mint_keypair: &Keypair,
         mint_authority: &Pubkey,
         decimals: u8,
     ) -> Result<Signature> {
-        // Get blockhash from validator
         let blockhash = self.client.get_latest_blockhash().await?;
-
-        // Calculate rent-exempt minimum for mint account
         let mint_rent = self
             .client
             .get_minimum_balance_for_rent_exemption(spl_token_2022::state::Mint::LEN)
             .await?;
 
-        // Create and initialize mint
-        let create_mint_tx = Transaction::new_signed_with_payer(
+        let tx = Transaction::new_signed_with_payer(
             &[
                 system_instruction::create_account(
                     &self.operator_key.pubkey(),
@@ -367,15 +339,12 @@ impl L1Context {
             blockhash,
         );
 
-        let sig = self
-            .client
-            .send_and_confirm_transaction(&create_mint_tx)
-            .await?;
-
-        Ok(sig)
+        self.client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
-    /// Create token accounts for multiple keypairs on the L1 (test validator)
     pub async fn create_token_accounts(
         &self,
         mint: &Pubkey,
@@ -386,7 +355,6 @@ impl L1Context {
             let token_account = get_associated_token_address(&keypair.pubkey(), mint);
             let blockhash = self.client.get_latest_blockhash().await?;
 
-            // Create ATA
             let create_ata_ix =
                 spl_associated_token_account::instruction::create_associated_token_account(
                     &keypair.pubkey(),
@@ -411,7 +379,6 @@ impl L1Context {
         Ok(())
     }
 
-    /// Mint tokens to a token account on the L1 (test validator)
     pub async fn mint_to(
         &self,
         mint: &Pubkey,
@@ -443,18 +410,16 @@ impl L1Context {
             panic!("Unsupported token program ID: {}", token_program_id);
         };
 
-        let mint_to_tx = Transaction::new_signed_with_payer(
+        let tx = Transaction::new_signed_with_payer(
             &[mint_to_ix],
             Some(&self.operator_key.pubkey()),
             &[&self.operator_key],
             blockhash,
         );
 
-        let sig = self
-            .client
-            .send_and_confirm_transaction(&mint_to_tx)
-            .await?;
-
-        Ok(sig)
+        self.client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .map_err(anyhow::Error::from)
     }
 }

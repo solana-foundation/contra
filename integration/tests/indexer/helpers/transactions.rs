@@ -12,7 +12,6 @@ const COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const COMPUTE_UNIT_PRICE: u64 = 1;
 const AIRDROP_AMOUNT: u64 = 10_000_000_000;
 
-/// Send and confirm a transaction with instructions
 pub async fn send_and_confirm_instructions(
     client: &RpcClient,
     instructions: &[Instruction],
@@ -20,22 +19,17 @@ pub async fn send_and_confirm_instructions(
     signers: &[&Keypair],
     description: &str,
 ) -> Result<Signature, Box<dyn std::error::Error>> {
-    // Add compute budget instructions
     let mut all_instructions = vec![
         ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
         ComputeBudgetInstruction::set_compute_unit_price(COMPUTE_UNIT_PRICE),
     ];
     all_instructions.extend_from_slice(instructions);
 
-    // Get recent blockhash
     let recent_blockhash = client.get_latest_blockhash().await?;
-
-    // Create message and transaction
     let message = Message::new(&all_instructions, Some(&payer.pubkey()));
     let mut transaction = Transaction::new_unsigned(message);
     transaction.sign(signers, recent_blockhash);
 
-    // Send and confirm
     let signature = client
         .send_and_confirm_transaction(&transaction)
         .await
@@ -44,7 +38,6 @@ pub async fn send_and_confirm_instructions(
     Ok(signature)
 }
 
-/// Setup wallets by airdropping SOL
 pub async fn setup_wallets(
     client: &RpcClient,
     faucet_keypair: &Keypair,

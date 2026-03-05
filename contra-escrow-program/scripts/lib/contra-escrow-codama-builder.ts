@@ -1,5 +1,4 @@
-import { Codama, createFromRoot } from 'codama';
-import { AnchorIdl, rootNodeFromAnchor } from '@codama/nodes-from-anchor';
+import { Codama, createFromJson } from 'codama';
 import {
     appendAccountDiscriminator,
     appendPdaDerivers,
@@ -11,8 +10,9 @@ import { removeEmitInstruction } from './updates/remove-emit-instruction';
 export class ContraEscrowCodamaBuilder {
     private codama: Codama;
 
-    constructor(contraEscrowIdl: AnchorIdl) {
-        this.codama = createFromRoot(rootNodeFromAnchor(contraEscrowIdl));
+    constructor(contraEscrowIdl: any) {
+        const idlJson = typeof contraEscrowIdl === 'string' ? contraEscrowIdl : JSON.stringify(contraEscrowIdl);
+        this.codama = createFromJson(idlJson);
     }
 
     appendAccountDiscriminator(): this {
@@ -45,6 +45,6 @@ export class ContraEscrowCodamaBuilder {
     }
 }
 
-export function createContraEscrowCodamaBuilder(contraEscrowIdl: AnchorIdl): ContraEscrowCodamaBuilder {
+export function createContraEscrowCodamaBuilder(contraEscrowIdl: any): ContraEscrowCodamaBuilder {
     return new ContraEscrowCodamaBuilder(contraEscrowIdl);
 }

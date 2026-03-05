@@ -1,12 +1,12 @@
-import { Codama, createFromRoot } from 'codama';
-import { AnchorIdl, rootNodeFromAnchor } from '@codama/nodes-from-anchor';
+import { Codama, createFromJson } from 'codama';
 import { setInstructionAccountDefaultValues } from './updates';
 
 export class ContraWithdrawCodamaBuilder {
     private codama: Codama;
 
-    constructor(contraWithdrawIdl: AnchorIdl) {
-        this.codama = createFromRoot(rootNodeFromAnchor(contraWithdrawIdl));
+    constructor(contraWithdrawIdl: any) {
+        const idlJson = typeof contraWithdrawIdl === 'string' ? contraWithdrawIdl : JSON.stringify(contraWithdrawIdl);
+        this.codama = createFromJson(idlJson);
     }
 
     setInstructionAccountDefaultValues(): this {
@@ -19,6 +19,6 @@ export class ContraWithdrawCodamaBuilder {
     }
 }
 
-export function createContraWithdrawCodamaBuilder(contraWithdrawIdl: AnchorIdl): ContraWithdrawCodamaBuilder {
+export function createContraWithdrawCodamaBuilder(contraWithdrawIdl: any): ContraWithdrawCodamaBuilder {
     return new ContraWithdrawCodamaBuilder(contraWithdrawIdl);
 }

@@ -1,11 +1,5 @@
 import { expect } from '@jest/globals';
-import {
-    getInstanceEncoder,
-    getInstanceDecoder,
-    getInstanceCodec,
-    getInstanceSize,
-    type Instance,
-} from '../../../src/generated';
+import { getInstanceEncoder, getInstanceDecoder, getInstanceCodec, type Instance } from '../../../src/generated';
 import { TEST_ADDRESSES, TEST_ROOT } from '../../setup/mocks';
 import { assertIsAddress, type Address } from '@solana/kit';
 
@@ -45,7 +39,9 @@ describe('Instance Account', () => {
             expect(decodedInstance.version).toBe(testInstance.version);
             expect(decodedInstance.instanceSeed).toBe(testInstance.instanceSeed);
             expect(decodedInstance.admin).toBe(testInstance.admin);
-            expect(decodedInstance.withdrawalTransactionsRoot).toEqual(testInstance.withdrawalTransactionsRoot);
+            expect(decodedInstance.withdrawalTransactionsRoot).toEqual(
+                Array.from(testInstance.withdrawalTransactionsRoot),
+            );
         });
 
         it('should handle combined codec correctly', () => {
@@ -55,7 +51,7 @@ describe('Instance Account', () => {
                 version: 2,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                 admin: TEST_ADDRESSES.WALLET,
-                withdrawalTransactionsRoot: new Uint8Array(32).fill(127),
+                withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(127)),
                 currentTreeIndex: 1n,
             };
 
@@ -78,7 +74,7 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
-                    withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                    withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                     currentTreeIndex: 2n,
                 };
 
@@ -101,7 +97,7 @@ describe('Instance Account', () => {
                     version,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
-                    withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                    withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                     currentTreeIndex: 3n,
                 };
 
@@ -129,7 +125,7 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: addresses.instanceSeed as Address,
                     admin: addresses.admin as Address,
-                    withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                    withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                     currentTreeIndex: 4n,
                 };
 
@@ -146,11 +142,11 @@ describe('Instance Account', () => {
 
         it('should handle different withdrawal root patterns (32 bytes)', () => {
             const testRoots = [
-                new Uint8Array(32).fill(0), // All zeros
-                new Uint8Array(32).fill(255), // All 0xFF
-                new Uint8Array(Array.from({ length: 32 }, (_, i) => i)), // Sequential 0-31
-                new Uint8Array(Array.from({ length: 32 }, (_, i) => 255 - i)), // Reverse sequential
-                crypto.getRandomValues(new Uint8Array(32)), // Random bytes
+                Array.from(new Uint8Array(32).fill(0)), // All zeros
+                Array.from(new Uint8Array(32).fill(255)), // All 0xFF
+                Array.from({ length: 32 }, (_, i) => i), // Sequential 0-31
+                Array.from({ length: 32 }, (_, i) => 255 - i), // Reverse sequential
+                Array.from(crypto.getRandomValues(new Uint8Array(32))), // Random bytes
             ];
 
             for (const withdrawalRoot of testRoots) {
@@ -170,7 +166,7 @@ describe('Instance Account', () => {
 
                 expect(decodedInstance.withdrawalTransactionsRoot).toEqual(withdrawalRoot);
                 expect(decodedInstance.withdrawalTransactionsRoot).toHaveLength(32);
-                expect(decodedInstance.withdrawalTransactionsRoot instanceof Uint8Array).toBe(true);
+                expect(Array.isArray(decodedInstance.withdrawalTransactionsRoot)).toBe(true);
             }
         });
     });
@@ -183,7 +179,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                 currentTreeIndex: 7n,
             };
 
@@ -204,7 +200,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                 currentTreeIndex: 8n,
             };
 
@@ -214,12 +210,12 @@ describe('Instance Account', () => {
             expect(typeof testInstance.version).toBe('number');
             expect(typeof testInstance.instanceSeed).toBe('string');
             expect(typeof testInstance.admin).toBe('string');
-            expect(testInstance.withdrawalTransactionsRoot instanceof Uint8Array).toBe(true);
+            expect(Array.isArray(testInstance.withdrawalTransactionsRoot)).toBe(true);
             expect(typeof testInstance.currentTreeIndex).toBe('bigint');
         });
 
         it('should validate withdrawal root is exactly 32 bytes', () => {
-            const validRoot = new Uint8Array(32).fill(0);
+            const validRoot = Array.from(new Uint8Array(32).fill(0));
 
             const testInstance: Instance = {
                 discriminator: 0,
@@ -237,7 +233,7 @@ describe('Instance Account', () => {
 
     describe('Size validation', () => {
         it('should report correct account size (107 bytes)', () => {
-            const accountSize = getInstanceSize();
+            const accountSize = getInstanceEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
 
@@ -248,13 +244,13 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                 currentTreeIndex: 10n,
             };
 
             const encoder = getInstanceEncoder();
             const encodedData = encoder.encode(testInstance);
-            const reportedSize = getInstanceSize();
+            const reportedSize = getInstanceEncoder().fixedSize;
             const actualSize = encodedData.length;
 
             expect(encodedData).toHaveLength(EXPECTED_SIZE);
@@ -270,7 +266,7 @@ describe('Instance Account', () => {
                     version: 1,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                     admin: TEST_ADDRESSES.ADMIN,
-                    withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                    withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                     currentTreeIndex: 11n,
                 },
                 {
@@ -279,7 +275,7 @@ describe('Instance Account', () => {
                     version: 255,
                     instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                     admin: TEST_ADDRESSES.WALLET,
-                    withdrawalTransactionsRoot: new Uint8Array(32).fill(255),
+                    withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(255)),
                     currentTreeIndex: 12n,
                 },
                 {
@@ -288,7 +284,7 @@ describe('Instance Account', () => {
                     version: 10,
                     instanceSeed: TEST_ADDRESSES.USDC_MINT,
                     admin: TEST_ADDRESSES.OPERATOR,
-                    withdrawalTransactionsRoot: crypto.getRandomValues(new Uint8Array(32)),
+                    withdrawalTransactionsRoot: Array.from(crypto.getRandomValues(new Uint8Array(32))),
                     currentTreeIndex: 13n,
                 },
             ];
@@ -302,7 +298,7 @@ describe('Instance Account', () => {
         });
 
         it('should calculate size based on field types', () => {
-            const reportedSize = getInstanceSize();
+            const reportedSize = getInstanceEncoder().fixedSize;
 
             // Test that our calculation matches the actual encoded size
             const testInstance: Instance = {
@@ -311,7 +307,7 @@ describe('Instance Account', () => {
                 version: 1,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED,
                 admin: TEST_ADDRESSES.ADMIN,
-                withdrawalTransactionsRoot: new Uint8Array(32).fill(0),
+                withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(0)),
                 currentTreeIndex: 14n,
             };
 

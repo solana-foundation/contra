@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import { preserveConfigFiles } from './lib/utils';
 import { createContraWithdrawCodamaBuilder } from './lib/contra-withdraw-codama-builder';
@@ -6,7 +7,7 @@ import { renderVisitor as renderJavaScriptVisitor } from '@codama/renderers-js';
 
 const projectRoot = path.join(__dirname, '..');
 const idlDir = path.join(projectRoot, 'idl');
-const contraWithdrawIdl = require(path.join(idlDir, 'contra_withdraw_program.json'));
+const contraWithdrawIdl = JSON.parse(fs.readFileSync(path.join(idlDir, 'contra_withdraw_program.json'), 'utf-8'));
 const rustClientsDir = path.join(__dirname, '..', 'clients', 'rust');
 const typescriptClientsDir = path.join(__dirname, '..', 'clients', 'typescript');
 

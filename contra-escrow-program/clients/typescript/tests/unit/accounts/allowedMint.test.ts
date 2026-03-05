@@ -3,7 +3,6 @@ import {
     getAllowedMintEncoder,
     getAllowedMintDecoder,
     getAllowedMintCodec,
-    getAllowedMintSize,
     type AllowedMint,
 } from '../../../src/generated';
 
@@ -93,7 +92,7 @@ describe('AllowedMint Account', () => {
 
     describe('Size validation', () => {
         it('should report correct account size (2 bytes)', () => {
-            const accountSize = getAllowedMintSize();
+            const accountSize = getAllowedMintEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
 
@@ -105,7 +104,7 @@ describe('AllowedMint Account', () => {
 
             const encoder = getAllowedMintEncoder();
             const encodedData = encoder.encode(testAllowedMint);
-            const reportedSize = getAllowedMintSize();
+            const reportedSize = getAllowedMintEncoder().fixedSize;
             const actualSize = encodedData.length;
 
             expect(encodedData).toHaveLength(EXPECTED_SIZE);

@@ -1,10 +1,5 @@
 import { expect } from '@jest/globals';
-import {
-    getInstanceEncoder,
-    getInstanceDecoder,
-    getInstanceCodec,
-    type Instance,
-} from '../../../src/generated';
+import { getInstanceEncoder, getInstanceDecoder, getInstanceCodec, type Instance } from '../../../src/generated';
 import { TEST_ADDRESSES, TEST_ROOT } from '../../setup/mocks';
 import { assertIsAddress, type Address } from '@solana/kit';
 
@@ -44,7 +39,9 @@ describe('Instance Account', () => {
             expect(decodedInstance.version).toBe(testInstance.version);
             expect(decodedInstance.instanceSeed).toBe(testInstance.instanceSeed);
             expect(decodedInstance.admin).toBe(testInstance.admin);
-            expect(decodedInstance.withdrawalTransactionsRoot).toEqual(Array.from(testInstance.withdrawalTransactionsRoot));
+            expect(decodedInstance.withdrawalTransactionsRoot).toEqual(
+                Array.from(testInstance.withdrawalTransactionsRoot),
+            );
         });
 
         it('should handle combined codec correctly', () => {

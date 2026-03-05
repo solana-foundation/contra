@@ -1,10 +1,5 @@
 import { expect } from '@jest/globals';
-import {
-    getOperatorEncoder,
-    getOperatorDecoder,
-    getOperatorCodec,
-    type Operator,
-} from '../../../src/generated';
+import { getOperatorEncoder, getOperatorDecoder, getOperatorCodec, type Operator } from '../../../src/generated';
 
 // Expected size calculation based on program structure
 const EXPECTED_SIZE =

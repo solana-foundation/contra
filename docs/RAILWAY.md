@@ -29,11 +29,10 @@ Services **not** deployed to Railway:
 - [Railway CLI](https://docs.railway.com/guides/cli) installed and authenticated (`railway login`)
 - A Railway project linked to this repo (`railway link`)
 - A Railway PostgreSQL instance in the project
-- `shank-cli` installed (`cargo install shank-cli@0.4.5`) -- ensure `~/.cargo/bin` is in your PATH for non-interactive shells (add `export PATH="$HOME/.cargo/bin:$PATH"` to `~/.zshenv` on macOS if `make generate-clients` fails with `shank: command not found`)
 - Generated clients and built programs:
   ```bash
   make install              # Install pnpm dependencies for both programs
-  make generate-clients     # Generate IDL + Rust/JS clients from Shank annotations
+  make generate-clients     # Generate IDL + Rust/JS clients from Codama annotations
   make -C contra-escrow-program build
   make -C contra-withdraw-program build
   ```

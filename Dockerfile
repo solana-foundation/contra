@@ -23,9 +23,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && npm install -g pnpm@latest \
     && rm -rf /var/lib/apt/lists/*
 
-# Install shank-cli
-RUN cargo install shank-cli@0.4.5
-
 # Install Solana CLI (stable version)
 RUN sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.19/install)" \
     && echo 'export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"' >> ~/.bashrc

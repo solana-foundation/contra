@@ -12,6 +12,7 @@ import {
 
 const WITHDRAW_PROGRAM_ID = 'J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi';
 const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 
 function createAtaPdaValueNode(ownerAccount: string, mintAccount: string, tokenProgram: string) {
     return pdaValueNode(
@@ -38,6 +39,10 @@ export function setInstructionAccountDefaultValues(contraWithdrawCodama: Codama)
             {
                 account: 'withdrawProgram',
                 defaultValue: publicKeyValueNode(WITHDRAW_PROGRAM_ID),
+            },
+            {
+                account: 'tokenProgram',
+                defaultValue: publicKeyValueNode(TOKEN_PROGRAM_ID),
             },
             {
                 account: 'associatedTokenProgram',

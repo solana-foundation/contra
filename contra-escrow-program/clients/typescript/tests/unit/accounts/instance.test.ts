@@ -3,7 +3,6 @@ import {
     getInstanceEncoder,
     getInstanceDecoder,
     getInstanceCodec,
-    getInstanceSize,
     type Instance,
 } from '../../../src/generated';
 import { TEST_ADDRESSES, TEST_ROOT } from '../../setup/mocks';
@@ -45,7 +44,7 @@ describe('Instance Account', () => {
             expect(decodedInstance.version).toBe(testInstance.version);
             expect(decodedInstance.instanceSeed).toBe(testInstance.instanceSeed);
             expect(decodedInstance.admin).toBe(testInstance.admin);
-            expect(decodedInstance.withdrawalTransactionsRoot).toEqual(testInstance.withdrawalTransactionsRoot);
+            expect(decodedInstance.withdrawalTransactionsRoot).toEqual(Array.from(testInstance.withdrawalTransactionsRoot));
         });
 
         it('should handle combined codec correctly', () => {
@@ -55,7 +54,7 @@ describe('Instance Account', () => {
                 version: 2,
                 instanceSeed: TEST_ADDRESSES.INSTANCE_SEED_2,
                 admin: TEST_ADDRESSES.WALLET,
-                withdrawalTransactionsRoot: new Uint8Array(32).fill(127),
+                withdrawalTransactionsRoot: Array.from(new Uint8Array(32).fill(127)),
                 currentTreeIndex: 1n,
             };
 
@@ -168,9 +167,9 @@ describe('Instance Account', () => {
                 const encodedData = codec.encode(testInstance);
                 const decodedInstance = codec.decode(encodedData);
 
-                expect(decodedInstance.withdrawalTransactionsRoot).toEqual(withdrawalRoot);
+                expect(decodedInstance.withdrawalTransactionsRoot).toEqual(Array.from(withdrawalRoot));
                 expect(decodedInstance.withdrawalTransactionsRoot).toHaveLength(32);
-                expect(decodedInstance.withdrawalTransactionsRoot instanceof Uint8Array).toBe(true);
+                expect(Array.isArray(decodedInstance.withdrawalTransactionsRoot)).toBe(true);
             }
         });
     });
@@ -237,7 +236,7 @@ describe('Instance Account', () => {
 
     describe('Size validation', () => {
         it('should report correct account size (107 bytes)', () => {
-            const accountSize = getInstanceSize();
+            const accountSize = getInstanceEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
 
@@ -254,7 +253,7 @@ describe('Instance Account', () => {
 
             const encoder = getInstanceEncoder();
             const encodedData = encoder.encode(testInstance);
-            const reportedSize = getInstanceSize();
+            const reportedSize = getInstanceEncoder().fixedSize;
             const actualSize = encodedData.length;
 
             expect(encodedData).toHaveLength(EXPECTED_SIZE);
@@ -302,7 +301,7 @@ describe('Instance Account', () => {
         });
 
         it('should calculate size based on field types', () => {
-            const reportedSize = getInstanceSize();
+            const reportedSize = getInstanceEncoder().fixedSize;
 
             // Test that our calculation matches the actual encoded size
             const testInstance: Instance = {

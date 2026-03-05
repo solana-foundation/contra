@@ -57,7 +57,7 @@ describe('releaseFunds', () => {
             assertIsAddress(decodedData.user);
 
             // Verify withdrawal root is correctly encoded (32 bytes)
-            expect(decodedData.newWithdrawalRoot).toEqual(testWithdrawalRoot);
+            expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testWithdrawalRoot));
             expect(decodedData.newWithdrawalRoot).toHaveLength(32);
         });
 
@@ -159,7 +159,7 @@ describe('releaseFunds', () => {
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
-                expect(decodedData.newWithdrawalRoot).toEqual(testRoot);
+                expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testRoot));
                 expect(decodedData.newWithdrawalRoot).toHaveLength(32);
             }
         });
@@ -192,13 +192,13 @@ describe('releaseFunds', () => {
             expect(decodedData.discriminator).toBe(RELEASE_FUNDS_DISCRIMINATOR);
             expect(decodedData.amount).toBe(testAmount);
             expect(decodedData.user).toBe(testUser);
-            expect(decodedData.newWithdrawalRoot).toEqual(testWithdrawalRoot);
+            expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testWithdrawalRoot));
 
             // Verify data types
             expect(typeof decodedData.discriminator).toBe('number');
             expect(typeof decodedData.amount).toBe('bigint');
             expect(typeof decodedData.user).toBe('string');
-            expect(decodedData.newWithdrawalRoot instanceof Uint8Array).toBe(true);
+            expect(Array.isArray(decodedData.newWithdrawalRoot)).toBe(true);
 
             // Re-encode and verify it matches
             const reEncodedData = getReleaseFundsInstructionDataCodec().encode({
@@ -738,7 +738,7 @@ describe('releaseFunds', () => {
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
-                expect(decodedData.newWithdrawalRoot).toEqual(testRoot);
+                expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testRoot));
             }
         });
     });

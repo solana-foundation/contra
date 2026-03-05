@@ -31,7 +31,7 @@ fmt:
 	@cd tests/integration-tests && cargo clippy --all-targets -- -D warnings
 	pnpm format
 
-# Generate IDL from Shank annotations
+# Generate IDL from Codama annotations
 generate-idl:
 	@echo "Generating IDL..."
 	pnpm run generate-idl

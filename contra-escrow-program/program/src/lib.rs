@@ -3,7 +3,6 @@
 pub mod constants;
 pub mod error;
 pub mod events;
-#[cfg(feature = "idl")]
 pub mod instructions;
 pub mod processor;
 pub mod state;

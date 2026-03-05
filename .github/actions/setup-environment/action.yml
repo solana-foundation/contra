@@ -11,7 +11,7 @@ inputs:
     required: false
     default: ""
   install-base-cargo-tools:
-    description: "Install base cargo tools (shank-cli, cargo-llvm-cov)"
+    description: "Install base cargo tools (cargo-llvm-cov)"
     required: false
     default: "true"
   install-system-dependencies:
@@ -46,7 +46,6 @@ runs:
       shell: bash
       run: |
         echo "RUST_VERSION=1.91.0" >> $GITHUB_ENV
-        echo "SHANK_VERSION=0.4.5" >> $GITHUB_ENV
         echo "LLVM_COV_VERSION=0.6.21" >> $GITHUB_ENV
 
     - name: Install system dependencies
@@ -75,9 +74,8 @@ runs:
       id: cargo-bin-cache
       with:
         path: |
-          ~/.cargo/bin/shank
           ~/.cargo/bin/cargo-llvm-cov
-        key: cargo-bins-v7-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-shank-${{ env.SHANK_VERSION }}-llvm-cov-${{ env.LLVM_COV_VERSION }}
+        key: cargo-bins-v8-${{ runner.os }}-rust-${{ env.RUST_VERSION }}-llvm-cov-${{ env.LLVM_COV_VERSION }}
 
     - name: Add cargo bin to PATH
       if: inputs.install-base-cargo-tools == 'true' || inputs.install-cargo-tools != ''
@@ -88,8 +86,6 @@ runs:
       if: inputs.install-base-cargo-tools == 'true' && steps.cargo-bin-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        echo "Installing shank-cli@${SHANK_VERSION}..."
-        cargo install shank-cli@${SHANK_VERSION}
         echo "Installing cargo-llvm-cov@${LLVM_COV_VERSION}..."
         cargo install cargo-llvm-cov@${LLVM_COV_VERSION}
 

@@ -13,6 +13,8 @@ import {
 
 const CONTRA_ESCROW_PROGRAM_ID = 'GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83';
 const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
+const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const EVENT_AUTHORITY_PDA = 'G9CCHrvvmKuoM9vqcEWCxmbFiyJqXTLJBJjpSFv5v3Fm';
 
 function createAtaPdaValueNode(ownerAccount: string, mintAccount: string, tokenProgram: string) {
@@ -41,6 +43,14 @@ export function setInstructionAccountDefaultValues(contraEscrowCodama: Codama): 
             {
                 account: 'contraEscrowProgram',
                 defaultValue: publicKeyValueNode(CONTRA_ESCROW_PROGRAM_ID),
+            },
+            {
+                account: 'systemProgram',
+                defaultValue: publicKeyValueNode(SYSTEM_PROGRAM_ID),
+            },
+            {
+                account: 'tokenProgram',
+                defaultValue: publicKeyValueNode(TOKEN_PROGRAM_ID),
             },
             {
                 account: 'associatedTokenProgram',

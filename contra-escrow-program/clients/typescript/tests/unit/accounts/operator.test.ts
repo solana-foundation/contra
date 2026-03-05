@@ -3,7 +3,6 @@ import {
     getOperatorEncoder,
     getOperatorDecoder,
     getOperatorCodec,
-    getOperatorSize,
     type Operator,
 } from '../../../src/generated';
 
@@ -93,7 +92,7 @@ describe('Operator Account', () => {
 
     describe('Size validation', () => {
         it('should report correct account size (2 bytes)', () => {
-            const accountSize = getOperatorSize();
+            const accountSize = getOperatorEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
 
@@ -105,7 +104,7 @@ describe('Operator Account', () => {
 
             const encoder = getOperatorEncoder();
             const encodedData = encoder.encode(testOperator);
-            const reportedSize = getOperatorSize();
+            const reportedSize = getOperatorEncoder().fixedSize;
             const actualSize = encodedData.length;
 
             expect(encodedData).toHaveLength(EXPECTED_SIZE);

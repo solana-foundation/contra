@@ -101,7 +101,7 @@ describe('releaseFunds', () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Test with different valid user addresses
             const testUsers = [
@@ -138,10 +138,10 @@ describe('releaseFunds', () => {
 
             // Test various 32-byte withdrawal roots
             const testRoots = [
-                new Uint8Array(32).fill(0), // All zeros
-                new Uint8Array(32).fill(255), // All 0xFF
-                new Uint8Array(Array.from({ length: 32 }, (_, i) => i)), // Sequential bytes
-                crypto.getRandomValues(new Uint8Array(32)), // Random bytes
+                Array.from(new Uint8Array(32).fill(0)), // All zeros
+                Array.from(new Uint8Array(32).fill(255)), // All 0xFF
+                Array.from({ length: 32 }, (_, i) => i), // Sequential bytes
+                Array.from(crypto.getRandomValues(new Uint8Array(32))), // Random bytes
             ];
 
             for (const testRoot of testRoots) {
@@ -159,7 +159,7 @@ describe('releaseFunds', () => {
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
-                expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testRoot));
+                expect(decodedData.newWithdrawalRoot).toEqual(testRoot);
                 expect(decodedData.newWithdrawalRoot).toHaveLength(32);
             }
         });
@@ -169,7 +169,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(2500000000); // 2.5K USDC
             const testUser = TEST_ADDRESSES.ADMIN as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(123);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(123));
 
             // Create instruction with specific data
             const instruction = await getReleaseFundsInstructionAsync({
@@ -218,7 +218,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -290,7 +290,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -359,7 +359,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -398,7 +398,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Get expected operator PDA using findOperatorPda
             const [expectedOperatorPda] = await findOperatorPda({
@@ -430,7 +430,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Get expected allowed mint PDA using findAllowedMintPda
             const [expectedAllowedMintPda] = await findAllowedMintPda({
@@ -462,7 +462,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const [expectedInstanceAta] = await findAssociatedTokenPda({
                 mint: TEST_ADDRESSES.USDC_MINT,
@@ -493,7 +493,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const [expectedInstanceAta] = await findAssociatedTokenPda({
                 mint: TEST_ADDRESSES.USDC_MINT,
@@ -531,7 +531,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Use different addresses to override auto-derivation
             const overriddenOperatorPda = TEST_ADDRESSES.OPERATOR; // Use as override
@@ -567,7 +567,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -592,7 +592,7 @@ describe('releaseFunds', () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Test with different valid operator addresses
             const testOperators = [
@@ -626,7 +626,7 @@ describe('releaseFunds', () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Test with different operators and verify operatorPda derives correctly
             const testOperators = [
@@ -667,7 +667,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(0);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -691,7 +691,7 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt('18446744073709551615'); // Max u64
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = new Uint8Array(32).fill(0);
+            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -718,9 +718,9 @@ describe('releaseFunds', () => {
 
             // Test edge case withdrawal roots
             const testRoots = [
-                new Uint8Array(32).fill(0), // All zeros
-                new Uint8Array(32).fill(255), // All 0xFF
-                new Uint8Array([...Array(32).keys()]), // 0-31 pattern
+                Array.from(new Uint8Array(32).fill(0)), // All zeros
+                Array.from(new Uint8Array(32).fill(255)), // All 0xFF
+                [...Array(32).keys()], // 0-31 pattern
             ];
 
             for (const testRoot of testRoots) {
@@ -738,7 +738,7 @@ describe('releaseFunds', () => {
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
-                expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testRoot));
+                expect(decodedData.newWithdrawalRoot).toEqual(testRoot);
             }
         });
     });

@@ -8,7 +8,7 @@ use crate::{
         verify_current_program,
     },
     state::{discriminator::AccountSerialize, Instance},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
@@ -35,17 +35,13 @@ pub fn process_set_new_admin(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(current_admin_info, false)?;
     verify_signer(new_admin_info, false)?;
-
-    // Verify programs
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate instance exists and current admin has authority
     let instance_data = instance_info.try_borrow()?;
     let mut instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -55,13 +51,9 @@ pub fn process_set_new_admin(
 
     instance.validate_admin(current_admin_info.address())?;
 
-    // Store the old admin for the event
     let old_admin = instance.admin;
-
-    // Update the instance with the new admin
     instance.admin = *new_admin_info.address();
 
-    // Serialize updated instance and write back to account
     let updated_instance_data = instance.to_bytes();
 
     drop(instance_data);
@@ -69,7 +61,6 @@ pub fn process_set_new_admin(
     let mut data_slice = instance_info.try_borrow_mut()?;
     data_slice[..updated_instance_data.len()].copy_from_slice(&updated_instance_data);
 
-    // Emit SetNewAdmin event
     let event = SetNewAdminEvent::new(instance.instance_seed, old_admin, instance.admin);
     emit_event(
         program_id,

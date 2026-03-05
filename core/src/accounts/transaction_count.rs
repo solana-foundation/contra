@@ -28,21 +28,9 @@ impl TransactionCount {
 
     /// Deserialize from bytes (little-endian u64)
     ///
-    /// Returns `None` if:
-    /// - The byte slice is not exactly 8 bytes
-    /// - The byte slice is empty
+    /// Returns `None` if the byte slice is not exactly 8 bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        // Validate byte count is exactly 8
-        if bytes.len() != 8 {
-            return None;
-        }
-
-        // Use try_into for safer conversion
-        let byte_array: [u8; 8] = match bytes.try_into() {
-            Ok(arr) => arr,
-            Err(_) => return None,
-        };
-
+        let byte_array: [u8; 8] = bytes.try_into().ok()?;
         Some(Self(u64::from_le_bytes(byte_array)))
     }
 }

@@ -253,7 +253,7 @@ fn parse_create_instance(
 
     Ok(Some(EscrowInstruction::CreateInstance {
         accounts,
-        data: CreateInstanceData { bump: ix_data.bump },
+        data: ix_data,
     }))
 }
 
@@ -301,7 +301,7 @@ fn parse_allow_mint(
             {
                 return Ok(Some(EscrowInstruction::AllowMint {
                     accounts,
-                    data: AllowMintData { bump: ix_data.bump },
+                    data: ix_data,
                     event: AllowMintEvent {
                         decimals: event_data[EVENT_DECIMALS_INDEX],
                     },
@@ -349,10 +349,7 @@ fn parse_deposit(
 
     Ok(Some(EscrowInstruction::Deposit {
         accounts,
-        data: DepositData {
-            amount: ix_data.amount,
-            recipient: ix_data.recipient,
-        },
+        data: ix_data,
     }))
 }
 
@@ -390,12 +387,7 @@ fn parse_release_funds(
 
     Ok(Some(EscrowInstruction::ReleaseFunds {
         accounts,
-        data: ReleaseFundsData {
-            amount: ix_data.amount,
-            user: ix_data.user,
-            new_withdrawal_root: ix_data.new_withdrawal_root,
-            transaction_nonce: ix_data.transaction_nonce,
-        },
+        data: ix_data,
     }))
 }
 

@@ -955,24 +955,27 @@ async fn test_simulate_transaction(
         }
     }
 
-    // Check sender's token account (should decrease by transfer_amount)
+    let decode_token_account =
+        |account: &solana_account_decoder_client_types::UiAccount, label: &str| -> TokenAccount {
+            let data_str = match &account.data {
+                UiAccountData::Binary(data, _) | UiAccountData::LegacyBinary(data) => data,
+                UiAccountData::Json(parsed) => {
+                    panic!("Unexpected JSON account data for {}: {:?}", label, parsed);
+                }
+            };
+            let bytes = STANDARD.decode(data_str).unwrap_or_else(|e| {
+                panic!("Failed to decode {} account data: {}", label, e);
+            });
+            TokenAccount::unpack(&bytes).unwrap_or_else(|e| {
+                panic!("Failed to unpack {} token account data: {}", label, e);
+            })
+        };
+
     let from_account = accounts
         .first()
         .and_then(|opt| opt.as_ref())
         .expect("Sender's token account not found in simulation response");
-    let data_str = match &from_account.data {
-        UiAccountData::Binary(data, _encoding) => data,
-        UiAccountData::LegacyBinary(data) => data,
-        UiAccountData::Json(parsed) => {
-            panic!("Unexpected JSON account data: {:?}", parsed);
-        }
-    };
-    let bytes = STANDARD
-        .decode(data_str)
-        .expect("Failed to decode sender account data");
-    println!("Sender account data length: {} bytes", bytes.len());
-    let from_token_data =
-        TokenAccount::unpack(&bytes).expect("Failed to unpack sender token account data");
+    let from_token_data = decode_token_account(from_account, "sender");
     let expected_from_balance = from_balance_before - amount;
     assert_eq!(
         from_token_data.amount, expected_from_balance,
@@ -984,24 +987,11 @@ async fn test_simulate_transaction(
         from_token_data.amount
     );
 
-    // Check recipient's token account (should increase by transfer_amount)
     let to_account = accounts
         .get(1)
         .and_then(|opt| opt.as_ref())
         .expect("Recipient's token account not found in simulation response");
-    let data_str = match &to_account.data {
-        UiAccountData::Binary(data, _encoding) => data,
-        UiAccountData::LegacyBinary(data) => data,
-        UiAccountData::Json(parsed) => {
-            panic!("Unexpected JSON account data: {:?}", parsed);
-        }
-    };
-    let bytes = STANDARD
-        .decode(data_str)
-        .expect("Failed to decode recipient account data");
-    println!("Recipient account data length: {} bytes", bytes.len());
-    let to_token_data =
-        TokenAccount::unpack(&bytes).expect("Failed to unpack recipient token account data");
+    let to_token_data = decode_token_account(to_account, "recipient");
     let expected_to_balance = to_balance_before + amount;
     assert_eq!(
         to_token_data.amount, expected_to_balance,

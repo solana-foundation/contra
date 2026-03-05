@@ -1,9 +1,7 @@
 #![allow(dead_code)]
 
-/// Database helper utilities for integration tests
 use sqlx::PgPool;
 
-/// Transaction data returned from database
 #[derive(Debug, Clone)]
 pub struct DbTransaction {
     pub signature: String,
@@ -32,6 +30,22 @@ type TransactionRow = (
     Option<chrono::DateTime<chrono::Utc>>,
     Option<i64>,
 );
+
+fn row_to_db_transaction(row: TransactionRow) -> DbTransaction {
+    DbTransaction {
+        signature: row.0,
+        slot: row.1,
+        initiator: row.2,
+        recipient: row.3,
+        mint: row.4,
+        amount: row.5,
+        transaction_type: row.6,
+        status: row.7,
+        counterpart_signature: row.8,
+        processed_at: row.9,
+        withdrawal_nonce: row.10,
+    }
+}
 
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPool::connect(database_url).await
@@ -170,33 +184,7 @@ pub async fn get_transaction(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(
-        |(
-            signature,
-            slot,
-            initiator,
-            recipient,
-            mint,
-            amount,
-            transaction_type,
-            status,
-            counterpart_signature,
-            processed_at,
-            withdrawal_nonce,
-        )| DbTransaction {
-            signature,
-            slot,
-            initiator,
-            recipient,
-            mint,
-            amount,
-            transaction_type,
-            status,
-            counterpart_signature,
-            processed_at,
-            withdrawal_nonce,
-        },
-    ))
+    Ok(row.map(row_to_db_transaction))
 }
 
 pub async fn get_processed_transactions(pool: &PgPool) -> Result<Vec<DbTransaction>, sqlx::Error> {
@@ -206,34 +194,5 @@ pub async fn get_processed_transactions(pool: &PgPool) -> Result<Vec<DbTransacti
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                signature,
-                slot,
-                initiator,
-                recipient,
-                mint,
-                amount,
-                transaction_type,
-                status,
-                counterpart_signature,
-                processed_at,
-                withdrawal_nonce,
-            )| DbTransaction {
-                signature,
-                slot,
-                initiator,
-                recipient,
-                mint,
-                amount,
-                transaction_type,
-                status,
-                counterpart_signature,
-                processed_at,
-                withdrawal_nonce,
-            },
-        )
-        .collect())
+    Ok(rows.into_iter().map(row_to_db_transaction).collect())
 }

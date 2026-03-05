@@ -1,15 +1,7 @@
 use pinocchio::{account::AccountView, address::Address, error::ProgramError, ProgramResult};
 
-/// Validates an Associated Token Account address.
-///
-/// # Arguments
-/// * `ata_info` - The ATA account to validate/create
-/// * `wallet_key` - The wallet that should own the ATA
-/// * `mint_info` - The token mint for the ATA
-/// * `token_program_info` - The token program account
-///
-/// # Returns
-/// * `ProgramResult` - Success if validation passes and ATA exists
+/// Validates that an Associated Token Account address matches the expected
+/// derivation for the given wallet and mint, and that the account has data.
 #[inline(always)]
 pub fn validate_ata(
     ata_info: &AccountView,
@@ -17,7 +9,6 @@ pub fn validate_ata(
     mint_info: &AccountView,
     token_program_info: &AccountView,
 ) -> ProgramResult {
-    // Validate ATA address is correct for this wallet + mint
     let expected_ata = Address::find_program_address(
         &[
             wallet_key.as_ref(),

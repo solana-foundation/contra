@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-/// Transaction execution helpers for deposits and withdrawals
 use super::send_and_confirm_instructions;
 use super::test_types::{TransactionType, UserTransaction, BASE_AMOUNT, DEPOSITS_PER_USER};
 
@@ -13,7 +12,6 @@ use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
-/// Execute all deposit transactions for a single user
 pub async fn execute_user_deposits(
     client: &RpcClient,
     user_id: usize,
@@ -80,7 +78,6 @@ pub async fn execute_user_deposits(
     Ok(transactions)
 }
 
-/// Execute a withdrawal transaction for a single user
 pub async fn execute_user_withdrawal(
     client: &RpcClient,
     user: &solana_sdk::signer::keypair::Keypair,
@@ -128,7 +125,6 @@ pub async fn execute_user_withdrawal(
     })
 }
 
-/// Calculate total deposited amount for a user
 pub fn calculate_user_total_deposited(user_id: usize) -> u64 {
     (0..DEPOSITS_PER_USER)
         .map(|deposit_num| BASE_AMOUNT + (user_id as u64 * 1000) + deposit_num as u64)

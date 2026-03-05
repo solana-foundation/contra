@@ -66,17 +66,15 @@ pub async fn run_fetcher(
                             signature = %transaction.signature,
                             "Sending transaction to processor"
                         );
+                        let sig = transaction.signature.clone();
                         if let Err(e) = send_guaranteed(
                             &processor_tx,
-                            transaction.clone(),
-                            &format!("transaction {}", transaction.signature),
+                            transaction,
+                            &format!("transaction {}", sig),
                         )
                         .await
                         {
-                            error!(
-                                "Failed to send transaction {} to processor: {}",
-                                transaction.signature, e
-                            );
+                            error!("Failed to send transaction {} to processor: {}", sig, e);
                             return Err(OperatorError::ChannelClosed {
                                 component: "fetcher".to_string(),
                             });

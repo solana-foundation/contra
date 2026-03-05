@@ -1,6 +1,5 @@
-extern crate alloc;
-
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
+use pinocchio_token::instructions::Burn;
 
 use crate::{
     error::ContraWithdrawProgramError,
@@ -10,7 +9,6 @@ use crate::{
     },
     require_len,
 };
-use pinocchio_token::instructions::Burn;
 
 /// Processes the WithdrawFunds instruction.
 ///
@@ -23,13 +21,13 @@ use pinocchio_token::instructions::Burn;
 ///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to withdraw
-/// * `destination` (Pubkey) - Destination public key
+/// * `destination` (Option<Pubkey>) - Destination public key
 pub fn process_withdraw_funds(
     _program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let args = process_instruction_data(instruction_data)?;
+    let args = parse_instruction_data(instruction_data)?;
 
     if args.amount == 0 {
         return Err(ContraWithdrawProgramError::ZeroAmount.into());
@@ -42,10 +40,8 @@ pub fn process_withdraw_funds(
     };
 
     verify_signer(user_info, false)?;
-
     verify_ata_program(associated_token_program_info)?;
     verify_token_program(token_program_info)?;
-
     verify_mint_account(mint_info)?;
 
     validate_ata(
@@ -55,7 +51,6 @@ pub fn process_withdraw_funds(
         token_program_info,
     )?;
 
-    // SPL Burn of the token
     Burn {
         account: token_account_info,
         mint: mint_info,
@@ -64,14 +59,11 @@ pub fn process_withdraw_funds(
     }
     .invoke()?;
 
-    let destination = args.destination.unwrap_or(*user_info.address());
-
-    // Log event
-    let withdraw_funds_event = WithdrawFundsEvent {
+    let event = WithdrawFundsEvent {
         amount: args.amount,
-        destination,
+        destination: args.destination.unwrap_or(*user_info.address()),
     };
-    pinocchio_log::log!("{}", withdraw_funds_event.to_bytes().as_slice());
+    pinocchio_log::log!("{}", event.to_bytes().as_slice());
 
     Ok(())
 }
@@ -82,28 +74,20 @@ pub struct WithdrawFundsArgs {
     pub destination: Option<Address>,
 }
 
-fn process_instruction_data(instruction_data: &[u8]) -> Result<WithdrawFundsArgs, ProgramError> {
-    require_len!(instruction_data, 9);
-
-    let mut offset = 0;
+fn parse_instruction_data(data: &[u8]) -> Result<WithdrawFundsArgs, ProgramError> {
+    require_len!(data, 9);
 
     let amount = u64::from_le_bytes(
-        instruction_data[offset..offset + 8]
+        data[..8]
             .try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
-    offset += 8;
-
-    let has_destination = instruction_data[offset] != 0;
-    offset += 1;
-
-    let destination = if has_destination {
-        require_len!(instruction_data, offset + 32);
-
-        let mut destination_bytes = [0u8; 32];
-        destination_bytes.copy_from_slice(&instruction_data[offset..offset + 32]);
-        Some(Address::new_from_array(destination_bytes))
+    let destination = if data[8] != 0 {
+        require_len!(data, 9 + 32);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data[9..41]);
+        Some(Address::new_from_array(bytes))
     } else {
         None
     };

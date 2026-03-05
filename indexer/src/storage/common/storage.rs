@@ -299,11 +299,10 @@ mod tests {
         assert_eq!(locked.len(), 2);
 
         // 1 deposit + 1 withdrawal remain
-        let remaining = mock.pending_transactions.lock().unwrap();
-        assert_eq!(remaining.len(), 2);
-
-        // Second lock of deposits gets the last one
-        drop(remaining);
+        {
+            let remaining = mock.pending_transactions.lock().unwrap();
+            assert_eq!(remaining.len(), 2);
+        }
         let locked2 = storage
             .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
             .await

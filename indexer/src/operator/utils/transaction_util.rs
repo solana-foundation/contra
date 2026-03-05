@@ -99,55 +99,44 @@ pub async fn check_transaction_status(
     let mut attempts = 0;
 
     while attempts < MAX_POLL_ATTEMPTS_CONFIRMATION {
-        match rpc_client.get_signature_statuses(&[*signature]).await {
-            Ok(response) => {
-                match response.value.first().and_then(|s| s.as_ref()) {
-                    Some(status) => match status.satisfies_commitment(commitment_config) {
-                        true => match &status.err {
-                            None => {
-                                debug!("Transaction confirmed: {}", signature);
-                                return Ok(ConfirmationResult::Confirmed);
-                            }
-                            Some(tx_err) => {
-                                debug!("Transaction failed: {:?}", tx_err);
-                                let error_code = parse_program_error(tx_err);
-
-                                match extra_error_checks_policy {
-                                    ExtraErrorCheckPolicy::None => {}
-                                    ExtraErrorCheckPolicy::Extra(error_checks) => {
-                                        for error_check in error_checks.iter() {
-                                            if let Some(result) = error_check(tx_err) {
-                                                return Ok(result);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                return Ok(ConfirmationResult::Failed(error_code));
-                            }
-                        },
-                        false => {
-                            debug!("Transaction not yet at commitment level: {}", signature);
-                        }
-                    },
-                    None => {
-                        debug!("Transaction not found: {}", signature);
-                    }
-                }
-
-                // Continue polling after sleep
-                attempts += 1;
-                if attempts < MAX_POLL_ATTEMPTS_CONFIRMATION {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        POLL_INTERVAL_MS_CONFIRMATION,
-                    ))
-                    .await;
-                }
-            }
-            Err(e) => {
+        let response = rpc_client
+            .get_signature_statuses(&[*signature])
+            .await
+            .map_err(|e| {
                 warn!("RPC error checking transaction status: {}", e);
-                return Err(TransactionError::Rpc(e));
+                TransactionError::Rpc(e)
+            })?;
+
+        if let Some(status) = response.value.first().and_then(|s| s.as_ref()) {
+            if status.satisfies_commitment(commitment_config) {
+                if let Some(tx_err) = &status.err {
+                    debug!("Transaction failed: {:?}", tx_err);
+
+                    if let ExtraErrorCheckPolicy::Extra(error_checks) = extra_error_checks_policy {
+                        for error_check in error_checks.iter() {
+                            if let Some(result) = error_check(tx_err) {
+                                return Ok(result);
+                            }
+                        }
+                    }
+
+                    return Ok(ConfirmationResult::Failed(parse_program_error(tx_err)));
+                }
+
+                debug!("Transaction confirmed: {}", signature);
+                return Ok(ConfirmationResult::Confirmed);
             }
+            debug!("Transaction not yet at commitment level: {}", signature);
+        } else {
+            debug!("Transaction not found: {}", signature);
+        }
+
+        attempts += 1;
+        if attempts < MAX_POLL_ATTEMPTS_CONFIRMATION {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                POLL_INTERVAL_MS_CONFIRMATION,
+            ))
+            .await;
         }
     }
 

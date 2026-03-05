@@ -26,6 +26,22 @@ impl MockStorage {
         Self::default()
     }
 
+    fn check_should_fail(&self, operation: &str) -> Result<(), StorageError> {
+        if self
+            .should_fail
+            .lock()
+            .unwrap()
+            .get(operation)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(StorageError::DatabaseError {
+                message: format!("Simulated {operation} failure"),
+            });
+        }
+        Ok(())
+    }
+
     pub fn set_checkpoint(&self, program_type: &str, slot: u64) {
         self.committed_checkpoints
             .lock()
@@ -59,18 +75,7 @@ impl MockStorage {
         &self,
         transaction: &DbTransaction,
     ) -> Result<i64, StorageError> {
-        if self
-            .should_fail
-            .lock()
-            .unwrap()
-            .get("insert_db_transaction")
-            .copied()
-            .unwrap_or(false)
-        {
-            return Err(StorageError::DatabaseError {
-                message: "Simulated insert_db_transaction failure".to_string(),
-            });
-        }
+        self.check_should_fail("insert_db_transaction")?;
         let mut store = self.inserted_single_transactions.lock().unwrap();
         let id = store.len() as i64 + 1;
         store.push(transaction.clone());
@@ -81,18 +86,7 @@ impl MockStorage {
         &self,
         transactions: &[DbTransaction],
     ) -> Result<Vec<i64>, StorageError> {
-        if self
-            .should_fail
-            .lock()
-            .unwrap()
-            .get("insert_db_transactions_batch")
-            .copied()
-            .unwrap_or(false)
-        {
-            return Err(StorageError::DatabaseError {
-                message: "Simulated insert_db_transactions_batch failure".to_string(),
-            });
-        }
+        self.check_should_fail("insert_db_transactions_batch")?;
         let mut store = self.inserted_transactions.lock().unwrap();
         let base = store.iter().map(|b| b.len()).sum::<usize>() as i64;
         store.push(transactions.to_vec());
@@ -153,20 +147,7 @@ impl MockStorage {
         program_type: &str,
         slot: u64,
     ) -> Result<(), StorageError> {
-        // Check if this program type should fail
-        if self
-            .should_fail
-            .lock()
-            .unwrap()
-            .get(program_type)
-            .copied()
-            .unwrap_or(false)
-        {
-            return Err(StorageError::DatabaseError {
-                message: "Simulated storage failure".to_string(),
-            });
-        }
-
+        self.check_should_fail(program_type)?;
         self.committed_checkpoints
             .lock()
             .unwrap()
@@ -181,18 +162,7 @@ impl MockStorage {
         counterpart_signature: Option<String>,
         processed_at: DateTime<Utc>,
     ) -> Result<(), StorageError> {
-        if self
-            .should_fail
-            .lock()
-            .unwrap()
-            .get("update_transaction_status")
-            .copied()
-            .unwrap_or(false)
-        {
-            return Err(StorageError::DatabaseError {
-                message: "Simulated update_transaction_status failure".to_string(),
-            });
-        }
+        self.check_should_fail("update_transaction_status")?;
         self.status_updates.lock().unwrap().push((
             transaction_id,
             status,
@@ -203,18 +173,7 @@ impl MockStorage {
     }
 
     pub async fn upsert_mints_batch(&self, mints: &[DbMint]) -> Result<(), StorageError> {
-        if self
-            .should_fail
-            .lock()
-            .unwrap()
-            .get("upsert_mints_batch")
-            .copied()
-            .unwrap_or(false)
-        {
-            return Err(StorageError::DatabaseError {
-                message: "Simulated upsert_mints_batch failure".to_string(),
-            });
-        }
+        self.check_should_fail("upsert_mints_batch")?;
         let mut store = self.mints.lock().unwrap();
         for mint in mints {
             store.insert(mint.mint_address.clone(), mint.clone());

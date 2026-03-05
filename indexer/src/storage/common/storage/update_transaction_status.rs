@@ -1,9 +1,6 @@
 use crate::{
     error::StorageError,
-    storage::{
-        common::{models::TransactionStatus, storage::Storage},
-        postgres::db::PostgresDb,
-    },
+    storage::common::{models::TransactionStatus, storage::Storage},
 };
 use chrono::{DateTime, Utc};
 
@@ -15,15 +12,15 @@ pub async fn update_transaction_status(
     processed_at: DateTime<Utc>,
 ) -> Result<(), StorageError> {
     match storage {
-        Storage::Postgres(postgres_db) => {
-            update_transaction_status_postgres(
-                postgres_db,
+        Storage::Postgres(db) => {
+            db.update_transaction_status_internal(
                 transaction_id,
                 status,
                 counterpart_signature,
                 processed_at,
             )
-            .await
+            .await?;
+            Ok(())
         }
         #[cfg(test)]
         Storage::Mock(mock_db) => {
@@ -37,21 +34,4 @@ pub async fn update_transaction_status(
                 .await
         }
     }
-}
-
-async fn update_transaction_status_postgres(
-    db: &PostgresDb,
-    transaction_id: i64,
-    status: TransactionStatus,
-    counterpart_signature: Option<String>,
-    processed_at: DateTime<Utc>,
-) -> Result<(), StorageError> {
-    db.update_transaction_status_internal(
-        transaction_id,
-        status,
-        counterpart_signature,
-        processed_at,
-    )
-    .await?;
-    Ok(())
 }

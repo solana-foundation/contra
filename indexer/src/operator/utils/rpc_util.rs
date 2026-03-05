@@ -83,31 +83,24 @@ impl RpcClientWithRetry {
                 f().await.map_err(|e| e.into())
             }
             RetryPolicy::Idempotent => {
-                // Retry with exponential backoff
                 let mut attempts = 0;
 
                 loop {
                     attempts += 1;
 
                     match f().await {
-                        Ok(result) => {
-                            return Ok(result);
-                        }
+                        Ok(result) => return Ok(result),
                         Err(e) => {
-                            let last_error = e.to_string();
-
                             if attempts >= self.retry_config.max_attempts {
                                 warn!(
                                     "{} failed after {} attempts: {}",
-                                    operation_name, attempts, last_error
+                                    operation_name, attempts, e
                                 );
                                 return Err(e.into());
                             }
 
                             let delay = self.retry_config.base_delay * 2_u32.pow(attempts - 1);
-                            let delay = delay.min(self.retry_config.max_delay);
-
-                            sleep(delay).await;
+                            sleep(delay.min(self.retry_config.max_delay)).await;
                         }
                     }
                 }

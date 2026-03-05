@@ -1,17 +1,12 @@
-use crate::{
-    error::StorageError,
-    storage::{common::storage::Storage, postgres::db::PostgresDb},
-};
+use crate::{error::StorageError, storage::common::storage::Storage};
 
 pub async fn close(storage: &Storage) -> Result<(), StorageError> {
     match storage {
-        Storage::Postgres(postgres_db) => close_postgres(postgres_db).await,
+        Storage::Postgres(db) => {
+            db.close().await?;
+            Ok(())
+        }
         #[cfg(test)]
         Storage::Mock(mock_db) => mock_db.close().await,
     }
-}
-
-async fn close_postgres(db: &PostgresDb) -> Result<(), StorageError> {
-    db.close().await?;
-    Ok(())
 }

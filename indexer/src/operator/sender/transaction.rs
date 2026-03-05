@@ -88,20 +88,13 @@ impl SenderState {
                 })
             }
             TransactionBuilder::ResetSmtRoot(ref builder) => {
-                // Check if there are any in-flight ReleaseFunds transactions
-                let has_in_flight = if let Some(ref smt_state) = self.smt_state {
-                    !smt_state.nonce_to_builder.is_empty()
-                } else {
-                    false
-                };
+                let in_flight_count = self
+                    .smt_state
+                    .as_ref()
+                    .map(|s| s.nonce_to_builder.len())
+                    .unwrap_or(0);
 
-                if has_in_flight {
-                    let in_flight_count = self
-                        .smt_state
-                        .as_ref()
-                        .map(|s| s.nonce_to_builder.len())
-                        .unwrap_or(0);
-
+                if in_flight_count > 0 {
                     info!(
                         "Rotation transaction received but {} in-flight txs exist - queuing",
                         in_flight_count

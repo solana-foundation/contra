@@ -73,33 +73,22 @@ impl ProcessorState {
 
 impl ReleaseFundsState {
     pub fn get_allowed_mint_pda(&mut self, mint: &Pubkey) -> Pubkey {
-        self.allowed_mints
-            .get(&mint.to_string())
-            .cloned()
-            .unwrap_or_else(|| {
-                let allowed_mint_pda = find_allowed_mint_pda(&self.instance_pda, mint);
-
-                self.allowed_mints
-                    .insert(mint.to_string(), allowed_mint_pda);
-
-                allowed_mint_pda
-            })
+        *self
+            .allowed_mints
+            .entry(mint.to_string())
+            .or_insert_with(|| find_allowed_mint_pda(&self.instance_pda, mint))
     }
 
     pub fn get_instance_ata(&mut self, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-        self.instance_atas
-            .get(&mint.to_string())
-            .cloned()
-            .unwrap_or_else(|| {
-                let instance_ata = get_associated_token_address_with_program_id(
+        *self
+            .instance_atas
+            .entry(mint.to_string())
+            .or_insert_with(|| {
+                get_associated_token_address_with_program_id(
                     &self.instance_pda,
                     mint,
                     token_program,
-                );
-
-                self.instance_atas.insert(mint.to_string(), instance_ata);
-
-                instance_ata
+                )
             })
     }
 }

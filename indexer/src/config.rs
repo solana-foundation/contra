@@ -133,27 +133,16 @@ pub struct ContraIndexerConfig {
 }
 
 impl ContraIndexerConfig {
-    /// Validate common configuration
     pub fn validate(&self) -> Result<(), String> {
-        // Validate escrow_instance_id based on program type
-        match self.program_type {
-            ProgramType::Escrow => {
-                if self.escrow_instance_id.is_none() {
-                    return Err(
-                        "--escrow-instance-id required when program_type is Escrow".to_string()
-                    );
-                }
+        match (self.program_type, &self.escrow_instance_id) {
+            (ProgramType::Escrow, None) => {
+                Err("--escrow-instance-id required when program_type is Escrow".to_string())
             }
-            ProgramType::Withdraw => {
-                if self.escrow_instance_id.is_some() {
-                    return Err(
-                        "--escrow-instance-id should not be set for Withdraw program".to_string(),
-                    );
-                }
+            (ProgramType::Withdraw, Some(_)) => {
+                Err("--escrow-instance-id should not be set for Withdraw program".to_string())
             }
+            _ => Ok(()),
         }
-
-        Ok(())
     }
 }
 

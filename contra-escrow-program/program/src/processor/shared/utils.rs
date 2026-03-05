@@ -19,9 +19,7 @@ macro_rules! validate_discriminator {
 #[macro_export]
 macro_rules! validate_event_authority {
     ($event_authority_info:expr) => {
-        if $event_authority_info.address()
-            != &$crate::constants::event_authority_pda::ID
-        {
+        if $event_authority_info.address() != &$crate::constants::event_authority_pda::ID {
             return Err($crate::error::ContraEscrowProgramError::InvalidEventAuthority.into());
         }
     };

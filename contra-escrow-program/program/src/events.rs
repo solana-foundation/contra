@@ -38,15 +38,13 @@ impl CreateInstanceEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (admin)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(73);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.admin.as_ref());
-
         data
     }
 }
@@ -73,16 +71,14 @@ impl AllowMintEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(74);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.push(self.decimals);
-
         data
     }
 }
@@ -106,15 +102,13 @@ impl BlockMintEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(73);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.mint.as_ref());
-
         data
     }
 }
@@ -138,15 +132,13 @@ impl AddOperatorEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(73);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.operator.as_ref());
-
         data
     }
 }
@@ -170,15 +162,13 @@ impl RemoveOperatorEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(73);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.operator.as_ref());
-
         data
     }
 }
@@ -205,16 +195,14 @@ impl SetNewAdminEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (old_admin) + 32 (new_admin)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(105);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.old_admin.as_ref());
         data.extend_from_slice(self.new_admin.as_ref());
-
         data
     }
 }
@@ -253,10 +241,9 @@ impl DepositEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (user) + 8 (amount) + 32 (recipient) + 32 (mint)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(145);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
@@ -264,7 +251,6 @@ impl DepositEvent {
         data.extend_from_slice(&self.amount.to_le_bytes());
         data.extend_from_slice(self.recipient.as_ref());
         data.extend_from_slice(self.mint.as_ref());
-
         data
     }
 }
@@ -307,10 +293,9 @@ impl ReleaseFundsEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 8 (amount) + 32 (user) + 32 (mint) + 32 (new_withdrawal_root)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(177);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
@@ -319,7 +304,6 @@ impl ReleaseFundsEvent {
         data.extend_from_slice(self.user.as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.extend_from_slice(&self.new_withdrawal_root);
-
         data
     }
 }
@@ -343,15 +327,13 @@ impl ResetSmtRootEvent {
         }
     }
 
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        // Prepend IX Discriminator for emit_event.
+        let mut data = Vec::with_capacity(73);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.operator.as_ref());
-
         data
     }
 }

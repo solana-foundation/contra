@@ -32,8 +32,8 @@ impl AllowedMint {
     pub const LEN: usize = 1 + // discriminator
         1; // bump
 
-    pub fn new(bump: u8) -> Result<Self, ProgramError> {
-        Ok(Self { bump })
+    pub fn new(bump: u8) -> Self {
+        Self { bump }
     }
 
     pub fn try_from_bytes(data: &[u8]) -> Result<Self, ProgramError> {
@@ -59,8 +59,7 @@ impl AllowedMint {
             &CONTRA_ESCROW_PROGRAM_ID,
             self.bump,
             account_info,
-        )?;
-
-        Ok(())
+        )
+        .map(|_| ())
     }
 }

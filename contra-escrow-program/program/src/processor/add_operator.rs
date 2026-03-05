@@ -14,7 +14,7 @@ use crate::{
     },
     require_len,
     state::{discriminator::AccountSerialize, Instance, Operator},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{
     account::AccountView,
@@ -50,19 +50,14 @@ pub fn process_add_operator(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(admin_info, false)?;
-
     verify_system_account(operator_pda_info, true)?;
-
-    // Verify programs
     verify_system_program(system_program_info)?;
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate instance
     let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -72,8 +67,7 @@ pub fn process_add_operator(
 
     instance.validate_admin(admin_info.address())?;
 
-    // Create Operator struct and validate PDA
-    let operator = Operator::new(args.bump)?;
+    let operator = Operator::new(args.bump);
     operator.validate_pda(
         instance_info.address(),
         operator_pda.address(),
@@ -81,8 +75,6 @@ pub fn process_add_operator(
     )?;
 
     let bump_seed = [args.bump];
-
-    // Create the Operator account
     let operator_seeds = [
         Seed::from(OPERATOR_SEED),
         Seed::from(instance_info.address().as_ref()),
@@ -101,14 +93,10 @@ pub fn process_add_operator(
         None,
     )?;
 
-    // Initialize Operator data
     let operator_data = operator.to_bytes();
-
-    // Write the serialized data to the account
     let mut data_slice = operator_pda_info.try_borrow_mut()?;
     data_slice[..operator_data.len()].copy_from_slice(&operator_data);
 
-    // Emit AddOperator event
     let event = AddOperatorEvent::new(instance.instance_seed, *operator_pda.address());
     emit_event(
         program_id,
@@ -125,12 +113,8 @@ struct AddOperatorArgs {
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<AddOperatorArgs, ProgramError> {
-    require_len!(data, 1); // Only need: bump(1)
-
-    // Read bump (first byte)
-    let bump = data[0];
-
-    Ok(AddOperatorArgs { bump })
+    require_len!(data, 1);
+    Ok(AddOperatorArgs { bump: data[0] })
 }
 
 #[cfg(test)]

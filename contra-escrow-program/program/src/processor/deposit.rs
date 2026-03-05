@@ -14,7 +14,7 @@ use crate::{
     },
     require_len,
     state::{AllowedMint, Instance},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
@@ -51,22 +51,17 @@ pub fn process_deposit(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(user_info, false)?;
-
-    // Verify programs
     verify_ata_program(associated_token_program_info)?;
     verify_system_program(system_program_info)?;
     verify_token_programs(token_program_info)?;
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate mint (Token or Token2022)
     verify_account_owner(mint_info, token_program_info.address())?;
 
-    // Validate instance exists and is properly formed
     let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -74,7 +69,6 @@ pub fn process_deposit(
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    // Validate allowed mint exists and is properly formed
     let allowed_mint_data = allowed_mint_info.try_borrow()?;
     let allowed_mint = AllowedMint::try_from_bytes(&allowed_mint_data)?;
 
@@ -86,7 +80,6 @@ pub fn process_deposit(
         )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
-    // Validate user ATA exists and belongs to user
     validate_ata(
         user_ata_info,
         user_info.address(),
@@ -94,7 +87,6 @@ pub fn process_deposit(
         token_program_info,
     )?;
 
-    // Validate instance ATA exists and belongs to instance
     validate_ata(
         instance_ata_info,
         instance_info.address(),
@@ -102,18 +94,10 @@ pub fn process_deposit(
         token_program_info,
     )?;
 
-    // Validate Token2022 mint extensions (if Token2022)
-    // Note: We don't need to check user ATA extensions because:
-    // - Frozen accounts: Transfer will fail naturally
-    // - CPI Guard: Transfer will fail naturally
-    // - Active delegates: Token program handles correctly, once transferred it's a non issue
-    // - Close authority: Can't affect successful transfers
-    // The mint-level extensions are the real security concern for escrow
     if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
         validate_token2022_extensions(mint_info)?;
     }
 
-    // Get escrow balance
     let escrow_token_balance_before = get_token_account_balance(instance_ata_info)?;
 
     Transfer2022 {
@@ -125,10 +109,7 @@ pub fn process_deposit(
     }
     .invoke_signed(&[])?;
 
-    // Determine recipient for event (use provided recipient or default to user)
     let recipient = args.recipient.unwrap_or(*user_info.address());
-
-    // Emit Deposit event
     let event = DepositEvent::new(
         instance.instance_seed,
         *user_info.address(),
@@ -143,10 +124,7 @@ pub fn process_deposit(
         &event.to_bytes(),
     )?;
 
-    // Get escrow balance
     let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
-
-    // Check if escrow balance increased by the amount deposited
     if escrow_token_balance_after
         != escrow_token_balance_before
             .checked_add(args.amount)
@@ -160,7 +138,6 @@ pub fn process_deposit(
 
 struct DepositArgs {
     amount: u64,
-    /// Optional recipient for Contra tracking, is the wallet address, not the ATA (if None, defaults to user)
     recipient: Option<Address>,
 }
 

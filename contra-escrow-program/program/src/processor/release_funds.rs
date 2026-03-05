@@ -16,7 +16,7 @@ use crate::{
     },
     require_len,
     state::{discriminator::AccountSerialize, AllowedMint, Instance, Operator},
-    validate_event_accounts,
+    validate_event_authority,
 };
 use pinocchio::{
     account::AccountView,
@@ -63,23 +63,17 @@ pub fn process_release_funds(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Validate account signatures and mutability
     verify_signer(payer_info, true)?;
     verify_signer(operator_info, false)?;
-
     verify_mutability(instance_info, true)?;
-
-    // Verify programs
     verify_ata_program(associated_token_program_info)?;
     verify_token_programs(token_program_info)?;
     verify_current_program(program_info)?;
 
-    validate_event_accounts!(event_authority_info, program_info);
+    validate_event_authority!(event_authority_info);
 
-    // Validate mint (Token or Token2022)
     verify_account_owner(mint_info, token_program_info.address())?;
 
-    // Validate instance exists and is properly formed
     let instance_data = instance_info.try_borrow()?;
     let mut instance = Instance::try_from_bytes(&instance_data)?;
 
@@ -87,7 +81,6 @@ pub fn process_release_funds(
         .validate_pda(instance_info)
         .map_err(|_| ContraEscrowProgramError::InvalidInstance)?;
 
-    // Validate operator exists and is properly formed
     let operator_pda_data = operator_pda_info.try_borrow()?;
     let operator_pda = Operator::try_from_bytes(&operator_pda_data)?;
 
@@ -99,7 +92,6 @@ pub fn process_release_funds(
         )
         .map_err(|_| ContraEscrowProgramError::InvalidOperatorPda)?;
 
-    // Validate allowed mint exists and is properly formed
     let allowed_mint_data = allowed_mint_info.try_borrow()?;
     let allowed_mint = AllowedMint::try_from_bytes(&allowed_mint_data)?;
 
@@ -111,10 +103,7 @@ pub fn process_release_funds(
         )
         .map_err(|_| ContraEscrowProgramError::InvalidAllowedMint)?;
 
-    // Validate user ATA exists and belongs to user
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
-
-    // Validate instance ATA exists and belongs to instance
     validate_ata(
         instance_ata_info,
         instance_info.address(),
@@ -122,32 +111,26 @@ pub fn process_release_funds(
         token_program_info,
     )?;
 
-    // Validate Token2022 mint extensions (if Token2022)
     if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
         validate_token2022_extensions(mint_info)?;
     }
 
-    // Verify transaction nonce for current tree index
     instance.validate_current_tree_index(args.transaction_nonce)?;
 
-    // Verify SMT exclusion proof - transaction nonce must not exist in current SMT
     SparseMerkleTreeUtils::verify_smt_exclusion_proof(
         &instance.withdrawal_transactions_root,
         args.transaction_nonce,
         &args.sibling_proofs,
     )?;
 
-    // Verify SMT inclusion proof - transaction nonce must exist in new SMT root
     SparseMerkleTreeUtils::verify_smt_inclusion_proof(
         &args.new_withdrawal_root,
         args.transaction_nonce,
         &args.sibling_proofs,
     )?;
 
-    // Get escrow balance before transfer
     let escrow_token_balance_before = get_token_account_balance(instance_ata_info)?;
 
-    // Create signer for instance PDA
     let bump_slice = [instance.bump];
     let signer_seeds = [
         Seed::from(b"instance"),
@@ -167,16 +150,12 @@ pub fn process_release_funds(
     }
     .invoke_signed(&[signer])?;
 
-    // Update withdrawal transactions root to new SMT root
     instance.withdrawal_transactions_root = args.new_withdrawal_root;
-
-    // Write updated instance back to account
     let updated_instance_data = instance.to_bytes();
     instance_info
         .try_borrow_mut()?
         .copy_from_slice(&updated_instance_data);
 
-    // Emit ReleaseFunds event
     let event = ReleaseFundsEvent::new(
         instance.instance_seed,
         *operator_info.address(),
@@ -192,10 +171,7 @@ pub fn process_release_funds(
         &event.to_bytes(),
     )?;
 
-    // Get escrow balance after transfer
     let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
-
-    // Check if escrow balance decreased by the amount released
     if escrow_token_balance_after
         != escrow_token_balance_before
             .checked_sub(args.amount)
@@ -216,11 +192,9 @@ struct ReleaseFundsArgs {
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramError> {
-    // Required: amount (8) + user (32) + new_root (32) + transaction_nonce (8) + sibling_proofs (32*16) = 592 bytes
     require_len!(data, INSTRUCTION_DATA_LENGTH);
 
     let mut offset = 0;
-    // Parse amount
     let amount = u64::from_le_bytes(
         data[offset..offset + 8]
             .try_into()
@@ -228,18 +202,15 @@ fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramErro
     );
     offset += 8;
 
-    // Parse user
     let mut user_bytes = [0u8; 32];
     user_bytes.copy_from_slice(&data[offset..offset + 32]);
     let user = Address::new_from_array(user_bytes);
     offset += 32;
 
-    // Parse new_root
     let mut new_withdrawal_root = [0u8; 32];
     new_withdrawal_root.copy_from_slice(&data[offset..offset + 32]);
     offset += 32;
 
-    // Parse transaction_nonce
     let transaction_nonce = u64::from_le_bytes(
         data[offset..offset + 8]
             .try_into()
@@ -247,7 +218,6 @@ fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramErro
     );
     offset += 8;
 
-    // Convert flat sibling_proofs [u8; 512] to [[u8; 32]; TREE_HEIGHT] for SMT verification
     let mut sibling_proofs = [[0u8; 32]; TREE_HEIGHT];
     for sibling_proof in sibling_proofs.iter_mut() {
         sibling_proof.copy_from_slice(&data[offset..offset + 32]);

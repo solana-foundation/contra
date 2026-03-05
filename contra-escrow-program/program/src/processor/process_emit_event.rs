@@ -14,7 +14,6 @@ pub fn process_emit_event(_program_id: &Address, accounts: &[AccountView]) -> Pr
         return Err(ContraEscrowProgramError::InvalidEventAuthority.into());
     }
 
-    // No-op, besides checking for event authority signing.
     verify_signer(event_authority, false)?;
 
     Ok(())

@@ -1,8 +1,9 @@
+use codama::CodamaErrors;
 use pinocchio::error::ProgramError;
 use thiserror::Error;
 
 /// Errors that may be returned by the Contra Escrow Program.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[derive(Clone, Debug, Eq, PartialEq, Error, CodamaErrors)]
 pub enum ContraEscrowProgramError {
     /// (0) Invalid event authority provided
     #[error("Invalid event authority provided")]

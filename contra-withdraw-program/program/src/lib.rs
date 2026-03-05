@@ -3,7 +3,6 @@
 pub mod discriminator;
 pub mod error;
 pub mod events;
-#[cfg(feature = "idl")]
 pub mod instructions;
 pub mod processor;
 

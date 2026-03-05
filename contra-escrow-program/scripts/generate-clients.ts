@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import { preserveConfigFiles } from './lib/utils';
 import { createContraEscrowCodamaBuilder } from './lib/contra-escrow-codama-builder';
@@ -6,7 +7,7 @@ import { renderVisitor as renderJavaScriptVisitor } from '@codama/renderers-js';
 
 const projectRoot = path.join(__dirname, '..');
 const idlDir = path.join(projectRoot, 'idl');
-const contraEscrowIdl = require(path.join(idlDir, 'contra_escrow_program.json'));
+const contraEscrowIdl = JSON.parse(fs.readFileSync(path.join(idlDir, 'contra_escrow_program.json'), 'utf-8'));
 const rustClientsDir = path.join(__dirname, '..', 'clients', 'rust');
 const typescriptClientsDir = path.join(__dirname, '..', 'clients', 'typescript');
 

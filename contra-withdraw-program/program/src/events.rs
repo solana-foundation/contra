@@ -1,11 +1,11 @@
 extern crate alloc;
 
+use codama::CodamaType;
 use pinocchio::Address as Pubkey;
-use shank::ShankType;
 
 const EVENT_SIZE: usize = size_of::<u64>() + size_of::<Pubkey>();
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct WithdrawFundsEvent {
     pub amount: u64,
     pub destination: Pubkey,

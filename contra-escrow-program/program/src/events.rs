@@ -1,8 +1,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use codama::CodamaType;
 use pinocchio::Address as Pubkey;
-use shank::ShankType;
 
 use crate::constants::EVENT_IX_TAG_LE;
 
@@ -19,7 +19,7 @@ pub enum EventDiscriminators {
     ResetSmtRoot = 8,
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct CreateInstanceEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -49,7 +49,7 @@ impl CreateInstanceEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct AllowMintEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -83,7 +83,7 @@ impl AllowMintEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct BlockMintEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -113,7 +113,7 @@ impl BlockMintEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct AddOperatorEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -143,7 +143,7 @@ impl AddOperatorEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct RemoveOperatorEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -173,7 +173,7 @@ impl RemoveOperatorEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct SetNewAdminEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -207,7 +207,7 @@ impl SetNewAdminEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct DepositEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -255,7 +255,7 @@ impl DepositEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct ReleaseFundsEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
@@ -308,7 +308,7 @@ impl ReleaseFundsEvent {
     }
 }
 
-#[derive(ShankType)]
+#[derive(CodamaType)]
 pub struct ResetSmtRootEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,

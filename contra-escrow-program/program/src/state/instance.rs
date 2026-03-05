@@ -9,12 +9,12 @@ use crate::processor::validate_pda_account;
 use crate::validate_discriminator;
 use crate::ID as CONTRA_ESCROW_PROGRAM_ID;
 use alloc::vec::Vec;
+use codama::CodamaAccount;
 use pinocchio::account::AccountView;
 use pinocchio::{error::ProgramError, Address as Pubkey};
-use shank::ShankAccount;
 
 /// Seeds: [b"instance", instance_seed.as_ref()]
-#[derive(Clone, Debug, PartialEq, ShankAccount)]
+#[derive(Clone, Debug, PartialEq, CodamaAccount)]
 #[repr(C)]
 pub struct Instance {
     pub bump: u8,

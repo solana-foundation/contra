@@ -22,5 +22,9 @@ solana-address = { version = "2.0", features = ["curve25519"] }
 pinocchio-associated-token-account = { workspace = true }
 pinocchio-log = { workspace = true }
 pinocchio-token = { workspace = true }
-shank = { workspace = true }
+codama = { workspace = true }
 thiserror = { workspace = true }
+
+[build-dependencies]
+codama = { workspace = true }
+serde_json = { workspace = true }

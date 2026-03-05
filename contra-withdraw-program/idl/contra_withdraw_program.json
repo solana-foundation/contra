@@ -1,101 +1,155 @@
 {
-  "version": "0.1.0",
-  "name": "contra_withdraw_program",
-  "instructions": [
-    {
-      "name": "WithdrawFunds",
-      "accounts": [
-        {
-          "name": "user",
-          "isMut": false,
-          "isSigner": true,
-          "docs": [
-            "User initiating the withdrawal"
-          ]
-        },
-        {
-          "name": "mint",
-          "isMut": true,
-          "isSigner": false,
-          "docs": [
-            "Token mint"
-          ]
-        },
-        {
-          "name": "tokenAccount",
-          "isMut": true,
-          "isSigner": false,
-          "docs": [
-            "Source token account"
-          ]
-        },
-        {
-          "name": "tokenProgram",
-          "isMut": false,
-          "isSigner": false,
-          "docs": [
-            "Token program"
-          ]
-        },
-        {
-          "name": "associatedTokenProgram",
-          "isMut": false,
-          "isSigner": false,
-          "docs": [
-            "Associated token program"
-          ]
+  "additionalPrograms": [],
+  "kind": "rootNode",
+  "program": {
+    "accounts": [],
+    "definedTypes": [
+      {
+        "kind": "definedTypeNode",
+        "name": "withdrawFundsEvent",
+        "type": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "amount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "destination",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            }
+          ],
+          "kind": "structTypeNode"
         }
-      ],
-      "args": [
-        {
-          "name": "amount",
-          "type": "u64"
-        },
-        {
-          "name": "destination",
-          "type": {
-            "option": "publicKey"
-          }
-        }
-      ],
-      "discriminant": {
-        "type": "u8",
-        "value": 0
       }
-    }
-  ],
-  "types": [
-    {
-      "name": "WithdrawFundsEvent",
-      "type": {
-        "kind": "struct",
-        "fields": [
+    ],
+    "errors": [
+      {
+        "code": 0,
+        "kind": "errorNode",
+        "message": "Invalid mint provided",
+        "name": "invalidMint"
+      },
+      {
+        "code": 1,
+        "kind": "errorNode",
+        "message": "Withdrawal amount must be greater than zero",
+        "name": "zeroAmount"
+      }
+    ],
+    "instructions": [
+      {
+        "accounts": [
           {
-            "name": "amount",
-            "type": "u64"
+            "docs": [
+              "User initiating the withdrawal"
+            ],
+            "isSigner": true,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "user"
           },
           {
-            "name": "destination",
-            "type": "publicKey"
+            "docs": [
+              "Token mint"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "mint"
+          },
+          {
+            "docs": [
+              "Source token account"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "tokenAccount"
+          },
+          {
+            "docs": [
+              "Token program"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "tokenProgram"
+          },
+          {
+            "docs": [
+              "Associated token program"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "associatedTokenProgram"
           }
-        ]
+        ],
+        "arguments": [
+          {
+            "defaultValue": {
+              "kind": "numberValueNode",
+              "number": 0
+            },
+            "defaultValueStrategy": "omitted",
+            "kind": "instructionArgumentNode",
+            "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "amount",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "destination",
+            "type": {
+              "item": {
+                "kind": "publicKeyTypeNode"
+              },
+              "kind": "optionTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          }
+        ],
+        "discriminators": [
+          {
+            "kind": "fieldDiscriminatorNode",
+            "name": "discriminator",
+            "offset": 0
+          }
+        ],
+        "kind": "instructionNode",
+        "name": "withdrawFunds"
       }
-    }
-  ],
-  "errors": [
-    {
-      "code": 0,
-      "name": "InvalidMint",
-      "msg": "Invalid mint provided"
-    },
-    {
-      "code": 1,
-      "name": "ZeroAmount",
-      "msg": "Withdrawal amount must be greater than zero"
-    }
-  ],
-  "metadata": {
-    "origin": "shank",
-    "address": "J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi"
-  }
+    ],
+    "kind": "programNode",
+    "name": "contraWithdrawProgram",
+    "pdas": [],
+    "publicKey": "J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi",
+    "version": "0.1.0"
+  },
+  "standard": "codama",
+  "version": "1.0.0"
 }

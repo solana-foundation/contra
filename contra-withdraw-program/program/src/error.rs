@@ -1,8 +1,9 @@
+use codama::CodamaErrors;
 use pinocchio::error::ProgramError;
 use thiserror::Error;
 
 /// Errors that may be returned by the Contra Withdraw Program.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[derive(Clone, Debug, Eq, PartialEq, Error, CodamaErrors)]
 pub enum ContraWithdrawProgramError {
     /// (0) Invalid mint provided
     #[error("Invalid mint provided")]

@@ -7,12 +7,12 @@ use crate::validate_discriminator;
 use crate::ID as CONTRA_ESCROW_PROGRAM_ID;
 use alloc::vec;
 use alloc::vec::Vec;
+use codama::CodamaAccount;
 use pinocchio::account::AccountView;
 use pinocchio::{error::ProgramError, Address};
-use shank::ShankAccount;
 
 /// Seeds: [b"operator", instance_pda, wallet_pubkey]
-#[derive(Clone, Debug, PartialEq, ShankAccount)]
+#[derive(Clone, Debug, PartialEq, CodamaAccount)]
 #[repr(C)]
 pub struct Operator {
     pub bump: u8,

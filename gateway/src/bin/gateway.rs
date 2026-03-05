@@ -3,7 +3,6 @@ use contra_gateway::{run, Args};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
 
     let metrics_port = std::env::var("METRICS_PORT")

@@ -91,9 +91,24 @@ impl Gateway {
         }
     }
 
-    /// Build an error response with CORS headers. If `body` is `None`, the
-    /// response has an empty body; otherwise the provided bytes are sent with
-    /// `Content-Type: application/json`.
+    fn record_metrics(
+        error_type: Option<&str>,
+        method: &str,
+        target: &str,
+        status: &str,
+        elapsed: f64,
+    ) {
+        if let Some(et) = error_type {
+            metrics::GATEWAY_ERRORS_TOTAL.with_label_values(&[et]).inc();
+        }
+        metrics::GATEWAY_REQUESTS_TOTAL
+            .with_label_values(&[method, target, status])
+            .inc();
+        metrics::GATEWAY_REQUEST_DURATION
+            .with_label_values(&[method, target])
+            .observe(elapsed);
+    }
+
     fn error_response(
         &self,
         status: StatusCode,
@@ -142,7 +157,6 @@ impl Gateway {
     > {
         let start = Instant::now();
 
-        // Handle CORS preflight requests
         if req.method() == hyper::Method::OPTIONS {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -178,21 +192,17 @@ impl Gateway {
                 .unwrap());
         }
 
-        // Only accept POST requests
         if req.method() != hyper::Method::POST {
-            metrics::GATEWAY_ERRORS_TOTAL
-                .with_label_values(&["method_not_allowed"])
-                .inc();
-            metrics::GATEWAY_REQUESTS_TOTAL
-                .with_label_values(&["unknown", "none", "405"])
-                .inc();
-            metrics::GATEWAY_REQUEST_DURATION
-                .with_label_values(&["unknown", "none"])
-                .observe(start.elapsed().as_secs_f64());
+            Self::record_metrics(
+                Some("method_not_allowed"),
+                "unknown",
+                "none",
+                "405",
+                start.elapsed().as_secs_f64(),
+            );
             return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, None));
         }
 
-        // Early reject if Content-Length header exceeds limit
         if let Some(content_length) = req.headers().get(hyper::header::CONTENT_LENGTH) {
             match content_length
                 .to_str()
@@ -204,15 +214,13 @@ impl Gateway {
                         "Request body too large: Content-Length {} exceeds limit of {} bytes",
                         len, MAX_BODY_SIZE
                     );
-                    metrics::GATEWAY_ERRORS_TOTAL
-                        .with_label_values(&["payload_too_large"])
-                        .inc();
-                    metrics::GATEWAY_REQUESTS_TOTAL
-                        .with_label_values(&["unknown", "none", "413"])
-                        .inc();
-                    metrics::GATEWAY_REQUEST_DURATION
-                        .with_label_values(&["unknown", "none"])
-                        .observe(start.elapsed().as_secs_f64());
+                    Self::record_metrics(
+                        Some("payload_too_large"),
+                        "unknown",
+                        "none",
+                        "413",
+                        start.elapsed().as_secs_f64(),
+                    );
                     return Ok(self.error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Some(Self::payload_too_large_body()),
@@ -225,7 +233,6 @@ impl Gateway {
             }
         }
 
-        // Read the request body with size limit enforced via Limited wrapper
         let limited_body = Limited::new(req.into_body(), MAX_BODY_SIZE);
         let body_bytes = match limited_body.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -235,66 +242,56 @@ impl Gateway {
                         "Request body exceeded size limit of {} bytes",
                         MAX_BODY_SIZE
                     );
-                    metrics::GATEWAY_ERRORS_TOTAL
-                        .with_label_values(&["payload_too_large"])
-                        .inc();
-                    metrics::GATEWAY_REQUESTS_TOTAL
-                        .with_label_values(&["unknown", "none", "413"])
-                        .inc();
-                    metrics::GATEWAY_REQUEST_DURATION
-                        .with_label_values(&["unknown", "none"])
-                        .observe(start.elapsed().as_secs_f64());
+                    Self::record_metrics(
+                        Some("payload_too_large"),
+                        "unknown",
+                        "none",
+                        "413",
+                        start.elapsed().as_secs_f64(),
+                    );
                     return Ok(self.error_response(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Some(Self::payload_too_large_body()),
                     ));
                 }
                 warn!("Failed to read request body: {}", e);
-                metrics::GATEWAY_ERRORS_TOTAL
-                    .with_label_values(&["bad_json"])
-                    .inc();
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&["unknown", "none", "400"])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&["unknown", "none"])
-                    .observe(start.elapsed().as_secs_f64());
+                Self::record_metrics(
+                    Some("bad_json"),
+                    "unknown",
+                    "none",
+                    "400",
+                    start.elapsed().as_secs_f64(),
+                );
                 return Ok(self.error_response(StatusCode::BAD_REQUEST, None));
             }
         };
 
-        // Parse as JSON to determine routing
         let json: Value = match serde_json::from_slice(&body_bytes) {
             Ok(json) => json,
             Err(e) => {
                 warn!("Invalid JSON: {}", e);
-                metrics::GATEWAY_ERRORS_TOTAL
-                    .with_label_values(&["bad_json"])
-                    .inc();
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&["unknown", "none", "400"])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&["unknown", "none"])
-                    .observe(start.elapsed().as_secs_f64());
+                Self::record_metrics(
+                    Some("bad_json"),
+                    "unknown",
+                    "none",
+                    "400",
+                    start.elapsed().as_secs_f64(),
+                );
                 return Ok(self.error_response(StatusCode::BAD_REQUEST, None));
             }
         };
 
-        // Validate JSON-RPC structure and get method
         let method = match json.get("method").and_then(|m| m.as_str()) {
             Some(method) => method,
             None => {
                 warn!("Missing or invalid 'method' field in JSON-RPC request");
-                metrics::GATEWAY_ERRORS_TOTAL
-                    .with_label_values(&["invalid_method"])
-                    .inc();
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&["unknown", "none", "400"])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&["unknown", "none"])
-                    .observe(start.elapsed().as_secs_f64());
+                Self::record_metrics(
+                    Some("invalid_method"),
+                    "unknown",
+                    "none",
+                    "400",
+                    start.elapsed().as_secs_f64(),
+                );
                 return Ok(self.error_response(StatusCode::BAD_REQUEST, None));
             }
         };
@@ -305,7 +302,6 @@ impl Gateway {
             "unknown"
         };
 
-        // Route based on method
         let (target_url, target_label) = if method == "sendTransaction" {
             info!("Routing sendTransaction to write node");
             (&self.write_url, "write")
@@ -314,25 +310,21 @@ impl Gateway {
             (&self.read_url, "read")
         };
 
-        // Parse target URL
         let uri = match target_url.parse::<hyper::Uri>() {
             Ok(uri) => uri,
             Err(e) => {
                 error!("Invalid target URL {}: {}", target_url, e);
-                metrics::GATEWAY_ERRORS_TOTAL
-                    .with_label_values(&["url_parse"])
-                    .inc();
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method_label, target_label, "500"])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method_label, target_label])
-                    .observe(start.elapsed().as_secs_f64());
+                Self::record_metrics(
+                    Some("url_parse"),
+                    method_label,
+                    target_label,
+                    "500",
+                    start.elapsed().as_secs_f64(),
+                );
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
         };
 
-        // Build forwarded request
         let forwarded_req = match Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
@@ -342,20 +334,17 @@ impl Gateway {
             Ok(req) => req,
             Err(e) => {
                 error!("Failed to build forwarded request: {}", e);
-                metrics::GATEWAY_ERRORS_TOTAL
-                    .with_label_values(&["request_build"])
-                    .inc();
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method_label, target_label, "500"])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method_label, target_label])
-                    .observe(start.elapsed().as_secs_f64());
+                Self::record_metrics(
+                    Some("request_build"),
+                    method_label,
+                    target_label,
+                    "500",
+                    start.elapsed().as_secs_f64(),
+                );
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
         };
 
-        // Forward the request and stream the response directly (no buffering!)
         match self.client.request(forwarded_req).await {
             Ok(response) => {
                 let status = response.status().as_u16().to_string();
@@ -364,15 +353,15 @@ impl Gateway {
                     target_url,
                     response.status()
                 );
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method_label, target_label, &status])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method_label, target_label])
-                    .observe(start.elapsed().as_secs_f64());
-                // Response body is streamed directly without reading into memory
+                Self::record_metrics(
+                    None,
+                    method_label,
+                    target_label,
+                    &status,
+                    start.elapsed().as_secs_f64(),
+                );
+
                 let (mut parts, body) = response.into_parts();
-                // Add CORS headers to the response
                 parts.headers.insert(
                     "Access-Control-Allow-Origin",
                     hyper::header::HeaderValue::from_str(&self.cors_allowed_origin).unwrap(),
@@ -391,15 +380,13 @@ impl Gateway {
             }
             Err(e) => {
                 error!("Failed to forward request to {}: {}", target_url, e);
-                metrics::GATEWAY_ERRORS_TOTAL
-                    .with_label_values(&["backend_error"])
-                    .inc();
-                metrics::GATEWAY_REQUESTS_TOTAL
-                    .with_label_values(&[method_label, target_label, "502"])
-                    .inc();
-                metrics::GATEWAY_REQUEST_DURATION
-                    .with_label_values(&[method_label, target_label])
-                    .observe(start.elapsed().as_secs_f64());
+                Self::record_metrics(
+                    Some("backend_error"),
+                    method_label,
+                    target_label,
+                    "502",
+                    start.elapsed().as_secs_f64(),
+                );
                 Ok(self.error_response(StatusCode::BAD_GATEWAY, None))
             }
         }
@@ -581,7 +568,6 @@ mod tests {
             body
         );
 
-        // Expect 502 (no backend running), which proves the body passed the size check
         let response = send_raw(addr, req.as_bytes()).await;
         assert_status(&response, 502);
     }

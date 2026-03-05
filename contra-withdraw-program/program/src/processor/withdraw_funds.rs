@@ -172,6 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_instruction_data_truncated_destination() {
+        // Flag byte = 1 (destination present) but only 5 bytes of pubkey instead of 32
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&100u64.to_le_bytes());
+        instruction_data.push(1);
+        instruction_data.extend_from_slice(&[0u8; 5]);
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
     fn test_process_withdraw_funds_empty_accounts() {
         let instruction_data = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let accounts = [];

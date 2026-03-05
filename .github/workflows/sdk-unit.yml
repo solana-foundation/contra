@@ -85,12 +85,16 @@ jobs:
             cat coverage-unit/coverage-summary.json | jq '.total'
           fi
 
+      - name: Prepare coverage for upload
+        run: |
+          cp ${{ matrix.program }}/clients/typescript/coverage-unit/lcov.info ./coverage-ts.lcov 2>/dev/null || true
+
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
         with:
           name: ts-unit-coverage-${{ matrix.program }}
-          path: |
-            ${{ matrix.program }}/clients/typescript/coverage-unit/lcov.info
+          path: coverage-ts.lcov
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Show failure logs

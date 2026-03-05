@@ -10,16 +10,34 @@
 |----------|----------|---------|
 | Instruction handlers | 100% (1/1) | WithdrawFunds tested |
 | Account validation paths | 40% (2/5) | Signer + mint validated; ATA/token/ATA-program untested |
-| Business logic error branches | 60% (3/5) | Zero amount, insufficient funds, wrong mint tested |
+| Business logic error branches | 80% (4/5) | Zero amount, insufficient funds, wrong mint, truncated destination |
 | Custom error codes exercised | 100% (2/2) | InvalidMint, ZeroAmount |
-| State & trait coverage (unit) | 0% (0/0) | No unit tests exist |
-| Event coverage | 0% (0/1) | Event emission not verified |
+| State & trait coverage (unit) | 100% (11/11) | Instruction parsing, discriminator, event serialization |
+| Event coverage | 50% (1/2) | Serialization tested; on-chain emission not verified |
 | Security edge cases | 50% (1/2) | Non-signer tested; program substitution untested |
-| **Overall (risk-weighted)** | **~45%** | |
+| **Overall (risk-weighted)** | **~60%** | |
 
 ## Test Inventory
 
-**0 unit tests** + **7 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
+**11 unit tests** + **7 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
+
+### Unit Tests (11 tests)
+
+#### Instruction Data Parsing (7 tests in `withdraw_funds.rs`)
+- `test_parse_instruction_data_valid_with_destination` — 41-byte data with destination
+- `test_parse_instruction_data_valid_without_destination` — 9-byte data, no destination
+- `test_parse_instruction_data_insufficient_length` — data too short (3 bytes)
+- `test_parse_instruction_data_empty` — empty data
+- `test_parse_instruction_data_zero_amount` — zero amount succeeds at parse level
+- `test_parse_instruction_data_truncated_destination` — flag=1 but pubkey truncated
+- `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
+
+#### Discriminator (2 tests in `discriminator.rs`)
+- `test_discriminator_valid` — byte 0 maps to WithdrawFunds
+- `test_discriminator_invalid` — byte 1 returns Err
+
+#### Event Serialization (1 test in `events.rs`)
+- `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
 ### WithdrawFunds — Integration Tests (7 tests)
 
@@ -49,18 +67,9 @@
 
 ## Documented Gaps
 
-### Missing Unit Tests
-The withdraw program has **no `#[cfg(test)]` blocks**. The following should be added:
-- `process_instruction_data` parsing — valid data with/without destination
-- `process_instruction_data` — insufficient length, empty data
-- `validate_ata` — PDA derivation, empty data check
-- `verify_signer` / `verify_mint_account` — error path isolation
-- `WithdrawFundsEvent::to_bytes` — event encoding
-
 ### Untested Error Paths
 | Error Path | Status | Notes |
 |-----------|--------|-------|
-| NotEnoughAccountKeys | Not tested | No test with insufficient accounts |
 | InvalidAccountOwner | Not tested | Token program owner check on mint |
 | IncorrectProgramId | Not tested | Wrong ATA or token program address |
 | InvalidSeeds (ATA derivation) | Not tested | ATA PDA mismatch |
@@ -75,15 +84,13 @@ The withdraw program has **no `#[cfg(test)]` blocks**. The following should be a
 | ATA non-empty data check | `validate_ata` | Not tested |
 
 ### Untested Business Logic
-- Event emission and encoding — no log verification
+- Event emission on-chain — no log verification
 - Invalid discriminator routing — no test for wrong instruction type
 - Token burn failure propagation — only insufficient funds tested
 - Boundary amounts — max u64 withdrawal not tested on-chain
 - Token2022 support — not tested (if applicable)
 
 ### Priority Recommendations
-1. **High**: Add unit tests for instruction data parsing and account validation helpers
-2. **High**: Add integration test for wrong ATA/token program addresses
-3. **Medium**: Add integration test for insufficient accounts
-4. **Medium**: Add Token2022 withdrawal test
-5. **Low**: Add event emission verification
+1. **High**: Add integration test for wrong ATA/token program addresses
+2. **Medium**: Add Token2022 withdrawal test
+3. **Low**: Add event emission verification

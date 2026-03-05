@@ -122,28 +122,41 @@ jobs:
 
       - name: Normalize and filter coverage files
         run: |
+          if [ ! -d coverage-artifacts ]; then
+            echo "ERROR: coverage-artifacts directory does not exist"
+            exit 1
+          fi
           # Rename lcov.info files to .lcov for consistent globbing
-          find coverage-artifacts -name 'lcov.info' | while read f; do
+          find coverage-artifacts -name 'lcov.info' -print0 | while IFS= read -r -d '' f; do
             dir=$(dirname "$f")
             mv "$f" "$dir/coverage.lcov"
           done
           # Remove empty coverage files
-          find coverage-artifacts -name '*.lcov' | while read f; do
+          find coverage-artifacts -name '*.lcov' -print0 | while IFS= read -r -d '' f; do
             if [ ! -s "$f" ]; then
               echo "WARNING: Removing empty coverage file: $f"
               rm "$f"
             fi
           done
 
+      - name: Verify coverage artifacts exist
+        run: |
+          count=$(find coverage-artifacts -name '*.lcov' -type f 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: No coverage artifacts found after download and filtering"
+            exit 1
+          fi
+          echo "Found $count coverage file(s)"
+
       - name: Combine coverage reports
         run: |
-          if ls coverage-artifacts/**/*.lcov 1>/dev/null 2>&1; then
-            echo "Combining coverage reports..."
-            lcov-result-merger 'coverage-artifacts/**/*.lcov' coverage-combined.lcov
-            echo "Combined coverage report generated"
-          else
-            echo "No coverage reports found, skipping combination"
+          shopt -s globstar
+          lcov-result-merger 'coverage-artifacts/**/*.lcov' coverage-combined.lcov
+          if [ ! -s coverage-combined.lcov ]; then
+            echo "ERROR: lcov-result-merger produced empty output"
+            exit 1
           fi
+          echo "Combined coverage report generated"
 
       - name: Generate coverage summary
         id: coverage-summary
@@ -152,6 +165,7 @@ jobs:
           echo "======================="
 
           COVERAGE_SUMMARY=""
+          PARSED_COUNT=0
 
           parse_lcov() {
             local file="$1" label="$2"
@@ -162,7 +176,10 @@ jobs:
                 COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_FOUND" | bc)
                 echo "${label}: ${COV}%"
                 COVERAGE_SUMMARY="${COVERAGE_SUMMARY}**${label}:** ${COV}%\n"
+                PARSED_COUNT=$((PARSED_COUNT + 1))
               fi
+            else
+              echo "WARNING: Missing or empty: $file ($label)"
             fi
           }
 
@@ -179,8 +196,13 @@ jobs:
           parse_lcov "coverage-artifacts/e2e/coverage-integration-e2e.lcov" "E2E Integration Tests"
 
           # TypeScript SDK coverage
-          parse_lcov "coverage-artifacts/ts-escrow/coverage.lcov" "Escrow TS SDK Tests"
-          parse_lcov "coverage-artifacts/ts-withdraw/coverage.lcov" "Withdraw TS SDK Tests"
+          parse_lcov "coverage-artifacts/ts-escrow/coverage-ts.lcov" "Escrow TS SDK Tests"
+          parse_lcov "coverage-artifacts/ts-withdraw/coverage-ts.lcov" "Withdraw TS SDK Tests"
+
+          if [ "$PARSED_COUNT" -eq 0 ]; then
+            echo "::error::No coverage data found across all expected reports"
+            COVERAGE_SUMMARY="No coverage data available. Check workflow artifacts.\n"
+          fi
 
           echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_OUTPUT
           echo -e "$COVERAGE_SUMMARY" >> $GITHUB_OUTPUT

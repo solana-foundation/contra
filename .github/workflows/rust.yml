@@ -247,11 +247,11 @@ jobs:
             --output-path ../coverage/coverage-integration-e2e.lcov
 
       - name: Upload E2E coverage reports
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-coverage-reports
           path: coverage/coverage-integration-e2e.lcov
+          if-no-files-found: warn
           retention-days: 7
 
   unit-tests:

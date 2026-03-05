@@ -95,9 +95,7 @@ pub fn get_stored_transaction(
 pub fn encode_transaction_data(data: &[u8], encoding: UiTransactionEncoding) -> String {
     match encoding {
         UiTransactionEncoding::Base58 => bs58::encode(data).into_string(),
-        UiTransactionEncoding::Base64 | UiTransactionEncoding::Binary => STANDARD.encode(data),
-        UiTransactionEncoding::Json => STANDARD.encode(data),
-        UiTransactionEncoding::JsonParsed => STANDARD.encode(data),
+        _ => STANDARD.encode(data),
     }
 }
 

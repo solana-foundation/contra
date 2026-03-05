@@ -10,27 +10,10 @@ use {
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct AccountLocks {
     read_locks: HashSet<usize>,
     write_lock: Option<usize>,
-}
-
-impl AccountLocks {
-    fn new() -> Self {
-        Self {
-            read_locks: HashSet::new(),
-            write_lock: None,
-        }
-    }
-
-    fn add_read_lock(&mut self, tx_index: usize) {
-        self.read_locks.insert(tx_index);
-    }
-
-    fn add_write_lock(&mut self, tx_index: usize) {
-        self.write_lock = Some(tx_index);
-    }
 }
 
 pub struct DAGScheduler {
@@ -64,10 +47,7 @@ impl DAGScheduler {
             let mut dependencies = HashSet::new();
 
             for account in &write_accounts {
-                let locks = self
-                    .account_locks
-                    .entry(*account)
-                    .or_insert_with(AccountLocks::new);
+                let locks = self.account_locks.entry(*account).or_default();
 
                 for &dependent_tx in &locks.read_locks {
                     dependencies.insert(dependent_tx);
@@ -77,14 +57,11 @@ impl DAGScheduler {
                     dependencies.insert(write_tx);
                 }
 
-                locks.add_write_lock(tx_index);
+                locks.write_lock = Some(tx_index);
             }
 
             for account in &read_accounts {
-                let locks = self
-                    .account_locks
-                    .entry(*account)
-                    .or_insert_with(AccountLocks::new);
+                let locks = self.account_locks.entry(*account).or_default();
 
                 if let Some(write_tx) = locks.write_lock {
                     if write_tx != tx_index {
@@ -92,7 +69,7 @@ impl DAGScheduler {
                     }
                 }
 
-                locks.add_read_lock(tx_index);
+                locks.read_locks.insert(tx_index);
             }
 
             for &dep in &dependencies {

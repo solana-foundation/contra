@@ -10,7 +10,7 @@ const DEFAULT_FEE_PAYER_LAMPORTS: u64 = 10;
 
 pub struct GaslessCallback<'a> {
     bob: &'a BOB,
-    fee_payers: HashSet<Pubkey>, // Own the Pubkeys instead of borrowing
+    fee_payers: HashSet<Pubkey>,
 }
 
 impl<'a> GaslessCallback<'a> {
@@ -26,16 +26,15 @@ impl<'a> InvokeContextCallback for GaslessCallback<'a> {}
 
 impl<'a> TransactionProcessingCallback for GaslessCallback<'a> {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
-        if let Some(account) = self.bob.get_account_shared_data(pubkey) {
-            return Some(account);
-        } else if self.fee_payers.contains(pubkey) {
-            return Some(AccountSharedData::new(
-                DEFAULT_FEE_PAYER_LAMPORTS,
-                0,
-                &solana_sdk_ids::system_program::ID, // Use system program as owner for fee payer accounts
-            ));
-        }
-        None
+        self.bob.get_account_shared_data(pubkey).or_else(|| {
+            self.fee_payers.contains(pubkey).then(|| {
+                AccountSharedData::new(
+                    DEFAULT_FEE_PAYER_LAMPORTS,
+                    0,
+                    &solana_sdk_ids::system_program::ID,
+                )
+            })
+        })
     }
 
     fn account_matches_owners(

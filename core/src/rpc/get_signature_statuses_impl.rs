@@ -7,7 +7,6 @@ use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcSignatureStatusConfig;
 use solana_rpc_client_types::response::{Response, RpcResponseContext};
 use solana_sdk::signature::Signature;
-use solana_transaction_error::TransactionError;
 use solana_transaction_status_client_types::{TransactionConfirmationStatus, TransactionStatus};
 use std::str::FromStr;
 use tracing::{debug, warn};
@@ -67,15 +66,10 @@ pub async fn get_signature_statuses_impl(
                 );
 
                 let err = tx.meta.err.clone();
-                let status: Result<(), TransactionError> = match err {
-                    None => Ok(()),
-                    Some(ref e) => Err(e.clone()),
-                };
-
                 statuses.push(Some(TransactionStatus {
                     slot: tx.slot,
-                    confirmations: None, // null means "rooted" (finalized)
-                    status,
+                    confirmations: None,
+                    status: err.clone().map_or(Ok(()), Err),
                     err,
                     confirmation_status: Some(TransactionConfirmationStatus::Finalized),
                 }));

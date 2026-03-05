@@ -47,8 +47,8 @@ pub fn extract_accounts(transaction: &SanitizedTransaction) -> (Vec<Pubkey>, Vec
         .get_account_locks(usize::MAX)
         .expect("Failed to get account locks");
 
-    let read_accounts = account_locks.readonly.iter().map(|&k| *k).collect();
-    let write_accounts = account_locks.writable.iter().map(|&k| *k).collect();
+    let read_accounts = account_locks.readonly.into_iter().copied().collect();
+    let write_accounts = account_locks.writable.into_iter().copied().collect();
 
     (read_accounts, write_accounts)
 }

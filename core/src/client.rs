@@ -2,7 +2,7 @@ use {
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer, transaction::Transaction},
     spl_associated_token_account::get_associated_token_address,
-    std::{fs, path::PathBuf},
+    std::{fs, path::Path},
 };
 
 #[derive(Debug)]
@@ -161,7 +161,7 @@ pub fn create_ata_transaction(
 }
 
 /// Load a keypair from a file
-pub fn load_keypair(path: &PathBuf) -> Result<Keypair, Box<dyn std::error::Error + Send + Sync>> {
+pub fn load_keypair(path: &Path) -> Result<Keypair, Box<dyn std::error::Error + Send + Sync>> {
     let keypair_string = fs::read_to_string(path)?;
 
     // Try to parse as JSON array of bytes
@@ -231,7 +231,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &json).unwrap();
 
-        let loaded = load_keypair(&tmp.path().to_path_buf()).unwrap();
+        let loaded = load_keypair(tmp.path()).unwrap();
         assert_eq!(loaded.pubkey(), kp.pubkey());
     }
 
@@ -243,7 +243,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), &json).unwrap();
 
-        let result = load_keypair(&tmp.path().to_path_buf());
+        let result = load_keypair(tmp.path());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Invalid keypair length"));
@@ -254,7 +254,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "not json at all").unwrap();
 
-        let result = load_keypair(&tmp.path().to_path_buf());
+        let result = load_keypair(tmp.path());
         assert!(result.is_err());
     }
 }

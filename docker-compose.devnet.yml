@@ -18,6 +18,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-primary-data:/var/lib/postgresql/data
+      - postgres-primary-wal-archive:/wal_archive
       - ./init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./init-primary-hba.sh:/docker-entrypoint-initdb.d/02-hba.sh:ro
     command: |
@@ -29,7 +30,7 @@ services:
       -c hot_standby_feedback=on
       -c wal_log_hints=on
       -c archive_mode=on
-      -c archive_command='/bin/true'
+      -c archive_command='cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f'
       -c listen_addresses='*'
     networks:
       - contra-network
@@ -176,6 +177,13 @@ services:
       - "5434:5432"
     volumes:
       - postgres-indexer-data:/var/lib/postgresql/data
+      - postgres-indexer-wal-archive:/wal_archive
+    command: |
+      postgres
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_command='cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f'
+      -c listen_addresses='*'
     networks:
       - contra-network
     healthcheck:
@@ -320,6 +328,50 @@ services:
     networks:
       - contra-network
 
+  # Base backup sidecar for postgres-primary
+  pg-backup-primary:
+    image: postgres:16-alpine
+    container_name: contra-pg-backup-primary
+    restart: unless-stopped
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      - PGHOST=postgres-primary
+      - PGUSER=${POSTGRES_USER}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - PG_BACKUP_INTERVAL_HOURS=${PG_BACKUP_INTERVAL_HOURS:-6}
+      - PG_BACKUP_RETENTION_COUNT=${PG_BACKUP_RETENTION_COUNT:-3}
+    volumes:
+      - postgres-primary-basebackups:/backups
+      - postgres-primary-wal-archive:/wal_archive
+      - ./scripts/pg-backup.sh:/usr/local/bin/pg-backup.sh:ro
+    command: ["/usr/local/bin/pg-backup.sh"]
+    networks:
+      - contra-network
+
+  # Base backup sidecar for postgres-indexer
+  pg-backup-indexer:
+    image: postgres:16-alpine
+    container_name: contra-pg-backup-indexer
+    restart: unless-stopped
+    depends_on:
+      postgres-indexer:
+        condition: service_healthy
+    environment:
+      - PGHOST=postgres-indexer
+      - PGUSER=${POSTGRES_USER}
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - PG_BACKUP_INTERVAL_HOURS=${PG_BACKUP_INTERVAL_HOURS:-6}
+      - PG_BACKUP_RETENTION_COUNT=${PG_BACKUP_RETENTION_COUNT:-3}
+    volumes:
+      - postgres-indexer-basebackups:/backups
+      - postgres-indexer-wal-archive:/wal_archive
+      - ./scripts/pg-backup.sh:/usr/local/bin/pg-backup.sh:ro
+    command: ["/usr/local/bin/pg-backup.sh"]
+    networks:
+      - contra-network
+
   # Blackbox Exporter for HTTP health probing
   blackbox-exporter:
     image: prom/blackbox-exporter:latest
@@ -383,6 +435,10 @@ volumes:
   postgres-primary-data:
   postgres-replica-data:
   postgres-indexer-data:
+  postgres-primary-wal-archive:
+  postgres-indexer-wal-archive:
+  postgres-primary-basebackups:
+  postgres-indexer-basebackups:
   prometheus-data:
   grafana-data:
 

@@ -194,7 +194,7 @@ The streamer needs a **public domain** for the admin-ui (and any other frontend)
 
 ### admin-ui
 
-The admin UI is a static React/Vite app. It connects to Solana RPC directly (via wallet) and to the Contra gateway for L2 operations.
+The admin UI is a static React/Vite app. It connects to Solana RPC directly (via wallet) and to the Contra gateway for payment channel operations.
 
 | Variable | Kind | Value |
 |---|---|---|

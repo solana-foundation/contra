@@ -35,11 +35,11 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 ### Escrow & Withdrawal Programs
 
-#### Escrow Program (Mainnet)
+#### Escrow Program (Devnet)
 
 **Purpose**: Locks tokens in escrow for use within the payment channel.
 
-**Program ID**: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83` (Solana Mainnet)
+**Program ID**: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83` (Solana Devnet)
 
 **Location**: [`contra-escrow-program/`](../contra-escrow-program/)
 
@@ -69,13 +69,13 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 ### Indexer & Operator
 
-The Indexer monitors blockchain activity and the Operator processes pending cross-chain transactions.
+The Indexer monitors blockchain activity and the Operator processes pending deposit and withdrawal transactions.
 
 **Location**: [`indexer/`](../indexer/)
 
 **Components**:
 1. **Indexer**: Monitors blockchain activity and writes to database
-2. **Operator**: Processes pending transactions and executes cross-chain operations
+2. **Operator**: Processes pending transactions and executes deposit/withdrawal operations
 
 **Supported Modes**:
 - **Mainnet Indexer**: Yellowstone gRPC or RPC polling
@@ -107,3 +107,55 @@ PostgreSQL 16+ with streaming replication
 
    Location: [`indexer/`](../indexer/src/storage/)
 
+
+## System Diagram
+
+```mermaid
+flowchart TB
+    Wallet([User Wallet])
+    Escrow[Escrow Program<br/><i>Solana Mainnet</i>]
+    IS[Indexer Solana]
+    IC[Indexer Contra]
+    PG_I[(Indexer DB)]
+    OS[Operator Solana]
+    OC[Operator Contra]
+    GW[Gateway :8899]
+    WN[Write Node :8900]
+    WP[Withdraw Program]
+    PG_P[(Postgres Primary)]
+    PG_R[(Postgres Replica)]
+    RN[Read Node :8901]
+    ST[Streamer :8902]
+
+    Wallet -- deposit --> Escrow
+    Wallet -- transact / withdraw --> GW
+    ST -. WebSocket .-> Wallet
+
+    Escrow -- watch --> IS
+    IS -- deposit events --> PG_I
+    PG_I -- pending deposits --> OS
+    OS -- mint --> GW
+
+    GW -- sendTransaction --> WN
+    WN --> WP
+    GW -- watch --> IC
+    IC -- withdrawal events --> PG_I
+    PG_I -- pending withdrawals --> OC
+    OC -- release --> Escrow
+
+    WN -- settle --> PG_P
+    PG_P -- replication --> PG_R
+    PG_R --> RN
+    RN --> GW
+    PG_P --> ST
+```
+
+### Data Flow Summary
+
+| Flow | Path |
+|------|------|
+| **Deposit** | User → Escrow Program (Mainnet) → Indexer Solana → Indexer DB → Operator Solana → Gateway → Write Node (mint on Contra) |
+| **Transfer** | User → Gateway → Write Node → Postgres Primary |
+| **Withdrawal** | User → Gateway → Write Node → Withdraw Program (burn) → Indexer Contra → Indexer DB → Operator Contra → Escrow Program (release on Mainnet) |
+| **Reads** | User → Gateway → Read Node → Postgres Replica |
+| **Streaming** | Postgres Primary → Streamer → WebSocket → User |

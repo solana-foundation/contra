@@ -82,23 +82,6 @@ runs:
           const fmtHit = linesHit.toLocaleString('en-US');
           const fmtTotal = linesTotal.toLocaleString('en-US');
 
-          const SKELETON = [
-            '',
-            '### Coverage Report',
-            '',
-            '| Component | Lines Hit | Lines Total | Coverage | Artifact |',
-            '|-----------|-----------|-------------|----------|----------|',
-            '| Core | - | - | - | - |',
-            '| Indexer | - | - | - | - |',
-            '| Gateway | - | - | - | - |',
-            '| Withdraw Program | - | - | - | - |',
-            '| Escrow Program | - | - | - | - |',
-            '| E2E Integration | - | - | - | - |',
-            '| **Total** | **-** | **-** | **-** | |',
-            '',
-            '> Last updated: — by —',
-          ].join('\n');
-
           function recalcTotal(body) {
             const components = ['Core', 'Indexer', 'Gateway', 'Withdraw Program', 'Escrow Program', 'E2E Integration'];
             let totalHit = 0;
@@ -141,10 +124,13 @@ runs:
 
             let body = pr.body || '';
 
-            // Only append skeleton if no coverage section exists.
-            // The check is inside the retry loop so we always see the latest body.
             if (!body.includes('### Coverage Report')) {
-              body = body + SKELETON;
+              console.log('Coverage table not found in PR body. It may not have been initialized yet. Retrying...');
+              if (attempt < MAX_ATTEMPTS) {
+                await new Promise(r => setTimeout(r, 5000));
+                return tryUpdate(attempt + 1);
+              }
+              throw new Error('Coverage table not found in PR body after all attempts');
             }
 
             // Replace this component's row
@@ -154,7 +140,7 @@ runs:
             const newRow = `| ${component} | ${fmtHit} | ${fmtTotal} | ${coverage}% | ${artifactLink} |`;
 
             if (!rowRegex.test(body)) {
-              throw new Error(`Component row "${component}" not found in PR body after skeleton insertion`);
+              throw new Error(`Component row "${component}" not found in PR body`);
             }
 
             body = body.replace(rowRegex, newRow);
@@ -162,10 +148,10 @@ runs:
             // Recalculate total
             body = recalcTotal(body);
 
-            // Update timestamp
+            // Update timestamp (matches both initial "Coverage runs in progress..." and subsequent "Last updated:" lines)
             const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z/, ' UTC');
             body = body.replace(
-              /> Last updated:.*/,
+              /> (Coverage runs in progress\.\.\.|Last updated:.*)/,
               `> Last updated: ${ts} by ${component}`
             );
 

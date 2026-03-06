@@ -20,6 +20,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  init-coverage-table:
+    name: Initialize Coverage Table
+    if: github.event_name == 'pull_request'
+    runs-on: contra-runner-1
+    steps:
+      - name: Insert coverage skeleton into PR body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) return;
+
+            const { data: pr } = await github.rest.pulls.get({
+              ...repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.body && pr.body.includes('### Coverage Report')) {
+              console.log('Coverage table already exists, skipping');
+              return;
+            }
+
+            const skeleton = [
+              '',
+              '### Coverage Report',
+              '',
+              '| Component | Lines Hit | Lines Total | Coverage | Artifact |',
+              '|-----------|-----------|-------------|----------|----------|',
+              '| Core | - | - | - | - |',
+              '| Indexer | - | - | - | - |',
+              '| Gateway | - | - | - | - |',
+              '| Withdraw Program | - | - | - | - |',
+              '| Escrow Program | - | - | - | - |',
+              '| E2E Integration | - | - | - | - |',
+              '| **Total** | **-** | **-** | **-** | |',
+              '',
+              '> Coverage runs in progress...',
+            ].join('\n');
+
+            const body = (pr.body || '') + skeleton;
+            await github.rest.pulls.update({
+              ...repo,
+              pull_number: prNumber,
+              body,
+            });
+            console.log(`Inserted coverage skeleton into PR #${prNumber}`);
+
   changes:
     name: Detect Changed Areas
     runs-on: contra-runner-1

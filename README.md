@@ -23,7 +23,7 @@ Contra is a payment channel with direct access to Solana Mainnet liquidity. Cont
 
 ## Documentation
 
-- **[Architecture Overview](docs/ARCHITECTURE.md)** - Deep dive into Contra's technical architecture, components, and design decisions
+- **[All Documentation](docs/README.md)** — Architecture, program references, guides, and operational requirements
 
 ## How Contra Works
 

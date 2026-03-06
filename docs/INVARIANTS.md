@@ -1,0 +1,53 @@
+# System Invariants
+
+This document defines the safety and correctness invariants that Contra must uphold. Requirement levels follow [RFC 2119](https://datatracker.ietf.org/doc/html/rfc2119) (MUST, SHOULD, etc.).
+
+---
+
+## Contra Core
+
+| ID | Invariant | Level | Status | Ref |
+|----|-----------|-------|--------|-----|
+| C1 | A slot and all of its transactions + account changes MUST be written to DB as a single transaction | MUST | Done | #16 |
+| C2 | The in-memory accounts DB MUST be in sync or ahead of the accounts DB on disk | MUST | Done | #20 |
+| C3 | Contra MUST NOT allow two transactions with the same signature to both execute | MUST | Done | #15 |
+| C4 | Contra MUST NOT allow a transaction with an expired blockhash to execute | MUST | Done | #22 |
+| C5 | Contra MUST require all transactions to be signed | MUST | Done | #22 |
+| C6 | Contra MUST enforce the instructions allowlist | MUST | Done | #22 |
+| C7 | Contra MUST require admin signatures for admin instructions | MUST | Done | #22 |
+| C8 | Contra MUST reject all transactions that mix admin and non-admin instructions | MUST | Done | #22 |
+| C9 | Contra MUST reject all transactions with no instructions | MUST | Done | #22 |
+| C10 | Finalized state MUST be based on DB state | MUST | Done | #36 |
+| C11 | Contra SHOULD support transaction/slot truncation | SHOULD | Done | #51 |
+| C12 | If truncation is supported, Contra MUST have a valid cold storage backup before truncating DB rows | MUST | Done | #60 |
+| C13 | Contra DB SHOULD use database backup and recovery | SHOULD | Done | #60 |
+
+## On-chain Programs
+
+| ID | Invariant | Level | Status | Ref |
+|----|-----------|-------|--------|-----|
+| P1 | Escrow program MUST require SPL transfers on escrow | MUST | Done | #18 |
+| P2 | Escrow program MUST reject SPL transfers for unauthorized mints | MUST | Done | #10 |
+| P3 | Withdrawal program MUST require admin transaction to release funds AND a valid withdrawal proof | MUST | Done | #9, #10, #29 |
+
+## Indexer
+
+| ID | Invariant | Level | Status | Ref |
+|----|-----------|-------|--------|-----|
+| I1 | Contra indexer SHOULD NOT fall behind by more than 10 seconds relative to the most recent Contra block | SHOULD | Done | #55 |
+| I2 | Mainnet indexer SHOULD NOT fall behind by more than 10 seconds relative to the most recent mainnet block | SHOULD | Done | #55 |
+| I3 | After downtime, indexers MUST backfill missed slots | MUST | Done | #48 |
+
+## Operator
+
+| ID | Invariant | Level | Status | Ref |
+|----|-----------|-------|--------|-----|
+| O1 | Withdrawals from escrow MUST NOT withdraw more than once | MUST | Done | #29, #9 |
+| O2 | Issuances on Contra MUST NOT issue more than once | MUST | Done | #26 |
+| O3 | Failed withdrawals/issuances MUST fire an alert | MUST | Done | #40 |
+
+## Global
+
+| ID | Invariant | Level | Status | Ref |
+|----|-----------|-------|--------|-----|
+| G1 | On-chain escrow holdings MUST equal total user liabilities in Contra | MUST | Done | #12, #39, #14 |

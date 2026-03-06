@@ -37,6 +37,7 @@ pub const INVALID_ACCOUNT_DATA_ERROR: u32 = 6; // ProgramError::InvalidAccountDa
 pub const NOT_ENOUGH_ACCOUNT_KEYS_ERROR: u32 = 2; // ProgramError::NotEnoughAccountKeys
 pub const INVALID_INSTRUCTION_DATA_ERROR: u32 = 3; // ProgramError::InvalidInstructionData
 pub const INVALID_ACCOUNT_OWNER_ERROR: u32 = 23; // ProgramError::InvalidAccountOwner
+pub const INCORRECT_PROGRAM_ID_ERROR: u32 = 4; // ProgramError::IncorrectProgramId
 pub const INVALID_SEEDS_ERROR: u32 = 14; // ProgramError::InvalidSeeds
 pub const MISSING_REQUIRED_SIGNATURE_ERROR: u32 = 0; // ProgramError::MissingRequiredSignature
 
@@ -81,16 +82,19 @@ impl TestContext {
         pubkey: &Pubkey,
         lamports: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(account) = self.svm.get_account(pubkey) {
-            if account.lamports < MIN_LAMPORTS {
-                return match self.svm.airdrop(pubkey, lamports) {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(format!("Airdrop failed: {:?}", e).into()),
-                };
-            }
-        }
+        let needs_airdrop = match self.svm.get_account(pubkey) {
+            Some(account) => account.lamports < MIN_LAMPORTS,
+            None => true,
+        };
 
-        Ok(())
+        if needs_airdrop {
+            match self.svm.airdrop(pubkey, lamports) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("Airdrop failed: {:?}", e).into()),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     pub fn create_account(
@@ -330,6 +334,7 @@ pub fn assert_program_error(
                 1 => vec!["insufficient funds"], // Token program error
                 2 => vec!["NotEnoughAccountKeys"],
                 3 => vec!["InvalidInstructionData"],
+                4 => vec!["IncorrectProgramId"],
                 5 => vec!["InvalidArgument"],
                 6 => vec!["InvalidAccountData"],
                 14 => vec!["InvalidSeeds"],

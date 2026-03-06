@@ -2,10 +2,11 @@ use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance, assert_get_or_deposit},
     utils::{
-        assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_permanent_delegate,
+        assert_program_error, get_or_create_associated_token_account, get_token_balance, set_mint,
+        set_mint_2022_basic, set_mint_2022_with_permanent_delegate, set_token_balance,
         setup_test_balances, TestContext, ATA_PROGRAM_ID, CONTRA_ESCROW_PROGRAM_ID,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_INSTRUCTION_DATA_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
-        PERMANENT_DELEGATE_NOT_ALLOWED_ERROR, TOKEN_2022_PROGRAM_ID,
+        INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
+        NOT_ENOUGH_ACCOUNT_KEYS_ERROR, PERMANENT_DELEGATE_NOT_ALLOWED_ERROR, TOKEN_2022_PROGRAM_ID,
         TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
@@ -425,4 +426,188 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, PERMANENT_DELEGATE_NOT_ALLOWED_ERROR);
+}
+
+#[test]
+fn test_deposit_invalid_associated_token_program() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT * 2,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let wrong_ata_program = solana_sdk::pubkey::Pubkey::new_unique();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(wrong_ata_program) // Wrong ATA program
+        .event_authority(event_authority_pda)
+        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, INCORRECT_PROGRAM_ID_ERROR);
+}
+
+#[test]
+fn test_multiple_depositors_same_instance() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user1 = Keypair::new();
+    let user2 = Keypair::new();
+    let user3 = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    // Setup balances for first user (also creates instance ATA)
+    setup_test_balances(
+        &mut context,
+        &user1,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    // Setup remaining users — airdrop SOL, create user ATAs, set token balances
+    // without re-creating the instance ATA (avoids AlreadyProcessed in LiteSVM)
+    for user in [&user2, &user3] {
+        context
+            .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+            .unwrap();
+        let user_ata =
+            get_or_create_associated_token_account(&mut context, &user.pubkey(), &mint.pubkey());
+        set_token_balance(
+            &mut context,
+            &user_ata,
+            &mint.pubkey(),
+            &user.pubkey(),
+            DEPOSIT_AMOUNT,
+        );
+    }
+
+    // Get instance ATA balance before any deposits
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    // Each user deposits
+    assert_get_or_deposit(
+        &mut context,
+        &user1,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit from user1 should succeed");
+
+    assert_get_or_deposit(
+        &mut context,
+        &user2,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit from user2 should succeed");
+
+    assert_get_or_deposit(
+        &mut context,
+        &user3,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit from user3 should succeed");
+
+    // Verify instance ATA received all deposits
+    let instance_balance = get_token_balance(&mut context, &instance_ata);
+    assert_eq!(
+        instance_balance,
+        DEPOSIT_AMOUNT * 3,
+        "Instance should hold deposits from all three users"
+    );
 }

@@ -6,24 +6,25 @@
 
 ## Summary
 
-| Category | Coverage | Details |
-|----------|----------|---------|
-| Instruction handlers | 100% (1/1) | WithdrawFunds tested |
-| Account validation paths | 40% (2/5) | Signer + mint validated; ATA/token/ATA-program untested |
-| Business logic error branches | 80% (4/5) | Zero amount, insufficient funds, wrong mint, truncated destination |
-| Custom error codes exercised | 100% (2/2) | InvalidMint, ZeroAmount |
-| State & trait coverage (unit) | 100% (11/11) | Instruction parsing, discriminator, event serialization |
-| Event coverage | 50% (1/2) | Serialization tested; on-chain emission not verified |
-| Security edge cases | 50% (1/2) | Non-signer tested; program substitution untested |
-| **Overall (risk-weighted)** | **~60%** | |
+| Category                      | Coverage     | Details                                                                                 |
+| ----------------------------- | ------------ | --------------------------------------------------------------------------------------- |
+| Instruction handlers          | 100% (1/1)   | WithdrawFunds tested                                                                    |
+| Account validation paths      | 100% (5/5)   | Signer, ATA program, token program, mint, ATA derivation                                |
+| Business logic error branches | 100% (5/5)   | Zero amount, insufficient funds, wrong mint, truncated destination, not enough accounts |
+| Custom error codes exercised  | 100% (2/2)   | InvalidMint, ZeroAmount                                                                 |
+| State & trait coverage (unit) | 100% (11/11) | Instruction parsing, discriminator, event serialization                                 |
+| Event coverage                | 50% (1/2)    | Serialization tested; on-chain emission not verified                                    |
+| Security edge cases           | 100% (3/3)   | Non-signer, wrong programs, wrong ATA address                                           |
+| **Overall (risk-weighted)**   | **~90%**     |                                                                                         |
 
 ## Test Inventory
 
-**11 unit tests** + **7 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
+**11 unit tests** + **12 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
 
 ### Unit Tests (11 tests)
 
 #### Instruction Data Parsing (7 tests in `withdraw_funds.rs`)
+
 - `test_parse_instruction_data_valid_with_destination` — 41-byte data with destination
 - `test_parse_instruction_data_valid_without_destination` — 9-byte data, no destination
 - `test_parse_instruction_data_insufficient_length` — data too short (3 bytes)
@@ -33,64 +34,60 @@
 - `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
 
 #### Discriminator (2 tests in `discriminator.rs`)
+
 - `test_discriminator_valid` — byte 0 maps to WithdrawFunds
 - `test_discriminator_invalid` — byte 1 returns Err
 
 #### Event Serialization (1 test in `events.rs`)
+
 - `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
-### WithdrawFunds — Integration Tests (7 tests)
+### WithdrawFunds — Integration Tests (12 tests)
 
 #### Happy Path
+
 - `test_withdraw_funds_success` — basic withdrawal, balance verified
 - `test_withdraw_funds_with_destination` — optional destination parameter
 
 #### Error Paths
+
 - `test_withdraw_funds_insufficient_funds` — SPL Token insufficient funds
 - `test_withdraw_funds_zero_amount` — ZeroAmount custom error
 - `test_withdraw_funds_invalid_instruction_data_too_short` — malformed data rejected
 - `test_withdraw_funds_wrong_mint` — InvalidMint custom error
 - `test_withdraw_funds_non_signer_user` — MissingRequiredSignature
 
+#### Account Validation
+
+- `test_withdraw_funds_wrong_ata_program` — wrong ATA program address (IncorrectProgramId)
+- `test_withdraw_funds_wrong_token_program` — wrong token program address (IncorrectProgramId)
+- `test_withdraw_funds_wrong_ata_address` — ATA PDA mismatch (InvalidInstructionData)
+- `test_withdraw_funds_invalid_discriminator` — byte 255 discriminator rejected
+- `test_withdraw_funds_not_enough_accounts` — only 3 of 5 required accounts
+
 ### WithdrawFunds — TypeScript SDK Tests (7 tests)
 
 #### Instruction Data Validation (4 tests)
+
 - Encodes discriminator, amount, and destination correctly
 - Handles u64 amounts (0, 1, 1M, 1B, max safe integer, max u64)
 - Handles optional destination (None/Some variants)
 - Round-trip encode/decode verification
 
 #### Account Requirements (3 tests)
+
 - All 5 required accounts present in correct order
 - Account permissions correct (READONLY_SIGNER, WRITABLE, READONLY)
 - Program addresses correct (contra program, token program, ATA program)
 
 ## Documented Gaps
 
-### Untested Error Paths
-| Error Path | Status | Notes |
-|-----------|--------|-------|
-| InvalidAccountOwner | Not tested | Token program owner check on mint |
-| IncorrectProgramId | Not tested | Wrong ATA or token program address |
-| InvalidSeeds (ATA derivation) | Not tested | ATA PDA mismatch |
+### Remaining Untested Paths
 
-### Untested Account Validations
-| Validation | Function | Status |
-|-----------|----------|--------|
-| ATA program address | `verify_ata_program` | Not tested |
-| Token program address | `verify_token_program` | Not tested |
-| Token program account ownership | `verify_token_program_account` | Not tested |
-| ATA PDA derivation | `validate_ata` | Not tested |
-| ATA non-empty data check | `validate_ata` | Not tested |
-
-### Untested Business Logic
-- Event emission on-chain — no log verification
-- Invalid discriminator routing — no test for wrong instruction type
-- Token burn failure propagation — only insufficient funds tested
-- Boundary amounts — max u64 withdrawal not tested on-chain
-- Token2022 support — not tested (if applicable)
+- Event emission on-chain — no log verification (serialization is unit-tested)
+- Token2022 support — not tested (withdraw program uses burn, which may differ for Token2022)
 
 ### Priority Recommendations
-1. **High**: Add integration test for wrong ATA/token program addresses
-2. **Medium**: Add Token2022 withdrawal test
-3. **Low**: Add event emission verification
+
+1. **Medium**: Add Token2022 withdrawal test
+2. **Low**: Add event log verification

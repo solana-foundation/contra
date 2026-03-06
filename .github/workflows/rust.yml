@@ -211,7 +211,6 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           rust-components: llvm-tools-preview
-          setup-solana: "false"
           setup-node: "false"
           setup-pnpm: "false"
           install-dependencies: "false"
@@ -239,12 +238,11 @@ jobs:
       - name: Run indexer integration tests with coverage
         run: make -C integration integration-coverage-indexer
 
+      - name: Run reconciliation e2e tests
+        run: cd indexer && cargo test --test reconciliation_e2e_test -- --nocapture
+
       - name: Generate combined E2E coverage report
-        run: |
-          mkdir -p coverage
-          cd integration && cargo llvm-cov report --lcov \
-            --ignore-filename-regex '(^tests/|/test_utils/|\.cargo/registry)' \
-            --output-path ../coverage/coverage-integration-e2e.lcov
+        run: make -C integration integration-coverage-report
 
       - name: Upload E2E coverage reports
         uses: actions/upload-artifact@v4

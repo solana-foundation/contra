@@ -1,5 +1,5 @@
 .PHONY: integration-test fmt
-.PHONY: integration-coverage integration-coverage-contra integration-coverage-indexer
+.PHONY: integration-coverage integration-coverage-contra integration-coverage-indexer integration-coverage-report
 
 COVERAGE_DIR ?= ../coverage
 
@@ -32,10 +32,12 @@ integration-coverage-indexer:
 	@echo "Running indexer integration tests with coverage instrumentation..."
 	@cargo llvm-cov --no-report --features test-tree --test indexer_integration -- --nocapture
 
-integration-coverage: integration-coverage-contra integration-coverage-indexer
+integration-coverage-report:
 	@echo "Generating combined integration E2E coverage report..."
 	@mkdir -p $(COVERAGE_DIR)
 	@cargo llvm-cov report --lcov \
 		--ignore-filename-regex '(^tests/|/test_utils/|\.cargo/registry)' \
 		--output-path $(COVERAGE_DIR)/coverage-integration-e2e.lcov
 	@echo "Coverage report: $(COVERAGE_DIR)/coverage-integration-e2e.lcov"
+
+integration-coverage: integration-coverage-contra integration-coverage-indexer integration-coverage-report

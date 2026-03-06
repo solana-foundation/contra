@@ -1,5 +1,9 @@
 name: TypeScript SDK Unit Tests
 
+concurrency:
+  group: sdk-unit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   workflow_call:
   push:

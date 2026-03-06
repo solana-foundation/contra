@@ -144,6 +144,7 @@ pub fn init_labels(program_type: &str) {
     INDEXER_CURRENT_SLOT.with_label_values(&[program_type]);
     INDEXER_CHAIN_TIP_SLOT.with_label_values(&[program_type]);
     INDEXER_BACKFILL_SLOTS_REMAINING.with_label_values(&[program_type]);
+    INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
 
     for error_type in &["stream", "get_slots", "get_block"] {
         INDEXER_RPC_ERRORS.with_label_values(&[program_type, error_type]);
@@ -159,6 +160,21 @@ pub fn init_labels(program_type: &str) {
 
     for result in &["success", "failure", "error"] {
         OPERATOR_RPC_SEND_DURATION.with_label_values(&[program_type, result]);
+    }
+
+    for error_reason in &[
+        "build_error",
+        "max_retries_exceeded",
+        "rpc_send_error",
+        "invalid_smt_proof",
+        "invalid_nonce_for_tree_index",
+        "mint_not_initialized",
+        "confirmation_timeout_non_idempotent",
+        "confirmation_timeout",
+        "program_error",
+        "confirmation_error",
+    ] {
+        OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }
 
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);

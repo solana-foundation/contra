@@ -21,106 +21,6 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
-      "id": 100,
-      "title": "Infrastructure",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "decimals": 2, "unit": "percent" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
-      "id": 1,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[1m])) * 100",
-          "legendFormat": "{{container_label_com_docker_compose_service}}",
-          "refId": "A"
-        }
-      ],
-      "title": "CPU Usage (%)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "decimals": 2, "unit": "decmbytes" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
-      "id": 2,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "container_memory_usage_bytes{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"} / 1024 / 1024",
-          "legendFormat": "{{container_label_com_docker_compose_service}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Memory Usage (MB)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "Bps" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
-      "id": 3,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_network_receive_bytes_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[1m]))",
-          "legendFormat": "{{container_label_com_docker_compose_service}} rx",
-          "refId": "A"
-        },
-        {
-          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_network_transmit_bytes_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[1m]))",
-          "legendFormat": "{{container_label_com_docker_compose_service}} tx",
-          "refId": "B"
-        }
-      ],
-      "title": "Network I/O (Bytes/sec)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "min": 0, "unit": "short" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
-      "id": 4,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "sum by (container_label_com_docker_compose_service) (changes(container_start_time_seconds{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[24h]))",
-          "legendFormat": "{{container_label_com_docker_compose_service}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Container Restarts (24h)",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
       "id": 110,
       "title": "Indexer Metrics",
       "type": "row"
@@ -131,7 +31,7 @@
         "defaults": { "unit": "none" },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 18 },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 1 },
       "id": 11,
       "options": {
         "colorMode": "value",
@@ -155,7 +55,7 @@
         "defaults": { "unit": "none" },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 18 },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 1 },
       "id": 12,
       "options": {
         "colorMode": "value",
@@ -176,10 +76,34 @@
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 1 },
+      "id": 17,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "contra_indexer_chain_tip_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Chain Tip Slot",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
         "defaults": { "unit": "ops" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
       "id": 13,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -201,7 +125,7 @@
         "defaults": { "unit": "ops" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
       "id": 14,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -226,7 +150,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "id": 15,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -251,7 +175,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "id": 16,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -270,34 +194,10 @@
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
-        "defaults": { "unit": "none" },
-        "overrides": []
-      },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 18 },
-      "id": 17,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "expr": "contra_indexer_chain_tip_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
-          "legendFormat": "{{program_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Chain Tip Slot",
-      "type": "stat"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
         "defaults": { "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
       "id": 18,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -319,7 +219,7 @@
         "defaults": { "unit": "s" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
       "id": 19,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -349,7 +249,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
       "id": 20,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -371,7 +271,7 @@
         "defaults": { "unit": "short", "min": 0 },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 56 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
       "id": 21,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -389,7 +289,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
       "id": 130,
       "title": "Lag & Health",
       "type": "row"
@@ -411,7 +311,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 65 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 48 },
       "id": 30,
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
@@ -427,6 +327,106 @@
       ],
       "title": "Slot Lag",
       "type": "gauge"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
+      "id": 100,
+      "title": "Infrastructure",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "id": 1,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[1m])) * 100",
+          "legendFormat": "{{container_label_com_docker_compose_service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "CPU Usage (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "unit": "decmbytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "id": 2,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "container_memory_usage_bytes{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"} / 1024 / 1024",
+          "legendFormat": "{{container_label_com_docker_compose_service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Usage (MB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 65 },
+      "id": 3,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_network_receive_bytes_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[1m]))",
+          "legendFormat": "{{container_label_com_docker_compose_service}} rx",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_network_transmit_bytes_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[1m]))",
+          "legendFormat": "{{container_label_com_docker_compose_service}} tx",
+          "refId": "B"
+        }
+      ],
+      "title": "Network I/O (Bytes/sec)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "min": 0, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 65 },
+      "id": 4,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (changes(container_start_time_seconds{container_label_com_docker_compose_service=~\"indexer-solana|indexer-contra\"}[24h]))",
+          "legendFormat": "{{container_label_com_docker_compose_service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Container Restarts (24h)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

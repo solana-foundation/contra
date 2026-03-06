@@ -134,6 +134,53 @@ gauge_vec!(
     &["program_type"]
 );
 
+pub fn init_labels(program_type: &str) {
+    INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
+    INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
+    INDEXER_SLOT_SAVE_ERRORS.with_label_values(&[program_type]);
+    INDEXER_SLOTS_PROCESSED.with_label_values(&[program_type]);
+    INDEXER_DATASOURCE_RECONNECTS.with_label_values(&[program_type]);
+
+    INDEXER_CURRENT_SLOT.with_label_values(&[program_type]);
+    INDEXER_CHAIN_TIP_SLOT.with_label_values(&[program_type]);
+    INDEXER_BACKFILL_SLOTS_REMAINING.with_label_values(&[program_type]);
+    INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
+
+    for error_type in &["stream", "get_slots", "get_block"] {
+        INDEXER_RPC_ERRORS.with_label_values(&[program_type, error_type]);
+    }
+
+    OPERATOR_TRANSACTIONS_FETCHED.with_label_values(&[program_type]);
+    OPERATOR_MINTS_SENT.with_label_values(&[program_type]);
+    OPERATOR_DB_UPDATE_ERRORS.with_label_values(&[program_type]);
+
+    for status in &["Pending", "Processing", "Completed", "Failed"] {
+        OPERATOR_DB_UPDATES.with_label_values(&[program_type, status]);
+    }
+
+    for result in &["success", "failure", "error"] {
+        OPERATOR_RPC_SEND_DURATION.with_label_values(&[program_type, result]);
+    }
+
+    for error_reason in &[
+        "build_error",
+        "max_retries_exceeded",
+        "rpc_send_error",
+        "invalid_smt_proof",
+        "invalid_nonce_for_tree_index",
+        "mint_not_initialized",
+        "confirmation_timeout_non_idempotent",
+        "confirmation_timeout",
+        "program_error",
+        "confirmation_error",
+    ] {
+        OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
+    }
+
+    OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
+    FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
+}
+
 pub fn init() {
     contra_metrics::init_metrics!(
         INDEXER_SLOTS_PROCESSED,

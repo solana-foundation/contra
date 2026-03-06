@@ -21,6 +21,308 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 110,
+      "title": "Operator Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "id": 21,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(contra_operator_transactions_fetched_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transactions Fetched/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "id": 28,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "contra_operator_backlog_depth{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Backlog Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "id": 27,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(contra_operator_mints_sent_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mints Sent/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "id": 26,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(contra_operator_transaction_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}} / {{error_reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transaction Errors/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "id": 23,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(contra_operator_db_updates_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}} / {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "DB Updates/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "id": 24,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(contra_operator_db_update_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "DB Update Errors/sec",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "id": 120,
+      "title": "Solana RPC",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "id": 22,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(contra_operator_rpc_send_duration_seconds_count{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}} / {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "RPC Submissions/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "id": 25,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, program_type) (rate(contra_operator_rpc_send_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{program_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, program_type) (rate(contra_operator_rpc_send_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{program_type}}",
+          "refId": "B"
+        }
+      ],
+      "title": "RPC Send Duration",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "id": 130,
+      "title": "Withdrawals",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "postgres-indexer" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "id": 30,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "showLegend": true },
+        "tooltip": { "mode": "single" },
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "pieType": "pie"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "postgres-indexer" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT status AS metric, COUNT(*) AS value\nFROM transactions\nWHERE transaction_type = 'withdrawal'\nGROUP BY status",
+          "refId": "A"
+        }
+      ],
+      "title": "Withdrawal Status Breakdown",
+      "type": "piechart"
+    },
+    {
+      "datasource": { "type": "postgres", "uid": "postgres-indexer" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "id": 31,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "postgres", "uid": "postgres-indexer" },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT\n  $__timeGroup(created_at, $__interval) AS time,\n  COUNT(*) AS \"pending withdrawals\"\nFROM transactions\nWHERE transaction_type = 'withdrawal'\n  AND status = 'pending'\n  AND $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "title": "Pending Withdrawals Over Time",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
+      "id": 140,
+      "title": "Feepayer",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "unit": "none",
+          "custom": {
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "id": 40,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "contra_feepayer_balance_lamports{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"} / 1e9",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Feepayer SOL Balance",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
       "id": 100,
       "title": "Infrastructure",
       "type": "row"
@@ -31,7 +333,7 @@
         "defaults": { "decimals": 2, "unit": "percent" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 53 },
       "id": 1,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -53,7 +355,7 @@
         "defaults": { "decimals": 2, "unit": "decmbytes" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 53 },
       "id": 2,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -75,7 +377,7 @@
         "defaults": { "unit": "Bps" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 61 },
       "id": 3,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -102,7 +404,7 @@
         "defaults": { "min": 0, "unit": "short" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 61 },
       "id": 4,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -116,308 +418,6 @@
         }
       ],
       "title": "Container Restarts (24h)",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
-      "id": 110,
-      "title": "Operator Metrics",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "ops" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
-      "id": 21,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "rate(contra_operator_transactions_fetched_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
-          "legendFormat": "{{program_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Transactions Fetched/sec",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "short" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
-      "id": 28,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "contra_operator_backlog_depth{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
-          "legendFormat": "{{program_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Backlog Depth",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "ops" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
-      "id": 27,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "rate(contra_operator_mints_sent_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
-          "legendFormat": "{{program_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Mints Sent/sec",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
-      "id": 26,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "rate(contra_operator_transaction_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
-          "legendFormat": "{{program_type}} / {{error_reason}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Transaction Errors/sec",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "ops" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
-      "id": 23,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "rate(contra_operator_db_updates_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
-          "legendFormat": "{{program_type}} / {{status}}",
-          "refId": "A"
-        }
-      ],
-      "title": "DB Updates/sec",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "fixed", "fixedColor": "red" },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
-      "id": 24,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "rate(contra_operator_db_update_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
-          "legendFormat": "{{program_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "DB Update Errors/sec",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 },
-      "id": 120,
-      "title": "Solana RPC",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "ops" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
-      "id": 22,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "rate(contra_operator_rpc_send_duration_seconds_count{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
-          "legendFormat": "{{program_type}} / {{result}}",
-          "refId": "A"
-        }
-      ],
-      "title": "RPC Submissions/sec",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": { "unit": "s" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
-      "id": 25,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum by (le, program_type) (rate(contra_operator_rpc_send_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
-          "legendFormat": "p50 {{program_type}}",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le, program_type) (rate(contra_operator_rpc_send_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
-          "legendFormat": "p99 {{program_type}}",
-          "refId": "B"
-        }
-      ],
-      "title": "RPC Send Duration",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
-      "id": 130,
-      "title": "Withdrawals",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "postgres-indexer" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
-      "id": 30,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "single" },
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "pieType": "pie"
-      },
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "postgres-indexer" },
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT status AS metric, COUNT(*) AS value\nFROM transactions\nWHERE transaction_type = 'withdrawal'\nGROUP BY status",
-          "refId": "A"
-        }
-      ],
-      "title": "Withdrawal Status Breakdown",
-      "type": "piechart"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "postgres-indexer" },
-      "fieldConfig": {
-        "defaults": { "unit": "short" },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
-      "id": 31,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "postgres-indexer" },
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  $__timeGroup(created_at, $__interval) AS time,\n  COUNT(*) AS \"pending withdrawals\"\nFROM transactions\nWHERE transaction_type = 'withdrawal'\n  AND status = 'pending'\n  AND $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
-          "refId": "A"
-        }
-      ],
-      "title": "Pending Withdrawals Over Time",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 60 },
-      "id": 140,
-      "title": "Feepayer",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "decimals": 4,
-          "unit": "none",
-          "custom": {
-            "thresholdsStyle": { "mode": "line" }
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 0.5 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 61 },
-      "id": 40,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      },
-      "targets": [
-        {
-          "expr": "contra_feepayer_balance_lamports{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"} / 1e9",
-          "legendFormat": "{{program_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Feepayer SOL Balance",
       "type": "timeseries"
     }
   ],

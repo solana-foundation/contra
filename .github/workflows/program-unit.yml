@@ -22,6 +22,8 @@ env:
 
 permissions:
   contents: read
+  pull-requests: write
+  actions: read
 
 jobs:
   unit-test:
@@ -60,7 +62,26 @@ jobs:
             coverage/coverage-escrow-html/
             coverage/coverage-withdraw-unit.lcov
             coverage/coverage-withdraw-html/
+          if-no-files-found: warn
           retention-days: 30
+
+      - name: Update PR coverage — Escrow Program
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Escrow Program
+          lcov-file: coverage/coverage-escrow-unit.lcov
+          artifact-name: unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR coverage — Withdraw Program
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Withdraw Program
+          lcov-file: coverage/coverage-withdraw-unit.lcov
+          artifact-name: unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show failure logs
         if: failure()

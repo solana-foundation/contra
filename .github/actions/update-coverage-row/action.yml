@@ -1,0 +1,182 @@
+name: Update Coverage Row
+description: Parse LCOV file and update a single row in the PR body coverage table
+
+inputs:
+  component:
+    description: 'Component name matching a table row (e.g. "Core", "Indexer", "Gateway")'
+    required: true
+  lcov-file:
+    description: 'Path to the LCOV file'
+    required: true
+  artifact-name:
+    description: 'Name of the uploaded artifact (used for link text)'
+    required: true
+  github-token:
+    description: 'GitHub token with pull-requests:write'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Parse LCOV coverage
+      id: parse
+      shell: bash
+      run: |
+        LCOV_FILE="${{ inputs.lcov-file }}"
+        if [ ! -f "$LCOV_FILE" ]; then
+          echo "::error::LCOV file not found: $LCOV_FILE"
+          exit 1
+        fi
+        if [ ! -s "$LCOV_FILE" ]; then
+          echo "::error::LCOV file is empty: $LCOV_FILE"
+          exit 1
+        fi
+        LINES_TOTAL=$(awk -F: '/^LF:/{sum+=$2} END{print sum+0}' "$LCOV_FILE")
+        LINES_HIT=$(awk -F: '/^LH:/{sum+=$2} END{print sum+0}' "$LCOV_FILE")
+        if [ "$LINES_TOTAL" -gt 0 ]; then
+          COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_TOTAL" | bc)
+        else
+          COV="0.0"
+        fi
+        echo "lines_hit=$LINES_HIT" >> $GITHUB_OUTPUT
+        echo "lines_total=$LINES_TOTAL" >> $GITHUB_OUTPUT
+        echo "coverage=$COV" >> $GITHUB_OUTPUT
+        echo "Parsed $LCOV_FILE: $LINES_HIT / $LINES_TOTAL = ${COV}%"
+
+    - name: Update PR body
+      uses: actions/github-script@v7
+      env:
+        INPUT_COMPONENT: ${{ inputs.component }}
+        INPUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        INPUT_LINES_HIT: ${{ steps.parse.outputs.lines_hit }}
+        INPUT_LINES_TOTAL: ${{ steps.parse.outputs.lines_total }}
+        INPUT_COVERAGE: ${{ steps.parse.outputs.coverage }}
+        INPUT_RUN_ID: ${{ github.run_id }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const component = process.env.INPUT_COMPONENT;
+          const linesHit = parseInt(process.env.INPUT_LINES_HIT, 10);
+          const linesTotal = parseInt(process.env.INPUT_LINES_TOTAL, 10);
+          const coverage = process.env.INPUT_COVERAGE;
+          const artifactName = process.env.INPUT_ARTIFACT_NAME;
+          const runId = process.env.INPUT_RUN_ID;
+          const repo = context.repo;
+          const prNumber = context.payload.pull_request?.number;
+
+          if (!prNumber) {
+            console.log('Not a PR event, skipping PR body update');
+            return;
+          }
+
+          if (isNaN(linesHit) || isNaN(linesTotal)) {
+            core.setFailed(`Invalid coverage data: hit=${process.env.INPUT_LINES_HIT}, total=${process.env.INPUT_LINES_TOTAL}`);
+            return;
+          }
+
+          const VALID_COMPONENTS = ['Core', 'Indexer', 'Gateway', 'Withdraw Program', 'Escrow Program', 'E2E Integration'];
+          if (!VALID_COMPONENTS.includes(component)) {
+            core.setFailed(`Unknown component "${component}". Valid: ${VALID_COMPONENTS.join(', ')}`);
+            return;
+          }
+
+          const artifactLink = `[${artifactName}](https://github.com/${repo.owner}/${repo.repo}/actions/runs/${runId})`;
+          const fmtHit = linesHit.toLocaleString('en-US');
+          const fmtTotal = linesTotal.toLocaleString('en-US');
+
+          const SKELETON = [
+            '',
+            '### Coverage Report',
+            '',
+            '| Component | Lines Hit | Lines Total | Coverage | Artifact |',
+            '|-----------|-----------|-------------|----------|----------|',
+            '| Core | - | - | - | - |',
+            '| Indexer | - | - | - | - |',
+            '| Gateway | - | - | - | - |',
+            '| Withdraw Program | - | - | - | - |',
+            '| Escrow Program | - | - | - | - |',
+            '| E2E Integration | - | - | - | - |',
+            '| **Total** | **-** | **-** | **-** | |',
+            '',
+            '> Last updated: — by —',
+          ].join('\n');
+
+          function recalcTotal(body) {
+            const components = ['Core', 'Indexer', 'Gateway', 'Withdraw Program', 'Escrow Program', 'E2E Integration'];
+            let totalHit = 0;
+            let totalTotal = 0;
+            let hasAny = false;
+
+            for (const comp of components) {
+              const re = new RegExp(`\\| ${comp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\| ([\\d,]+) \\| ([\\d,]+) \\|`);
+              const m = body.match(re);
+              if (m) {
+                totalHit += parseInt(m[1].replace(/,/g, ''), 10);
+                totalTotal += parseInt(m[2].replace(/,/g, ''), 10);
+                hasAny = true;
+              }
+            }
+
+            if (hasAny && totalTotal > 0) {
+              const pct = ((totalHit / totalTotal) * 100).toFixed(1);
+              const fH = totalHit.toLocaleString('en-US');
+              const fT = totalTotal.toLocaleString('en-US');
+              body = body.replace(
+                /\| \*\*Total\*\* \|[^\n]+/,
+                `| **Total** | **${fH}** | **${fT}** | **${pct}%** | |`
+              );
+            }
+            return body;
+          }
+
+          async function tryUpdate(attempt = 1) {
+            // Jitter to reduce collision probability between concurrent workflows
+            const jitter = Math.floor(Math.random() * 3000);
+            await new Promise(r => setTimeout(r, jitter));
+
+            const { data: pr } = await github.rest.pulls.get({
+              ...repo,
+              pull_number: prNumber,
+            });
+
+            let body = pr.body || '';
+
+            if (!body.includes('### Coverage Report')) {
+              body = body + SKELETON;
+            }
+
+            // Replace this component's row
+            const rowRegex = new RegExp(
+              `\\| ${component.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|[^\\n]+`
+            );
+            const newRow = `| ${component} | ${fmtHit} | ${fmtTotal} | ${coverage}% | ${artifactLink} |`;
+            body = body.replace(rowRegex, newRow);
+
+            // Recalculate total
+            body = recalcTotal(body);
+
+            // Update timestamp
+            const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z/, ' UTC');
+            body = body.replace(
+              /> Last updated:.*/,
+              `> Last updated: ${ts} by ${component}`
+            );
+
+            try {
+              await github.rest.pulls.update({
+                ...repo,
+                pull_number: prNumber,
+                body,
+              });
+              console.log(`Updated PR #${prNumber} — ${component}: ${fmtHit}/${fmtTotal} (${coverage}%)`);
+            } catch (e) {
+              if (attempt < 3) {
+                console.log(`PR body update failed (attempt ${attempt}/${3}): ${e.message}. Retrying...`);
+                await new Promise(r => setTimeout(r, 1000 * attempt));
+                return tryUpdate(attempt + 1);
+              }
+              throw e;
+            }
+          }
+
+          await tryUpdate();

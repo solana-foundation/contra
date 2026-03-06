@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, hardening/pre-release-audit]
 
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -252,6 +257,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Update PR coverage — E2E Integration
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: E2E Integration
+          lcov-file: coverage/coverage-integration-e2e.lcov
+          artifact-name: e2e-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
   unit-tests:
     name: Core + Indexer Unit Coverage
     needs: [changes, build-artifacts]
@@ -291,3 +305,30 @@ jobs:
             coverage/coverage-indexer-unit.lcov
             coverage/coverage-gateway-unit.lcov
           retention-days: 7
+
+      - name: Update PR coverage — Core
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Core
+          lcov-file: coverage/coverage-core-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR coverage — Indexer
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Indexer
+          lcov-file: coverage/coverage-indexer-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR coverage — Gateway
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Gateway
+          lcov-file: coverage/coverage-gateway-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, hardening/pre-release-audit]
 
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -15,6 +20,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  init-coverage-table:
+    name: Initialize Coverage Table
+    if: github.event_name == 'pull_request'
+    runs-on: contra-runner-1
+    steps:
+      - name: Insert coverage skeleton into PR body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) return;
+
+            const { data: pr } = await github.rest.pulls.get({
+              ...repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.body && pr.body.includes('### Coverage Report')) {
+              console.log('Coverage table already exists, skipping');
+              return;
+            }
+
+            const skeleton = [
+              '',
+              '### Coverage Report',
+              '',
+              '| Component | Lines Hit | Lines Total | Coverage | Artifact |',
+              '|-----------|-----------|-------------|----------|----------|',
+              '| Core | - | - | - | - |',
+              '| Indexer | - | - | - | - |',
+              '| Gateway | - | - | - | - |',
+              '| Withdraw Program | - | - | - | - |',
+              '| Escrow Program | - | - | - | - |',
+              '| E2E Integration | - | - | - | - |',
+              '| **Total** | **-** | **-** | **-** | |',
+              '',
+              '> Coverage runs in progress...',
+            ].join('\n');
+
+            const body = (pr.body || '') + skeleton;
+            await github.rest.pulls.update({
+              ...repo,
+              pull_number: prNumber,
+              body,
+            });
+            console.log(`Inserted coverage skeleton into PR #${prNumber}`);
+
   changes:
     name: Detect Changed Areas
     runs-on: contra-runner-1
@@ -252,6 +305,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Update PR coverage — E2E Integration
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: E2E Integration
+          lcov-file: coverage/coverage-integration-e2e.lcov
+          artifact-name: e2e-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
   unit-tests:
     name: Core + Indexer Unit Coverage
     needs: [changes, build-artifacts]
@@ -291,3 +353,30 @@ jobs:
             coverage/coverage-indexer-unit.lcov
             coverage/coverage-gateway-unit.lcov
           retention-days: 7
+
+      - name: Update PR coverage — Core
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Core
+          lcov-file: coverage/coverage-core-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR coverage — Indexer
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Indexer
+          lcov-file: coverage/coverage-indexer-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR coverage — Gateway
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Gateway
+          lcov-file: coverage/coverage-gateway-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}

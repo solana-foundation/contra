@@ -156,4 +156,77 @@ mod tests {
         assert_eq!(instance.instance_seed, instance_seed);
         assert_eq!(instance.withdrawal_transactions_root, EMPTY_TREE_ROOT);
     }
+
+    #[test]
+    fn test_checked_add_overflow_tree_index() {
+        // Verify that checked_add on u64::MAX returns None (would cause ArithmeticOverflow)
+        let admin = Pubkey::new_from_array([0u8; 32]);
+        let instance_seed = Pubkey::new_from_array([0u8; 32]);
+        let mut instance = Instance::new(1, instance_seed, admin);
+
+        // Simulate tree_index at u64::MAX
+        instance.current_tree_index = u64::MAX;
+
+        // checked_add(1) should return None, which the processor maps to ArithmeticOverflow
+        let result = instance.current_tree_index.checked_add(1);
+        assert_eq!(
+            result, None,
+            "checked_add(1) on u64::MAX should return None (overflow)"
+        );
+    }
+
+    #[test]
+    fn test_validate_current_tree_index_nonce_zero() {
+        let admin = Pubkey::new_from_array([0u8; 32]);
+        let instance_seed = Pubkey::new_from_array([0u8; 32]);
+        let instance = Instance::new(1, instance_seed, admin);
+
+        // tree_index=0, nonce=0 -> expected_tree_index = 0/65536 = 0. Should pass.
+        let result = instance.validate_current_tree_index(0);
+        assert!(result.is_ok(), "Nonce 0 should be valid for tree_index 0");
+    }
+
+    #[test]
+    fn test_validate_current_tree_index_boundary() {
+        let admin = Pubkey::new_from_array([0u8; 32]);
+        let instance_seed = Pubkey::new_from_array([0u8; 32]);
+        let instance = Instance::new(1, instance_seed, admin);
+
+        // tree_index=0: valid nonces are 0..65535
+        // nonce=65535 -> expected_tree_index = 65535/65536 = 0. Should pass.
+        let result = instance.validate_current_tree_index(MAX_TREE_LEAVES as u64 - 1);
+        assert!(
+            result.is_ok(),
+            "Last nonce in tree_index=0 range should be valid"
+        );
+
+        // nonce=65536 -> expected_tree_index = 65536/65536 = 1. Should fail for tree_index=0.
+        let result = instance.validate_current_tree_index(MAX_TREE_LEAVES as u64);
+        assert!(
+            result.is_err(),
+            "First nonce of tree_index=1 should be invalid for tree_index=0"
+        );
+    }
+
+    #[test]
+    fn test_serialization_roundtrip() {
+        let admin = Pubkey::new_from_array([42u8; 32]);
+        let instance_seed = Pubkey::new_from_array([7u8; 32]);
+        let mut instance = Instance::new(255, instance_seed, admin);
+        instance.current_tree_index = 12345;
+        instance.withdrawal_transactions_root = [99u8; 32];
+
+        let bytes = instance.to_bytes();
+        let deserialized = Instance::try_from_bytes(&bytes).expect("Should deserialize");
+
+        assert_eq!(deserialized.bump, instance.bump);
+        assert_eq!(deserialized.version, instance.version);
+        assert_eq!(deserialized.instance_seed, instance.instance_seed);
+        assert_eq!(deserialized.admin, instance.admin);
+        assert_eq!(
+            deserialized.withdrawal_transactions_root,
+            instance.withdrawal_transactions_root
+        );
+        assert_eq!(deserialized.current_tree_index, instance.current_tree_index);
+    }
 }

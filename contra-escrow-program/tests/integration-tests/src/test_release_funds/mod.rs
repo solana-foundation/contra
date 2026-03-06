@@ -849,3 +849,268 @@ fn test_release_funds_with_smt_reset() {
         INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
     );
 }
+
+#[test]
+fn test_release_funds_nonce_zero_boundary() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+
+    // Use nonce = 0 (boundary value)
+    let nonce: u64 = 0;
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
+
+    smt.insert(nonce);
+    let new_withdrawal_root = smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        new_withdrawal_root,
+        nonce,
+        sibling_proofs,
+        false,
+    )
+    .expect("Release with nonce=0 should succeed");
+}
+
+#[test]
+fn test_release_funds_single_leaf_smt() {
+    // Test SMT operations with exactly one leaf inserted
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let large_deposit = 10_000_000;
+    let release_amount = 100_000;
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        large_deposit,
+    );
+
+    // Insert exactly one leaf and verify the tree works correctly
+    let single_nonce: u64 = 1;
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(single_nonce);
+
+    smt.insert(single_nonce);
+    let new_root = smt.current_root();
+
+    // First release with the single nonce should succeed
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        release_amount,
+        &user.pubkey(),
+        new_root,
+        single_nonce,
+        sibling_proofs,
+        false,
+    )
+    .expect("Single-leaf SMT release should succeed");
+
+    // A different nonce should also work against the single-leaf tree
+    let second_nonce: u64 = 2;
+    let (_, second_proofs) = smt.generate_exclusion_proof_for_verification(second_nonce);
+
+    smt.insert(second_nonce);
+    let second_root = smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        release_amount,
+        &user.pubkey(),
+        second_root,
+        second_nonce,
+        second_proofs,
+        false,
+    )
+    .expect("Second release against single-leaf SMT should succeed");
+
+    // Replaying the single nonce should fail (SMT now has two leaves)
+    let replay_result = assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        release_amount,
+        &user.pubkey(),
+        second_root,
+        single_nonce,
+        sibling_proofs, // Old proofs for the single nonce
+        false,
+    );
+
+    assert_program_error(replay_result, INVALID_SMT_PROOF_ERROR);
+}
+
+#[test]
+fn test_release_funds_max_depth_smt_proof() {
+    // Verify the full 16-level depth of the SMT works end-to-end.
+    // Use a nonce that exercises all 16 bits of the leaf position
+    // (position = nonce % 65536). Nonce 65535 = 0xFFFF sets all bits.
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+
+    // Use nonce that maps to last leaf position (65535 = all bits set)
+    let max_position_nonce: u64 = (MAX_TREE_LEAVES as u64) - 1;
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(max_position_nonce);
+
+    smt.insert(max_position_nonce);
+    let new_root = smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        new_root,
+        max_position_nonce,
+        sibling_proofs,
+        false,
+    )
+    .expect("Release with max-position nonce (all bits set) should succeed");
+}

@@ -34,7 +34,7 @@ runs:
         LINES_TOTAL=$(awk -F: '/^LF:/{sum+=$2} END{print sum+0}' "$LCOV_FILE")
         LINES_HIT=$(awk -F: '/^LH:/{sum+=$2} END{print sum+0}' "$LCOV_FILE")
         if [ "$LINES_TOTAL" -gt 0 ]; then
-          COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_TOTAL" | bc)
+          COV=$(printf "%.1f" "$(echo "scale=4; $LINES_HIT * 100 / $LINES_TOTAL" | bc)")
         else
           COV="0.0"
         fi
@@ -70,36 +70,17 @@ runs:
           }
 
           if (isNaN(linesHit) || isNaN(linesTotal)) {
-            core.setFailed(`Invalid coverage data: hit=${process.env.INPUT_LINES_HIT}, total=${process.env.INPUT_LINES_TOTAL}`);
-            return;
+            throw new Error(`Invalid coverage data: hit=${process.env.INPUT_LINES_HIT}, total=${process.env.INPUT_LINES_TOTAL}`);
           }
 
           const VALID_COMPONENTS = ['Core', 'Indexer', 'Gateway', 'Withdraw Program', 'Escrow Program', 'E2E Integration'];
           if (!VALID_COMPONENTS.includes(component)) {
-            core.setFailed(`Unknown component "${component}". Valid: ${VALID_COMPONENTS.join(', ')}`);
-            return;
+            throw new Error(`Unknown component "${component}". Valid: ${VALID_COMPONENTS.join(', ')}`);
           }
 
           const artifactLink = `[${artifactName}](https://github.com/${repo.owner}/${repo.repo}/actions/runs/${runId})`;
           const fmtHit = linesHit.toLocaleString('en-US');
           const fmtTotal = linesTotal.toLocaleString('en-US');
-
-          const SKELETON = [
-            '',
-            '### Coverage Report',
-            '',
-            '| Component | Lines Hit | Lines Total | Coverage | Artifact |',
-            '|-----------|-----------|-------------|----------|----------|',
-            '| Core | - | - | - | - |',
-            '| Indexer | - | - | - | - |',
-            '| Gateway | - | - | - | - |',
-            '| Withdraw Program | - | - | - | - |',
-            '| Escrow Program | - | - | - | - |',
-            '| E2E Integration | - | - | - | - |',
-            '| **Total** | **-** | **-** | **-** | |',
-            '',
-            '> Last updated: — by —',
-          ].join('\n');
 
           function recalcTotal(body) {
             const components = ['Core', 'Indexer', 'Gateway', 'Withdraw Program', 'Escrow Program', 'E2E Integration'];
@@ -129,9 +110,11 @@ runs:
             return body;
           }
 
+          const MAX_ATTEMPTS = 5;
+
           async function tryUpdate(attempt = 1) {
             // Jitter to reduce collision probability between concurrent workflows
-            const jitter = Math.floor(Math.random() * 3000);
+            const jitter = Math.floor(Math.random() * 5000) + 1000;
             await new Promise(r => setTimeout(r, jitter));
 
             const { data: pr } = await github.rest.pulls.get({
@@ -142,7 +125,12 @@ runs:
             let body = pr.body || '';
 
             if (!body.includes('### Coverage Report')) {
-              body = body + SKELETON;
+              console.log('Coverage table not found in PR body. It may not have been initialized yet. Retrying...');
+              if (attempt < MAX_ATTEMPTS) {
+                await new Promise(r => setTimeout(r, 5000));
+                return tryUpdate(attempt + 1);
+              }
+              throw new Error('Coverage table not found in PR body after all attempts');
             }
 
             // Replace this component's row
@@ -150,15 +138,20 @@ runs:
               `\\| ${component.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|[^\\n]+`
             );
             const newRow = `| ${component} | ${fmtHit} | ${fmtTotal} | ${coverage}% | ${artifactLink} |`;
+
+            if (!rowRegex.test(body)) {
+              throw new Error(`Component row "${component}" not found in PR body`);
+            }
+
             body = body.replace(rowRegex, newRow);
 
             // Recalculate total
             body = recalcTotal(body);
 
-            // Update timestamp
+            // Update timestamp (matches both initial "Coverage runs in progress..." and subsequent "Last updated:" lines)
             const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z/, ' UTC');
             body = body.replace(
-              /> Last updated:.*/,
+              /> (Coverage runs in progress\.\.\.|Last updated:.*)/,
               `> Last updated: ${ts} by ${component}`
             );
 
@@ -170,9 +163,10 @@ runs:
               });
               console.log(`Updated PR #${prNumber} — ${component}: ${fmtHit}/${fmtTotal} (${coverage}%)`);
             } catch (e) {
-              if (attempt < 3) {
-                console.log(`PR body update failed (attempt ${attempt}/${3}): ${e.message}. Retrying...`);
-                await new Promise(r => setTimeout(r, 1000 * attempt));
+              if (attempt < MAX_ATTEMPTS) {
+                const backoff = 2000 * attempt + Math.floor(Math.random() * 2000);
+                console.log(`PR body update failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${e.message}. Retrying in ${backoff}ms...`);
+                await new Promise(r => setTimeout(r, backoff));
                 return tryUpdate(attempt + 1);
               }
               throw e;

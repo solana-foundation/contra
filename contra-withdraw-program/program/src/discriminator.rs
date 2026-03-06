@@ -14,3 +14,26 @@ impl TryFrom<u8> for ContraWithdrawInstructionDiscriminators {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_discriminator_valid() {
+        let result = ContraWithdrawInstructionDiscriminators::try_from(0u8);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            ContraWithdrawInstructionDiscriminators::WithdrawFunds
+        );
+    }
+
+    #[test]
+    fn test_discriminator_invalid() {
+        let result = ContraWithdrawInstructionDiscriminators::try_from(1u8);
+
+        assert!(result.is_err());
+    }
+}

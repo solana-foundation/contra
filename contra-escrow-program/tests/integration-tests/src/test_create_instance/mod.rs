@@ -2,8 +2,9 @@ use crate::{
     pda_utils::{find_event_authority_pda, find_instance_pda},
     state_utils::assert_get_or_create_instance,
     utils::{
-        assert_program_error, TestContext, CONTRA_ESCROW_PROGRAM_ID,
-        INVALID_INSTRUCTION_DATA_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        assert_program_error, TestContext, CONTRA_ESCROW_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR,
+        INVALID_EVENT_AUTHORITY_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
+        MISSING_REQUIRED_SIGNATURE_ERROR,
     },
 };
 use contra_escrow_program_client::instructions::CreateInstanceBuilder;
@@ -126,4 +127,79 @@ fn test_create_instance_invalid_admin_not_signer() {
     let result = context.send_transaction_with_signers(instruction, &[&instance_seed]);
 
     assert_program_error(result, MISSING_REQUIRED_SIGNATURE_ERROR);
+}
+
+#[test]
+fn test_create_instance_invalid_event_authority() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    context
+        .airdrop_if_required(&admin.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
+    let wrong_event_authority = Pubkey::new_unique(); // Not the real event authority PDA
+
+    let accounts = vec![
+        AccountMeta::new(context.payer.pubkey(), true), // payer (signer, writable)
+        AccountMeta::new_readonly(admin.pubkey(), true), // admin (signer)
+        AccountMeta::new_readonly(instance_seed.pubkey(), true), // instance_seed (signer)
+        AccountMeta::new(instance_pda, false),          // instance (writable)
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
+        AccountMeta::new_readonly(wrong_event_authority, false), // event_authority (WRONG)
+        AccountMeta::new_readonly(CONTRA_ESCROW_PROGRAM_ID, false), // contra_escrow_program
+    ];
+
+    let mut data = vec![0]; // discriminator for CreateInstance
+    data.push(bump); // bump
+
+    let instruction = Instruction {
+        program_id: CONTRA_ESCROW_PROGRAM_ID,
+        accounts,
+        data,
+    };
+
+    let result = context.send_transaction_with_signers(instruction, &[&admin, &instance_seed]);
+
+    assert_program_error(result, INVALID_EVENT_AUTHORITY_ERROR);
+}
+
+#[test]
+fn test_create_instance_invalid_system_program() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    context
+        .airdrop_if_required(&admin.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let wrong_system_program = Pubkey::new_unique();
+
+    let accounts = vec![
+        AccountMeta::new(context.payer.pubkey(), true), // payer (signer, writable)
+        AccountMeta::new_readonly(admin.pubkey(), true), // admin (signer)
+        AccountMeta::new_readonly(instance_seed.pubkey(), true), // instance_seed (signer)
+        AccountMeta::new(instance_pda, false),          // instance (writable)
+        AccountMeta::new_readonly(wrong_system_program, false), // system_program (WRONG)
+        AccountMeta::new_readonly(event_authority_pda, false), // event_authority
+        AccountMeta::new_readonly(CONTRA_ESCROW_PROGRAM_ID, false), // contra_escrow_program
+    ];
+
+    let mut data = vec![0]; // discriminator for CreateInstance
+    data.push(bump); // bump
+
+    let instruction = Instruction {
+        program_id: CONTRA_ESCROW_PROGRAM_ID,
+        accounts,
+        data,
+    };
+
+    let result = context.send_transaction_with_signers(instruction, &[&admin, &instance_seed]);
+
+    assert_program_error(result, INCORRECT_PROGRAM_ID_ERROR);
 }

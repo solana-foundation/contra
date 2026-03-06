@@ -65,6 +65,9 @@ pub const INVALID_ACCOUNT_OWNER_ERROR: u32 = 23; // ProgramError::InvalidAccount
 pub const INVALID_SEEDS_ERROR: u32 = 14; // ProgramError::InvalidSeeds
 pub const MISSING_REQUIRED_SIGNATURE_ERROR: u32 = 0; // ProgramError::MissingRequiredSignature
 
+// Standard Solana Program Error Codes (continued)
+pub const INCORRECT_PROGRAM_ID_ERROR: u32 = 100; // ProgramError::IncorrectProgramId (string match)
+
 // SPL Token Program Error Codes
 pub const TOKEN_INSUFFICIENT_FUNDS_ERROR: u32 = 1; // TokenError::InsufficientFunds (from spl-token)
 
@@ -106,16 +109,19 @@ impl TestContext {
         pubkey: &Pubkey,
         lamports: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(account) = self.svm.get_account(pubkey) {
-            if account.lamports < MIN_LAMPORTS {
-                return match self.svm.airdrop(pubkey, lamports) {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(format!("Airdrop failed: {:?}", e).into()),
-                };
-            }
-        }
+        let needs_airdrop = match self.svm.get_account(pubkey) {
+            Some(account) => account.lamports < MIN_LAMPORTS,
+            None => true,
+        };
 
-        Ok(())
+        if needs_airdrop {
+            match self.svm.airdrop(pubkey, lamports) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!("Airdrop failed: {:?}", e).into()),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     pub fn create_account(
@@ -419,6 +425,7 @@ pub fn assert_program_error(
                 6 => vec!["InvalidAccountData"],
                 14 => vec!["InvalidSeeds"],
                 23 => vec!["InvalidAccountOwner"],
+                100 => vec!["IncorrectProgramId"],
                 _ => vec![],
             };
 

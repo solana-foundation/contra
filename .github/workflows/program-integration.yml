@@ -38,33 +38,19 @@ jobs:
       - name: Setup environment
         uses: ./.github/actions/setup-environment
         with:
-          rust-components: llvm-tools-preview
+          install-base-cargo-tools: "false"
           build-programs: "false"
 
-      - name: Run integration tests with coverage
+      - name: Build programs
         run: |
-          echo "🧪 Running integration tests with coverage..."
-          make integration-coverage
+          make -C contra-escrow-program build
+          make -C contra-withdraw-program build
 
-      - name: Generate HTML coverage report
-        run: |
-          echo "📊 Generating HTML coverage reports..."
-          make coverage-html
+      - name: Run escrow integration tests
+        run: make -C contra-escrow-program integration-test-no-build
 
-      - name: Display coverage summary
-        run: |
-          echo "📈 Coverage summary will be shown by make integration-coverage"
-
-      - name: Upload coverage reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-coverage-reports
-          path: |
-            coverage/coverage-escrow-integration.lcov
-            coverage/coverage-escrow-html/
-            coverage/coverage-withdraw-integration.lcov
-            coverage/coverage-withdraw-html/
-          retention-days: 30
+      - name: Run withdraw integration tests
+        run: make -C contra-withdraw-program integration-test-no-build
 
       - name: Show failure logs
         if: failure()

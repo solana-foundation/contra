@@ -1,29 +1,44 @@
 name: TypeScript SDK Unit Tests
 
+concurrency:
+  group: sdk-unit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   workflow_call:
   push:
     branches: [main, hardening/pre-release-audit]
     paths:
       - "contra-escrow-program/clients/typescript/**"
+      - "contra-withdraw-program/clients/typescript/**"
       - ".github/workflows/sdk-unit.yml"
       - "contra-escrow-program/idl/**"
       - "contra-escrow-program/scripts/**"
       - "contra-escrow-program/package.json"
+      - "contra-withdraw-program/idl/**"
+      - "contra-withdraw-program/scripts/**"
+      - "contra-withdraw-program/package.json"
 
   pull_request:
     branches: [main, hardening/pre-release-audit]
     paths:
       - "contra-escrow-program/clients/typescript/**"
+      - "contra-withdraw-program/clients/typescript/**"
       - ".github/workflows/sdk-unit.yml"
       - "contra-escrow-program/idl/**"
       - "contra-escrow-program/scripts/**"
       - "contra-escrow-program/package.json"
+      - "contra-withdraw-program/idl/**"
+      - "contra-withdraw-program/scripts/**"
+      - "contra-withdraw-program/package.json"
 
 jobs:
   typescript-sdk-unit:
     name: TypeScript SDK Unit Tests
     runs-on: contra-runner-1
+    strategy:
+      matrix:
+        program: [contra-escrow-program, contra-withdraw-program]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -50,42 +65,44 @@ jobs:
           key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-pnpm-
 
-      - name: Install root dependencies
+      - name: Install dependencies
         shell: bash
-        run: cd contra-escrow-program && pnpm install --frozen-lockfile
+        run: cd ${{ matrix.program }} && pnpm install --frozen-lockfile
 
       - name: Generate clients
-        run: cd contra-escrow-program && pnpm run generate-clients
+        run: cd ${{ matrix.program }} && pnpm run generate-clients
 
       - name: Check code formatting
-        run: cd contra-escrow-program && pnpm run format:check
+        run: cd ${{ matrix.program }} && pnpm run format:check
 
       - name: Build TypeScript SDK
-        run: cd contra-escrow-program && pnpm run build
+        run: cd ${{ matrix.program }} && pnpm run build
 
       - name: Run TypeScript unit tests with coverage
         run: |
-          echo "🧪 Running TypeScript SDK unit tests with coverage..."
-          cd contra-escrow-program && pnpm run test:unit --coverage --coverageDirectory=coverage-unit
+          cd ${{ matrix.program }} && pnpm run test:unit --coverage --coverageDirectory=coverage-unit
+
+      - name: Display coverage summary
+        working-directory: ${{ matrix.program }}/clients/typescript
+        run: |
+          if [ -f coverage-unit/coverage-summary.json ]; then
+            cat coverage-unit/coverage-summary.json | jq '.total'
+          fi
+
+      - name: Prepare coverage for upload
+        run: |
+          cp ${{ matrix.program }}/clients/typescript/coverage-unit/lcov.info ./coverage-ts.lcov 2>/dev/null || true
 
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
         with:
-          name: ts-unit-coverage-reports
-          path: |
-            contra-escrow-program/clients/typescript/coverage-unit/
+          name: ts-unit-coverage-${{ matrix.program }}
+          path: coverage-ts.lcov
+          if-no-files-found: warn
           retention-days: 30
-
-      - name: Display coverage summary
-        working-directory: contra-escrow-program/clients/typescript
-        run: |
-          if [ -f coverage-unit/coverage-summary.json ]; then
-            echo "📊 Coverage Summary:"
-            cat coverage-unit/coverage-summary.json | jq '.total'
-          fi
 
       - name: Show failure logs
         if: failure()
         uses: ./.github/actions/show-failure-logs
         with:
-          test-type: "TypeScript unit"
+          test-type: "TypeScript unit (${{ matrix.program }})"

@@ -2,7 +2,7 @@ name: Coverage Report
 
 on:
   workflow_run:
-    workflows: ["Program Unit Tests", "Program Integration Tests", "Rust Checks"]
+    workflows: ["Program Unit Tests", "Rust Checks", "TypeScript SDK Unit Tests"]
     types:
       - completed
   workflow_dispatch:
@@ -38,11 +38,17 @@ jobs:
         with:
           script: |
             const branch = context.payload.workflow_run?.head_branch || context.ref.replace(/^refs\/heads\//, '');
+            const headSha = context.payload.workflow_run?.head_sha;
             const workflows = {
               'program-unit.yml': 'unit_run_id',
-              'program-integration.yml': 'integration_run_id',
               'rust.yml': 'rust_run_id',
+              'sdk-unit.yml': 'ts_run_id',
             };
+
+            // Only accept runs that completed successfully for the EXACT same commit.
+            // This prevents stale artifacts from old pushes and ensures we wait for
+            // all sibling workflows to finish before generating the report.
+            let foundCount = 0;
             for (const [filename, output] of Object.entries(workflows)) {
               try {
                 const { data } = await github.rest.actions.listWorkflowRuns({
@@ -53,20 +59,38 @@ jobs:
                   status: 'completed',
                   per_page: 5,
                 });
-                const successful = data.workflow_runs.filter(r => r.conclusion === 'success');
-                if (successful.length > 0) {
-                  core.setOutput(output, successful[0].id);
-                  console.log(`${filename}: run ${successful[0].id}`);
+                const match = data.workflow_runs.find(
+                  r => r.conclusion === 'success' && (!headSha || r.head_sha === headSha)
+                );
+                if (match) {
+                  core.setOutput(output, match.id);
+                  console.log(`${filename}: run ${match.id} (sha: ${match.head_sha.slice(0,7)})`);
+                  foundCount++;
                 } else {
-                  console.log(`${filename}: no successful runs on ${branch}`);
+                  console.log(`${filename}: no successful run for ${headSha?.slice(0,7) || 'unknown'} on ${branch}`);
                 }
               } catch (e) {
                 console.log(`${filename}: lookup failed — ${e.message}`);
               }
             }
 
+            const totalWorkflows = Object.keys(workflows).length;
+            core.setOutput('all_found', foundCount === totalWorkflows ? 'true' : 'false');
+            if (foundCount < totalWorkflows) {
+              console.log(`Only ${foundCount}/${totalWorkflows} workflows succeeded for this SHA. Waiting for the rest.`);
+            }
+
+      - name: Wait for all workflows to complete
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          if [ "${{ steps.find-runs.outputs.all_found }}" != "true" ]; then
+            echo "Not all coverage workflows have completed yet — skipping this run."
+            echo "Coverage report will be generated when the last workflow finishes."
+            echo "SKIP_COVERAGE=true" >> $GITHUB_ENV
+          fi
+
       - name: Download program unit coverage
-        if: steps.find-runs.outputs.unit_run_id
+        if: env.SKIP_COVERAGE != 'true' && steps.find-runs.outputs.unit_run_id
         uses: actions/download-artifact@v4
         with:
           name: unit-coverage-reports
@@ -75,18 +99,8 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
-      - name: Download program integration coverage
-        if: steps.find-runs.outputs.integration_run_id
-        uses: actions/download-artifact@v4
-        with:
-          name: integration-coverage-reports
-          path: coverage-artifacts/integration
-          run-id: ${{ steps.find-runs.outputs.integration_run_id }}
-          github-token: ${{ github.token }}
-        continue-on-error: true
-
       - name: Download rust unit coverage
-        if: steps.find-runs.outputs.rust_run_id
+        if: env.SKIP_COVERAGE != 'true' && steps.find-runs.outputs.rust_run_id
         uses: actions/download-artifact@v4
         with:
           name: rust-unit-coverage-reports
@@ -95,39 +109,106 @@ jobs:
           github-token: ${{ github.token }}
         continue-on-error: true
 
+      - name: Download E2E integration coverage
+        if: env.SKIP_COVERAGE != 'true' && steps.find-runs.outputs.rust_run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-coverage-reports
+          path: coverage-artifacts/e2e
+          run-id: ${{ steps.find-runs.outputs.rust_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Download escrow TS coverage
+        if: env.SKIP_COVERAGE != 'true' && steps.find-runs.outputs.ts_run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: ts-unit-coverage-contra-escrow-program
+          path: coverage-artifacts/ts-escrow
+          run-id: ${{ steps.find-runs.outputs.ts_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
+      - name: Download withdraw TS coverage
+        if: env.SKIP_COVERAGE != 'true' && steps.find-runs.outputs.ts_run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: ts-unit-coverage-contra-withdraw-program
+          path: coverage-artifacts/ts-withdraw
+          run-id: ${{ steps.find-runs.outputs.ts_run_id }}
+          github-token: ${{ github.token }}
+        continue-on-error: true
+
       - name: Setup coverage tools
+        if: env.SKIP_COVERAGE != 'true'
         run: |
           npm install -g lcov-result-merger
           sudo apt-get update && sudo apt-get install -y bc jq
 
-      - name: Combine coverage reports
+      - name: Normalize and filter coverage files
+        if: env.SKIP_COVERAGE != 'true'
         run: |
-          if ls coverage-artifacts/**/*.lcov 1>/dev/null 2>&1; then
-            echo "Combining coverage reports..."
-            lcov-result-merger 'coverage-artifacts/**/*.lcov' coverage-combined.lcov
-            echo "Combined coverage report generated"
-          else
-            echo "No coverage reports found, skipping combination"
+          if [ ! -d coverage-artifacts ]; then
+            echo "ERROR: coverage-artifacts directory does not exist"
+            exit 1
           fi
+          # Rename lcov.info files to .lcov for consistent globbing
+          find coverage-artifacts -name 'lcov.info' -print0 | while IFS= read -r -d '' f; do
+            dir=$(dirname "$f")
+            mv "$f" "$dir/coverage.lcov"
+          done
+          # Remove empty coverage files
+          find coverage-artifacts -name '*.lcov' -print0 | while IFS= read -r -d '' f; do
+            if [ ! -s "$f" ]; then
+              echo "WARNING: Removing empty coverage file: $f"
+              rm "$f"
+            fi
+          done
+
+      - name: Verify coverage artifacts exist
+        if: env.SKIP_COVERAGE != 'true'
+        run: |
+          count=$(find coverage-artifacts -name '*.lcov' -type f 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: No coverage artifacts found after download and filtering"
+            exit 1
+          fi
+          echo "Found $count coverage file(s)"
+
+      - name: Combine coverage reports
+        if: env.SKIP_COVERAGE != 'true'
+        run: |
+          shopt -s globstar
+          lcov-result-merger 'coverage-artifacts/**/*.lcov' coverage-combined.lcov
+          if [ ! -s coverage-combined.lcov ]; then
+            echo "ERROR: lcov-result-merger produced empty output"
+            exit 1
+          fi
+          echo "Combined coverage report generated"
 
       - name: Generate coverage summary
+        if: env.SKIP_COVERAGE != 'true'
         id: coverage-summary
         run: |
           echo "Coverage Summary Report"
           echo "======================="
 
           COVERAGE_SUMMARY=""
+          PARSED_COUNT=0
 
           parse_lcov() {
             local file="$1" label="$2"
-            if [ -f "$file" ]; then
-              LINES_FOUND=$(grep -E "^LF:" "$file" | awk -F: '{sum += $2} END {print sum}')
-              LINES_HIT=$(grep -E "^LH:" "$file" | awk -F: '{sum += $2} END {print sum}')
+            if [ -f "$file" ] && [ -s "$file" ]; then
+              LINES_FOUND=$(awk -F: '/^LF:/{sum += $2} END {print sum+0}' "$file")
+              LINES_HIT=$(awk -F: '/^LH:/{sum += $2} END {print sum+0}' "$file")
               if [ "$LINES_FOUND" -gt 0 ]; then
                 COV=$(echo "scale=1; $LINES_HIT * 100 / $LINES_FOUND" | bc)
                 echo "${label}: ${COV}%"
                 COVERAGE_SUMMARY="${COVERAGE_SUMMARY}**${label}:** ${COV}%\n"
+                PARSED_COUNT=$((PARSED_COUNT + 1))
               fi
+            else
+              echo "WARNING: Missing or empty: $file ($label)"
             fi
           }
 
@@ -135,20 +216,29 @@ jobs:
           parse_lcov "coverage-artifacts/unit/coverage/coverage-escrow-unit.lcov" "Escrow Unit Tests"
           parse_lcov "coverage-artifacts/unit/coverage/coverage-withdraw-unit.lcov" "Withdraw Unit Tests"
 
-          # Program integration coverage
-          parse_lcov "coverage-artifacts/integration/coverage/coverage-escrow-integration.lcov" "Escrow Integration Tests"
-          parse_lcov "coverage-artifacts/integration/coverage/coverage-withdraw-integration.lcov" "Withdraw Integration Tests"
-
-          # Core + indexer unit coverage
+          # Core + indexer + gateway unit coverage
           parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-core-unit.lcov" "Core Unit Tests"
           parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-indexer-unit.lcov" "Indexer Unit Tests"
+          parse_lcov "coverage-artifacts/rust-unit/coverage/coverage-gateway-unit.lcov" "Gateway Unit Tests"
+
+          # E2E integration coverage
+          parse_lcov "coverage-artifacts/e2e/coverage-integration-e2e.lcov" "E2E Integration Tests"
+
+          # TypeScript SDK coverage
+          parse_lcov "coverage-artifacts/ts-escrow/coverage-ts.lcov" "Escrow TS SDK Tests"
+          parse_lcov "coverage-artifacts/ts-withdraw/coverage-ts.lcov" "Withdraw TS SDK Tests"
+
+          if [ "$PARSED_COUNT" -eq 0 ]; then
+            echo "::error::No coverage data found across all expected reports"
+            COVERAGE_SUMMARY="No coverage data available. Check workflow artifacts.\n"
+          fi
 
           echo "COVERAGE_SUMMARY<<EOF" >> $GITHUB_OUTPUT
           echo -e "$COVERAGE_SUMMARY" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Post coverage comment on PR
-        if: github.event.workflow_run.event == 'pull_request'
+        if: env.SKIP_COVERAGE != 'true' && github.event.workflow_run.event == 'pull_request'
         uses: actions/github-script@v7
         env:
           COVERAGE_SUMMARY: ${{ steps.coverage-summary.outputs.COVERAGE_SUMMARY }}
@@ -166,6 +256,7 @@ jobs:
             Coverage reports have been generated for all test suites:
             - [Combined Coverage Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
             - Individual test coverage artifacts available in workflow runs
+            - Program integration test coverage is tracked via semantic analysis in \`TEST_COVERAGE.md\`
 
             </details>`;
 
@@ -206,7 +297,7 @@ jobs:
             }
 
       - name: Upload combined coverage report
-        if: success()
+        if: env.SKIP_COVERAGE != 'true' && success()
         uses: actions/upload-artifact@v4
         with:
           name: combined-coverage-report

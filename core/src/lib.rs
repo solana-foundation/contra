@@ -1,4 +1,5 @@
 // Library modules that other binaries and tests can use
+// ci: test coverage table
 pub mod accounts;
 pub mod client;
 pub mod nodes;

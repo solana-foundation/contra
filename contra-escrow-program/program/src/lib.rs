@@ -1,5 +1,5 @@
 #![no_std]
-
+// ci: test coverage table
 pub mod constants;
 pub mod error;
 pub mod events;

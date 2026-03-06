@@ -2,9 +2,9 @@ name: Rust Checks
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, "ci(coverage)/improve-coverage-report"]
   pull_request:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, "ci(coverage)/improve-coverage-report"]
 
 permissions:
   contents: read

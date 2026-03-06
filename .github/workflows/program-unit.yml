@@ -2,14 +2,14 @@ name: Program Unit Tests
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit, "ci(coverage)/improve-coverage-report"]
+    branches: [main, hardening/pre-release-audit]
     paths:
       - "contra-escrow-program/**"
       - "contra-withdraw-program/**"
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
   pull_request:
-    branches: [main, hardening/pre-release-audit, "ci(coverage)/improve-coverage-report"]
+    branches: [main, hardening/pre-release-audit]
     paths:
       - "contra-escrow-program/**"
       - "contra-withdraw-program/**"

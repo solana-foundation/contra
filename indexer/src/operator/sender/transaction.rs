@@ -27,7 +27,6 @@ use super::types::{
 };
 
 use std::time::Duration;
-use tokio::time::Instant;
 
 /// Safety delay before checking finality and reminting.
 /// Solana finalized ≈ 32 slots × 400ms = ~12.8s. We use 2.5× safety factor.
@@ -699,28 +698,48 @@ pub(super) async fn handle_permanent_failure(
         return;
     }
 
-    // Write Failed status immediately so the txn isn't stuck in Processing if we crash
-    // during the finality window. The deferred remint will overwrite to FailedReminted
-    // or ManualReview once it completes.
+    let deadline = Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap();
+
+    // Atomically transition to PendingRemint, persisting the withdrawal signatures
+    // needed for the finality check. This replaces the previous Failed write —
+    // keeping status as Processing until the remint resolves avoids partial state
+    // if the operator crashes during the finality window.
     if let Some(transaction_id) = ctx.transaction_id {
-        send_guaranteed(
-            storage_tx,
-            TransactionStatusUpdate {
-                transaction_id,
-                trace_id: ctx.trace_id.clone(),
-                status: TransactionStatus::Failed,
-                counterpart_signature: None,
-                processed_at: Some(Utc::now()),
-                error_message: Some(error_msg.to_string()),
-                remint_signature: None,
-            },
-            "transaction status update",
-        )
-        .await
-        .ok();
+        let sig_strings: Vec<String> = signatures
+            .iter()
+            .map(|sig| sig.to_string())
+            .collect();
+
+        if let Err(e) = state.storage
+            .set_pending_remint(transaction_id, sig_strings, deadline)
+            .await 
+        {
+            error!(
+                "Failed to persist PendingRemint for transaction {} - sending to manual review: {}",
+                transaction_id, e
+            );
+            send_guaranteed(
+                storage_tx, 
+                TransactionStatusUpdate { 
+                    transaction_id, 
+                    trace_id: ctx.trace_id.clone(), 
+                    status: TransactionStatus::ManualReview, 
+                    counterpart_signature: None, 
+                    processed_at: Some(Utc::now()), 
+                    error_message: Some(format!(
+                        "{} | failed to persist pending remint: {}",
+                        error_msg, e
+                    )),
+                    remint_signature: None,
+                }, 
+                "transaction status update"
+            )
+            .await
+            .ok();
+            return;
+        }
     }
 
-    let deadline = Instant::now() + FINALITY_SAFETY_DELAY;
     info!(
         "Remint deferred for finality check ({}s) — {} signature(s) to verify for nonce {:?}",
         FINALITY_SAFETY_DELAY.as_secs(),
@@ -749,7 +768,7 @@ pub async fn process_pending_remints(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    let now = Instant::now();
+    let now = Utc::now();
 
     // Partition: matured entries get processed, immature stay in the queue
     let mut remaining = Vec::new();
@@ -855,7 +874,7 @@ pub async fn process_pending_remints(
                     );
                     remaining.push(PendingRemint {
                         finality_check_attempts: attempt,
-                        deadline: Instant::now() + FINALITY_SAFETY_DELAY,
+                        deadline: Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap(),
                         ..entry
                     });
                 }
@@ -967,7 +986,6 @@ mod tests {
     use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::time::Instant;
 
     use std::sync::Once;
 
@@ -1080,15 +1098,11 @@ mod tests {
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
 
-        // Should receive an immediate Failed status (crash safety)
-        let update = storage_rx.try_recv().expect("should receive Failed status");
-        assert_eq!(update.transaction_id, 10);
-        assert_eq!(update.status, TransactionStatus::Failed);
-
-        // No further status updates yet — remint is deferred
+        // No immediate status update — transaction remains in PendingRemint in DB
+        // until process_pending_remints resolves it after the finality window.
         assert!(
             storage_rx.try_recv().is_err(),
-            "should NOT send a second status update"
+            "should NOT send a status update while remint is deferred"
         );
 
         // Entry should be in pending_remints
@@ -1156,7 +1170,7 @@ mod tests {
             remint_info: make_remint_info(20),
             signatures: vec![Signature::new_unique()],
             original_error: "max retries".to_string(),
-            deadline: Instant::now() - Duration::from_secs(1),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
         });
 
@@ -1190,7 +1204,7 @@ mod tests {
             remint_info: make_remint_info(20),
             signatures: vec![Signature::new_unique()],
             original_error: "max retries".to_string(),
-            deadline: Instant::now() - Duration::from_secs(1),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 2, // MAX_FINALITY_CHECK_ATTEMPTS - 1
         });
 
@@ -1308,7 +1322,7 @@ mod tests {
             remint_info: make_remint_info(30),
             signatures: vec![Signature::new_unique()],
             original_error: "timeout".to_string(),
-            deadline: Instant::now() + Duration::from_secs(600),
+            deadline: Utc::now() + chrono::Duration::seconds(600),
             finality_check_attempts: 0,
         });
 

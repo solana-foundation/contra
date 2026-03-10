@@ -55,6 +55,11 @@ pub async fn run_sender(
         source_rpc_client,
     )?;
 
+    // Re-hydrate the deferred remint queue from any PendingRemint rows written             
+    // before a crash. These will be picked up by process_pending_remints on the          
+    // next tick
+    state.recover_pending_remints(&storage_tx).await?;
+
     // Periodic check for pending rotation (every 500ms)
     let mut rotation_check_interval = interval(Duration::from_millis(500));
 

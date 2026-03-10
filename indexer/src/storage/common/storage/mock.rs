@@ -19,6 +19,11 @@ pub struct MockStorage {
     pub inserted_transactions: std::sync::Arc<Mutex<Vec<Vec<DbTransaction>>>>,
     pub inserted_single_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
     pub status_updates: std::sync::Arc<Mutex<Vec<StatusUpdateRecord>>>,
+    /// Signatures stored per transaction on PendingRemint transition, keyed as (transaction_id, remint_signatures, deadline_at).                                                  
+    /// Used in tests to verify the correct withdrawal signatures were persisted.                                                                         
+    pub pending_remint_signatures: std::sync::Arc<Mutex<Vec<(i64, Vec<String>, DateTime<Utc>)>>>,
+    /// Transactions currently in PendingRemint status, used in tests to simulate startup recovery.
+    pub pending_remint_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
 }
 
 impl MockStorage {
@@ -216,5 +221,37 @@ impl MockStorage {
         _max_nonce: u64,
     ) -> Result<Vec<u64>, StorageError> {
         Ok(vec![])
+    }
+
+    pub async fn set_pending_remint(                                                        
+        &self,                         
+        transaction_id: i64,                                                                
+        remint_signatures: Vec<String>,
+        deadline_at: DateTime<Utc>,                                                  
+    ) -> Result<(), StorageError> {                                                         
+        if self                                           
+            .should_fail
+            .lock()
+            .unwrap()                                                                       
+            .get("set_pending_remint")
+            .copied()                                                                       
+            .unwrap_or(false)                             
+        {                                                                                   
+            return Err(StorageError::DatabaseError {
+                message: "Simulated set_pending_remint failure".to_string(),                
+            });                                                                             
+        }
+        self.pending_remint_signatures                                                                
+            .lock()                                       
+            .unwrap()
+            .push((transaction_id, remint_signatures, deadline_at));
+        Ok(())
+    }
+
+    pub async fn get_pending_remint_transactions(
+        &self,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        let pending = self.pending_remint_transactions.lock().unwrap();
+        Ok(pending.clone())
     }
 }

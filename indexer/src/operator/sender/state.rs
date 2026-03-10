@@ -1,14 +1,22 @@
+use crate::channel_utils::send_guaranteed;
 use crate::error::account::AccountError;
 use crate::error::OperatorError;
+use crate::operator::sender::types::{PendingRemint, TransactionContext};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::utils::smt_util::SmtState;
-use crate::operator::MintCache;
+use crate::operator::{MintCache, TransactionStatusUpdate, WithdrawalRemintInfo};
 use crate::operator::{parse_instance, RetryConfig, RpcClientWithRetry};
+use crate::storage::TransactionStatus;
 use crate::storage::common::storage::Storage;
 use crate::ContraIndexerConfig;
+use chrono::Utc;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use tokio::sync::mpsc;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -137,6 +145,170 @@ impl SenderState {
             smt_state,
             nonce_to_builder: HashMap::new(),
         });
+
+        Ok(())
+    }
+
+    /// Sends a ManualReview status update during startup recovery when a stored            
+    /// transaction cannot be reconstructed (e.g. unparseable pubkey or signature).         
+    /// Using send_guaranteed so the alert is never silently dropped.                       
+    async fn send_recovery_manual_review(                                                   
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,                                 
+        transaction_id: i64,                                                                
+        trace_id: &str,                                   
+        reason: &str,                                                                       
+    ) {                                                   
+        send_guaranteed(
+            storage_tx,                                                                     
+            TransactionStatusUpdate {
+                transaction_id,                                                             
+                trace_id: Some(trace_id.to_string()),     
+                status: TransactionStatus::ManualReview,
+                counterpart_signature: None,
+                processed_at: Some(Utc::now()),                                             
+                error_message: Some(format!("recovery failed: {}", reason)),                
+                remint_signature: None,                                                     
+            },                                                                              
+            "transaction status update",                  
+        )
+        .await                                                                              
+        .ok();
+    }                                                                                                                                                    
+                                                        
+    pub(super) async fn recover_pending_remints(
+        &mut self,                                                                          
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) -> Result<(), OperatorError> {                                                        
+        let transactions = self.storage.get_pending_remint_transactions().await?;           
+                                                                                            
+        if transactions.is_empty() {                                                        
+            return Ok(());                                                                  
+        }                                                                                   
+                                                            
+        info!(
+            "Recovering {} pending remint(s) from database",
+            transactions.len()                                                              
+        );
+                                                                                            
+        // Contra only supports SPL Token for now.                                          
+        let contra_token_program = self.mint_cache.get_contra_token_program();
+                                                                                            
+        for tx in transactions {                          
+            // Parse pubkeys stored as strings. On any failure we cannot remint safely,     
+            // and silently skipping would leave the row stuck in PendingRemint on every    
+            // restart — so we escalate to ManualReview.                                    
+            let mint = match Pubkey::from_str(&tx.mint) {                                   
+                Ok(pk) => pk,                                                               
+                Err(e) => {                               
+                    error!(transaction_id = tx.id, "Recovery: invalid mint pubkey: {}", e); 
+                    Self::send_recovery_manual_review(
+                        storage_tx, 
+                        tx.id, 
+                        &tx.trace_id, 
+                        &format!("invalid mint pubkey: {}", e)
+                    ).await;                                          
+                    continue;
+                }                                                                           
+            };                                            
+
+            let user = match Pubkey::from_str(&tx.recipient) {
+                Ok(pk) => pk,                                                               
+                Err(e) => {                               
+                    error!(transaction_id = tx.id, "Recovery: invalid user pubkey: {}", e); 
+                    Self::send_recovery_manual_review(
+                        storage_tx, 
+                        tx.id, 
+                        &tx.trace_id,
+                        &format!("invalid user pubkey: {}", e)
+                    ).await;                                          
+                    continue;                                                               
+                }                                                                           
+            };                                            
+
+            let user_ata =
+                get_associated_token_address_with_program_id(&user, &mint, &contra_token_program);                                          
+                                                                                            
+            // u64::try_from catches negative amounts. The write path already guards        
+            // against this (ba77249) but a corrupt DB row could still produce one —
+            // casting a negative i64 to u64 would produce a massive spurious remint.       
+            let amount = match u64::try_from(tx.amount) {                                   
+                Ok(a) => a,                                                                 
+                Err(_) => {                                                                 
+                    error!(transaction_id = tx.id, "Recovery: negative amount {}", tx.amount);                                                                             
+                    Self::send_recovery_manual_review(
+                        storage_tx, 
+                        tx.id, 
+                        &tx.trace_id,
+                        &format!("negative amount {}", tx.amount)
+                    ).await;                                       
+                    continue;                             
+                }                                                                           
+            };
+                                                                                            
+            // Parse all stored withdrawal signatures. These are passed to                  
+            // get_signature_statuses() by process_pending_remints to verify the
+            // withdrawal did not finalize before we remint. A single bad entry             
+            // means we cannot safely do that check — escalate to ManualReview.             
+            let sig_strings = tx.remint_signatures.unwrap_or_default();                     
+            let signatures = match sig_strings                                              
+                .iter()                                                                     
+                .map(|s| Signature::from_str(s))                                            
+                .collect::<Result<Vec<_>, _>>()           
+            {                                                                               
+                Ok(sigs) => sigs,
+                Err(e) => {                                                                 
+                    error!(transaction_id = tx.id, "Recovery: invalid withdrawal signature: {}", e);
+                    Self::send_recovery_manual_review(
+                        storage_tx, 
+                        tx.id, 
+                        &tx.trace_id, 
+                        &format!("invalid withdrawal signature: {}", e)
+                    ).await;                                 
+                    continue;
+                }                                                                           
+            };                                            
+
+            // Restore the original deadline. Fall back to now() if missing (shouldn't      
+            // happen) so the entry fires on the next tick instead of waiting 32s more.
+            let deadline = tx.pending_remint_deadline_at.unwrap_or_else(Utc::now);          
+                                                            
+            let ctx = TransactionContext {                                                  
+                transaction_id: Some(tx.id),              
+                // Nonce is not needed for the remint — SMT cleanup already ran in          
+                // handle_permanent_failure before the row was written as PendingRemint.    
+                withdrawal_nonce: tx.withdrawal_nonce.map(|n| n as u64),                    
+                trace_id: Some(tx.trace_id.clone()),                                        
+            };                                                                              
+                                                                                            
+            let remint_info = WithdrawalRemintInfo {                                        
+                transaction_id: tx.id,
+                trace_id: tx.trace_id,                                                      
+                mint,                                     
+                user,
+                user_ata,
+                token_program: contra_token_program,
+                amount,                                                                     
+            };
+                                                                                            
+            info!(                                                                          
+                transaction_id = tx.id,
+                nonce = ctx.withdrawal_nonce.map(|n| n as i64),                             
+                sigs = signatures.len(),                                                    
+                "Recovered PendingRemint, deadline={}",
+                deadline,                                                                   
+            );                                            
+                                                                                            
+            self.pending_remints.push(PendingRemint {     
+                ctx,
+                remint_info,
+                signatures,                                                                 
+                // The original error string is not stored in DB. Only surfaced in
+                // combined error messages if the remint itself also fails.                 
+                original_error: "recovered from persistent storage".to_string(),            
+                deadline,                                                                   
+                finality_check_attempts: 0,                                                 
+            });                                                                             
+        }                                                 
 
         Ok(())
     }

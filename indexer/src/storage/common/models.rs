@@ -35,6 +35,11 @@ pub enum TransactionStatus {
     // Remint attempted but could not confirm — requires manual investigation
     #[sqlx(rename = "manual_review")]
     ManualReview,
+    // Withdrawal failed permanently; remint is queued and will be attempted after
+    // the finality window. Transitions to FailedReminted, ManualReview, or
+    // Completed (if original withdrawal actually landed).
+    #[sqlx(rename = "pending_remint")]
+    PendingRemint,
 }
 
 /// DbTransaction domain model
@@ -59,6 +64,13 @@ pub struct DbTransaction {
     // If this is a deposit from Solana to Contra, this will represent the Contra signature and
     // if this is a withdrawal from Contra to Solana, this will represent the Solana signature
     pub counterpart_signature: Option<String>,
+    /// Withdrawal signatures sent to Solana, stored when status transitions to
+    /// PendingRemint. Used on restart to verify whether the original withdrawal
+    /// finalized before attempting to remint.
+    pub remint_signatures: Option<Vec<String>>,
+    /// UTC timestamp of when the finality check deadline expires for PendingRemint transactions.                                                                           
+    /// Set when transitioning to PendingRemint, used to restore the exact wait time on restart.                                                                            
+    pub pending_remint_deadline_at: Option<DateTime<Utc>>,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -168,6 +180,8 @@ impl DbTransactionBuilder {
             updated_at: now,
             processed_at: None,
             counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
         }
     }
 }

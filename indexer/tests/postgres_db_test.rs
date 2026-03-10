@@ -64,6 +64,8 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         updated_at: Utc::now(),
         processed_at: None,
         counterpart_signature: None,
+        remint_signatures: None,
+        pending_remint_deadline_at: None,
     }
 }
 

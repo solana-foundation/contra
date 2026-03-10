@@ -10,7 +10,6 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::time::Instant;
 
 use crate::operator::utils::instruction_util::{MintToBuilder, WithdrawalRemintInfo};
 
@@ -64,7 +63,11 @@ pub struct PendingRemint {
     pub remint_info: WithdrawalRemintInfo,
     pub signatures: Vec<Signature>,
     pub original_error: String,
-    pub deadline: Instant,
+    /// UTC timestamp after which the finality check runs. Using DateTime<Utc> instead of
+    /// Instant allows the deadline to be persisted to the database and restored on restart.
+    /// The minor risk of clock skew affecting a 32-second window is acceptable — the       
+    /// finality check runs regardless, so a slightly early or late execution is safe.
+    pub deadline: DateTime<Utc>,
     /// Number of times the finality check has been retried (e.g. due to RPC errors).
     pub finality_check_attempts: u32,
 }

@@ -26,6 +26,8 @@ mod transaction_cols {
     pub const PROCESSED_AT: &str = "processed_at";
     pub const COUNTERPART_SIGNATURE: &str = "counterpart_signature";
     pub const TRACE_ID: &str = "trace_id";
+    pub const REMINT_SIGNATURES: &str = "remint_signatures";
+    pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
 }
 
 #[derive(Clone)]
@@ -169,6 +171,33 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("trace_id migration complete");
+
+        // Idempotent migration: add remint_signatures to existing databases
+        info!("Running remint_signatures migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN                                                                         
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS remint_signatures TEXT[];     
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("remint_signatures migration complete");
+
+        // Idempotent migration: add pending_remint_deadline_at to existing databases       
+        info!("Running pending_remint_deadline_at migration if needed...");    
+        sqlx::query(                                                                            
+            r#"
+            DO $$ BEGIN                                                                         
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pending_remint_deadline_at    
+        TIMESTAMPTZ;                                                                            
+            END $$;                                                                             
+            "#,                                                                                 
+        )                                                     
+        .execute(&self.pool)
+        .await?;
+        info!("pending_remint_deadline_at migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -325,6 +354,15 @@ impl PostgresDb {
         sqlx::query(
             r#"
             ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'manual_review';
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Add pending_remint status for withdrawals that failed and have to be processed for remint
+        sqlx::query(
+            r#"
+            ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'pending_remint';
             "#,
         )
         .execute(&self.pool)
@@ -529,7 +567,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -551,6 +589,8 @@ impl PostgresDb {
             transaction_cols::UPDATED_AT,
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -564,6 +604,51 @@ impl PostgresDb {
         .await
     }
 
+    /// Returns all withdrawal transactions currently in PendingRemint status.
+  /// Called on startup to re-hydrate the in-memory remint queue after a crash.
+  pub async fn get_pending_remint_transactions_internal(
+        &self,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = $1 AND {} = $2
+            ORDER BY {} ASC
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            // Filters
+            transaction_cols::STATUS,
+            transaction_cols::TRANSACTION_TYPE,
+            // Ordering (FIFO)
+            transaction_cols::ID,
+        ))
+        .bind(TransactionStatus::PendingRemint)
+        .bind(TransactionType::Withdrawal)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+
     /// Get all transactions of a given type regardless of status
     pub async fn get_all_transactions_internal(
         &self,
@@ -574,7 +659,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -596,6 +681,8 @@ impl PostgresDb {
             transaction_cols::UPDATED_AT,
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -656,7 +743,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -679,6 +766,8 @@ impl PostgresDb {
             transaction_cols::UPDATED_AT,
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -733,6 +822,35 @@ impl PostgresDb {
         .bind(status)
         .bind(counterpart_signature)
         .bind(processed_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Transitions a withdrawal to PendingRemint status, storing the
+    /// withdrawal signatures needed for the finality check on restart.
+    pub async fn set_pending_remint_internal(
+        &self,
+        transaction_id: i64,
+        remint_signatures: Vec<String>,
+        deadline_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE transactions
+            SET
+                status = $2,
+                remint_signatures = $3,
+                pending_remint_deadline_at = $4,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(TransactionStatus::PendingRemint)
+        .bind(remint_signatures)
+        .bind(deadline_at)
         .execute(&self.pool)
         .await?;
 

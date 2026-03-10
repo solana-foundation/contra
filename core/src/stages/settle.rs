@@ -481,36 +481,28 @@ async fn settle_transactions(
 mod tests {
     use super::*;
 
-    use crate::test_helpers::create_test_sanitized_transaction;
-    use solana_sdk::signature::{Keypair, Signer};
-    use solana_svm::account_loader::LoadedTransaction;
+    use crate::test_helpers::{
+        create_test_sanitized_transaction, start_test_postgres,
+    };
+    use solana_sdk::{
+        account::AccountSharedData,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+    };
+    use solana_svm::account_loader::{FeesOnlyTransaction, LoadedTransaction};
+    use solana_svm::rollback_accounts::RollbackAccounts;
     use solana_svm::transaction_execution_result::{
         ExecutedTransaction, TransactionExecutionDetails,
     };
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::postgres::Postgres;
-
-    async fn start_test_postgres() -> (AccountsDB, testcontainers::ContainerAsync<Postgres>) {
-        let container = Postgres::default()
-            .with_db_name("settle_test")
-            .with_user("postgres")
-            .with_password("password")
-            .start()
-            .await
-            .unwrap();
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:password@{}:{}/settle_test", host, port);
-        let db = AccountsDB::new(&url, false)
-            .await
-            .unwrap_or_else(|e| panic!("Failed: {}", e));
-        (db, container)
-    }
+    use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     fn make_executed(
         accounts: Vec<(
             solana_sdk::pubkey::Pubkey,
-            solana_sdk::account::AccountSharedData,
+            AccountSharedData,
         )>,
     ) -> ProcessedTransaction {
         ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
@@ -564,15 +556,15 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // Create an executed result with a writable account
-        let account_pk = solana_sdk::pubkey::Pubkey::new_unique();
-        let account_data = solana_sdk::account::AccountSharedData::new(
+        let account_pk = Pubkey::new_unique();
+        let account_data = AccountSharedData::new(
             500,
             0,
-            &solana_sdk::pubkey::Pubkey::new_unique(),
+            &Pubkey::new_unique(),
         );
         let processed = make_executed(vec![(account_pk, account_data)]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
@@ -592,12 +584,12 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // The system transfer tx has writable accounts at indices 0,1 and readonly at 2
         // Create executed result with 3 accounts
-        let owner = solana_sdk::pubkey::Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
         let pk0 = from.pubkey();
         let pk1 = to;
         let pk2 = solana_system_interface::program::id();
@@ -605,15 +597,15 @@ mod tests {
         let processed = make_executed(vec![
             (
                 pk0,
-                solana_sdk::account::AccountSharedData::new(900, 0, &owner),
+                AccountSharedData::new(900, 0, &owner),
             ),
             (
                 pk1,
-                solana_sdk::account::AccountSharedData::new(100, 0, &owner),
+                AccountSharedData::new(100, 0, &owner),
             ),
             (
                 pk2,
-                solana_sdk::account::AccountSharedData::new(1, 0, &owner),
+                AccountSharedData::new(1, 0, &owner),
             ),
         ]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
@@ -635,14 +627,14 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // Account with 0 lamports and empty data = deleted
         let pk = from.pubkey();
         let processed = make_executed(vec![(
             pk,
-            solana_sdk::account::AccountSharedData::default(),
+            AccountSharedData::default(),
         )]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
@@ -661,7 +653,7 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
         let sig = *tx.signature();
 
@@ -684,13 +676,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_fees_only_records_signature_no_accounts() {
-        use solana_svm::account_loader::FeesOnlyTransaction;
-        use solana_svm::rollback_accounts::RollbackAccounts;
-
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
         let sig = *tx.signature();
 
@@ -699,7 +688,7 @@ mod tests {
         let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
             load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
             rollback_accounts: RollbackAccounts::FeePayerOnly {
-                fee_payer_account: solana_sdk::account::AccountSharedData::new(
+                fee_payer_account: AccountSharedData::new(
                     900,
                     0,
                     &solana_sdk_ids::system_program::ID,

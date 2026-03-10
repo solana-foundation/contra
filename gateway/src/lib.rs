@@ -432,20 +432,24 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    async fn start_test_gateway() -> SocketAddr {
+    /// Spawn a test gateway with configurable backend URLs.
+    /// Each invocation binds to a unique port via port 0 (OS-assigned).
+    async fn start_gateway_with_urls(write_url: &str, read_url: &str) -> SocketAddr {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
         let gateway = Arc::new(Gateway::new(
-            "http://127.0.0.1:1".to_string(),
-            "http://127.0.0.1:1".to_string(),
+            write_url.to_string(),
+            read_url.to_string(),
             "*".to_string(),
         ));
 
+        // Port 0 lets the OS assign a unique free port; avoids collisions between concurrent tests.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -468,12 +472,45 @@ mod tests {
         addr
     }
 
+    async fn start_test_gateway() -> SocketAddr {
+        start_gateway_with_urls("http://127.0.0.1:1", "http://127.0.0.1:1").await
+    }
+
+    /// Spawn a minimal HTTP/1.1 backend that replies with a static 200 response body.
+    /// Accepts multiple requests in a loop to handle tests that may send more than one request.
+    async fn start_mock_http_backend(response_body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                // Accept with timeout to prevent indefinite blocking when test exits
+                match tokio::time::timeout(Duration::from_secs(5), listener.accept()).await {
+                    Ok(Ok((mut stream, _))) => {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = stream.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        );
+                        let _ = stream.write_all(resp.as_bytes()).await;
+                    }
+                    _ => break, // Timeout or error; exit the loop
+                }
+            }
+        });
+
+        addr
+    }
+
     /// Send raw bytes to the test gateway and return the response as a string.
     async fn send_raw(addr: SocketAddr, data: &[u8]) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(data).await.unwrap();
 
-        let mut buf = vec![0u8; 4096];
+        // Buffer for reading response from gateway (8KB safely handles all test cases).
+        let mut buf = vec![0u8; 8192];
         let n = stream.read(&mut buf).await.unwrap();
         String::from_utf8_lossy(&buf[..n]).into_owned()
     }
@@ -570,5 +607,202 @@ mod tests {
 
         let response = send_raw(addr, req.as_bytes()).await;
         assert_status(&response, 502);
+    }
+
+    #[tokio::test]
+    async fn options_request_returns_200_with_cors_headers() {
+        let addr = start_test_gateway().await;
+        let req = "OPTIONS / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 200);
+        let lower = response.to_lowercase();
+        assert!(
+            lower.contains("access-control-allow-origin"),
+            "CORS origin header missing from OPTIONS response: {response}"
+        );
+        assert!(
+            lower.contains("access-control-allow-methods"),
+            "CORS methods header missing from OPTIONS response: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_health_returns_200_with_status_ok() {
+        let addr = start_test_gateway().await;
+        let req = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains(r#""status":"ok""#),
+            "Health response must contain status:ok body, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_post_non_options_returns_405() {
+        let addr = start_test_gateway().await;
+        let req = "PUT / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 405);
+    }
+
+    #[tokio::test]
+    async fn invalid_json_body_returns_400() {
+        let addr = start_test_gateway().await;
+        let body = b"not valid json";
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut raw = req.into_bytes();
+        raw.extend_from_slice(body);
+        let response = send_raw(addr, &raw).await;
+        assert_status(&response, 400);
+    }
+
+    #[tokio::test]
+    async fn missing_method_field_returns_400() {
+        let addr = start_test_gateway().await;
+        let body = r#"{"jsonrpc":"2.0","id":1}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 400);
+    }
+
+    #[tokio::test]
+    async fn send_transaction_attempts_write_node() {
+        let addr = start_test_gateway().await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["AAAA"]}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        // Both URLs point to a closed port — gateway must attempt forwarding and return 502
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 502);
+    }
+
+    #[tokio::test]
+    async fn unknown_rpc_method_attempts_read_node() {
+        let addr = start_test_gateway().await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"customUnknownMethod"}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        // Unknown method uses "unknown" label; routing attempt to unreachable read node → 502
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 502);
+    }
+
+    #[tokio::test]
+    async fn invalid_backend_url_returns_500() {
+        // "http://[" is an invalid URI (unclosed IPv6 bracket) — triggers URL parse error path
+        let addr = start_gateway_with_urls("http://[", "http://[").await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 500);
+    }
+
+    /// The `run()` function should bind, accept connections, and route requests.
+    /// Spawned in a background task; aborted after one successful round-trip.
+    #[tokio::test]
+    async fn run_binds_and_serves_requests() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        // Reserve a free port, then release it so `run()` can bind it.
+        let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tmp.local_addr().unwrap().port();
+        drop(tmp);
+
+        let args = Args {
+            port,
+            write_url: "http://127.0.0.1:1".to_string(),
+            read_url: "http://127.0.0.1:1".to_string(),
+            cors_allowed_origin: "*".to_string(),
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = run(args).await;
+        });
+
+        // Retry with backoff until gateway accepts a connection (replaces flaky sleep).
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut retry_count = 0;
+        loop {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            retry_count += 1;
+            if retry_count >= 50 {
+                panic!("Gateway did not bind within reasonable time");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = send_raw(addr, req.as_bytes()).await;
+        // Backend is unreachable (port 1) → gateway returns 502.
+        assert_status(&response, 502);
+
+        handle.abort();
+    }
+
+    /// Invalid Content-Length headers are rejected by Hyper at the HTTP layer.
+    /// This test verifies the gateway doesn't crash and returns a proper error response.
+    #[tokio::test]
+    async fn invalid_content_length_returns_400() {
+        let addr = start_test_gateway().await;
+
+        // Hyper's HTTP/1.1 parser validates headers and rejects malformed Content-Length.
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: invalid_integer\r\n\r\n{}",
+            body
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        // Hyper rejects invalid headers at the HTTP layer → 400 Bad Request.
+        assert_status(&response, 400);
+    }
+
+    #[tokio::test]
+    async fn successful_backend_response_includes_cors_headers() {
+        let backend_addr = start_mock_http_backend(r#"{"result":42}"#).await;
+        let read_url = format!("http://{backend_addr}");
+        let addr = start_gateway_with_urls("http://127.0.0.1:1", &read_url).await;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response
+                .to_lowercase()
+                .contains("access-control-allow-origin"),
+            "CORS header must be present in forwarded response: {response}"
+        );
     }
 }

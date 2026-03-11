@@ -722,7 +722,9 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             "*".to_string(),
         ));
-        let handle = tokio::spawn(async move { let _ = serve(listener, gateway).await; });
+        let handle = tokio::spawn(async move {
+            let _ = serve(listener, gateway).await;
+        });
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
         let req = format!(

@@ -766,7 +766,10 @@ mod tests {
         };
         let result = truncate_slots(&db, &opts).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Backup verification failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Backup verification failed"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -784,7 +787,10 @@ mod tests {
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.latest_slot, Some(19));
-        assert!(report.blocks_deleted > 0, "dry run should report blocks that would be deleted");
+        assert!(
+            report.blocks_deleted > 0,
+            "dry run should report blocks that would be deleted"
+        );
         // Verify blocks are still there
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blocks")
             .fetch_one(db.pool.as_ref())

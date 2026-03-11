@@ -483,21 +483,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            loop {
-                // Accept with timeout to prevent indefinite blocking when test exits
-                match tokio::time::timeout(Duration::from_secs(5), listener.accept()).await {
-                    Ok(Ok((mut stream, _))) => {
-                        let mut buf = vec![0u8; 4096];
-                        let _ = stream.read(&mut buf).await;
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                            response_body.len(),
-                            response_body
-                        );
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                    }
-                    _ => break, // Timeout or error; exit the loop
-                }
+            // Accept with timeout to prevent indefinite blocking when test exits
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
             }
         });
 

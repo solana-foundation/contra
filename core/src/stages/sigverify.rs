@@ -579,8 +579,7 @@ mod tests {
 
         let ix = initialize_mint_ix(&mint, &real_admin.pubkey());
         let tx = sanitize(&[ix], &real_admin, &[&real_admin]);
-        let result =
-            sigverify_transaction(&tx, &[other_admin, real_admin.pubkey()]).await;
+        let result = sigverify_transaction(&tx, &[other_admin, real_admin.pubkey()]).await;
         assert!(
             matches!(result, SigverifyResult::Valid(TransactionType::Admin)),
             "expected Valid(Admin) when one of multiple admin keys signs, got {result}"

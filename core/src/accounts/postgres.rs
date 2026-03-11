@@ -89,6 +89,70 @@ impl Drop for PostgresAccountsDB {
     }
 }
 
+async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
+    // Create tables
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS accounts (
+                pubkey BYTEA PRIMARY KEY,
+                data BYTEA NOT NULL
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS transactions (
+                signature BYTEA PRIMARY KEY,
+                data BYTEA NOT NULL
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS blocks (
+                slot BIGINT PRIMARY KEY,
+                data BYTEA NOT NULL
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS metadata (
+                key VARCHAR PRIMARY KEY,
+                value BYTEA NOT NULL
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS performance_samples (
+                slot BIGINT PRIMARY KEY,
+                num_transactions BIGINT NOT NULL,
+                num_slots BIGINT NOT NULL,
+                sample_period_secs SMALLINT NOT NULL,
+                num_non_vote_transactions BIGINT NOT NULL
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
+    info!("PostgreSQL tables initialized");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,68 +341,4 @@ mod tests {
         let result = pg_db.account_matches_owners(&pubkey, &[Pubkey::new_unique()]);
         assert!(result.is_none(), "no owner match should return None");
     }
-}
-
-async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
-    // Create tables
-    sqlx::query(
-        r#"
-            CREATE TABLE IF NOT EXISTS accounts (
-                pubkey BYTEA PRIMARY KEY,
-                data BYTEA NOT NULL
-            )
-            "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-            CREATE TABLE IF NOT EXISTS transactions (
-                signature BYTEA PRIMARY KEY,
-                data BYTEA NOT NULL
-            )
-            "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-            CREATE TABLE IF NOT EXISTS blocks (
-                slot BIGINT PRIMARY KEY,
-                data BYTEA NOT NULL
-            )
-            "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-            CREATE TABLE IF NOT EXISTS metadata (
-                key VARCHAR PRIMARY KEY,
-                value BYTEA NOT NULL
-            )
-            "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-            CREATE TABLE IF NOT EXISTS performance_samples (
-                slot BIGINT PRIMARY KEY,
-                num_transactions BIGINT NOT NULL,
-                num_slots BIGINT NOT NULL,
-                sample_period_secs SMALLINT NOT NULL,
-                num_non_vote_transactions BIGINT NOT NULL
-            )
-            "#,
-    )
-    .execute(pool)
-    .await?;
-
-    info!("PostgreSQL tables initialized");
-    Ok(())
 }

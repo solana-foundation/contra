@@ -500,10 +500,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn make_executed(
-        accounts: Vec<(
-            solana_sdk::pubkey::Pubkey,
-            AccountSharedData,
-        )>,
+        accounts: Vec<(solana_sdk::pubkey::Pubkey, AccountSharedData)>,
     ) -> ProcessedTransaction {
         ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
             loaded_transaction: LoadedTransaction {
@@ -561,11 +558,7 @@ mod tests {
 
         // Create an executed result with a writable account
         let account_pk = Pubkey::new_unique();
-        let account_data = AccountSharedData::new(
-            500,
-            0,
-            &Pubkey::new_unique(),
-        );
+        let account_data = AccountSharedData::new(500, 0, &Pubkey::new_unique());
         let processed = make_executed(vec![(account_pk, account_data)]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
@@ -595,18 +588,9 @@ mod tests {
         let pk2 = solana_system_interface::program::id();
 
         let processed = make_executed(vec![
-            (
-                pk0,
-                AccountSharedData::new(900, 0, &owner),
-            ),
-            (
-                pk1,
-                AccountSharedData::new(100, 0, &owner),
-            ),
-            (
-                pk2,
-                AccountSharedData::new(1, 0, &owner),
-            ),
+            (pk0, AccountSharedData::new(900, 0, &owner)),
+            (pk1, AccountSharedData::new(100, 0, &owner)),
+            (pk2, AccountSharedData::new(1, 0, &owner)),
         ]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
@@ -632,10 +616,7 @@ mod tests {
 
         // Account with 0 lamports and empty data = deleted
         let pk = from.pubkey();
-        let processed = make_executed(vec![(
-            pk,
-            AccountSharedData::default(),
-        )]);
+        let processed = make_executed(vec![(pk, AccountSharedData::default())]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
         let result = settle_transactions(None, &mut db, None, &results)
@@ -683,22 +664,35 @@ mod tests {
         let to1 = Pubkey::new_unique();
         let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
         let pk1 = Pubkey::new_unique();
-        let processed1 = make_executed(vec![(pk1, AccountSharedData::new(500, 0, &Pubkey::new_unique()))]);
+        let processed1 = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
         let results1: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed1), tx1)];
 
-        let r1 = settle_transactions(None, &mut db, None, &results1).await.unwrap();
+        let r1 = settle_transactions(None, &mut db, None, &results1)
+            .await
+            .unwrap();
         assert_eq!(r1.slot, 0);
 
         // Settle second batch, chaining from first
-        let last = LastBlock { slot: r1.slot, blockhash: r1.blockhash };
+        let last = LastBlock {
+            slot: r1.slot,
+            blockhash: r1.blockhash,
+        };
         let from2 = Keypair::new();
         let to2 = Pubkey::new_unique();
         let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
         let pk2 = Pubkey::new_unique();
-        let processed2 = make_executed(vec![(pk2, AccountSharedData::new(300, 0, &Pubkey::new_unique()))]);
+        let processed2 = make_executed(vec![(
+            pk2,
+            AccountSharedData::new(300, 0, &Pubkey::new_unique()),
+        )]);
         let results2: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed2), tx2)];
 
-        let r2 = settle_transactions(Some(last), &mut db, None, &results2).await.unwrap();
+        let r2 = settle_transactions(Some(last), &mut db, None, &results2)
+            .await
+            .unwrap();
         assert_eq!(r2.slot, 1);
         assert_ne!(r2.blockhash, r1.blockhash);
 
@@ -943,10 +937,15 @@ mod tests {
         exec_tx.send((output, vec![tx])).unwrap();
 
         // Wait for the blocktime tick to process and emit settlements
-        let settlements = tokio::time::timeout(Duration::from_secs(5), settled_accounts_rx.recv()).await;
-        assert!(settlements.is_ok(), "should receive settlements within timeout");
+        let settlements =
+            tokio::time::timeout(Duration::from_secs(5), settled_accounts_rx.recv()).await;
+        assert!(
+            settlements.is_ok(),
+            "should receive settlements within timeout"
+        );
 
-        let blockhash = tokio::time::timeout(Duration::from_secs(1), settled_blockhashes_rx.recv()).await;
+        let blockhash =
+            tokio::time::timeout(Duration::from_secs(1), settled_blockhashes_rx.recv()).await;
         assert!(blockhash.is_ok(), "should receive blockhash within timeout");
 
         shutdown.cancel();
@@ -978,7 +977,10 @@ mod tests {
         drop(exec_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
-        assert!(result.is_ok(), "settle worker should exit when input channel closes");
+        assert!(
+            result.is_ok(),
+            "settle worker should exit when input channel closes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -990,7 +992,10 @@ mod tests {
         let to1 = Pubkey::new_unique();
         let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
         let pk1 = Pubkey::new_unique();
-        let executed = make_executed(vec![(pk1, AccountSharedData::new(500, 0, &Pubkey::new_unique()))]);
+        let executed = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
 
         let from2 = Keypair::new();
         let to2 = Pubkey::new_unique();
@@ -999,7 +1004,11 @@ mod tests {
         let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
             load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
             rollback_accounts: RollbackAccounts::FeePayerOnly {
-                fee_payer_account: AccountSharedData::new(900, 0, &solana_sdk_ids::system_program::ID),
+                fee_payer_account: AccountSharedData::new(
+                    900,
+                    0,
+                    &solana_sdk_ids::system_program::ID,
+                ),
             },
             fee_details: Default::default(),
         }));
@@ -1012,16 +1021,19 @@ mod tests {
             solana_sdk::instruction::InstructionError::Custom(42),
         );
 
-        let results: Vec<(TransactionProcessingResult, _)> = vec![
-            (Ok(executed), tx1),
-            (Ok(fees_only), tx2),
-            (Err(err), tx3),
-        ];
+        let results: Vec<(TransactionProcessingResult, _)> =
+            vec![(Ok(executed), tx1), (Ok(fees_only), tx2), (Err(err), tx3)];
 
-        let result = settle_transactions(None, &mut db, None, &results).await.unwrap();
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
 
         // All three signatures should be recorded in the block
-        assert_eq!(result.account_settlements.len(), 1, "only executed tx settles accounts");
+        assert_eq!(
+            result.account_settlements.len(),
+            1,
+            "only executed tx settles accounts"
+        );
         assert_eq!(
             result.blockhash,
             Hash::default(),
@@ -1046,10 +1058,15 @@ mod tests {
         let to1 = Pubkey::new_unique();
         let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
         let pk1 = Pubkey::new_unique();
-        let executed1 = make_executed(vec![(pk1, AccountSharedData::new(500, 0, &Pubkey::new_unique()))]);
+        let executed1 = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
         let results1 = vec![(Ok(executed1), tx1)];
 
-        let r1 = settle_transactions(None, &mut db, None, &results1).await.unwrap();
+        let r1 = settle_transactions(None, &mut db, None, &results1)
+            .await
+            .unwrap();
         assert_eq!(r1.slot, 0);
 
         let block1 = db.get_block(0).await.unwrap();
@@ -1066,10 +1083,15 @@ mod tests {
         let to2 = Pubkey::new_unique();
         let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
         let pk2 = Pubkey::new_unique();
-        let executed2 = make_executed(vec![(pk2, AccountSharedData::new(300, 0, &Pubkey::new_unique()))]);
+        let executed2 = make_executed(vec![(
+            pk2,
+            AccountSharedData::new(300, 0, &Pubkey::new_unique()),
+        )]);
         let results2 = vec![(Ok(executed2), tx2)];
 
-        let r2 = settle_transactions(Some(last), &mut db, None, &results2).await.unwrap();
+        let r2 = settle_transactions(Some(last), &mut db, None, &results2)
+            .await
+            .unwrap();
         assert_eq!(r2.slot, 1);
 
         let block2 = db.get_block(1).await.unwrap();
@@ -1103,13 +1125,22 @@ mod tests {
         let sig3 = *tx3.signature();
 
         let pk1 = Pubkey::new_unique();
-        let executed1 = make_executed(vec![(pk1, AccountSharedData::new(500, 0, &Pubkey::new_unique()))]);
+        let executed1 = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
 
         let pk2 = Pubkey::new_unique();
-        let executed2 = make_executed(vec![(pk2, AccountSharedData::new(600, 0, &Pubkey::new_unique()))]);
+        let executed2 = make_executed(vec![(
+            pk2,
+            AccountSharedData::new(600, 0, &Pubkey::new_unique()),
+        )]);
 
         let pk3 = Pubkey::new_unique();
-        let executed3 = make_executed(vec![(pk3, AccountSharedData::new(700, 0, &Pubkey::new_unique()))]);
+        let executed3 = make_executed(vec![(
+            pk3,
+            AccountSharedData::new(700, 0, &Pubkey::new_unique()),
+        )]);
 
         let results = vec![
             (Ok(executed1), tx1),
@@ -1117,10 +1148,16 @@ mod tests {
             (Ok(executed3), tx3),
         ];
 
-        let result = settle_transactions(None, &mut db, None, &results).await.unwrap();
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
 
         let block = db.get_block(result.slot).await.unwrap();
-        assert_eq!(block.transaction_signatures.len(), 3, "all three signatures recorded");
+        assert_eq!(
+            block.transaction_signatures.len(),
+            3,
+            "all three signatures recorded"
+        );
         // Verify signatures are in the same order as input
         assert_eq!(block.transaction_signatures[0], sig1);
         assert_eq!(block.transaction_signatures[1], sig2);
@@ -1163,7 +1200,9 @@ mod tests {
         }));
 
         let results = vec![(Ok(executed), tx)];
-        let result = settle_transactions(None, &mut db, None, &results).await.unwrap();
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
 
         // Both writable accounts (payer and recipient) should be settled
         assert_eq!(
@@ -1174,7 +1213,10 @@ mod tests {
         let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
         assert!(settlement_keys.contains(&from.pubkey()), "payer settled");
         assert!(settlement_keys.contains(&to), "recipient settled");
-        assert!(!settlement_keys.contains(&system_prog), "system program not settled (read-only)");
+        assert!(
+            !settlement_keys.contains(&system_prog),
+            "system program not settled (read-only)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1189,7 +1231,10 @@ mod tests {
         let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
         let pk = Pubkey::new_unique();
-        let executed = make_executed(vec![(pk, AccountSharedData::new(500, 0, &Pubkey::new_unique()))]);
+        let executed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
         settle_transactions(None, &mut pg_db, None, &[(Ok(executed), tx)])
             .await
             .unwrap();
@@ -1223,7 +1268,10 @@ mod tests {
         // No keys should be written when Postgres is empty
         let mut conn = redis_db.connection.clone();
         let slot: Option<u64> = conn.get("latest_slot").await.ok();
-        assert!(slot.is_none(), "Redis should have no slot when Postgres is empty");
+        assert!(
+            slot.is_none(),
+            "Redis should have no slot when Postgres is empty"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1254,7 +1302,10 @@ mod tests {
         let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
         let pk = Pubkey::new_unique();
-        let executed = make_executed(vec![(pk, AccountSharedData::new(500, 0, &Pubkey::new_unique()))]);
+        let executed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
         let output = LoadAndExecuteSanitizedTransactionsOutput {
             processing_results: vec![Ok(executed)],
             error_metrics: Default::default(),
@@ -1276,6 +1327,9 @@ mod tests {
         // Create a fresh db instance to read the performance samples
         let db = AccountsDB::new(&url, false).await.unwrap();
         let samples = db.get_recent_performance_samples(10).await.unwrap();
-        assert!(!samples.is_empty(), "perf sample should have been stored after 1s tick");
+        assert!(
+            !samples.is_empty(),
+            "perf sample should have been stored after 1s tick"
+        );
     }
 }

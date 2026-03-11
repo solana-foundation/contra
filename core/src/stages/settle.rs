@@ -889,8 +889,6 @@ mod tests {
         })
         .await;
 
-        // Give worker time to initialize
-        tokio::time::sleep(Duration::from_millis(200)).await;
         shutdown.cancel();
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
@@ -917,9 +915,6 @@ mod tests {
             shutdown_token: shutdown.clone(),
         })
         .await;
-
-        // Give worker time to initialize and first tick to fire
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Send a batch of execution results
         let from = Keypair::new();
@@ -972,8 +967,6 @@ mod tests {
         })
         .await;
 
-        // Give worker time to initialize, then close the input channel
-        tokio::time::sleep(Duration::from_millis(200)).await;
         drop(exec_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
@@ -1314,15 +1307,10 @@ mod tests {
         };
         exec_tx.send((output, vec![tx])).unwrap();
 
-        // Wait long enough for:
-        // 1. blocktime_interval start delay (1000ms from SETTLE_START_DELAY_MS)
-        // 2. perf_sample_interval start delay (1000ms from perf_sample_period_secs)
-        // 3. Both ticks to fire and be processed
-        tokio::time::sleep(Duration::from_millis(2500)).await;
+        // Wait for both blocktime and perf tick to fire:
+        // ~1000ms initial blocktime delay + ~1000ms perf sample delay + processing time
+        tokio::time::sleep(Duration::from_millis(2200)).await;
         shutdown.cancel();
-
-        // Give the worker time to process shutdown and store the final sample
-        tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Create a fresh db instance to read the performance samples
         let db = AccountsDB::new(&url, false).await.unwrap();

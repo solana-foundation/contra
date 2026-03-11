@@ -393,23 +393,11 @@ impl Gateway {
     }
 }
 
-pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting Contra Gateway");
-    info!("  Port: {}", args.port);
-    info!("  Write URL: {}", args.write_url);
-    info!("  Read URL: {}", args.read_url);
-    info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
-
-    let gateway = Arc::new(Gateway::new(
-        args.write_url,
-        args.read_url,
-        args.cors_allowed_origin,
-    ));
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    let listener = TcpListener::bind(addr).await?;
-
-    info!("Gateway listening on http://{}", addr);
+async fn serve(
+    listener: TcpListener,
+    gateway: Arc<Gateway>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Gateway listening on http://{}", listener.local_addr()?);
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -427,6 +415,25 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
+
+pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting Contra Gateway");
+    info!("  Port: {}", args.port);
+    info!("  Write URL: {}", args.write_url);
+    info!("  Read URL: {}", args.read_url);
+    info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
+
+    let gateway = Arc::new(Gateway::new(
+        args.write_url,
+        args.read_url,
+        args.cors_allowed_origin,
+    ));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let listener = TcpListener::bind(addr).await?;
+
+    serve(listener, gateway).await
 }
 
 #[cfg(test)]
@@ -454,19 +461,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let io = TokioIo::new(stream);
-                let gateway = Arc::clone(&gateway);
-
-                tokio::spawn(async move {
-                    let service = service_fn(move |req| {
-                        let gateway = Arc::clone(&gateway);
-                        async move { gateway.handle_request(req).await }
-                    });
-                    let _ = http1::Builder::new().serve_connection(io, service).await;
-                });
-            }
+            let _ = serve(listener, gateway).await;
         });
 
         addr

@@ -359,11 +359,11 @@ mod tests {
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         let max = 3usize;
-        let num_of_sent = max * 2;
+        let num_to_send = max * 2; // 6 items, more than max (3)
 
         // Pre-fill with more than max transactions so the non-blocking loop
         // hits the limit and breaks.
-        for _ in 0..=num_of_sent {
+        for _ in 0..num_to_send {
             let from = Keypair::new();
             let to = Pubkey::new_unique();
             input_tx

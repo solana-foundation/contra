@@ -431,8 +431,6 @@ mod tests {
         })
         .await;
 
-        // Give the worker a moment to initialize
-        tokio::time::sleep(Duration::from_millis(100)).await;
         shutdown.cancel();
 
         let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
@@ -461,8 +459,6 @@ mod tests {
         })
         .await;
 
-        // Give worker time to initialize, then close the input channel
-        tokio::time::sleep(Duration::from_millis(200)).await;
         drop(batch_tx);
 
         // Worker should exit when input channel closes

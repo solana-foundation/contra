@@ -707,43 +707,22 @@ mod tests {
         assert_status(&response, 500);
     }
 
-    /// The `run()` function should bind, accept connections, and route requests.
-    /// Spawned in a background task; aborted after one successful round-trip.
+    /// The `serve()` function should bind, accept connections, and route requests.
+    /// Uses a pre-bound listener (port 0) to avoid TOCTOU race.
     #[tokio::test]
     async fn run_binds_and_serves_requests() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
-        // Reserve a free port, then release it so `run()` can bind it.
-        let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = tmp.local_addr().unwrap().port();
-        drop(tmp);
-
-        let args = Args {
-            port,
-            write_url: "http://127.0.0.1:1".to_string(),
-            read_url: "http://127.0.0.1:1".to_string(),
-            cors_allowed_origin: "*".to_string(),
-        };
-
-        let handle = tokio::spawn(async move {
-            let _ = run(args).await;
-        });
-
-        // Retry with backoff until gateway accepts a connection (replaces flaky sleep).
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let mut retry_count = 0;
-        loop {
-            if TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-            retry_count += 1;
-            if retry_count >= 50 {
-                panic!("Gateway did not bind within reasonable time");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gateway = Arc::new(Gateway::new(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "*".to_string(),
+        ));
+        let handle = tokio::spawn(async move { let _ = serve(listener, gateway).await; });
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
         let req = format!(
@@ -751,11 +730,9 @@ mod tests {
             body.len(),
             body
         );
-
         let response = send_raw(addr, req.as_bytes()).await;
         // Backend is unreachable (port 1) → gateway returns 502.
         assert_status(&response, 502);
-
         handle.abort();
     }
 

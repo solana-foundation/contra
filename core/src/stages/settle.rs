@@ -1307,17 +1307,21 @@ mod tests {
         };
         exec_tx.send((output, vec![tx])).unwrap();
 
-        // Wait for both blocktime and perf tick to fire:
-        // ~1000ms initial blocktime delay + ~1000ms perf sample delay + processing time
-        tokio::time::sleep(Duration::from_millis(2200)).await;
+        // Poll for perf sample with deadline instead of fixed sleep.
+        // Perf tick fires after ~1s; poll every 100ms for up to 5s.
+        let db_poll = AccountsDB::new(&url, false).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let samples = db_poll.get_recent_performance_samples(10).await.unwrap();
+            if !samples.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for perf sample to be stored"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         shutdown.cancel();
-
-        // Create a fresh db instance to read the performance samples
-        let db = AccountsDB::new(&url, false).await.unwrap();
-        let samples = db.get_recent_performance_samples(10).await.unwrap();
-        assert!(
-            !samples.is_empty(),
-            "perf sample should have been stored after 1s tick"
-        );
     }
 }

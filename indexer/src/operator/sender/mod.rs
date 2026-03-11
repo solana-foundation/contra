@@ -55,8 +55,8 @@ pub async fn run_sender(
         source_rpc_client,
     )?;
 
-    // Re-hydrate the deferred remint queue from any PendingRemint rows written             
-    // before a crash. These will be picked up by process_pending_remints on the          
+    // Re-hydrate the deferred remint queue from any PendingRemint rows written
+    // before a crash. These will be picked up by process_pending_remints on the
     // next tick
     state.recover_pending_remints(&storage_tx).await?;
 

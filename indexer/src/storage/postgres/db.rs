@@ -185,16 +185,16 @@ impl PostgresDb {
         .await?;
         info!("remint_signatures migration complete");
 
-        // Idempotent migration: add pending_remint_deadline_at to existing databases       
-        info!("Running pending_remint_deadline_at migration if needed...");    
-        sqlx::query(                                                                            
+        // Idempotent migration: add pending_remint_deadline_at to existing databases
+        info!("Running pending_remint_deadline_at migration if needed...");
+        sqlx::query(
             r#"
             DO $$ BEGIN                                                                         
                 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pending_remint_deadline_at    
         TIMESTAMPTZ;                                                                            
             END $$;                                                                             
-            "#,                                                                                 
-        )                                                     
+            "#,
+        )
         .execute(&self.pool)
         .await?;
         info!("pending_remint_deadline_at migration complete");
@@ -605,8 +605,8 @@ impl PostgresDb {
     }
 
     /// Returns all withdrawal transactions currently in PendingRemint status.
-  /// Called on startup to re-hydrate the in-memory remint queue after a crash.
-  pub async fn get_pending_remint_transactions_internal(
+    /// Called on startup to re-hydrate the in-memory remint queue after a crash.
+    pub async fn get_pending_remint_transactions_internal(
         &self,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         sqlx::query_as::<_, DbTransaction>(&format!(
@@ -647,7 +647,6 @@ impl PostgresDb {
         .fetch_all(&self.pool)
         .await
     }
-
 
     /// Get all transactions of a given type regardless of status
     pub async fn get_all_transactions_internal(

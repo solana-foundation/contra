@@ -11,7 +11,8 @@ pub async fn set_pending_remint(
 ) -> Result<(), StorageError> {
     match storage {
         Storage::Postgres(postgres_db) => {
-            set_pending_remint_postgres(postgres_db, transaction_id, remint_signatures, deadline_at).await
+            set_pending_remint_postgres(postgres_db, transaction_id, remint_signatures, deadline_at)
+                .await
         }
         #[cfg(test)]
         Storage::Mock(mock_db) => {

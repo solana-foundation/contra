@@ -705,34 +705,32 @@ pub(super) async fn handle_permanent_failure(
     // keeping status as Processing until the remint resolves avoids partial state
     // if the operator crashes during the finality window.
     if let Some(transaction_id) = ctx.transaction_id {
-        let sig_strings: Vec<String> = signatures
-            .iter()
-            .map(|sig| sig.to_string())
-            .collect();
+        let sig_strings: Vec<String> = signatures.iter().map(|sig| sig.to_string()).collect();
 
-        if let Err(e) = state.storage
+        if let Err(e) = state
+            .storage
             .set_pending_remint(transaction_id, sig_strings, deadline)
-            .await 
+            .await
         {
             error!(
                 "Failed to persist PendingRemint for transaction {} - sending to manual review: {}",
                 transaction_id, e
             );
             send_guaranteed(
-                storage_tx, 
-                TransactionStatusUpdate { 
-                    transaction_id, 
-                    trace_id: ctx.trace_id.clone(), 
-                    status: TransactionStatus::ManualReview, 
-                    counterpart_signature: None, 
-                    processed_at: Some(Utc::now()), 
+                storage_tx,
+                TransactionStatusUpdate {
+                    transaction_id,
+                    trace_id: ctx.trace_id.clone(),
+                    status: TransactionStatus::ManualReview,
+                    counterpart_signature: None,
+                    processed_at: Some(Utc::now()),
                     error_message: Some(format!(
                         "{} | failed to persist pending remint: {}",
                         error_msg, e
                     )),
                     remint_signature: None,
-                }, 
-                "transaction status update"
+                },
+                "transaction status update",
             )
             .await
             .ok();
@@ -874,7 +872,8 @@ pub async fn process_pending_remints(
                     );
                     remaining.push(PendingRemint {
                         finality_check_attempts: attempt,
-                        deadline: Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap(),
+                        deadline: Utc::now()
+                            + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap(),
                         ..entry
                     });
                 }
@@ -1484,7 +1483,7 @@ mod tests {
             .mock("POST", "/")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(format!(
+            .with_body(
                 r#"{{
                     "jsonrpc": "2.0",
                     "result": {{
@@ -1499,7 +1498,7 @@ mod tests {
                     }},
                     "id": 0
                 }}"#,
-            ))
+            )
             .create_async()
             .await;
 
@@ -1610,12 +1609,20 @@ mod tests {
         };
         let calls = mock.pending_remint_signatures.lock().unwrap();
 
-        assert_eq!(calls.len(), 1, "set_pending_remint should be called exactly once");
+        assert_eq!(
+            calls.len(),
+            1,
+            "set_pending_remint should be called exactly once"
+        );
 
         let (stored_id, stored_sigs, stored_deadline) = &calls[0];
         assert_eq!(*stored_id, 10, "wrong transaction_id persisted");
 
-        assert_eq!(stored_sigs.len(), 2, "both withdrawal signatures must be persisted");
+        assert_eq!(
+            stored_sigs.len(),
+            2,
+            "both withdrawal signatures must be persisted"
+        );
         assert!(
             stored_sigs.contains(&sig1.to_string()),
             "sig1 must be persisted"
@@ -1694,5 +1701,206 @@ mod tests {
         assert!(state.remint_cache.contains_key(&7));
         assert_eq!(state.remint_cache.get(&7).unwrap().amount, expected_amount);
         assert_eq!(state.remint_cache.get(&7).unwrap().transaction_id, 42);
+    }
+
+    // ── execute_deferred_remint paths ───────────────────────────────
+
+    /// When the finality check returns null for a withdrawal signature
+    /// (transaction was dropped), `execute_deferred_remint` is called.
+    /// If the remint itself also fails (RPC unreachable after the finality
+    /// check mock is consumed), the combined error must be sent as ManualReview.
+    ///
+    /// This covers the most common production failure mode: withdrawal dropped,
+    /// remint RPC unavailable → operator can't recover without intervention.
+    #[tokio::test]
+    async fn process_pending_remints_not_finalized_remint_fails_sends_manual_review() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let sig = Signature::new_unique();
+
+        // Finality check: null means the tx was dropped — proceed to remint.
+        let _mock = rpc_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+            )
+            .create_async()
+            .await;
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(77),
+                withdrawal_nonce: Some(11),
+                trace_id: Some("trace-77".to_string()),
+            },
+            remint_info: make_remint_info(77),
+            signatures: vec![sig],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Remint fails (RPC unavailable beyond the first mock) → ManualReview.
+        let update = storage_rx.try_recv().expect("should receive ManualReview");
+        assert_eq!(update.transaction_id, 77);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+
+        let err = update.error_message.as_deref().unwrap();
+        assert!(
+            err.contains("remint failed"),
+            "error should mention remint failure: {err}"
+        );
+        assert!(
+            err.contains("release_funds failed"),
+            "error should include original withdrawal error: {err}"
+        );
+
+        // Entry consumed — not re-queued after ManualReview.
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// A withdrawal that reached finality but failed on-chain (err field is set)
+    /// is NOT a successful withdrawal — the user's funds never left the escrow.
+    /// The operator must proceed to remint, not mark Completed.
+    #[tokio::test]
+    async fn process_pending_remints_finalized_with_onchain_error_proceeds_to_remint() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let sig = Signature::new_unique();
+
+        // Signature is finalized but has an on-chain error → withdrawal failed.
+        // `status.err.is_some()` must block the Completed path.
+        let _mock = rpc_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{{
+                    "jsonrpc": "2.0",
+                    "result": {{
+                        "context": {{"slot": 200}},
+                        "value": [{{
+                            "slot": 100,
+                            "confirmations": null,
+                            "err": {{"InstructionError": [0, {{"Custom": 1}}]}},
+                            "status": {{"Err": {{"InstructionError": [0, {{"Custom": 1}}]}}}},
+                            "confirmationStatus": "finalized"
+                        }}]
+                    }},
+                    "id": 0
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(88),
+                withdrawal_nonce: Some(12),
+                trace_id: Some("trace-88".to_string()),
+            },
+            remint_info: make_remint_info(88),
+            signatures: vec![sig],
+            original_error: "timeout".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Must NOT produce Completed — on-chain error means funds never moved.
+        // Remint is attempted; it fails here (no further mocks) → ManualReview.
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive a status update");
+        assert_ne!(
+            update.status,
+            TransactionStatus::Completed,
+            "finalized-with-error must NOT produce Completed — funds never left escrow"
+        );
+        assert_eq!(update.transaction_id, 88);
+    }
+
+    /// When a withdrawal was retried and produced multiple signatures, one of the
+    /// later retry signatures may reach finality. The operator must identify which
+    /// specific signature finalized and record it as the counterpart_signature.
+    #[tokio::test]
+    async fn process_pending_remints_second_of_two_sigs_finalized_marks_completed() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let sig1 = Signature::new_unique(); // first attempt — dropped
+        let sig2 = Signature::new_unique(); // retry — finalized
+
+        // value[0] = null (sig1 dropped), value[1] = finalized (sig2 succeeded)
+        let _mock = rpc_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{{
+                    "jsonrpc": "2.0",
+                    "result": {{
+                        "context": {{"slot": 200}},
+                        "value": [
+                            null,
+                            {{
+                                "slot": 100,
+                                "confirmations": null,
+                                "err": null,
+                                "status": {{"Ok": null}},
+                                "confirmationStatus": "finalized"
+                            }}
+                        ]
+                    }},
+                    "id": 0
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(55),
+                withdrawal_nonce: Some(6),
+                trace_id: Some("trace-55".to_string()),
+            },
+            remint_info: make_remint_info(55),
+            signatures: vec![sig1, sig2],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive Completed status");
+        assert_eq!(update.transaction_id, 55);
+        assert_eq!(update.status, TransactionStatus::Completed);
+
+        // counterpart_signature must be sig2 (the one that actually finalized).
+        assert_eq!(
+            update.counterpart_signature.as_deref(),
+            Some(sig2.to_string().as_str()),
+            "counterpart_signature must be the finalized sig (sig2), not the dropped sig1"
+        );
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "entry consumed after Completed"
+        );
     }
 }

@@ -1,10 +1,7 @@
 use crate::{
     error::StorageError,
     storage::{
-        common::{
-            models::DbTransaction,
-            storage::Storage,
-        },
+        common::{models::DbTransaction, storage::Storage},
         postgres::db::PostgresDb,
     },
 };

@@ -1038,6 +1038,38 @@ mod tests {
         }
     }
 
+    /// Build a SenderState pointed at a custom RPC URL.
+    /// Uses max_attempts=1 and minimal delays so tests don't wait on retries.
+    fn make_sender_state_with_rpc(rpc_url: &str) -> SenderState {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+            rpc_url.to_string(),
+            crate::operator::RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ));
+        SenderState {
+            rpc_client: rpc,
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: MintCache::new(storage),
+            retry_max_attempts: 3,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: crate::config::ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+        }
+    }
+
     // ── handle_permanent_failure ─────────────────────────────────────
 
     #[tokio::test]
@@ -1305,6 +1337,91 @@ mod tests {
         assert_eq!(update.status, TransactionStatus::Completed);
     }
 
+    // ── mixed matured/immature queue ────────────────────────────────
+
+    /// When the pending_remints queue contains both matured entries (deadline
+    /// in the past) and immature ones (deadline in the future), only the
+    /// matured entries should be processed on a given tick.
+    ///
+    /// The immature entry must remain in the queue completely unchanged —
+    /// same deadline, same attempt count. Processing it early would violate
+    /// the finality window guarantee that prevents double-minting.
+    #[tokio::test]
+    async fn process_pending_remints_handles_mixed_matured_and_immature() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let future_deadline = Utc::now() + chrono::Duration::seconds(600);
+
+        // Entry 1: matured — RPC will fail (localhost unreachable), so it
+        // gets re-queued with attempt=1. This is the observable side-effect
+        // that proves it was processed.
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(10),
+                withdrawal_nonce: Some(1),
+                trace_id: Some("trace-10".to_string()),
+            },
+            remint_info: make_remint_info(10),
+            signatures: vec![Signature::new_unique()],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        // Entry 2: immature — must not be touched at all.
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(20),
+                withdrawal_nonce: Some(2),
+                trace_id: Some("trace-20".to_string()),
+            },
+            remint_info: make_remint_info(20),
+            signatures: vec![Signature::new_unique()],
+            original_error: "release_funds failed".to_string(),
+            deadline: future_deadline,
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // No status update yet — the matured entry's RPC failed and was re-queued,
+        // the immature entry was skipped entirely.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update expected on first RPC failure"
+        );
+
+        // Both entries are still in the queue.
+        assert_eq!(state.pending_remints.len(), 2);
+
+        // The matured entry was processed: attempt counter incremented.
+        let matured = state
+            .pending_remints
+            .iter()
+            .find(|e| e.ctx.transaction_id == Some(10))
+            .expect("matured entry should still be in queue");
+        assert_eq!(
+            matured.finality_check_attempts, 1,
+            "matured entry should have attempt=1 after first RPC failure"
+        );
+
+        // The immature entry was not touched: attempt counter and deadline unchanged.
+        let immature = state
+            .pending_remints
+            .iter()
+            .find(|e| e.ctx.transaction_id == Some(20))
+            .expect("immature entry should still be in queue");
+        assert_eq!(
+            immature.finality_check_attempts, 0,
+            "immature entry must not be processed"
+        );
+        assert_eq!(
+            immature.deadline, future_deadline,
+            "immature entry deadline must be unchanged"
+        );
+    }
+
     // ── remint_cache population ─────────────────────────────────────
 
     #[tokio::test]
@@ -1340,6 +1457,96 @@ mod tests {
         );
     }
 
+    // ── finality check: withdrawal actually landed ───────────────────
+
+    /// The core anti-duplication invariant: if the original withdrawal
+    /// transaction reached finality on Solana, the remint must be skipped
+    /// and the transaction marked Completed instead.
+    ///
+    /// Skipping this check would mean reminting tokens that were already
+    /// successfully withdrawn — a direct double-credit to the user.
+    ///
+    /// This test mocks the Solana RPC to return a finalized status for the
+    /// withdrawal signature and verifies that no remint is attempted and
+    /// Completed is sent with the finalized signature as the counterpart.
+    #[tokio::test]
+    async fn process_pending_remints_marks_completed_when_withdrawal_finalized() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let sig = Signature::new_unique();
+
+        // Mock the Solana `getSignatureStatuses` RPC call to report the
+        // withdrawal signature as finalized with no error — meaning the
+        // funds did leave the escrow and reached the user's wallet.
+        let _mock = rpc_server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{
+                    "jsonrpc": "2.0",
+                    "result": {{
+                        "context": {{"slot": 200}},
+                        "value": [{{
+                            "slot": 100,
+                            "confirmations": null,
+                            "err": null,
+                            "status": {{"Ok": null}},
+                            "confirmationStatus": "finalized"
+                        }}]
+                    }},
+                    "id": 0
+                }}"#,
+            ))
+            .create_async()
+            .await;
+
+        // Push a matured entry whose deadline has already passed.
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(99),
+                withdrawal_nonce: Some(7),
+                trace_id: Some("trace-99".to_string()),
+            },
+            remint_info: make_remint_info(99),
+            signatures: vec![sig],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Must send Completed — the withdrawal landed, no remint needed.
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive Completed status");
+        assert_eq!(update.transaction_id, 99);
+        assert_eq!(update.status, TransactionStatus::Completed);
+
+        // The finalized withdrawal signature must be recorded as the
+        // counterpart so the DB has a pointer to the on-chain transaction.
+        assert_eq!(
+            update.counterpart_signature.as_deref(),
+            Some(sig.to_string().as_str()),
+            "counterpart_signature must be the finalized withdrawal sig"
+        );
+
+        // No second message — the remint path must not have been entered.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "should send exactly one status update — no remint attempted"
+        );
+
+        // Entry is consumed, not re-queued.
+        assert!(
+            state.pending_remints.is_empty(),
+            "entry should be removed from queue after Completed"
+        );
+    }
+
     #[tokio::test]
     async fn send_and_confirm_stashes_withdrawal_signature() {
         let mut state = make_sender_state();
@@ -1361,6 +1568,118 @@ mod tests {
             .or_default()
             .push(sig2);
         assert_eq!(state.pending_signatures[&nonce].len(), 2);
+    }
+
+    // ── set_pending_remint persistence ───────────────────────────────
+
+    /// When a withdrawal fails permanently and is eligible for remint,
+    /// `handle_permanent_failure` must persist the PendingRemint state to
+    /// the database before queuing the entry in memory.
+    ///
+    /// This test verifies three things that are critical for crash safety:
+    ///   1. `set_pending_remint` is called exactly once with the correct transaction_id.
+    ///   2. All withdrawal signatures are stored — missing even one could cause a
+    ///      false "not finalized" result on recovery, leading to a duplicate remint.
+    ///   3. The deadline is ~32s in the future so recovery restores the correct wait
+    ///      time rather than firing the remint immediately on restart.
+    #[tokio::test]
+    async fn permanent_failure_calls_set_pending_remint_with_correct_args() {
+        let mut state = make_sender_state();
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        // Two signatures — simulating a withdrawal that was retried once before
+        // failing permanently. Both must be persisted for a complete finality check.
+        let sig1 = Signature::new_unique();
+        let sig2 = Signature::new_unique();
+        state.remint_cache.insert(5, make_remint_info(10));
+        state.pending_signatures.insert(5, vec![sig1, sig2]);
+
+        let ctx = TransactionContext {
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+        };
+
+        let before = Utc::now();
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+        let after = Utc::now();
+
+        // Extract the mock to inspect what was written to storage.
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let calls = mock.pending_remint_signatures.lock().unwrap();
+
+        assert_eq!(calls.len(), 1, "set_pending_remint should be called exactly once");
+
+        let (stored_id, stored_sigs, stored_deadline) = &calls[0];
+        assert_eq!(*stored_id, 10, "wrong transaction_id persisted");
+
+        assert_eq!(stored_sigs.len(), 2, "both withdrawal signatures must be persisted");
+        assert!(
+            stored_sigs.contains(&sig1.to_string()),
+            "sig1 must be persisted"
+        );
+        assert!(
+            stored_sigs.contains(&sig2.to_string()),
+            "sig2 must be persisted"
+        );
+
+        // Deadline must be ~FINALITY_SAFETY_DELAY (32s) from now.
+        // We allow a ±3s window to absorb test execution time.
+        let expected_min = before + chrono::Duration::seconds(29);
+        let expected_max = after + chrono::Duration::seconds(35);
+        assert!(
+            *stored_deadline >= expected_min && *stored_deadline <= expected_max,
+            "deadline should be ~32s from now, got {stored_deadline}"
+        );
+    }
+
+    /// When the database write for `set_pending_remint` fails, the operator
+    /// cannot safely defer the remint — it has no guarantee the state will
+    /// survive a restart. Instead of silently losing the remint, it must
+    /// immediately escalate to ManualReview so an operator can intervene.
+    ///
+    /// Equally important: nothing should be queued in `pending_remints`.
+    /// Queuing in memory without the DB write would be a half-written state —
+    /// the entry would disappear on the next crash, violating the atomicity
+    /// invariant.
+    #[tokio::test]
+    async fn permanent_failure_sends_manual_review_when_storage_fails() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Instruct the mock to fail on set_pending_remint.
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("set_pending_remint", true);
+
+        state.remint_cache.insert(5, make_remint_info(10));
+        state
+            .pending_signatures
+            .insert(5, vec![Signature::new_unique()]);
+
+        let ctx = TransactionContext {
+            transaction_id: Some(10),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-10".to_string()),
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        // Must escalate to ManualReview — human intervention is needed.
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive ManualReview status");
+        assert_eq!(update.transaction_id, 10);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+
+        // Must not queue in memory — no DB write means no crash safety.
+        assert!(
+            state.pending_remints.is_empty(),
+            "should not queue pending remint when storage write failed"
+        );
     }
 
     #[test]

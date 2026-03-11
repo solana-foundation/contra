@@ -805,4 +805,62 @@ mod tests {
             "CORS header must be present in forwarded response: {response}"
         );
     }
+
+    #[tokio::test]
+    async fn send_transaction_routes_to_write_node_mock() {
+        let backend_addr = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        let write_url = format!("http://{backend_addr}");
+        let addr = start_gateway_with_urls(&write_url, "http://127.0.0.1:1").await;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["AAAA"]}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains("sig123"),
+            "response should contain backend body"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_too_large_body_contains_error_json() {
+        let addr = start_test_gateway().await;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            65 * 1024
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 413);
+        assert!(
+            response.contains("exceeds maximum size"),
+            "413 body should explain the limit: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_read_methods_route_to_read_node() {
+        let backend_addr = start_mock_http_backend(r#"{"result":"ok"}"#).await;
+        let read_url = format!("http://{backend_addr}");
+        let addr = start_gateway_with_urls("http://127.0.0.1:1", &read_url).await;
+
+        for method in &[
+            "getAccountInfo",
+            "getTransaction",
+            "getLatestBlockhash",
+            "getEpochInfo",
+        ] {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{}"}}"#, method);
+            let req = format!(
+                "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let response = send_raw(addr, req.as_bytes()).await;
+            assert_status(&response, 200);
+        }
+    }
 }

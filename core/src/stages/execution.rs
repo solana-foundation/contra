@@ -307,3 +307,169 @@ pub async fn execute_batch(
         regular_results,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::start_test_postgres;
+    use solana_sdk::{
+        hash::Hash,
+        message::Message,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn create_test_transaction() -> SanitizedTransaction {
+        let payer = Keypair::new();
+        let instruction = solana_system_interface::instruction::transfer(
+            &payer.pubkey(),
+            &Pubkey::new_unique(),
+            100,
+        );
+        let message = Message::new(&[instruction], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], message, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to create test transaction")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_empty_batch() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx).await;
+
+        let empty_batch = ConflictFreeBatch {
+            transactions: vec![],
+        };
+
+        let result = execute_batch(empty_batch, &mut deps).await;
+        assert!(result.admin_transactions.is_empty());
+        assert!(result.regular_transactions.is_empty());
+        assert!(result.admin_results.is_none());
+        assert!(result.regular_results.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_single_normal_transaction() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx).await;
+
+        let tx = create_test_transaction();
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: 0,
+            }],
+        };
+
+        let result = execute_batch(batch, &mut deps).await;
+        assert!(!result.regular_transactions.is_empty());
+        assert!(result.admin_transactions.is_empty());
+        assert!(
+            result.regular_results.is_some(),
+            "regular results should be present"
+        );
+        assert!(
+            result.admin_results.is_none(),
+            "no admin results for normal tx"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_multiple_normal_transactions() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx).await;
+
+        let tx1 = create_test_transaction();
+        let tx2 = create_test_transaction();
+        let batch = ConflictFreeBatch {
+            transactions: vec![
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(tx1),
+                    index: 0,
+                },
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(tx2),
+                    index: 1,
+                },
+            ],
+        };
+
+        let result = execute_batch(batch, &mut deps).await;
+        assert_eq!(result.regular_transactions.len(), 2);
+        assert!(result.admin_transactions.is_empty());
+        let results = result.regular_results.unwrap();
+        assert_eq!(results.processing_results.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execution_worker_shutdown_exits_cleanly() {
+        let (_accounts_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (_batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
+        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let (execution_results_tx, _execution_results_rx) = mpsc::unbounded_channel::<(
+            LoadAndExecuteSanitizedTransactionsOutput,
+            Vec<SanitizedTransaction>,
+        )>();
+        let shutdown = CancellationToken::new();
+
+        let handle = start_execution_worker(ExecutionArgs {
+            batch_rx,
+            settled_accounts_rx: settled_rx,
+            execution_results_tx,
+            accountsdb_connection_url: url,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Give the worker a moment to initialize
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
+        assert!(result.is_ok(), "worker should exit promptly after shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execution_worker_channel_closed_exits() {
+        let (_accounts_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
+        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let (execution_results_tx, _execution_results_rx) = mpsc::unbounded_channel::<(
+            LoadAndExecuteSanitizedTransactionsOutput,
+            Vec<SanitizedTransaction>,
+        )>();
+        let shutdown = CancellationToken::new();
+
+        let handle = start_execution_worker(ExecutionArgs {
+            batch_rx,
+            settled_accounts_rx: settled_rx,
+            execution_results_tx,
+            accountsdb_connection_url: url,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Give worker time to initialize, then close the input channel
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(batch_tx);
+
+        // Worker should exit when input channel closes
+        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "worker should exit when input channel is closed"
+        );
+    }
+}

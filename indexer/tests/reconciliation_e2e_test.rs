@@ -185,7 +185,6 @@ async fn test_reconciliation_success_within_tolerance() -> Result<(), Box<dyn st
 /// - Mismatch detected (1000 bps > 10 bps tolerance)
 /// - Webhook alert sent with correct data
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "stub test, not yet implemented"]  
 async fn test_reconciliation_detects_mismatch_and_alerts() -> Result<(), Box<dyn std::error::Error>>
 {
     let (pool, storage, _pg) = start_postgres().await?;
@@ -532,7 +531,6 @@ async fn test_reconciliation_ignores_non_completed_transactions(
 /// Expected:
 /// - Webhook retried and eventually succeeds
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "stub test, not yet implemented"]  
 async fn test_reconciliation_webhook_retry_logic() -> Result<(), Box<dyn std::error::Error>> {
     let mut webhook_server = mockito::Server::new_async().await;
 
@@ -701,12 +699,12 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
     let webhook_mock = webhook_server
         .mock("POST", "/")
         .match_header("content-type", "application/json")
-        .match_body(mockito::Matcher::AllOf(vec![
-            mockito::Matcher::Regex(format!(r#""mint":"{}""#, mint2)),
-            mockito::Matcher::Regex(r#""on_chain_balance":1800000"#.to_string()),
-            mockito::Matcher::Regex(r#""db_balance":2000000"#.to_string()),
-            mockito::Matcher::Regex(format!(r#""delta_bps":{}"#, mismatch.delta_bps)),
-        ]))
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "mint": mint2.to_string(),
+            "on_chain_balance": 1_800_000u64,
+            "db_balance": 2_000_000u64,
+            "delta_bps": mismatch.delta_bps,
+        })))
         .with_status(200)
         .create_async()
         .await;

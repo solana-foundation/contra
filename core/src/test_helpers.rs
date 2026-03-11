@@ -114,6 +114,26 @@ pub(crate) async fn start_test_postgres_with_new_instance() -> (
     (db, second, container)
 }
 
+/// Spin up a throwaway Redis container and return a `RedisAccountsDB` directly.
+/// Use this when testing `RedisAccountsDB`-specific methods or warm_redis_cache.
+#[cfg(test)]
+pub(crate) async fn start_test_redis() -> (
+    crate::accounts::RedisAccountsDB,
+    testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
+) {
+    use testcontainers::runners::AsyncRunner;
+
+    let container = testcontainers_modules::redis::Redis::default()
+        .start()
+        .await
+        .unwrap();
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(6379).await.unwrap();
+    let url = format!("redis://{}:{}", host, port);
+    let db = crate::accounts::RedisAccountsDB::new(&url).await.unwrap();
+    (db, container)
+}
+
 /// Create a BOB with empty state and a dummy (non-connecting) Postgres pool.
 /// The pool uses a bogus URL — any accidental DB call will fail with a
 /// connection timeout. Only for unit tests that stay in-memory.

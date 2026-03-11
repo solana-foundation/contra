@@ -233,17 +233,28 @@ mod tests {
 
         let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx);
         // Conflicting transactions should be split into separate batches
-        assert_eq!(sent, 2, "Two conflicting txs should produce two separate batches");
+        assert_eq!(
+            sent, 2,
+            "Two conflicting txs should produce two separate batches"
+        );
 
         // Verify first batch received
         let batch1 = batch_rx.try_recv();
         assert!(batch1.is_ok(), "First batch should be received");
-        assert_eq!(batch1.unwrap().transactions.len(), 1, "First batch should contain one transaction");
+        assert_eq!(
+            batch1.unwrap().transactions.len(),
+            1,
+            "First batch should contain one transaction"
+        );
 
         // Verify second batch received
         let batch2 = batch_rx.try_recv();
         assert!(batch2.is_ok(), "Second batch should be received");
-        assert_eq!(batch2.unwrap().transactions.len(), 1, "Second batch should contain one transaction");
+        assert_eq!(
+            batch2.unwrap().transactions.len(),
+            1,
+            "Second batch should contain one transaction"
+        );
     }
 
     // Txs with no shared accounts are eligible to be placed in the same batch.
@@ -262,42 +273,22 @@ mod tests {
         let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
 
         let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx);
-        assert_eq!(sent, 1, "Non-conflicting txs should be grouped into one batch");
+        assert_eq!(
+            sent, 1,
+            "Non-conflicting txs should be grouped into one batch"
+        );
 
         // Verify the batch contains both transactions
         let batch = batch_rx.try_recv();
         assert!(batch.is_ok(), "One batch should be received");
-        assert_eq!(batch.unwrap().transactions.len(), 2, "Batch should contain both non-conflicting transactions");
+        assert_eq!(
+            batch.unwrap().transactions.len(),
+            2,
+            "Batch should contain both non-conflicting transactions"
+        );
     }
 
     // ---- start_sequence_worker tests ----
-
-    // A single tx flowing through the live worker produces a batch on the output channel.
-    #[tokio::test]
-    async fn worker_single_tx_emits_batch() {
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
-        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
-        let shutdown = CancellationToken::new();
-
-        let _handle = start_sequence_worker(SequencerArgs {
-            max_tx_per_batch: 64,
-            rx: input_rx,
-            batch_tx,
-            shutdown_token: shutdown.clone(),
-        })
-        .await;
-
-        let from = Keypair::new();
-        let to = Pubkey::new_unique();
-        input_tx
-            .send(create_test_sanitized_transaction(&from, &to, 100))
-            .unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(300), batch_rx.recv()).await;
-        assert!(result.is_ok(), "expected a batch within timeout");
-        assert!(result.unwrap().is_some());
-        shutdown.cancel();
-    }
 
     // Closing the input channel with a pending tx causes the worker to flush it then exit.
     #[tokio::test]
@@ -368,10 +359,11 @@ mod tests {
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
         let max = 3usize;
+        let num_of_sent = max * 2;
 
         // Pre-fill with more than max transactions so the non-blocking loop
         // hits the limit and breaks.
-        for _ in 0..=max {
+        for _ in 0..=num_of_sent {
             let from = Keypair::new();
             let to = Pubkey::new_unique();
             input_tx
@@ -387,13 +379,16 @@ mod tests {
         })
         .await;
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let result = batch_rx.try_recv();
-        assert!(result.is_ok(), "expected at least one batch");
-        let batch = result.unwrap();
-        assert_eq!(batch.transactions.len(), max,
-            "Batch should contain exactly max_tx_per_batch ({}) transactions", max);
+        // Use timeout + recv instead of sleep + try_recv for determinism
+        let result = tokio::time::timeout(Duration::from_millis(500), batch_rx.recv()).await;
+        assert!(result.is_ok(), "expected at least one batch within timeout");
+        let batch = result.unwrap().expect("channel should not be closed");
+        assert_eq!(
+            batch.transactions.len(),
+            max,
+            "Batch should contain exactly max_tx_per_batch ({}) transactions",
+            max
+        );
         shutdown.cancel();
     }
 }

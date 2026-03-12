@@ -184,43 +184,238 @@ pub fn load_keypair(path: &Path) -> Result<Keypair, Box<dyn std::error::Error + 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spl_token::instruction::TokenInstruction;
+    use spl_token::solana_program::program_option::COption;
+
+    /// Helper: resolve the program ID from a compiled instruction
+    fn resolve_program_id(tx: &Transaction, ix_index: usize) -> Pubkey {
+        let ix = &tx.message.instructions[ix_index];
+        tx.message.account_keys[ix.program_id_index as usize]
+    }
+
     #[test]
-    fn test_create_spl_transfer_structure() {
+    fn test_create_spl_transfer() {
         let from = Keypair::new();
         let to = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
+        let amount: u64 = 1_000;
         let blockhash = Hash::new_unique();
 
-        let tx = create_spl_transfer(&from, &to, &mint, 1000, blockhash);
+        let tx = create_spl_transfer(&from, &to, &mint, amount, blockhash);
+
         assert_eq!(tx.message.recent_blockhash, blockhash);
         assert_eq!(tx.message.instructions.len(), 1);
-        // The fee payer should be the from keypair
-        let fee_payer = tx.message.account_keys[0];
-        assert_eq!(fee_payer, from.pubkey());
+        assert_eq!(tx.message.account_keys[0], from.pubkey());
+
+        // Program must be SPL Token
+        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+
+        let ix = &tx.message.instructions[0];
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack Transfer instruction") {
+            TokenInstruction::Transfer {
+                amount: decoded_amount,
+            } => {
+                assert_eq!(decoded_amount, amount);
+            }
+            other => panic!("expected Transfer, got {other:?}"),
+        }
+
+        // Account keys must contain the correct ATAs
+        let expected_from_ata = get_associated_token_address(&from.pubkey(), &mint);
+        let expected_to_ata = get_associated_token_address(&to, &mint);
+        assert!(
+            tx.message.account_keys.contains(&expected_from_ata),
+            "source ATA missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&expected_to_ata),
+            "destination ATA missing from account keys"
+        );
     }
 
     #[test]
-    fn test_create_spl_burn_structure() {
+    fn test_create_spl_burn() {
         let from = Keypair::new();
         let mint = Pubkey::new_unique();
+        let amount: u64 = 500;
         let blockhash = Hash::new_unique();
 
-        let tx = create_spl_burn(&from, &mint, 500, blockhash);
+        let tx = create_spl_burn(&from, &mint, amount, blockhash);
+
         assert_eq!(tx.message.recent_blockhash, blockhash);
         assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.account_keys[0], from.pubkey());
+        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+
+        let ix = &tx.message.instructions[0];
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack Burn instruction") {
+            TokenInstruction::Burn {
+                amount: decoded_amount,
+            } => {
+                assert_eq!(decoded_amount, amount);
+            }
+            other => panic!("expected Burn, got {other:?}"),
+        }
+
+        let expected_ata = get_associated_token_address(&from.pubkey(), &mint);
+        assert!(
+            tx.message.account_keys.contains(&expected_ata),
+            "source ATA missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&mint),
+            "mint missing from account keys"
+        );
     }
 
     #[test]
-    fn test_create_admin_initialize_mint_structure() {
+    fn test_create_admin_initialize_mint() {
         let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let decimals: u8 = 6;
+        let blockhash = Hash::new_unique();
+
+        let tx = create_admin_initialize_mint(&admin, &mint, decimals, blockhash);
+
+        assert_eq!(tx.message.recent_blockhash, blockhash);
+        assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.account_keys[0], admin.pubkey());
+        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+
+        let ix = &tx.message.instructions[0];
+        match TokenInstruction::unpack(&ix.data)
+            .expect("failed to unpack InitializeMint instruction")
+        {
+            TokenInstruction::InitializeMint {
+                decimals: decoded_decimals,
+                mint_authority,
+                freeze_authority,
+            } => {
+                assert_eq!(decoded_decimals, decimals);
+                assert_eq!(mint_authority, admin.pubkey());
+                assert_eq!(freeze_authority, COption::None);
+            }
+            other => panic!("expected InitializeMint, got {other:?}"),
+        }
+
+        assert!(
+            tx.message.account_keys.contains(&mint),
+            "mint missing from account keys"
+        );
+    }
+
+    #[test]
+    fn test_create_admin_mint_to() {
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let dest = Pubkey::new_unique();
+        let amount: u64 = 1_000;
+        let blockhash = Hash::new_unique();
+
+        let tx = create_admin_mint_to(&admin, &mint, &dest, amount, blockhash);
+
+        assert_eq!(tx.message.recent_blockhash, blockhash);
+        assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.account_keys[0], admin.pubkey());
+        assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
+
+        let ix = &tx.message.instructions[0];
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack MintTo instruction") {
+            TokenInstruction::MintTo {
+                amount: decoded_amount,
+            } => {
+                assert_eq!(decoded_amount, amount);
+            }
+            other => panic!("expected MintTo, got {other:?}"),
+        }
+
+        assert!(
+            tx.message.account_keys.contains(&mint),
+            "mint missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&dest),
+            "destination missing from account keys"
+        );
+    }
+
+    #[test]
+    fn test_create_ata_transaction() {
+        let payer = Keypair::new();
+        let owner = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let blockhash = Hash::new_unique();
 
-        let tx = create_admin_initialize_mint(&admin, &mint, 6, blockhash);
+        let tx = create_ata_transaction(&payer, &owner, &mint, blockhash);
+
         assert_eq!(tx.message.recent_blockhash, blockhash);
-        // InitializeMint instruction
         assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.account_keys[0], payer.pubkey());
+
+        // Program must be the Associated Token Account program
+        assert_eq!(
+            resolve_program_id(&tx, 0),
+            spl_associated_token_account::id()
+        );
+
+        // The derived ATA address must appear in account keys
+        let expected_ata = get_associated_token_address(&owner, &mint);
+        assert!(
+            tx.message.account_keys.contains(&expected_ata),
+            "derived ATA missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&owner),
+            "owner missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&mint),
+            "mint missing from account keys"
+        );
     }
+
+    #[test]
+    fn test_create_withdraw_funds() {
+        let from = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let amount: u64 = 500;
+        let blockhash = Hash::new_unique();
+
+        let tx = create_withdraw_funds(&from, &mint, amount, blockhash);
+
+        assert_eq!(tx.message.recent_blockhash, blockhash);
+        assert_eq!(tx.message.instructions.len(), 1);
+        assert_eq!(tx.message.account_keys[0], from.pubkey());
+
+        // Program must be the Contra withdraw program
+        assert_eq!(
+            resolve_program_id(&tx, 0),
+            contra_withdraw_program_client::programs::CONTRA_WITHDRAW_PROGRAM_ID,
+        );
+
+        // Account keys must include the derived ATA, mint, and token programs
+        let expected_ata = get_associated_token_address(&from.pubkey(), &mint);
+        assert!(
+            tx.message.account_keys.contains(&expected_ata),
+            "token account ATA missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&mint),
+            "mint missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&spl_token::id()),
+            "SPL Token program missing from account keys"
+        );
+        assert!(
+            tx.message
+                .account_keys
+                .contains(&spl_associated_token_account::id()),
+            "ATA program missing from account keys"
+        );
+    }
+
+    // --- load_keypair tests ---
 
     #[test]
     fn test_load_keypair_valid() {
@@ -236,17 +431,23 @@ mod tests {
     }
 
     #[test]
-    fn test_load_keypair_invalid_length() {
-        let bytes: Vec<u8> = vec![0u8; 32]; // too short
-        let json = serde_json::to_string(&bytes).unwrap();
+    fn test_load_keypair_invalid_length_boundary() {
+        // Test values around the 64-byte boundary
+        for len in [0, 1, 32, 63, 65, 128] {
+            let bytes: Vec<u8> = vec![0u8; len];
+            let json = serde_json::to_string(&bytes).unwrap();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), &json).unwrap();
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), &json).unwrap();
 
-        let result = load_keypair(tmp.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Invalid keypair length"));
+            let result = load_keypair(tmp.path());
+            assert!(result.is_err(), "expected error for {len}-byte keypair");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Invalid keypair length"),
+                "expected 'Invalid keypair length' for {len} bytes, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -255,6 +456,17 @@ mod tests {
         std::fs::write(tmp.path(), "not json at all").unwrap();
 
         let result = load_keypair(tmp.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("parse keypair JSON"),
+            "expected JSON parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_keypair_nonexistent_file() {
+        let result = load_keypair(Path::new("/nonexistent/path/keypair.json"));
         assert!(result.is_err());
     }
 }

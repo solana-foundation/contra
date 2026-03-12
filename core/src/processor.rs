@@ -150,3 +150,69 @@ pub fn get_transaction_check_results(
         len
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
+    use solana_svm::transaction_processing_callback::TransactionProcessingCallback;
+    use solana_svm_callback::InvokeContextCallback;
+
+    #[test]
+    fn test_get_transaction_check_results_constructed_with_expected_values() {
+        // Verify the hardcoded configuration values by constructing
+        // the expected details and comparing with Debug output.
+        // Fields are pub(crate) so we can't access them directly,
+        // but we can verify the construction matches our expectation.
+        let expected = CheckedTransactionDetails::new(
+            None, // no nonce
+            Ok(SVMTransactionExecutionAndFeeBudgetLimits {
+                budget: SVMTransactionExecutionBudget::default(),
+                loaded_accounts_data_size_limit: NonZeroU32::new(64 * 1024 * 1024).expect("64 MiB"),
+                fee_details: FeeDetails::default(),
+            }),
+        );
+        let results = get_transaction_check_results(1);
+        let actual = results[0].as_ref().unwrap();
+        assert_eq!(
+            actual, &expected,
+            "check result should use None nonce, default budget, 64 MiB limit, default fees"
+        );
+    }
+
+    /// Minimal mock that returns None for all accounts — triggers the
+    /// "BPF program not found" error path.
+    struct EmptyAccountsDB;
+    impl InvokeContextCallback for EmptyAccountsDB {}
+    impl TransactionProcessingCallback for EmptyAccountsDB {
+        fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<AccountSharedData> {
+            None
+        }
+        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
+            None
+        }
+    }
+
+    #[test]
+    fn test_create_processor_fails_when_bpf_program_missing() {
+        let db = EmptyAccountsDB;
+        let feature_set = SVMFeatureSet::default();
+        let budget = SVMTransactionExecutionBudget::default();
+
+        let result = create_transaction_batch_processor(&db, &feature_set, &budget);
+
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error when BPF programs are missing"),
+        };
+        // The first BPF program looked up is spl_token
+        assert!(
+            err.contains("BPF program") && err.contains("not found"),
+            "expected 'BPF program ... not found' error, got: {err}"
+        );
+        assert!(
+            err.contains(&spl_token::id().to_string()),
+            "error should mention the first missing program (spl_token), got: {err}"
+        );
+    }
+}

@@ -167,7 +167,10 @@ fn process_and_send_batches(
 mod tests {
     use super::*;
     use crate::test_helpers::create_test_sanitized_transaction;
+    use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Keypair;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_single_tx_produces_batch() {
@@ -175,7 +178,7 @@ mod tests {
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx);
@@ -206,11 +209,186 @@ mod tests {
         drop(batch_rx);
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // Should not panic, just return 0 since channel is closed
         let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx);
         assert_eq!(sent, 0);
+    }
+
+    // Conflicting txs (same payer = write conflict) are split across separate conflict-free batches.
+    #[test]
+    fn test_multiple_txs_produce_multiple_batches() {
+        // When transactions conflict they are split into separate batches.
+        // Use the same payer (write conflict on fee payer account).
+        let mut scheduler = Scheduler::new_dag();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+
+        let payer = Keypair::new();
+        let to1 = Pubkey::new_unique();
+        let to2 = Pubkey::new_unique();
+        let tx1 = create_test_sanitized_transaction(&payer, &to1, 100);
+        let tx2 = create_test_sanitized_transaction(&payer, &to2, 200);
+
+        let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx);
+        // Conflicting transactions should be split into separate batches
+        assert_eq!(
+            sent, 2,
+            "Two conflicting txs should produce two separate batches"
+        );
+
+        // Verify first batch received
+        let batch1 = batch_rx.try_recv();
+        assert!(batch1.is_ok(), "First batch should be received");
+        assert_eq!(
+            batch1.unwrap().transactions.len(),
+            1,
+            "First batch should contain one transaction"
+        );
+
+        // Verify second batch received
+        let batch2 = batch_rx.try_recv();
+        assert!(batch2.is_ok(), "Second batch should be received");
+        assert_eq!(
+            batch2.unwrap().transactions.len(),
+            1,
+            "Second batch should contain one transaction"
+        );
+    }
+
+    // Txs with no shared accounts are eligible to be placed in the same batch.
+    #[test]
+    fn test_non_conflicting_txs_may_share_batch() {
+        // Transactions with no shared accounts can be in the same batch.
+        // Different payers and recipients = no conflicts = can share batch.
+        let mut scheduler = Scheduler::new_dag();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+
+        let from1 = Keypair::new();
+        let from2 = Keypair::new();
+        let to1 = Pubkey::new_unique();
+        let to2 = Pubkey::new_unique();
+        let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
+        let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
+
+        let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx);
+        assert_eq!(
+            sent, 1,
+            "Non-conflicting txs should be grouped into one batch"
+        );
+
+        // Verify the batch contains both transactions
+        let batch = batch_rx.try_recv();
+        assert!(batch.is_ok(), "One batch should be received");
+        assert_eq!(
+            batch.unwrap().transactions.len(),
+            2,
+            "Batch should contain both non-conflicting transactions"
+        );
+    }
+
+    // ---- start_sequence_worker tests ----
+
+    // Closing the input channel with a pending tx causes the worker to flush it then exit.
+    #[tokio::test]
+    async fn worker_channel_closed_flushes_pending_and_exits() {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        input_tx
+            .send(create_test_sanitized_transaction(&from, &to, 100))
+            .unwrap();
+        drop(input_tx); // close the channel with a pending tx
+
+        let _handle = start_sequence_worker(SequencerArgs {
+            max_tx_per_batch: 64,
+            rx: input_rx,
+            batch_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Worker should receive the pending tx, process it, then exit
+        let result = tokio::time::timeout(Duration::from_millis(300), batch_rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "batch should arrive before channel-close exit"
+        );
+        shutdown.cancel();
+    }
+
+    // Cancelling the shutdown token stops the worker without deadlock or panic.
+    #[tokio::test]
+    async fn worker_shutdown_signal_exits_cleanly() {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let _handle = start_sequence_worker(SequencerArgs {
+            max_tx_per_batch: 64,
+            rx: input_rx,
+            batch_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Send a tx so the worker has something to flush on shutdown
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        input_tx
+            .send(create_test_sanitized_transaction(&from, &to, 100))
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.cancel();
+
+        // The batch emitted before or at shutdown should be receivable
+        let _ = tokio::time::timeout(Duration::from_millis(200), batch_rx.recv()).await;
+        // No panic or deadlock is the primary assertion here
+        drop(input_tx);
+    }
+
+    // The worker's non-blocking drain loop stops collecting once max_tx_per_batch is reached.
+    #[tokio::test]
+    async fn worker_collects_up_to_max_tx_per_batch() {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let max = 3usize;
+        let num_to_send = max * 2; // 6 items, more than max (3)
+
+        // Pre-fill with more than max transactions so the non-blocking loop
+        // hits the limit and breaks.
+        for _ in 0..num_to_send {
+            let from = Keypair::new();
+            let to = Pubkey::new_unique();
+            input_tx
+                .send(create_test_sanitized_transaction(&from, &to, 100))
+                .unwrap();
+        }
+
+        let _handle = start_sequence_worker(SequencerArgs {
+            max_tx_per_batch: max,
+            rx: input_rx,
+            batch_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Use timeout + recv instead of sleep + try_recv for determinism
+        let result = tokio::time::timeout(Duration::from_millis(500), batch_rx.recv()).await;
+        assert!(result.is_ok(), "expected at least one batch within timeout");
+        let batch = result.unwrap().expect("channel should not be closed");
+        assert_eq!(
+            batch.transactions.len(),
+            max,
+            "Batch should contain exactly max_tx_per_batch ({}) transactions",
+            max
+        );
+        shutdown.cancel();
     }
 }

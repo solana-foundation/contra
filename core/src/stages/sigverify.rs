@@ -394,6 +394,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_forwards_valid_tx_to_sequencer() {
+        let (sigverify_tx, sigverify_rx) = tokio_mpmc::channel::<SanitizedTransaction>(10);
+        let (sequencer_tx, mut sequencer_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let payer = Keypair::new();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+        let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
+        let tx = sanitize(&[ix], &payer, &[&payer]);
+        let expected_sig = *tx.signature();
+
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            sequencer_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        sigverify_tx.send(tx).await.unwrap();
+
+        // valid tx should reach sequencer
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), sequencer_rx.recv())
+            .await
+            .expect("timeout waiting for sequencer")
+            .expect("sequencer channel closed");
+        assert_eq!(received.signature(), &expected_sig);
+
+        shutdown.cancel();
+        for h in handles {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_drops_invalid_tx() {
+        let (sigverify_tx, sigverify_rx) = tokio_mpmc::channel::<SanitizedTransaction>(10);
+        let (sequencer_tx, mut sequencer_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        // empty transaction → InvalidTransaction(Empty)
+        let payer = Keypair::new();
+        let empty_tx = sanitize(&[], &payer, &[&payer]);
+
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            sequencer_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        sigverify_tx.send(empty_tx).await.unwrap();
+
+        // Sentinel: send a valid tx right after the invalid one.
+        // When this arrives on sequencer_rx, the invalid tx was already processed and dropped.
+        let sentinel_from = Keypair::new();
+        let sentinel_to = Pubkey::new_unique();
+        let sentinel_tx = {
+            let payer = &sentinel_from;
+            let to = &sentinel_to;
+            let ix = spl_token::instruction::transfer(
+                &spl_token::id(),
+                to,
+                to,
+                &payer.pubkey(),
+                &[],
+                1_000,
+            )
+            .unwrap();
+            let message = solana_sdk::message::Message::new(&[ix], Some(&payer.pubkey()));
+            let tx = solana_sdk::transaction::Transaction::new(
+                &[payer],
+                message,
+                solana_sdk::hash::Hash::default(),
+            );
+            SanitizedTransaction::try_from_legacy_transaction(tx, &std::collections::HashSet::new())
+                .unwrap()
+        };
+        sigverify_tx.send(sentinel_tx.clone()).await.unwrap();
+
+        // The sentinel valid tx should arrive
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), sequencer_rx.recv()).await;
+        assert!(result.is_ok(), "sentinel valid tx should be forwarded");
+
+        // Nothing else should arrive (invalid tx was dropped, not forwarded)
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(50), sequencer_rx.recv()).await;
+        assert!(extra.is_err(), "only sentinel should have been forwarded");
+
+        shutdown.cancel();
+        for h in handles {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_shutdown_signal_stops_worker() {
+        let (_sigverify_tx, sigverify_rx) = tokio_mpmc::channel::<SanitizedTransaction>(10);
+        let (sequencer_tx, _sequencer_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 2,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            sequencer_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+        assert_eq!(handles.len(), 2);
+
+        shutdown.cancel();
+        for h in handles {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+            assert!(result.is_ok(), "worker should exit promptly after shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_not_signed_by_admin_with_empty_admin_keys() {
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ix = initialize_mint_ix(&mint, &admin.pubkey());
+        let tx = sanitize(&[ix], &admin, &[&admin]);
+        // Empty admin_keys means no one is an admin
+        let result = sigverify_transaction(&tx, &[]).await;
+        assert!(
+            matches!(result, SigverifyResult::NotSignedByAdmin),
+            "expected NotSignedByAdmin when admin_keys is empty, got {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn instruction_with_empty_data_not_counted() {
         // An instruction with no data bytes is skipped by classify_transaction.
         // A tx with only such instructions is classified Empty.
@@ -412,6 +550,98 @@ mod tests {
                 SigverifyResult::InvalidTransaction(TransactionType::Empty)
             ),
             "expected InvalidTransaction(Empty) for empty-data ix, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_tx_with_tampered_signature_fails_verification() {
+        // Admin instruction + admin signer, but signature is corrupted
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ix = initialize_mint_ix(&mint, &admin.pubkey());
+
+        let mut tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&admin.pubkey()),
+            &[&admin],
+            Hash::default(),
+        );
+        // Corrupt the signature
+        let mut sig_bytes = <[u8; 64]>::from(tx.signatures[0]);
+        sig_bytes[0] ^= 0xff;
+        tx.signatures[0] = Signature::from(sig_bytes);
+
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        let result = sigverify_transaction(&sanitized, &[admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::SigverifyFailed(_)),
+            "expected SigverifyFailed for corrupted admin tx, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_key_as_non_signer_account_rejected() {
+        // Admin key listed as a read-only (non-signer) account, not a signer
+        let admin = Keypair::new();
+        let signer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new_readonly(admin.pubkey(), false), // admin as read-only
+            ],
+            data: vec![0], // initialize_mint opcode
+        };
+        let tx = sanitize(&[ix], &signer, &[&signer]);
+        let result = sigverify_transaction(&tx, &[admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::NotSignedByAdmin),
+            "expected NotSignedByAdmin when admin is non-signer, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_admin_keys_any_one_matches() {
+        // Multiple admin keys in the allowlist; any one signer should pass
+        let real_admin = Keypair::new();
+        let other_admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+
+        let ix = initialize_mint_ix(&mint, &real_admin.pubkey());
+        let tx = sanitize(&[ix], &real_admin, &[&real_admin]);
+        let result = sigverify_transaction(&tx, &[other_admin, real_admin.pubkey()]).await;
+        assert!(
+            matches!(result, SigverifyResult::Valid(TransactionType::Admin)),
+            "expected Valid(Admin) when one of multiple admin keys signs, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_exits_when_input_channel_closed() {
+        let (sigverify_tx, sigverify_rx) = tokio_mpmc::channel::<SanitizedTransaction>(10);
+        let (sequencer_tx, _sequencer_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let mut handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            sequencer_tx,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Close the input channel (drop the sender)
+        drop(sigverify_tx);
+
+        // Worker should detect channel closed and exit within timeout
+        let handle = handles.pop().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "worker should exit promptly when input channel closes"
         );
     }
 }

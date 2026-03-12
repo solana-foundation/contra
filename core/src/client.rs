@@ -212,7 +212,9 @@ mod tests {
 
         let ix = &tx.message.instructions[0];
         match TokenInstruction::unpack(&ix.data).expect("failed to unpack Transfer instruction") {
-            TokenInstruction::Transfer { amount: decoded_amount } => {
+            TokenInstruction::Transfer {
+                amount: decoded_amount,
+            } => {
                 assert_eq!(decoded_amount, amount);
             }
             other => panic!("expected Transfer, got {other:?}"),
@@ -247,7 +249,9 @@ mod tests {
 
         let ix = &tx.message.instructions[0];
         match TokenInstruction::unpack(&ix.data).expect("failed to unpack Burn instruction") {
-            TokenInstruction::Burn { amount: decoded_amount } => {
+            TokenInstruction::Burn {
+                amount: decoded_amount,
+            } => {
                 assert_eq!(decoded_amount, amount);
             }
             other => panic!("expected Burn, got {other:?}"),
@@ -279,7 +283,9 @@ mod tests {
         assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
 
         let ix = &tx.message.instructions[0];
-        match TokenInstruction::unpack(&ix.data).expect("failed to unpack InitializeMint instruction") {
+        match TokenInstruction::unpack(&ix.data)
+            .expect("failed to unpack InitializeMint instruction")
+        {
             TokenInstruction::InitializeMint {
                 decimals: decoded_decimals,
                 mint_authority,
@@ -315,7 +321,9 @@ mod tests {
 
         let ix = &tx.message.instructions[0];
         match TokenInstruction::unpack(&ix.data).expect("failed to unpack MintTo instruction") {
-            TokenInstruction::MintTo { amount: decoded_amount } => {
+            TokenInstruction::MintTo {
+                amount: decoded_amount,
+            } => {
                 assert_eq!(decoded_amount, amount);
             }
             other => panic!("expected MintTo, got {other:?}"),

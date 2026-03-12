@@ -1484,20 +1484,20 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{{
+                r#"{
                     "jsonrpc": "2.0",
-                    "result": {{
-                        "context": {{"slot": 200}},
-                        "value": [{{
+                    "result": {
+                        "context": {"slot": 200},
+                        "value": [{
                             "slot": 100,
                             "confirmations": null,
                             "err": null,
-                            "status": {{"Ok": null}},
+                            "status": {"Ok": null},
                             "confirmationStatus": "finalized"
-                        }}]
-                    }},
+                        }]
+                    },
                     "id": 0
-                }}"#,
+                }"#,
             )
             .create_async()
             .await;
@@ -1785,20 +1785,20 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{{
+                r#"{
                     "jsonrpc": "2.0",
-                    "result": {{
-                        "context": {{"slot": 200}},
-                        "value": [{{
+                    "result": {
+                        "context": {"slot": 200},
+                        "value": [{
                             "slot": 100,
                             "confirmations": null,
-                            "err": {{"InstructionError": [0, {{"Custom": 1}}]}},
-                            "status": {{"Err": {{"InstructionError": [0, {{"Custom": 1}}]}}}},
+                            "err": {"InstructionError": [0, {"Custom": 1}]},
+                            "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
                             "confirmationStatus": "finalized"
-                        }}]
-                    }},
+                        }]
+                    },
                     "id": 0
-                }}"#,
+                }"#,
             )
             .create_async()
             .await;
@@ -1849,23 +1849,23 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{{
+                r#"{
                     "jsonrpc": "2.0",
-                    "result": {{
-                        "context": {{"slot": 200}},
+                    "result": {
+                        "context": {"slot": 200},
                         "value": [
                             null,
-                            {{
+                            {
                                 "slot": 100,
                                 "confirmations": null,
                                 "err": null,
-                                "status": {{"Ok": null}},
+                                "status": {"Ok": null},
                                 "confirmationStatus": "finalized"
-                            }}
+                            }
                         ]
-                    }},
+                    },
                     "id": 0
-                }}"#,
+                }"#,
             )
             .create_async()
             .await;

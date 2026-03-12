@@ -21,7 +21,7 @@ use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::{Account as TokenAccount, Mint};
 use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn get_account_info_impl(
     read_deps: &ReadDeps,
@@ -73,7 +73,10 @@ fn build_token_additional_data(
         return None;
     }
     let token_account = TokenAccount::unpack(account.data()).ok()?;
-    let mint_account = bob.get_account_shared_data(&token_account.mint)?;
+    let mint_account = bob.get_account_shared_data(&token_account.mint).or_else(|| {
+        warn!("mint account {} not found for jsonParsed encoding, falling back to base64", token_account.mint);
+        None
+    })?;
     let mint = Mint::unpack(mint_account.data()).ok()?;
     Some(AccountAdditionalDataV3 {
         spl_token_additional_data: Some(SplTokenAdditionalDataV2 {

@@ -184,6 +184,8 @@ pub fn load_keypair(path: &Path) -> Result<Keypair, Box<dyn std::error::Error + 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spl_token::instruction::TokenInstruction;
+    use spl_token::solana_program::program_option::COption;
 
     /// Helper: resolve the program ID from a compiled instruction
     fn resolve_program_id(tx: &Transaction, ix_index: usize) -> Pubkey {
@@ -209,13 +211,12 @@ mod tests {
         assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
 
         let ix = &tx.message.instructions[0];
-        // SPL Transfer opcode = 3
-        assert_eq!(ix.data[0], 3);
-        // Amount encoded as little-endian u64
-        assert_eq!(
-            u64::from_le_bytes(ix.data[1..9].try_into().unwrap()),
-            amount
-        );
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack Transfer instruction") {
+            TokenInstruction::Transfer { amount: decoded_amount } => {
+                assert_eq!(decoded_amount, amount);
+            }
+            other => panic!("expected Transfer, got {other:?}"),
+        }
 
         // Account keys must contain the correct ATAs
         let expected_from_ata = get_associated_token_address(&from.pubkey(), &mint);
@@ -245,12 +246,12 @@ mod tests {
         assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
 
         let ix = &tx.message.instructions[0];
-        // SPL Burn opcode = 8
-        assert_eq!(ix.data[0], 8);
-        assert_eq!(
-            u64::from_le_bytes(ix.data[1..9].try_into().unwrap()),
-            amount
-        );
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack Burn instruction") {
+            TokenInstruction::Burn { amount: decoded_amount } => {
+                assert_eq!(decoded_amount, amount);
+            }
+            other => panic!("expected Burn, got {other:?}"),
+        }
 
         let expected_ata = get_associated_token_address(&from.pubkey(), &mint);
         assert!(
@@ -278,12 +279,18 @@ mod tests {
         assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
 
         let ix = &tx.message.instructions[0];
-        // SPL InitializeMint opcode = 0
-        assert_eq!(ix.data[0], 0);
-        // Decimals is the second byte
-        assert_eq!(ix.data[1], decimals);
-        // Mint authority (32 bytes starting at offset 2) should be admin pubkey
-        assert_eq!(&ix.data[2..34], admin.pubkey().as_ref());
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack InitializeMint instruction") {
+            TokenInstruction::InitializeMint {
+                decimals: decoded_decimals,
+                mint_authority,
+                freeze_authority,
+            } => {
+                assert_eq!(decoded_decimals, decimals);
+                assert_eq!(mint_authority, admin.pubkey());
+                assert_eq!(freeze_authority, COption::None);
+            }
+            other => panic!("expected InitializeMint, got {other:?}"),
+        }
 
         assert!(
             tx.message.account_keys.contains(&mint),
@@ -307,12 +314,12 @@ mod tests {
         assert_eq!(resolve_program_id(&tx, 0), spl_token::id());
 
         let ix = &tx.message.instructions[0];
-        // SPL MintTo opcode = 7
-        assert_eq!(ix.data[0], 7);
-        assert_eq!(
-            u64::from_le_bytes(ix.data[1..9].try_into().unwrap()),
-            amount
-        );
+        match TokenInstruction::unpack(&ix.data).expect("failed to unpack MintTo instruction") {
+            TokenInstruction::MintTo { amount: decoded_amount } => {
+                assert_eq!(decoded_amount, amount);
+            }
+            other => panic!("expected MintTo, got {other:?}"),
+        }
 
         assert!(
             tx.message.account_keys.contains(&mint),

@@ -31,6 +31,9 @@ pub struct TransactionStatusUpdate {
     pub error_message: Option<String>,
     /// Signature of the remint transaction (only set for FailedReminted status)
     pub remint_signature: Option<String>,
+    /// True when a remint was attempted but failed (ManualReview). Lets consumers
+    /// distinguish "remint tried and failed" from "remint never attempted".
+    pub remint_attempted: bool,
 }
 
 /// Sender state tracking SMT and pending transactions

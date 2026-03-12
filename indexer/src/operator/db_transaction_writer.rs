@@ -129,6 +129,8 @@ impl DbTransactionWriter {
 
         let remint_status: Option<&str> = if update.remint_signature.is_some() {
             Some("success")
+        } else if update.remint_attempted {
+            Some("failed")
         } else {
             None
         };
@@ -182,6 +184,7 @@ mod tests {
             error_message: Some("Test error message".to_string()),
             processed_at: Some(Utc::now()),
             remint_signature: None,
+            remint_attempted: false,
         }
     }
 
@@ -360,30 +363,11 @@ mod tests {
             error_message: Some("withdrawal failed".to_string()),
             processed_at: Some(Utc::now()),
             remint_signature: Some("remint_sig_abc".to_string()),
+            remint_attempted: true,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
         mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_manual_review_triggers_alerting() {
-        let (_tx, rx) = mpsc::channel(1);
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Escrow);
-
-        let update = TransactionStatusUpdate {
-            transaction_id: 77,
-            trace_id: Some("trace_manual_review".to_string()),
-            status: TransactionStatus::ManualReview,
-            counterpart_signature: None,
-            error_message: Some("release failed | remint failed: confirmation timeout".to_string()),
-            processed_at: Some(Utc::now()),
-            remint_signature: None,
-        };
-
-        // Should complete without panic — ManualReview hits the alerting path
-        writer.handle_update(update).await;
     }
 
     #[tokio::test]
@@ -412,6 +396,7 @@ mod tests {
             error_message: Some("release failed | remint failed: timeout".to_string()),
             processed_at: Some(Utc::now()),
             remint_signature: None,
+            remint_attempted: true,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -419,23 +404,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failed_reminted_triggers_alerting() {
+    async fn test_webhook_remint_status_is_null_when_remint_not_attempted() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "transaction_id": 78_i64,
+                "status": "manual_review",
+                "remint_status": null,
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+
         let (_tx, rx) = mpsc::channel(1);
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Escrow);
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
 
         let update = TransactionStatusUpdate {
-            transaction_id: 99,
-            trace_id: Some("trace_remint".to_string()),
-            status: TransactionStatus::FailedReminted,
+            transaction_id: 78,
+            trace_id: Some("trace_no_remint".to_string()),
+            status: TransactionStatus::ManualReview,
             counterpart_signature: None,
-            error_message: Some("release_funds failed".to_string()),
+            error_message: Some("no signatures to verify — remint unsafe".to_string()),
             processed_at: Some(Utc::now()),
-            remint_signature: Some("sig123".to_string()),
+            remint_signature: None,
+            remint_attempted: false,
         };
 
-        // Should complete without panic — FailedReminted hits the alerting path
-        // even when no webhook URL is configured
-        writer.handle_update(update).await;
+        writer.send_webhook_alert(&server.url(), &update).await;
+        mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_webhook_remint_status_is_failed_when_remint_attempted_and_failed() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "transaction_id": 88_i64,
+                "status": "manual_review",
+                "remint_status": "failed",
+            })))
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = DbTransactionWriter::new(storage, rx, Some(server.url()), ProgramType::Escrow);
+
+        let update = TransactionStatusUpdate {
+            transaction_id: 88,
+            trace_id: Some("trace_remint_failed".to_string()),
+            status: TransactionStatus::ManualReview,
+            counterpart_signature: None,
+            error_message: Some("release_funds failed | remint failed: timeout".to_string()),
+            processed_at: Some(Utc::now()),
+            remint_signature: None,
+            remint_attempted: true,
+        };
+
+        writer.send_webhook_alert(&server.url(), &update).await;
+        mock.assert();
     }
 }

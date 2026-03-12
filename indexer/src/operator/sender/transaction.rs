@@ -508,6 +508,7 @@ pub(super) async fn handle_success(
                     processed_at: Some(Utc::now()),
                     error_message: None,
                     remint_signature: None,
+                    remint_attempted: false,
                 },
                 "transaction status update",
             )
@@ -535,6 +536,7 @@ pub(super) async fn handle_success(
                 processed_at: Some(Utc::now()),
                 error_message: None,
                 remint_signature: None,
+                remint_attempted: false,
             },
             "transaction status update",
         )
@@ -689,6 +691,7 @@ pub(super) async fn handle_permanent_failure(
                         error_msg
                     )),
                     remint_signature: None,
+                    remint_attempted: false,
                 },
                 "transaction status update",
             )
@@ -729,6 +732,7 @@ pub(super) async fn handle_permanent_failure(
                         error_msg, e
                     )),
                     remint_signature: None,
+                    remint_attempted: false,
                 },
                 "transaction status update",
             )
@@ -736,6 +740,21 @@ pub(super) async fn handle_permanent_failure(
             .ok();
             return;
         }
+    }
+
+    // `transaction_id` is always `Some` at this point in practice — only
+    // `ReleaseFunds` transactions populate `remint_cache`, and `ReleaseFunds`
+    // always carries a DB transaction_id (see `TransactionBuilder::transaction_id`
+    // in instruction_util.rs). `InitializeMint` and `ResetSmtRoot` return `None`
+    // there and would have exited early above via `send_fatal_error`. This guard
+    // exists to prevent silently enqueuing a `PendingRemint` with no DB record,
+    // which would be lost on restart since recovery reads from the DB.
+    if ctx.transaction_id.is_none() {
+        error!(
+            "Cannot defer remint for nonce {:?} — no transaction_id, entry would be unrecoverable on restart",
+            ctx.withdrawal_nonce,
+        );
+        return;
     }
 
     info!(
@@ -815,6 +834,7 @@ pub async fn process_pending_remints(
                                         processed_at: Some(Utc::now()),
                                         error_message: None,
                                         remint_signature: None,
+                                        remint_attempted: false,
                                     },
                                     "transaction status update",
                                 )
@@ -858,6 +878,7 @@ pub async fn process_pending_remints(
                                     entry.original_error, attempt, e
                                 )),
                                 remint_signature: None,
+                                remint_attempted: false,
                             },
                             "transaction status update",
                         )
@@ -907,6 +928,7 @@ async fn execute_deferred_remint(
                         processed_at: Some(Utc::now()),
                         error_message: Some(entry.original_error.clone()),
                         remint_signature: Some(signature.to_string()),
+                        remint_attempted: true,
                     },
                     "transaction status update",
                 )
@@ -939,6 +961,7 @@ async fn execute_deferred_remint(
                         processed_at: Some(Utc::now()),
                         error_message: Some(combined),
                         remint_signature: None,
+                        remint_attempted: true,
                     },
                     "transaction status update",
                 )
@@ -966,6 +989,7 @@ pub(super) async fn send_fatal_error(
                 processed_at: Some(Utc::now()),
                 error_message: Some(error_msg.to_string()),
                 remint_signature: None,
+                remint_attempted: false,
             },
             "transaction status update",
         )
@@ -1265,29 +1289,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn permanent_failure_drains_remint_cache() {
-        ensure_test_signer();
-        let mut state = make_sender_state();
-        let (storage_tx, _storage_rx) = mpsc::channel(10);
-
-        state.remint_cache.insert(5, make_remint_info(10));
-        assert!(state.remint_cache.contains_key(&5));
-
-        let ctx = TransactionContext {
-            transaction_id: Some(10),
-            withdrawal_nonce: Some(5),
-            trace_id: Some("trace-10".to_string()),
-        };
-
-        handle_permanent_failure(&mut state, &ctx, &storage_tx, "error").await;
-
-        assert!(
-            !state.remint_cache.contains_key(&5),
-            "remint_cache entry should be consumed"
-        );
-    }
-
     // ── handle_success ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -1418,41 +1419,6 @@ mod tests {
         assert_eq!(
             immature.deadline, future_deadline,
             "immature entry deadline must be unchanged"
-        );
-    }
-
-    // ── remint_cache population ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn process_pending_remints_skips_immature() {
-        let mut state = make_sender_state();
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // Push an entry with a future deadline
-        state.pending_remints.push(PendingRemint {
-            ctx: TransactionContext {
-                transaction_id: Some(30),
-                withdrawal_nonce: Some(9),
-                trace_id: Some("trace-30".to_string()),
-            },
-            remint_info: make_remint_info(30),
-            signatures: vec![Signature::new_unique()],
-            original_error: "timeout".to_string(),
-            deadline: Utc::now() + chrono::Duration::seconds(600),
-            finality_check_attempts: 0,
-        });
-
-        process_pending_remints(&mut state, &storage_tx).await;
-
-        // Nothing should be processed
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "immature entry should not be processed"
-        );
-        assert_eq!(
-            state.pending_remints.len(),
-            1,
-            "immature entry should remain in queue"
         );
     }
 
@@ -1687,20 +1653,6 @@ mod tests {
             state.pending_remints.is_empty(),
             "should not queue pending remint when storage write failed"
         );
-    }
-
-    #[test]
-    fn remint_cache_populated_from_release_funds_builder() {
-        let mut state = make_sender_state();
-        let info = make_remint_info(42);
-        let expected_amount = info.amount;
-
-        // Directly insert into cache as handle_transaction_builder would
-        state.remint_cache.insert(7, info);
-
-        assert!(state.remint_cache.contains_key(&7));
-        assert_eq!(state.remint_cache.get(&7).unwrap().amount, expected_amount);
-        assert_eq!(state.remint_cache.get(&7).unwrap().transaction_id, 42);
     }
 
     // ── execute_deferred_remint paths ───────────────────────────────

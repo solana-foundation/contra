@@ -835,7 +835,7 @@ impl PostgresDb {
         remint_signatures: Vec<String>,
         deadline_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE transactions
             SET
@@ -852,6 +852,10 @@ impl PostgresDb {
         .bind(deadline_at)
         .execute(&self.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         Ok(())
     }

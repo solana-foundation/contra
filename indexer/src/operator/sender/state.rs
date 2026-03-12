@@ -168,6 +168,7 @@ impl SenderState {
                 processed_at: Some(Utc::now()),
                 error_message: Some(format!("recovery failed: {}", reason)),
                 remint_signature: None,
+                remint_attempted: false,
             },
             "transaction status update",
         )

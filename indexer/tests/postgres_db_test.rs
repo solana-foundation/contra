@@ -519,3 +519,46 @@ async fn completed_withdrawal_nonces_empty() -> Result<(), Box<dyn std::error::E
     assert!(nonces.is_empty());
     Ok(())
 }
+
+// ── set_pending_remint status guard ──────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_pending_remint_succeeds_when_processing() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    let txn = make_db_transaction("remint_processing", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    // Lock to transition to Processing
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    storage
+        .set_pending_remint(id, vec!["sig1".to_string()], deadline)
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let txn = make_db_transaction("remint_completed", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    let result = storage
+        .set_pending_remint(id, vec!["sig1".to_string()], deadline)
+        .await;
+
+    assert!(result.is_err(), "should fail when status is not processing");
+    Ok(())
+}

@@ -844,6 +844,7 @@ impl PostgresDb {
                 pending_remint_deadline_at = $4,
                 updated_at = NOW()
             WHERE id = $1
+                AND status = 'processing'
             "#,
         )
         .bind(transaction_id)

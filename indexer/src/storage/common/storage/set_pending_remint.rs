@@ -1,7 +1,4 @@
-use crate::{
-    error::StorageError,
-    storage::{common::storage::Storage, postgres::db::PostgresDb},
-};
+use crate::{error::StorageError, storage::common::storage::Storage};
 
 pub async fn set_pending_remint(
     storage: &Storage,
@@ -10,9 +7,11 @@ pub async fn set_pending_remint(
     deadline_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), StorageError> {
     match storage {
-        Storage::Postgres(postgres_db) => {
-            set_pending_remint_postgres(postgres_db, transaction_id, remint_signatures, deadline_at)
-                .await
+        Storage::Postgres(db) => {
+            db.set_pending_remint_internal(transaction_id, remint_signatures, deadline_at)
+                .await?;
+
+            Ok(())
         }
         #[cfg(test)]
         Storage::Mock(mock_db) => {
@@ -21,15 +20,4 @@ pub async fn set_pending_remint(
                 .await
         }
     }
-}
-
-async fn set_pending_remint_postgres(
-    db: &PostgresDb,
-    transaction_id: i64,
-    remint_signatures: Vec<String>,
-    deadline_at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), StorageError> {
-    db.set_pending_remint_internal(transaction_id, remint_signatures, deadline_at)
-        .await?;
-    Ok(())
 }

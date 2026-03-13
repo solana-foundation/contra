@@ -176,6 +176,24 @@ impl SenderState {
         .ok();
     }
 
+    /// On an error, logs it and sends a ManualReview update. Returns `None` on error.
+    async fn or_manual_review<T>(
+        result: Result<T, String>,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+        tx_id: i64,
+        trace_id: &str,
+    ) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(msg) => {
+                error!(transaction_id = tx_id, "Recovery: {}", msg);
+                Self::send_recovery_manual_review(storage_tx, tx_id, trace_id, &msg).await;
+
+                None
+            }
+        }
+    }
+
     pub(super) async fn recover_pending_remints(
         &mut self,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
@@ -198,40 +216,26 @@ impl SenderState {
             // Parse pubkeys stored as strings. On any failure we cannot remint safely,
             // and silently skipping would leave the row stuck in PendingRemint on every
             // restart — so we escalate to ManualReview.
-            let mint = match Pubkey::from_str(&tx.mint) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    error!(
-                        transaction_id = tx.id,
-                        "Recovery: invalid mint pubkey: {}", e
-                    );
-                    Self::send_recovery_manual_review(
-                        storage_tx,
-                        tx.id,
-                        &tx.trace_id,
-                        &format!("invalid mint pubkey: {}", e),
-                    )
-                    .await;
-                    continue;
-                }
+            let Some(mint) = Self::or_manual_review(
+                Pubkey::from_str(&tx.mint).map_err(|e| format!("invalid mint pubkey: {e}")),
+                storage_tx,
+                tx.id,
+                &tx.trace_id,
+            )
+            .await
+            else {
+                continue;
             };
 
-            let user = match Pubkey::from_str(&tx.recipient) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    error!(
-                        transaction_id = tx.id,
-                        "Recovery: invalid user pubkey: {}", e
-                    );
-                    Self::send_recovery_manual_review(
-                        storage_tx,
-                        tx.id,
-                        &tx.trace_id,
-                        &format!("invalid user pubkey: {}", e),
-                    )
-                    .await;
-                    continue;
-                }
+            let Some(user) = Self::or_manual_review(
+                Pubkey::from_str(&tx.recipient).map_err(|e| format!("invalid user pubkey: {e}")),
+                storage_tx,
+                tx.id,
+                &tx.trace_id,
+            )
+            .await
+            else {
+                continue;
             };
 
             let user_ata =
@@ -240,22 +244,15 @@ impl SenderState {
             // u64::try_from catches negative amounts. The write path already guards
             // against this (ba77249) but a corrupt DB row could still produce one —
             // casting a negative i64 to u64 would produce a massive spurious remint.
-            let amount = match u64::try_from(tx.amount) {
-                Ok(a) => a,
-                Err(_) => {
-                    error!(
-                        transaction_id = tx.id,
-                        "Recovery: negative amount {}", tx.amount
-                    );
-                    Self::send_recovery_manual_review(
-                        storage_tx,
-                        tx.id,
-                        &tx.trace_id,
-                        &format!("negative amount {}", tx.amount),
-                    )
-                    .await;
-                    continue;
-                }
+            let Some(amount) = Self::or_manual_review(
+                u64::try_from(tx.amount).map_err(|_| format!("negative amount: {}", tx.amount)),
+                storage_tx,
+                tx.id,
+                &tx.trace_id,
+            )
+            .await
+            else {
+                continue;
             };
 
             // Parse all stored withdrawal signatures. These are passed to
@@ -263,26 +260,19 @@ impl SenderState {
             // withdrawal did not finalize before we remint. A single bad entry
             // means we cannot safely do that check — escalate to ManualReview.
             let sig_strings = tx.remint_signatures.unwrap_or_default();
-            let signatures = match sig_strings
-                .iter()
-                .map(|s| Signature::from_str(s))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(sigs) => sigs,
-                Err(e) => {
-                    error!(
-                        transaction_id = tx.id,
-                        "Recovery: invalid withdrawal signature: {}", e
-                    );
-                    Self::send_recovery_manual_review(
-                        storage_tx,
-                        tx.id,
-                        &tx.trace_id,
-                        &format!("invalid withdrawal signature: {}", e),
-                    )
-                    .await;
-                    continue;
-                }
+            let Some(signatures) = Self::or_manual_review(
+                sig_strings
+                    .iter()
+                    .map(|s| Signature::from_str(s))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("invalid withdrawal signature: {e}")),
+                storage_tx,
+                tx.id,
+                &tx.trace_id,
+            )
+            .await
+            else {
+                continue;
             };
 
             // Restore the original deadline. Fall back to now() if missing (shouldn't

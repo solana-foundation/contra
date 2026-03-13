@@ -138,6 +138,8 @@ mod tests {
             updated_at: now,
             processed_at: None,
             counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
         }
     }
 

@@ -151,11 +151,20 @@ pub async fn find_existing_mint_signature(
     rpc_client: &RpcClientWithRetry,
     builder_with_txn_id: &MintToBuilderWithTxnId,
 ) -> Result<Option<Signature>, String> {
+    let expected_memo = mint_idempotency_memo(builder_with_txn_id.txn_id);
+    find_existing_mint_signature_with_memo(rpc_client, builder_with_txn_id, &expected_memo).await
+}
+
+/// Check recent ATA signatures for an already-confirmed mint carrying the given memo.
+pub async fn find_existing_mint_signature_with_memo(
+    rpc_client: &RpcClientWithRetry,
+    builder_with_txn_id: &MintToBuilderWithTxnId,
+    expected_memo: &str,
+) -> Result<Option<Signature>, String> {
     let transaction_id = builder_with_txn_id.txn_id;
     let Some(expected_mint) = expected_mint_instruction(transaction_id, builder_with_txn_id) else {
         return Ok(None);
     };
-    let expected_memo = mint_idempotency_memo(transaction_id);
 
     let signatures = match rpc_client
         .get_signatures_for_address(
@@ -187,7 +196,7 @@ pub async fn find_existing_mint_signature(
         }
 
         let memo = match signature_status.memo.as_deref() {
-            Some(memo) if memo_matches(memo, &expected_memo) => memo,
+            Some(memo) if memo_matches(memo, expected_memo) => memo,
             _ => continue,
         };
 
@@ -212,7 +221,7 @@ pub async fn find_existing_mint_signature(
             }
         };
 
-        if transaction_matches_expected_mint(&transaction, &expected_memo, &expected_mint) {
+        if transaction_matches_expected_mint(&transaction, expected_memo, &expected_mint) {
             info!(
                 "Skipping resend for transaction_id {}: found existing confirmed mint {} with memo {}",
                 transaction_id, signature, memo

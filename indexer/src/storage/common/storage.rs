@@ -11,9 +11,11 @@ pub mod get_escrow_balances_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_pending_db_transactions;
+pub mod get_pending_remint_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
+pub mod set_pending_remint;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -173,6 +175,26 @@ impl Storage {
         get_completed_withdrawal_nonces::get_completed_withdrawal_nonces(self, min_nonce, max_nonce)
             .await
     }
+
+    /// Transitions a withdrawal to PendingRemint, storing withdrawal
+    /// signatures for the finality check on restart.
+    pub async fn set_pending_remint(
+        &self,
+        transaction_id: i64,
+        remint_signatures: Vec<String>,
+        deadline_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        set_pending_remint::set_pending_remint(self, transaction_id, remint_signatures, deadline_at)
+            .await
+    }
+
+    /// Returns all withdrawal transactions in PendingRemint status.
+    /// Called on startup to re-hydrate the remint queue after a crash.
+    pub async fn get_pending_remint_transactions(
+        &self,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_pending_remint_transactions::get_pending_remint_transactions(self).await
+    }
 }
 
 /// MockStorage behavior tests — only test non-trivial mock logic (filtering, recording, failure).
@@ -208,6 +230,8 @@ mod tests {
             updated_at: Utc::now(),
             processed_at: None,
             counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
         }
     }
 

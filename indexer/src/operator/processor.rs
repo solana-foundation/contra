@@ -1,6 +1,8 @@
 use crate::channel_utils::send_guaranteed;
-use crate::error::OperatorError;
-use crate::operator::instruction_util::{mint_idempotency_memo, MintToBuilder, TransactionBuilder};
+use crate::error::{OperatorError, ProgramError};
+use crate::operator::instruction_util::{
+    mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
+};
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
@@ -209,9 +211,36 @@ pub async fn process_release_funds(
                 .user_ata(recipient_ata)
                 .instance_ata(instance_ata)
                 .token_program(token_program)
-                .amount(transaction.amount as u64)
                 .user(recipient)
                 .transaction_nonce(nonce);
+
+            let amount = u64::try_from(transaction.amount).map_err(|_| {
+                OperatorError::Program(ProgramError::InvalidBuilder {
+                    reason: format!(
+                        "negative withdrawal amount {} for transaction {}",
+                        transaction.amount, transaction.id
+                    ),
+                })
+            })?;
+            builder.amount(amount);
+
+            // Build remint info for token recovery on permanent failure.
+            // Uses Contra token program (not mainnet) since remint happens on Contra.
+            let contra_token_program = processor_state.mint_cache.get_contra_token_program();
+            let remint_user_ata = get_associated_token_address_with_program_id(
+                &recipient,
+                &mint,
+                &contra_token_program,
+            );
+            let remint_info = WithdrawalRemintInfo {
+                transaction_id: transaction.id,
+                trace_id: transaction.trace_id.clone(),
+                mint,
+                user: recipient,
+                user_ata: remint_user_ata,
+                token_program: contra_token_program,
+                amount,
+            };
 
             info!("Processing withdrawal");
 
@@ -221,6 +250,7 @@ pub async fn process_release_funds(
                     nonce,
                     transaction_id: transaction.id,
                     trace_id: transaction.trace_id.clone(),
+                    remint_info: Some(remint_info),
                 }));
 
             send_guaranteed(&sender_tx, wrapped, "processed release funds")

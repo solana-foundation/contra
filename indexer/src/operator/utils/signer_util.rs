@@ -246,6 +246,10 @@ impl SignerUtil {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // serial_test ensures env-var-mutating tests run sequentially; cargo test
+    // runs tests in parallel by default, which causes races on shared process
+    // environment variables (set_var / remove_var).
+    use serial_test::serial;
 
     /// Only "memory", "vault", "turnkey", and "privy" are valid signer types; any other
     /// string — including an empty one — must return an InvalidPrivateKey error.
@@ -262,6 +266,7 @@ mod tests {
     /// When ADMIN_SIGNER is absent, load_signer must fail immediately with a message
     /// naming the missing variable so the operator can identify the misconfiguration.
     #[test]
+    #[serial]
     fn load_signer_admin_no_env_var_errors() {
         let original = env::var(ADMIN_SIGNER).ok();
         env::remove_var(ADMIN_SIGNER);
@@ -283,6 +288,7 @@ mod tests {
     /// ADMIN_SIGNER=memory requires ADMIN_PRIVATE_KEY to be set; without it load_signer
     /// must fail and name the missing variable in the error message.
     #[test]
+    #[serial]
     fn load_signer_memory_missing_private_key_errors() {
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_key = env::var(ADMIN_PRIVATE_KEY).ok();
@@ -310,6 +316,7 @@ mod tests {
     /// ADMIN_SIGNER=vault requires ADMIN_VAULT_ADDR as the first credential; the error
     /// message must identify the missing variable so misconfiguration is immediately obvious.
     #[test]
+    #[serial]
     fn load_signer_vault_missing_vault_addr_errors() {
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_addr = env::var(ADMIN_VAULT_ADDR).ok();
@@ -338,6 +345,7 @@ mod tests {
     /// ADMIN_SIGNER=turnkey requires ADMIN_TURNKEY_API_PUBLIC_KEY as the first credential;
     /// the error must name the exact missing variable rather than giving a generic message.
     #[test]
+    #[serial]
     fn load_signer_turnkey_missing_api_public_key_errors() {
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_key = env::var(ADMIN_TURNKEY_API_PUBLIC_KEY).ok();
@@ -366,6 +374,7 @@ mod tests {
     /// ADMIN_SIGNER=privy requires ADMIN_PRIVY_APP_ID as the first credential; the error
     /// must name the missing variable so the operator knows which env var to supply.
     #[test]
+    #[serial]
     fn load_signer_privy_missing_app_id_errors() {
         let orig_type = env::var(ADMIN_SIGNER).ok();
         let orig_app_id = env::var(ADMIN_PRIVY_APP_ID).ok();
@@ -394,6 +403,7 @@ mod tests {
     /// When OPERATOR_SIGNER is absent, load_signer returns an error so the caller
     /// (the global Lazy) can fall back to the admin signer and log a warning.
     #[test]
+    #[serial]
     fn load_signer_operator_no_env_var_errors() {
         let orig = env::var(OPERATOR_SIGNER).ok();
         env::remove_var(OPERATOR_SIGNER);
@@ -415,6 +425,7 @@ mod tests {
     /// OPERATOR_SIGNER=memory requires OPERATOR_PRIVATE_KEY; without it load_signer must
     /// fail and name the missing variable so the caller can report a clear startup error.
     #[test]
+    #[serial]
     fn load_signer_operator_memory_missing_key_errors() {
         let orig_type = env::var(OPERATOR_SIGNER).ok();
         let orig_key = env::var(OPERATOR_PRIVATE_KEY).ok();

@@ -2020,6 +2020,7 @@ dependencies = [
  "rustls 0.23.31",
  "serde",
  "serde_json",
+ "serial_test",
  "solana-address 1.0.0",
  "solana-client 2.3.10",
  "solana-keychain",

@@ -26,6 +26,7 @@ fmt:
 
 integration-coverage-contra:
 	@echo "Running contra integration tests with coverage instrumentation..."
+	@cargo llvm-cov clean --workspace
 	@cargo llvm-cov --no-report --test contra_integration -- --nocapture
 
 integration-coverage-indexer:

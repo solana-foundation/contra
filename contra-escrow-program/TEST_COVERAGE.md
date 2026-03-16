@@ -19,7 +19,7 @@
 
 ## Test Inventory
 
-**41 unit tests** (instruction data parsing, state serialization, error ABI, event encoding) + **84 integration tests** (end-to-end behavior).
+**66 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, SMT proof logic) + **84 integration tests** (end-to-end behavior).
 
 ### CreateInstance (4 integration tests)
 
@@ -133,7 +133,7 @@
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### Unit Tests (41 tests across processor and program modules)
+### Unit Tests (66 tests across processor and program modules)
 
 **Instruction data parsing** (processor modules):
 
@@ -142,13 +142,17 @@
 - `deposit`: 5 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
 - `reset_smt_root`: 1 test (empty accounts)
-- `add_operator`: 1 test (valid instruction data)
+- `add_operator`: 2 tests (valid instruction data, empty instruction data)
+
+**SMT proof logic** (`processor/shared/smt_utils.rs`):
+
+- 19 tests covering `hash_combine` (determinism, order-dependence, avalanche effect) and `verify_smt_exclusion_proof` / `verify_smt_inclusion_proof` (empty tree, different nonces, with siblings, wrong root, corrupted siblings, edge-case nonces, early termination, all-bits-set, exclusion-vs-inclusion for same nonce)
 
 **State serialization and validation** (`state/`):
 
 - `allowed_mint`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
 - `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
-- `instance`: 4 tests (validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization, tree index 1 nonce boundary validation)
+- `instance`: 9 tests (constructor, checked_add overflow on tree index, nonce zero boundary, nonce boundary at tree index 1, serialization roundtrip, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization, second tree nonce validation)
 - `discriminator`: 2 tests (all 10 valid instruction discriminator bytes accepted, unmapped bytes rejected)
 
 **Error ABI stability** (`error.rs`):

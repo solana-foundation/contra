@@ -143,7 +143,7 @@ unit-coverage:
 	@echo "→ Coverage: postgres integration tests..."
 	@cargo llvm-cov test --no-report --test postgres_db_test
 	@cargo llvm-cov test --no-report --test reconciliation_db_test
- 	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov $(COV_IGNORE)
+	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov $(COV_IGNORE)
 
 ## Generate HTML coverage report (accumulates both feature variants)
 coverage-html:

@@ -347,4 +347,45 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
+
+    /// Even when base_delay is huge (100s), max_delay (1ms) acts as a hard ceiling so each
+    /// inter-attempt pause is clamped to 1ms, keeping wall-clock time well under 1 second.
+    #[tokio::test]
+    async fn with_retry_backoff_clamped_to_max_delay() {
+        let client = RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig {
+                max_attempts: 10,
+                base_delay: Duration::from_secs(100), // very large base delay
+                max_delay: Duration::from_millis(1),  // tiny max delay
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let start = std::time::Instant::now();
+        let _: Result<u32, Box<client_error::Error>> = client
+            .with_retry("test_op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    let count = cc.fetch_add(1, Ordering::SeqCst);
+                    if count < 2 {
+                        Err::<u32, Box<client_error::Error>>(Box::new(
+                            client_error::Error::new_with_request(
+                                client_error::ErrorKind::Custom("fail".to_string()),
+                                solana_rpc_client_api::request::RpcRequest::GetBalance,
+                            ),
+                        ))
+                    } else {
+                        Ok(1)
+                    }
+                }
+            })
+            .await;
+
+        // Should complete quickly because max_delay clamps the large base_delay
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
 }

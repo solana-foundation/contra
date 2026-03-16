@@ -13,6 +13,8 @@ pub async fn get_all_db_transactions(
             .get_all_transactions_internal(transaction_type, limit)
             .await?),
         #[cfg(test)]
-        Storage::Mock(_) => Ok(vec![]),
+        Storage::Mock(mock) => Ok(mock
+            .get_all_db_transactions(transaction_type, limit)
+            .await?),
     }
 }

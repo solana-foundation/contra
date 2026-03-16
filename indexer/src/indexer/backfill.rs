@@ -373,9 +373,12 @@ mod tests {
         assert_eq!(batches[0], vec![101]);
     }
 
-    // ============================================================================
-    // fill_slot_range Integration Tests
-    // ============================================================================
+    #[test]
+    fn test_calculate_batches_same_from_to_slot() {
+        // from_slot == to_slot: next_slot = from_slot+1 > to_slot, so no iterations
+        let batches = calculate_batches(100, 100, 10);
+        assert!(batches.is_empty());
+    }
 
     #[cfg(feature = "datasource-rpc")]
     mod fill_slot_range_tests {
@@ -556,6 +559,279 @@ mod tests {
                 fill_slot_range(&poller, 100, 100, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 0);
+        }
+    }
+
+    // ============================================================================
+    // BackfillService Tests
+    // ============================================================================
+
+    #[cfg(feature = "datasource-rpc")]
+    mod backfill_service_tests {
+        use super::*;
+        use crate::config::BackfillConfig;
+        use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+        use crate::storage::common::storage::mock::MockStorage;
+        use mockito::Server;
+        use serde_json::json;
+        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_transaction_status::UiTransactionEncoding;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        fn make_config(rpc_url: &str, max_gap_slots: u64) -> BackfillConfig {
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: rpc_url.to_string(),
+                batch_size: 10,
+                max_gap_slots,
+                start_slot: None,
+            }
+        }
+
+        fn make_poller(url: &str) -> Arc<RpcPoller> {
+            Arc::new(RpcPoller::new(
+                url.to_string(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            ))
+        }
+
+        fn mock_get_slot(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({"method": "getSlot"})))
+                .with_status(200)
+                .with_body(json!({"jsonrpc": "2.0", "result": slot, "id": 1}).to_string())
+                .create()
+        }
+
+        fn mock_get_block_empty(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash111111111111111111111111111",
+                            "parentSlot": slot - 1,
+                            "transactions": []
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        // ---- BackfillService::new ----
+
+        /// All five constructor arguments are stored verbatim; no transformation occurs.
+        #[test]
+        fn new_stores_escrow_instance_id() {
+            use solana_sdk::pubkey::Pubkey;
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            let poller = make_poller("http://localhost:8899");
+            let config = make_config("http://localhost:8899", 500);
+            let key = Pubkey::new_unique();
+
+            let service =
+                BackfillService::new(storage, poller, ProgramType::Withdraw, config, Some(key));
+
+            assert_eq!(service.program_type, ProgramType::Withdraw);
+            assert_eq!(service.config.max_gap_slots, 500);
+            assert_eq!(service.escrow_instance_id, Some(key));
+        }
+
+        // ---- BackfillService::run ----
+
+        /// checkpoint == current_slot means validate_gap returns None; run exits early
+        /// without sending any messages or fetching blocks.
+        #[tokio::test]
+        async fn run_no_gap_returns_ok_without_fetching_blocks() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 100);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+            let (tx, mut rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            service.run(tx).await.unwrap();
+
+            // tx dropped by run(); channel is empty — no SlotComplete or Instruction sent
+            assert!(
+                rx.try_recv().is_err(),
+                "expected no messages when there is no gap"
+            );
+        }
+
+        /// current_slot < checkpoint means the RPC node is lagging; treated as no gap,
+        /// no backfill attempted, no messages sent.
+        #[tokio::test]
+        async fn run_current_slot_behind_checkpoint_no_gap() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 50);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+            let (tx, mut rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            service.run(tx).await.unwrap();
+
+            assert!(
+                rx.try_recv().is_err(),
+                "expected no messages when RPC slot is behind checkpoint"
+            );
+        }
+
+        // ---- BackfillService::run — gap too large ----
+
+        /// A gap of 5000 slots with max_gap_slots=1000 must be rejected with a descriptive
+        /// error rather than silently attempting an oversized backfill.
+        #[tokio::test]
+        async fn run_gap_too_large_returns_err() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 5000); // checkpoint=0, gap=5000
+
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+            let (tx, _rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            let err = service.run(tx).await.unwrap_err();
+
+            let msg = err.to_string();
+            assert!(msg.contains("Gap too large"), "unexpected error: {msg}");
+            assert!(
+                msg.contains("5000"),
+                "error should report the actual gap: {msg}"
+            );
+        }
+
+        // ---- BackfillService::run — fills actual gap ----
+
+        /// For a 3-slot gap (checkpoint=100, tip=103), run fetches each block and emits
+        /// exactly one ordered SlotComplete per slot with no Instruction messages.
+        #[tokio::test]
+        async fn run_fills_gap_sends_slot_complete_per_slot() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 103);
+            let _m_b101 = mock_get_block_empty(&mut server, 101);
+            let _m_b102 = mock_get_block_empty(&mut server, 102);
+            let _m_b103 = mock_get_block_empty(&mut server, 103);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+            let (tx, mut rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            service.run(tx).await.unwrap();
+
+            // Collect all messages; tx was dropped by run() so the channel is now closed
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert_eq!(messages.len(), 3, "expected one SlotComplete per slot");
+
+            let slots: Vec<u64> = messages
+                .iter()
+                .map(|m| match m {
+                    ProcessorMessage::SlotComplete { slot, .. } => *slot,
+                    ProcessorMessage::Instruction(_) => panic!("unexpected Instruction message"),
+                })
+                .collect();
+            assert_eq!(slots, vec![101, 102, 103]);
+        }
+
+        // ---- BackfillService::run — start_slot configured ----
+
+        /// When start_slot=200 is ahead of the DB checkpoint=100, the effective from_slot
+        /// becomes 199 (start_slot-1), so nothing before slot 200 is re-processed.
+        #[tokio::test]
+        async fn run_start_slot_ahead_of_checkpoint_uses_start_slot() {
+            let mut server = Server::new_async().await;
+            // effective from_slot=199; current_slot=199 → no gap, no blocks fetched
+            let _m_slot = mock_get_slot(&mut server, 199);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let mut config = make_config(&server.url(), 10_000);
+            config.start_slot = Some(200);
+            let (tx, mut rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            service.run(tx).await.unwrap();
+
+            assert!(
+                rx.try_recv().is_err(),
+                "no messages expected; start_slot skipped past the gap"
+            );
+        }
+
+        /// When the DB checkpoint=200 is ahead of start_slot=50, the checkpoint wins
+        /// (max logic), so already-processed slots are not re-fetched.
+        #[tokio::test]
+        async fn run_checkpoint_ahead_of_start_slot_uses_checkpoint() {
+            let mut server = Server::new_async().await;
+            // effective from_slot=200; current_slot=200 → no gap
+            let _m_slot = mock_get_slot(&mut server, 200);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 200);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let mut config = make_config(&server.url(), 10_000);
+            config.start_slot = Some(50);
+            let (tx, mut rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            service.run(tx).await.unwrap();
+
+            assert!(
+                rx.try_recv().is_err(),
+                "no messages expected; checkpoint supersedes start_slot"
+            );
+        }
+
+        /// start_slot=0 is the genesis edge case: configured_checkpoint clamps to 0
+        /// (avoids u64 underflow), which is identical to having no checkpoint at all.
+        #[tokio::test]
+        async fn run_start_slot_zero_uses_zero_checkpoint() {
+            let mut server = Server::new_async().await;
+            // from_slot=0, current_slot=0 → no gap
+            let _m_slot = mock_get_slot(&mut server, 0);
+
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            let poller = make_poller(&server.url());
+            let mut config = make_config(&server.url(), 10_000);
+            config.start_slot = Some(0);
+            let (tx, mut rx) = mpsc::channel(64);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            service.run(tx).await.unwrap();
+
+            assert!(
+                rx.try_recv().is_err(),
+                "no messages expected for zero-slot no-gap case"
+            );
         }
     }
 }

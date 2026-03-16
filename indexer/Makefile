@@ -7,9 +7,11 @@
 .PHONY: yellowstone-clone build-yellowstone-plugin clean-yellowstone
 
 # Configuration
-# Files excluded from coverage — error enums, constants, CLI entrypoints, models.
+# Files excluded from coverage — error enums, constants, CLI entrypoints, models, types.
 # These inflate the denominator without meaningful test value.
-COV_IGNORE := --ignore-filename-regex '(error/|constants\.rs|bin/|models\.rs|shutdown_utils\.rs)'
+# indexer/indexer.rs, operator/operator.rs — pure orchestration that blocks 
+# on signal::ctrl_c(); no logic of their own and covered by integration tests.
+COV_IGNORE := --ignore-filename-regex '(error/|constants\.rs|bin/|models\.rs|shutdown_utils\.rs|types\.rs|indexer/indexer\.rs|operator/operator\.rs)'
 
 CONTRA_ESCROW_PROGRAM_ID ?= GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
 CONTRA_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
@@ -138,7 +140,10 @@ unit-coverage:
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
 	@echo "→ Coverage: rpc datasource..."
 	@cargo llvm-cov test --no-report --lib --features datasource-rpc
-	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov $(COV_IGNORE)
+	@echo "→ Coverage: postgres integration tests..."
+	@cargo llvm-cov test --no-report --test postgres_db_test
+	@cargo llvm-cov test --no-report --test reconciliation_db_test
+ 	@cargo llvm-cov report --lcov --output-path ../coverage/coverage-indexer-unit.lcov $(COV_IGNORE)
 
 ## Generate HTML coverage report (accumulates both feature variants)
 coverage-html:
@@ -147,6 +152,8 @@ coverage-html:
 	@cargo llvm-cov clean --workspace
 	@cargo llvm-cov test --no-report --lib --features datasource-yellowstone
 	@cargo llvm-cov test --no-report --lib --features datasource-rpc
+	@cargo llvm-cov test --no-report --test postgres_db_test
+	@cargo llvm-cov test --no-report --test reconciliation_db_test
 	@cargo llvm-cov report --html --output-dir ../coverage/coverage-indexer-html $(COV_IGNORE)
 
 ## Run all coverage tasks

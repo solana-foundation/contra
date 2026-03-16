@@ -109,6 +109,21 @@ impl MockStorage {
         Ok(result)
     }
 
+    pub async fn get_all_db_transactions(
+        &self,
+        transaction_type: TransactionType,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, Box<dyn std::error::Error + Send + Sync>> {
+        let pending = self.pending_transactions.lock().unwrap();
+        let result: Vec<DbTransaction> = pending
+            .iter()
+            .filter(|t| t.transaction_type == transaction_type)
+            .take(limit as usize)
+            .cloned()
+            .collect();
+        Ok(result)
+    }
+
     pub async fn get_and_lock_pending_transactions(
         &self,
         transaction_type: TransactionType,
@@ -205,16 +220,38 @@ impl MockStorage {
 
     pub async fn count_pending_transactions(
         &self,
-        _transaction_type: TransactionType,
+        transaction_type: TransactionType,
     ) -> Result<i64, StorageError> {
-        Ok(0)
+        let count = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.transaction_type == transaction_type && t.status == TransactionStatus::Pending
+            })
+            .count();
+        Ok(count as i64)
     }
 
     pub fn get_completed_withdrawal_nonces(
         &self,
-        _min_nonce: u64,
-        _max_nonce: u64,
+        min_nonce: u64,
+        max_nonce: u64,
     ) -> Result<Vec<u64>, StorageError> {
-        Ok(vec![])
+        let nonces: Vec<u64> = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                t.transaction_type == TransactionType::Withdrawal
+                    && t.status == TransactionStatus::Completed
+                    && t.withdrawal_nonce.is_some()
+            })
+            .filter_map(|t| t.withdrawal_nonce.map(|n| n as u64))
+            .filter(|n| n >= &min_nonce && n < &max_nonce)
+            .collect();
+        Ok(nonces)
     }
 }

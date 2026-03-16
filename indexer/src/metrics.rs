@@ -203,3 +203,97 @@ pub fn init() {
         FEEPAYER_BALANCE_LAMPORTS,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contra_metrics::prometheus;
+    use prometheus::proto::MetricFamily;
+
+    fn find_family(name: &str) -> MetricFamily {
+        prometheus::gather()
+            .into_iter()
+            .find(|family| family.name() == name)
+            .unwrap_or_else(|| panic!("metric family not found: {}", name))
+    }
+
+    fn metric_with_labels(family: &MetricFamily, labels: &[(&str, &str)]) -> bool {
+        family.get_metric().iter().any(|metric| {
+            labels.iter().all(|(name, value)| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == *name && label.value() == *value)
+            })
+        })
+    }
+
+    #[test]
+    fn init_labels_registers_single_label_series() {
+        let program_type = "test_program_single_label";
+
+        init_labels(program_type);
+
+        let single_label_metrics = [
+            "contra_indexer_mints_saved_total",
+            "contra_indexer_transactions_saved_total",
+            "contra_indexer_slot_save_errors_total",
+            "contra_indexer_slots_processed_total",
+            "contra_indexer_datasource_reconnects_total",
+            "contra_indexer_current_slot",
+            "contra_indexer_chain_tip_slot",
+            "contra_indexer_backfill_slots_remaining",
+            "contra_indexer_slot_processing_duration_seconds",
+            "contra_operator_transactions_fetched_total",
+            "contra_operator_db_update_errors_total",
+            "contra_operator_mints_sent_total",
+            "contra_operator_backlog_depth",
+            "contra_feepayer_balance_lamports",
+        ];
+
+        for name in single_label_metrics {
+            let family = find_family(name);
+            assert!(
+                metric_with_labels(&family, &[("program_type", program_type)]),
+                "missing program_type label for {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn init_registers_metric_families() {
+        init();
+        init_labels("default");
+
+        let names = [
+            "contra_indexer_slots_processed_total",
+            "contra_indexer_transactions_saved_total",
+            "contra_indexer_mints_saved_total",
+            "contra_indexer_slot_save_errors_total",
+            "contra_indexer_current_slot",
+            "contra_indexer_rpc_errors_total",
+            "contra_indexer_chain_tip_slot",
+            "contra_indexer_backfill_slots_remaining",
+            "contra_indexer_datasource_reconnects_total",
+            "contra_indexer_slot_processing_duration_seconds",
+            "contra_operator_transactions_fetched_total",
+            "contra_operator_db_updates_total",
+            "contra_operator_db_update_errors_total",
+            "contra_operator_rpc_send_duration_seconds",
+            "contra_operator_transaction_errors_total",
+            "contra_operator_mints_sent_total",
+            "contra_operator_backlog_depth",
+            "contra_feepayer_balance_lamports",
+        ];
+
+        let families = prometheus::gather();
+        for name in names {
+            assert!(
+                families.iter().any(|family| family.name() == name),
+                "metric family missing after init: {}",
+                name
+            );
+        }
+    }
+}

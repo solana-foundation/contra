@@ -96,7 +96,7 @@
 - `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData
 - `test_deposit_wrong_instance_ata` — passing an instance ATA for a different mint is rejected with InvalidInstructionData
 
-### ReleaseFunds (22 integration tests)
+### ReleaseFunds (23 integration tests)
 
 - `test_release_funds_success` — happy path with SMT proof
 - `test_release_funds_insufficient_funds` — insufficient balance error

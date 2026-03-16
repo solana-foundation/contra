@@ -15,6 +15,8 @@ mod test_create_instance;
 #[cfg(test)]
 mod test_deposit;
 #[cfg(test)]
+mod test_emit_event;
+#[cfg(test)]
 mod test_release_funds;
 #[cfg(test)]
 mod test_remove_operator;

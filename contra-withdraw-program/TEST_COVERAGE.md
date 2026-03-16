@@ -13,13 +13,13 @@
 | Business logic error branches | 100% (5/5)   | Zero amount, insufficient funds, wrong mint, truncated destination, not enough accounts |
 | Custom error codes exercised  | 100% (2/2)   | InvalidMint, ZeroAmount                                                                 |
 | State & trait coverage (unit) | 100% (11/11) | Instruction parsing, discriminator, event serialization                                 |
-| Event coverage                | 50% (1/2)    | Serialization tested; on-chain emission not verified                                    |
+| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test               |
 | Security edge cases           | 100% (3/3)   | Non-signer, wrong programs, wrong ATA address                                           |
 | **Overall (risk-weighted)**   | **~90%**     |                                                                                         |
 
 ## Test Inventory
 
-**11 unit tests** + **12 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
+**11 unit tests** + **13 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
 
 ### Unit Tests (11 tests)
 
@@ -42,12 +42,13 @@
 
 - `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
-### WithdrawFunds — Integration Tests (12 tests)
+### WithdrawFunds — Integration Tests (13 tests)
 
 #### Happy Path
 
 - `test_withdraw_funds_success` — basic withdrawal, balance verified
 - `test_withdraw_funds_with_destination` — optional destination parameter
+- `test_withdraw_funds_event_emission` — verifies the `WithdrawFundsEvent` log is actually emitted on-chain with the correct amount and destination bytes; reconstructs the expected pinocchio_log format (`[b0, b1, ..., b39]`) and matches it against the transaction logs
 
 #### Error Paths
 
@@ -84,10 +85,8 @@
 
 ### Remaining Untested Paths
 
-- Event emission on-chain — no log verification (serialization is unit-tested)
 - Token2022 support — not tested (withdraw program uses burn, which may differ for Token2022)
 
 ### Priority Recommendations
 
 1. **Medium**: Add Token2022 withdrawal test
-2. **Low**: Add event log verification

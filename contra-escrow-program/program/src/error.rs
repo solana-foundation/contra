@@ -67,3 +67,42 @@ impl From<ContraEscrowProgramError> for ProgramError {
         ProgramError::Custom(e as u32)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each error variant must map to a fixed Custom(N) code. Client SDKs and
+    // indexers decode errors by number, so silently reordering or inserting a
+    // variant in the middle would break them without any compile error.
+    // This test acts as an explicit lock on the ABI.
+    #[test]
+    fn test_error_codes_are_stable() {
+        use ContraEscrowProgramError::*;
+
+        let cases: &[(ContraEscrowProgramError, u32)] = &[
+            (InvalidEventAuthority, 0),
+            (InvalidAta, 1),
+            (InvalidMint, 2),
+            (InvalidInstanceId, 3),
+            (InvalidInstance, 4),
+            (InvalidAdmin, 5),
+            (PermanentDelegateNotAllowed, 6),
+            (PausableMintNotAllowed, 7),
+            (InvalidOperatorPda, 8),
+            (InvalidTokenAccount, 9),
+            (InvalidEscrowBalance, 10),
+            (InvalidAllowedMint, 11),
+            (InvalidSmtProof, 12),
+            (InvalidTransactionNonceForCurrentTreeIndex, 13),
+        ];
+
+        for (error, expected_code) in cases {
+            assert_eq!(
+                ProgramError::from(error.clone()),
+                ProgramError::Custom(*expected_code),
+                "{error:?} should map to Custom({expected_code})"
+            );
+        }
+    }
+}

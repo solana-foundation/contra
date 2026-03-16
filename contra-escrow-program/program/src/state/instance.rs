@@ -229,4 +229,67 @@ mod tests {
         );
         assert_eq!(deserialized.current_tree_index, instance.current_tree_index);
     }
+
+    // validate_admin should return Ok when the provided key matches the stored admin.
+    #[test]
+    fn test_validate_admin_correct() {
+        let admin = Pubkey::new_from_array([5u8; 32]);
+        let instance = Instance::new(1, Pubkey::new_from_array([1u8; 32]), admin);
+
+        assert!(instance.validate_admin(&admin).is_ok());
+    }
+
+    // validate_admin should return InvalidAdmin when a different key is provided.
+    // This is the guard that prevents a non-admin from performing admin-only operations
+    // (allow_mint, block_mint, add_operator, remove_operator, set_new_admin).
+    #[test]
+    fn test_validate_admin_wrong() {
+        let admin = Pubkey::new_from_array([5u8; 32]);
+        let wrong_admin = Pubkey::new_from_array([6u8; 32]);
+        let instance = Instance::new(1, Pubkey::new_from_array([1u8; 32]), admin);
+
+        let result = instance.validate_admin(&wrong_admin);
+
+        assert_eq!(
+            result.err(),
+            Some(ContraEscrowProgramError::InvalidAdmin.into())
+        );
+    }
+
+    // try_from_bytes should reject data whose first byte doesn't match the Instance
+    // discriminator, preventing a different account type from being parsed as an Instance.
+    #[test]
+    fn test_try_from_bytes_invalid_discriminator() {
+        let admin = Pubkey::new_from_array([42u8; 32]);
+        let instance_seed = Pubkey::new_from_array([7u8; 32]);
+        let instance = Instance::new(1, instance_seed, admin);
+        let mut bytes = instance.to_bytes();
+        bytes[0] = 99; // corrupt the discriminator byte
+
+        let result = Instance::try_from_bytes(&bytes);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidAccountData));
+    }
+
+    // Verifies tree index 1 behaviour: nonces belonging to tree 1 (>= MAX_TREE_LEAVES)
+    // are valid, while nonces from tree 0 are rejected. This ensures the math holds after the first reset.
+    #[test]
+    fn test_validate_current_tree_index_second_tree() {
+        let mut instance = Instance::new(
+            1,
+            Pubkey::new_from_array([0u8; 32]),
+            Pubkey::new_from_array([0u8; 32]),
+        );
+        instance.current_tree_index = 1;
+
+        // First nonce of tree 1 — expected_tree_index = MAX_TREE_LEAVES / MAX_TREE_LEAVES = 1.
+        assert!(instance
+            .validate_current_tree_index(MAX_TREE_LEAVES as u64)
+            .is_ok());
+
+        // Last nonce of tree 0 — expected_tree_index = 0, should fail for tree 1.
+        assert!(instance
+            .validate_current_tree_index(MAX_TREE_LEAVES as u64 - 1)
+            .is_err());
+    }
 }

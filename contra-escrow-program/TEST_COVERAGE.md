@@ -19,7 +19,7 @@
 
 ## Test Inventory
 
-**14 unit tests** (instruction data parsing) + **73 integration tests** (end-to-end behavior).
+**41 unit tests** (instruction data parsing, state serialization, error ABI, event encoding) + **84 integration tests** (end-to-end behavior).
 
 ### CreateInstance (4 integration tests)
 
@@ -41,7 +41,7 @@
 - `test_allow_mint_token_2022_permanent_delegate_blocked` — PermanentDelegateNotAllowed
 - `test_allow_mint_token_2022_pausable_blocked` — PausableMintNotAllowed
 
-### BlockMint (7 integration tests)
+### BlockMint (9 integration tests)
 
 - `test_block_mint_success` — happy path with rent reclamation
 - `test_block_mint_allowed_mint_not_found` — nonexistent mint fails
@@ -50,6 +50,8 @@
 - `test_block_mint_invalid_admin` — wrong admin rejected
 - `test_block_mint_invalid_instance_account_owner` — wrong owner rejected
 - `test_block_mint_mismatched_mint` — PDA/mint mismatch rejected
+- `test_block_mint_prevents_deposit` — a blocked mint causes a subsequent deposit to fail with InvalidAccountData
+- `test_allow_block_allow_cycle` — a mint can be re-allowed after being blocked; deposit succeeds once re-allowed
 
 ### AddOperator (6 integration tests)
 
@@ -60,23 +62,26 @@
 - `test_add_operator_invalid_admin` — wrong admin rejected
 - `test_add_operator_invalid_instance_account_owner` — wrong owner rejected
 
-### RemoveOperator (5 integration tests)
+### RemoveOperator (6 integration tests)
 
 - `test_remove_operator_success` — happy path with rent reclamation
 - `test_remove_operator_nonexistent` — nonexistent operator fails
 - `test_remove_operator_invalid_admin_not_signer` — unsigned admin rejected
 - `test_remove_operator_invalid_admin` — wrong admin rejected
 - `test_remove_operator_invalid_instance_account_owner` — wrong owner rejected
+- `test_remove_operator_prevents_release_funds` — once an operator PDA is closed, release_funds using that PDA fails with InvalidAccountData
 
-### SetNewAdmin (5 integration tests)
+### SetNewAdmin (7 integration tests)
 
 - `test_set_new_admin_success` — happy path
 - `test_set_new_admin_invalid_current_admin_not_signer` — unsigned current admin
 - `test_set_new_admin_invalid_current_admin` — wrong admin rejected
 - `test_set_new_admin_invalid_instance_account_owner` — wrong owner rejected
 - `test_set_new_admin_invalid_new_admin_not_signer` — new admin must sign
+- `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
+- `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (10 integration tests)
+### Deposit (12 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -88,8 +93,10 @@
 - `test_deposit_token_2022_permanent_delegate_rejected` — Token2022 extension blocked
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
+- `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData
+- `test_deposit_wrong_instance_ata` — passing an instance ATA for a different mint is rejected with InvalidInstructionData
 
-### ReleaseFunds (18 integration tests)
+### ReleaseFunds (22 integration tests)
 
 - `test_release_funds_success` — happy path with SMT proof
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -111,6 +118,8 @@
 - `test_malformed_proof_nonce_far_outside_range` — far out-of-range nonce
 - `test_boundary_nonce_last_valid_for_tree_index_zero` — boundary nonce
 - `test_zero_amount_release` — zero amount edge case
+- `test_release_funds_wrong_user_ata` — passing another user's ATA as user_ata while keeping the correct user pubkey in instruction data is rejected with InvalidInstructionData
+- `test_release_funds_full_balance` — releasing the entire deposited balance succeeds and leaves the instance ATA at zero
 
 ### ResetSmtRoot (4 integration tests)
 
@@ -119,16 +128,36 @@
 - `test_reset_smt_root_operator_not_signer` — unsigned operator rejected
 - `test_reset_smt_root_updates_nonce` — tree index incremented
 
-### Unit Tests (14 tests across processor modules)
+### EmitEvent (2 integration tests)
 
-Focused on instruction data parsing and validation:
+- `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
+- `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
+
+### Unit Tests (41 tests across processor and program modules)
+
+**Instruction data parsing** (processor modules):
 
 - `create_instance`: 3 tests (valid data, insufficient data, empty data)
 - `allow_mint`: 2 tests (valid bump, empty data)
-- `deposit`: 4 tests (with/without recipient, insufficient length, empty accounts)
+- `deposit`: 5 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
 - `reset_smt_root`: 1 test (empty accounts)
 - `add_operator`: 1 test (valid instruction data)
+
+**State serialization and validation** (`state/`):
+
+- `allowed_mint`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
+- `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
+- `instance`: 4 tests (validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization, tree index 1 nonce boundary validation)
+- `discriminator`: 2 tests (all 10 valid instruction discriminator bytes accepted, unmapped bytes rejected)
+
+**Error ABI stability** (`error.rs`):
+
+- `test_error_codes_are_stable`: 1 test — asserts every `ContraEscrowProgramError` variant maps to its expected `Custom(N)` code; acts as an explicit lock against silent reordering that would break client SDKs and indexers
+
+**Event encoding** (`events.rs`):
+
+- 9 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, ResetSmtRoot) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix
 
 ## Documented Gaps
 

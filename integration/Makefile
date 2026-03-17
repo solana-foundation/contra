@@ -27,16 +27,17 @@ fmt:
 integration-coverage-contra:
 	@echo "Running contra integration tests with coverage instrumentation..."
 	@cargo llvm-cov clean --workspace
-	@cargo llvm-cov --no-report --test contra_integration -- --nocapture
+	@cargo llvm-cov test --no-report --workspace --test contra_integration -- --nocapture
 
 integration-coverage-indexer:
 	@echo "Running indexer integration tests with coverage instrumentation..."
-	@cargo llvm-cov --no-report --features test-tree --test indexer_integration -- --nocapture
+	@cargo llvm-cov test --no-report --workspace --features test-tree --test indexer_integration -- --nocapture
 
 integration-coverage-report:
 	@echo "Generating combined integration E2E coverage report..."
 	@mkdir -p $(COVERAGE_DIR)
 	@cargo llvm-cov report --lcov \
+		-p contra-core -p contra-indexer -p contra-integration \
 		--ignore-filename-regex '(^tests/|/test_utils/|\.cargo/registry)' \
 		--output-path $(COVERAGE_DIR)/coverage-integration-e2e.lcov
 	@echo "Coverage report: $(COVERAGE_DIR)/coverage-integration-e2e.lcov"

@@ -298,6 +298,7 @@ pub async fn process_deposit_funds(
 mod tests {
     use super::*;
     use crate::operator::find_allowed_mint_pda;
+    use crate::storage::common::storage::mock::MockStorage;
 
     fn make_release_funds_state() -> ReleaseFundsState {
         ReleaseFundsState {
@@ -368,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_release_funds_missing_state_errors() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -391,7 +392,7 @@ mod tests {
     /// to the sender channel as a ReleaseFunds builder.
     #[tokio::test]
     async fn process_release_funds_sends_transaction_builder() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -459,7 +460,7 @@ mod tests {
     /// sent before the ReleaseFunds transaction to rotate the SMT root.
     #[tokio::test]
     async fn process_release_funds_tree_rotation_sends_reset_first() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -538,7 +539,7 @@ mod tests {
     /// rather than panicking or silently skipping the transaction.
     #[tokio::test]
     async fn process_release_funds_invalid_mint_errors() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -585,7 +586,7 @@ mod tests {
     /// idempotency memo, then forwarded to the sender channel.
     #[tokio::test]
     async fn process_deposit_funds_sends_mint_builder() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -636,7 +637,7 @@ mod tests {
     /// process_deposit_funds rather than being swallowed.
     #[tokio::test]
     async fn process_deposit_funds_invalid_mint_errors() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -683,7 +684,7 @@ mod tests {
     /// the function should return Ok(()) immediately without touching the sender.
     #[tokio::test]
     async fn process_deposit_funds_empty_channel_returns_ok() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -711,7 +712,7 @@ mod tests {
     /// derivation step must never be reached with garbage input.
     #[tokio::test]
     async fn process_deposit_funds_invalid_recipient_errors() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -758,7 +759,7 @@ mod tests {
     /// valid and the release_funds_state is fully populated.
     #[tokio::test]
     async fn process_release_funds_invalid_recipient_errors() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),

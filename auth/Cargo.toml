@@ -1,0 +1,28 @@
+[package]
+name = "auth"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "auth"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+clap = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tower-http = { workspace = true, features = ["cors"] }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+solana-sdk = { workspace = true }
+bs58 = { workspace = true }

@@ -481,37 +481,26 @@ async fn settle_transactions(
 mod tests {
     use super::*;
 
-    use crate::test_helpers::create_test_sanitized_transaction;
-    use solana_sdk::signature::{Keypair, Signer};
-    use solana_svm::account_loader::LoadedTransaction;
+    use crate::test_helpers::{
+        create_test_sanitized_transaction, postgres_container_url, start_test_postgres,
+        start_test_redis,
+    };
+    use solana_sdk::{
+        account::AccountSharedData,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+    };
+    use solana_svm::account_loader::{FeesOnlyTransaction, LoadedTransaction};
+    use solana_svm::rollback_accounts::RollbackAccounts;
     use solana_svm::transaction_execution_result::{
         ExecutedTransaction, TransactionExecutionDetails,
     };
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::postgres::Postgres;
-
-    async fn start_test_postgres() -> (AccountsDB, testcontainers::ContainerAsync<Postgres>) {
-        let container = Postgres::default()
-            .with_db_name("settle_test")
-            .with_user("postgres")
-            .with_password("password")
-            .start()
-            .await
-            .unwrap();
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
-        let url = format!("postgres://postgres:password@{}:{}/settle_test", host, port);
-        let db = AccountsDB::new(&url, false)
-            .await
-            .unwrap_or_else(|e| panic!("Failed: {}", e));
-        (db, container)
-    }
+    use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     fn make_executed(
-        accounts: Vec<(
-            solana_sdk::pubkey::Pubkey,
-            solana_sdk::account::AccountSharedData,
-        )>,
+        accounts: Vec<(solana_sdk::pubkey::Pubkey, AccountSharedData)>,
     ) -> ProcessedTransaction {
         ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
             loaded_transaction: LoadedTransaction {
@@ -564,16 +553,12 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // Create an executed result with a writable account
-        let account_pk = solana_sdk::pubkey::Pubkey::new_unique();
-        let account_data = solana_sdk::account::AccountSharedData::new(
-            500,
-            0,
-            &solana_sdk::pubkey::Pubkey::new_unique(),
-        );
+        let account_pk = Pubkey::new_unique();
+        let account_data = AccountSharedData::new(500, 0, &Pubkey::new_unique());
         let processed = make_executed(vec![(account_pk, account_data)]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
@@ -592,29 +577,20 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // The system transfer tx has writable accounts at indices 0,1 and readonly at 2
         // Create executed result with 3 accounts
-        let owner = solana_sdk::pubkey::Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
         let pk0 = from.pubkey();
         let pk1 = to;
         let pk2 = solana_system_interface::program::id();
 
         let processed = make_executed(vec![
-            (
-                pk0,
-                solana_sdk::account::AccountSharedData::new(900, 0, &owner),
-            ),
-            (
-                pk1,
-                solana_sdk::account::AccountSharedData::new(100, 0, &owner),
-            ),
-            (
-                pk2,
-                solana_sdk::account::AccountSharedData::new(1, 0, &owner),
-            ),
+            (pk0, AccountSharedData::new(900, 0, &owner)),
+            (pk1, AccountSharedData::new(100, 0, &owner)),
+            (pk2, AccountSharedData::new(1, 0, &owner)),
         ]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
@@ -635,15 +611,12 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // Account with 0 lamports and empty data = deleted
         let pk = from.pubkey();
-        let processed = make_executed(vec![(
-            pk,
-            solana_sdk::account::AccountSharedData::default(),
-        )]);
+        let processed = make_executed(vec![(pk, AccountSharedData::default())]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
         let result = settle_transactions(None, &mut db, None, &results)
@@ -661,7 +634,7 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
         let sig = *tx.signature();
 
@@ -683,14 +656,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_settle_fees_only_records_signature_no_accounts() {
-        use solana_svm::account_loader::FeesOnlyTransaction;
-        use solana_svm::rollback_accounts::RollbackAccounts;
+    async fn test_settle_multiple_sequential_batches() {
+        let (mut db, _pg) = start_test_postgres().await;
 
+        // Settle first batch
+        let from1 = Keypair::new();
+        let to1 = Pubkey::new_unique();
+        let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
+        let pk1 = Pubkey::new_unique();
+        let processed1 = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let results1: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed1), tx1)];
+
+        let r1 = settle_transactions(None, &mut db, None, &results1)
+            .await
+            .unwrap();
+        assert_eq!(r1.slot, 0);
+
+        // Settle second batch, chaining from first
+        let last = LastBlock {
+            slot: r1.slot,
+            blockhash: r1.blockhash,
+        };
+        let from2 = Keypair::new();
+        let to2 = Pubkey::new_unique();
+        let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
+        let pk2 = Pubkey::new_unique();
+        let processed2 = make_executed(vec![(
+            pk2,
+            AccountSharedData::new(300, 0, &Pubkey::new_unique()),
+        )]);
+        let results2: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed2), tx2)];
+
+        let r2 = settle_transactions(Some(last), &mut db, None, &results2)
+            .await
+            .unwrap();
+        assert_eq!(r2.slot, 1);
+        assert_ne!(r2.blockhash, r1.blockhash);
+
+        // Both blocks should be stored
+        assert!(db.get_block(0).await.is_some());
+        assert!(db.get_block(1).await.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_fees_only_records_signature_no_accounts() {
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
-        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
         let sig = *tx.signature();
 
@@ -699,7 +715,7 @@ mod tests {
         let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
             load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
             rollback_accounts: RollbackAccounts::FeePayerOnly {
-                fee_payer_account: solana_sdk::account::AccountSharedData::new(
+                fee_payer_account: AccountSharedData::new(
                     900,
                     0,
                     &solana_sdk_ids::system_program::ID,
@@ -848,5 +864,464 @@ mod tests {
         // Cleanup: Remove test data from Redis
         let _: Result<(), _> = conn.del("latest_slot").await;
         let _: Result<(), _> = conn.del("latest_blockhash").await;
+    }
+
+    // --- Settle worker integration tests ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_worker_shutdown_exits_cleanly() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (_exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 60,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
+        assert!(result.is_ok(), "settle worker should exit after shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_worker_processes_results_and_emits_settlements() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 50, // fast for testing
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Send a batch of execution results
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let pk = Pubkey::new_unique();
+        let account_data = AccountSharedData::new(500, 0, &Pubkey::new_unique());
+        let executed = make_executed(vec![(pk, account_data)]);
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(executed)],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        exec_tx.send((output, vec![tx])).unwrap();
+
+        // Wait for the blocktime tick to process and emit settlements
+        let settlements =
+            tokio::time::timeout(Duration::from_secs(5), settled_accounts_rx.recv()).await;
+        assert!(
+            settlements.is_ok(),
+            "should receive settlements within timeout"
+        );
+
+        let blockhash =
+            tokio::time::timeout(Duration::from_secs(1), settled_blockhashes_rx.recv()).await;
+        assert!(blockhash.is_ok(), "should receive blockhash within timeout");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_worker_channel_closed_exits() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 50,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        drop(exec_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "settle worker should exit when input channel closes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_mixed_outcomes_in_batch() {
+        // Test batch with Executed, FeesOnly, and Error outcomes mixed
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from1 = Keypair::new();
+        let to1 = Pubkey::new_unique();
+        let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
+        let pk1 = Pubkey::new_unique();
+        let executed = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+
+        let from2 = Keypair::new();
+        let to2 = Pubkey::new_unique();
+        let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
+
+        let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
+            load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
+            rollback_accounts: RollbackAccounts::FeePayerOnly {
+                fee_payer_account: AccountSharedData::new(
+                    900,
+                    0,
+                    &solana_sdk_ids::system_program::ID,
+                ),
+            },
+            fee_details: Default::default(),
+        }));
+
+        let from3 = Keypair::new();
+        let to3 = Pubkey::new_unique();
+        let tx3 = create_test_sanitized_transaction(&from3, &to3, 300);
+        let err = solana_transaction_error::TransactionError::InstructionError(
+            0,
+            solana_sdk::instruction::InstructionError::Custom(42),
+        );
+
+        let results: Vec<(TransactionProcessingResult, _)> =
+            vec![(Ok(executed), tx1), (Ok(fees_only), tx2), (Err(err), tx3)];
+
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
+
+        // All three signatures should be recorded in the block
+        assert_eq!(
+            result.account_settlements.len(),
+            1,
+            "only executed tx settles accounts"
+        );
+        assert_eq!(
+            result.blockhash,
+            Hash::default(),
+            "first block has default hash"
+        );
+
+        let block = db.get_block(result.slot).await.unwrap();
+        assert_eq!(
+            block.transaction_signatures.len(),
+            3,
+            "all three signatures recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_block_metadata_correctness() {
+        // Test that block metadata (time, height, parent_slot) is set correctly
+        let (mut db, _pg) = start_test_postgres().await;
+
+        // First block
+        let from1 = Keypair::new();
+        let to1 = Pubkey::new_unique();
+        let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
+        let pk1 = Pubkey::new_unique();
+        let executed1 = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let results1 = vec![(Ok(executed1), tx1)];
+
+        let r1 = settle_transactions(None, &mut db, None, &results1)
+            .await
+            .unwrap();
+        assert_eq!(r1.slot, 0);
+
+        let block1 = db.get_block(0).await.unwrap();
+        assert_eq!(block1.parent_slot, 0, "first block parent_slot is 0");
+        assert_eq!(block1.block_height, Some(0), "first block height is 0");
+        assert!(block1.block_time.is_some(), "block time is set");
+
+        // Second block, chained from first
+        let last = LastBlock {
+            slot: r1.slot,
+            blockhash: r1.blockhash,
+        };
+        let from2 = Keypair::new();
+        let to2 = Pubkey::new_unique();
+        let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
+        let pk2 = Pubkey::new_unique();
+        let executed2 = make_executed(vec![(
+            pk2,
+            AccountSharedData::new(300, 0, &Pubkey::new_unique()),
+        )]);
+        let results2 = vec![(Ok(executed2), tx2)];
+
+        let r2 = settle_transactions(Some(last), &mut db, None, &results2)
+            .await
+            .unwrap();
+        assert_eq!(r2.slot, 1);
+
+        let block2 = db.get_block(1).await.unwrap();
+        assert_eq!(block2.parent_slot, 0, "second block parent_slot is 0");
+        assert_eq!(block2.block_height, Some(1), "second block height is 1");
+        assert_eq!(
+            block2.previous_blockhash, r1.blockhash,
+            "second block's previous_blockhash matches first block's blockhash"
+        );
+        assert!(block2.block_time.is_some(), "block time is set");
+        assert_ne!(
+            block2.blockhash, r1.blockhash,
+            "block hashes differ between blocks"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_transaction_signature_ordering() {
+        // Test that transaction signatures and recent_blockhashes are collected in order
+        let (mut db, _pg) = start_test_postgres().await;
+
+        // Create three transactions with different recent_blockhashes
+        let tx1 = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 100);
+        let tx2 = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 200);
+        let tx3 = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 300);
+
+        // Note: We can't easily modify recent_blockhash on a SanitizedTransaction,
+        // so we test signature order instead by using the signature as a proxy
+        let sig1 = *tx1.signature();
+        let sig2 = *tx2.signature();
+        let sig3 = *tx3.signature();
+
+        let pk1 = Pubkey::new_unique();
+        let executed1 = make_executed(vec![(
+            pk1,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+
+        let pk2 = Pubkey::new_unique();
+        let executed2 = make_executed(vec![(
+            pk2,
+            AccountSharedData::new(600, 0, &Pubkey::new_unique()),
+        )]);
+
+        let pk3 = Pubkey::new_unique();
+        let executed3 = make_executed(vec![(
+            pk3,
+            AccountSharedData::new(700, 0, &Pubkey::new_unique()),
+        )]);
+
+        let results = vec![
+            (Ok(executed1), tx1),
+            (Ok(executed2), tx2),
+            (Ok(executed3), tx3),
+        ];
+
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
+
+        let block = db.get_block(result.slot).await.unwrap();
+        assert_eq!(
+            block.transaction_signatures.len(),
+            3,
+            "all three signatures recorded"
+        );
+        // Verify signatures are in the same order as input
+        assert_eq!(block.transaction_signatures[0], sig1);
+        assert_eq!(block.transaction_signatures[1], sig2);
+        assert_eq!(block.transaction_signatures[2], sig3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_writable_only_uses_transaction_metadata() {
+        // Test that only writable accounts (per transaction metadata) are settled,
+        // even if they're in the loaded accounts list
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+
+        // For a system transfer, account indices 0 and 1 are writable (payer, recipient)
+        // and 2 (system program) is read-only
+        let owner = Pubkey::new_unique();
+        let system_prog = solana_system_interface::program::id();
+
+        let executed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![
+                    (from.pubkey(), AccountSharedData::new(900, 0, &owner)),
+                    (to, AccountSharedData::new(100, 0, &owner)),
+                    (system_prog, AccountSharedData::new(1, 0, &owner)),
+                ],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 100,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: std::collections::HashMap::new(),
+        }));
+
+        let results = vec![(Ok(executed), tx)];
+        let result = settle_transactions(None, &mut db, None, &results)
+            .await
+            .unwrap();
+
+        // Both writable accounts (payer and recipient) should be settled
+        assert_eq!(
+            result.account_settlements.len(),
+            2,
+            "both writable accounts settled"
+        );
+        let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
+        assert!(settlement_keys.contains(&from.pubkey()), "payer settled");
+        assert!(settlement_keys.contains(&to), "recipient settled");
+        assert!(
+            !settlement_keys.contains(&system_prog),
+            "system program not settled (read-only)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_redis_cache_with_postgres_data() {
+        // Test that warm_redis_cache reads latest_slot and latest_blockhash from Postgres
+        // and writes them to Redis
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let (redis_db, _redis) = start_test_redis().await;
+
+        // Seed Postgres via settle_transactions
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let pk = Pubkey::new_unique();
+        let executed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(None, &mut pg_db, None, &[(Ok(executed), tx)])
+            .await
+            .unwrap();
+
+        // Get the PostgresAccountsDB variant for warm_redis_cache
+        let AccountsDB::Postgres(ref pg) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        warm_redis_cache(pg, &redis_db).await.unwrap();
+
+        // Verify Redis was populated
+        let mut conn = redis_db.connection.clone();
+        let slot: Option<u64> = conn.get("latest_slot").await.ok();
+        assert_eq!(slot, Some(0), "Redis latest_slot should be 0");
+        let bh: Option<String> = conn.get("latest_blockhash").await.ok();
+        assert!(bh.is_some(), "Redis latest_blockhash should be set");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_warm_redis_cache_empty_postgres() {
+        // Test that warm_redis_cache handles empty Postgres gracefully
+        let (pg_db, _pg) = start_test_postgres().await;
+        let (redis_db, _redis) = start_test_redis().await;
+
+        let AccountsDB::Postgres(ref pg) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        // Should succeed without panic — empty DB is gracefully handled
+        warm_redis_cache(pg, &redis_db).await.unwrap();
+
+        // No keys should be written when Postgres is empty
+        let mut conn = redis_db.connection.clone();
+        let slot: Option<u64> = conn.get("latest_slot").await.ok();
+        assert!(
+            slot.is_none(),
+            "Redis should have no slot when Postgres is empty"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_worker_perf_sample_tick_fires() {
+        // Test that the performance sample tick fires after perf_sample_period_secs
+        // and stores a sample in the database
+        let (_db, pg_container) = start_test_postgres().await;
+        let url = postgres_container_url(&pg_container, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (_settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (_settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx: _settled_accounts_tx,
+            settled_blockhashes_tx: _settled_blockhashes_tx,
+            accountsdb_connection_url: url.clone(),
+            blocktime_ms: 50,
+            perf_sample_period_secs: 1, // fires after 1s
+            shutdown_token: shutdown.clone(),
+        })
+        .await;
+
+        // Send a transaction so last_block is set before the perf tick
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let pk = Pubkey::new_unique();
+        let executed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(executed)],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        exec_tx.send((output, vec![tx])).unwrap();
+
+        // Poll for perf sample with deadline instead of fixed sleep.
+        // Perf tick fires after ~1s; poll every 100ms for up to 5s.
+        let db_poll = AccountsDB::new(&url, false).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let samples = db_poll.get_recent_performance_samples(10).await.unwrap();
+            if !samples.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for perf sample to be stored"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        shutdown.cancel();
     }
 }

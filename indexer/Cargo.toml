@@ -74,6 +74,7 @@ spl-associated-token-account = { workspace = true }
 solana-system-interface = { workspace = true }
 contra-withdraw-program-client = { workspace = true }
 mockito = "1.7"
+serial_test = "3"
 solana-address = { workspace = true }
 solana-rpc = { workspace = true }
 solana-sdk = { workspace = true }

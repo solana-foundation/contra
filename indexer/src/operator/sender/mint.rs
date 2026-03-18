@@ -603,11 +603,16 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 mod tests {
     use super::{
         accounts_and_amount_match, expected_mint_instruction, instruction_has_expected_mint,
-        memo_matches, parse_token_instruction_mint_amount,
-        partially_decoded_instruction_has_expected_mint, raw_instruction_has_expected_mint,
-        strip_memo_length_prefix, transaction_matches_expected_mint, ExpectedMintInstruction,
+        instruction_has_memo, is_method_not_found_error, memo_matches,
+        parse_token_instruction_mint_amount, partially_decoded_instruction_has_expected_mint,
+        raw_instruction_has_expected_mint, strip_memo_length_prefix,
+        transaction_matches_expected_mint, ExpectedMintInstruction,
     };
     use crate::operator::utils::instruction_util::{MintToBuilder, MintToBuilderWithTxnId};
+    use solana_rpc_client_api::{
+        client_error::{self, ErrorKind},
+        request::{RpcError, RpcResponseErrorData},
+    };
     use solana_sdk::pubkey::Pubkey;
     use solana_transaction_status::parse_instruction::ParsedInstruction;
     use solana_transaction_status::{
@@ -1167,5 +1172,291 @@ mod tests {
             expected_memo,
             &expected,
         ));
+    }
+
+    // ====================================================================
+    // instruction_has_memo tests
+    // ====================================================================
+
+    /// Compiled instructions carry no program-id string, so the memo check must
+    /// return false regardless of the memo argument.
+    #[test]
+    fn instruction_has_memo_compiled_returns_false() {
+        let ix = UiInstruction::Compiled(UiCompiledInstruction {
+            program_id_index: 0,
+            accounts: vec![],
+            data: "".to_string(),
+            stack_height: None,
+        });
+        assert!(!instruction_has_memo(&ix, "any-memo"));
+    }
+
+    /// A fully-parsed spl-memo instruction with the canonical program id and
+    /// matching memo text must be recognized as containing the expected memo.
+    #[test]
+    fn instruction_has_memo_parsed_correct_memo() {
+        let memo_text = "contra:mint-idempotency:7";
+        let ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-memo".to_string(),
+            program_id: spl_memo::id().to_string(),
+            parsed: serde_json::Value::String(memo_text.to_string()),
+            stack_height: None,
+        }));
+        assert!(instruction_has_memo(&ix, memo_text));
+    }
+
+    /// Matching memo text is not enough; the program_id must also equal spl_memo::id(),
+    /// so an instruction from a different program is rejected.
+    #[test]
+    fn instruction_has_memo_parsed_wrong_program() {
+        let memo_text = "contra:mint-idempotency:7";
+        let wrong_program = Pubkey::new_unique();
+        let ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "not-memo".to_string(),
+            program_id: wrong_program.to_string(),
+            parsed: serde_json::Value::String(memo_text.to_string()),
+            stack_height: None,
+        }));
+        assert!(!instruction_has_memo(&ix, memo_text));
+    }
+
+    /// Only `serde_json::Value::String` is accepted as the parsed field; a JSON object
+    /// (even from the correct program) must cause the check to return false.
+    #[test]
+    fn instruction_has_memo_parsed_non_string_parsed_value() {
+        let ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
+            program: "spl-memo".to_string(),
+            program_id: spl_memo::id().to_string(),
+            parsed: serde_json::json!({ "not": "a string" }),
+            stack_height: None,
+        }));
+        assert!(!instruction_has_memo(&ix, "any-memo"));
+    }
+
+    /// PartiallyDecoded instructions store memo bytes as bs58; verify the decode-and-compare
+    /// path correctly recognises the expected memo text.
+    #[test]
+    fn instruction_has_memo_partially_decoded_correct_memo() {
+        let memo_text = "contra:mint-idempotency:99";
+        let encoded_memo = bs58::encode(memo_text.as_bytes()).into_string();
+        let ix = UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(
+            UiPartiallyDecodedInstruction {
+                program_id: spl_memo::id().to_string(),
+                accounts: vec![],
+                data: encoded_memo,
+                stack_height: None,
+            },
+        ));
+        assert!(instruction_has_memo(&ix, memo_text));
+    }
+
+    /// A correct memo payload attached to a non-memo program id must be rejected
+    /// even in the PartiallyDecoded encoding.
+    #[test]
+    fn instruction_has_memo_partially_decoded_wrong_program() {
+        let memo_text = "contra:mint-idempotency:99";
+        let encoded_memo = bs58::encode(memo_text.as_bytes()).into_string();
+        let wrong_program = Pubkey::new_unique();
+        let ix = UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(
+            UiPartiallyDecodedInstruction {
+                program_id: wrong_program.to_string(),
+                accounts: vec![],
+                data: encoded_memo,
+                stack_height: None,
+            },
+        ));
+        assert!(!instruction_has_memo(&ix, memo_text));
+    }
+
+    // ====================================================================
+    // is_method_not_found_error tests
+    // ====================================================================
+
+    /// JSON-RPC error code -32601 is the standard "method not found" code; the helper
+    /// must return true exactly for this value.
+    #[test]
+    fn is_method_not_found_error_returns_true_for_32601() {
+        let error = client_error::Error::new_with_request(
+            ErrorKind::RpcError(RpcError::RpcResponseError {
+                code: -32601,
+                message: "Method not found".to_string(),
+                data: RpcResponseErrorData::Empty,
+            }),
+            solana_rpc_client_api::request::RpcRequest::GetBalance,
+        );
+        assert!(is_method_not_found_error(&error));
+    }
+
+    /// Any other RPC response error code (e.g. -32600 "invalid request") must not be
+    /// confused with method-not-found.
+    #[test]
+    fn is_method_not_found_error_returns_false_for_other_rpc_code() {
+        let error = client_error::Error::new_with_request(
+            ErrorKind::RpcError(RpcError::RpcResponseError {
+                code: -32600,
+                message: "Invalid request".to_string(),
+                data: RpcResponseErrorData::Empty,
+            }),
+            solana_rpc_client_api::request::RpcRequest::GetBalance,
+        );
+        assert!(!is_method_not_found_error(&error));
+    }
+
+    // ====================================================================
+    // transaction_matches_expected_mint with Raw message
+    // ====================================================================
+
+    fn build_test_transaction_raw(
+        account_keys: Vec<String>,
+        num_required_signatures: u8,
+        instructions: Vec<UiCompiledInstruction>,
+        meta_err: Option<solana_sdk::transaction::TransactionError>,
+    ) -> EncodedConfirmedTransactionWithStatusMeta {
+        EncodedConfirmedTransactionWithStatusMeta {
+            slot: 0,
+            transaction: EncodedTransactionWithStatusMeta {
+                transaction: EncodedTransaction::Json(UiTransaction {
+                    signatures: vec!["sig".to_string()],
+                    message: UiMessage::Raw(UiRawMessage {
+                        header: solana_sdk::message::MessageHeader {
+                            num_required_signatures,
+                            num_readonly_signed_accounts: 0,
+                            num_readonly_unsigned_accounts: 0,
+                        },
+                        account_keys,
+                        recent_blockhash: "11111111111111111111111111111111".to_string(),
+                        instructions,
+                        address_table_lookups: None,
+                    }),
+                }),
+                meta: Some(UiTransactionStatusMeta {
+                    err: meta_err,
+                    status: Ok(()),
+                    fee: 5000,
+                    pre_balances: vec![],
+                    post_balances: vec![],
+                    inner_instructions: OptionSerializer::None,
+                    log_messages: OptionSerializer::None,
+                    pre_token_balances: OptionSerializer::None,
+                    post_token_balances: OptionSerializer::None,
+                    rewards: OptionSerializer::None,
+                    loaded_addresses: OptionSerializer::Skip,
+                    return_data: OptionSerializer::Skip,
+                    compute_units_consumed: OptionSerializer::Skip,
+                    cost_units: OptionSerializer::Skip,
+                }),
+                version: None,
+            },
+            block_time: None,
+        }
+    }
+
+    /// End-to-end check: a UiRawMessage transaction with the correct memo, spl-token MintTo
+    /// instruction, and matching signers/accounts must pass the full validation.
+    #[test]
+    fn transaction_matches_expected_mint_raw_message_happy_path() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let memo_text = "contra:mint-idempotency:42";
+
+        let mint_data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+
+        // account_keys layout:
+        // 0 = mint_authority (signer)
+        // 1 = spl_memo program
+        // 2 = spl_token program
+        // 3 = mint
+        // 4 = recipient_ata
+        let account_keys = vec![
+            mint_authority.to_string(),
+            spl_memo::id().to_string(),
+            spl_token::id().to_string(),
+            mint.to_string(),
+            recipient_ata.to_string(),
+        ];
+
+        let memo_ix = UiCompiledInstruction {
+            program_id_index: 1, // spl_memo
+            accounts: vec![],
+            data: bs58::encode(memo_text.as_bytes()).into_string(),
+            stack_height: None,
+        };
+        let mint_ix = UiCompiledInstruction {
+            program_id_index: 2,     // spl_token
+            accounts: vec![3, 4, 0], // mint, recipient_ata, mint_authority
+            data: bs58::encode(&mint_data).into_string(),
+            stack_height: None,
+        };
+
+        let tx = build_test_transaction_raw(account_keys, 1, vec![memo_ix, mint_ix], None);
+        assert!(transaction_matches_expected_mint(&tx, memo_text, &expected));
+    }
+
+    /// If the real mint_authority is not in a signing position (index ≥ num_required_signatures),
+    /// the transaction must be rejected even when all other fields match.
+    #[test]
+    fn transaction_matches_expected_mint_raw_message_rejects_wrong_signer() {
+        let (mint, recipient_ata, mint_authority, expected) = make_expected();
+        let memo_text = "contra:mint-idempotency:42";
+
+        let mint_data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
+        let wrong_authority = Pubkey::new_unique();
+
+        // mint_authority is not in signed position (not index < num_required_signatures)
+        let account_keys = vec![
+            wrong_authority.to_string(), // index 0 is the signer, but it's a different key
+            mint_authority.to_string(),  // index 1 is the real authority, but not a signer
+            spl_memo::id().to_string(),
+            spl_token::id().to_string(),
+            mint.to_string(),
+            recipient_ata.to_string(),
+        ];
+
+        let memo_ix = UiCompiledInstruction {
+            program_id_index: 2,
+            accounts: vec![],
+            data: bs58::encode(memo_text.as_bytes()).into_string(),
+            stack_height: None,
+        };
+        let mint_ix = UiCompiledInstruction {
+            program_id_index: 3,
+            accounts: vec![4, 5, 1], // uses index 1 (mint_authority) as signer account
+            data: bs58::encode(&mint_data).into_string(),
+            stack_height: None,
+        };
+
+        // num_required_signatures = 1, so only index 0 is a signer
+        // mint_authority is at index 1, which is NOT a signer
+        let tx = build_test_transaction_raw(account_keys, 1, vec![memo_ix, mint_ix], None);
+        assert!(!transaction_matches_expected_mint(
+            &tx, memo_text, &expected
+        ));
+    }
+
+    // ====================================================================
+    // strip_memo_length_prefix edge cases
+    // ====================================================================
+
+    /// Strings with no opening bracket have no length prefix to strip; the original
+    /// value must be returned unchanged.
+    #[test]
+    fn strip_memo_length_prefix_no_bracket() {
+        assert_eq!(strip_memo_length_prefix("plain memo"), "plain memo");
+    }
+
+    /// A bracket prefix like `[abc]` whose content is not all digits is not a valid
+    /// length prefix, so the original string must be returned unchanged.
+    #[test]
+    fn strip_memo_length_prefix_non_digit_length() {
+        assert_eq!(
+            strip_memo_length_prefix("[abc] some memo"),
+            "[abc] some memo"
+        );
+    }
+
+    /// `split_once("] ")` requires a space after the closing bracket; without it the
+    /// prefix is not stripped and the original string is returned unchanged.
+    #[test]
+    fn strip_memo_length_prefix_no_space_after_bracket() {
+        assert_eq!(strip_memo_length_prefix("[123]no-space"), "[123]no-space");
     }
 }

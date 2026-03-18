@@ -675,6 +675,55 @@ mod tests {
         assert_eq!(mismatches.len(), 0);
     }
 
+    fn make_operator_config() -> OperatorConfig {
+        use solana_sdk::commitment_config::CommitmentLevel;
+        OperatorConfig {
+            db_poll_interval: std::time::Duration::from_secs(1),
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay: std::time::Duration::from_millis(100),
+            channel_buffer_size: 100,
+            rpc_commitment: CommitmentLevel::Confirmed,
+            alert_webhook_url: None,
+            reconciliation_interval: std::time::Duration::from_secs(60),
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url: None,
+            feepayer_monitor_interval: std::time::Duration::from_secs(60),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_reconciliation_returns_ok_when_precancelled() {
+        use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
+        use crate::storage::common::storage::{mock::MockStorage, Storage};
+        use solana_sdk::commitment_config::CommitmentConfig;
+        use std::sync::Arc;
+
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        ));
+        let config = make_operator_config();
+        let ct = CancellationToken::new();
+        ct.cancel(); // pre-cancel so the loop exits immediately
+
+        let result = run_reconciliation(
+            storage,
+            config,
+            rpc_client,
+            solana_sdk::pubkey::Pubkey::new_unique(),
+            ct,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "pre-cancelled reconciliation should return Ok"
+        );
+    }
+
     fn test_webhook_client() -> WebhookClient {
         WebhookClient::new(
             Duration::from_secs(10),

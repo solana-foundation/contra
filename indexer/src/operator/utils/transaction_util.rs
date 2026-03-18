@@ -281,4 +281,258 @@ mod tests {
         let err = TransactionError::InsufficientFundsForFee;
         assert!(parse_program_error(&err).is_none());
     }
+
+    // ====================================================================
+    // check_transaction_status tests (mockito-based RPC mocking)
+    // ====================================================================
+
+    fn make_rpc_client_for_test(url: String) -> Arc<crate::operator::RpcClientWithRetry> {
+        use crate::operator::utils::rpc_util::RetryConfig;
+        use std::time::Duration;
+        Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+            url,
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        ))
+    }
+
+    /// A confirmed status with no error in the RPC response must produce Confirmed,
+    /// meaning the caller can proceed to mark the transaction as settled.
+    #[tokio::test]
+    async fn check_transaction_status_returns_confirmed_on_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "confirmed",
+                            "confirmations": 1,
+                            "err": null,
+                            "slot": 100,
+                            "status": {"Ok": null}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let sig = solana_sdk::signature::Signature::new_unique();
+
+        let result = check_transaction_status(
+            rpc_client,
+            &sig,
+            CommitmentConfig::confirmed(),
+            &ExtraErrorCheckPolicy::None,
+        )
+        .await;
+
+        assert!(matches!(result, Ok(ConfirmationResult::Confirmed)));
+    }
+
+    /// A confirmed status carrying Custom(12) must decode to Failed(InvalidSmtProof) so
+    /// the sender receives the exact escrow-program error rather than a generic failure.
+    #[tokio::test]
+    async fn check_transaction_status_returns_failed_on_program_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "confirmed",
+                            "confirmations": 1,
+                            "err": {"InstructionError": [0, {"Custom": 12}]},
+                            "slot": 100,
+                            "status": {"Err": {"InstructionError": [0, {"Custom": 12}]}}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let sig = solana_sdk::signature::Signature::new_unique();
+
+        let result = check_transaction_status(
+            rpc_client,
+            &sig,
+            CommitmentConfig::confirmed(),
+            &ExtraErrorCheckPolicy::None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Ok(ConfirmationResult::Failed(Some(
+                ContraEscrowProgramError::InvalidSmtProof
+            )))
+        ));
+    }
+
+    /// An RPC-level error (-32600) must surface as Err(TransactionError::Rpc) so the
+    /// caller can distinguish a network/RPC failure from an on-chain transaction failure.
+    #[tokio::test]
+    async fn check_transaction_status_returns_err_on_rpc_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Invalid request"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let sig = solana_sdk::signature::Signature::new_unique();
+
+        let result = check_transaction_status(
+            rpc_client,
+            &sig,
+            CommitmentConfig::confirmed(),
+            &ExtraErrorCheckPolicy::None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::error::TransactionError::Rpc(_))),
+            "expected TransactionError::Rpc, got: {:?}",
+            result
+        );
+    }
+
+    // ====================================================================
+    // sign_and_send_transaction tests (mockito-based RPC mocking)
+    // ====================================================================
+
+    fn make_instruction_with_empty_signers(
+    ) -> super::super::super::sender::types::InstructionWithSigners {
+        use solana_keychain::Signer;
+        super::super::super::sender::types::InstructionWithSigners {
+            instructions: vec![],
+            fee_payer: solana_sdk::pubkey::Pubkey::default(),
+            signers: Vec::<&'static Signer>::new(),
+            compute_unit_price: None,
+            compute_budget: None,
+        }
+    }
+
+    /// A successful getLatestBlockhash + sendTransaction round-trip must return the exact
+    /// signature string echoed by the RPC server, not just any Ok value.
+    #[tokio::test]
+    async fn sign_and_send_transaction_returns_signature_on_success() {
+        let mut server = mockito::Server::new_async().await;
+        let expected_sig = solana_sdk::signature::Signature::default().to_string();
+
+        let _m_hash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                            "lastValidBlockHeight": 100
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let _m_send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": expected_sig
+                })
+                .to_string(),
+            )
+            .create();
+
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let ix = make_instruction_with_empty_signers();
+
+        let result = sign_and_send_transaction(rpc_client, ix, RetryPolicy::None).await;
+
+        let sig = result.unwrap();
+        assert_eq!(sig.to_string(), expected_sig);
+    }
+
+    /// When getLatestBlockhash fails the function must return Err(TransactionError::Rpc)
+    /// immediately — sendTransaction must never be called with a stale or missing blockhash.
+    #[tokio::test]
+    async fn sign_and_send_transaction_returns_err_on_blockhash_failure() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Server error"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let ix = make_instruction_with_empty_signers();
+
+        let result = sign_and_send_transaction(rpc_client, ix, RetryPolicy::None).await;
+
+        assert!(
+            matches!(result, Err(crate::error::TransactionError::Rpc(_))),
+            "expected TransactionError::Rpc, got: {:?}",
+            result
+        );
+    }
 }

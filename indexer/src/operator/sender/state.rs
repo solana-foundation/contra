@@ -775,4 +775,111 @@ mod tests {
         // No ManualReview sent — missing deadline is handled gracefully.
         assert!(storage_rx.try_recv().is_err());
     }
+
+    // ── SenderState construction tests ───────────────────────────────
+
+    use crate::config::{PostgresConfig, ProgramType, StorageType};
+    use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
+    use std::sync::Arc;
+
+    fn make_sender_state_with_pda(pda: Option<Pubkey>) -> SenderState {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig {
+                commitment: CommitmentLevel::Confirmed,
+            },
+        ));
+        SenderState {
+            rpc_client: rpc_client.clone(),
+            storage: storage.clone(),
+            instance_pda: pda,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: MintCache::new(storage),
+            retry_max_attempts: 3,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+        }
+    }
+
+    fn make_config() -> ContraIndexerConfig {
+        ContraIndexerConfig {
+            program_type: ProgramType::Escrow,
+            storage_type: StorageType::Postgres,
+            rpc_url: "http://localhost:8899".to_string(),
+            source_rpc_url: None,
+            postgres: PostgresConfig {
+                database_url: "postgresql://localhost/test".to_string(),
+                max_connections: 5,
+            },
+            escrow_instance_id: None,
+        }
+    }
+
+    /// `initialize_smt_state` requires a PDA to look up the on-chain SMT root; without one
+    /// it must return an `AccountError::InstanceNotFound` wrapped as `OperatorError::Account`.
+    #[tokio::test]
+    async fn initialize_smt_state_fails_without_instance_pda() {
+        let mut state = make_sender_state_with_pda(None);
+
+        let result = state.initialize_smt_state().await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OperatorError::Account(crate::error::AccountError::InstanceNotFound { .. })
+            ),
+            "expected OperatorError::Account(InstanceNotFound), got: {err}"
+        );
+    }
+
+    /// `SenderState::new` with no instance PDA and Escrow program type must succeed and leave
+    /// SMT state uninitialised (it is lazily loaded on first use).
+    #[test]
+    fn sender_state_new_constructs_successfully() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let config = make_config();
+
+        let result = SenderState::new(&config, CommitmentLevel::Confirmed, None, storage, 3, None);
+
+        assert!(result.is_ok());
+        let state = result.unwrap();
+        assert!(state.instance_pda.is_none());
+        assert!(state.smt_state.is_none());
+        assert_eq!(state.retry_max_attempts, 3);
+        assert_eq!(state.program_type, ProgramType::Escrow);
+    }
+
+    /// Providing an instance PDA and a higher retry limit must be reflected in the constructed
+    /// state; the PDA is stored as-is for later SMT initialisation.
+    #[test]
+    fn sender_state_new_with_instance_pda() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let instance_pda = Pubkey::new_unique();
+        let config = make_config();
+
+        let result = SenderState::new(
+            &config,
+            CommitmentLevel::Finalized,
+            Some(instance_pda),
+            storage,
+            5,
+            None,
+        );
+
+        assert!(result.is_ok());
+        let state = result.unwrap();
+        assert_eq!(state.instance_pda, Some(instance_pda));
+        assert_eq!(state.retry_max_attempts, 5);
+    }
 }

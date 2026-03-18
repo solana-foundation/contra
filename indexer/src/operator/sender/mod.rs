@@ -119,3 +119,91 @@ pub async fn run_sender(
     info!("Sender stopped gracefully");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PostgresConfig, ProgramType, StorageType};
+    use crate::storage::common::storage::mock::MockStorage;
+    use crate::ContraIndexerConfig;
+    use solana_sdk::commitment_config::CommitmentLevel;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    fn minimal_config() -> ContraIndexerConfig {
+        ContraIndexerConfig {
+            program_type: ProgramType::Escrow,
+            storage_type: StorageType::Postgres,
+            rpc_url: "http://localhost:8899".to_string(),
+            source_rpc_url: None,
+            postgres: PostgresConfig {
+                database_url: "postgresql://localhost/test".to_string(),
+                max_connections: 5,
+            },
+            escrow_instance_id: None,
+        }
+    }
+
+    /// Cancellation with an already-closed processor channel must drain zero transactions
+    /// and return Ok(()), confirming the graceful-shutdown path terminates without hanging.
+    #[tokio::test]
+    async fn run_sender_exits_when_cancelled_with_empty_channel() {
+        let config = minimal_config();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let (processor_tx, processor_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        let cancellation_token = CancellationToken::new();
+
+        // Cancel before calling run_sender so the cancellation arm fires immediately
+        cancellation_token.cancel();
+        // Drop processor sender so the drain loop (while let Some) completes quickly
+        drop(processor_tx);
+
+        let result = run_sender(
+            &config,
+            CommitmentLevel::Confirmed,
+            processor_rx,
+            storage_tx,
+            cancellation_token,
+            storage,
+            3,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    /// When the processor drops its sender before any messages are sent, run_sender must
+    /// detect the closed channel in the normal recv arm and return Ok(()) without cancellation.
+    #[tokio::test]
+    async fn run_sender_exits_when_processor_channel_closed() {
+        let config = minimal_config();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+
+        // Create a channel and immediately close the sender side
+        let processor_rx = {
+            let (tx, rx) = mpsc::channel::<TransactionBuilder>(10);
+            drop(tx);
+            rx
+        };
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        let cancellation_token = CancellationToken::new();
+
+        let result = run_sender(
+            &config,
+            CommitmentLevel::Confirmed,
+            processor_rx,
+            storage_tx,
+            cancellation_token,
+            storage,
+            3,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+}

@@ -639,4 +639,218 @@ mod tests {
         assert_eq!(report.account_history_rows_deleted, 0);
         assert_eq!(report.first_available_block, None);
     }
+
+    #[test]
+    fn check_pg_dump_stale_file() {
+        // A fresh temp file with max_backup_age=0 will always be "too old"
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (ok, reason) = check_pg_dump_recency(Some(tmp.path()), Duration::from_secs(0));
+        assert!(!ok);
+        assert!(reason.contains("seconds old"));
+    }
+
+    // --- Integration tests requiring Postgres ---
+
+    use crate::test_helpers::start_test_postgres_raw;
+
+    async fn store_test_blocks(db: &PostgresAccountsDB, slots: &[u64]) {
+        let pool = db.pool.clone();
+        for &slot in slots {
+            let block = BlockInfo {
+                slot,
+                blockhash: solana_sdk::hash::Hash::new_unique(),
+                previous_blockhash: solana_sdk::hash::Hash::default(),
+                parent_slot: slot.saturating_sub(1),
+                block_height: Some(slot),
+                block_time: Some(1_700_000_000 + slot as i64),
+                transaction_signatures: vec![solana_sdk::signature::Signature::new_unique()],
+                transaction_recent_blockhashes: vec![solana_sdk::hash::Hash::new_unique()],
+            };
+            let data = bincode::serialize(&block).unwrap();
+            sqlx::query("INSERT INTO blocks (slot, data) VALUES ($1, $2) ON CONFLICT (slot) DO UPDATE SET data = $2")
+                .bind(slot as i64)
+                .bind(&data)
+                .execute(pool.as_ref())
+                .await
+                .unwrap();
+            // Also store each transaction signature
+            for sig in &block.transaction_signatures {
+                sqlx::query(
+                    "INSERT INTO transactions (signature, data) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+                )
+                .bind(sig.as_ref())
+                .bind(b"test" as &[u8])
+                .execute(pool.as_ref())
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_rejects_zero_keep_slots() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        let opts = TruncateOptions {
+            keep_slots: 0,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: None,
+            batch_size: 100,
+            dry_run: false,
+        };
+        let result = truncate_slots(&db, &opts).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("keep_slots"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_rejects_zero_batch_size() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        let opts = TruncateOptions {
+            keep_slots: 10,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: None,
+            batch_size: 0,
+            dry_run: false,
+        };
+        let result = truncate_slots(&db, &opts).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("batch_size"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_empty_db_returns_early() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        let opts = TruncateOptions {
+            keep_slots: 10,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: None,
+            batch_size: 100,
+            dry_run: false,
+        };
+        let report = truncate_slots(&db, &opts).await.unwrap();
+        assert_eq!(report.latest_slot, None);
+        assert_eq!(report.blocks_deleted, 0);
+        assert!(!report.backup_check.has_valid_backup());
+        assert!(report.backup_check.wal_archive_reason.contains("Skipped"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_nothing_to_delete_when_within_keep_window() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        // Store 5 blocks, keep_slots=10 → nothing to delete
+        store_test_blocks(&db, &[0, 1, 2, 3, 4]).await;
+        let opts = TruncateOptions {
+            keep_slots: 10,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: None,
+            batch_size: 100,
+            dry_run: false,
+        };
+        let report = truncate_slots(&db, &opts).await.unwrap();
+        assert_eq!(report.latest_slot, Some(4));
+        assert_eq!(report.blocks_deleted, 0);
+        assert!(report.backup_check.wal_archive_reason.contains("Skipped"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_fails_without_valid_backup() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        // Store 20 blocks, keep_slots=5 → 16 blocks eligible for deletion
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        let opts = TruncateOptions {
+            keep_slots: 5,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: None, // no pg_dump
+            batch_size: 100,
+            dry_run: false,
+        };
+        let result = truncate_slots(&db, &opts).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Backup verification failed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_dry_run_does_not_delete() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = TruncateOptions {
+            keep_slots: 5,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: Some(tmp.path().to_path_buf()),
+            batch_size: 100,
+            dry_run: true,
+        };
+        let report = truncate_slots(&db, &opts).await.unwrap();
+        assert_eq!(report.latest_slot, Some(19));
+        assert!(
+            report.blocks_deleted > 0,
+            "dry run should report blocks that would be deleted"
+        );
+        // Verify blocks are still there
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blocks")
+            .fetch_one(db.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(count, 20, "dry run should not actually delete blocks");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_deletes_old_blocks_and_transactions() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = TruncateOptions {
+            keep_slots: 5,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: Some(tmp.path().to_path_buf()),
+            batch_size: 100,
+            dry_run: false,
+        };
+        let report = truncate_slots(&db, &opts).await.unwrap();
+        assert_eq!(report.latest_slot, Some(19));
+        // truncate_before_slot = 19 - (5-1) = 15, so slots 0..15 deleted = 15 blocks
+        assert_eq!(report.truncate_before_slot, Some(15));
+        assert_eq!(report.blocks_deleted, 15);
+        assert_eq!(report.transactions_deleted, 15); // 1 tx per block
+
+        // Verify remaining blocks
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blocks")
+            .fetch_one(db.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 5);
+
+        // first_available_block should be updated
+        assert!(report.first_available_block.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_batched_deletion() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = TruncateOptions {
+            keep_slots: 5,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: Some(tmp.path().to_path_buf()),
+            batch_size: 3, // small batch to exercise the batching loop
+            dry_run: false,
+        };
+        let report = truncate_slots(&db, &opts).await.unwrap();
+        assert_eq!(report.blocks_deleted, 15);
+        assert_eq!(report.transactions_deleted, 15);
+
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blocks")
+            .fetch_one(db.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 5);
+    }
 }

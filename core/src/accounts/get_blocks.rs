@@ -97,5 +97,6 @@ async fn get_blocks_redis(
         .await
         .map_err(|e| anyhow!("Failed to query block slot index in Redis: {}", e))?;
 
+    slots.sort_unstable();
     Ok(slots)
 }

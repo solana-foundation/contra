@@ -287,6 +287,9 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
+
       - name: Run contra integration tests with coverage
         run: make -C integration integration-coverage-contra
 

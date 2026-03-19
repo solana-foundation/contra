@@ -19,6 +19,8 @@ use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
+use spl_token_2022::extension::StateWithExtensions;
+use spl_token_2022::state::Account as Token2022Account;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -312,16 +314,23 @@ async fn fetch_on_chain_balances(
                 OperatorError::RpcError("Failed to decode token account data".to_string())
             })?;
 
-            // Unpack the token account structure
-            let token_account = TokenAccount::unpack(&account_data).map_err(|e| {
-                OperatorError::RpcError(format!(
-                    "Failed to parse token account for program {}: {}",
-                    token_program_id, e
-                ))
-            })?;
+            let (mint, amount) = if token_program_id == spl_token_2022::id() {
+                let account = StateWithExtensions::<Token2022Account>::unpack(&account_data)
+                    .map_err(|e| {
+                        OperatorError::RpcError(format!(
+                            "Failed to parse token-2022 account: {}",
+                            e
+                        ))
+                    })?;
+                (account.base.mint, account.base.amount)
+            } else {
+                let account = TokenAccount::unpack(&account_data).map_err(|e| {
+                    OperatorError::RpcError(format!("Failed to parse token account: {}", e))
+                })?;
+                (account.mint, account.amount)
+            };
 
-            // Sum balances for each mint (handles multiple token accounts for the same mint)
-            *balances.entry(token_account.mint).or_insert(0) += token_account.amount;
+            *balances.entry(mint).or_insert(0) += amount;
         }
     }
 
@@ -1174,6 +1183,86 @@ mod tests {
             "DB-only balance should always be detected (u64::MAX delta)"
         );
         assert_eq!(mismatches[0].delta_bps, u64::MAX);
+    }
+
+    #[test]
+    fn test_spl_token_account_unpack() {
+        use spl_token::state::AccountState;
+
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let token_account = TokenAccount {
+            mint,
+            owner,
+            amount: 1_000_000,
+            delegate: solana_sdk::program_option::COption::None,
+            state: AccountState::Initialized,
+            is_native: solana_sdk::program_option::COption::None,
+            delegated_amount: 0,
+            close_authority: solana_sdk::program_option::COption::None,
+        };
+
+        let mut data = vec![0u8; TokenAccount::LEN];
+        Pack::pack(token_account, &mut data).unwrap();
+
+        let unpacked = TokenAccount::unpack(&data).unwrap();
+        assert_eq!(unpacked.mint, mint);
+        assert_eq!(unpacked.amount, 1_000_000);
+    }
+
+    #[test]
+    fn test_spl_token_unpack_rejects_token2022_data() {
+        use spl_token_2022::extension::AccountType;
+        use spl_token_2022::state::AccountState as AccountState2022;
+
+        let token_account = Token2022Account {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            amount: 500_000,
+            delegate: solana_sdk::program_option::COption::None,
+            state: AccountState2022::Initialized,
+            is_native: solana_sdk::program_option::COption::None,
+            delegated_amount: 0,
+            close_authority: solana_sdk::program_option::COption::None,
+        };
+
+        let mut data = vec![0u8; Token2022Account::LEN];
+        Pack::pack(token_account, &mut data).unwrap();
+        data.push(AccountType::Account as u8);
+
+        let result = TokenAccount::unpack(&data);
+        assert!(
+            result.is_err(),
+            "Pack::unpack must reject 166-byte Token-2022 data (expects exactly 165)"
+        );
+    }
+
+    #[test]
+    fn test_state_with_extensions_unpacks_token2022_data() {
+        use spl_token_2022::extension::AccountType;
+        use spl_token_2022::state::AccountState as AccountState2022;
+
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let token_account = Token2022Account {
+            mint,
+            owner,
+            amount: 750_000,
+            delegate: solana_sdk::program_option::COption::None,
+            state: AccountState2022::Initialized,
+            is_native: solana_sdk::program_option::COption::None,
+            delegated_amount: 0,
+            close_authority: solana_sdk::program_option::COption::None,
+        };
+
+        let mut data = vec![0u8; Token2022Account::LEN];
+        Pack::pack(token_account, &mut data).unwrap();
+        data.push(AccountType::Account as u8);
+
+        let unpacked = StateWithExtensions::<Token2022Account>::unpack(&data).unwrap();
+        assert_eq!(unpacked.base.mint, mint);
+        assert_eq!(unpacked.base.owner, owner);
+        assert_eq!(unpacked.base.amount, 750_000);
     }
 
     #[test]

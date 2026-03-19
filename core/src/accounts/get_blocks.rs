@@ -85,17 +85,38 @@ async fn get_blocks_redis(
         ));
     }
 
-    // Query blocks within the range
-    // In Redis, blocks are stored with keys like "block:{slot}"
-    // We need to check which slots have blocks
+    // Use SCAN with a pattern to avoid O(range) round trips.
+    // Checking each slot individually via EXISTS would require up to MAX_BLOCKS_RANGE
+    // (500,000) sequential round trips — far too slow and connection-breaking.
+    let mut cursor = 0u64;
     let mut slots = Vec::new();
-    for slot in start_slot..=end_slot {
-        let key = format!("block:{}", slot);
-        let exists: redis::RedisResult<bool> = conn.exists(&key).await;
-        if exists.unwrap_or(false) {
-            slots.push(slot);
+    loop {
+        let (new_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("block:*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| anyhow!("Failed to scan blocks in Redis: {}", e))?;
+
+        for key in keys {
+            if let Some(slot_str) = key.strip_prefix("block:") {
+                if let Ok(slot) = slot_str.parse::<u64>() {
+                    if slot >= start_slot && slot <= end_slot {
+                        slots.push(slot);
+                    }
+                }
+            }
+        }
+
+        cursor = new_cursor;
+        if cursor == 0 {
+            break;
         }
     }
 
+    slots.sort_unstable();
     Ok(slots)
 }

@@ -588,6 +588,17 @@ async fn execute_tree_rotation_boundary_phase(
     pool: &sqlx::PgPool,
     env: &TestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Phase 10 drives MAX_TREE_LEAVES withdrawals through the operator to trigger tree rotation.
+    // With the production value (65,536) this would require tens of thousands of on-chain
+    // transactions and would never finish on a test validator. Always compile with
+    // --features test-tree (MAX_TREE_LEAVES = 8) when running this test.
+    #[cfg(not(feature = "test-tree"))]
+    panic!(
+        "test_master_chaos_stress_test requires --features test-tree. \
+         Without it MAX_TREE_LEAVES={} and Phase 10 would need ~65k on-chain transactions.",
+        MAX_TREE_LEAVES
+    );
+
     println!("\n## Tree Rotation Boundary Phase");
     println!(
         "Testing tree rotation at boundary (MAX_TREE_LEAVES = {})...",

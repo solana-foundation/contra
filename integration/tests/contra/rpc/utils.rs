@@ -38,9 +38,20 @@ pub async fn start_contra(config: NodeConfig) -> Result<(NodeHandles, String)> {
     let node_handles = run_node(config)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start node: {}", e))?;
-    sleep(Duration::from_secs(1)).await;
 
     let url = format!("http://127.0.0.1:{}", port);
+    // Poll until the node has produced its first block (blockhash in DB).
+    // get_latest_blockhash requires at least one committed block, so success
+    // here means the full pipeline (RPC + settler + DB) is ready for testing.
+    // With blocktime_ms = 100 ms this typically takes 200–400 ms.
+    let client = RpcClient::new(url.clone());
+    for _ in 0..50 {
+        if client.get_latest_blockhash().await.is_ok() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
     println!("\n=== Node Started ===");
     println!("Node endpoint: {}", url);
 

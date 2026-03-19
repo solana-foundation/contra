@@ -1,3 +1,15 @@
+//! Integration test for indexer gap detection and restart recovery.
+//!
+//! Verifies that when the L1 indexer is stopped while on-chain deposits occur,
+//! it correctly re-indexes the missed ("gap") slots when it is restarted, and
+//! that the checkpoint advances past every recovered deposit's slot.
+//!
+//! Phases:
+//! 1. Start validator + Postgres.
+//! 2. Execute 2 deposits → start indexer → verify backfill.
+//! 3. Abort indexer → execute 2 more deposits (the "gap").
+//! 4. Restart indexer → verify all 4 deposits are in DB + checkpoint advanced.
+
 #[path = "helpers/mod.rs"]
 mod helpers;
 
@@ -78,6 +90,13 @@ async fn execute_deposit(
     })
 }
 
+/// Full lifecycle: deposit → index → stop → deposit-while-down → restart → verify recovery.
+///
+/// Deposits 1 and 2 are indexed on the first run.  Deposits 3 and 4 land while
+/// the indexer is offline.  After restart the indexer must backfill the gap and
+/// the DB must contain all 4 deposits with correct slot and amount values.
+/// The checkpoint stored in `indexer_state` must also advance past the highest
+/// gap-deposit slot, proving the backfill reached and committed those slots.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Gap Detection: Restart Recovery Test ===\n");
@@ -269,10 +288,22 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
         println!("  Verified: {} (slot {})", tx.signature, tx.slot);
     }
 
+    let gap_deposit_max_slot = all_signatures.iter().map(|t| t.slot).max().unwrap();
+
+    // Wait for the checkpoint to advance past the gap deposits' max slot.
+    // The deposits are in the DB, but the checkpoint update is asynchronous
+    // so we must poll rather than read immediately.
+    let checkpoint_ready =
+        db::wait_for_checkpoint(&pool, "escrow", gap_deposit_max_slot, WAIT_TIMEOUT_SECS).await?;
+    assert!(
+        checkpoint_ready,
+        "Checkpoint did not advance past gap deposits' max slot ({}) within timeout",
+        gap_deposit_max_slot
+    );
+
     let checkpoint_after_gap = db::get_checkpoint_slot(&pool, "escrow")
         .await?
         .expect("Checkpoint should exist after gap recovery");
-    let gap_deposit_max_slot = all_signatures.iter().map(|t| t.slot).max().unwrap();
     assert!(
         checkpoint_after_gap >= gap_deposit_max_slot,
         "Checkpoint ({}) should have advanced past the gap deposits' max slot ({})",

@@ -219,6 +219,9 @@ pub(crate) async fn write_batch_redis(
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
         pipe.set(key, serialized);
+        // Set first_available_block only on the first block (NX = do not overwrite).
+        // Mirrors the Postgres fallback of SELECT MIN(slot) FROM blocks.
+        pipe.set_nx("first_available_block", block.slot);
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

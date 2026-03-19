@@ -1,3 +1,16 @@
+//! Integration tests for the slot-truncation utility (`truncate_slots`).
+//!
+//! Each test spins up an isolated Postgres container, seeds five blocks
+//! (slots 1–5) with matching transactions and account_history rows, then
+//! invokes `truncate_slots` with `keep_slots = 3`.  The expected outcome is
+//! that slots 1 and 2 are pruned while slots 3–5 are retained.
+//!
+//! Scenarios covered:
+//! 1. Apply mode  – rows are deleted, `first_available_block` metadata is
+//!    written, and `AccountsDB::get_first_available_block()` returns 3.
+//! 2. Dry-run mode – row counts and reported deletions match apply-mode values
+//!    but no rows are actually removed and metadata is not mutated.
+
 use {
     anyhow::{anyhow, Context, Result},
     contra_core::accounts::{
@@ -144,6 +157,10 @@ async fn count_rows(pool: &PgPool, table: &str) -> Result<i64> {
     Ok(count)
 }
 
+/// Verifies that `truncate_slots` with `dry_run = false` physically deletes
+/// blocks/transactions/account_history rows below the keep-slots threshold,
+/// updates the `first_available_block` metadata row, and that
+/// `AccountsDB::get_first_available_block()` reflects the new minimum slot.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_truncate_apply_mode_e2e() -> Result<()> {
     let (db, _container) = start_postgres("truncate_apply").await?;
@@ -213,6 +230,9 @@ async fn test_truncate_apply_mode_e2e() -> Result<()> {
     Ok(())
 }
 
+/// Verifies that `truncate_slots` with `dry_run = true` reports the correct
+/// deletion counts (matching what apply-mode would remove) but leaves all rows
+/// intact and does not write the `first_available_block` metadata entry.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_truncate_dry_run_e2e() -> Result<()> {
     let (db, _container) = start_postgres("truncate_dry_run").await?;

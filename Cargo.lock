@@ -2021,6 +2021,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "solana-account-decoder-client-types 2.3.10",
  "solana-address 1.0.0",
  "solana-client 2.3.10",
  "solana-keychain",
@@ -2056,6 +2057,7 @@ dependencies = [
  "anyhow",
  "base64 0.21.7",
  "bincode",
+ "bs58",
  "chrono",
  "contra-core",
  "contra-escrow-program-client",
@@ -2064,6 +2066,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
+ "mockito",
  "serde_json",
  "solana-account-decoder-client-types 2.3.10",
  "solana-client 2.3.10",
@@ -2082,8 +2085,10 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tokio-util 0.7.16",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -15373,6 +15378,7 @@ dependencies = [
  "serde_json",
  "solana-address 1.0.0",
  "solana-client 3.0.6",
+ "solana-net-utils 3.0.6",
  "solana-rpc",
  "solana-sdk",
  "solana-sdk-ids 3.0.0",

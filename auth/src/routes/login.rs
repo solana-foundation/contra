@@ -2,15 +2,17 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{extract::State, Json};
 
 use crate::{
-    db, 
-    error::{AppError, AppResult}, models::{LoginRequest, LoginResponse}, 
-    AppState
+    db,
+    error::{AppError, AppResult},
+    models::{LoginRequest, LoginResponse},
+    AppState,
 };
 
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<LoginResponse>> {
+    // Return 401 for both "user not found" and "wrong password" to avoid username enumeration.
     let user = db::find_user_by_username(&state.pool, &req.username)
         .await?
         .ok_or(AppError::Unauthorized)?;

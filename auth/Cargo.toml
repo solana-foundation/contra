@@ -3,6 +3,10 @@ name = "auth"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "contra_auth"
+path = "src/lib.rs"
+
 [[bin]]
 name = "auth"
 path = "src/main.rs"
@@ -26,3 +30,9 @@ argon2 = { workspace = true }
 rand = { workspace = true }
 solana-sdk = { workspace = true }
 bs58 = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }                                     
+testcontainers = { workspace = true }                                                   
+testcontainers-modules = { workspace = true }                                           
+tokio = { workspace = true, features = ["full"] }

@@ -25,6 +25,7 @@ impl JwtConfig {
         }
     }
 
+    /// Sign a JWT for the given user. Tokens expire after 24 hours.
     pub fn sign(&self, user_id: Uuid, role: Role) -> Result<String, jsonwebtoken::errors::Error> {
         let exp = Utc::now()
             .checked_add_signed(Duration::hours(24))
@@ -36,6 +37,7 @@ impl JwtConfig {
         encode(&Header::default(), &claims, &self.encoding_key)
     }
 
+    /// Verify a JWT and return its claims. Returns an error if the token is invalid or expired.
     pub fn verify(&self, token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
         let data = decode::<Claims>(token, &self.decoding_key, &Validation::default())?;
         Ok(data.claims)

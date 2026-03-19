@@ -1,13 +1,13 @@
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2
+    Argon2,
 };
 use axum::{extract::State, Json};
 
 use crate::{
     db, error::{AppError, AppResult},
     models::{RegisterRequest, User},
-    AppState
+    AppState,
 };
 
 pub async fn register(
@@ -21,6 +21,7 @@ pub async fn register(
         return Err(AppError::Conflict("username already taken".into()));
     }
 
+    // Hash the password with Argon2 before storing.
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(req.password.as_bytes(), &salt)
@@ -28,6 +29,8 @@ pub async fn register(
         .to_string();
 
     let user = db::insert_user(&state.pool, &req.username, &hash).await?;
+
+    tracing::info!(username = %user.username, "new user registered");
 
     Ok(Json(user))
 }

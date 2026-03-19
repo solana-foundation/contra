@@ -3,11 +3,11 @@ use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::str::FromStr;
 
 use crate::{
-    db, 
-    error::{AppError, AppResult}, 
-    models::{VerifyWalletRequest, WalletResponse}, 
-    AppState, 
-    jwt::Claims
+    db,
+    error::{AppError, AppResult},
+    models::{VerifyWalletRequest, WalletResponse},
+    AppState,
+    jwt::Claims,
 };
 
 pub async fn verify_wallet(
@@ -15,10 +15,13 @@ pub async fn verify_wallet(
     claims: Claims,
     Json(req): Json<VerifyWalletRequest>,
 ) -> AppResult<Json<WalletResponse>> {
+    // Consume the challenge atomically — marks it used so it cannot be replayed.
     let challenge = db::consume_challenge(&state.pool, claims.sub, req.nonce)
         .await?
         .ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
 
+    // Reconstruct the exact message the client was asked to sign.
+    // Must match the format returned by /auth/challenge-wallet.
     let message = format!(
         "Contra wallet verification\nuser: {}\nnonce: {}\nexpires: {}",
         claims.sub,
@@ -33,10 +36,23 @@ pub async fn verify_wallet(
         .map_err(|_| AppError::BadRequest("invalid signature".into()))?;
 
     if !signature.verify(pubkey.as_ref(), message.as_bytes()) {
+        tracing::warn!(user_id = %claims.sub, pubkey = %req.pubkey, "wallet verification failed: invalid signature");
         return Err(AppError::Unauthorized);
     }
 
-    let wallet = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey).await?;
+    let wallet = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey)
+        .await
+        .map_err(|e| match e {
+            // Unique constraint on (user_id, pubkey) — wallet already verified.
+            AppError::Db(sqlx::Error::Database(ref db_err))
+                if db_err.constraint() == Some("verified_wallets_user_id_pubkey_key") =>
+            {
+                AppError::Conflict("wallet already verified".into())
+            }
+            other => other,
+        })?;
+
+    tracing::info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
 
     Ok(Json(WalletResponse {
         pubkey: wallet.pubkey,

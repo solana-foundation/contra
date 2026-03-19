@@ -58,3 +58,32 @@ pub trait AccountSerialize: Discriminator {
         data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // All 10 defined instruction discriminators must parse successfully.
+    // If a variant is added or removed, this test will catch the gap.
+    #[test]
+    fn test_instruction_discriminator_all_valid_values() {
+        for byte in [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 228] {
+            assert!(
+                ContraEscrowInstructionDiscriminators::try_from(byte).is_ok(),
+                "byte {byte} should be a valid discriminator"
+            );
+        }
+    }
+
+    // Bytes that don't map to any instruction must return Err.
+    // The entrypoint relies on this to reject malformed instructions before dispatch.
+    #[test]
+    fn test_instruction_discriminator_invalid_values() {
+        for byte in [9u8, 10, 100, 227, 229, 255] {
+            assert!(
+                ContraEscrowInstructionDiscriminators::try_from(byte).is_err(),
+                "byte {byte} should not map to a valid discriminator"
+            );
+        }
+    }
+}

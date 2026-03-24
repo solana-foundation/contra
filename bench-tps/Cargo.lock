@@ -1054,6 +1054,7 @@ dependencies = [
  "solana-sdk",
  "spl-associated-token-account",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

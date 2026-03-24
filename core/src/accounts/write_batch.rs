@@ -224,7 +224,8 @@ pub(crate) async fn write_batch_redis(
         // are safe. ZRANGE 0 0 on this key always returns the smallest score,
         // giving correct MIN semantics even when backfill writes older slots after
         // live indexing has already started.
-        pipe.zadd("first_available_block_zset", block.slot as f64, block.slot);
+        // redis-rs 0.27: zadd(key, member, score) — member first, score second.
+        pipe.zadd("first_available_block_zset", block.slot, block.slot as f64);
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

@@ -10,6 +10,7 @@ use solana_system_interface::instruction as system_instruction;
 
 const COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const COMPUTE_UNIT_PRICE: u64 = 1;
+#[allow(dead_code)]
 const AIRDROP_AMOUNT: u64 = 10_000_000_000;
 
 pub async fn send_and_confirm_instructions(
@@ -38,6 +39,7 @@ pub async fn send_and_confirm_instructions(
     Ok(signature)
 }
 
+#[allow(dead_code)]
 pub async fn setup_wallets(
     client: &RpcClient,
     faucet_keypair: &Keypair,

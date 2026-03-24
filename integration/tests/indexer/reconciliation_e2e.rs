@@ -120,8 +120,7 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
 
     // Create mint
     let mint_keypair = Keypair::new();
-    let mint_pubkey =
-        generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
+    let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
     // Derive escrow instance PDA
     let seed_keypair = Keypair::new();
@@ -130,17 +129,23 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
     const AMOUNT: u64 = 500_000;
 
     // Mint real tokens to the escrow instance ATA
-    mint_to_owner(client.as_ref(), &authority, mint_pubkey, pda, &authority, AMOUNT).await?;
+    mint_to_owner(
+        client.as_ref(),
+        &authority,
+        mint_pubkey,
+        pda,
+        &authority,
+        AMOUNT,
+    )
+    .await?;
 
     // Seed DB with matching record
     seed_mint_and_deposit(&pool, &mint_pubkey.to_string(), AMOUNT as i64).await?;
 
     // Wait for finalized ATA balance
     {
-        let fin_client = RpcClient::new_with_commitment(
-            test_validator.rpc_url(),
-            CommitmentConfig::finalized(),
-        );
+        let fin_client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::finalized());
         let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
             &pda,
             &mint_pubkey,

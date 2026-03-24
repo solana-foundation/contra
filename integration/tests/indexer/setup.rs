@@ -257,6 +257,7 @@ impl TestEnvironment {
     }
 
     /// Setup for multi-user chaos testing
+    #[allow(dead_code)]
     pub async fn setup_multi_user(
         client: &RpcClient,
         faucet_keypair: &Keypair,

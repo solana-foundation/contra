@@ -72,7 +72,13 @@ fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService 
         max_gap_slots: u64::MAX,
         start_slot: None,
     };
-    ResyncService::new(storage, rpc_poller, ProgramType::Escrow, backfill_config, None)
+    ResyncService::new(
+        storage,
+        rpc_poller,
+        ProgramType::Escrow,
+        backfill_config,
+        None,
+    )
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -87,8 +93,7 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
     let (test_validator, _faucet) = start_test_validator_no_geyser().await;
     let rpc_url = test_validator.rpc_url();
 
-    let (db_url, storage, _container) =
-        start_postgres_for_resync("resync_clear_test").await?;
+    let (db_url, storage, _container) = start_postgres_for_resync("resync_clear_test").await?;
 
     // Insert a dummy row so we can verify that resync wipes it.
     {
@@ -104,10 +109,9 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         .execute(&pool)
         .await?;
 
-        let count_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM transactions")
-                .fetch_one(&pool)
-                .await?;
+        let count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&pool)
+            .await?;
         assert_eq!(count_before.0, 1, "Should have 1 row before resync");
         println!("  Rows before resync: {}", count_before.0);
     }
@@ -134,10 +138,9 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
     // Open a fresh pool to avoid any stale prepared-statement cache from before
     // the table drop / recreation.
     let pool_after = sqlx::PgPool::connect(&db_url).await?;
-    let count_after: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
-            .fetch_one(&pool_after)
-            .await?;
+    let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions")
+        .fetch_one(&pool_after)
+        .await?;
     assert_eq!(
         count_after, 0,
         "Transactions table must be empty after resync"

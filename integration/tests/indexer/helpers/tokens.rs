@@ -16,6 +16,7 @@ use spl_token::{
 
 use super::transactions::send_and_confirm_instructions;
 
+#[allow(dead_code)]
 pub async fn generate_mint(
     client: &RpcClient,
     payer: &Keypair,

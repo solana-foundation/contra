@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN git clone https://github.com/rpcpool/yellowstone-grpc.git && \
     cd yellowstone-grpc && \
+    git checkout v9.1.0+solana.2.3.11 && \
     cargo build --release -p yellowstone-grpc-geyser
 
 # Runtime stage

@@ -16,7 +16,7 @@ members = [
     "scripts/devnet",
 ]
 
-exclude = []
+exclude = ["bench-tps"]
 
 resolver = "2"
 

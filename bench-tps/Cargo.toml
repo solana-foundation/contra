@@ -1,0 +1,21 @@
+[package]
+name = "contra-bench-tps"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "contra-bench-tps"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+contra-core = { path = "../core" }
+futures = "0.3"
+rayon = "1.10"
+solana-client = "2.3.0"
+solana-sdk = "2.3.0"
+spl-associated-token-account = "7.0.0"
+tokio = { version = "=1.47.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

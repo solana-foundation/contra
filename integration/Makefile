@@ -26,6 +26,10 @@ integration-test:
 	@cargo test --test truncate_integration -- --nocapture
 	@echo "Running operator lifecycle integration tests (requires test-tree build)..."
 	@cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@echo "Running resync integration tests..."
+	@cargo test --test resync_integration -- --nocapture
+	@echo "Running reconciliation e2e tests..."
+	@cargo test --test reconciliation_e2e_test -- --nocapture
 
 # Format and lint code
 fmt:
@@ -60,6 +64,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test truncate_integration -- --nocapture
 	@echo "Running operator lifecycle integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@echo "Running resync integration tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture
 	@echo "Running reconciliation e2e tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_e2e_test -- --nocapture
 
@@ -68,7 +74,7 @@ integration-coverage-report:
 	@mkdir -p $(COVERAGE_DIR)
 	@cargo llvm-cov report --lcov \
 		-p contra-core -p contra-indexer -p contra-integration \
-		--ignore-filename-regex '(^tests/|/test_utils/|\.cargo/registry)' \
+		--ignore-filename-regex '(^tests/|/test_utils/|\.cargo/registry|src/bin/|shutdown_utils\.rs|metrics\.rs|test_helpers\.rs|scheduler/greedy\.rs|core/src/client\.rs|accounts/error\.rs|operator/constants\.rs)' \
 		--output-path $(COVERAGE_DIR)/coverage-integration-e2e.lcov
 	@echo "Coverage report: $(COVERAGE_DIR)/coverage-integration-e2e.lcov"
 

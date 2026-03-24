@@ -31,6 +31,14 @@ path = "tests/contra/truncate.rs"
 name = "operator_lifecycle_integration"
 path = "tests/indexer/operator_lifecycle.rs"
 
+[[test]]
+name = "resync_integration"
+path = "tests/indexer/resync.rs"
+
+[[test]]
+name = "reconciliation_e2e_test"
+path = "tests/indexer/reconciliation_e2e.rs"
+
 [features]
 test-tree = ["contra-indexer/test-tree"]
 

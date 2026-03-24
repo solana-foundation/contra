@@ -283,7 +283,9 @@ jobs:
           docker image inspect redis:5.0 >/dev/null 2>&1 || docker pull redis:5.0
 
       - name: Install cargo-nextest
-        run: cargo install cargo-nextest --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
 
       - name: Run contra integration tests with coverage
         run: make -C integration integration-coverage-contra

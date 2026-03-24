@@ -82,7 +82,11 @@ pub async fn start_contra_indexer(
         rpc_polling: Some(rpc_polling_config),
         yellowstone: yellowstone_config,
         backfill: backfill_config,
-        reconciliation: contra_indexer::ReconciliationConfig::default(),
+        // Disable the mismatch guard: gap-recovery restarts (indexer stopped
+        // while deposits arrived) must not be blocked by startup reconciliation.
+        reconciliation: contra_indexer::ReconciliationConfig {
+            mismatch_threshold_raw: u64::MAX,
+        },
     };
 
     indexer_config.validate()?;
@@ -91,6 +95,79 @@ pub async fn start_contra_indexer(
     let indexer_handle = tokio::spawn(async move {
         if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
             eprintln!("Indexer error: {}", e);
+        }
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    Ok((
+        IndexerHandle {
+            _handles: vec![indexer_handle],
+        },
+        (*storage).clone(),
+    ))
+}
+
+/// Start the L1 indexer using RPC polling (no Yellowstone geyser required).
+/// Suitable for environments where the test validator has no geyser plugin.
+pub async fn start_l1_indexer_rpc_polling(
+    rpc_url: String,
+    database_url: String,
+    escrow_instance_id: Option<Pubkey>,
+) -> Result<(IndexerHandle, Storage), Box<dyn std::error::Error>> {
+    let postgres_config = PostgresConfig {
+        database_url,
+        max_connections: 50,
+    };
+
+    let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
+    storage.init_schema().await?;
+
+    let rpc_polling_config = RpcPollingConfig {
+        poll_interval_ms: 200,
+        error_retry_interval_ms: 1000,
+        batch_size: 10,
+        from_slot: Some(1),
+        encoding: UiTransactionEncoding::Json,
+        commitment: CommitmentLevel::Finalized,
+    };
+
+    let backfill_config = BackfillConfig {
+        enabled: true,
+        batch_size: 100,
+        max_gap_slots: u64::MAX,
+        exit_after_backfill: false,
+        rpc_url: rpc_url.clone(),
+        start_slot: None,
+    };
+
+    let common_config = ContraIndexerConfig {
+        program_type: ProgramType::Escrow,
+        storage_type: StorageType::Postgres,
+        postgres: postgres_config,
+        rpc_url,
+        source_rpc_url: None,
+        escrow_instance_id,
+    };
+
+    let indexer_config = IndexerConfig {
+        datasource_type: DatasourceType::RpcPolling,
+        rpc_polling: Some(rpc_polling_config),
+        yellowstone: None,
+        backfill: backfill_config,
+        // Disable the mismatch guard: gap-recovery restarts (indexer stopped
+        // while deposits arrived) must not be blocked by startup reconciliation.
+        reconciliation: contra_indexer::ReconciliationConfig {
+            mismatch_threshold_raw: u64::MAX,
+        },
+    };
+
+    common_config.validate()?;
+    indexer_config.validate()?;
+
+    let indexer_handle = tokio::spawn(async move {
+        if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
+            eprintln!("L1 RPC-polling Indexer error: {}", e);
         }
     });
 
@@ -157,7 +234,11 @@ pub async fn start_l1_indexer(
         rpc_polling: Some(rpc_polling_config),
         yellowstone: Some(yellowstone_config),
         backfill: backfill_config,
-        reconciliation: contra_indexer::ReconciliationConfig::default(),
+        // Disable the mismatch guard: gap-recovery restarts (indexer stopped
+        // while deposits arrived) must not be blocked by startup reconciliation.
+        reconciliation: contra_indexer::ReconciliationConfig {
+            mismatch_threshold_raw: u64::MAX,
+        },
     };
 
     common_config.validate()?;

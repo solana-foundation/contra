@@ -43,10 +43,18 @@ fn decode_first_available_block(value: &[u8]) -> Option<u64> {
 
 async fn get_first_available_block_redis(db: &RedisAccountsDB) -> Result<u64> {
     let mut conn = db.connection.clone();
-    let result: redis::RedisResult<Option<u64>> = conn.get("first_available_block").await;
+    // ZRANGE 0 0 returns the single member with the lowest score (earliest slot).
+    // Pairs with write_batch_redis which uses ZADD to maintain proper MIN semantics.
+    let result: redis::RedisResult<Vec<u64>> =
+        conn.zrange("first_available_block_zset", 0isize, 0isize).await;
     result
         .map_err(|e| anyhow!("Failed to get first available block from Redis: {}", e))
-        .and_then(|opt| opt.ok_or_else(|| anyhow!("No first available block found in Redis")))
+        .and_then(|slots| {
+            slots
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("No first available block found in Redis"))
+        })
 }
 
 #[cfg(test)]

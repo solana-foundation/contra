@@ -219,9 +219,12 @@ pub(crate) async fn write_batch_redis(
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
         pipe.set(key, serialized);
-        // Set first_available_block only on the first block (NX = do not overwrite).
-        // Mirrors the Postgres fallback of SELECT MIN(slot) FROM blocks.
-        pipe.set_nx("first_available_block", block.slot);
+        // Track the minimum indexed slot using a sorted set (score = slot value).
+        // ZADD is idempotent for the same (score, member) pair, so repeated writes
+        // are safe. ZRANGE 0 0 on this key always returns the smallest score,
+        // giving correct MIN semantics even when backfill writes older slots after
+        // live indexing has already started.
+        pipe.zadd("first_available_block_zset", block.slot as f64, block.slot);
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

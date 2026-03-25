@@ -54,7 +54,7 @@ async fn start_app(db_url: &str) -> SocketAddr {
         jwt: Arc::new(JwtConfig::new("test-secret")),
     };
 
-    let app = build_app(state);
+    let app = build_app(state, "*");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -92,6 +92,73 @@ async fn test_register() {
         body["password_hash"].is_null(),
         "password_hash must not be exposed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_password_too_short() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    // Empty password and passwords shorter than 6 characters must both be rejected.
+    for password in ["", "abc", "12345"] {
+        let res = client
+            .post(format!("{}/auth/register", base_url(addr)))
+            .json(&json!({ "username": "alice", "password": password }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            400,
+            "expected 400 for password {:?}",
+            password
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_password_too_long() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    // 73 characters — one byte over Argon2's silent truncation boundary.
+    let password = "a".repeat(73);
+
+    let res = client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": password }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_password_at_boundaries() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    // Exactly 6 characters (min) and exactly 72 characters (max) must both succeed.
+    for (username, password) in [("min_user", "a".repeat(6)), ("max_user", "a".repeat(72))] {
+        let res = client
+            .post(format!("{}/auth/register", base_url(addr)))
+            .json(&json!({ "username": username, "password": password }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            200,
+            "expected 200 for password of length {}",
+            password.len()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -644,4 +711,59 @@ async fn test_list_wallets() {
 
     assert_eq!(wallets.as_array().unwrap().len(), 1);
     assert_eq!(wallets[0]["pubkey"], keypair.pubkey().to_string());
+}
+
+/// Fires N concurrent registration requests for the same username and asserts that:
+///   - exactly one succeeds (200 OK), and
+///   - every other response is 409 Conflict — never 500.
+///
+/// This is the actual TOCTOU scenario. The old check-then-insert pattern let multiple
+/// requests pass the SELECT guard simultaneously, causing the losing INSERT to hit the
+/// UNIQUE constraint and return 500. The fix drops the pre-check and catches the
+/// constraint violation at the INSERT site, so all losers get 409 regardless of timing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_concurrent_same_username_returns_409_not_500() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+
+    let url = format!("{}/auth/register", base_url(addr));
+    let payload = json!({ "username": "raceuser", "password": "password123" });
+
+    // Spawn 10 requests simultaneously. We want genuine concurrency so we collect
+    // the futures first and then await them all at once via join_all.
+    const N: usize = 10;
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let url = url.clone();
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                Client::new()
+                    .post(&url)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .expect("request failed")
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+
+    let statuses: Vec<u16> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.expect("task panicked"))
+        .collect();
+
+    let successes = statuses.iter().filter(|&&s| s == 200).count();
+    let conflicts = statuses.iter().filter(|&&s| s == 409).count();
+    let errors = statuses.iter().filter(|&&s| s == 500).count();
+
+    assert_eq!(successes, 1, "exactly one registration should succeed");
+    assert_eq!(
+        conflicts,
+        N - 1,
+        "all other requests should get 409, not 500"
+    );
+    assert_eq!(errors, 0, "no request should return 500");
 }

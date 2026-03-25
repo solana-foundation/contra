@@ -184,6 +184,7 @@ services:
       - AUTH_PORT=${AUTH_PORT}
       - AUTH_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - JWT_SECRET=${JWT_SECRET}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
     ports:
       - "${AUTH_PORT}:${AUTH_PORT}"
     command: ["/usr/local/bin/auth"]

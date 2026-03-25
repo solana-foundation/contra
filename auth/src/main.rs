@@ -33,7 +33,7 @@ async fn main() {
         jwt: Arc::new(JwtConfig::new(&config.jwt_secret)),
     };
 
-    let app = build_app(state);
+    let app = build_app(state, &config.cors_allowed_origin);
 
     let addr = format!("0.0.0.0:{}", config.port);
 

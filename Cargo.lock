@@ -819,6 +819,7 @@ dependencies = [
  "bs58",
  "chrono",
  "clap 4.5.48",
+ "futures 0.3.31",
  "jsonwebtoken",
  "rand 0.7.3",
  "reqwest 0.11.27",

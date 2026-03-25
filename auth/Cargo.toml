@@ -32,7 +32,8 @@ solana-sdk = { workspace = true }
 bs58 = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json"] }                                     
-testcontainers = { workspace = true }                                                   
-testcontainers-modules = { workspace = true }                                           
+reqwest = { workspace = true, features = ["json"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }

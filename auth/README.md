@@ -9,6 +9,7 @@ Authentication service for the Contra platform. Handles user registration, login
 | `AUTH_PORT` | `8903` | Port to listen on |
 | `AUTH_DATABASE_URL` | — | Postgres connection URL |
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
+| `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.contra.xyz`). Defaults to `*` for local dev. |
 
 ## API
 
@@ -21,6 +22,8 @@ Create a new account. All users are registered with the `user` role.
 ```json
 { "username": "alice", "password": "hunter2" }
 ```
+
+Password requirements: minimum 6 characters, maximum 72 characters (Argon2's input limit — inputs beyond 72 bytes are silently truncated, so longer passwords are rejected outright).
 
 Returns the created user. Passwords are hashed with Argon2 and never returned.
 

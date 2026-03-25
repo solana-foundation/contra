@@ -7,13 +7,13 @@ pub mod routes;
 
 use axum::{
     extract::FromRequestParts,
-    http::{request::Parts, StatusCode},
+    http::{request::Parts, HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use jwt::{Claims, JwtConfig};
 
@@ -58,7 +58,34 @@ impl AsRef<Arc<JwtConfig>> for AppState {
     }
 }
 
-pub fn build_app(state: AppState) -> Router {
+pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
+    // Restrict CORS to only what this service actually needs.
+    // CorsLayer::permissive() would allow any origin, method, and header — too broad
+    // for a service that issues JWTs and handles credentials.
+    let origin = if cors_allowed_origin == "*" {
+        AllowOrigin::any()
+    } else {
+        // Parse into a HeaderValue so tower-http can match it exactly.
+        // Panic at startup rather than silently falling back to a permissive default.
+        let value = HeaderValue::from_str(cors_allowed_origin)
+            .expect("CORS_ALLOWED_ORIGIN is not a valid HTTP header value");
+        AllowOrigin::exact(value)
+    };
+
+    let cors = CorsLayer::new()
+        .allow_origin(origin)
+        // Only the methods actually used by auth routes.
+        .allow_methods(AllowMethods::list([
+            Method::GET,
+            Method::POST,
+            Method::OPTIONS,
+        ]))
+        // Only the headers clients need to send.
+        .allow_headers(AllowHeaders::list([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]));
+
     Router::new()
         .route("/auth/register", post(routes::register::register))
         .route("/auth/login", post(routes::login::login))
@@ -69,6 +96,6 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/auth/wallets", get(routes::wallets::wallets))
         .route("/health", get(|| async { "ok" }))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
 }

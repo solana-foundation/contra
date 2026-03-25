@@ -11,15 +11,31 @@ use crate::{
     AppState,
 };
 
+/// Minimum and maximum accepted password lengths.
+///
+/// The lower bound is a basic policy floor; the upper bound matches Argon2's
+/// internal input limit. Argon2 silently truncates passwords longer than 72
+/// bytes, which means two distinct passwords that share the same first 72 bytes
+/// would produce the same hash — a subtle but serious correctness issue.
+/// Rejecting inputs above the limit surfaces the problem to the caller instead
+/// of silently accepting a weaker credential.
+const PASSWORD_MIN_LEN: usize = 6;
+const PASSWORD_MAX_LEN: usize = 72;
+
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> AppResult<Json<User>> {
-    if db::find_user_by_username(&state.pool, &req.username)
-        .await?
-        .is_some()
-    {
-        return Err(AppError::Conflict("username already taken".into()));
+    // Validate password length before doing any hashing work.
+    if req.password.len() < PASSWORD_MIN_LEN {
+        return Err(AppError::BadRequest(format!(
+            "password must be at least {PASSWORD_MIN_LEN} characters"
+        )));
+    }
+    if req.password.len() > PASSWORD_MAX_LEN {
+        return Err(AppError::BadRequest(format!(
+            "password must not exceed {PASSWORD_MAX_LEN} characters"
+        )));
     }
 
     // Hash the password with Argon2 before storing.
@@ -29,7 +45,30 @@ pub async fn register(
         .map_err(|e| AppError::BadRequest(e.to_string()))?
         .to_string();
 
-    let user = db::insert_user(&state.pool, &req.username, &hash).await?;
+    // Attempt the INSERT directly rather than doing a SELECT first.
+    //
+    // The old check-then-insert pattern (find_user_by_username → insert_user) has a TOCTOU
+    // race: two concurrent requests for the same username can both pass the existence check,
+    // then the second INSERT hits the UNIQUE constraint and returns a 500 instead of 409.
+    //
+    // The UNIQUE constraint on `username` is atomic at the database level — exactly one
+    // concurrent INSERT will succeed. We rely on that guarantee and convert the constraint
+    // violation into the correct 409 response here. This is one fewer round-trip and
+    // correct under concurrency without any additional transaction isolation.
+    //
+    // The constraint name `users_username_key` is generated deterministically by Postgres
+    // from the table and column name (inline UNIQUE), so it is stable as long as the
+    // schema definition in db.rs does not change.
+    let user = db::insert_user(&state.pool, &req.username, &hash)
+        .await
+        .map_err(|e| match e {
+            AppError::Db(sqlx::Error::Database(ref db_err))
+                if db_err.constraint() == Some("users_username_key") =>
+            {
+                AppError::Conflict("username already taken".into())
+            }
+            other => other,
+        })?;
 
     tracing::info!(username = %user.username, "new user registered");
 

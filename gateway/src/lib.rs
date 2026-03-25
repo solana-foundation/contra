@@ -589,6 +589,24 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
+    // Refuse to start if JWT_SECRET is set without AUTH_DATABASE_URL.
+    //
+    // Auth is intentionally optional: both absent means "run without auth" and
+    // is valid for local dev. But JWT_SECRET present without AUTH_DATABASE_URL
+    // is a misconfiguration — enforce_auth silently falls through to its wildcard
+    // arm and returns None, disabling all enforcement with no indication. An
+    // operator who sets JWT_SECRET believes auth is active; failing here at boot
+    // ensures that belief is correct rather than every request passing through
+    // unguarded at runtime.
+    if args.jwt_secret.is_some() && args.auth_database_url.is_none() {
+        return Err(
+            "JWT_SECRET is set but AUTH_DATABASE_URL is not configured. \
+             Auth enforcement requires both. Either provide AUTH_DATABASE_URL \
+             or unset JWT_SECRET to run without auth."
+                .into(),
+        );
+    }
+
     // Connect to the auth DB if a URL was provided.
     // This pool is used for per-request wallet ownership checks.
     let auth_db = match args.auth_database_url {

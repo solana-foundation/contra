@@ -6,7 +6,7 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := build
 
 PROGRAM_DIRS := contra-escrow-program contra-withdraw-program
-RUST_DIRS := core indexer gateway
+RUST_DIRS := core indexer gateway auth
 FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
 
@@ -134,10 +134,11 @@ all-coverage:
 	done
 
 ci-unit-coverage:
-	@echo "Running CI unit tests with coverage for core + indexer + gateway..."
+	@echo "Running CI unit tests with coverage for core + indexer + gateway + auth..."
 	@$(MAKE) -C core unit-coverage
 	@$(MAKE) -C indexer unit-coverage
 	@$(MAKE) -C gateway unit-coverage
+	@$(MAKE) -C auth unit-coverage
 
 ci-e2e-coverage:
 	@echo "Running E2E integration tests with coverage..."

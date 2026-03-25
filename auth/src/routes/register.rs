@@ -5,7 +5,8 @@ use argon2::{
 use axum::{extract::State, Json};
 
 use crate::{
-    db, error::{AppError, AppResult},
+    db,
+    error::{AppError, AppResult},
     models::{RegisterRequest, User},
     AppState,
 };

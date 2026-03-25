@@ -52,6 +52,7 @@ jobs:
               '| Core | - | - | - | - |',
               '| Indexer | - | - | - | - |',
               '| Gateway | - | - | - | - |',
+              '| Auth | - | - | - | - |',
               '| Withdraw Program | - | - | - | - |',
               '| Escrow Program | - | - | - | - |',
               '| E2E Integration | - | - | - | - |',
@@ -99,6 +100,7 @@ jobs:
               - 'test_utils/**'
               - 'contra-escrow-program/**'
               - 'contra-withdraw-program/**'
+              - 'auth/**'
             integration:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -121,6 +123,7 @@ jobs:
               - 'core/**'
               - 'indexer/**'
               - 'gateway/**'
+              - 'auth/**'
 
   build-artifacts:
     name: Build Shared Artifacts
@@ -218,6 +221,7 @@ jobs:
             -p contra-integration \
             -p test_utils \
             -p devnet-scripts \
+            -p auth \
             -- --check
 
   clippy:
@@ -352,6 +356,7 @@ jobs:
             coverage/coverage-core-unit.lcov
             coverage/coverage-indexer-unit.lcov
             coverage/coverage-gateway-unit.lcov
+            coverage/coverage-auth-unit.lcov
           retention-days: 7
 
       - name: Update PR coverage — Core
@@ -378,5 +383,14 @@ jobs:
         with:
           component: Gateway
           lcov-file: coverage/coverage-gateway-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR coverage — Auth
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Auth
+          lcov-file: coverage/coverage-auth-unit.lcov
           artifact-name: rust-unit-coverage-reports
           github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -17,14 +17,15 @@ pub async fn login(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    let hash = PasswordHash::new(&user.password_hash)
-        .map_err(|_| AppError::Unauthorized)?;
+    let hash = PasswordHash::new(&user.password_hash).map_err(|_| AppError::Unauthorized)?;
 
     Argon2::default()
         .verify_password(req.password.as_bytes(), &hash)
         .map_err(|_| AppError::Unauthorized)?;
 
-    let token = state.jwt.sign(user.id, user.role)
+    let token = state
+        .jwt
+        .sign(user.id, user.role)
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     Ok(Json(LoginResponse { token }))

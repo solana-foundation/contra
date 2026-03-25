@@ -36,6 +36,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY core/Cargo.toml ./core/
 COPY gateway/Cargo.toml ./gateway/
 COPY indexer/Cargo.toml ./indexer/
+COPY auth/Cargo.toml ./auth/
 
 # Copy Cargo.toml files for other workspace members (to satisfy workspace references)
 COPY contra-escrow-program/program/Cargo.toml ./contra-escrow-program/program/
@@ -55,14 +56,14 @@ RUN mkdir -p contra-escrow-program/program/src contra-escrow-program/tests/integ
     contra-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
     contra-escrow-program/clients/rust/src contra-withdraw-program/clients/rust/src \
-    core/src metrics/src
+    core/src metrics/src auth/src
 RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/integration-tests/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/program/src/lib.rs \
     contra-withdraw-program/tests/integration-tests/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/clients/rust/src/lib.rs \
-    core/src/lib.rs metrics/src/lib.rs
+    core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs
 
 # Build the project with the dummy files. We can cache this layer.
 RUN cargo build --release
@@ -80,6 +81,7 @@ COPY core ./core
 COPY gateway ./gateway
 COPY indexer ./indexer
 COPY metrics ./metrics
+COPY auth ./auth
 
 # Resolve the symlink: copy the built .so into core/precompiles/
 # (the source symlink points to target/deploy/ which exists in the builder)
@@ -88,7 +90,8 @@ RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra
 RUN cargo build --release \
     -p contra-core \
     -p contra-gateway \
-    -p contra-indexer
+    -p contra-indexer \
+    -p auth
 
 # Stage 2: Runtime
 FROM --platform=linux/amd64 debian:bookworm-slim
@@ -109,6 +112,7 @@ COPY --from=builder /usr/src/contra/target/release/admin /usr/local/bin/admin
 COPY --from=builder /usr/src/contra/target/release/gateway /usr/local/bin/gateway
 COPY --from=builder /usr/src/contra/target/release/indexer /usr/local/bin/indexer
 COPY --from=builder /usr/src/contra/target/release/streamer /usr/local/bin/streamer
+COPY --from=builder /usr/src/contra/target/release/auth /usr/local/bin/auth
 
 # Copy indexer/operator config files
 COPY indexer/config /etc/contra/config

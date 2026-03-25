@@ -5,7 +5,12 @@ pub mod jwt;
 pub mod models;
 pub mod routes;
 
-use axum::{Json, Router, extract::FromRequestParts, http::{StatusCode, request::Parts}, routing::{get, post}};
+use axum::{
+    extract::FromRequestParts,
+    http::{request::Parts, StatusCode},
+    routing::{get, post},
+    Json, Router,
+};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -25,10 +30,7 @@ where
 {
     type Rejection = (StatusCode, Json<serde_json::Value>);
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
             .get("Authorization")
@@ -41,15 +43,12 @@ where
                 )
             })?;
 
-        state
-            .as_ref()
-            .verify(token)
-            .map_err(|_| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({ "error": "invalid token" })),
-                )
-            })
+        state.as_ref().verify(token).map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "invalid token" })),
+            )
+        })
     }
 }
 
@@ -64,7 +63,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/auth/register", post(routes::register::register))
         .route("/auth/login", post(routes::login::login))
         .route("/auth/challenge-wallet", post(routes::challenge::challenge))
-        .route("/auth/verify-wallet", post(routes::verify_wallet::verify_wallet))
+        .route(
+            "/auth/verify-wallet",
+            post(routes::verify_wallet::verify_wallet),
+        )
         .route("/auth/wallets", get(routes::wallets::wallets))
         .route("/health", get(|| async { "ok" }))
         .layer(CorsLayer::permissive())

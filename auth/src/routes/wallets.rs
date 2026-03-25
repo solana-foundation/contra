@@ -1,9 +1,6 @@
 use axum::{extract::State, Json};
 
-use crate::{
-    db, error::AppResult, 
-    models::WalletResponse, AppState, jwt::Claims
-};
+use crate::{db, error::AppResult, jwt::Claims, models::WalletResponse, AppState};
 
 pub async fn wallets(
     State(state): State<AppState>,
@@ -12,7 +9,7 @@ pub async fn wallets(
     let wallets = db::list_verified_wallets(&state.pool, claims.sub).await?;
 
     Ok(Json(
-        wallets 
+        wallets
             .into_iter()
             .map(|w| WalletResponse {
                 pubkey: w.pubkey,

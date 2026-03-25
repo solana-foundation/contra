@@ -5,11 +5,21 @@ use uuid::Uuid;
 
 use crate::models::Role;
 
+/// Issuer claim embedded in every JWT. Must match `JWT_ISSUER` in the gateway.
+pub const JWT_ISSUER: &str = "contra-auth";
+
+/// Audience claim embedded in every JWT. Must match `JWT_AUDIENCE` in the gateway.
+pub const JWT_AUDIENCE: &str = "contra-gateway";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid,
     pub role: Role,
     pub exp: usize,
+    /// Issuer — always `"contra-auth"`.
+    pub iss: String,
+    /// Audience — always `"contra-gateway"`.
+    pub aud: String,
 }
 
 pub struct JwtConfig {
@@ -32,14 +42,117 @@ impl JwtConfig {
             .unwrap()
             .timestamp() as usize;
 
-        let claims = Claims { sub: user_id, role, exp };
+        let claims = Claims {
+            sub: user_id,
+            role,
+            exp,
+            iss: JWT_ISSUER.to_string(),
+            aud: JWT_AUDIENCE.to_string(),
+        };
 
         encode(&Header::default(), &claims, &self.encoding_key)
     }
 
     /// Verify a JWT and return its claims. Returns an error if the token is invalid or expired.
     pub fn verify(&self, token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
-        let data = decode::<Claims>(token, &self.decoding_key, &Validation::default())?;
+        let mut validation = Validation::default();
+        validation.set_issuer(&[JWT_ISSUER]);
+        validation.set_audience(&[JWT_AUDIENCE]);
+        let data = decode::<Claims>(token, &self.decoding_key, &validation)?;
         Ok(data.claims)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Role;
+    use uuid::Uuid;
+
+    const SECRET: &str = "test-secret";
+
+    fn config() -> JwtConfig {
+        JwtConfig::new(SECRET)
+    }
+
+    /// Sign a token with arbitrary claims using the test secret.
+    /// Used to exercise rejection paths that `JwtConfig::sign` cannot produce
+    /// (e.g. wrong issuer, wrong audience, past expiry).
+    fn forge_raw(claims: &Claims) -> String {
+        encode(
+            &Header::default(),
+            claims,
+            &EncodingKey::from_secret(SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sign_and_verify_round_trip_user() {
+        let id = Uuid::new_v4();
+        let token = config().sign(id, Role::User).unwrap();
+        let claims = config().verify(&token).unwrap();
+        assert_eq!(claims.sub, id);
+        assert_eq!(claims.role, Role::User);
+        assert_eq!(claims.iss, JWT_ISSUER);
+        assert_eq!(claims.aud, JWT_AUDIENCE);
+    }
+
+    #[test]
+    fn sign_and_verify_round_trip_operator() {
+        let id = Uuid::new_v4();
+        let token = config().sign(id, Role::Operator).unwrap();
+        let claims = config().verify(&token).unwrap();
+        assert_eq!(claims.sub, id);
+        assert_eq!(claims.role, Role::Operator);
+    }
+
+    #[test]
+    fn wrong_secret_is_rejected() {
+        let token = config().sign(Uuid::new_v4(), Role::User).unwrap();
+        assert!(JwtConfig::new("different-secret").verify(&token).is_err());
+    }
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            role: Role::User,
+            exp: (Utc::now().timestamp() - 3600) as usize,
+            iss: JWT_ISSUER.to_string(),
+            aud: JWT_AUDIENCE.to_string(),
+        };
+        assert!(config().verify(&forge_raw(&claims)).is_err());
+    }
+
+    #[test]
+    fn wrong_issuer_is_rejected() {
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            role: Role::User,
+            exp: (Utc::now().timestamp() + 3600) as usize,
+            iss: "wrong-issuer".to_string(),
+            aud: JWT_AUDIENCE.to_string(),
+        };
+        assert!(config().verify(&forge_raw(&claims)).is_err());
+    }
+
+    #[test]
+    fn wrong_audience_is_rejected() {
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            role: Role::User,
+            exp: (Utc::now().timestamp() + 3600) as usize,
+            iss: JWT_ISSUER.to_string(),
+            aud: "wrong-audience".to_string(),
+        };
+        assert!(config().verify(&forge_raw(&claims)).is_err());
+    }
+
+    #[test]
+    fn malformed_token_is_rejected() {
+        assert!(config().verify("not.a.jwt").is_err());
+        assert!(config().verify("").is_err());
+        assert!(config().verify("a.b.c").is_err());
     }
 }

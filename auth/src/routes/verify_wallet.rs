@@ -5,9 +5,9 @@ use std::str::FromStr;
 use crate::{
     db,
     error::{AppError, AppResult},
+    jwt::Claims,
     models::{VerifyWalletRequest, WalletResponse},
     AppState,
-    jwt::Claims,
 };
 
 pub async fn verify_wallet(
@@ -29,8 +29,8 @@ pub async fn verify_wallet(
         challenge.expires_at.timestamp()
     );
 
-    let pubkey = Pubkey::from_str(&req.pubkey)
-        .map_err(|_| AppError::BadRequest("invalid pubkey".into()))?;
+    let pubkey =
+        Pubkey::from_str(&req.pubkey).map_err(|_| AppError::BadRequest("invalid pubkey".into()))?;
 
     let signature = Signature::from_str(&req.signature)
         .map_err(|_| AppError::BadRequest("invalid signature".into()))?;

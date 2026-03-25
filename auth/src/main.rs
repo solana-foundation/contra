@@ -2,8 +2,8 @@ use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
-use contra_auth::{AppState, build_app, db, jwt::JwtConfig};
 use contra_auth::config::Config;
+use contra_auth::{build_app, db, jwt::JwtConfig, AppState};
 
 #[tokio::main]
 async fn main() {
@@ -41,7 +41,5 @@ async fn main() {
         .await
         .expect("failed to bind");
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    axum::serve(listener, app).await.expect("server error");
 }

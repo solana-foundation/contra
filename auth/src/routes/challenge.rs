@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use uuid::Uuid;
 
-use crate::{db, error::AppResult, models::ChallengeResponse, AppState, jwt::Claims};
+use crate::{db, error::AppResult, jwt::Claims, models::ChallengeResponse, AppState};
 
 pub async fn challenge(
     State(state): State<AppState>,

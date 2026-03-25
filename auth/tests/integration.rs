@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use solana_sdk::{signature::Signer, signer::keypair::Keypair};
 use sqlx::postgres::PgPoolOptions;
 use testcontainers::runners::AsyncRunner;
@@ -17,7 +17,7 @@ use testcontainers_modules::postgres::Postgres;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use contra_auth::{AppState, build_app, db, jwt::JwtConfig};
+use contra_auth::{build_app, db, jwt::JwtConfig, AppState};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -88,7 +88,10 @@ async fn test_register() {
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["username"], "alice");
-    assert!(body["password_hash"].is_null(), "password_hash must not be exposed");
+    assert!(
+        body["password_hash"].is_null(),
+        "password_hash must not be exposed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -98,7 +101,12 @@ async fn test_register_duplicate() {
     let client = Client::new();
 
     let payload = json!({ "username": "alice", "password": "password123" });
-    client.post(format!("{}/auth/register", base_url(addr))).json(&payload).send().await.unwrap();
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
 
     let res = client
         .post(format!("{}/auth/register", base_url(addr)))
@@ -301,6 +309,260 @@ async fn test_verify_wallet_replay_rejected() {
         .await
         .unwrap();
     assert_eq!(second.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_verify_wallet_invalid_pubkey() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
+    let keypair = Keypair::new();
+    let signature = keypair.sign_message(challenge_res["message"].as_str().unwrap().as_bytes());
+
+    let res = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": "not-a-valid-pubkey",
+            "nonce": nonce,
+            "signature": signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_verify_wallet_invalid_signature_format() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
+    let keypair = Keypair::new();
+
+    let res = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": keypair.pubkey().to_string(),
+            "nonce": nonce,
+            "signature": "not-a-valid-signature",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_verify_wallet_wrong_signature() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let message = challenge_res["message"].as_str().unwrap();
+    let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
+
+    let keypair = Keypair::new();
+    // Sign with a different keypair — signature won't verify against the pubkey we submit.
+    let wrong_keypair = Keypair::new();
+    let signature = wrong_keypair.sign_message(message.as_bytes());
+
+    let res = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": keypair.pubkey().to_string(),
+            "nonce": nonce,
+            "signature": signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_verify_wallet_duplicate() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+    let keypair = Keypair::new();
+
+    // Helper: get a fresh challenge and verify the same wallet.
+    let do_verify = |_token: &str, nonce: Uuid, message: &str| {
+        let signature = keypair.sign_message(message.as_bytes());
+        (json!({
+            "pubkey": keypair.pubkey().to_string(),
+            "nonce": nonce,
+            "signature": signature.to_string(),
+        }),)
+    };
+
+    // First verification — must succeed.
+    let challenge1: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let (payload1,) = do_verify(
+        token,
+        challenge1["nonce"].as_str().unwrap().parse().unwrap(),
+        challenge1["message"].as_str().unwrap(),
+    );
+
+    let first = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&payload1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    // Second verification of the same wallet with a fresh nonce — must conflict.
+    let challenge2: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let (payload2,) = do_verify(
+        token,
+        challenge2["nonce"].as_str().unwrap().parse().unwrap(),
+        challenge2["message"].as_str().unwrap(),
+    );
+
+    let second = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&payload2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 409);
 }
 
 #[tokio::test(flavor = "multi_thread")]

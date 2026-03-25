@@ -1,5 +1,11 @@
+pub mod auth;
+pub mod db;
 pub mod metrics;
 
+use crate::auth::{
+    check_account_data_ownership, check_request_auth, decode_account_data, forbidden_body,
+    AuthDecision,
+};
 use clap::Parser;
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -10,7 +16,10 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonrpsee::types::error::INVALID_REQUEST_CODE;
+use jsonwebtoken::DecodingKey;
 use serde_json::Value;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -63,6 +72,17 @@ pub struct Args {
     /// CORS Access-Control-Allow-Origin header value
     #[arg(long, default_value = "*", env = "GATEWAY_CORS_ALLOWED_ORIGIN")]
     pub cors_allowed_origin: String,
+
+    /// Shared JWT secret used to verify tokens issued by the auth service.
+    /// If absent, auth enforcement is disabled (useful for local dev).
+    /// Must match the JWT_SECRET configured in the auth service.
+    #[arg(long, env = "JWT_SECRET")]
+    pub jwt_secret: Option<String>,
+
+    /// Connection URL for the auth service's Postgres database.
+    /// Required when JWT_SECRET is set (used for wallet ownership checks).
+    #[arg(long, env = "AUTH_DATABASE_URL")]
+    pub auth_database_url: Option<String>,
 }
 
 pub struct Gateway {
@@ -73,21 +93,41 @@ pub struct Gateway {
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         Full<Bytes>,
     >,
+    /// Pre-built decoding key derived from JWT_SECRET at startup.
+    /// `None` means auth enforcement is disabled.
+    jwt_secret: Option<DecodingKey>,
+    /// Connection pool to the auth service's Postgres database.
+    /// Used for wallet ownership checks on gated methods.
+    /// `None` when auth enforcement is disabled.
+    auth_db: Option<PgPool>,
 }
 
 impl Gateway {
-    pub fn new(write_url: String, read_url: String, cors_allowed_origin: String) -> Self {
+    pub fn new(
+        write_url: String,
+        read_url: String,
+        cors_allowed_origin: String,
+        jwt_secret: Option<String>,
+        auth_db: Option<PgPool>,
+    ) -> Self {
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
+        // Convert the raw secret string into a DecodingKey once here.
+        // DecodingKey borrows its input, so we use from_secret which copies it internally.
+        let jwt_secret = jwt_secret
+            .as_deref()
+            .map(|s| DecodingKey::from_secret(s.as_bytes()));
         Self {
             write_url,
             read_url,
             cors_allowed_origin,
             client,
+            jwt_secret,
+            auth_db,
         }
     }
 
@@ -107,6 +147,52 @@ impl Gateway {
         metrics::GATEWAY_REQUEST_DURATION
             .with_label_values(&[method, target])
             .observe(elapsed);
+    }
+
+    /// Fetch raw account data from the read node for Phase 2 ownership checks.
+    ///
+    /// Sends a `getAccountInfo` request with `encoding: "base64"` to the read
+    /// node and returns the decoded account bytes alongside the program owner
+    /// string (e.g. the SPL Token program ID).
+    ///
+    /// Returns `None` if the account does not exist or cannot be fetched.
+    async fn fetch_account_for_auth(&self, pubkey: &str) -> Option<(Vec<u8>, String)> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            // Request base64 encoding so we get the raw bytes back as a string.
+            "params": [pubkey, { "encoding": "base64" }]
+        })
+        .to_string();
+
+        let uri = self.read_url.parse::<hyper::Uri>().ok()?;
+        let req = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .ok()?;
+
+        let response = self.client.request(req).await.ok()?;
+        let body_bytes = response.into_body().collect().await.ok()?.to_bytes();
+
+        let json: Value = serde_json::from_slice(&body_bytes).ok()?;
+
+        // getAccountInfo returns null for result.value when the account doesn't exist.
+        let value = json.get("result")?.get("value")?;
+        if value.is_null() {
+            return None;
+        }
+
+        // The program that owns this account — used to confirm it is a token account.
+        let program_owner = value.get("owner")?.as_str()?.to_owned();
+
+        // data is [base64_string, encoding_name] — we want index 0.
+        let encoded = value.get("data")?.get(0)?.as_str()?;
+        let data = decode_account_data(encoded)?;
+
+        Some((data, program_owner))
     }
 
     fn error_response(
@@ -133,6 +219,60 @@ impl Gateway {
                 .body(Empty::new().map_err(|never| match never {}).boxed_unsync())
                 .unwrap(),
         }
+    }
+
+    /// Enforces RBAC on gated methods.
+    ///
+    /// Returns `Some(response)` if the request must be rejected, `None` if it
+    /// may proceed. No-ops immediately when auth is not configured.
+    async fn enforce_auth(
+        &self,
+        auth_header: Option<&str>,
+        method: &str,
+        method_label: &str,
+        params: &Value,
+        start: Instant,
+    ) -> Option<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>> {
+        let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
+            (Some(k), Some(db)) => (k, db),
+            _ => return None,
+        };
+
+        let decision = check_request_auth(auth_header, decoding_key, method, params);
+
+        let (status, body) = match decision {
+            AuthDecision::Proceed => return None,
+            AuthDecision::Reject(status, body) => (status, body),
+            AuthDecision::NeedsAccountFetch { user_id, pubkey } => {
+                let result = match self.fetch_account_for_auth(&pubkey).await {
+                    Some((data, program_owner)) => {
+                        check_account_data_ownership(
+                            &data,
+                            &program_owner,
+                            &pubkey,
+                            user_id,
+                            auth_db,
+                        )
+                        .await
+                    }
+                    None => AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body()),
+                };
+                match result {
+                    AuthDecision::Proceed => return None,
+                    AuthDecision::Reject(status, body) => (status, body),
+                    AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
+                }
+            }
+        };
+
+        Self::record_metrics(
+            Some("auth_rejected"),
+            method_label,
+            "none",
+            &status.as_u16().to_string(),
+            start.elapsed().as_secs_f64(),
+        );
+        Some(self.error_response(status, Some(body)))
     }
 
     /// Build a JSON-RPC–style error body for 413 responses.
@@ -233,6 +373,14 @@ impl Gateway {
             }
         }
 
+        // Extract the Authorization header as an owned String before req is
+        // consumed by into_body(). Needed for the auth check after JSON parsing.
+        let auth_header = req
+            .headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+
         let limited_body = Limited::new(req.into_body(), MAX_BODY_SIZE);
         let body_bytes = match limited_body.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -301,6 +449,15 @@ impl Gateway {
         } else {
             "unknown"
         };
+
+        // --- RBAC enforcement ---
+        let params = json.get("params").cloned().unwrap_or(Value::Null);
+        if let Some(rejection) = self
+            .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
+            .await
+        {
+            return Ok(rejection);
+        }
 
         let (target_url, target_label) = if method == "sendTransaction" {
             info!("Routing sendTransaction to write node");
@@ -393,7 +550,7 @@ impl Gateway {
     }
 }
 
-async fn serve(
+pub async fn serve(
     listener: TcpListener,
     gateway: Arc<Gateway>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -423,11 +580,35 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("  Write URL: {}", args.write_url);
     info!("  Read URL: {}", args.read_url);
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
+    info!(
+        "  Auth enforcement: {}",
+        if args.jwt_secret.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
+    // Connect to the auth DB if a URL was provided.
+    // This pool is used for per-request wallet ownership checks.
+    let auth_db = match args.auth_database_url {
+        Some(ref url) => {
+            let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+            info!("  Auth DB: connected");
+            Some(pool)
+        }
+        None => {
+            info!("  Auth DB: not configured");
+            None
+        }
+    };
 
     let gateway = Arc::new(Gateway::new(
         args.write_url,
         args.read_url,
         args.cors_allowed_origin,
+        args.jwt_secret,
+        auth_db,
     ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
@@ -454,6 +635,8 @@ mod tests {
             write_url.to_string(),
             read_url.to_string(),
             "*".to_string(),
+            None, // no auth enforcement in these tests
+            None,
         ));
 
         // Port 0 lets the OS assign a unique free port; avoids collisions between concurrent tests.
@@ -721,6 +904,8 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             "http://127.0.0.1:1".to_string(),
             "*".to_string(),
+            None, // no auth enforcement in this test
+            None,
         ));
         let handle = tokio::spawn(async move {
             let _ = serve(listener, gateway).await;

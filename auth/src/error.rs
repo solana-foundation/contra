@@ -1,4 +1,8 @@
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde_json::json;
 use thiserror::Error;
 
@@ -26,11 +30,17 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Internal(e) => {
                 tracing::error!("internal error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
             }
             AppError::Db(e) => {
                 tracing::error!("database error: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error".to_string(),
+                )
             }
         };
 
@@ -39,3 +49,42 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    fn status(err: AppError) -> StatusCode {
+        err.into_response().status()
+    }
+
+    #[test]
+    fn unauthorized_maps_to_401() {
+        assert_eq!(status(AppError::Unauthorized), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn conflict_maps_to_409() {
+        assert_eq!(
+            status(AppError::Conflict("duplicate username".to_string())),
+            StatusCode::CONFLICT,
+        );
+    }
+
+    #[test]
+    fn bad_request_maps_to_400() {
+        assert_eq!(
+            status(AppError::BadRequest("missing field".to_string())),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[test]
+    fn internal_maps_to_500() {
+        assert_eq!(
+            status(AppError::Internal(anyhow::anyhow!("boom"))),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+}

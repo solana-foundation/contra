@@ -18,7 +18,7 @@
 
 use {
     crate::{
-        bench_metrics::{BENCH_LANDED_TOTAL, BENCH_TPS_CURRENT, NO_LABELS},
+        bench_metrics::{BENCH_LANDED_TOTAL, NO_LABELS},
         types::{BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL},
     },
     solana_client::nonblocking::rpc_client::RpcClient,
@@ -128,7 +128,6 @@ pub async fn run_metrics_sampler(
                             .with_label_values(&NO_LABELS)
                             .inc_by(delta as f64);
                     }
-                    BENCH_TPS_CURRENT.with_label_values(&NO_LABELS).set(0.0);
                 }
                 return (start_count.unwrap_or(final_count), final_count);
             }
@@ -144,7 +143,6 @@ pub async fn run_metrics_sampler(
                                     .with_label_values(&NO_LABELS)
                                     .inc_by(tps as f64);
                             }
-                            BENCH_TPS_CURRENT.with_label_values(&NO_LABELS).set(tps as f64);
                             let remaining_secs = load_end
                                 .saturating_duration_since(tokio::time::Instant::now())
                                 .as_secs();

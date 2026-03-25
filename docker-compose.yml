@@ -62,6 +62,8 @@ services:
       - CONTRA_JSON_LOGS=false
       - CONTRA_MODE=write
       - CONTRA_ADMIN_KEYS=${CONTRA_ADMIN_KEYS}
+      - CONTRA_METRICS=${CONTRA_METRICS:-false}
+      - CONTRA_METRICS_PORT=${CONTRA_METRICS_PORT:-9090}
     ports:
       - "${CONTRA_WRITE_PORT}:${CONTRA_WRITE_PORT}"
     command: ["/usr/local/bin/contra-node"]
@@ -507,6 +509,7 @@ services:
     environment:
       - HOST_SUFFIX=
       - BENCH_METRICS_TARGET=${BENCH_METRICS_TARGET:-host.docker.internal:9101}
+      - CONTRA_METRICS_PORT=${CONTRA_METRICS_PORT:-9090}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

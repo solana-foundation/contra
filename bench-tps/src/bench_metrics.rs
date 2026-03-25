@@ -1,4 +1,4 @@
-use contra_metrics::{counter_vec, gauge_vec, init_metrics};
+use contra_metrics::{counter_vec, init_metrics};
 
 counter_vec!(
     BENCH_SENT_TOTAL,
@@ -14,15 +14,8 @@ counter_vec!(
     &[]
 );
 
-gauge_vec!(
-    BENCH_TPS_CURRENT,
-    "contra_bench_tps_current_tps",
-    "Instantaneous TPS observed by the node",
-    &[]
-);
-
 pub fn init() {
-    init_metrics!(BENCH_SENT_TOTAL, BENCH_LANDED_TOTAL, BENCH_TPS_CURRENT);
+    init_metrics!(BENCH_SENT_TOTAL, BENCH_LANDED_TOTAL);
 }
 
 pub const NO_LABELS: [&str; 0] = [];

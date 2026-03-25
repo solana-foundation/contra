@@ -39,6 +39,11 @@ scrape_configs:
     static_configs:
       - targets: ['${BENCH_METRICS_TARGET}']
 
+  - job_name: 'write-node-stages'
+    scrape_interval: 2s
+    static_configs:
+      - targets: ['write-node:${CONTRA_METRICS_PORT}']
+
   - job_name: 'blackbox-http'
     metrics_path: /probe
     params:

@@ -1883,6 +1883,7 @@ dependencies = [
  "bincode",
  "bs58",
  "clap 4.5.48",
+ "contra-metrics",
  "contra-withdraw-program-client",
  "enum_dispatch",
  "futures 0.3.31",

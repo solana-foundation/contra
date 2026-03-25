@@ -23,106 +23,270 @@
   "panels": [
     {
       "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "id": 10,
       "title": "Bench TPS",
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
           "min": 0,
-          "unit": "TPS"
+          "unit": "TPS",
+          "custom": { "showPoints": "always", "pointSize": 4 }
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 1
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
       "id": 11,
       "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "contra_bench_tps_current_tps",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_bench_tps_landed_total[10s])",
           "legendFormat": "Landed TPS",
           "refId": "A",
-          "interval": "1s",
-          "step": "1s"
+          "interval": "2s",
+          "step": "2s"
         }
       ],
       "title": "Landed TPS",
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": {
         "defaults": {
           "min": 0,
-          "unit": "TPS"
+          "unit": "TPS",
+          "custom": { "showPoints": "always", "pointSize": 4 }
         },
         "overrides": []
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 1
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
       "id": 12,
       "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "multi", "sort": "desc" }
       },
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "irate(contra_bench_tps_sent_total[5s])",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_bench_tps_sent_total[10s])",
           "legendFormat": "Sent/s",
           "refId": "A",
-          "interval": "5s",
-          "step": "5s"
+          "interval": "2s",
+          "step": "2s"
         }
       ],
       "title": "Sent TPS (Sender Threads)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "id": 19,
+      "title": "Pipeline Stages",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "showPoints": "always", "pointSize": 4 }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "id": 20,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_dedup_received_total[10s])",
+          "legendFormat": "Received",
+          "refId": "A",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_dedup_forwarded_total[10s])",
+          "legendFormat": "Forwarded",
+          "refId": "B",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_dedup_dropped_duplicate_total[10s])",
+          "legendFormat": "Dropped (dup)",
+          "refId": "C",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_dedup_dropped_unknown_bh_total[10s])",
+          "legendFormat": "Dropped (bh)",
+          "refId": "D",
+          "interval": "2s",
+          "step": "2s"
+        }
+      ],
+      "title": "Dedup Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "showPoints": "always", "pointSize": 4 }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "id": 21,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_sigverify_forwarded_total[10s])",
+          "legendFormat": "Forwarded",
+          "refId": "A",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_sigverify_rejected_total[10s])",
+          "legendFormat": "Rejected ({{reason}})",
+          "refId": "B",
+          "interval": "2s",
+          "step": "2s"
+        }
+      ],
+      "title": "Sigverify Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "showPoints": "always", "pointSize": 4 }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "id": 23,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_sequencer_collected_total[10s])",
+          "legendFormat": "Collected/s",
+          "refId": "A",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_sequencer_transactions_emitted_total[10s])",
+          "legendFormat": "Emitted/s",
+          "refId": "B",
+          "interval": "2s",
+          "step": "2s"
+        }
+      ],
+      "title": "Sequencer Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "showPoints": "always", "pointSize": 4 }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "id": 27,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_executor_results_sent_total[10s])",
+          "legendFormat": "Results sent/s",
+          "refId": "A",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_executor_results_send_failed_total[10s])",
+          "legendFormat": "Send failed/s ({{kind}})",
+          "refId": "B",
+          "interval": "2s",
+          "step": "2s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_executor_missing_results_total[10s])",
+          "legendFormat": "Missing results/s ({{kind}})",
+          "refId": "C",
+          "interval": "2s",
+          "step": "2s"
+        }
+      ],
+      "title": "Executor Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "custom": { "showPoints": "always", "pointSize": 4 }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 26 },
+      "id": 26,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "rate(contra_settler_txs_settled_total[10s])",
+          "legendFormat": "Settled/s",
+          "refId": "A",
+          "interval": "2s",
+          "step": "2s"
+        }
+      ],
+      "title": "Settler Throughput",
       "type": "timeseries"
     }
   ],
@@ -143,5 +307,5 @@
   "timezone": "",
   "title": "Contra Bench",
   "uid": "contra-bench",
-  "version": 1
+  "version": 3
 }

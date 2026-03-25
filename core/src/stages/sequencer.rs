@@ -2,6 +2,7 @@ use {
     crate::{
         nodes::node::WorkerHandle,
         scheduler::{ConflictFreeBatch, Scheduler, SchedulerTrait},
+        stage_metrics::SharedMetrics,
     },
     solana_sdk::transaction::SanitizedTransaction,
     tokio::sync::mpsc,
@@ -14,6 +15,7 @@ pub struct SequencerArgs {
     pub rx: mpsc::UnboundedReceiver<SanitizedTransaction>,
     pub batch_tx: mpsc::UnboundedSender<ConflictFreeBatch>,
     pub shutdown_token: CancellationToken,
+    pub metrics: SharedMetrics,
 }
 
 pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
@@ -22,6 +24,7 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
         mut rx,
         batch_tx,
         shutdown_token,
+        metrics,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -49,10 +52,12 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
                         None => {
                             // Channel closed - process any remaining and exit
                             if !pending_transactions.is_empty() {
+                                metrics.sequencer_collected(pending_transactions.len());
                                 let sent = process_and_send_batches(
                                     &mut scheduler,
                                     &pending_transactions,
                                     &batch_tx,
+                                    &metrics,
                                 );
                                 total_batches_sent += sent;
                             }
@@ -65,10 +70,12 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
                 _ = shutdown_token.cancelled() => {
                     // Process remaining transactions before shutdown
                     if !pending_transactions.is_empty() {
+                        metrics.sequencer_collected(pending_transactions.len());
                         let sent = process_and_send_batches(
                             &mut scheduler,
                             &pending_transactions,
                             &batch_tx,
+                            &metrics,
                         );
                         total_batches_sent += sent;
                     }
@@ -102,8 +109,9 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
 
             // Process the collected transactions into conflict-free batches
             if !pending_transactions.is_empty() {
+                metrics.sequencer_collected(pending_transactions.len());
                 let sent =
-                    process_and_send_batches(&mut scheduler, &pending_transactions, &batch_tx);
+                    process_and_send_batches(&mut scheduler, &pending_transactions, &batch_tx, &metrics);
                 total_batches_sent += sent;
                 pending_transactions.clear();
 
@@ -122,6 +130,7 @@ fn process_and_send_batches(
     scheduler: &mut Scheduler,
     transactions: &[SanitizedTransaction],
     batch_tx: &mpsc::UnboundedSender<ConflictFreeBatch>,
+    metrics: &SharedMetrics,
 ) -> u64 {
     let num_transactions = transactions.len();
     debug!(
@@ -132,6 +141,10 @@ fn process_and_send_batches(
     // Schedule transactions to create conflict-free batches
     let conflict_free_batches = scheduler.schedule(transactions.to_vec());
     let num_batches = conflict_free_batches.len();
+
+    if num_transactions > 0 {
+        metrics.sequencer_transactions_emitted(num_transactions);
+    }
 
     debug!(
         "Created {} conflict-free batches from {} transactions",
@@ -166,9 +179,10 @@ fn process_and_send_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::create_test_sanitized_transaction;
+    use crate::{stage_metrics::NoopMetrics, test_helpers::create_test_sanitized_transaction};
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Keypair;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -181,7 +195,8 @@ mod tests {
         let to = Pubkey::new_unique();
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
-        let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx);
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx, &noop);
         assert!(sent >= 1);
 
         // Should have received at least one batch
@@ -195,7 +210,8 @@ mod tests {
         let mut scheduler = Scheduler::new_dag();
         let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
 
-        let sent = process_and_send_batches(&mut scheduler, &[], &batch_tx);
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let sent = process_and_send_batches(&mut scheduler, &[], &batch_tx, &noop);
         assert_eq!(sent, 0);
         assert!(batch_rx.try_recv().is_err());
     }
@@ -213,7 +229,8 @@ mod tests {
         let tx = create_test_sanitized_transaction(&from, &to, 100);
 
         // Should not panic, just return 0 since channel is closed
-        let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx);
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let sent = process_and_send_batches(&mut scheduler, &[tx], &batch_tx, &noop);
         assert_eq!(sent, 0);
     }
 
@@ -231,7 +248,8 @@ mod tests {
         let tx1 = create_test_sanitized_transaction(&payer, &to1, 100);
         let tx2 = create_test_sanitized_transaction(&payer, &to2, 200);
 
-        let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx);
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx, &noop);
         // Conflicting transactions should be split into separate batches
         assert_eq!(
             sent, 2,
@@ -272,7 +290,8 @@ mod tests {
         let tx1 = create_test_sanitized_transaction(&from1, &to1, 100);
         let tx2 = create_test_sanitized_transaction(&from2, &to2, 200);
 
-        let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx);
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let sent = process_and_send_batches(&mut scheduler, &[tx1, tx2], &batch_tx, &noop);
         assert_eq!(
             sent, 1,
             "Non-conflicting txs should be grouped into one batch"
@@ -309,6 +328,7 @@ mod tests {
             rx: input_rx,
             batch_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -333,6 +353,7 @@ mod tests {
             rx: input_rx,
             batch_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -376,6 +397,7 @@ mod tests {
             rx: input_rx,
             batch_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 

@@ -5,6 +5,7 @@ pub mod nodes;
 pub mod processor;
 pub mod rpc;
 pub mod scheduler;
+pub mod stage_metrics;
 pub mod stages;
 pub mod transactions;
 mod vm;

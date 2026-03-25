@@ -23,7 +23,9 @@ Create a new account. All users are registered with the `user` role.
 { "username": "alice", "password": "hunter2" }
 ```
 
-Password requirements: minimum 6 characters, maximum 72 characters (Argon2's input limit — inputs beyond 72 bytes are silently truncated, so longer passwords are rejected outright).
+Username requirements: 5–32 characters, alphanumeric plus underscores and hyphens only.
+
+Password requirements: 6–72 characters (Argon2's input limit — inputs beyond 72 bytes are silently truncated, so longer passwords are rejected outright).
 
 Returns the created user. Passwords are hashed with Argon2 and never returned.
 

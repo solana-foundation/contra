@@ -11,21 +11,43 @@ use crate::{
     AppState,
 };
 
-/// Minimum and maximum accepted password lengths.
-///
-/// The lower bound is a basic policy floor; the upper bound matches Argon2's
-/// internal input limit. Argon2 silently truncates passwords longer than 72
-/// bytes, which means two distinct passwords that share the same first 72 bytes
-/// would produce the same hash — a subtle but serious correctness issue.
-/// Rejecting inputs above the limit surfaces the problem to the caller instead
-/// of silently accepting a weaker credential.
 const PASSWORD_MIN_LEN: usize = 6;
+/// Upper bound matches Argon2's input limit. Argon2 silently truncates passwords
+/// longer than 72 bytes, meaning two distinct passwords that share the same first
+/// 72 bytes would produce the same hash. Rejecting inputs above the limit surfaces
+/// the problem to the caller instead of silently accepting a weaker credential.
 const PASSWORD_MAX_LEN: usize = 72;
+
+const USERNAME_MIN_LEN: usize = 5;
+const USERNAME_MAX_LEN: usize = 32;
 
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> AppResult<Json<User>> {
+    // Validate username length and characters.
+    // Only alphanumeric, underscores, and hyphens are allowed — keeps usernames
+    // URL-safe and unambiguous in display contexts.
+    if req.username.len() < USERNAME_MIN_LEN {
+        return Err(AppError::BadRequest(format!(
+            "username must be at least {USERNAME_MIN_LEN} characters"
+        )));
+    }
+    if req.username.len() > USERNAME_MAX_LEN {
+        return Err(AppError::BadRequest(format!(
+            "username must not exceed {USERNAME_MAX_LEN} characters"
+        )));
+    }
+    if !req
+        .username
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AppError::BadRequest(
+            "username may only contain letters, numbers, underscores, and hyphens".into(),
+        ));
+    }
+
     // Validate password length before doing any hashing work.
     if req.password.len() < PASSWORD_MIN_LEN {
         return Err(AppError::BadRequest(format!(

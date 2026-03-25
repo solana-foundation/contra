@@ -95,6 +95,93 @@ async fn test_register() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_register_username_too_short() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    for username in ["", "ab", "abcd"] {
+        let res = client
+            .post(format!("{}/auth/register", base_url(addr)))
+            .json(&json!({ "username": username, "password": "password123" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            400,
+            "expected 400 for username {:?}",
+            username
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_username_too_long() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    let username = "a".repeat(33);
+    let res = client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_username_invalid_chars() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    for username in ["alice bob", "alice@bob", "alice!"] {
+        let res = client
+            .post(format!("{}/auth/register", base_url(addr)))
+            .json(&json!({ "username": username, "password": "password123" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            400,
+            "expected 400 for username {:?}",
+            username
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_register_username_valid_formats() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    // Underscores, hyphens, and mixed case should all be accepted.
+    for username in ["alice", "alice_bob", "alice-bob", "Alice123"] {
+        let res = client
+            .post(format!("{}/auth/register", base_url(addr)))
+            .json(&json!({ "username": username, "password": "password123" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            200,
+            "expected 200 for username {:?}",
+            username
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_register_password_too_short() {
     let (db_url, _container) = start_postgres().await;
     let addr = start_app(&db_url).await;

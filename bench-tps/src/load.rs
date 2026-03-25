@@ -21,7 +21,12 @@
 //! if throttling is enabled.
 
 use {
-    crate::types::{BatchQueue, BenchConfig, BenchState, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT},
+    crate::{
+        bench_metrics::{BENCH_SENT_TOTAL, NO_LABELS},
+        types::{
+            BatchQueue, BenchConfig, BenchState, AMOUNT_VARIANCE, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT,
+        },
+    },
     contra_core::client::create_spl_transfer,
     solana_sdk::pubkey::Pubkey,
     std::sync::{
@@ -91,7 +96,8 @@ pub async fn run_generator(
         for _ in 0..batch_size {
             let src = &config.accounts[tx_seq % config.accounts.len()];
             let dst = &config.destinations[tx_seq % config.destinations.len()];
-            let tx = create_spl_transfer(src, dst, &config.mint, TRANSFER_AMOUNT, blockhash);
+            let amount = TRANSFER_AMOUNT + (tx_seq as u64 % AMOUNT_VARIANCE);
+            let tx = create_spl_transfer(src, dst, &config.mint, amount, blockhash);
             batch.push(tx);
             tx_seq = tx_seq.wrapping_add(1);
         }
@@ -154,6 +160,7 @@ pub fn run_sender_thread(
         // trip time of one HTTP request, giving the generator time to pre-sign
         // the next batch while this one is in flight.
         for tx in &batch {
+            BENCH_SENT_TOTAL.with_label_values(&NO_LABELS).inc();
             match rpc.send_transaction(tx) {
                 Ok(_) => {}
                 Err(e) => warn!(err = %e, "sender: send_transaction failed"),

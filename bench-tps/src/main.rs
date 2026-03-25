@@ -30,6 +30,7 @@
 
 mod args;
 mod background;
+mod bench_metrics;
 mod load;
 mod rpc;
 mod setup;
@@ -61,6 +62,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level)),
         )
         .init();
+
+    bench_metrics::init();
+    if let Some(port) = args.metrics_port {
+        contra_metrics::start_metrics_server(port);
+    }
 
     info!(
         rpc_url = %args.rpc_url,

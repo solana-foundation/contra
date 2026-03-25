@@ -279,3 +279,29 @@ libraries and does not need to match those pins exactly.  Keeping it excluded:
 
 The bench still depends on `contra-core` via a path dependency and inherits
 whatever version of `solana-sdk` / `solana-client` that crate uses.
+
+---
+
+## CPU pinning verification
+
+After starting `./bench-tps/scripts/run.sh`, verify that services and the bench
+process are pinned to non-overlapping CPU sets.
+
+1. Check container CPU pinning (services):
+
+```bash
+docker ps --filter "name=contra-" --format "{{.Names}}" \
+| xargs -I{} docker inspect --format '{{.Name}} {{.HostConfig.CpusetCpus}}' {}
+```
+
+2. Check bench CPU pinning (bench process):
+
+```bash
+pgrep -f contra-bench-tps
+```
+
+Use the PID printed above:
+
+```bash
+taskset -pc <PID>
+```

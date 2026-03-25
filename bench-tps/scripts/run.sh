@@ -45,21 +45,39 @@ BENCH_ENV="${BENCH_DIR}/.env"
 # --rebuild  Force-rebuild the Rust binary, Solana programs, and Docker images.
 #            Also regenerates the admin keypair.  Use this after code changes.
 #
-# --clean    Wipe all Docker volumes (postgres data, validator ledger) before
-#            starting.  Use this when a previous run was interrupted and left
-#            corrupt state (e.g. "unexpected end of file" errors on startup).
+# --clean             Wipe all Docker volumes (postgres data, validator ledger)
+#                     before starting.  Use this when a previous run was
+#                     interrupted and left corrupt state.
+#
+# --no-refresh-metrics  Skip recreating Prometheus + Grafana. By default the
+#                       script refreshes them to reload scrape config and
+#                       dashboards (safe; does not delete data volumes).
+#
+# --contra-threads N  Pin Contra service containers to the first N CPU cores
+#                     and the bench binary to the remaining cores.  When
+#                     omitted the default 75% / 25% split is used.
 #
 # Any other flags are collected into BENCH_ARGS and forwarded verbatim to the
 # bench binary at the end of the script (e.g. --threads 20 --duration 120).
 # ---------------------------------------------------------------------------
 REBUILD=0
 CLEAN=0
+REFRESH_METRICS=1
+CONTRA_THREADS=""   # explicit core count for services (optional)
 BENCH_ARGS=()
+SKIP_NEXT=0
 for arg in "$@"; do
+    if [ "${SKIP_NEXT}" -eq 1 ]; then
+        CONTRA_THREADS="${arg}"
+        SKIP_NEXT=0
+        continue
+    fi
     case "${arg}" in
-        --rebuild) REBUILD=1 ;;
-        --clean)   CLEAN=1 ;;
-        *)         BENCH_ARGS+=("${arg}") ;;
+        --rebuild)        REBUILD=1 ;;
+        --clean)          CLEAN=1 ;;
+        --no-refresh-metrics) REFRESH_METRICS=0 ;;
+        --contra-threads) SKIP_NEXT=1 ;;  # value is the next token
+        *)                BENCH_ARGS+=("${arg}") ;;
     esac
 done
 
@@ -94,16 +112,25 @@ WRITE_PORT="${CONTRA_WRITE_PORT:-8899}"
 GATEWAY_PORT="${GATEWAY_PORT:-8898}"
 
 # ---------------------------------------------------------------------------
-# Step 4 — CPU affinity split (75% services / 25% bench)
+# Step 4 — CPU affinity split
 #
 # Assigning separate cores to Docker services and the bench binary eliminates
 # CPU competition that would artificially inflate RTT measurements.
 #
-# Layout on an 8-core machine:
-#   cores 0-5  → all contra Docker containers (write-node, postgres, etc.)
-#   cores 6-7  → bench binary (contra-bench-tps)
+# Two modes:
 #
-# On a single-core machine this is skipped entirely.
+#   --contra-threads N  (explicit)
+#     Pins services to cores 0..N-1 and the bench to the remaining cores
+#     N..TOTAL-1.  Use this when you know exactly how many cores the Contra
+#     stack needs (e.g. you profiled it and it saturates 6 cores).
+#     Example: --contra-threads 6 on a 10-core machine gives bench cores 6-9.
+#
+#   (default — 75% / 25% rule)
+#     Allocates floor(TOTAL * 0.75) cores to services and the remainder to
+#     the bench.  Enforces a minimum of 1 core on each side.
+#     Example: 8 cores → services 0-5, bench 6-7.
+#
+# On a single-core machine CPU pinning is skipped entirely.
 # ---------------------------------------------------------------------------
 TOTAL_CORES=$(nproc)
 
@@ -112,11 +139,19 @@ if [ "${TOTAL_CORES}" -lt 2 ]; then
     SERVICE_CPUSET=""
     BENCH_CPUSET=""
 else
-    # Allocate 75% of cores (rounded down, minimum 1) to services.
-    SERVICE_COUNT=$(( TOTAL_CORES * 3 / 4 ))
-    [ "${SERVICE_COUNT}" -lt 1 ] && SERVICE_COUNT=1
-    # Reserve at least one core for the bench binary.
-    [ "${SERVICE_COUNT}" -ge "${TOTAL_CORES}" ] && SERVICE_COUNT=$(( TOTAL_CORES - 1 ))
+    if [ -n "${CONTRA_THREADS}" ]; then
+        # Explicit mode: caller specified exactly how many cores go to services.
+        SERVICE_COUNT="${CONTRA_THREADS}"
+        if [ "${SERVICE_COUNT}" -lt 1 ] || [ "${SERVICE_COUNT}" -ge "${TOTAL_CORES}" ]; then
+            echo "ERROR: --contra-threads must be between 1 and $(( TOTAL_CORES - 1 ))" >&2
+            exit 1
+        fi
+    else
+        # Default mode: 75% to services (rounded down, minimum 1).
+        SERVICE_COUNT=$(( TOTAL_CORES * 3 / 4 ))
+        [ "${SERVICE_COUNT}" -lt 1 ] && SERVICE_COUNT=1
+        [ "${SERVICE_COUNT}" -ge "${TOTAL_CORES}" ] && SERVICE_COUNT=$(( TOTAL_CORES - 1 ))
+    fi
 
     BENCH_START="${SERVICE_COUNT}"
     BENCH_END=$(( TOTAL_CORES - 1 ))
@@ -186,11 +221,15 @@ patch_env "ADMIN_PRIVATE_KEY" "${ADMIN_PRIVKEY_JSON}"
 
 echo "Patched CONTRA_ADMIN_KEYS and ADMIN_PRIVATE_KEY in ${BENCH_ENV}"
 
-# Re-source .env so the rest of this script sees the updated values (docker
-# compose also re-reads the file at startup, but explicit variables in the
-# shell environment take precedence).
+# Re-source so the shell environment reflects the patched values before
+# `docker compose up` (Step 10).  Shell env vars take precedence over
+# --env-file in docker compose, so without this re-source the operator and
+# activity containers would inherit the stale empty ADMIN_PRIVATE_KEY that
+# was exported during the initial Step 3 source.
 # shellcheck disable=SC1091
 set -a; source "${BENCH_ENV}"; set +a
+
+# (BENCH_METRICS_TARGET is set in Step 10b after the Docker network exists)
 
 # ---------------------------------------------------------------------------
 # Step 6 — Build Solana programs (.so files)
@@ -299,6 +338,69 @@ done
 # ---------------------------------------------------------------------------
 echo "Starting all services..."
 "${COMPOSE[@]}" up -d --no-build
+
+# ---------------------------------------------------------------------------
+# Step 10b — Detect Docker gateway IP and refresh Prometheus + Grafana
+#
+# The contra-network bridge is only created by `docker compose up` (Step 10),
+# so gateway detection must happen here — after the network exists — not before.
+#
+# On Linux, `host.docker.internal` is not automatically resolvable inside
+# containers, so we use the Docker bridge gateway IP (e.g. 172.18.0.1) as the
+# Prometheus scrape target for the bench binary running on the host.
+#
+# After patching .env, Prometheus is always recreated so it reads the updated
+# prometheus.yml with the correct BENCH_METRICS_TARGET value.
+# ---------------------------------------------------------------------------
+DEFAULT_BENCH_METRICS_TARGET="host.docker.internal:9101"
+
+# Only auto-detect if the caller hasn't already set BENCH_METRICS_TARGET.
+if [ -z "${BENCH_METRICS_TARGET:-}" ]; then
+    NET_ID=$(docker network ls \
+        --filter label=com.docker.compose.network=contra-network \
+        -q | head -n 1)
+    if [ -n "${NET_ID}" ]; then
+        GW_IP=$(docker network inspect "${NET_ID}" \
+            -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
+    fi
+    if [ -n "${GW_IP:-}" ]; then
+        BENCH_METRICS_TARGET="${GW_IP}:9101"
+    else
+        BENCH_METRICS_TARGET="${DEFAULT_BENCH_METRICS_TARGET}"
+    fi
+fi
+
+patch_env "BENCH_METRICS_TARGET" "${BENCH_METRICS_TARGET}"
+echo "Patched BENCH_METRICS_TARGET=${BENCH_METRICS_TARGET} in ${BENCH_ENV}"
+
+# Re-source so the recreated Prometheus container inherits the updated value.
+# shellcheck disable=SC1091
+set -a; source "${BENCH_ENV}"; set +a
+
+# Always recreate Prometheus (and Grafana if REFRESH_METRICS) so they pick up
+# the correct scrape target and latest dashboard files.
+if [ "${REFRESH_METRICS}" -eq 1 ]; then
+    echo "Refreshing Prometheus + Grafana..."
+    "${COMPOSE[@]}" up -d --force-recreate prometheus grafana
+else
+    echo "Refreshing Prometheus (target update)..."
+    "${COMPOSE[@]}" up -d --force-recreate prometheus
+fi
+
+# ---------------------------------------------------------------------------
+# Step 10c — Open host firewall for bench metrics scraping
+#
+# The bench binary listens on 0.0.0.0:9101 (host). Prometheus runs inside
+# Docker and reaches the host via the bridge gateway (172.18.0.1). On many
+# Linux hosts the INPUT chain policy is DROP, which silently blocks this.
+# Insert a rule allowing TCP 9101 from the Docker subnet if it isn't there.
+# ---------------------------------------------------------------------------
+DOCKER_SUBNET="172.18.0.0/16"
+if ! sudo iptables -C INPUT -p tcp --dport 9101 -s "${DOCKER_SUBNET}" -j ACCEPT 2>/dev/null; then
+    sudo iptables -I INPUT -p tcp --dport 9101 -s "${DOCKER_SUBNET}" -j ACCEPT \
+        && echo "Opened host port 9101 for Docker subnet ${DOCKER_SUBNET}" \
+        || echo "WARNING: could not add iptables rule — Prometheus may not scrape bench metrics"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 11 — Pin contra containers to service CPU cores
@@ -524,11 +626,13 @@ if [ -n "${BENCH_CPUSET}" ]; then
     taskset -c "${BENCH_CPUSET}" "${BENCH_BIN}" \
         --admin-keypair "${ADMIN_KEYPAIR_FILE}" \
         --rpc-url "http://localhost:${GATEWAY_PORT}" \
+        --metrics-port 9101 \
         "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"
 else
     "${BENCH_BIN}" \
         --admin-keypair "${ADMIN_KEYPAIR_FILE}" \
         --rpc-url "http://localhost:${GATEWAY_PORT}" \
+        --metrics-port 9101 \
         "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"
 fi
 

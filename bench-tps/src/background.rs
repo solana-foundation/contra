@@ -17,7 +17,10 @@
 //! transactions landed over the full duration.
 
 use {
-    crate::types::{BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL},
+    crate::{
+        bench_metrics::{BENCH_LANDED_TOTAL, BENCH_TPS_CURRENT, NO_LABELS},
+        types::{BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL},
+    },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::commitment_config::CommitmentConfig,
     std::{sync::Arc, time::Instant},
@@ -118,6 +121,15 @@ pub async fn run_metrics_sampler(
                     .get_transaction_count()
                     .await
                     .unwrap_or(prev_count.unwrap_or(0));
+                if let Some(prev) = prev_count {
+                    let delta = final_count.saturating_sub(prev);
+                    if delta > 0 {
+                        BENCH_LANDED_TOTAL
+                            .with_label_values(&NO_LABELS)
+                            .inc_by(delta as f64);
+                    }
+                    BENCH_TPS_CURRENT.with_label_values(&NO_LABELS).set(0.0);
+                }
                 return (start_count.unwrap_or(final_count), final_count);
             }
 
@@ -127,6 +139,12 @@ pub async fn run_metrics_sampler(
                         let sc = *start_count.get_or_insert(count);
                         if let Some(prev) = prev_count {
                             let tps = count.saturating_sub(prev);
+                            if tps > 0 {
+                                BENCH_LANDED_TOTAL
+                                    .with_label_values(&NO_LABELS)
+                                    .inc_by(tps as f64);
+                            }
+                            BENCH_TPS_CURRENT.with_label_values(&NO_LABELS).set(tps as f64);
                             let remaining_secs = load_end
                                 .saturating_duration_since(tokio::time::Instant::now())
                                 .as_secs();

@@ -80,7 +80,7 @@ pub struct Args {
     ///
     /// Use this to throttle the send rate without reducing `--threads`.
     /// A value of 0 disables the sleep entirely (maximum throughput mode).
-    #[arg(long, default_value_t = 10, env = "BENCH_SENDER_SLEEP_MS")]
+    #[arg(long, default_value_t = 5, env = "BENCH_SENDER_SLEEP_MS")]
     pub sender_sleep_ms: u64,
 
     /// Tracing log level.  One of: error, warn, info, debug, trace.

@@ -19,7 +19,7 @@
 use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
-        types::{BenchState, MINT_DECIMALS},
+        types::{BenchState, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
     contra_core::client::{
@@ -135,87 +135,127 @@ pub async fn run_setup_phase(
             "initialize_mint: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&rpc, &[mint_sig], "initialize_mint").await?;
+    let retry = poll_confirmations(&rpc, &[Some(mint_sig)], "initialize_mint", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!("initialize_mint failed to confirm on-chain"));
+    }
     info!(mint = %mint, elapsed_ms = t3.elapsed().as_millis(), "Mint initialized");
 
     // ------------------------------------------------------------------
-    // Task 4: Create ATAs for all keypairs in parallel
+    // Tasks 4 + 5: Create and confirm ATAs in batches of SETUP_BATCH_SIZE
     //
-    // All `create_ata_transaction` calls share the same blockhash.  Sending
-    // them in chunks of MAX_CONCURRENT_SENDS bounds peak connection count.
+    // Processing in batches of 200 rather than all at once:
+    //   - Fetches a fresh blockhash per batch so hashes don't approach expiry.
+    //   - Confirms each batch before starting the next, keeping in-flight work
+    //     bounded and making it easy to log progress.
+    //   - On confirmation, only the transactions that failed to land are
+    //     re-signed and retried; the rest are not touched.
     // ------------------------------------------------------------------
     let t4 = Instant::now();
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .context("get_latest_blockhash")?;
-    let ata_sigs = send_parallel(rpc_url, &keypairs, |kp, url| {
-        let admin = Arc::clone(&admin_keypair);
-        let owner = kp.pubkey();
-        async move {
-            let tx = create_ata_transaction(&admin, &owner, &mint, blockhash);
-            RpcClient::new(url).send_transaction(&tx).await
+    {
+        let total = keypairs.len();
+        let mut to_send: Vec<Arc<Keypair>> = keypairs.to_vec();
+        let mut batch_num = 0usize;
+        // Running total of ATAs confirmed across all batches and retry rounds.
+        let mut confirmed_so_far = 0usize;
+
+        while !to_send.is_empty() {
+            let mut next_round: Vec<Arc<Keypair>> = Vec::new();
+
+            for batch in to_send.chunks(SETUP_BATCH_SIZE) {
+                batch_num += 1;
+                let blockhash = rpc.get_latest_blockhash().await.context("get_latest_blockhash")?;
+                info!(batch = batch_num, size = batch.len(), total, "Sending ATA batch");
+
+                let sigs = send_parallel(rpc_url, batch, blockhash, "create-ata", |kp, url, bh| {
+                    let admin = Arc::clone(&admin_keypair);
+                    let owner = kp.pubkey();
+                    async move {
+                        let tx = create_ata_transaction(&admin, &owner, &mint, bh);
+                        RpcClient::new(url).send_transaction(&tx).await
+                    }
+                })
+                .await;
+
+                let retry_indices =
+                    poll_confirmations(&rpc, &sigs, "create-ata", confirmed_so_far, total).await?;
+                let confirmed = batch.len() - retry_indices.len();
+                confirmed_so_far += confirmed;
+                info!(
+                    batch = batch_num,
+                    confirmed,
+                    retrying = retry_indices.len(),
+                    "ATA batch complete",
+                );
+                for i in retry_indices {
+                    next_round.push(Arc::clone(&batch[i]));
+                }
+            }
+
+            to_send = next_round;
+            if !to_send.is_empty() {
+                warn!(count = to_send.len(), "Retrying failed ATA transactions with fresh blockhash");
+            }
         }
-    })
-    .await;
-    info!(
-        sent = ata_sigs.len(),
-        total = keypairs.len(),
-        elapsed_ms = t4.elapsed().as_millis(),
-        "ATA transactions sent",
-    );
+    }
+    info!(total = keypairs.len(), elapsed_ms = t4.elapsed().as_millis(), "All ATAs confirmed");
 
     // ------------------------------------------------------------------
-    // Task 5: Wait for all ATAs to be confirmed
+    // Tasks 6 + 7: Mint initial token balances in batches of SETUP_BATCH_SIZE
     //
-    // ATAs must exist on-chain before mint-to transactions can reference them.
-    // ------------------------------------------------------------------
-    let t5 = Instant::now();
-    poll_confirmations(&rpc, &ata_sigs, "ATA").await?;
-    info!(
-        confirmed = ata_sigs.len(),
-        elapsed_ms = t5.elapsed().as_millis(),
-        "ATAs confirmed",
-    );
-
-    // ------------------------------------------------------------------
-    // Task 6: Mint initial token balances to all ATAs in parallel
-    //
-    // Each account receives `initial_balance` raw token units.  With
-    // TRANSFER_AMOUNT = 1 per transfer this is also the maximum number of
-    // transfers the account can make before its balance hits zero.
+    // Same batch+retry pattern as tasks 4+5.  Each account receives
+    // `initial_balance` raw token units; with TRANSFER_AMOUNT = 1 per
+    // transfer this equals the maximum number of transfers that account
+    // can make before its balance hits zero.
     // ------------------------------------------------------------------
     let t6 = Instant::now();
-    let blockhash = rpc
-        .get_latest_blockhash()
-        .await
-        .context("get_latest_blockhash")?;
-    let mint_sigs = send_parallel(rpc_url, &keypairs, |kp, url| {
-        let admin = Arc::clone(&admin_keypair);
-        let ata = get_associated_token_address(&kp.pubkey(), &mint);
-        async move {
-            let tx = create_admin_mint_to(&admin, &mint, &ata, initial_balance, blockhash);
-            RpcClient::new(url).send_transaction(&tx).await
-        }
-    })
-    .await;
-    info!(
-        sent = mint_sigs.len(),
-        total = keypairs.len(),
-        elapsed_ms = t6.elapsed().as_millis(),
-        "Mint-to transactions sent",
-    );
+    {
+        let total = keypairs.len();
+        let mut to_send: Vec<Arc<Keypair>> = keypairs.to_vec();
+        let mut batch_num = 0usize;
+        // Running total of mint-to transactions confirmed across all batches and retry rounds.
+        let mut confirmed_so_far = 0usize;
 
-    // ------------------------------------------------------------------
-    // Task 7: Wait for all mint-to transactions to be confirmed
-    // ------------------------------------------------------------------
-    let t7 = Instant::now();
-    poll_confirmations(&rpc, &mint_sigs, "mint-to").await?;
-    info!(
-        confirmed = mint_sigs.len(),
-        elapsed_ms = t7.elapsed().as_millis(),
-        "Mint-to confirmed",
-    );
+        while !to_send.is_empty() {
+            let mut next_round: Vec<Arc<Keypair>> = Vec::new();
+
+            for batch in to_send.chunks(SETUP_BATCH_SIZE) {
+                batch_num += 1;
+                let blockhash = rpc.get_latest_blockhash().await.context("get_latest_blockhash")?;
+                info!(batch = batch_num, size = batch.len(), total, "Sending mint-to batch");
+
+                let sigs = send_parallel(rpc_url, batch, blockhash, "mint-to", |kp, url, bh| {
+                    let admin = Arc::clone(&admin_keypair);
+                    let ata = get_associated_token_address(&kp.pubkey(), &mint);
+                    async move {
+                        let tx = create_admin_mint_to(&admin, &mint, &ata, initial_balance, bh);
+                        RpcClient::new(url).send_transaction(&tx).await
+                    }
+                })
+                .await;
+
+                let retry_indices =
+                    poll_confirmations(&rpc, &sigs, "mint-to", confirmed_so_far, total).await?;
+                let confirmed = batch.len() - retry_indices.len();
+                confirmed_so_far += confirmed;
+                info!(
+                    batch = batch_num,
+                    confirmed,
+                    retrying = retry_indices.len(),
+                    "Mint-to batch complete",
+                );
+                for i in retry_indices {
+                    next_round.push(Arc::clone(&batch[i]));
+                }
+            }
+
+            to_send = next_round;
+            if !to_send.is_empty() {
+                warn!(count = to_send.len(), "Retrying failed mint-to transactions with fresh blockhash");
+            }
+        }
+    }
+    info!(total = keypairs.len(), elapsed_ms = t6.elapsed().as_millis(), "All mint-to confirmed");
 
     // ------------------------------------------------------------------
     // Task 8: Seed BenchState with the current blockhash

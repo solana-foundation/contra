@@ -40,15 +40,33 @@ pub const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the blockhash poller emits an average fetch-latency log line.
 pub const BLOCKHASH_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Raw token units transferred per SPL transfer transaction.
-/// 1 raw unit = 0.000001 token (6 decimals).  Keeping this small avoids
-/// draining account balances during long runs.
+/// Base token units transferred per SPL transfer transaction.
+/// 1 raw unit = 0.000001 token (6 decimals).
 pub const TRANSFER_AMOUNT: u64 = 1;
+
+/// The actual transfer amount is `TRANSFER_AMOUNT + (tx_seq % AMOUNT_VARIANCE)`,
+/// giving amounts in the range [1, 100].  This ensures that transactions with
+/// the same (src, dst, blockhash) — which can repeat when accounts < batch_size
+/// — produce distinct byte payloads and therefore distinct signatures, so the
+/// node's dedup stage cannot treat them as duplicates.
+///
+/// With `--initial-balance 1_000_000` each account can still make at least
+/// 1_000_000 / 100 = 10_000 transfers before exhaustion.
+pub const AMOUNT_VARIANCE: u64 = 100;
 
 /// Maximum number of pending batches allowed in the queue before the
 /// generator yields.  This bounds queue memory and prevents the generator
 /// from running too far ahead of the senders.
 pub const MAX_QUEUE_DEPTH: usize = 32;
+
+/// Number of accounts processed per setup batch (ATA creation, mint-to).
+/// After each batch all transactions are confirmed before the next batch
+/// starts, and only the ones that failed to land are retried.
+pub const SETUP_BATCH_SIZE: usize = 200;
+
+/// Maximum signatures per `getSignatureStatuses` RPC call.
+/// The Solana RPC spec caps this at 256; exceeding it returns HTTP 413.
+pub const SIG_STATUS_CHUNK_SIZE: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Shared data structures

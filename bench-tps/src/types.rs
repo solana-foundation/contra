@@ -40,19 +40,15 @@ pub const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the blockhash poller emits an average fetch-latency log line.
 pub const BLOCKHASH_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Base token units transferred per SPL transfer transaction.
+/// Token units transferred per SPL transfer transaction.
 /// 1 raw unit = 0.000001 token (6 decimals).
-pub const TRANSFER_AMOUNT: u64 = 1;
-
-/// The actual transfer amount is `TRANSFER_AMOUNT + (tx_seq % AMOUNT_VARIANCE)`,
-/// giving amounts in the range [1, 100].  This ensures that transactions with
-/// the same (src, dst, blockhash) — which can repeat when accounts < batch_size
-/// — produce distinct byte payloads and therefore distinct signatures, so the
-/// node's dedup stage cannot treat them as duplicates.
 ///
-/// With `--initial-balance 1_000_000` each account can still make at least
-/// 1_000_000 / 100 = 10_000 transfers before exhaustion.
-pub const AMOUNT_VARIANCE: u64 = 100;
+/// Transaction uniqueness is guaranteed by a memo instruction carrying
+/// `tx_seq` rather than by varying the amount, so all transfers use the
+/// same fixed amount and accounts drain at a predictable rate.
+/// With `--initial-balance 1_000_000` each account can make 1_000_000
+/// transfers before exhaustion.
+pub const TRANSFER_AMOUNT: u64 = 1;
 
 /// Maximum number of pending batches allowed in the queue before the
 /// generator yields.  This bounds queue memory and prevents the generator

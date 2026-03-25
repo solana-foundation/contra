@@ -72,6 +72,7 @@
           "expr": "contra_bench_tps_current_tps",
           "legendFormat": "Landed TPS",
           "refId": "A",
+          "interval": "1s",
           "step": "1s"
         }
       ],
@@ -117,7 +118,8 @@
           "expr": "irate(contra_bench_tps_sent_total[5s])",
           "legendFormat": "Sent/s",
           "refId": "A",
-          "step": "1s"
+          "interval": "5s",
+          "step": "5s"
         }
       ],
       "title": "Sent TPS (Sender Threads)",

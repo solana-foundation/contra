@@ -23,12 +23,17 @@
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, NO_LABELS},
-        types::{
-            BatchQueue, BenchConfig, BenchState, AMOUNT_VARIANCE, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT,
-        },
+        types::{BatchQueue, BenchConfig, BenchState, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT},
     },
-    contra_core::client::create_spl_transfer,
-    solana_sdk::pubkey::Pubkey,
+    solana_sdk::{
+        hash::Hash,
+        instruction::Instruction,
+        pubkey::Pubkey,
+        signature::Keypair,
+        signer::Signer,
+        transaction::Transaction,
+    },
+    spl_associated_token_account::get_associated_token_address,
     std::sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -36,6 +41,57 @@ use {
     tokio_util::sync::CancellationToken,
     tracing::warn,
 };
+
+/// SPL Memo v1 program — accepts arbitrary UTF-8 (or raw bytes) as instruction
+/// data and succeeds unconditionally, making it the standard way to embed
+/// unique metadata in a Solana transaction without affecting token balances.
+const MEMO_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
+/// Build a signed SPL token transfer transaction with a memo instruction that
+/// encodes `nonce` as 8 little-endian bytes.
+///
+/// Appending a unique nonce guarantees that every transaction has distinct
+/// bytes — and therefore a distinct signature — regardless of whether the
+/// `(src, dst, amount, blockhash)` tuple repeats.  This completely eliminates
+/// the duplicate-signature rejections that the dedup stage would otherwise
+/// produce when accounts or destinations are few relative to batch size.
+fn build_transfer(
+    from: &Keypair,
+    to: &Pubkey,
+    mint: &Pubkey,
+    amount: u64,
+    blockhash: Hash,
+    nonce: u64,
+) -> Transaction {
+    let from_pubkey = from.pubkey();
+    let from_ata = get_associated_token_address(&from_pubkey, mint);
+    let to_ata = get_associated_token_address(to, mint);
+
+    let transfer_ix = spl_token::instruction::transfer(
+        &spl_token::id(),
+        &from_ata,
+        &to_ata,
+        &from_pubkey,
+        &[],
+        amount,
+    )
+    .unwrap();
+
+    // Memo carries the 8-byte little-endian encoding of `nonce` (= tx_seq).
+    // The memo program requires no accounts and accepts any byte sequence.
+    let memo_ix = Instruction {
+        program_id: MEMO_PROGRAM_ID,
+        accounts: vec![],
+        data: nonce.to_le_bytes().to_vec(),
+    };
+
+    Transaction::new_signed_with_payer(
+        &[transfer_ix, memo_ix],
+        Some(&from_pubkey),
+        &[from],
+        blockhash,
+    )
+}
 
 /// Build the list of destination wallet pubkeys for the load phase.
 ///
@@ -96,8 +152,9 @@ pub async fn run_generator(
         for _ in 0..batch_size {
             let src = &config.accounts[tx_seq % config.accounts.len()];
             let dst = &config.destinations[tx_seq % config.destinations.len()];
-            let amount = TRANSFER_AMOUNT + (tx_seq as u64 % AMOUNT_VARIANCE);
-            let tx = create_spl_transfer(src, dst, &config.mint, amount, blockhash);
+            // tx_seq is passed as the memo nonce so every transaction has a
+            // unique signature regardless of blockhash or account cycling.
+            let tx = build_transfer(src, dst, &config.mint, TRANSFER_AMOUNT, blockhash, tx_seq as u64);
             batch.push(tx);
             tx_seq = tx_seq.wrapping_add(1);
         }

@@ -1,8 +1,6 @@
 use {
     crate::{
-        accounts::traits::AccountsDB,
-        nodes::node::WorkerHandle,
-        stage_metrics::SharedMetrics,
+        accounts::traits::AccountsDB, nodes::node::WorkerHandle, stage_metrics::SharedMetrics,
     },
     anyhow::{ensure, Result},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},

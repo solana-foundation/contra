@@ -110,8 +110,12 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
             // Process the collected transactions into conflict-free batches
             if !pending_transactions.is_empty() {
                 metrics.sequencer_collected(pending_transactions.len());
-                let sent =
-                    process_and_send_batches(&mut scheduler, &pending_transactions, &batch_tx, &metrics);
+                let sent = process_and_send_batches(
+                    &mut scheduler,
+                    &pending_transactions,
+                    &batch_tx,
+                    &metrics,
+                );
                 total_batches_sent += sent;
                 pending_transactions.clear();
 

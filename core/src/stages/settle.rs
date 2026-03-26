@@ -137,6 +137,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         metrics,
     } = args;
     let handle = tokio::spawn(async move {
+        #[allow(clippy::too_many_arguments)]
         async fn run_settle_worker(
             mut execution_results_rx: mpsc::UnboundedReceiver<(
                 LoadAndExecuteSanitizedTransactionsOutput,
@@ -494,7 +495,6 @@ mod tests {
             start_test_redis,
         },
     };
-    use std::sync::Arc;
     use solana_sdk::{
         account::AccountSharedData,
         pubkey::Pubkey,
@@ -506,6 +506,7 @@ mod tests {
         ExecutedTransaction, TransactionExecutionDetails,
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 

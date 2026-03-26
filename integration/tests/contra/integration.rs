@@ -1,6 +1,6 @@
 use anyhow::Result;
 use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 
 #[path = "./rpc/mod.rs"]
 mod rpc;
@@ -128,6 +128,7 @@ async fn test_with_redis() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         // Start Redis container for contra accountsdb
         let redis_container = Redis::default()
+            .with_tag("7")
             .start()
             .await
             .expect("Failed to start Redis container");

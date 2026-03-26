@@ -7,12 +7,12 @@ and verify the Landed TPS metric.
 
 ## Landed TPS — How It Is Calculated
 
-The **Landed TPS** panel shows `contra_bench_tps_current_tps`, a Gauge updated by
-the bench binary every second:
+The **Landed TPS** panel queries `rate(contra_bench_tps_landed_total[10s])`, a
+counter incremented by the bench binary each time `getTransactionCount` advances:
 
 ```
-tps = getTransactionCount() − prev_count
-BENCH_TPS_CURRENT.set(tps)
+delta = getTransactionCount() − prev_count
+contra_bench_tps_landed_total.inc_by(delta)
 ```
 
 `getTransactionCount` reads the `transaction_count` key from the Postgres metadata
@@ -67,7 +67,7 @@ Any persistent gap at a specific stage is the bottleneck.
 The raw send rate from the bench. This is the demand being placed on the node.
 
 **Landed TPS**
-`contra_bench_tps_current_tps`
+`rate(contra_bench_tps_landed_total[10s])`
 
 Transactions confirmed as settled. Compare to Sent TPS — the gap is total pipeline
 loss. If Sent ≫ Landed at steady state, something in the stages below is dropping.

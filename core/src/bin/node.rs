@@ -76,7 +76,7 @@ struct Args {
     perf_sample_period_secs: u64,
 
     /// Enable Prometheus stage metrics server (load testing / profiling only).
-    /// Uses CONTRA_METRICS_PORT for the bind port (default 9090).
+    /// Bind port is controlled by the CONTRA_METRICS_PORT environment variable (default: 9090).
     #[arg(long, env = "CONTRA_METRICS")]
     metrics: bool,
 }

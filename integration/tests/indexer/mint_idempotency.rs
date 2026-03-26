@@ -18,6 +18,9 @@ use contra_indexer::operator::{
 };
 use helpers::{generate_mint, send_and_confirm_instructions, setup_wallets};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_config::RpcTransactionConfig;
+use solana_transaction_status::UiTransactionEncoding;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     instruction::{AccountMeta, Instruction},
@@ -97,9 +100,6 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
     // Poll until both getSignaturesForAddress and getTransaction succeed for
     // our signature, guaranteeing full indexing before find_existing_mint_signature.
     {
-        use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-        use solana_client::rpc_config::RpcTransactionConfig;
-        use solana_transaction_status::UiTransactionEncoding;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         loop {
             let sigs = client

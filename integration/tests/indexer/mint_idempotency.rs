@@ -20,12 +20,12 @@ use helpers::{generate_mint, send_and_confirm_instructions, setup_wallets};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_config::RpcTransactionConfig;
-use solana_transaction_status::UiTransactionEncoding;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     instruction::{AccountMeta, Instruction},
     signature::{Keypair, Signer},
 };
+use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::sync::Arc;
 use test_utils::validator_helper::start_test_validator;

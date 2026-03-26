@@ -582,7 +582,7 @@ async fn verify_final_balances(
 // Test Functions
 // ============================================================================
 
-#[allow(dead_code)]
+#[allow(dead_code, unreachable_code, unused_variables)]
 async fn execute_tree_rotation_boundary_phase(
     client: &Arc<RpcClient>,
     pool: &sqlx::PgPool,

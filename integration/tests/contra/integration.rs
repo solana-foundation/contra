@@ -1,6 +1,7 @@
 use anyhow::Result;
 use contra_core::stage_metrics::NoopMetrics;
 use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
+use std::sync::Arc;
 use testcontainers::{ContainerAsync, ImageExt};
 
 #[path = "./rpc/mod.rs"]

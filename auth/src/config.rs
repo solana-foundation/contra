@@ -19,4 +19,8 @@ pub struct Config {
     /// restricted in any environment that handles real credentials.
     #[arg(long, env = "CORS_ALLOWED_ORIGIN", default_value = "*")]
     pub cors_allowed_origin: String,
+
+    /// Maximum number of connections in the database pool.
+    #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
+    pub database_max_connections: u32,
 }

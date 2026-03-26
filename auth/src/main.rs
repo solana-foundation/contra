@@ -14,7 +14,7 @@ async fn main() {
     tracing::info!("Starting contra-auth on port {}", config.port);
 
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.database_max_connections)
         .connect(&config.database_url)
         .await
         .expect("failed to connect to database");

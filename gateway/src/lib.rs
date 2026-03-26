@@ -83,6 +83,13 @@ pub struct Args {
     /// Required when JWT_SECRET is set (used for wallet ownership checks).
     #[arg(long, env = "AUTH_DATABASE_URL")]
     pub auth_database_url: Option<String>,
+
+    /// Maximum number of connections in the auth database pool.
+    /// Only relevant when AUTH_DATABASE_URL is set. Each concurrent request
+    /// that hits a gated method occupies one connection for the ownership
+    /// check, so this should be sized to match expected peak concurrency.
+    #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
+    pub auth_database_max_connections: u32,
 }
 
 pub struct Gateway {
@@ -611,8 +618,14 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // This pool is used for per-request wallet ownership checks.
     let auth_db = match args.auth_database_url {
         Some(ref url) => {
-            let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
-            info!("  Auth DB: connected");
+            let pool = PgPoolOptions::new()
+                .max_connections(args.auth_database_max_connections)
+                .connect(url)
+                .await?;
+            info!(
+                "  Auth DB: connected (max_connections={})",
+                args.auth_database_max_connections
+            );
             Some(pool)
         }
         None => {

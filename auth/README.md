@@ -10,6 +10,7 @@ Authentication service for the Contra platform. Handles user registration, login
 | `AUTH_DATABASE_URL` | — | Postgres connection URL |
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.contra.xyz`). Defaults to `*` for local dev. |
+| `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
 
 ## API
 

@@ -25,7 +25,7 @@ use {
 /// Returns `Vec<Option<Signature>>` indexed 1:1 with `keypairs`:
 ///   - `Some(sig)` — `send_transaction` succeeded; sig is awaiting confirmation
 ///   - `None`      — `send_transaction` failed; this keypair index will be
-///                   returned by `poll_confirmations` as a retry candidate
+///     returned by `poll_confirmations` as a retry candidate
 ///
 /// Progress is logged after every chunk of 64 so long-running batches are not
 /// silent.

@@ -54,9 +54,9 @@ pub struct Args {
     ///
     /// Controls how much sequencer contention the test generates:
     ///   - 1            → all senders write to the same destination ATA
-    ///                    (maximum conflict, stresses the sequencer)
+    ///     (maximum conflict, stresses the sequencer)
     ///   - == accounts  → each sender has a unique destination
-    ///                    (no conflicts, maximum throughput)
+    ///     (no conflicts, maximum throughput)
     ///
     /// Defaults to `--accounts` when omitted.
     #[arg(long, env = "BENCH_NUM_CONFLICT_GROUPS")]

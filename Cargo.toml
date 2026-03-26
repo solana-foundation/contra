@@ -14,9 +14,8 @@ members = [
     "integration",
     "test_utils",
     "scripts/devnet",
+    "bench-tps",
 ]
-
-exclude = ["bench-tps"]
 
 resolver = "2"
 

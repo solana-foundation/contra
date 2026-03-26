@@ -82,21 +82,30 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# Step 2 — Sanity checks
+# Step 2 — Build bench binary (if needed) and ensure .env exists
 #
-# The binary must be compiled before running this script.  The .env file
-# must exist (copy .env.sample and fill in values).
+# With --rebuild the binary is always recompiled.  On first run (no binary
+# yet) it is built automatically so `run.sh --rebuild` works from scratch.
+# The .env file is auto-seeded from .env.sample if it does not exist yet.
 # ---------------------------------------------------------------------------
-if [ ! -f "${BENCH_BIN}" ]; then
-    echo "ERROR: binary not found at ${BENCH_BIN}" >&2
-    echo "       Run: cargo build --release --manifest-path bench-tps/Cargo.toml" >&2
-    exit 1
+if [ "${REBUILD}" -eq 1 ]; then
+    echo "Building bench binary (--rebuild flag set)..."
+    cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
+elif [ ! -f "${BENCH_BIN}" ]; then
+    echo "Bench binary not found — building (this may take a few minutes)..."
+    cargo build --release --manifest-path "${BENCH_DIR}/Cargo.toml"
+else
+    echo "Bench binary found — skipping build"
 fi
 
 if [ ! -f "${BENCH_ENV}" ]; then
-    echo "ERROR: ${BENCH_ENV} not found" >&2
-    echo "       Run: cp ${BENCH_DIR}/.env.sample ${BENCH_ENV} and fill in the values" >&2
-    exit 1
+    if [ -f "${BENCH_DIR}/.env.sample" ]; then
+        cp "${BENCH_DIR}/.env.sample" "${BENCH_ENV}"
+        echo "Created ${BENCH_ENV} from .env.sample (review and adjust values if needed)"
+    else
+        echo "ERROR: ${BENCH_ENV} not found and no .env.sample to seed from" >&2
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------------------------

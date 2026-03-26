@@ -232,6 +232,33 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
     // to confirm that all deposit statuses contribute to the DB-expected balance.
     seed_mint_and_deposit(&pool, &mint_pubkey.to_string(), AMOUNT as i64).await?;
 
+    // run_startup_reconciliation queries at `finalized` commitment.  Wait for the
+    // ATA balance to become visible at that commitment level before proceeding so
+    // the test doesn't race against the validator's finalization pipeline.
+    {
+        let finalized_client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::finalized());
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &pda,
+            &mint_pubkey,
+            &spl_token::id(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let balance = finalized_client.get_token_account_balance(&ata).await;
+            if let Ok(b) = balance {
+                if b.amount.parse::<u64>().unwrap_or(0) == AMOUNT {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Timed out waiting for finalized ATA balance"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
@@ -239,7 +266,7 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        &seed_keypair.pubkey(),
+        &pda,
     )
     .await;
 

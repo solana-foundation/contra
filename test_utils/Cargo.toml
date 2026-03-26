@@ -11,6 +11,7 @@ contra-indexer = { path = "../indexer" }
 serde_json.workspace = true
 solana-address.workspace = true
 solana-client.workspace = true
+solana-net-utils = "3.0"
 solana-rpc.workspace = true
 solana-sdk.workspace = true
 solana-sdk-ids = "3.0"

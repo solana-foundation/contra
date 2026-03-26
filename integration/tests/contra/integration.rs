@@ -1,6 +1,6 @@
 use anyhow::Result;
 use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 
 #[path = "./rpc/mod.rs"]
 mod rpc;
@@ -88,7 +88,6 @@ async fn test_with_postgres() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn test_signature_statuses_only_with_postgres() {
     init_tracing();
 
@@ -122,17 +121,14 @@ async fn test_signature_statuses_only_with_postgres() {
     .unwrap();
 }
 
-// TODO: Tests aren't running well together. Individually, they pass. This
-// started happening after adding the L1 -> Contra operator. Needs
-// investigation.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn test_with_redis() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
         // Start Redis container for contra accountsdb
         let redis_container = Redis::default()
+            .with_tag("7")
             .start()
             .await
             .expect("Failed to start Redis container");
@@ -158,20 +154,17 @@ async fn test_with_redis() {
     .unwrap();
 }
 
+/// Startup is organized into three parallel stages to minimize wall-clock time:
+///   1. Validator + both Postgres containers  (all independent)
+///   2. Both indexers              (each has its own DB and datasource)
+///   3. Both operators             (independent of each other)
 async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
-    // Acquire global setup lock to serialize test initialization
-    // This prevents parallel tests from conflicting on shared resources
+    // Acquire global setup lock to serialize test initialization.
+    // With nextest each test runs in its own process so this never blocks across
+    // tests; it only guards against concurrent calls within the same process.
     let _lock = SETUP_LOCK.lock().await;
 
-    // Start solana-test-validator
-    let (test_validator, faucet_keypair, geyser_port) = start_test_validator().await;
-    println!(
-        "Solana test validator started on {}",
-        test_validator.rpc_url()
-    );
-    println!("Geyser plugin running on port {}", geyser_port);
-
-    // Generate keys
+    // Generate keys before launching anything async
     let operator_key = Keypair::new();
     let mint = Pubkey::new_unique();
     let escrow_instance = Keypair::new();
@@ -179,34 +172,38 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
     println!("Operator: {}", operator_key.pubkey());
     println!("Mint: {}", mint);
 
-    let node_config = NodeConfig {
-        mode: NodeMode::Aio,
-        port: get_free_port(),
-        sigverify_queue_size: 100,
-        sigverify_workers: 2,
-        max_connections: 50,
-        max_tx_per_batch: 10,
-        accountsdb_connection_url: accountsdb_connection_url.clone(),
-        admin_keys: vec![operator_key.pubkey()],
-        transaction_expiration_ms: 15000,
-        blocktime_ms: 100,
-        perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
-    };
+    // Start the validator and both indexer Postgres containers in parallel —
+    // they are fully independent of each other.
+    println!("Starting validator and indexer databases in parallel...");
+    let (
+        (test_validator, faucet_keypair, geyser_port),
+        contra_indexer_postgres_container,
+        l1_indexer_postgres_container,
+    ) = tokio::join!(
+        start_test_validator(),
+        Postgres::default()
+            .with_db_name("contra_indexer")
+            .with_user("postgres")
+            .with_password("password")
+            .start(),
+        Postgres::default()
+            .with_db_name("l1_indexer")
+            .with_user("postgres")
+            .with_password("password")
+            .start(),
+    );
+    let contra_indexer_postgres_container =
+        contra_indexer_postgres_container.expect("Failed to start Contra PostgreSQL container");
+    let l1_indexer_postgres_container =
+        l1_indexer_postgres_container.expect("Failed to start L1 PostgreSQL container");
 
-    let (contra_handles, contra_rpc_url) = start_contra(node_config).await.unwrap();
+    println!(
+        "Solana test validator started on {}",
+        test_validator.rpc_url()
+    );
+    println!("Geyser plugin running on port {}", geyser_port);
 
-    // Start Contra indexer (RPC polling) in background
-    println!("\n=== Starting Contra Indexer (RPC Polling) ===");
-
-    // Start PostgreSQL container for Contra indexer
-    let contra_indexer_postgres_container = Postgres::default()
-        .with_db_name("contra_indexer")
-        .with_user("postgres")
-        .with_password("password")
-        .start()
-        .await
-        .expect("Failed to start Contra PostgreSQL container");
-
+    // Resolve DB URLs now that the containers are up
     let contra_indexer_host = contra_indexer_postgres_container
         .get_host()
         .await
@@ -219,25 +216,6 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         "postgres://postgres:password@{}:{}/contra_indexer",
         contra_indexer_host, contra_indexer_port
     );
-
-    let (contra_indexer_handle, contra_indexer_storage) =
-        start_contra_indexer(None, contra_rpc_url.clone(), contra_indexer_db_url.clone())
-            .await
-            .expect("Failed to start Contra indexer");
-
-    println!("Contra Indexer started successfully");
-
-    // Start L1 indexer (Yellowstone geyser) in background
-    println!("\n=== Starting L1 Indexer (Yellowstone Geyser) ===");
-
-    // Start PostgreSQL container for L1 indexer
-    let l1_indexer_postgres_container = Postgres::default()
-        .with_db_name("l1_indexer")
-        .with_user("postgres")
-        .with_password("password")
-        .start()
-        .await
-        .expect("Failed to start L1 PostgreSQL container");
 
     let l1_indexer_host = l1_indexer_postgres_container
         .get_host()
@@ -252,48 +230,69 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         l1_indexer_host, l1_indexer_port
     );
 
-    let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
+    // Start the Contra node (requires the validator URL)
+    let node_config = NodeConfig {
+        mode: NodeMode::Aio,
+        port: get_free_port(),
+        sigverify_queue_size: 100,
+        sigverify_workers: 2,
+        max_connections: 50,
+        max_tx_per_batch: 10,
+        accountsdb_connection_url: accountsdb_connection_url.clone(),
+        admin_keys: vec![operator_key.pubkey()],
+        transaction_expiration_ms: 15000,
+        blocktime_ms: 100,
+        perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
+    };
+    let (contra_handles, contra_rpc_url) = start_contra(node_config).await.unwrap();
+
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
         &[b"instance", escrow_instance.pubkey().as_ref()],
         &CONTRA_ESCROW_PROGRAM_ID,
     );
-    let (l1_indexer_handle, l1_indexer_storage) = start_l1_indexer(
-        geyser_endpoint,
-        test_validator.rpc_url(),
-        l1_indexer_db_url.clone(),
-        Some(instance_pda),
-    )
-    .await
-    .expect("Failed to start L1 indexer");
 
-    println!("L1 Indexer started successfully");
+    // Start both indexers in parallel — each has its own DB and datasource
+    println!("\n=== Starting Contra Indexer and L1 Indexer in parallel ===");
+    let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
+    let (contra_indexer_result, l1_indexer_result) = tokio::join!(
+        start_contra_indexer(None, contra_rpc_url.clone(), contra_indexer_db_url.clone()),
+        start_l1_indexer(
+            geyser_endpoint,
+            test_validator.rpc_url(),
+            l1_indexer_db_url.clone(),
+            Some(instance_pda),
+        ),
+    );
+    let (contra_indexer_handle, contra_indexer_storage) =
+        contra_indexer_result.expect("Failed to start Contra indexer");
+    let (l1_indexer_handle, l1_indexer_storage) =
+        l1_indexer_result.expect("Failed to start L1 indexer");
+    println!("Contra Indexer and L1 Indexer started successfully");
 
-    // Start L1 -> Contra operator
-    println!("\n=== Starting L1 -> Contra Operator ===");
-    let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let l1_to_contra_operator_handle = start_l1_to_contra_operator(
-        contra_rpc_url.clone(),
-        l1_indexer_db_url.clone(),
-        operator_key_clone,
-        instance_pda,
-    )
-    .await
-    .expect("Failed to start L1 -> Contra operator");
-    println!("L1 -> Contra Operator started successfully");
-
-    // Start Contra -> L1 operator
-    println!("\n=== Starting Contra -> L1 Operator ===");
-    let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let contra_to_l1_operator_handle = start_contra_to_l1_operator(
-        test_validator.rpc_url(),
-        contra_indexer_db_url.clone(),
-        operator_key_clone,
-        instance_pda,
-    )
-    .await
-    .expect("Failed to start Contra -> L1 operator");
-    println!("Contra -> L1 Operator started successfully");
+    // Start both operators in parallel — they are independent of each other
+    println!("\n=== Starting Operators in parallel ===");
+    let operator_key_l1_to_contra = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    let operator_key_contra_to_l1 = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    let (l1_to_contra_result, contra_to_l1_result) = tokio::join!(
+        start_l1_to_contra_operator(
+            contra_rpc_url.clone(),
+            l1_indexer_db_url.clone(),
+            operator_key_l1_to_contra,
+            instance_pda,
+        ),
+        start_contra_to_l1_operator(
+            test_validator.rpc_url(),
+            contra_indexer_db_url.clone(),
+            operator_key_contra_to_l1,
+            instance_pda,
+        ),
+    );
+    let l1_to_contra_operator_handle =
+        l1_to_contra_result.expect("Failed to start L1 -> Contra operator");
+    let contra_to_l1_operator_handle =
+        contra_to_l1_result.expect("Failed to start Contra -> L1 operator");
+    println!("L1 -> Contra and Contra -> L1 Operators started successfully");
 
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     let l1_ctx = L1Context::new(

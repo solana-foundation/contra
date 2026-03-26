@@ -10,8 +10,11 @@ use solana_sdk::{
     signature::{Keypair, Signer},
 };
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
-use spl_associated_token_account::get_associated_token_address_with_program_id;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_associated_token_account::{
+    get_associated_token_address_with_program_id,
+    instruction::create_associated_token_account_idempotent,
+};
+use spl_token::{instruction::mint_to, ID as TOKEN_PROGRAM_ID};
 
 use super::helpers::{
     generate_mint, get_token_balance, mint_to_owner, send_and_confirm_instructions, setup_wallets,
@@ -81,24 +84,58 @@ impl TestEnvironment {
         let mint_keypair = Keypair::new();
         let mint = generate_mint(client, &admin, &admin, &mint_keypair).await?;
 
-        // Mint to users
-        for user in &users {
-            mint_to_owner(
+        // batch all user ATA-creation + mint instructions into a
+        // single transaction instead of one confirmation round-trip per user.
+        // This reduces setup time from O(N × latency) to O(1 × latency).
+        if !users.is_empty() && initial_user_balance > 0 {
+            let mut batch_ixs = Vec::new();
+            for user in &users {
+                let ata = get_associated_token_address_with_program_id(
+                    &user.pubkey(),
+                    &mint,
+                    &TOKEN_PROGRAM_ID,
+                );
+                batch_ixs.push(create_associated_token_account_idempotent(
+                    &admin.pubkey(),
+                    &user.pubkey(),
+                    &mint,
+                    &TOKEN_PROGRAM_ID,
+                ));
+                batch_ixs.push(mint_to(
+                    &TOKEN_PROGRAM_ID,
+                    &mint,
+                    &ata,
+                    &admin.pubkey(),
+                    &[],
+                    initial_user_balance,
+                )?);
+            }
+            send_and_confirm_instructions(
                 client,
+                &batch_ixs,
                 &admin,
-                mint,
-                user.pubkey(),
-                &admin,
-                initial_user_balance,
+                &[&admin],
+                "Batch Mint to Users",
             )
             .await?;
-            let owner_token_balance = get_token_balance(client, &user.pubkey(), &mint).await?;
-            println!(
-                "Minted {} tokens to {}. New balance: {} tokens",
-                initial_user_balance,
-                user.pubkey(),
-                owner_token_balance
-            );
+            for user in &users {
+                let balance = get_token_balance(client, &user.pubkey(), &mint).await?;
+                println!(
+                    "Minted {} tokens to {}. New balance: {} tokens",
+                    initial_user_balance,
+                    user.pubkey(),
+                    balance
+                );
+            }
+        } else {
+            // Zero-balance case: still create ATAs so token accounts exist on-chain.
+            for user in &users {
+                mint_to_owner(client, &admin, mint, user.pubkey(), &admin, 0).await?;
+                println!(
+                    "Minted 0 tokens to {}. New balance: 0 tokens",
+                    user.pubkey()
+                );
+            }
         }
 
         let (_, instance_pda) =
@@ -220,6 +257,7 @@ impl TestEnvironment {
     }
 
     /// Setup for multi-user chaos testing
+    #[allow(dead_code)]
     pub async fn setup_multi_user(
         client: &RpcClient,
         faucet_keypair: &Keypair,

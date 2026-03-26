@@ -102,7 +102,19 @@ impl ContraContext {
             .await
             .map_err(|e| anyhow::anyhow!("Send transaction failed: {}", e))?;
 
-        sleep(wait_duration).await;
+        // Poll until the transaction is confirmed or wait_duration expires.
+        // With blocktime_ms = 100 ms the transaction is typically settled in < 300 ms,
+        // so this returns much earlier than the 1 s fixed sleep it replaces.
+        let deadline = tokio::time::Instant::now() + wait_duration;
+        loop {
+            if let Ok(Some(_)) = self.get_transaction(&sig).await {
+                return Ok(Some(sig));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
 
         self.get_transaction(&sig).await.map(|opt| opt.map(|_| sig))
     }

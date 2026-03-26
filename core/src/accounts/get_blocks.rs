@@ -85,17 +85,17 @@ async fn get_blocks_redis(
         ));
     }
 
-    // Query blocks within the range
-    // In Redis, blocks are stored with keys like "block:{slot}"
-    // We need to check which slots have blocks
-    let mut slots = Vec::new();
-    for slot in start_slot..=end_slot {
-        let key = format!("block:{}", slot);
-        let exists: redis::RedisResult<bool> = conn.exists(&key).await;
-        if exists.unwrap_or(false) {
-            slots.push(slot);
-        }
-    }
+    // ZRANGE ... BYSCORE queries only the requested range in O(log N + M),
+    // where N is total slots indexed and M is the number of results returned.
+    // Results are returned in ascending score order (slot order) by default.
+    let slots: Vec<u64> = redis::cmd("ZRANGE")
+        .arg("block_slot_index")
+        .arg(start_slot)
+        .arg(end_slot)
+        .arg("BYSCORE")
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| anyhow!("Failed to query block slot index in Redis: {}", e))?;
 
     Ok(slots)
 }

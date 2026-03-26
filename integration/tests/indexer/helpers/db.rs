@@ -103,7 +103,8 @@ async fn wait_for_count_with_filter(
         if count >= expected {
             return Ok(true);
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // 200 ms granularity to detect completion sooner.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
     Ok(false)
@@ -146,7 +147,8 @@ pub async fn wait_for_checkpoint(
                 return Ok(true);
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // 200 ms granularity to detect completion sooner.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
     Ok(false)

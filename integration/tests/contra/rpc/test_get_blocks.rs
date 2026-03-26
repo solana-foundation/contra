@@ -147,5 +147,24 @@ pub async fn run_get_blocks_test(ctx: &ContraContext) {
     }
     println!("✓ Future slot query handled correctly");
 
+    // Test 6: end_slot < start_slot must return an error
+    println!("\nTest 6: Query with end_slot < start_slot (expect error)");
+    let inv_result = ctx.get_blocks(current_slot + 1, Some(current_slot)).await;
+    assert!(
+        inv_result.is_err(),
+        "getBlocks with end_slot < start_slot should return an error, got: {:?}",
+        inv_result
+    );
+    println!("✓ end_slot < start_slot correctly returns error");
+
+    // Test 7: range > MAX_SLOT_RANGE (500_000) must return an error
+    println!("\nTest 7: Query with range > MAX_SLOT_RANGE (expect error)");
+    let large_range_result = ctx.get_blocks(0, Some(500_001)).await;
+    assert!(
+        large_range_result.is_err(),
+        "getBlocks with range > 500_000 should return an error"
+    );
+    println!("✓ Range > MAX_SLOT_RANGE correctly returns error");
+
     println!("\n✓ All getBlocks tests passed!");
 }

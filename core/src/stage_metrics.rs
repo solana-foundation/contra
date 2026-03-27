@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tracing::debug;
 
 /// Instrumentation trait — each stage calls into this; no pipeline logic changes.
 pub trait StageMetrics: Send + Sync {
@@ -35,40 +36,40 @@ pub struct NoopMetrics;
 
 impl StageMetrics for NoopMetrics {
     fn dedup_received(&self) {
-        tracing::debug!("dedup: received");
+        debug!("dedup: received");
     }
     fn dedup_forwarded(&self) {
-        tracing::debug!("dedup: forwarded");
+        debug!("dedup: forwarded");
     }
     fn dedup_dropped_duplicate(&self) {
-        tracing::debug!("dedup: dropped duplicate");
+        debug!("dedup: dropped duplicate");
     }
     fn dedup_dropped_unknown_blockhash(&self) {
-        tracing::debug!("dedup: dropped unknown blockhash");
+        debug!("dedup: dropped unknown blockhash");
     }
     fn sigverify_forwarded(&self) {
-        tracing::debug!("sigverify: forwarded");
+        debug!("sigverify: forwarded");
     }
     fn sigverify_rejected(&self, reason: &'static str) {
-        tracing::debug!("sigverify: rejected reason={}", reason);
+        debug!("sigverify: rejected reason={}", reason);
     }
     fn sequencer_collected(&self, n: usize) {
-        tracing::debug!("sequencer: collected {}", n);
+        debug!("sequencer: collected {}", n);
     }
     fn sequencer_transactions_emitted(&self, n: usize) {
-        tracing::debug!("sequencer: emitted {} transactions", n);
+        debug!("sequencer: emitted {} transactions", n);
     }
     fn executor_results_sent(&self, n: usize) {
-        tracing::debug!("executor: sent {} results", n);
+        debug!("executor: sent {} results", n);
     }
     fn executor_results_send_failed(&self, kind: &'static str) {
-        tracing::debug!("executor: send failed kind={}", kind);
+        debug!("executor: send failed kind={}", kind);
     }
     fn executor_missing_results(&self, kind: &'static str) {
-        tracing::debug!("executor: missing results kind={}", kind);
+        debug!("executor: missing results kind={}", kind);
     }
     fn settler_txs_settled(&self, n: usize) {
-        tracing::debug!("settler: settled {}", n);
+        debug!("settler: settled {}", n);
     }
 }
 

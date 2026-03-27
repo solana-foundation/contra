@@ -50,15 +50,14 @@ pub struct Args {
     #[arg(long, default_value_t = 4, env = "BENCH_THREADS")]
     pub threads: usize,
 
-    /// Number of distinct destination accounts.
+    /// Number of distinct receiver accounts.
     ///
-    /// Controls how much sequencer contention the test generates:
-    ///   - 1            → all senders write to the same destination ATA
-    ///     (maximum conflict, stresses the sequencer)
-    ///   - == accounts  → each sender has a unique destination
-    ///     (no conflicts, maximum throughput)
+    /// Accounts are split into a sender pool (first half) and a receiver pool
+    /// (second half).  This flag controls how many receivers are used:
+    ///   - 1              → all senders target the same receiver (max contention)
+    ///   - accounts / 2   → each sender has a unique receiver (zero contention)
     ///
-    /// Defaults to `--accounts` when omitted.
+    /// Defaults to `accounts / 2` (zero contention) when omitted.
     #[arg(long, env = "BENCH_NUM_CONFLICT_GROUPS")]
     pub num_conflict_groups: Option<usize>,
 

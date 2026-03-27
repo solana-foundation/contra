@@ -137,7 +137,9 @@ pub async fn run_setup_phase(
     };
     let retry = poll_confirmations(&rpc, &[Some(mint_sig)], "initialize_mint", 0, 1).await?;
     if !retry.is_empty() {
-        return Err(anyhow::anyhow!("initialize_mint failed to confirm on-chain"));
+        return Err(anyhow::anyhow!(
+            "initialize_mint failed to confirm on-chain"
+        ));
     }
     info!(mint = %mint, elapsed_ms = t3.elapsed().as_millis(), "Mint initialized");
 
@@ -164,8 +166,16 @@ pub async fn run_setup_phase(
 
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = rpc.get_latest_blockhash().await.context("get_latest_blockhash")?;
-                info!(batch = batch_num, size = batch.len(), total, "Sending ATA batch");
+                let blockhash = rpc
+                    .get_latest_blockhash()
+                    .await
+                    .context("get_latest_blockhash")?;
+                info!(
+                    batch = batch_num,
+                    size = batch.len(),
+                    total,
+                    "Sending ATA batch"
+                );
 
                 let sigs = send_parallel(rpc_url, batch, blockhash, "create-ata", |kp, url, bh| {
                     let admin = Arc::clone(&admin_keypair);
@@ -194,11 +204,18 @@ pub async fn run_setup_phase(
 
             to_send = next_round;
             if !to_send.is_empty() {
-                warn!(count = to_send.len(), "Retrying failed ATA transactions with fresh blockhash");
+                warn!(
+                    count = to_send.len(),
+                    "Retrying failed ATA transactions with fresh blockhash"
+                );
             }
         }
     }
-    info!(total = keypairs.len(), elapsed_ms = t4.elapsed().as_millis(), "All ATAs confirmed");
+    info!(
+        total = keypairs.len(),
+        elapsed_ms = t4.elapsed().as_millis(),
+        "All ATAs confirmed"
+    );
 
     // ------------------------------------------------------------------
     // Tasks 6 + 7: Mint initial token balances in batches of SETUP_BATCH_SIZE
@@ -221,8 +238,16 @@ pub async fn run_setup_phase(
 
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = rpc.get_latest_blockhash().await.context("get_latest_blockhash")?;
-                info!(batch = batch_num, size = batch.len(), total, "Sending mint-to batch");
+                let blockhash = rpc
+                    .get_latest_blockhash()
+                    .await
+                    .context("get_latest_blockhash")?;
+                info!(
+                    batch = batch_num,
+                    size = batch.len(),
+                    total,
+                    "Sending mint-to batch"
+                );
 
                 let sigs = send_parallel(rpc_url, batch, blockhash, "mint-to", |kp, url, bh| {
                     let admin = Arc::clone(&admin_keypair);
@@ -251,11 +276,18 @@ pub async fn run_setup_phase(
 
             to_send = next_round;
             if !to_send.is_empty() {
-                warn!(count = to_send.len(), "Retrying failed mint-to transactions with fresh blockhash");
+                warn!(
+                    count = to_send.len(),
+                    "Retrying failed mint-to transactions with fresh blockhash"
+                );
             }
         }
     }
-    info!(total = keypairs.len(), elapsed_ms = t6.elapsed().as_millis(), "All mint-to confirmed");
+    info!(
+        total = keypairs.len(),
+        elapsed_ms = t6.elapsed().as_millis(),
+        "All mint-to confirmed"
+    );
 
     // ------------------------------------------------------------------
     // Task 8: Seed BenchState with the current blockhash

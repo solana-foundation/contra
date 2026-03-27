@@ -287,11 +287,6 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
       - name: Run contra integration tests with coverage
         run: make -C integration integration-coverage-contra
 

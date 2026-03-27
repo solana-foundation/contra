@@ -74,19 +74,18 @@ pub struct BenchConfig {
     /// The SPL mint created during setup.  All ATAs and transfers use this mint.
     pub mint: Pubkey,
 
-    /// Source keypairs generated during setup, one per funded account.
+    /// Sender keypairs (first half of funded accounts).
     /// The generator cycles through these round-robin so that each keypair
     /// signs roughly the same number of transactions.
     pub accounts: Vec<Arc<Keypair>>,
 
-    /// Destination wallet pubkeys, len = num_conflict_groups.
-    /// `create_spl_transfer` derives the destination ATA from each pubkey
-    /// internally, so these are owner addresses, not ATA addresses.
+    /// Receiver wallet pubkeys (drawn from the second half of funded accounts).
+    /// Length equals `num_conflict_groups` (clamped to the receiver pool size).
     ///
-    /// Setting num_conflict_groups = 1 forces all transfers to the same
-    /// destination, which maximises sequencer contention (a single conflict
-    /// chain).  Setting it to `accounts` gives each sender a unique
-    /// destination and eliminates sequencer conflicts entirely.
+    /// Because sender and receiver pools are disjoint, no account appears on
+    /// both sides of a transaction — sequencer contention is zero at the
+    /// default setting.  Setting `num_conflict_groups = 1` concentrates all
+    /// traffic on a single receiver to stress the sequencer.
     pub destinations: Vec<Pubkey>,
 }
 

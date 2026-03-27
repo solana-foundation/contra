@@ -82,7 +82,6 @@ async fn main() -> Result<()> {
     // Creates the mint, ATAs, and token balances.  The function blocks until
     // all setup transactions are confirmed on-chain before returning.
     // -------------------------------------------------------------------------
-    let num_conflict_groups = args.num_conflict_groups.unwrap_or(args.accounts);
     let setup_result = setup::run_setup_phase(
         &args.rpc_url,
         &args.admin_keypair,
@@ -98,10 +97,14 @@ async fn main() -> Result<()> {
     // poller, metrics sampler) and the generator + sender threads concurrently.
     // The main task waits for `args.duration` seconds, then cancels everything.
     // -------------------------------------------------------------------------
-    let destinations = build_destinations(&setup_result.keypairs, num_conflict_groups);
+    // Split accounts into sender (first half) and receiver (second half) pools.
+    // num_conflict_groups controls how many distinct receivers are used;
+    // defaults to half of accounts for zero sequencer contention.
+    let num_conflict_groups = args.num_conflict_groups.unwrap_or(args.accounts / 2);
+    let (senders, destinations) = build_destinations(&setup_result.keypairs, num_conflict_groups);
     let config = Arc::new(BenchConfig {
         mint: setup_result.mint,
-        accounts: setup_result.keypairs,
+        accounts: senders,
         destinations,
     });
 
@@ -154,7 +157,11 @@ async fn main() -> Result<()> {
         }));
     }
 
-    info!(duration_secs = args.duration, threads = args.threads, "Load phase started");
+    info!(
+        duration_secs = args.duration,
+        threads = args.threads,
+        "Load phase started"
+    );
     tokio::time::sleep(Duration::from_secs(args.duration)).await;
 
     // Cancel all background tasks and wake any sender threads parked on the

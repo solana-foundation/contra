@@ -412,6 +412,7 @@ services:
       - prometheus-data:/prometheus
     environment:
       - HOST_SUFFIX=
+      - BENCH_METRICS_TARGET=${BENCH_METRICS_TARGET:-host.docker.internal:9101}
       - CONTRA_METRICS_PORT=${CONTRA_METRICS_PORT:-9090}
     networks:
       - contra-network

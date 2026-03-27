@@ -26,11 +26,7 @@ use {
         types::{BatchQueue, BenchConfig, BenchState, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT},
     },
     solana_sdk::{
-        hash::Hash,
-        instruction::Instruction,
-        pubkey::Pubkey,
-        signature::Keypair,
-        signer::Signer,
+        hash::Hash, instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
         transaction::Transaction,
     },
     spl_associated_token_account::get_associated_token_address,
@@ -93,20 +89,36 @@ fn build_transfer(
     )
 }
 
-/// Build the list of destination wallet pubkeys for the load phase.
+/// Split funded accounts into sender and receiver pools for the load phase.
 ///
-/// Takes the first `n` accounts from the funded keypair list and returns their
-/// public keys.  `create_spl_transfer` derives ATAs from these pubkeys
-/// internally, so no extra on-chain lookup is needed.
+/// The accounts list is divided in half:
+///   - **Senders**   (`accounts[0..n/2]`) — sign and pay for each transaction.
+///   - **Receivers** (`accounts[n/2..n]`) — receive tokens; their pubkeys are returned.
 ///
-/// The caller passes `num_conflict_groups` as `n`:
-///   - n = 1         → single destination, maximum sequencer contention
-///   - n = accounts  → unique destination per account, no sequencer contention
-pub fn build_destinations(accounts: &[Arc<solana_sdk::signature::Keypair>], n: usize) -> Vec<Pubkey> {
-    accounts.iter().take(n).map(|kp| {
-        use solana_sdk::signer::Signer;
-        kp.pubkey()
-    }).collect()
+/// No account appears in both roles, so no two concurrent transactions share
+/// an account and sequencer contention is zero at the default setting.
+///
+/// `num_conflict_groups` controls how many distinct receiver accounts are used
+/// (clamped to the size of the receiver pool):
+///   - 1         → every sender targets the same receiver (maximum contention)
+///   - pool size → each sender has a unique receiver (zero contention)
+///
+/// Unlike a self-transfer (`src == dst`), each transaction produces a real
+/// balance change.  Senders drain at `TRANSFER_AMOUNT` per transaction, but
+/// with `--initial-balance 1_000_000` and `TRANSFER_AMOUNT = 1` there is
+/// ample runway for any typical bench run.
+pub fn build_destinations(
+    accounts: &[Arc<solana_sdk::signature::Keypair>],
+    num_conflict_groups: usize,
+) -> (Vec<Arc<solana_sdk::signature::Keypair>>, Vec<Pubkey>) {
+    let mid = accounts.len() / 2;
+    let senders = accounts[..mid].to_vec();
+    let n = num_conflict_groups.min(mid).max(1);
+    let receivers = accounts[mid..mid + n]
+        .iter()
+        .map(|kp| kp.pubkey())
+        .collect();
+    (senders, receivers)
 }
 
 /// Async generator task: signs batches of SPL transfer transactions and pushes
@@ -154,7 +166,14 @@ pub async fn run_generator(
             let dst = &config.destinations[tx_seq % config.destinations.len()];
             // tx_seq is passed as the memo nonce so every transaction has a
             // unique signature regardless of blockhash or account cycling.
-            let tx = build_transfer(src, dst, &config.mint, TRANSFER_AMOUNT, blockhash, tx_seq as u64);
+            let tx = build_transfer(
+                src,
+                dst,
+                &config.mint,
+                TRANSFER_AMOUNT,
+                blockhash,
+                tx_seq as u64,
+            );
             batch.push(tx);
             tx_seq = tx_seq.wrapping_add(1);
         }
@@ -206,8 +225,9 @@ pub fn run_sender_thread(
                 if let Some(batch) = q.pop_front() {
                     break batch;
                 }
-                let (new_q, _) =
-                    cvar.wait_timeout(q, std::time::Duration::from_millis(50)).unwrap();
+                let (new_q, _) = cvar
+                    .wait_timeout(q, std::time::Duration::from_millis(50))
+                    .unwrap();
                 q = new_q;
             }
         };

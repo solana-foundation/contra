@@ -19,7 +19,9 @@
 use {
     crate::{
         bench_metrics::{BENCH_LANDED_TOTAL, NO_LABELS},
-        types::{BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL},
+        types::{
+            BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL,
+        },
     },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::commitment_config::CommitmentConfig,

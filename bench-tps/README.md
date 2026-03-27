@@ -248,39 +248,7 @@ Individual transaction rejected — increments `dropped`.  Occasional failures
 are expected; a high rate points to dedup (stale blockhash), sigverify
 (invalid signature), or the node being overloaded.
 
----
 
-## Workspace isolation
-
-**`bench-tps` is intentionally excluded from the root Cargo workspace.**
-
-```toml
-# Cargo.toml (repo root)
-[workspace]
-exclude = ["bench-tps"]
-```
-
-### Why
-
-The Contra workspace pins service dependencies tightly — specific versions of
-`solana-client`, `tokio`, `sqlx`, etc. — because those versions must be
-ABI-compatible with the Solana validator and postgres driver at runtime.
-
-`bench-tps` only sends HTTP requests; it does not link against the same native
-libraries and does not need to match those pins exactly.  Keeping it excluded:
-
-1. **Prevents dependency hell**: adding bench-specific crates (e.g. heavier
-   testing utilities) cannot break the workspace-wide dependency resolution.
-2. **Faster iteration**: `cargo build` inside `bench-tps/` only rebuilds the
-   bench crate and its direct deps, not the entire workspace.
-3. **Independent lock file**: `bench-tps/Cargo.lock` tracks the bench's own
-   resolved dependency graph.  Changes to workspace deps do not force a bench
-   lockfile update, and vice versa.
-
-The bench still depends on `contra-core` via a path dependency and inherits
-whatever version of `solana-sdk` / `solana-client` that crate uses.
-
----
 
 ## CPU pinning verification
 

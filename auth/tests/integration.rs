@@ -211,8 +211,8 @@ async fn test_register_password_too_long() {
     let addr = start_app(&db_url).await;
     let client = Client::new();
 
-    // 73 characters — one byte over Argon2's silent truncation boundary.
-    let password = "a".repeat(73);
+    // 129 characters — one over the max allowed.
+    let password = "a".repeat(129);
 
     let res = client
         .post(format!("{}/auth/register", base_url(addr)))
@@ -230,8 +230,8 @@ async fn test_register_password_at_boundaries() {
     let addr = start_app(&db_url).await;
     let client = Client::new();
 
-    // Exactly 6 characters (min) and exactly 72 characters (max) must both succeed.
-    for (username, password) in [("min_user", "a".repeat(6)), ("max_user", "a".repeat(72))] {
+    // Exactly 6 characters (min) and exactly 128 characters (max) must both succeed.
+    for (username, password) in [("min_user", "a".repeat(6)), ("max_user", "a".repeat(128))] {
         let res = client
             .post(format!("{}/auth/register", base_url(addr)))
             .json(&json!({ "username": username, "password": password }))
@@ -313,6 +313,21 @@ async fn test_login_wrong_password() {
     let res = client
         .post(format!("{}/auth/login", base_url(addr)))
         .json(&json!({ "username": "alice", "password": "wrongpassword" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_login_unknown_username() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+
+    let res = Client::new()
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "doesnotexist", "password": "password123" }))
         .send()
         .await
         .unwrap();
@@ -853,4 +868,216 @@ async fn test_register_concurrent_same_username_returns_409_not_500() {
         "all other requests should get 409, not 500"
     );
     assert_eq!(errors, 0, "no request should return 500");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cleanup_stale_challenges() {
+    let (db_url, _container) = start_postgres().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    db::init_schema(&pool).await.expect("failed to init schema");
+
+    // Insert a user so we have a valid user_id to reference.
+    let user = db::insert_user(&pool, "cleanupuser", "fakehash")
+        .await
+        .expect("failed to insert user");
+
+    // Insert an expired challenge (expires_at in the past, not used).
+    sqlx::query(
+        r#"
+        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at)
+        VALUES ($1, $2, $3, NOW() - INTERVAL '1 hour')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user.id)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("failed to insert expired challenge");
+
+    // Insert a used challenge (used_at is set, not yet expired).
+    sqlx::query(
+        r#"
+        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at, used_at)
+        VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes', NOW())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user.id)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("failed to insert used challenge");
+
+    // Insert a valid challenge (not expired, not used) — must survive cleanup.
+    let valid_nonce = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at)
+        VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user.id)
+    .bind(valid_nonce)
+    .execute(&pool)
+    .await
+    .expect("failed to insert valid challenge");
+
+    let deleted = db::cleanup_stale_challenges(&pool)
+        .await
+        .expect("cleanup failed");
+
+    assert_eq!(deleted, 2, "expired and used challenges should be removed");
+
+    let remaining: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM contra_auth.challenges WHERE nonce = $1")
+            .bind(valid_nonce)
+            .fetch_one(&pool)
+            .await
+            .expect("count query failed");
+
+    assert_eq!(remaining.0, 1, "valid challenge must not be deleted");
+}
+
+/// Helper: register a user, log in, verify a wallet, and return the token and pubkey.
+async fn setup_user_with_wallet(addr: SocketAddr, username: &str) -> (String, String) {
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap().to_string();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let message = challenge_res["message"].as_str().unwrap().to_string();
+    let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
+    let keypair = Keypair::new();
+    let signature = keypair.sign_message(message.as_bytes());
+
+    client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(&token)
+        .json(&json!({
+            "pubkey": keypair.pubkey().to_string(),
+            "nonce": nonce,
+            "signature": signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    (token, keypair.pubkey().to_string())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delete_wallet_success() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    let (token, pubkey) = setup_user_with_wallet(addr, "alice").await;
+
+    // Wallet should be present before deletion.
+    let wallets: Value = client
+        .get(format!("{}/auth/wallets", base_url(addr)))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(wallets.as_array().unwrap().len(), 1);
+
+    // Delete the wallet.
+    let res = client
+        .delete(format!("{}/auth/wallets/{}", base_url(addr), pubkey))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+
+    // Wallet should no longer appear in the list.
+    let wallets: Value = client
+        .get(format!("{}/auth/wallets", base_url(addr)))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(wallets.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delete_wallet_not_found() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+
+    let (token, _) = setup_user_with_wallet(addr, "alice").await;
+
+    let res = Client::new()
+        .delete(format!(
+            "{}/auth/wallets/{}",
+            base_url(addr),
+            "nonexistentpubkey"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delete_wallet_cannot_delete_other_users_wallet() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    let (_, pubkey) = setup_user_with_wallet(addr, "alice").await;
+    let (bob_token, _) = setup_user_with_wallet(addr, "bobob").await;
+
+    // Bob tries to delete Alice's wallet — must not succeed.
+    let res = client
+        .delete(format!("{}/auth/wallets/{}", base_url(addr), pubkey))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 400);
 }

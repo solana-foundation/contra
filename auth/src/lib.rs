@@ -8,7 +8,7 @@ pub mod routes;
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, HeaderValue, Method, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use sqlx::PgPool;
@@ -78,6 +78,7 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
         .allow_methods(AllowMethods::list([
             Method::GET,
             Method::POST,
+            Method::DELETE,
             Method::OPTIONS,
         ]))
         // Only the headers clients need to send.
@@ -95,6 +96,10 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
             post(routes::verify_wallet::verify_wallet),
         )
         .route("/auth/wallets", get(routes::wallets::wallets))
+        .route(
+            "/auth/wallets/{pubkey}",
+            delete(routes::wallets::delete_wallet),
+        )
         .route("/health", get(|| async { "ok" }))
         .layer(cors)
         .with_state(state)

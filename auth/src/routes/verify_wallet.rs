@@ -1,6 +1,7 @@
 use axum::{extract::State, Json};
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::str::FromStr;
+use tracing::{info, warn};
 
 use crate::{
     db,
@@ -36,7 +37,7 @@ pub async fn verify_wallet(
         .map_err(|_| AppError::BadRequest("invalid signature".into()))?;
 
     if !signature.verify(pubkey.as_ref(), message.as_bytes()) {
-        tracing::warn!(user_id = %claims.sub, pubkey = %req.pubkey, "wallet verification failed: invalid signature");
+        warn!(user_id = %claims.sub, pubkey = %req.pubkey, "wallet verification failed: invalid signature");
         return Err(AppError::Unauthorized);
     }
 
@@ -52,7 +53,7 @@ pub async fn verify_wallet(
             other => other,
         })?;
 
-    tracing::info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
+    info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
 
     Ok(Json(WalletResponse {
         pubkey: wallet.pubkey,

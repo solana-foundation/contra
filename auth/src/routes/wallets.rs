@@ -1,6 +1,16 @@
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
 
-use crate::{db, error::AppResult, jwt::Claims, models::WalletResponse, AppState};
+use crate::{
+    db,
+    error::{AppError, AppResult},
+    jwt::Claims,
+    models::WalletResponse,
+    AppState,
+};
 
 pub async fn wallets(
     State(state): State<AppState>,
@@ -17,4 +27,22 @@ pub async fn wallets(
             })
             .collect(),
     ))
+}
+
+pub async fn delete_wallet(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(pubkey): Path<String>,
+) -> AppResult<StatusCode> {
+    let deleted = db::delete_verified_wallet(&state.pool, claims.sub, &pubkey)
+        .await
+        .map_err(AppError::Db)?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::BadRequest(
+            "wallet not associated with this user".into(),
+        ))
+    }
 }

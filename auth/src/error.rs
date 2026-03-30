@@ -5,6 +5,7 @@ use axum::{
 };
 use serde_json::json;
 use thiserror::Error;
+use tracing::error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -29,14 +30,14 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Internal(e) => {
-                tracing::error!("internal error: {e}");
+                error!("internal error: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),
                 )
             }
             AppError::Db(e) => {
-                tracing::error!("database error: {e}");
+                error!("database error: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal server error".to_string(),

@@ -203,6 +203,37 @@ pub async fn insert_verified_wallet(
     })
 }
 
+/// Delete a verified wallet for the given user. Returns `true` if the wallet was found
+/// and deleted, `false` if it was not associated with the user.
+pub async fn delete_verified_wallet(
+    pool: &PgPool,
+    user_id: Uuid,
+    pubkey: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"DELETE FROM contra_auth.verified_wallets WHERE user_id = $1 AND pubkey = $2"#,
+    )
+    .bind(user_id)
+    .bind(pubkey)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Delete challenges that are expired or already used.
+/// Safe to call at any frequency; designed to run as a periodic background task.
+/// Returns the number of rows deleted.
+pub async fn cleanup_stale_challenges(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"DELETE FROM contra_auth.challenges WHERE used_at IS NOT NULL OR expires_at < NOW()"#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 pub async fn list_verified_wallets(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<VerifiedWallet>> {
     let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
         r#"SELECT pubkey, created_at FROM contra_auth.verified_wallets WHERE user_id = $1"#,

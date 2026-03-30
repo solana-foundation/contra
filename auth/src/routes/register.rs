@@ -3,6 +3,7 @@ use argon2::{
     Argon2,
 };
 use axum::{extract::State, Json};
+use tracing::info;
 
 use crate::{
     db,
@@ -12,11 +13,9 @@ use crate::{
 };
 
 const PASSWORD_MIN_LEN: usize = 6;
-/// Upper bound matches Argon2's input limit. Argon2 silently truncates passwords
-/// longer than 72 bytes, meaning two distinct passwords that share the same first
-/// 72 bytes would produce the same hash. Rejecting inputs above the limit surfaces
-/// the problem to the caller instead of silently accepting a weaker credential.
-const PASSWORD_MAX_LEN: usize = 72;
+/// Prevents DoS via excessively long inputs that would make Argon2 consume
+/// significant CPU and memory on every login/register attempt.
+const PASSWORD_MAX_LEN: usize = 128;
 
 const USERNAME_MIN_LEN: usize = 5;
 const USERNAME_MAX_LEN: usize = 32;
@@ -49,12 +48,14 @@ pub async fn register(
     }
 
     // Validate password length before doing any hashing work.
-    if req.password.len() < PASSWORD_MIN_LEN {
+    // chars().count() is used so limits are in characters, which is what users understand.
+    let password_len = req.password.chars().count();
+    if password_len < PASSWORD_MIN_LEN {
         return Err(AppError::BadRequest(format!(
             "password must be at least {PASSWORD_MIN_LEN} characters"
         )));
     }
-    if req.password.len() > PASSWORD_MAX_LEN {
+    if password_len > PASSWORD_MAX_LEN {
         return Err(AppError::BadRequest(format!(
             "password must not exceed {PASSWORD_MAX_LEN} characters"
         )));
@@ -92,7 +93,7 @@ pub async fn register(
             other => other,
         })?;
 
-    tracing::info!(username = %user.username, "new user registered");
+    info!(username = %user.username, "new user registered");
 
     Ok(Json(user))
 }

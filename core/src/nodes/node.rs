@@ -6,6 +6,7 @@ use {
             ReadDeps, WriteDeps,
         },
         scheduler::ConflictFreeBatch,
+        stage_metrics::{NoopMetrics, SharedMetrics},
         stages::{
             dedup::load_dedup_state, execution::start_execution_worker,
             sequencer::start_sequence_worker, settle::start_settle_worker,
@@ -16,7 +17,7 @@ use {
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
     solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput,
-    std::time::Duration,
+    std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, task::JoinHandle},
     tokio_mpmc,
     tokio_util::sync::CancellationToken,
@@ -46,6 +47,7 @@ pub struct NodeConfig {
     pub transaction_expiration_ms: u64,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64, // Performance sample collection period (default 60 seconds)
+    pub metrics: SharedMetrics,
 }
 
 impl NodeConfig {
@@ -71,6 +73,7 @@ impl Default for NodeConfig {
             transaction_expiration_ms: 15000, // 15 seconds default
             blocktime_ms: 100,                // 100ms default
             perf_sample_period_secs: 60,      // 60 seconds default
+            metrics: Arc::new(NoopMetrics),
         }
     }
 }
@@ -156,6 +159,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 shutdown_token: shutdown_token.clone(),
                 initial_live_blockhashes,
                 initial_dedup_cache,
+                metrics: Arc::clone(&config.metrics),
             })
             .await;
             write_workers.push(dedup);
@@ -167,6 +171,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 rx: sigverify_rx,
                 sequencer_tx,
                 shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
             })
             .await;
             write_workers.extend(sigverify_workers);
@@ -177,6 +182,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 rx: sequencer_rx,
                 batch_tx,
                 shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
             })
             .await;
             write_workers.push(sequence);
@@ -188,6 +194,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 execution_results_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
             })
             .await;
             write_workers.push(execution);
@@ -200,6 +207,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 blocktime_ms: config.blocktime_ms,
                 perf_sample_period_secs: config.perf_sample_period_secs,
                 shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
             })
             .await;
             write_workers.push(settle);

@@ -1,5 +1,7 @@
 use anyhow::Result;
+use contra_core::stage_metrics::NoopMetrics;
 use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
+use std::sync::Arc;
 use testcontainers::{ContainerAsync, ImageExt};
 
 #[path = "./rpc/mod.rs"]
@@ -243,6 +245,7 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         transaction_expiration_ms: 15000,
         blocktime_ms: 100,
         perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
+        metrics: Arc::new(NoopMetrics),
     };
     let (contra_handles, contra_rpc_url) = start_contra(node_config).await.unwrap();
 

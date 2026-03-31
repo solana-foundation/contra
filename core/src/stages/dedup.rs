@@ -1,5 +1,7 @@
 use {
-    crate::{accounts::traits::AccountsDB, nodes::node::WorkerHandle},
+    crate::{
+        accounts::traits::AccountsDB, nodes::node::WorkerHandle, stage_metrics::SharedMetrics,
+    },
     anyhow::{ensure, Result},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
     std::{
@@ -21,6 +23,7 @@ pub struct DedupArgs {
     pub initial_live_blockhashes: LinkedList<Hash>,
     /// Pre-populated from DB on startup; empty on a fresh node.
     pub initial_dedup_cache: HashMap<Hash, HashSet<Signature>>,
+    pub metrics: SharedMetrics,
 }
 
 /// Create the dedup channel pair (unbounded)
@@ -121,6 +124,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
         shutdown_token,
         initial_live_blockhashes,
         initial_dedup_cache,
+        metrics,
     } = args;
 
     let live_blockhashes = Arc::new(RwLock::new(initial_live_blockhashes));
@@ -156,12 +160,14 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                 result = input_rx.recv() => {
                     match result {
                         Some(transaction) => {
+                            metrics.dedup_received();
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
 
                             if !live_blockhashes_clone.read()
                                 .expect("blockhash lock poisoned")
                                 .contains(&blockhash) {
+                                metrics.dedup_dropped_unknown_blockhash();
                                 warn!("Blockhash {} not found in live blockhashes", blockhash);
                                 continue;
                             }
@@ -173,9 +179,8 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                 .unwrap_or(false);
 
                             if is_duplicate {
+                                metrics.dedup_dropped_duplicate();
                                 warn!("Duplicate transaction detected: {} (blockhash: {})", signature, blockhash);
-                                // TODO: Track duplicate metrics
-                                // TODO: Consider returning an error to the client
                                 continue;
                             }
 
@@ -185,6 +190,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                 .or_default()
                                 .insert(signature);
 
+                            metrics.dedup_forwarded();
                             // Forward to sigverify
                             if let Err(e) = output_tx.send(transaction).await {
                                 warn!("Failed to forward transaction to sigverify: {}", e);
@@ -219,7 +225,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
 mod tests {
     use {
         super::*,
-        crate::accounts::traits::BlockInfo,
+        crate::{accounts::traits::BlockInfo, stage_metrics::NoopMetrics},
         solana_sdk::{
             hash::Hash,
             message::Message,
@@ -274,6 +280,7 @@ mod tests {
             shutdown_token: shutdown.clone(),
             initial_live_blockhashes: LinkedList::new(),
             initial_dedup_cache: HashMap::new(),
+            metrics: Arc::new(NoopMetrics),
         };
         tokio::spawn(async move {
             start_dedup(args).await;

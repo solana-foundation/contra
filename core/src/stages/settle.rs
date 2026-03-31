@@ -4,6 +4,7 @@ use {
             postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::BlockInfo, AccountsDB,
         },
         nodes::node::WorkerHandle,
+        stage_metrics::SharedMetrics,
     },
     anyhow::{anyhow, Context, Result},
     redis::AsyncCommands,
@@ -121,6 +122,7 @@ pub struct SettleArgs {
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64,
     pub shutdown_token: CancellationToken,
+    pub metrics: SharedMetrics,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -132,8 +134,10 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         blocktime_ms,
         perf_sample_period_secs,
         shutdown_token,
+        metrics,
     } = args;
     let handle = tokio::spawn(async move {
+        #[allow(clippy::too_many_arguments)]
         async fn run_settle_worker(
             mut execution_results_rx: mpsc::UnboundedReceiver<(
                 LoadAndExecuteSanitizedTransactionsOutput,
@@ -145,6 +149,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             blocktime_ms: u64,
             perf_sample_period_secs: u64,
             shutdown_token: CancellationToken,
+            metrics: SharedMetrics,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -230,6 +235,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             // Track performance metrics
                             let num_txs = processing_results.len() as u64;
                             perf_num_transactions += num_txs;
+                            metrics.settler_txs_settled(processing_results.len());
 
                             last_block = Some(LastBlock {
                                 slot: settle_result.slot,
@@ -318,6 +324,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             blocktime_ms,
             perf_sample_period_secs,
             shutdown_token,
+            metrics,
         )
         .await
         {
@@ -481,9 +488,12 @@ async fn settle_transactions(
 mod tests {
     use super::*;
 
-    use crate::test_helpers::{
-        create_test_sanitized_transaction, postgres_container_url, start_test_postgres,
-        start_test_redis,
+    use crate::{
+        stage_metrics::NoopMetrics,
+        test_helpers::{
+            create_test_sanitized_transaction, postgres_container_url, start_test_postgres,
+            start_test_redis,
+        },
     };
     use solana_sdk::{
         account::AccountSharedData,
@@ -496,6 +506,7 @@ mod tests {
         ExecutedTransaction, TransactionExecutionDetails,
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -886,6 +897,7 @@ mod tests {
             blocktime_ms: 100,
             perf_sample_period_secs: 60,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -913,6 +925,7 @@ mod tests {
             blocktime_ms: 50, // fast for testing
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -964,6 +977,7 @@ mod tests {
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -1287,6 +1301,7 @@ mod tests {
             blocktime_ms: 50,
             perf_sample_period_secs: 1, // fires after 1s
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 

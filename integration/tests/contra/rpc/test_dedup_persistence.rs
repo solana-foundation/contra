@@ -1,12 +1,13 @@
 use {
     contra_core::nodes::node::{NodeConfig, NodeMode},
+    contra_core::stage_metrics::NoopMetrics,
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
         commitment_config::CommitmentConfig, signature::Keypair, signer::Signer,
         transaction::Transaction,
     },
     spl_associated_token_account::get_associated_token_address,
-    std::time::Duration,
+    std::{sync::Arc, time::Duration},
     tokio::time::sleep,
 };
 
@@ -47,6 +48,7 @@ pub async fn run_dedup_persistence_test(db_url: String) {
         transaction_expiration_ms: 15_000,
         blocktime_ms: 100,
         perf_sample_period_secs: 10,
+        metrics: Arc::new(NoopMetrics),
     };
 
     let (handles, rpc_url) = start_contra(node_config.clone()).await.unwrap();

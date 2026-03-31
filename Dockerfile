@@ -48,6 +48,7 @@ COPY integration/Cargo.toml ./integration/
 COPY test_utils/Cargo.toml ./test_utils/
 COPY scripts/devnet/Cargo.toml ./scripts/devnet/
 COPY metrics/Cargo.toml ./metrics/
+COPY bench-tps/Cargo.toml ./bench-tps/
 
 # Create dummy lib.rs files for workspace members we're not building
 RUN mkdir -p contra-escrow-program/program/src contra-escrow-program/tests/integration-tests/src \
@@ -55,14 +56,15 @@ RUN mkdir -p contra-escrow-program/program/src contra-escrow-program/tests/integ
     contra-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
     contra-escrow-program/clients/rust/src contra-withdraw-program/clients/rust/src \
-    core/src metrics/src
+    core/src metrics/src bench-tps/src
 RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/integration-tests/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/program/src/lib.rs \
     contra-withdraw-program/tests/integration-tests/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/clients/rust/src/lib.rs \
-    core/src/lib.rs metrics/src/lib.rs
+    core/src/lib.rs metrics/src/lib.rs && \
+    printf 'fn main() {}\n' > bench-tps/src/main.rs
 
 # Build the project with the dummy files. We can cache this layer.
 RUN cargo build --release

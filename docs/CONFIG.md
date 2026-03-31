@@ -27,6 +27,8 @@ Reference for configuring, tuning, and operating Contra services.
 | `--log-level` | `CONTRA_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `--json-logs` | `CONTRA_JSON_LOGS` | `false` | Structured JSON log output |
 | `--perf-sample-period-secs` | `CONTRA_PERF_SAMPLE_PERIOD_SECS` | `60` | Performance metrics sampling interval |
+| `--metrics` | `CONTRA_METRICS` | `false` | Enable Prometheus stage metrics server |
+| — | `CONTRA_METRICS_PORT` | `9090` | Port for the stage metrics server |
 
 **Startup validation:** The node rejects `blocktime_ms == 0` and `transaction_expiration_ms < blocktime_ms` to prevent misconfiguration.
 

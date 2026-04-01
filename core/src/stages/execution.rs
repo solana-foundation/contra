@@ -6,6 +6,7 @@ use {
             create_transaction_batch_processor, get_transaction_check_results, ContraForkGraph,
         },
         scheduler::ConflictFreeBatch,
+        stage_metrics::SharedMetrics,
         stages::AccountSettlement,
         transactions::is_admin_instruction,
         vm::{
@@ -39,6 +40,7 @@ pub struct ExecutionArgs {
     )>,
     pub accountsdb_connection_url: String,
     pub shutdown_token: CancellationToken,
+    pub metrics: SharedMetrics,
 }
 
 pub struct ExecutionDeps {
@@ -64,6 +66,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         execution_results_tx,
         accountsdb_connection_url,
         shutdown_token,
+        metrics,
     } = args;
     let handle = tokio::spawn(async move {
         info!("Execution worker started");
@@ -93,22 +96,30 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             let num_transactions_executed = execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
                             if !execution_result.admin_transactions.is_empty() {
                                 if let Some(admin_results) = execution_result.admin_results {
+                                    let len = execution_result.admin_transactions.len();
                                     if let Err(e) = execution_results_tx.send((admin_results, execution_result.admin_transactions)) {
+                                        metrics.executor_results_send_failed("admin");
                                         error!("Failed to send admin results: {:?}", e);
                                         break;
                                     }
+                                    metrics.executor_results_sent(len);
                                 } else {
+                                    metrics.executor_missing_results("admin");
                                     error!("Unexpected error: No result found for admin transactions");
                                     break;
                                 }
                             }
                             if !execution_result.regular_transactions.is_empty() {
                                 if let Some(regular_results) = execution_result.regular_results {
+                                    let len = execution_result.regular_transactions.len();
                                     if let Err(e) = execution_results_tx.send((regular_results, execution_result.regular_transactions)) {
+                                        metrics.executor_results_send_failed("regular");
                                         error!("Failed to send regular results: {:?}", e);
                                         break;
                                     }
+                                    metrics.executor_results_sent(len);
                                 } else {
+                                    metrics.executor_missing_results("regular");
                                     error!("Unexpected error: No result found for regular transactions");
                                     break;
                                 }
@@ -311,7 +322,7 @@ pub async fn execute_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::start_test_postgres;
+    use crate::{stage_metrics::NoopMetrics, test_helpers::start_test_postgres};
     use solana_sdk::{
         hash::Hash,
         message::Message,
@@ -321,6 +332,7 @@ mod tests {
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
     use std::collections::HashSet;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -428,6 +440,7 @@ mod tests {
             execution_results_tx,
             accountsdb_connection_url: url,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -456,6 +469,7 @@ mod tests {
             execution_results_tx,
             accountsdb_connection_url: url,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 

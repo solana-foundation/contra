@@ -226,4 +226,18 @@ mod tests {
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
     }
+
+    // has_recipient flag = 1 signals that 32 more bytes follow for the recipient key.
+    // If those bytes are absent the require_len! guard must reject the data rather
+    // than reading out-of-bounds memory.
+    #[test]
+    fn test_process_deposit_instruction_data_has_recipient_flag_but_missing_key() {
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&1000u64.to_le_bytes()); // amount
+        instruction_data.push(1); // has_recipient = true, but no 32-byte key follows
+
+        let result = process_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
 }

@@ -2,19 +2,23 @@ use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{
         assert_get_or_allow_mint, assert_get_or_block_mint, assert_get_or_create_instance,
+        assert_get_or_deposit,
     },
     utils::{
-        assert_program_error, set_mint, TestContext, CONTRA_ESCROW_PROGRAM_ID,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR,
+        assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        CONTRA_ESCROW_PROGRAM_ID, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
+        INVALID_ALLOWED_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
     },
 };
-use contra_escrow_program_client::instructions::BlockMintBuilder;
+use contra_escrow_program_client::instructions::{BlockMintBuilder, DepositBuilder};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
+    system_program::ID as SYSTEM_PROGRAM_ID,
 };
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use spl_token::ID as TOKEN_PROGRAM_ID;
 
 #[test]
 fn test_block_mint_success() {
@@ -319,4 +323,154 @@ fn test_block_mint_mismatched_mint() {
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
     assert_program_error(result, INVALID_ALLOWED_MINT_ERROR);
+}
+
+#[test]
+fn test_block_mint_prevents_deposit() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        1_000_000,
+        0,
+    );
+
+    assert_get_or_block_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        false,
+    )
+    .expect("BlockMint should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .amount(1_000_000)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, INVALID_ACCOUNT_DATA_ERROR);
+}
+
+#[test]
+fn test_allow_block_allow_cycle() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    assert_get_or_block_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        false,
+    )
+    .expect("BlockMint should succeed");
+
+    context.warp_to_slot(100);
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("Re-AllowMint after block should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        1_000_000,
+        0,
+    );
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        1_000_000,
+        None,
+        false,
+    )
+    .expect("Deposit after re-allow should succeed");
 }

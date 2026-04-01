@@ -10,6 +10,7 @@ use solana_system_interface::instruction as system_instruction;
 
 const COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const COMPUTE_UNIT_PRICE: u64 = 1;
+#[allow(dead_code)]
 const AIRDROP_AMOUNT: u64 = 10_000_000_000;
 
 pub async fn send_and_confirm_instructions(
@@ -38,37 +39,43 @@ pub async fn send_and_confirm_instructions(
     Ok(signature)
 }
 
+#[allow(dead_code)]
 pub async fn setup_wallets(
     client: &RpcClient,
     faucet_keypair: &Keypair,
     wallets: &[&Keypair],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for wallet in wallets {
-        let recent_blockhash = client.get_latest_blockhash().await?;
-        let transfer_ix = system_instruction::transfer(
-            &faucet_keypair.pubkey(),
-            &wallet.pubkey(),
-            AIRDROP_AMOUNT,
-        );
-        let tx = Transaction::new_signed_with_payer(
-            &[transfer_ix],
-            Some(&faucet_keypair.pubkey()),
-            &[&faucet_keypair],
-            recent_blockhash,
-        );
-        client.send_and_confirm_transaction(&tx).await?;
+    if wallets.is_empty() {
+        return Ok(());
+    }
 
+    // batch all SOL transfers into a single transaction instead of
+    // one confirmation round-trip per wallet.  A single `send_and_confirm_transaction`
+    // with N transfer instructions replaces N sequential confirmations, reducing
+    // setup time from O(N × confirmation_latency) to O(1 × confirmation_latency).
+    let transfer_ixs: Vec<Instruction> = wallets
+        .iter()
+        .map(|w| {
+            system_instruction::transfer(&faucet_keypair.pubkey(), &w.pubkey(), AIRDROP_AMOUNT)
+        })
+        .collect();
+
+    send_and_confirm_instructions(
+        client,
+        &transfer_ixs,
+        faucet_keypair,
+        &[faucet_keypair],
+        "Fund Wallets",
+    )
+    .await?;
+
+    for wallet in wallets {
         println!(
             "Airdropped {} SOL to {}. New balance: {} SOL",
             AIRDROP_AMOUNT,
             wallet.pubkey(),
             client.get_balance(&wallet.pubkey()).await?
         );
-
-        while client.get_balance(&wallet.pubkey()).await? < AIRDROP_AMOUNT {
-            println!("Waiting for airdrop to complete for {}", wallet.pubkey());
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
     }
 
     Ok(())

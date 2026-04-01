@@ -54,6 +54,7 @@ contra-metrics = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
 solana-client = { version = "2.3.10" }
 solana-rpc-client-api = { workspace = true }
 solana-transaction-status = { version = "2.3.10" }
@@ -74,6 +75,7 @@ spl-associated-token-account = { workspace = true }
 solana-system-interface = { workspace = true }
 contra-withdraw-program-client = { workspace = true }
 mockito = "1.7"
+serial_test = "3"
 solana-address = { workspace = true }
 solana-rpc = { workspace = true }
 solana-sdk = { workspace = true }

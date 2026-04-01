@@ -219,6 +219,12 @@ pub(crate) async fn write_batch_redis(
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
         pipe.set(key, serialized);
+        // Index all slots in a sorted set (score = slot value) for two purposes:
+        // 1. getBlocks: ZRANGE block_slot_index start end BYSCORE for O(log N + M) range queries.
+        // 2. getFirstAvailableBlock: ZRANGE block_slot_index 0 0 returns the minimum slot.
+        // ZADD is idempotent for the same (member, score) pair, so replays are safe.
+        // redis-rs 0.27: zadd(key, member, score) — member first, score second.
+        pipe.zadd("block_slot_index", block.slot, block.slot as f64);
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

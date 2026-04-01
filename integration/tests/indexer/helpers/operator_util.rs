@@ -3,6 +3,12 @@
 use super::db;
 use super::test_types::WAIT_TIMEOUT_SECS;
 
+/// Wait until at least `expected_count` transactions reach `completed` status.
+///
+/// Polls every 200 ms and gives up after `WAIT_TIMEOUT_SECS`.
+/// Exits early if the combined completed + failed count already equals
+/// `expected_count` — in that case not all transactions succeeded, so the
+/// assertion below will fail with a descriptive message showing the breakdown.
 pub async fn wait_for_operator_completion(
     pool: &sqlx::PgPool,
     expected_count: usize,
@@ -13,50 +19,71 @@ pub async fn wait_for_operator_completion(
     let mut ready = false;
 
     while start.elapsed().as_secs() < WAIT_TIMEOUT_SECS {
-        let completed_count = db::count_transactions_by_status(pool, "completed").await?;
+        let completed = db::count_transactions_by_status(pool, "completed").await?;
+        let failed = db::count_transactions_by_status(pool, "failed").await?;
 
-        if completed_count >= expected_count as i64 {
+        if completed >= expected_count as i64 {
             println!(
                 "✓ Reached target: {}/{} transactions completed",
-                completed_count, expected_count
+                completed, expected_count
             );
             ready = true;
             break;
         }
 
-        // Log progress every 5 seconds
+        // If every terminal-state transaction has been decided and none are still
+        // pending, there is no point waiting for the full timeout.
+        if failed > 0 && completed + failed >= expected_count as i64 {
+            println!(
+                "✗ All transactions terminal but only {}/{} completed ({} failed)",
+                completed, expected_count, failed
+            );
+            break;
+        }
+
+        // Log progress every 5 seconds.
         let elapsed = start.elapsed().as_secs();
         if elapsed - last_logged >= 5 {
             println!(
-                "  Progress: {}/{} completed ({:.1}%) - elapsed: {}s",
-                completed_count,
+                "  Progress: {}/{} completed ({:.1}%), {} failed — elapsed: {}s",
+                completed,
                 expected_count,
-                (completed_count as f64 / expected_count as f64) * 100.0,
+                (completed as f64 / expected_count as f64) * 100.0,
+                failed,
                 elapsed
             );
             last_logged = elapsed;
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Issue 7 fix: poll every 200 ms instead of 1 s.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
     if !ready {
-        let final_count = db::count_transactions_by_status(pool, "completed").await?;
+        let completed = db::count_transactions_by_status(pool, "completed").await?;
+        let failed = db::count_transactions_by_status(pool, "failed").await?;
+        let pending = db::count_transactions_by_status(pool, "pending").await?;
         println!(
-            "✗ Timeout: only {}/{} transactions completed",
-            final_count, expected_count
+            "✗ Timeout after {}s: completed={}, failed={}, pending={} (expected {} completed)",
+            WAIT_TIMEOUT_SECS, completed, failed, pending, expected_count
         );
     }
 
     assert!(
         ready,
-        "Operator did not process all {} within timeout",
+        "Operator did not process all {} within timeout \
+         (check output above for completed/failed/pending breakdown)",
         operation_name
     );
 
     Ok(())
 }
 
+/// Wait until a specific transaction reaches `completed` status.
+///
+/// Fails immediately (rather than timing out) if the transaction is already
+/// in `failed` status — this avoids burning the full `timeout_secs` when the
+/// operator has already decided the transaction is unprocessable.
 pub async fn wait_for_transaction_completion(
     pool: &sqlx::PgPool,
     signature: &str,
@@ -66,11 +93,20 @@ pub async fn wait_for_transaction_completion(
 
     while start.elapsed().as_secs() < timeout_secs {
         if let Some(tx) = db::get_transaction(pool, signature).await? {
-            if tx.status == "completed" {
-                return Ok(());
+            match tx.status.as_str() {
+                "completed" => return Ok(()),
+                "failed" => {
+                    return Err(format!(
+                        "Transaction {} reached 'failed' status (not 'completed')",
+                        signature
+                    )
+                    .into())
+                }
+                _ => {}
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Issue 7 fix: poll every 200 ms instead of 500 ms.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
     Err(format!(

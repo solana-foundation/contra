@@ -61,23 +61,36 @@ impl CheckpointWriter {
 
             loop {
                 tokio::select! {
-                    Some(update) = rx.recv() => {
-                        pending
-                            .entry(update.program_type)
-                            .and_modify(|slot| {
-                                if update.slot > *slot {
-                                    *slot = update.slot;
+                    update = rx.recv() => {
+                        match update {
+                            Some(update) => {
+                                pending
+                                    .entry(update.program_type)
+                                    .and_modify(|slot| {
+                                        if update.slot > *slot {
+                                            *slot = update.slot;
+                                        }
+                                    })
+                                    .or_insert(update.slot);
+
+                                update_count += 1;
+
+                                if update_count >= self.max_batch_size {
+                                    if let Err(e) = self.flush_checkpoints(&mut pending).await {
+                                        error!("Failed to flush checkpoints: {}", e);
+                                    }
+                                    update_count = 0;
                                 }
-                            })
-                            .or_insert(update.slot);
-
-                        update_count += 1;
-
-                        if update_count >= self.max_batch_size {
-                            if let Err(e) = self.flush_checkpoints(&mut pending).await {
-                                error!("Failed to flush checkpoints: {}", e);
                             }
-                            update_count = 0;
+                            None => {
+                                info!("Checkpoint channel closed, flushing remaining checkpoints");
+                                if !pending.is_empty() {
+                                    if let Err(e) = self.flush_checkpoints(&mut pending).await {
+                                        error!("Failed to flush checkpoints on shutdown: {}", e);
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
 
@@ -88,16 +101,6 @@ impl CheckpointWriter {
                             }
                             update_count = 0;
                         }
-                    }
-
-                    else => {
-                        info!("Checkpoint channel closed, flushing remaining checkpoints");
-                        if !pending.is_empty() {
-                            if let Err(e) = self.flush_checkpoints(&mut pending).await {
-                                error!("Failed to flush checkpoints on shutdown: {}", e);
-                            }
-                        }
-                        break;
                     }
                 }
             }
@@ -321,5 +324,134 @@ mod tests {
 
         assert_eq!(escrow_checkpoint, 100);
         assert_eq!(withdraw_checkpoint, 200);
+    }
+
+    // ============================================================================
+    // start() integration tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_start_flushes_on_channel_close() {
+        let mock = MockStorage::new();
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+        let writer = CheckpointWriter::new(storage.clone())
+            .with_batch_interval(1) // short so the task terminates quickly
+            .with_max_batch_size(1000);
+
+        let (tx, rx) = mpsc::channel(16);
+        let handle = writer.start(rx);
+
+        tx.send(CheckpointUpdate {
+            program_type: ProgramType::Escrow,
+            slot: 500,
+        })
+        .await
+        .unwrap();
+
+        // Drop sender to close the channel
+        drop(tx);
+
+        // Wait for the task to finish (ticker will flush then exit)
+        handle.await.unwrap();
+
+        // Verify checkpoint was flushed
+        let cp = storage.get_committed_checkpoint("escrow").await.unwrap();
+        assert_eq!(cp, Some(500));
+    }
+
+    #[tokio::test]
+    async fn test_start_flushes_on_max_batch_size() {
+        let mock = MockStorage::new();
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+        let writer = CheckpointWriter::new(storage.clone())
+            .with_batch_interval(1)
+            .with_max_batch_size(2); // flush after 2 updates
+
+        let (tx, rx) = mpsc::channel(16);
+        let handle = writer.start(rx);
+
+        // Send 2 updates to trigger batch flush
+        tx.send(CheckpointUpdate {
+            program_type: ProgramType::Escrow,
+            slot: 100,
+        })
+        .await
+        .unwrap();
+        tx.send(CheckpointUpdate {
+            program_type: ProgramType::Escrow,
+            slot: 200,
+        })
+        .await
+        .unwrap();
+
+        // Give the task a moment to process and flush
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify checkpoint was flushed (latest slot wins)
+        let cp = storage.get_committed_checkpoint("escrow").await.unwrap();
+        assert_eq!(cp, Some(200));
+
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_start_keeps_highest_slot_per_program_type() {
+        let mock = MockStorage::new();
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+        let writer = CheckpointWriter::new(storage.clone())
+            .with_batch_interval(1) // short so the task terminates quickly
+            .with_max_batch_size(1000);
+
+        let (tx, rx) = mpsc::channel(16);
+        let handle = writer.start(rx);
+
+        // Send updates with decreasing slots - highest should win
+        tx.send(CheckpointUpdate {
+            program_type: ProgramType::Escrow,
+            slot: 300,
+        })
+        .await
+        .unwrap();
+        tx.send(CheckpointUpdate {
+            program_type: ProgramType::Escrow,
+            slot: 100, // lower slot, should be ignored
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        handle.await.unwrap();
+
+        let cp = storage.get_committed_checkpoint("escrow").await.unwrap();
+        assert_eq!(cp, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_start_flushes_on_timer() {
+        let mock = MockStorage::new();
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+        let writer = CheckpointWriter::new(storage.clone())
+            .with_batch_interval(1) // 1 second interval
+            .with_max_batch_size(1000);
+
+        let (tx, rx) = mpsc::channel(16);
+        let handle = writer.start(rx);
+
+        tx.send(CheckpointUpdate {
+            program_type: ProgramType::Withdraw,
+            slot: 42,
+        })
+        .await
+        .unwrap();
+
+        // Wait for timer to trigger flush
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let cp = storage.get_committed_checkpoint("withdraw").await.unwrap();
+        assert_eq!(cp, Some(42));
+
+        drop(tx);
+        handle.await.unwrap();
     }
 }

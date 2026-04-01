@@ -170,3 +170,47 @@ impl ResyncService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BackfillConfig, ProgramType};
+    use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+    use crate::storage::common::storage::mock::MockStorage;
+    use crate::storage::Storage;
+    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_transaction_status::UiTransactionEncoding;
+    use std::sync::Arc;
+
+    #[test]
+    fn resync_service_new_with_escrow_instance_id() {
+        use solana_sdk::pubkey::Pubkey;
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://localhost:8899".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: false,
+            exit_after_backfill: false,
+            rpc_url: "http://localhost:8899".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: Some(1000),
+        };
+        let instance_id = Pubkey::new_unique();
+
+        let service = ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Withdraw,
+            backfill_config,
+            Some(instance_id),
+        );
+
+        assert_eq!(service.program_type, ProgramType::Withdraw);
+        assert_eq!(service.escrow_instance_id, Some(instance_id));
+        assert_eq!(service.backfill_config_base.start_slot, Some(1000));
+    }
+}

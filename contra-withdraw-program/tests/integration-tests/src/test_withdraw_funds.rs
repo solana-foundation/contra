@@ -1,6 +1,7 @@
 use contra_withdraw_program_client::instructions::WithdrawFundsBuilder;
 use solana_sdk::{
     instruction::Instruction,
+    pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
 use spl_associated_token_account::get_associated_token_address;
@@ -125,4 +126,51 @@ fn test_withdraw_funds_invalid_instruction_data_too_short() {
 
     let result = context.send_transaction(instruction);
     assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+}
+
+// Verifies that a successful withdrawal actually emits a WithdrawFundsEvent log.
+// pinocchio_log formats &[u8] as "[b0, b1, ..., b39]" (decimal bytes, comma-space
+// separated) and sol_log_ prepends "Program log: " in the transaction logs.
+#[test]
+fn test_withdraw_funds_event_emission() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let destination = Pubkey::new_from_array([42u8; 32]);
+    let mint = Keypair::new();
+    let amount: u64 = 500_000;
+
+    set_mint(&mut context, &mint.pubkey());
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+
+    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint.pubkey())
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .amount(amount)
+        .destination(destination)
+        .instruction();
+
+    let meta = context
+        .send_transaction_with_signers_with_transaction_result(instruction, &[&user], false, None)
+        .expect("Withdraw funds should succeed");
+
+    // Build the expected log string: amount as LE bytes followed by destination bytes,
+    // formatted as pinocchio_log renders a &[u8].
+    let mut event_bytes = [0u8; 40];
+    event_bytes[..8].copy_from_slice(&amount.to_le_bytes());
+    event_bytes[8..].copy_from_slice(destination.as_ref());
+
+    let parts: Vec<String> = event_bytes.iter().map(|b| b.to_string()).collect();
+    let expected_log = format!("Program log: [{}]", parts.join(", "));
+
+    assert!(
+        meta.logs.iter().any(|log| log == &expected_log),
+        "WithdrawFundsEvent not found in transaction logs.\nExpected: {}\nGot: {:#?}",
+        expected_log,
+        meta.logs,
+    );
 }

@@ -1,10 +1,14 @@
 use {
     clap::Parser,
-    contra_core::nodes::node::{run_node, NodeConfig, NodeMode},
+    contra_core::{
+        nodes::node::{run_node, NodeConfig, NodeMode},
+        stage_metrics::{init_prometheus_metrics, NoopMetrics, PrometheusMetrics},
+    },
+    contra_metrics::start_metrics_server,
     solana_sdk::pubkey::Pubkey,
-    std::str::FromStr,
+    std::{str::FromStr, sync::Arc},
     tokio::signal,
-    tracing::{error, info},
+    tracing::{error, info, warn},
 };
 
 /// Contra Node - High-performance Solana transaction processing node
@@ -70,6 +74,11 @@ struct Args {
     /// Performance sample collection period in seconds
     #[arg(long, default_value_t = 60, env = "CONTRA_PERF_SAMPLE_PERIOD_SECS")]
     perf_sample_period_secs: u64,
+
+    /// Enable Prometheus stage metrics server (load testing / profiling only).
+    /// Bind port is controlled by the CONTRA_METRICS_PORT environment variable (default: 9090).
+    #[arg(long, env = "CONTRA_METRICS")]
+    metrics: bool,
 }
 
 async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -95,6 +104,28 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         info!("Configured admin keys: {:?}", admin_keys);
     }
 
+    let metrics: Arc<dyn contra_core::stage_metrics::StageMetrics> = if args.metrics {
+        let metrics_port = match std::env::var("CONTRA_METRICS_PORT") {
+            Ok(value) => match value.parse::<u16>() {
+                Ok(port) => port,
+                Err(err) => {
+                    warn!(
+                        "Invalid CONTRA_METRICS_PORT='{}' ({}); falling back to 9090",
+                        value, err
+                    );
+                    9090
+                }
+            },
+            Err(_) => 9090,
+        };
+        init_prometheus_metrics();
+        start_metrics_server(metrics_port);
+        info!("Stage metrics enabled on port {}", metrics_port);
+        Arc::new(PrometheusMetrics)
+    } else {
+        Arc::new(NoopMetrics)
+    };
+
     let config = NodeConfig {
         mode: args.mode,
         port: args.port,
@@ -107,6 +138,7 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         transaction_expiration_ms: args.transaction_expiration_ms,
         blocktime_ms: args.blocktime_ms,
         perf_sample_period_secs: args.perf_sample_period_secs,
+        metrics,
     };
 
     let mut handles = run_node(config).await?;

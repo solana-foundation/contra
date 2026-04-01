@@ -10,6 +10,8 @@ use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
 use std::fmt::Display;
 
+pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "contra:remint:";
+
 /*
 Mint initialization is going to be done outside of the operator. There's a command that will add to the allowed mints on Solana mainnet
 and will also initialize that mint on Contra. This simplifies our operator's code and reduces the checks it needs to do if we'd want to
@@ -18,6 +20,24 @@ validate mint existence on Contra.
 
 pub fn mint_idempotency_memo(transaction_id: impl Display) -> String {
     format!("{MINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
+}
+
+pub fn remint_idempotency_memo(transaction_id: impl Display) -> String {
+    format!("{REMINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
+}
+
+/// Info needed to remint Contra tokens back to user on permanent withdrawal failure.
+/// Captured in the processor where locals are available, since ReleaseFundsBuilder
+/// has private fields (codama-generated).
+#[derive(Clone, Debug)]
+pub struct WithdrawalRemintInfo {
+    pub transaction_id: i64,
+    pub trace_id: String,
+    pub mint: Pubkey,
+    pub user: Pubkey,
+    pub user_ata: Pubkey,
+    pub token_program: Pubkey,
+    pub amount: u64,
 }
 
 /// Retry policy for transaction submission
@@ -158,6 +178,7 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub nonce: u64,
     pub transaction_id: i64,
     pub trace_id: String,
+    pub remint_info: Option<WithdrawalRemintInfo>,
 }
 
 /// Builder for simple SPL token mint instructions (deposit flow)
@@ -507,6 +528,7 @@ mod tests {
             nonce: 42,
             transaction_id: 7,
             trace_id: "trace-rf".to_string(),
+            remint_info: None,
         }))
     }
 
@@ -627,5 +649,13 @@ mod tests {
             make_reset_smt_builder().extra_error_checks_policy(),
             ExtraErrorCheckPolicy::None
         ));
+    }
+
+    #[test]
+    fn remint_idempotency_memo_format() {
+        assert_eq!(
+            remint_idempotency_memo(99_i64),
+            "contra:remint:99".to_string()
+        );
     }
 }

@@ -337,3 +337,212 @@ impl ResetSmtRootEvent {
         data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_instance_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let admin = Pubkey::new_from_array([2u8; 32]);
+        let event = CreateInstanceEvent::new(instance_seed, admin);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::CreateInstance as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.admin, admin);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (admin)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::CreateInstance as u8);
+    }
+
+    #[test]
+    fn test_allow_mint_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let mint = Pubkey::new_from_array([2u8; 32]);
+        let event = AllowMintEvent::new(instance_seed, mint, 6);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::AllowMint as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.mint, mint);
+        assert_eq!(event.decimals, 6);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 74);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::AllowMint as u8);
+    }
+
+    #[test]
+    fn test_block_mint_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let mint = Pubkey::new_from_array([2u8; 32]);
+        let event = BlockMintEvent::new(instance_seed, mint);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::BlockMint as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.mint, mint);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::BlockMint as u8);
+    }
+
+    #[test]
+    fn test_add_operator_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let event = AddOperatorEvent::new(instance_seed, operator);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::AddOperator as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.operator, operator);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::AddOperator as u8);
+    }
+
+    #[test]
+    fn test_remove_operator_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let event = RemoveOperatorEvent::new(instance_seed, operator);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::RemoveOperator as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.operator, operator);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::RemoveOperator as u8);
+    }
+
+    #[test]
+    fn test_set_new_admin_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let old_admin = Pubkey::new_from_array([2u8; 32]);
+        let new_admin = Pubkey::new_from_array([3u8; 32]);
+        let event = SetNewAdminEvent::new(instance_seed, old_admin, new_admin);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::SetNewAdmin as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.old_admin, old_admin);
+        assert_eq!(event.new_admin, new_admin);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (old_admin) + 32 (new_admin)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 105);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::SetNewAdmin as u8);
+    }
+
+    #[test]
+    fn test_deposit_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let user = Pubkey::new_from_array([2u8; 32]);
+        let recipient = Pubkey::new_from_array([3u8; 32]);
+        let mint = Pubkey::new_from_array([4u8; 32]);
+        let amount = 1_000_000u64;
+        let event = DepositEvent::new(instance_seed, user, amount, recipient, mint);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::Deposit as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.user, user);
+        assert_eq!(event.amount, amount);
+        assert_eq!(event.recipient, recipient);
+        assert_eq!(event.mint, mint);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (user) + 8 (amount) + 32 (recipient) + 32 (mint)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 145);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::Deposit as u8);
+    }
+
+    #[test]
+    fn test_release_funds_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let user = Pubkey::new_from_array([3u8; 32]);
+        let mint = Pubkey::new_from_array([4u8; 32]);
+        let new_withdrawal_root = [5u8; 32];
+        let amount = 500_000u64;
+        let event = ReleaseFundsEvent::new(
+            instance_seed,
+            operator,
+            amount,
+            user,
+            mint,
+            new_withdrawal_root,
+        );
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::ReleaseFunds as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.operator, operator);
+        assert_eq!(event.amount, amount);
+        assert_eq!(event.user, user);
+        assert_eq!(event.mint, mint);
+        assert_eq!(event.new_withdrawal_root, new_withdrawal_root);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 8 (amount) + 32 (user) + 32 (mint) + 32 (new_withdrawal_root)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 177);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::ReleaseFunds as u8);
+    }
+
+    #[test]
+    fn test_reset_smt_root_event() {
+        let instance_seed = Pubkey::new_from_array([1u8; 32]);
+        let operator = Pubkey::new_from_array([2u8; 32]);
+        let event = ResetSmtRootEvent::new(instance_seed, operator);
+
+        assert_eq!(
+            event.event_discriminator,
+            EventDiscriminators::ResetSmtRoot as u8
+        );
+        assert_eq!(event.instance_seed, instance_seed);
+        assert_eq!(event.operator, operator);
+
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator)
+        let bytes = event.to_bytes();
+        assert_eq!(bytes.len(), 73);
+        assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
+        assert_eq!(bytes[8], EventDiscriminators::ResetSmtRoot as u8);
+    }
+}

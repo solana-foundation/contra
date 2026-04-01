@@ -1923,6 +1923,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "contra-bench-tps"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.5.48",
+ "contra-core",
+ "contra-metrics",
+ "futures 0.3.31",
+ "rayon",
+ "solana-client 2.3.10",
+ "solana-sdk",
+ "spl-associated-token-account 7.0.0",
+ "spl-token 8.0.0",
+ "tokio",
+ "tokio-util 0.7.16",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "contra-core"
 version = "0.1.0"
 dependencies = [
@@ -1932,6 +1952,7 @@ dependencies = [
  "bincode",
  "bs58",
  "clap 4.5.48",
+ "contra-metrics",
  "contra-withdraw-program-client",
  "enum_dispatch",
  "futures 0.3.31",
@@ -2080,6 +2101,8 @@ dependencies = [
  "rustls 0.23.31",
  "serde",
  "serde_json",
+ "serial_test",
+ "solana-account-decoder-client-types 2.3.10",
  "solana-address 1.0.0",
  "solana-client 2.3.10",
  "solana-keychain",
@@ -2115,6 +2138,7 @@ dependencies = [
  "anyhow",
  "base64 0.21.7",
  "bincode",
+ "bs58",
  "chrono",
  "contra-core",
  "contra-escrow-program-client",
@@ -2123,6 +2147,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
+ "mockito",
  "serde_json",
  "solana-account-decoder-client-types 2.3.10",
  "solana-client 2.3.10",
@@ -2141,8 +2166,10 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tokio-util 0.7.16",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -15484,6 +15511,7 @@ dependencies = [
  "serde_json",
  "solana-address 1.0.0",
  "solana-client 3.0.6",
+ "solana-net-utils 3.0.6",
  "solana-rpc",
  "solana-sdk",
  "solana-sdk-ids 3.0.0",

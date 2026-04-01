@@ -63,3 +63,56 @@ impl Operator {
         .map(|_| ())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verifies the constructor stores the bump without modification.
+    #[test]
+    fn test_operator_new() {
+        let operator = Operator::new(42);
+        assert_eq!(operator.bump, 42);
+    }
+
+    // Full serialize → deserialize cycle. Guards against off-by-one errors in the
+    // byte layout and confirms the discriminator is written as the first byte.
+    #[test]
+    fn test_operator_serialization_roundtrip() {
+        let operator = Operator::new(200);
+        let bytes = operator.to_bytes();
+
+        assert_eq!(bytes.len(), Operator::LEN);
+        assert_eq!(bytes[0], Operator::DISCRIMINATOR);
+
+        let deserialized = Operator::try_from_bytes(&bytes).expect("Should deserialize");
+        assert_eq!(deserialized.bump, operator.bump);
+    }
+
+    // Wrong discriminator byte should be rejected before any field is read.
+    // Prevents a different account type (e.g. Instance) from being interpreted as
+    // an Operator, which would allow spoofing operator permissions.
+    #[test]
+    fn test_operator_try_from_bytes_invalid_discriminator() {
+        // Instance discriminator (0) placed where Operator discriminator (1) is expected.
+        let data = [0u8, 42u8];
+        let result = Operator::try_from_bytes(&data);
+        assert_eq!(result.err(), Some(ProgramError::InvalidAccountData));
+    }
+
+    // Empty slice must be rejected — validate_discriminator! checks is_empty() first.
+    #[test]
+    fn test_operator_try_from_bytes_empty_data() {
+        let result = Operator::try_from_bytes(&[]);
+        assert_eq!(result.err(), Some(ProgramError::InvalidAccountData));
+    }
+
+    // Correct discriminator but no bump byte — require_len! fires before the
+    // field read, returning InvalidInstructionData instead of panicking.
+    #[test]
+    fn test_operator_try_from_bytes_too_short() {
+        let data = [Operator::DISCRIMINATOR]; // discriminator only, LEN=2 needs 2 bytes
+        let result = Operator::try_from_bytes(&data);
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+}

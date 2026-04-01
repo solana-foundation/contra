@@ -27,12 +27,25 @@ path = "tests/indexer/gap_detection.rs"
 name = "truncate_integration"
 path = "tests/contra/truncate.rs"
 
+[[test]]
+name = "operator_lifecycle_integration"
+path = "tests/indexer/operator_lifecycle.rs"
+
+[[test]]
+name = "resync_integration"
+path = "tests/indexer/resync.rs"
+
+[[test]]
+name = "reconciliation_e2e_test"
+path = "tests/indexer/reconciliation_e2e.rs"
+
 [features]
 test-tree = ["contra-indexer/test-tree"]
 
 [dependencies]
 anyhow = "1.0.100"
 base64 = { workspace = true }
+bs58 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 contra-core = { path = "../core" }
@@ -59,9 +72,12 @@ spl-memo = { workspace = true }
 spl-token = { workspace = true }
 spl-token-2022 = { workspace = true }
 sqlx = { workspace = true }
+mockito = "1.7"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 test_utils = { path = "../test_utils" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

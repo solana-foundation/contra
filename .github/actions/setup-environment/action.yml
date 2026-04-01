@@ -46,7 +46,7 @@ runs:
       shell: bash
       run: |
         echo "RUST_VERSION=1.91.0" >> $GITHUB_ENV
-        echo "LLVM_COV_VERSION=0.6.21" >> $GITHUB_ENV
+        echo "LLVM_COV_VERSION=0.8.4" >> $GITHUB_ENV
 
     - name: Install system dependencies
       if: inputs.install-system-dependencies == 'true'

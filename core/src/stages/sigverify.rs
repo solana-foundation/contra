@@ -1,7 +1,9 @@
 // Signature verification stage for Contra
 
 use {
-    crate::{nodes::node::WorkerHandle, transactions::is_admin_instruction},
+    crate::{
+        nodes::node::WorkerHandle, stage_metrics::SharedMetrics, transactions::is_admin_instruction,
+    },
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
     std::{
         fmt::{self, Display},
@@ -105,6 +107,7 @@ pub struct SigverifyArgs {
     pub rx: tokio_mpmc::Receiver<SanitizedTransaction>,
     pub sequencer_tx: mpsc::UnboundedSender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
+    pub metrics: SharedMetrics,
 }
 
 pub async fn sigverify_transaction(
@@ -142,15 +145,17 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
         rx,
         sequencer_tx,
         shutdown_token,
+        metrics,
     } = args;
     let mut handles = Vec::with_capacity(num_workers);
     let admin_keys = Arc::new(admin_keys);
-
+    // metrics is already an Arc; clone it for each worker
     for worker_id in 0..num_workers {
         let rx = rx.clone();
         let tx = sequencer_tx.clone();
         let shutdown = shutdown_token.clone();
         let admin_keys = admin_keys.clone();
+        let metrics = Arc::clone(&metrics);
 
         let handle = tokio::spawn(async move {
             info!("Sigverify worker {} started", worker_id);
@@ -164,6 +169,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                 let result = sigverify_transaction(&transaction, &admin_keys).await;
                                 match result {
                                     SigverifyResult::Valid(_) => {
+                                        metrics.sigverify_forwarded();
                                         // Send to sequencer (unbounded, no await needed)
                                         match tx.send(transaction) {
                                             Ok(_) => {
@@ -179,25 +185,25 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                         }
                                     }
                                     SigverifyResult::InvalidTransaction(transaction_type) => {
+                                        metrics.sigverify_rejected("invalid");
                                         warn!(
                                             "Worker {} rejected invalid transaction {}: {:?}",
                                             worker_id,
                                             transaction.signature(),
                                             transaction_type.to_string()
                                         );
-                                        continue;
                                     }
                                     SigverifyResult::NotSignedByAdmin => {
+                                        metrics.sigverify_rejected("not_admin");
                                         warn!(
                                             "Worker {} rejected admin transaction not signed by admin: {}",
                                             worker_id,
                                             transaction.signature()
                                         );
-                                        continue;
                                     }
                                     SigverifyResult::SigverifyFailed(e) => {
+                                        metrics.sigverify_rejected("sig_failed");
                                         warn!("Worker {} sigverify failed: {}", worker_id, e);
-                                        continue;
                                     }
                                 }
                             }
@@ -230,6 +236,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stage_metrics::NoopMetrics;
     use solana_sdk::{
         hash::Hash,
         instruction::{AccountMeta, Instruction},
@@ -412,6 +419,7 @@ mod tests {
             rx: sigverify_rx,
             sequencer_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -446,6 +454,7 @@ mod tests {
             rx: sigverify_rx,
             sequencer_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 
@@ -506,6 +515,7 @@ mod tests {
             rx: sigverify_rx,
             sequencer_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
         assert_eq!(handles.len(), 2);
@@ -630,6 +640,7 @@ mod tests {
             rx: sigverify_rx,
             sequencer_tx,
             shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
         })
         .await;
 

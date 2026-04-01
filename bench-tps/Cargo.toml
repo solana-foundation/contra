@@ -1,0 +1,26 @@
+[package]
+name = "contra-bench-tps"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "contra-bench-tps"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { workspace = true }
+contra-core = { workspace = true }
+contra-metrics = { workspace = true }
+futures = { workspace = true }
+rayon = "1.10"
+# Pinned to 2.3.10 (matches core/indexer/integration). Workspace declares 3.0.0
+# but { workspace = true } breaks compilation — solana-sdk is still 2.x.
+solana-client = "2.3.10"
+solana-sdk = { workspace = true }
+spl-associated-token-account = { workspace = true }
+spl-token = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

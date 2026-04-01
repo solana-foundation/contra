@@ -1,3 +1,15 @@
+//! Integration test for indexer gap detection and restart recovery.
+//!
+//! Verifies that when the L1 indexer is stopped while on-chain deposits occur,
+//! it correctly re-indexes the missed ("gap") slots when it is restarted, and
+//! that the checkpoint advances past every recovered deposit's slot.
+//!
+//! Phases:
+//! 1. Start validator + Postgres.
+//! 2. Execute 2 deposits → start indexer → verify backfill.
+//! 3. Abort indexer → execute 2 more deposits (the "gap").
+//! 4. Restart indexer → verify all 4 deposits are in DB + checkpoint advanced.
+
 #[path = "helpers/mod.rs"]
 mod helpers;
 
@@ -14,8 +26,8 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::SeedDerivable;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signer};
 use std::sync::Arc;
-use test_utils::indexer_helper::start_l1_indexer;
-use test_utils::validator_helper::start_test_validator;
+use test_utils::indexer_helper::{start_l1_indexer, start_l1_indexer_rpc_polling};
+use test_utils::validator_helper::{start_test_validator, start_test_validator_no_geyser};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -78,6 +90,13 @@ async fn execute_deposit(
     })
 }
 
+/// Full lifecycle: deposit → index → stop → deposit-while-down → restart → verify recovery.
+///
+/// Deposits 1 and 2 are indexed on the first run.  Deposits 3 and 4 land while
+/// the indexer is offline.  After restart the indexer must backfill the gap and
+/// the DB must contain all 4 deposits with correct slot and amount values.
+/// The checkpoint stored in `indexer_state` must also advance past the highest
+/// gap-deposit slot, proving the backfill reached and committed those slots.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Gap Detection: Restart Recovery Test ===\n");
@@ -269,10 +288,22 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
         println!("  Verified: {} (slot {})", tx.signature, tx.slot);
     }
 
+    let gap_deposit_max_slot = all_signatures.iter().map(|t| t.slot).max().unwrap();
+
+    // Wait for the checkpoint to advance past the gap deposits' max slot.
+    // The deposits are in the DB, but the checkpoint update is asynchronous
+    // so we must poll rather than read immediately.
+    let checkpoint_ready =
+        db::wait_for_checkpoint(&pool, "escrow", gap_deposit_max_slot, WAIT_TIMEOUT_SECS).await?;
+    assert!(
+        checkpoint_ready,
+        "Checkpoint did not advance past gap deposits' max slot ({}) within timeout",
+        gap_deposit_max_slot
+    );
+
     let checkpoint_after_gap = db::get_checkpoint_slot(&pool, "escrow")
         .await?
         .expect("Checkpoint should exist after gap recovery");
-    let gap_deposit_max_slot = all_signatures.iter().map(|t| t.slot).max().unwrap();
     assert!(
         checkpoint_after_gap >= gap_deposit_max_slot,
         "Checkpoint ({}) should have advanced past the gap deposits' max slot ({})",
@@ -288,5 +319,170 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
     indexer_handle_2.abort();
 
     println!("\n=== Gap Detection: Restart Recovery Test PASSED ===");
+    Ok(())
+}
+
+/// Same stop/gap/restart scenario as [`test_gap_detection_restart_recovery`] but
+/// uses the **RPC-polling datasource** instead of Yellowstone geyser.
+///
+/// This test exercises `indexer/datasource/rpc_polling/source.rs` which is
+/// otherwise unreachable in the integration suite (all other tests use geyser).
+/// A validator WITHOUT the geyser plugin is used — only the RPC port is needed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Gap Detection: RPC-Polling Fallback Test ===\n");
+
+    // ── Phase 0: Infrastructure (no geyser needed) ───────────────────────
+    println!("## Phase 0: Start validator (no geyser) + Postgres");
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let rpc_url = test_validator.rpc_url();
+    println!("  Validator: {}", rpc_url);
+
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let client = Arc::new(client);
+
+    let pg_container = Postgres::default()
+        .with_db_name("gap_rpc_test")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/gap_rpc_test",
+        pg_host, pg_port
+    );
+    println!("  Postgres: {}\n", db_url);
+
+    let pool = db::connect(&db_url).await?;
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&contra_indexer::PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 50,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    // ── Phase 1: On-chain setup ──────────────────────────────────────────
+    println!("## Phase 1: On-chain setup");
+    let instance_seeds = Keypair::from_seed(&ESCROW_INSTANCE_SEEDS_PRIVATE_KEY).unwrap();
+    let (_instance_seed, instance_pda) =
+        TestEnvironment::setup_instance(&client, &faucet_keypair, Some(instance_seeds)).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, instance_pda).await?;
+
+    let env = TestEnvironment::setup(
+        &client,
+        &faucet_keypair,
+        1,
+        10_000_000 * 10u64.pow(6),
+        Some(Keypair::from_seed(&ESCROW_INSTANCE_SEEDS_PRIVATE_KEY).unwrap()),
+    )
+    .await?;
+
+    let user = &env.users[0];
+    println!("  Instance: {}", env.instance);
+    println!("  Mint:     {}", env.mint);
+    println!("  User:     {}\n", user.pubkey());
+
+    // ── Phase 2: Pre-indexer deposits ────────────────────────────────────
+    println!("## Phase 2: Execute 2 deposits BEFORE indexer starts");
+    let mut all_txs: Vec<UserTransaction> = Vec::new();
+
+    for i in 0..2 {
+        let tx = execute_deposit(
+            &client,
+            user,
+            &env.instance,
+            &env.mint,
+            GAP_DEPOSIT_AMOUNT + i * 500,
+        )
+        .await?;
+        println!("  Deposit {}: {} (slot {})", i + 1, tx.signature, tx.slot);
+        all_txs.push(tx);
+    }
+
+    // ── Phase 3: Start RPC-polling indexer — backfill expected ───────────
+    println!("\n## Phase 3: Start RPC-polling L1 indexer");
+    let (indexer_handle, _storage) =
+        start_l1_indexer_rpc_polling(rpc_url.clone(), db_url.clone(), Some(instance_pda)).await?;
+    println!("  Indexer started (RPC-polling mode)");
+
+    // ── Phase 4: Verify backfill ─────────────────────────────────────────
+    println!("\n## Phase 4: Wait for 2 deposits in DB");
+    let ready = db::wait_for_count(&pool, 2, WAIT_TIMEOUT_SECS).await?;
+    assert!(
+        ready,
+        "RPC-polling indexer did not backfill 2 pre-indexer deposits within timeout"
+    );
+    println!("  2 deposits confirmed in DB");
+
+    let checkpoint_before = db::get_checkpoint_slot(&pool, "escrow")
+        .await?
+        .expect("Checkpoint should exist after backfill");
+    println!("  Checkpoint after first run: {}", checkpoint_before);
+
+    // ── Phase 5: Kill the indexer ────────────────────────────────────────
+    println!("\n## Phase 5: Abort indexer");
+    indexer_handle.abort();
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // ── Phase 6: Gap deposits ────────────────────────────────────────────
+    println!("\n## Phase 6: Execute 2 deposits while indexer is DOWN");
+    for i in 0..2 {
+        let tx = execute_deposit(
+            &client,
+            user,
+            &env.instance,
+            &env.mint,
+            GAP_DEPOSIT_AMOUNT + 1000 + i * 500,
+        )
+        .await?;
+        println!("  Deposit {}: {} (slot {})", i + 3, tx.signature, tx.slot);
+        all_txs.push(tx);
+    }
+
+    // ── Phase 7: Restart indexer ─────────────────────────────────────────
+    println!("\n## Phase 7: Restart RPC-polling indexer (gap recovery)");
+    let (indexer_handle_2, _storage_2) =
+        start_l1_indexer_rpc_polling(rpc_url.clone(), db_url.clone(), Some(instance_pda)).await?;
+    println!("  Indexer restarted");
+
+    // ── Phase 8: Verify all 4 deposits ──────────────────────────────────
+    println!("\n## Phase 8: Wait for all 4 deposits in DB");
+    let ready = db::wait_for_count(&pool, 4, WAIT_TIMEOUT_SECS).await?;
+    assert!(
+        ready,
+        "RPC-polling indexer did not recover gap deposits within timeout"
+    );
+
+    let gap_max_slot = all_txs.iter().map(|t| t.slot).max().unwrap();
+    let checkpoint_ready =
+        db::wait_for_checkpoint(&pool, "escrow", gap_max_slot, WAIT_TIMEOUT_SECS).await?;
+    assert!(
+        checkpoint_ready,
+        "Checkpoint did not advance past gap deposits' max slot ({}) within timeout",
+        gap_max_slot
+    );
+
+    let checkpoint_after = db::get_checkpoint_slot(&pool, "escrow")
+        .await?
+        .expect("Checkpoint should exist after gap recovery");
+    assert!(
+        checkpoint_after >= gap_max_slot,
+        "Checkpoint ({}) should have advanced past gap max slot ({})",
+        checkpoint_after,
+        gap_max_slot
+    );
+    println!(
+        "\n  Checkpoint after gap recovery: {} (gap max slot: {})",
+        checkpoint_after, gap_max_slot
+    );
+
+    indexer_handle_2.abort();
+    println!("\n=== Gap Detection: RPC-Polling Fallback Test PASSED ===");
     Ok(())
 }

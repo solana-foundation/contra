@@ -65,11 +65,21 @@ integration-test:
 	@$(MAKE) -C contra-escrow-program integration-test
 	@$(MAKE) -C contra-withdraw-program integration-test
 	@echo "Running contra integration test (with production build)..."
-	@cd integration && cargo test --test contra_integration -- --nocapture
-	@echo "Building escrow with test-tree for indexer tests..."
+	@cd integration && cargo nextest run --test contra_integration
+	@echo "Running reconciliation integration tests..."
+	@cd integration && cargo test --test reconciliation_integration -- --nocapture
+	@echo "Running mint idempotency integration tests..."
+	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
+	@echo "Running gap detection integration tests..."
+	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@echo "Running truncate integration tests..."
+	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
 	@$(MAKE) -C contra-escrow-program build-test
 	@echo "Running indexer integration test (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+	@echo "Running operator lifecycle integration tests (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 
 ci-unit-test:
 	@echo "Running CI unit tests for core + indexer..."
@@ -85,21 +95,41 @@ ci-integration-test:
 
 ci-integration-test-build-test-tree:
 	@$(MAKE) ci-integration-test-prebuilt
-	@echo "Building escrow with test-tree for indexer tests..."
+	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
 	@$(MAKE) -C contra-escrow-program build-test
 	@echo "Running indexer integration test (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+	@echo "Running operator lifecycle integration tests (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 
 ci-integration-test-prebuilt:
 	@echo "Running contra integration test (with production build)..."
-	@cd integration && cargo test --test contra_integration -- --nocapture
+	@cd integration && cargo nextest run --test contra_integration
+	@echo "Running reconciliation integration tests..."
+	@cd integration && cargo test --test reconciliation_integration -- --nocapture
+	@echo "Running mint idempotency integration tests..."
+	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
+	@echo "Running gap detection integration tests..."
+	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@echo "Running truncate integration tests..."
+	@cd integration && cargo test --test truncate_integration -- --nocapture
 
 # CI-focused integration target that runs indexer integration tests only.
 ci-integration-test-indexer:
-	@echo "Building escrow with test-tree for indexer tests..."
+	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
 	@$(MAKE) -C contra-escrow-program build-test
 	@echo "Running indexer integration test (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
+	@echo "Running reconciliation integration tests..."
+	@cd integration && cargo test --test reconciliation_integration -- --nocapture
+	@echo "Running mint idempotency integration tests..."
+	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
+	@echo "Running gap detection integration tests..."
+	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@echo "Running truncate integration tests..."
+	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@echo "Running operator lifecycle integration tests (with test-tree build)..."
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@echo "Running reconciliation e2e tests..."
 	@cd indexer && cargo test --test reconciliation_e2e_test -- --nocapture
 

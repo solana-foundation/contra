@@ -611,3 +611,163 @@ fn test_multiple_depositors_same_instance() {
         "Instance should hold deposits from all three users"
     );
 }
+
+#[test]
+fn test_deposit_wrong_user_ata() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let other_user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT * 2,
+        0,
+    );
+
+    // Also create an ATA for other_user so the account exists
+    let other_user_ata =
+        get_or_create_associated_token_account(&mut context, &other_user.pubkey(), &mint.pubkey());
+    set_token_balance(
+        &mut context,
+        &other_user_ata,
+        &mint.pubkey(),
+        &other_user.pubkey(),
+        DEPOSIT_AMOUNT,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    // user_ata belongs to other_user, not the signing user
+    let wrong_user_ata = get_associated_token_address_with_program_id(
+        &other_user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(wrong_user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+}
+
+#[test]
+fn test_deposit_wrong_instance_ata() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let other_mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+    set_mint(&mut context, &other_mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT * 2,
+        0,
+    );
+
+    // Create a valid ATA for the instance but for a different mint
+    let wrong_instance_ata =
+        get_or_create_associated_token_account(&mut context, &instance_pda, &other_mint.pubkey());
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(wrong_instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+}

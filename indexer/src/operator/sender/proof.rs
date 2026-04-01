@@ -138,13 +138,25 @@ pub(super) async fn rebuild_with_regenerated_proof(
         nonce
     );
 
+    let transaction_id = ctx
+        .transaction_id
+        .expect("rebuild must have transaction_id");
+    let trace_id = ctx.trace_id.expect("rebuild must have trace_id");
+
+    let remint_info = state.remint_cache.get(&nonce).cloned();
+    if remint_info.is_none() {
+        error!(
+            "Missing remint_info for rebuild nonce {} - remint will not be possible on failure",
+            nonce
+        );
+    }
+
     let builder_with_nonce = Box::new(ReleaseFundsBuilderWithNonce {
         builder,
         nonce,
-        transaction_id: ctx
-            .transaction_id
-            .expect("rebuild must have transaction_id"),
-        trace_id: ctx.trace_id.expect("rebuild must have trace_id"),
+        transaction_id,
+        trace_id,
+        remint_info,
     });
 
     match smt_state.handle_release_funds_transaction(
@@ -168,7 +180,7 @@ pub(super) async fn rebuild_with_regenerated_proof(
 /// Cleanup SMT state and caches when transaction fails
 ///
 /// Removes the nonce from local SMT to keep it in sync with on-chain state.
-/// Also clears builder cache and retry counts.
+/// Also clears builder cache, retry counts, and remint cache.
 pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<u64>) {
     if let (Some(nonce), Some(ref mut smt_state)) = (nonce, state.smt_state.as_mut()) {
         if smt_state.smt_state.remove_nonce(nonce) {
@@ -176,6 +188,11 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
         }
         smt_state.nonce_to_builder.remove(&nonce);
         state.retry_counts.remove(&nonce);
+    }
+    if let Some(nonce) = nonce {
+        // Note: when called from handle_permanent_failure, remint_cache is
+        // already drained. This removal is defensive for any other call site.
+        state.remint_cache.remove(&nonce);
     }
 
     mint::cleanup_mint_builder(state, nonce.map(|n| n as i64));
@@ -191,6 +208,8 @@ mod tests {
     use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
 
     /// Build a minimal SenderState for testing (no RPC needed)
     fn make_sender_state() -> SenderState {
@@ -213,6 +232,21 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+        }
+    }
+
+    fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
+        WithdrawalRemintInfo {
+            transaction_id,
+            trace_id: trace_id.to_string(),
+            mint: Pubkey::new_unique(),
+            user: Pubkey::new_unique(),
+            user_ata: Pubkey::new_unique(),
+            token_program: spl_token::id(),
+            amount: 1000,
         }
     }
 
@@ -304,6 +338,7 @@ mod tests {
             .insert(5, (ctx, ReleaseFundsBuilder::new()));
         state.smt_state = Some(smt);
         state.retry_counts.insert(5, 2);
+        state.remint_cache.insert(5, make_test_remint_info(1, "t"));
 
         cleanup_failed_transaction(&mut state, Some(5));
 
@@ -311,6 +346,7 @@ mod tests {
         assert!(!smt.smt_state.contains_nonce(5));
         assert!(!smt.nonce_to_builder.contains_key(&5));
         assert!(!state.retry_counts.contains_key(&5));
+        assert!(!state.remint_cache.contains_key(&5));
     }
 
     #[test]
@@ -341,6 +377,7 @@ mod tests {
             nonce,
             transaction_id: 1,
             trace_id: "t".to_string(),
+            remint_info: Some(make_test_remint_info(1, "t")),
         });
 
         let result =
@@ -365,6 +402,7 @@ mod tests {
             nonce: 3,
             transaction_id: 1,
             trace_id: "t".to_string(),
+            remint_info: Some(make_test_remint_info(1, "t")),
         });
 
         let result =
@@ -381,6 +419,7 @@ mod tests {
             nonce: 0,
             transaction_id: 42,
             trace_id: "trace-42".to_string(),
+            remint_info: Some(make_test_remint_info(42, "trace-42")),
         });
 
         let result = smt.handle_release_funds_transaction(
@@ -415,6 +454,7 @@ mod tests {
                 nonce,
                 transaction_id: nonce as i64,
                 trace_id: format!("t-{nonce}"),
+                remint_info: Some(make_test_remint_info(nonce as i64, &format!("t-{nonce}"))),
             });
             smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None)
                 .unwrap();
@@ -504,5 +544,41 @@ mod tests {
         let rebuilt = result.unwrap();
         assert_eq!(rebuilt.fee_payer, fee_payer);
         assert_eq!(rebuilt.compute_unit_price, Some(1000));
+    }
+
+    #[tokio::test]
+    async fn rebuild_propagates_cached_remint_info() {
+        let mut state = make_sender_state();
+        let mut smt = make_smt_state(0);
+
+        let builder = make_release_funds_builder();
+        let ctx = TransactionContext {
+            transaction_id: Some(1),
+            withdrawal_nonce: Some(0),
+            trace_id: Some("t".to_string()),
+        };
+        smt.nonce_to_builder.insert(0, (ctx, builder));
+        state.smt_state = Some(smt);
+
+        // Seed remint_cache so rebuild can propagate it
+        let remint = make_test_remint_info(1, "t");
+        let expected_mint = remint.mint;
+        state.remint_cache.insert(0, remint);
+
+        let ix = InstructionWithSigners {
+            instructions: vec![],
+            fee_payer: Pubkey::new_unique(),
+            signers: vec![],
+            compute_unit_price: None,
+            compute_budget: None,
+        };
+
+        let result = rebuild_with_regenerated_proof(&mut state, Some(0), ix).await;
+        assert!(result.is_some());
+
+        // Verify remint_cache is still present (rebuild reads but doesn't drain)
+        let cached = state.remint_cache.get(&0);
+        assert!(cached.is_some(), "remint_cache should survive rebuild");
+        assert_eq!(cached.unwrap().mint, expected_mint);
     }
 }

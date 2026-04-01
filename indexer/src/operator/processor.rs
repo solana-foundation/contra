@@ -1,6 +1,8 @@
 use crate::channel_utils::send_guaranteed;
-use crate::error::OperatorError;
-use crate::operator::instruction_util::{mint_idempotency_memo, MintToBuilder, TransactionBuilder};
+use crate::error::{OperatorError, ProgramError};
+use crate::operator::instruction_util::{
+    mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
+};
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
@@ -209,9 +211,36 @@ pub async fn process_release_funds(
                 .user_ata(recipient_ata)
                 .instance_ata(instance_ata)
                 .token_program(token_program)
-                .amount(transaction.amount as u64)
                 .user(recipient)
                 .transaction_nonce(nonce);
+
+            let amount = u64::try_from(transaction.amount).map_err(|_| {
+                OperatorError::Program(ProgramError::InvalidBuilder {
+                    reason: format!(
+                        "negative withdrawal amount {} for transaction {}",
+                        transaction.amount, transaction.id
+                    ),
+                })
+            })?;
+            builder.amount(amount);
+
+            // Build remint info for token recovery on permanent failure.
+            // Uses Contra token program (not mainnet) since remint happens on Contra.
+            let contra_token_program = processor_state.mint_cache.get_contra_token_program();
+            let remint_user_ata = get_associated_token_address_with_program_id(
+                &recipient,
+                &mint,
+                &contra_token_program,
+            );
+            let remint_info = WithdrawalRemintInfo {
+                transaction_id: transaction.id,
+                trace_id: transaction.trace_id.clone(),
+                mint,
+                user: recipient,
+                user_ata: remint_user_ata,
+                token_program: contra_token_program,
+                amount,
+            };
 
             info!("Processing withdrawal");
 
@@ -221,6 +250,7 @@ pub async fn process_release_funds(
                     nonce,
                     transaction_id: transaction.id,
                     trace_id: transaction.trace_id.clone(),
+                    remint_info: Some(remint_info),
                 }));
 
             send_guaranteed(&sender_tx, wrapped, "processed release funds")
@@ -298,6 +328,7 @@ pub async fn process_deposit_funds(
 mod tests {
     use super::*;
     use crate::operator::find_allowed_mint_pda;
+    use crate::storage::common::storage::mock::MockStorage;
 
     fn make_release_funds_state() -> ReleaseFundsState {
         ReleaseFundsState {
@@ -368,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_release_funds_missing_state_errors() {
-        let mock = crate::storage::common::storage::mock::MockStorage::new();
+        let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
@@ -384,6 +415,451 @@ mod tests {
             matches!(result, Err(crate::error::OperatorError::MissingBuilder)),
             "expected MissingBuilder, got: {:?}",
             result
+        );
+    }
+
+    /// A valid withdrawal transaction is enriched with PDAs and ATA addresses then forwarded
+    /// to the sender channel as a ReleaseFunds builder.
+    #[tokio::test]
+    async fn process_release_funds_sends_transaction_builder() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        // Add a mint to the mock storage so mint_cache can find it
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        {
+            let mock_storage = match storage.as_ref() {
+                Storage::Mock(m) => m,
+                _ => unreachable!(),
+            };
+            mock_storage.mints.lock().unwrap().insert(
+                mint_pubkey.to_string(),
+                crate::storage::common::models::DbMint {
+                    mint_address: mint_pubkey.to_string(),
+                    decimals: 6,
+                    token_program: spl_token::id().to_string(),
+                    created_at: chrono::Utc::now(),
+                },
+            );
+        }
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: recipient.to_string(),
+            mint: mint_pubkey.to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
+            withdrawal_nonce: Some(5),
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(&mut ps, fetcher_rx, sender_tx).await;
+        assert!(result.is_ok());
+
+        let msg = sender_rx.recv().await.unwrap();
+        let TransactionBuilder::ReleaseFunds(b) = msg else {
+            panic!("expected ReleaseFunds, got a different variant");
+        };
+        assert_eq!(b.nonce, 5);
+        assert_eq!(b.transaction_id, 1);
+        assert_eq!(b.trace_id, "trace-1");
+    }
+
+    /// When the nonce lands exactly on MAX_TREE_LEAVES, a ResetSmtRoot transaction must be
+    /// sent before the ReleaseFunds transaction to rotate the SMT root.
+    #[tokio::test]
+    async fn process_release_funds_tree_rotation_sends_reset_first() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        {
+            let mock_storage = match storage.as_ref() {
+                Storage::Mock(m) => m,
+                _ => unreachable!(),
+            };
+            mock_storage.mints.lock().unwrap().insert(
+                mint_pubkey.to_string(),
+                crate::storage::common::models::DbMint {
+                    mint_address: mint_pubkey.to_string(),
+                    decimals: 6,
+                    token_program: spl_token::id().to_string(),
+                    created_at: chrono::Utc::now(),
+                },
+            );
+        }
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+
+        // Use nonce at tree rotation boundary (MAX_TREE_LEAVES)
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: recipient.to_string(),
+            mint: mint_pubkey.to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
+            withdrawal_nonce: Some(MAX_TREE_LEAVES as i64),
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(&mut ps, fetcher_rx, sender_tx).await;
+        assert!(result.is_ok());
+
+        // First message must be ResetSmtRoot — rotation happens before the boundary withdrawal
+        let msg1 = sender_rx.recv().await.unwrap();
+        assert!(
+            matches!(msg1, TransactionBuilder::ResetSmtRoot(_)),
+            "expected ResetSmtRoot first, got: {:?}",
+            std::mem::discriminant(&msg1)
+        );
+
+        // Second message must be the ReleaseFunds for the boundary nonce itself
+        let msg2 = sender_rx.recv().await.unwrap();
+        let TransactionBuilder::ReleaseFunds(b) = msg2 else {
+            panic!("expected ReleaseFunds second, got a different variant");
+        };
+        assert_eq!(b.nonce, MAX_TREE_LEAVES as u64);
+        assert_eq!(b.transaction_id, 1);
+
+        // No further messages — exactly two were sent
+        assert!(sender_rx.try_recv().is_err(), "unexpected third message");
+    }
+
+    /// A mint field that cannot be parsed as a Pubkey must surface as an InvalidPubkey error
+    /// rather than panicking or silently skipping the transaction.
+    #[tokio::test]
+    async fn process_release_funds_invalid_mint_errors() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: "not_a_valid_pubkey".to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
+            withdrawal_nonce: Some(1),
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let err = process_release_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::InvalidPubkey { ref pubkey, .. } if pubkey == "not_a_valid_pubkey"),
+            "expected InvalidPubkey for bad mint, got: {:?}",
+            err
+        );
+    }
+
+    /// A valid deposit transaction is wrapped as a Mint builder with the correct ATA and
+    /// idempotency memo, then forwarded to the sender channel.
+    #[tokio::test]
+    async fn process_deposit_funds_sends_mint_builder() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: recipient.to_string(),
+            mint: mint_pubkey.to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_deposit_funds(&mut ps, fetcher_rx, sender_tx).await;
+        assert!(result.is_ok());
+
+        let msg = sender_rx.recv().await.unwrap();
+        let TransactionBuilder::Mint(b) = msg else {
+            panic!("expected Mint, got a different variant");
+        };
+        assert_eq!(b.txn_id, 1);
+        assert_eq!(b.trace_id, "trace-1");
+    }
+
+    /// A non-base58 mint string must fail with InvalidPubkey; the error propagates out of
+    /// process_deposit_funds rather than being swallowed.
+    #[tokio::test]
+    async fn process_deposit_funds_invalid_mint_errors() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: "not_a_valid_pubkey".to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let err = process_deposit_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::InvalidPubkey { ref pubkey, .. } if pubkey == "not_a_valid_pubkey"),
+            "expected InvalidPubkey for bad mint, got: {:?}",
+            err
+        );
+    }
+
+    /// An already-closed fetcher channel means there are no transactions to process;
+    /// the function should return Ok(()) immediately without touching the sender.
+    #[tokio::test]
+    async fn process_deposit_funds_empty_channel_returns_ok() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+
+        drop(fetcher_tx); // close channel immediately — no transactions to process
+
+        process_deposit_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap();
+
+        // Nothing was sent; channel is empty and the sender was dropped by the function
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "expected empty sender channel"
+        );
+    }
+
+    /// A recipient field that is not a valid base58 pubkey must return an error; the ATA
+    /// derivation step must never be reached with garbage input.
+    #[tokio::test]
+    async fn process_deposit_funds_invalid_recipient_errors() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: "not_a_valid_pubkey".to_string(), // invalid recipient
+            mint: Pubkey::new_unique().to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let err = process_deposit_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::InvalidPubkey { ref pubkey, .. } if pubkey == "not_a_valid_pubkey"),
+            "expected InvalidPubkey for bad recipient, got: {:?}",
+            err
+        );
+    }
+
+    /// An unparseable recipient pubkey must fail with InvalidPubkey even when the mint is
+    /// valid and the release_funds_state is fully populated.
+    #[tokio::test]
+    async fn process_release_funds_invalid_recipient_errors() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let mint_pubkey = Pubkey::new_unique();
+        {
+            let mock_storage = match storage.as_ref() {
+                Storage::Mock(m) => m,
+                _ => unreachable!(),
+            };
+            mock_storage.mints.lock().unwrap().insert(
+                mint_pubkey.to_string(),
+                crate::storage::common::models::DbMint {
+                    mint_address: mint_pubkey.to_string(),
+                    decimals: 6,
+                    token_program: spl_token::id().to_string(),
+                    created_at: chrono::Utc::now(),
+                },
+            );
+        }
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 1,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: "not_a_valid_pubkey".to_string(), // invalid recipient
+            mint: mint_pubkey.to_string(),
+            amount: 1000,
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
+            withdrawal_nonce: Some(5),
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let err = process_release_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OperatorError::InvalidPubkey { ref pubkey, .. } if pubkey == "not_a_valid_pubkey"),
+            "expected InvalidPubkey for bad recipient, got: {:?}",
+            err
         );
     }
 }

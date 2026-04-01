@@ -4,6 +4,7 @@ members = [
     "auth",
     "contra-escrow-program/program",
     "contra-escrow-program/tests/integration-tests",
+    "contra-escrow-program/tests/fuzz",
     "contra-escrow-program/clients/rust",
     "contra-withdraw-program/program",
     "contra-withdraw-program/tests/integration-tests",

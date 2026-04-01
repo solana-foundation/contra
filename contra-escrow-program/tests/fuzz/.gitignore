@@ -1,0 +1,3 @@
+# honggfuzz artifacts                                                                   
+hfuzz_workspace/
+hfuzz_target/

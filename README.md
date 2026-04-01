@@ -33,6 +33,7 @@ Contra operates as a payment channel with direct access to Solana Mainnet liquid
 - **Contra Escrow Program**: Makes assets readily accessible to the payment channel. Users deposit SPL tokens. The program locks funds in escrow for use within the channel.
 - **Contra Withdrawal Program**: Withdrawals are initiated by sending tokens to the withdraw program inside the payment channel. The withdraw program burns the tokens and SPL tokens are released from the escrow program.
 - **Contra Indexer/Operator**: Monitors deposits and withdrawals, orchestrates state synchronization, and maintains an auditable record of all activity.
+- **Contra Auth**: Optional authentication service. Issues signed JWTs for registered users and verified Solana wallets. When enabled, the gateway enforces RBAC — restricting account queries to wallets the caller owns and reserving operator-only methods (block/transaction fetching, transaction simulation) for elevated accounts.
 
 ### Case Study - Payments
 
@@ -223,7 +224,8 @@ make all-test
 |-----------|------|-------------|
 | **Contra Core** | [core/](core/) | Payment channel transaction pipeline |
 | **Contra DB** | [core/src/accounts/](core/src/accounts/) | Accounts database with multi-backend support |
-| **Gateway** | [gateway/](gateway/) | Read/write node routing service |
+| **Gateway** | [gateway/](gateway/) | Read/write node routing service with optional RBAC enforcement |
+| **Auth** | [auth/](auth/) | Authentication service — user registration, login, wallet verification, JWT issuance |
 | **Escrow Program** | [contra-escrow-program/](contra-escrow-program/) | Mainnet token deposit via escrow |
 | **Withdrawal Program** | [contra-withdraw-program/](contra-withdraw-program/) | Channel token withdrawal via burning |
 | **Indexer + Operator** | [indexer/](indexer/) | Mainnet & channel transaction monitoring & automation |
@@ -254,6 +256,23 @@ make unit-test
 # Run integration tests only
 make integration-test
 ```
+
+### Running with Auth (RBAC)
+
+Auth is opt-in. The gateway runs without it by default — all RPC methods are accessible without a token.
+
+To enable auth, set `JWT_SECRET` in your `.env` and start with the `auth` profile:
+
+```bash
+# Copy and configure env
+cp .env.example .env
+# Set JWT_SECRET=<your-secret> in .env
+
+# Start full stack including auth service
+docker compose --profile auth up
+```
+
+Once running, the auth service is available at `http://localhost:${AUTH_PORT}` (default `8903`). See [auth/README.md](auth/README.md) for the full API reference, role definitions, and wallet verification flow.
 
 ## License
 

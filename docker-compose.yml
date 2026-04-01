@@ -161,9 +161,37 @@ services:
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9101
+      # Optional — omit or leave blank to disable RBAC enforcement.
+      - JWT_SECRET=${JWT_SECRET:-}
+      - AUTH_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+      - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
     ports:
       - "${GATEWAY_PORT}:${GATEWAY_PORT}"
     command: ["/usr/local/bin/gateway"]
+    networks:
+      - contra-network
+
+  # Auth Service (optional — run with: docker compose --profile auth up)
+  auth:
+    profiles: [auth]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: contra-auth
+    restart: unless-stopped
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info
+      - AUTH_PORT=${AUTH_PORT}
+      - AUTH_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+      - JWT_SECRET=${JWT_SECRET}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
+      - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
+    ports:
+      - "${AUTH_PORT}:${AUTH_PORT}"
+    command: ["/usr/local/bin/auth"]
     networks:
       - contra-network
 

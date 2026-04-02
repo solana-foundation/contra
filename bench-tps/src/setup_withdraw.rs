@@ -176,6 +176,16 @@ pub async fn run_setup_withdraw_phase(
                 break;
             }
         }
+        if l1_rpc
+            .get_balance(&admin_keypair.pubkey())
+            .await
+            .unwrap_or(0)
+            < MIN_ADMIN_LAMPORTS
+        {
+            return Err(anyhow::anyhow!(
+                "airdrop timed out: admin balance still below minimum after 60 attempts"
+            ));
+        }
         info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on L1");
     } else {
         info!(balance, "Admin already funded on L1, skipping airdrop");
@@ -228,7 +238,12 @@ pub async fn run_setup_withdraw_phase(
             "create_instance: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&l1_rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
+    let retry = poll_confirmations(&l1_rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!(
+            "create_instance failed to confirm on-chain"
+        ));
+    }
     info!(%instance_pda, elapsed_ms = t3.elapsed().as_millis(), "Escrow instance created on L1");
 
     // ------------------------------------------------------------------
@@ -282,7 +297,10 @@ pub async fn run_setup_withdraw_phase(
             "add_operator: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&l1_rpc, &[Some(add_op_sig)], "add_operator", 0, 1).await?;
+    let retry = poll_confirmations(&l1_rpc, &[Some(add_op_sig)], "add_operator", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!("add_operator failed to confirm on-chain"));
+    }
     info!(%operator_pda, elapsed_ms = t4.elapsed().as_millis(), "Operator registered on L1");
 
     // ------------------------------------------------------------------
@@ -345,7 +363,10 @@ pub async fn run_setup_withdraw_phase(
             "l1 mint init: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&l1_rpc, &[Some(mint_sig)], "l1_mint_init", 0, 1).await?;
+    let retry = poll_confirmations(&l1_rpc, &[Some(mint_sig)], "l1_mint_init", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!("l1_mint_init failed to confirm on-chain"));
+    }
     info!(%mint, elapsed_ms = t5.elapsed().as_millis(), "L1 mint initialized");
 
     // ------------------------------------------------------------------
@@ -401,7 +422,10 @@ pub async fn run_setup_withdraw_phase(
             "allow_mint: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&l1_rpc, &[Some(allow_sig)], "allow_mint", 0, 1).await?;
+    let retry = poll_confirmations(&l1_rpc, &[Some(allow_sig)], "allow_mint", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!("allow_mint failed to confirm on-chain"));
+    }
     info!(
         %allowed_mint_pda,
         %instance_ata,
@@ -458,7 +482,12 @@ pub async fn run_setup_withdraw_phase(
             "seed_instance_ata: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&l1_rpc, &[Some(seed_sig)], "seed_instance_ata", 0, 1).await?;
+    let retry = poll_confirmations(&l1_rpc, &[Some(seed_sig)], "seed_instance_ata", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!(
+            "seed_instance_ata failed to confirm on-chain"
+        ));
+    }
     info!(
         %instance_ata,
         seed_amount,
@@ -604,7 +633,10 @@ pub async fn run_setup_withdraw_phase(
             "l2 mint init: all retries exhausted: {last_err}"
         ));
     };
-    poll_confirmations(&l2_rpc, &[Some(l2_mint_sig)], "l2_mint_init", 0, 1).await?;
+    let retry = poll_confirmations(&l2_rpc, &[Some(l2_mint_sig)], "l2_mint_init", 0, 1).await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!("l2_mint_init failed to confirm on-chain"));
+    }
     info!(%mint, elapsed_ms = t9.elapsed().as_millis(), "Mint initialized on L2");
 
     // ------------------------------------------------------------------

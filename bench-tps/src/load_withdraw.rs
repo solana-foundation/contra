@@ -153,11 +153,9 @@ pub fn run_withdraw_sender_thread(
         };
 
         for tx in &batch {
-            match rpc.send_transaction(tx) {
-                Ok(_) => {
-                    BENCH_SENT_TOTAL.with_label_values(&[FLOW_WITHDRAW]).inc();
-                }
-                Err(e) => warn!(err = %e, "withdraw sender: send_transaction failed"),
+            BENCH_SENT_TOTAL.with_label_values(&[FLOW_WITHDRAW]).inc();
+            if let Err(e) = rpc.send_transaction(tx) {
+                warn!(err = %e, "withdraw sender: send_transaction failed");
             }
         }
 

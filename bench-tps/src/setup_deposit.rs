@@ -171,6 +171,11 @@ pub async fn run_setup_deposit_phase(
                 break;
             }
         }
+        if rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) < MIN_ADMIN_LAMPORTS {
+            return Err(anyhow::anyhow!(
+                "airdrop timed out: admin balance still below minimum after 60 attempts"
+            ));
+        }
         info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on L1");
     } else {
         info!(balance, "Admin already funded on L1, skipping airdrop");

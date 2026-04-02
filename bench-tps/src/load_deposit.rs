@@ -175,7 +175,8 @@ pub fn run_deposit_sender_thread(
         };
 
         for tx in &batch {
-            match rpc.send_transaction_with_config(
+            BENCH_SENT_TOTAL.with_label_values(&[FLOW_DEPOSIT]).inc();
+            if let Err(e) = rpc.send_transaction_with_config(
                 tx,
                 RpcSendTransactionConfig {
                     skip_preflight: false,
@@ -183,10 +184,7 @@ pub fn run_deposit_sender_thread(
                     ..Default::default()
                 },
             ) {
-                Ok(_) => {
-                    BENCH_SENT_TOTAL.with_label_values(&[FLOW_DEPOSIT]).inc();
-                }
-                Err(e) => warn!(err = %e, "deposit sender: send_transaction failed"),
+                warn!(err = %e, "deposit sender: send_transaction failed");
             }
         }
 

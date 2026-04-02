@@ -32,8 +32,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${BENCH_DIR}/.." && pwd)"
 
-# Release binary produced by: cargo build --release --manifest-path bench-tps/Cargo.toml
-BENCH_BIN="${BENCH_DIR}/target/release/contra-bench-tps"
+# Release binary produced by: cargo build --release -p contra-bench-tps
+# bench-tps is a workspace member so Cargo outputs to the workspace target dir.
+BENCH_BIN="${REPO_ROOT}/target/release/contra-bench-tps"
 
 # .env file loaded by both this script and docker compose.
 # Copy from .env.sample and fill in values before first run.
@@ -45,9 +46,12 @@ BENCH_ENV="${BENCH_DIR}/.env"
 # --rebuild  Force-rebuild the Rust binary, Solana programs, and Docker images.
 #            Also regenerates the admin keypair.  Use this after code changes.
 #
-# --clean             Wipe all Docker volumes (postgres data, validator ledger)
-#                     before starting.  Use this when a previous run was
-#                     interrupted and left corrupt state.
+# --no-clean          Skip wiping Docker volumes.  By default volumes are wiped
+#                     on every run (the validator ledger resets, so stale DB
+#                     state from a prior run will cause the indexer's startup
+#                     reconciliation to fail).  Pass --no-clean only when you
+#                     intentionally want to resume from existing state, e.g.
+#                     after a crash where the validator did not reset.
 #
 # --no-refresh-metrics  Skip recreating Prometheus + Grafana. By default the
 #                       script refreshes them to reload scrape config and
@@ -61,7 +65,7 @@ BENCH_ENV="${BENCH_DIR}/.env"
 # bench binary at the end of the script (e.g. --threads 20 --duration 120).
 # ---------------------------------------------------------------------------
 REBUILD=0
-CLEAN=0
+CLEAN=1          # default: always wipe volumes because validator resets each run
 REFRESH_METRICS=1
 CONTRA_THREADS=""   # explicit core count for services (optional)
 BENCH_ARGS=()
@@ -74,7 +78,7 @@ for arg in "$@"; do
     fi
     case "${arg}" in
         --rebuild)        REBUILD=1 ;;
-        --clean)          CLEAN=1 ;;
+        --no-clean)       CLEAN=0 ;;
         --no-refresh-metrics) REFRESH_METRICS=0 ;;
         --contra-threads) SKIP_NEXT=1 ;;  # value is the next token
         *)                BENCH_ARGS+=("${arg}") ;;
@@ -230,6 +234,43 @@ patch_env "ADMIN_PRIVATE_KEY" "${ADMIN_PRIVKEY_JSON}"
 
 echo "Patched CONTRA_ADMIN_KEYS and ADMIN_PRIVATE_KEY in ${BENCH_ENV}"
 
+# ---------------------------------------------------------------------------
+# Step 5b — Generate / reuse the deposit instance-seed keypair and derive PDA
+#
+# The bench deposit subcommand creates an escrow instance on L1 during setup.
+# indexer-solana and operator-solana must be pre-configured with the matching
+# instance PDA so they can observe deposits as they land.
+#
+# Strategy:
+#   1. Generate (or reuse) a persistent instance-seed keypair file alongside
+#      the admin keypair.  Using a fixed file means the same instance PDA is
+#      produced on every run as long as the file is not deleted.
+#   2. Derive the instance PDA using the bench binary's `derive-pda` subcommand
+#      (no RPC call needed — pure local computation).
+#   3. Patch COMMON_ESCROW_INSTANCE_ID into .env so docker-compose passes it
+#      to both indexer-solana and operator-solana.
+#
+# On --rebuild the keypair is regenerated and the PDA changes accordingly.
+# ---------------------------------------------------------------------------
+INSTANCE_SEED_FILE="${BENCH_DIR}/deposit-instance-seed.json"
+
+if [ "${REBUILD}" -eq 1 ] || [ ! -f "${INSTANCE_SEED_FILE}" ]; then
+    solana-keygen new --no-bip39-passphrase --silent --force --outfile "${INSTANCE_SEED_FILE}"
+    echo "Generated deposit instance-seed keypair: ${INSTANCE_SEED_FILE}"
+else
+    echo "Reusing existing deposit instance-seed keypair: ${INSTANCE_SEED_FILE}"
+fi
+
+# Derive the instance PDA via the bench binary (builds fast, no RPC needed).
+BENCH_DEPOSIT_INSTANCE_PDA=$("${BENCH_BIN}" derive-pda \
+    --instance-seed-keypair "${INSTANCE_SEED_FILE}")
+echo "Deposit instance PDA: ${BENCH_DEPOSIT_INSTANCE_PDA}"
+
+# Write as COMMON_ESCROW_INSTANCE_ID so docker-compose can pass it through to
+# both indexer-solana and operator-solana without an explicit mapping.  Also
+# keep BENCH_DEPOSIT_INSTANCE_PDA for reference / debugging.
+patch_env "COMMON_ESCROW_INSTANCE_ID" "${BENCH_DEPOSIT_INSTANCE_PDA}"
+
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
 # --env-file in docker compose, so without this re-source the operator and
@@ -300,22 +341,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8 — Optionally wipe data volumes (--clean)
+# Step 8 — Wipe data volumes (default; skip with --no-clean)
 #
-# postgres-primary, postgres-replica, postgres-indexer, and the validator
-# ledger are all stored in named Docker volumes.  If a previous run was
-# interrupted mid-write (e.g. Ctrl+C during a DB migration) the volumes may
-# contain corrupt data.  Symptoms: "unexpected end of file", WAL errors, or
-# the write-node failing to start.
+# Volumes are wiped by default because the local Solana validator resets its
+# ledger on every run, leaving the indexer DB in a state that is inconsistent
+# with on-chain reality.  The startup reconciliation will detect this mismatch
+# and crash the indexer unless the DB is also reset.
 #
-# --clean calls `docker compose down -v` which removes all named volumes
-# associated with this compose project.  The next startup will reinitialise
-# from scratch (migrations re-run, validator resets its ledger, etc.).
+# Pass --no-clean only when you intentionally want to resume from existing
+# state (e.g. after a CTRL+C where the validator was not restarted).
 #
 # WARNING: this permanently deletes all data in those volumes.
 # ---------------------------------------------------------------------------
 if [ "${CLEAN}" -eq 1 ]; then
-    echo "Removing data volumes (--clean flag set)..."
+    echo "Removing data volumes (pass --no-clean to skip)..."
     "${COMPOSE[@]}" down -v 2>/dev/null || true
     echo "Data volumes removed."
 fi
@@ -604,14 +643,18 @@ echo "All services stable."
 # ---------------------------------------------------------------------------
 # Step 13 — Run the bench binary
 #
-# Two mandatory arguments are always injected by this script:
+# Mandatory arguments always injected by this script:
 #   --admin-keypair  path to the keypair generated in step 5
-#   --rpc-url        gateway address (bench sends through gateway so that
-#                    reads are routed to the read-node automatically)
+#   --metrics-port   fixed at 9101 (scraped by Prometheus)
+#
+# Subcommand-specific RPC injection:
+#   transfer/withdraw → --rpc-url  (L2 gateway)
+#   deposit           → --l1-rpc-url (L1 validator, host port 18899)
 #
 # Any extra arguments passed to run.sh (i.e. those not consumed in step 1)
 # are forwarded verbatim, allowing callers to override defaults:
-#   ./scripts/run.sh --threads 20 --duration 120 --num-conflict-groups 1
+#   ./scripts/run.sh transfer --threads 20 --duration 120
+#   ./scripts/run.sh deposit  --duration 60
 #
 # When CPU pinning is active, taskset -c restricts the bench process to the
 # bench CPU set so it does not compete with service containers.
@@ -631,18 +674,59 @@ echo ""
 echo "Running bench on cores [${BENCH_CPUSET:-any}]..."
 echo "-------------------------------------------------------"
 
+# Determine the subcommand.  The first element of BENCH_ARGS that does not
+# start with "--" is treated as the subcommand; if none is found, default to
+# "transfer" to preserve backwards compatibility.
+SUBCOMMAND="transfer"
+REMAINING_ARGS=()
+for arg in "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"; do
+    if [[ "${arg}" != --* ]] && [ "${SUBCOMMAND}" = "transfer" ] && \
+       [[ "${arg}" =~ ^(transfer|deposit|withdraw)$ ]]; then
+        SUBCOMMAND="${arg}"
+    else
+        REMAINING_ARGS+=("${arg}")
+    fi
+done
+
+# Base mandatory flags injected by this script.
+BASE_FLAGS=(
+    --admin-keypair "${ADMIN_KEYPAIR_FILE}"
+    --metrics-port 9101
+)
+
+# --rpc-url is used by transfer and withdraw (L2 gateway); deposit and withdraw
+# also need --l1-rpc-url for L1 escrow setup.
+L1_RPC="${BENCH_L1_RPC_URL:-http://localhost:${CONTRA_VALIDATOR_PORT:-18899}}"
+
+if [ "${SUBCOMMAND}" = "deposit" ]; then
+    BASE_FLAGS+=(--l1-rpc-url "${L1_RPC}")
+    # Pass the persistent instance-seed keypair so the bench reuses the same
+    # instance PDA that indexer-solana and operator-solana are watching.
+    if [ -f "${INSTANCE_SEED_FILE}" ]; then
+        BASE_FLAGS+=(--instance-seed-keypair "${INSTANCE_SEED_FILE}")
+    fi
+elif [ "${SUBCOMMAND}" = "withdraw" ]; then
+    BASE_FLAGS+=(--rpc-url "http://localhost:${GATEWAY_PORT}")
+    BASE_FLAGS+=(--l1-rpc-url "${L1_RPC}")
+    # Reuse the same instance-seed as deposit so COMMON_ESCROW_INSTANCE_ID matches
+    # the PDA that operator-contra is watching.
+    if [ -f "${INSTANCE_SEED_FILE}" ]; then
+        BASE_FLAGS+=(--instance-seed-keypair "${INSTANCE_SEED_FILE}")
+    fi
+else
+    BASE_FLAGS+=(--rpc-url "http://localhost:${GATEWAY_PORT}")
+fi
+
 if [ -n "${BENCH_CPUSET}" ]; then
     taskset -c "${BENCH_CPUSET}" "${BENCH_BIN}" \
-        --admin-keypair "${ADMIN_KEYPAIR_FILE}" \
-        --rpc-url "http://localhost:${GATEWAY_PORT}" \
-        --metrics-port 9101 \
-        "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"
+        "${SUBCOMMAND}" \
+        "${BASE_FLAGS[@]}" \
+        "${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}"
 else
     "${BENCH_BIN}" \
-        --admin-keypair "${ADMIN_KEYPAIR_FILE}" \
-        --rpc-url "http://localhost:${GATEWAY_PORT}" \
-        --metrics-port 9101 \
-        "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"
+        "${SUBCOMMAND}" \
+        "${BASE_FLAGS[@]}" \
+        "${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}"
 fi
 
 echo "-------------------------------------------------------"

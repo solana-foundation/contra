@@ -106,3 +106,39 @@ pub struct BenchState {
 /// - The `Condvar` lets sender threads block cheaply when the queue is empty
 ///   instead of spinning, and wakes them when the generator pushes a new batch.
 pub type BatchQueue = Arc<(Mutex<VecDeque<Vec<Transaction>>>, Condvar)>;
+
+// ---------------------------------------------------------------------------
+// Deposit / Withdraw configuration structs
+// ---------------------------------------------------------------------------
+
+/// Configuration for the deposit load phase.
+///
+/// Holds the on-chain state set up by `setup_deposit::run_setup_deposit_phase`.
+pub struct DepositConfig {
+    /// The L1 token mint being deposited into the escrow.
+    pub mint: Pubkey,
+    /// The escrow instance PDA derived from the instance seed.
+    pub instance_pda: Pubkey,
+    /// The allowed-mint PDA for this (instance, mint) pair.
+    pub allowed_mint_pda: Pubkey,
+    /// The instance's ATA (escrow account) for this mint.
+    pub instance_ata: Pubkey,
+    /// Event authority PDA for the escrow program (derived from "event_authority" seed).
+    pub event_authority: Pubkey,
+    /// Depositor keypairs, one per account.  Each has an L1 ATA funded with tokens.
+    pub keypairs: Vec<Arc<Keypair>>,
+    /// Shared mutable state seeded with the current L1 blockhash.
+    pub state: Arc<BenchState>,
+}
+
+/// Configuration for the withdraw load phase.
+///
+/// Holds the on-chain state set up by the L2 `setup::run_setup_phase`.
+pub struct WithdrawConfig {
+    /// The L2 SPL mint whose tokens will be burned on withdraw.
+    pub mint: Pubkey,
+    /// Withdrawer keypairs, one per account.  Each has an L2 ATA funded with tokens.
+    pub keypairs: Vec<Arc<Keypair>>,
+    /// Shared mutable state seeded with the current L2 blockhash.
+    pub state: Arc<BenchState>,
+}

@@ -12,12 +12,18 @@ anyhow = "1.0"
 clap = { workspace = true }
 contra-core = { workspace = true }
 contra-metrics = { workspace = true }
+contra-escrow-program-client = { workspace = true }
+contra-withdraw-program-client = { workspace = true }
 futures = { workspace = true }
+hex = "0.4"
 rayon = "1.10"
+serde_json = { workspace = true }
 # Pinned to 2.3.10 (matches core/indexer/integration). Workspace declares 3.0.0
 # but { workspace = true } breaks compilation — solana-sdk is still 2.x.
 solana-client = "2.3.10"
+reqwest = { workspace = true }
 solana-sdk = { workspace = true }
+solana-system-interface = { workspace = true }
 spl-associated-token-account = { workspace = true }
 spl-token = { workspace = true }
 tokio = { workspace = true }

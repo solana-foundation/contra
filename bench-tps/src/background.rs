@@ -18,7 +18,11 @@
 
 use {
     crate::{
+        bench_metrics::BENCH_LANDED_TOTAL,
         bench_metrics::{BENCH_LANDED_TOTAL, NO_LABELS},
+        types::{
+            BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL,
+        },
         types::{
             BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL,
         },
@@ -29,6 +33,103 @@ use {
     tokio_util::sync::CancellationToken,
     tracing::{info, warn},
 };
+
+/// Scrape a single metric value from a Prometheus `/metrics` text endpoint.
+///
+/// Returns `Ok(value)` when the metric line is found, `Err(reason)` otherwise
+/// so callers can log a precise failure message.
+async fn scrape_prometheus_metric(
+    metrics_url: &str,
+    metric_name: &str,
+    label_filter: &str,
+) -> Result<f64, &'static str> {
+    let body = match reqwest::get(metrics_url).await {
+        Ok(resp) => match resp.text().await {
+            Ok(t) => t,
+            Err(_) => return Err("failed to read response body"),
+        },
+        Err(_) => return Err("connection refused or unreachable"),
+    };
+
+    for line in body.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with(metric_name) && line.contains(label_filter) {
+            // Prometheus text format: `metric_name{labels} value [timestamp]`
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            return parts
+                .get(1)
+                .and_then(|s| s.parse::<f64>().ok())
+                .ok_or("failed to parse metric value");
+        }
+    }
+    Err("metric line not found in response")
+}
+
+/// Samples `contra_operator_mints_sent_total` every second from a Prometheus
+/// `/metrics` endpoint, logging instantaneous confirmed/s and remaining test time.
+///
+/// Mirrors `run_metrics_sampler` but measures operator-confirmed transactions instead
+/// of raw L2 transaction count — giving the true end-to-end completion rate.
+///
+/// `program_type` selects which operator to sample:
+///   - `"escrow"`  → deposit operator (L2 mints confirmed)
+///   - `"withdraw"` → withdraw operator (L1 releases confirmed)
+///
+/// Returns `(start_count, final_count)` for drop-rate calculation.
+pub async fn run_operator_mints_sampler(
+    metrics_url: String,
+    load_end: tokio::time::Instant,
+    cancel: CancellationToken,
+    program_type: &'static str,
+) -> (u64, u64) {
+    info!(url = %metrics_url, program_type, "operator_mints_sampler: starting");
+
+    let mut ticker = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut start_count: Option<u64> = None;
+    let mut prev_count: Option<u64> = None;
+
+    const METRIC: &str = "contra_operator_mints_sent_total";
+    let label = format!(r#"program_type="{}""#, program_type);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = cancel.cancelled() => {
+                let final_count = match scrape_prometheus_metric(&metrics_url, METRIC, &label).await {
+                    Ok(v) => v as u64,
+                    Err(reason) => {
+                        warn!(reason, "operator_mints_sampler: final scrape failed");
+                        prev_count.unwrap_or(0)
+                    }
+                };
+                return (start_count.unwrap_or(final_count), final_count);
+            }
+
+            _ = ticker.tick() => {
+                let count = match scrape_prometheus_metric(&metrics_url, METRIC, &label).await {
+                    Ok(v) => v as u64,
+                    Err(reason) => {
+                        warn!(reason, url = %metrics_url, "operator_mints_sampler: scrape failed, will retry");
+                        continue;
+                    }
+                };
+
+                let sc = *start_count.get_or_insert(count);
+                let confirmed_per_sec = count.saturating_sub(prev_count.unwrap_or(count));
+                let remaining_secs = load_end
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs();
+                info!(confirmed_per_sec, total_confirmed = count, baseline = sc, remaining_secs, program_type, "operator confirmed/s");
+                prev_count = Some(count);
+            }
+        }
+    }
+}
 
 /// Refreshes the cached blockhash at `BLOCKHASH_POLL_INTERVAL` (80 ms) and
 /// logs average fetch latency at `BLOCKHASH_LOG_INTERVAL` (every 2 s).
@@ -103,6 +204,7 @@ pub async fn run_metrics_sampler(
     rpc_url: String,
     load_end: tokio::time::Instant,
     cancel: CancellationToken,
+    flow: &'static str,
 ) -> (u64, u64) {
     let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::processed());
     let mut ticker = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
@@ -127,7 +229,7 @@ pub async fn run_metrics_sampler(
                     let delta = final_count.saturating_sub(prev);
                     if delta > 0 {
                         BENCH_LANDED_TOTAL
-                            .with_label_values(&NO_LABELS)
+                            .with_label_values(&[flow])
                             .inc_by(delta as f64);
                     }
                 }
@@ -142,7 +244,7 @@ pub async fn run_metrics_sampler(
                             let tps = count.saturating_sub(prev);
                             if tps > 0 {
                                 BENCH_LANDED_TOTAL
-                                    .with_label_values(&NO_LABELS)
+                                    .with_label_values(&[flow])
                                     .inc_by(tps as f64);
                             }
                             let remaining_secs = load_end

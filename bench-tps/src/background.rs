@@ -19,10 +19,6 @@
 use {
     crate::{
         bench_metrics::BENCH_LANDED_TOTAL,
-        bench_metrics::{BENCH_LANDED_TOTAL, NO_LABELS},
-        types::{
-            BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL,
-        },
         types::{
             BenchState, BLOCKHASH_LOG_INTERVAL, BLOCKHASH_POLL_INTERVAL, METRICS_SAMPLE_INTERVAL,
         },

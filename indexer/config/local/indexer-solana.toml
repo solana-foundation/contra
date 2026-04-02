@@ -3,6 +3,12 @@
 [common]
 program_type = "escrow"
 rpc_url = "http://localhost:18899"
+
+# Placeholder — overridden at runtime by COMMON_ESCROW_INSTANCE_ID, which
+# bench-tps/scripts/run.sh derives from the persistent deposit-instance-seed.json
+# keypair and injects via .env before starting Docker services.
+# Only used as a fallback for manual `docker compose up` without run.sh;
+# update this value to match your actual escrow instance PDA in that case.
 escrow_instance_id = "7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz"
 
 [storage]

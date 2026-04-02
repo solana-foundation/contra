@@ -48,7 +48,6 @@ use {
     load::{build_destinations, run_generator, run_sender_thread},
     load_deposit::{run_deposit_generator, run_deposit_sender_thread},
     load_withdraw::{run_withdraw_generator, run_withdraw_sender_thread},
-    serde_json,
     setup_deposit::find_instance_pda,
     solana_sdk::{signature::Keypair, signer::Signer},
     std::{

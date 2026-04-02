@@ -9,7 +9,7 @@
 //!   3. AddOperator   — registers admin as the ReleaseFunds operator.
 //!   4. Create L1 SPL mint (admin = mint authority, same keypair reused on L2).
 //!   5. AllowMint     — registers the mint; creates allowed_mint PDA and
-//!                      instance ATA on L1.
+//!      instance ATA on L1.
 //!   6. Seed the instance ATA with `num_accounts × initial_balance` tokens so
 //!      ReleaseFunds has enough tokens to release for every withdrawal.
 //!
@@ -28,23 +28,20 @@ use {
         types::{BenchState, WithdrawConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
-    contra_core::client::{create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction},
+    contra_core::client::{
+        create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction,
+    },
     contra_escrow_program_client::{
         instructions::{
-            AddOperator, AddOperatorInstructionArgs,
-            AllowMint, AllowMintInstructionArgs,
+            AddOperator, AddOperatorInstructionArgs, AllowMint, AllowMintInstructionArgs,
             CreateInstance, CreateInstanceInstructionArgs,
         },
         CONTRA_ESCROW_PROGRAM_ID,
     },
     rayon::prelude::*,
-    serde_json,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
     solana_sdk::{
-        commitment_config::CommitmentConfig,
-        pubkey::Pubkey,
-        signature::Keypair,
-        signer::Signer,
+        commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
         transaction::Transaction,
     },
     solana_system_interface::{instruction as system_instruction, program},
@@ -67,7 +64,11 @@ const AIRDROP_LAMPORTS: u64 = 100_000_000_000;
 
 fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[ALLOWED_MINT_SEED_PREFIX, instance_pda.as_ref(), mint.as_ref()],
+        &[
+            ALLOWED_MINT_SEED_PREFIX,
+            instance_pda.as_ref(),
+            mint.as_ref(),
+        ],
         &CONTRA_ESCROW_PROGRAM_ID,
     )
 }
@@ -137,8 +138,7 @@ pub async fn run_setup_withdraw_phase(
     let instance_seed_pubkey = instance_seed_keypair.pubkey();
     let (instance_pda, instance_bump) = find_instance_pda(&instance_seed_pubkey);
     let (event_authority, _) = find_event_authority();
-    let (operator_pda, operator_bump) =
-        find_operator_pda(&instance_pda, &admin_keypair.pubkey());
+    let (operator_pda, operator_bump) = find_operator_pda(&instance_pda, &admin_keypair.pubkey());
     info!(
         %instance_seed_pubkey,
         %instance_pda,
@@ -167,7 +167,12 @@ pub async fn run_setup_withdraw_phase(
             .context("airdrop to admin on L1")?;
         for _ in 0..60u32 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if l1_rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) >= AIRDROP_LAMPORTS {
+            if l1_rpc
+                .get_balance(&admin_keypair.pubkey())
+                .await
+                .unwrap_or(0)
+                >= AIRDROP_LAMPORTS
+            {
                 break;
             }
         }
@@ -199,7 +204,9 @@ pub async fn run_setup_withdraw_phase(
                         event_authority,
                         contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
                     }
-                    .instruction(CreateInstanceInstructionArgs { bump: instance_bump });
+                    .instruction(CreateInstanceInstructionArgs {
+                        bump: instance_bump,
+                    });
                     let tx = Transaction::new_signed_with_payer(
                         &[create_ix],
                         Some(&admin_keypair.pubkey()),
@@ -251,7 +258,9 @@ pub async fn run_setup_withdraw_phase(
                         event_authority,
                         contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
                     }
-                    .instruction(AddOperatorInstructionArgs { bump: operator_bump });
+                    .instruction(AddOperatorInstructionArgs {
+                        bump: operator_bump,
+                    });
                     let tx = Transaction::new_signed_with_payer(
                         &[add_op_ix],
                         Some(&admin_keypair.pubkey()),
@@ -491,7 +500,12 @@ pub async fn run_setup_withdraw_phase(
                     .get_latest_blockhash()
                     .await
                     .context("get_latest_blockhash (l1 create-ata)")?;
-                info!(batch = batch_num, size = batch.len(), total, "Creating L1 withdrawer ATA batch");
+                info!(
+                    batch = batch_num,
+                    size = batch.len(),
+                    total,
+                    "Creating L1 withdrawer ATA batch"
+                );
                 let sigs = send_parallel(
                     l1_rpc_url,
                     batch,
@@ -534,7 +548,11 @@ pub async fn run_setup_withdraw_phase(
                 warn!(count = to_send.len(), "Retrying failed L1 ATA transactions");
             }
         }
-        info!(total, elapsed_ms = t8b.elapsed().as_millis(), "All L1 withdrawer ATAs created");
+        info!(
+            total,
+            elapsed_ms = t8b.elapsed().as_millis(),
+            "All L1 withdrawer ATAs created"
+        );
     }
 
     // ====================================================================
@@ -565,8 +583,12 @@ pub async fn run_setup_withdraw_phase(
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
-                    let init_tx =
-                        create_admin_initialize_mint(&admin_keypair, &mint, MINT_DECIMALS, blockhash);
+                    let init_tx = create_admin_initialize_mint(
+                        &admin_keypair,
+                        &mint,
+                        MINT_DECIMALS,
+                        blockhash,
+                    );
                     match l2_rpc.send_transaction(&init_tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
@@ -603,7 +625,12 @@ pub async fn run_setup_withdraw_phase(
                     .get_latest_blockhash()
                     .await
                     .context("get_latest_blockhash (l2 create-ata)")?;
-                info!(batch = batch_num, size = batch.len(), total, "Sending L2 ATA batch");
+                info!(
+                    batch = batch_num,
+                    size = batch.len(),
+                    total,
+                    "Sending L2 ATA batch"
+                );
                 let sigs = send_parallel(
                     l2_rpc_url,
                     batch,
@@ -621,9 +648,14 @@ pub async fn run_setup_withdraw_phase(
                     },
                 )
                 .await;
-                let retry_indices =
-                    poll_confirmations(&l2_rpc, &sigs, "create-ata(withdraw)", confirmed_so_far, total)
-                        .await?;
+                let retry_indices = poll_confirmations(
+                    &l2_rpc,
+                    &sigs,
+                    "create-ata(withdraw)",
+                    confirmed_so_far,
+                    total,
+                )
+                .await?;
                 confirmed_so_far += batch.len() - retry_indices.len();
                 for i in retry_indices {
                     next_round.push(Arc::clone(&batch[i]));
@@ -650,7 +682,12 @@ pub async fn run_setup_withdraw_phase(
                     .get_latest_blockhash()
                     .await
                     .context("get_latest_blockhash (l2 mint-to)")?;
-                info!(batch = batch_num, size = batch.len(), total, "Sending L2 mint-to batch");
+                info!(
+                    batch = batch_num,
+                    size = batch.len(),
+                    total,
+                    "Sending L2 mint-to batch"
+                );
                 let sigs = send_parallel(
                     l2_rpc_url,
                     batch,
@@ -661,20 +698,27 @@ pub async fn run_setup_withdraw_phase(
                         let ata = get_associated_token_address(&kp.pubkey(), &mint);
                         async move {
                             let tx = create_admin_mint_to(&admin, &mint, &ata, initial_balance, bh);
-                            RpcClient::new(_url).send_transaction_with_config(
-                                &tx,
-                                RpcSendTransactionConfig {
-                                    skip_preflight: true,
-                                    ..Default::default()
-                                },
-                            ).await
+                            RpcClient::new(_url)
+                                .send_transaction_with_config(
+                                    &tx,
+                                    RpcSendTransactionConfig {
+                                        skip_preflight: true,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
                         }
                     },
                 )
                 .await;
-                let retry_indices =
-                    poll_confirmations(&l2_rpc, &sigs, "mint-to(withdraw)", confirmed_so_far, total)
-                        .await?;
+                let retry_indices = poll_confirmations(
+                    &l2_rpc,
+                    &sigs,
+                    "mint-to(withdraw)",
+                    confirmed_so_far,
+                    total,
+                )
+                .await?;
                 confirmed_so_far += batch.len() - retry_indices.len();
                 for i in retry_indices {
                     next_round.push(Arc::clone(&batch[i]));
@@ -682,7 +726,10 @@ pub async fn run_setup_withdraw_phase(
             }
             to_send = next_round;
             if !to_send.is_empty() {
-                warn!(count = to_send.len(), "Retrying failed L2 mint-to transactions");
+                warn!(
+                    count = to_send.len(),
+                    "Retrying failed L2 mint-to transactions"
+                );
             }
         }
     }
@@ -704,6 +751,9 @@ pub async fn run_setup_withdraw_phase(
         "L2 blockhash seeded — withdraw setup complete",
     );
 
-    Ok(WithdrawConfig { mint, keypairs, state })
+    Ok(WithdrawConfig {
+        mint,
+        keypairs,
+        state,
+    })
 }
-

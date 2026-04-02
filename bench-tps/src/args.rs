@@ -135,7 +135,11 @@ pub struct DepositArgs {
     pub admin_keypair: PathBuf,
 
     /// JSON-RPC endpoint of the L1 Solana validator (for deposit transactions).
-    #[arg(long, default_value = "http://localhost:8899", env = "BENCH_L1_RPC_URL")]
+    #[arg(
+        long,
+        default_value = "http://localhost:8899",
+        env = "BENCH_L1_RPC_URL"
+    )]
     pub l1_rpc_url: String,
 
     /// Number of depositor accounts to generate.
@@ -196,7 +200,11 @@ pub struct WithdrawArgs {
     pub admin_keypair: PathBuf,
 
     /// JSON-RPC endpoint of the L1 Solana validator (for L1 escrow setup).
-    #[arg(long, default_value = "http://localhost:8899", env = "BENCH_L1_RPC_URL")]
+    #[arg(
+        long,
+        default_value = "http://localhost:8899",
+        env = "BENCH_L1_RPC_URL"
+    )]
     pub l1_rpc_url: String,
 
     /// JSON-RPC endpoint of the L2 contra write-node (or gateway).
@@ -247,4 +255,3 @@ pub struct WithdrawArgs {
     #[arg(long, default_value = "info", env = "BENCH_LOG_LEVEL")]
     pub log_level: String,
 }
-

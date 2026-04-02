@@ -660,15 +660,24 @@ echo "All services stable."
 # bench CPU set so it does not compete with service containers.
 # ---------------------------------------------------------------------------
 
-# Register a cleanup function that stops all Docker services when this script
-# exits (normally, on error, or on Ctrl+C / SIGTERM).
+# Register a cleanup function that tears down all Docker services when this
+# script exits for any reason: normal completion, unhandled error, Ctrl+C, or
+# SIGTERM from an external process.
+#
+# Using a _CLEANUP_DONE guard prevents the function from running twice when a
+# caught signal causes bash to both run the signal trap and then re-trigger
+# EXIT (bash fires EXIT after every signal trap that doesn't call `exit`
+# explicitly, so without the guard the compose down would run twice).
+_CLEANUP_DONE=0
 cleanup() {
+    [ "${_CLEANUP_DONE}" -eq 1 ] && return
+    _CLEANUP_DONE=1
     echo ""
-    echo "Stopping all services..."
-    "${COMPOSE[@]}" stop 2>/dev/null || true
+    echo "Tearing down all services..."
+    "${COMPOSE[@]}" down 2>/dev/null || true
     echo "Done."
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM ERR
 
 echo ""
 echo "Running bench on cores [${BENCH_CPUSET:-any}]..."

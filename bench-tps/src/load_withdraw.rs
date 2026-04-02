@@ -13,7 +13,10 @@ use {
         types::{BatchQueue, BenchState, WithdrawConfig, MAX_QUEUE_DEPTH},
     },
     contra_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs},
-    solana_sdk::{hash::Hash, signature::Keypair, signer::Signer, transaction::Transaction},
+    solana_sdk::{
+        hash::Hash, instruction::Instruction, pubkey, pubkey::Pubkey, signature::Keypair,
+        signer::Signer, transaction::Transaction,
+    },
     spl_associated_token_account::get_associated_token_address,
     std::sync::{
         atomic::{AtomicU64, Ordering},
@@ -26,11 +29,21 @@ use {
 /// Amount of tokens burned per withdraw transaction (1 raw unit).
 const WITHDRAW_AMOUNT: u64 = 1;
 
+/// SPL Memo program — accepts any data and always succeeds.
+/// Appending a unique nonce prevents duplicate-signature rejection when the
+/// same withdrawer account reuses the same blockhash across batches.
+const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
 /// Build a signed L2 withdraw-burn transaction.
+///
+/// `nonce` is encoded as a decimal string in a memo instruction so that every
+/// transaction has a unique signature even when the same keypair and blockhash
+/// are reused across batches.
 fn build_withdraw_tx(
     withdrawer: &Keypair,
     config: &WithdrawConfig,
     blockhash: Hash,
+    nonce: u64,
 ) -> Transaction {
     let withdrawer_pubkey = withdrawer.pubkey();
     let token_account = get_associated_token_address(&withdrawer_pubkey, &config.mint);
@@ -48,7 +61,18 @@ fn build_withdraw_tx(
         destination: None,
     });
 
-    Transaction::new_signed_with_payer(&[ix], Some(&withdrawer_pubkey), &[withdrawer], blockhash)
+    let memo_ix = Instruction {
+        program_id: MEMO_PROGRAM_ID,
+        accounts: vec![],
+        data: nonce.to_string().into_bytes(),
+    };
+
+    Transaction::new_signed_with_payer(
+        &[ix, memo_ix],
+        Some(&withdrawer_pubkey),
+        &[withdrawer],
+        blockhash,
+    )
 }
 
 /// Async generator: signs batches of withdraw transactions and enqueues them.
@@ -81,7 +105,7 @@ pub async fn run_withdraw_generator(
         let mut batch = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             let withdrawer = &config.keypairs[tx_seq % config.keypairs.len()];
-            let tx = build_withdraw_tx(withdrawer, &config, blockhash);
+            let tx = build_withdraw_tx(withdrawer, &config, blockhash, tx_seq as u64);
             batch.push(tx);
             tx_seq = tx_seq.wrapping_add(1);
         }

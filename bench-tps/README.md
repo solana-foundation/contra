@@ -1,185 +1,178 @@
 # contra-bench-tps
 
-Load testing binary for the Contra payment channel pipeline.
+Load testing binary for the Contra payment channel. Supports three flows:
 
-Generates sustained SPL token transfer load against a running Contra stack,
-measures actual pipeline throughput (transactions landed per second), and
-quantifies the drop rate at each concurrency level.  Controllable conflict
-patterns let you stress-test the sequencer specifically or bypass it entirely
-for a pure throughput baseline.
-
----
-
-## Architecture
-
-```
-bench-tps/src/
-├── main.rs          Entry point — wires all three phases together
-├── args.rs          CLI argument definitions (clap + env vars)
-├── types.rs         Shared constants, BenchConfig, BenchState, BatchQueue
-├── setup.rs         Phase 1 — on-chain setup (mint, ATAs, initial balances)
-├── background.rs    Phase 2 — blockhash poller + metrics sampler
-├── load.rs          Phase 3 — transaction generator + sender threads
-└── rpc.rs           Helpers — send_parallel, poll_confirmations
-```
-
-### Phase 1 — Setup
-
-Runs once before load begins. All steps must complete and confirm on-chain
-before the load phase starts.
-
-| Step | What happens |
-|------|-------------|
-| 1 | Load admin keypair from `--admin-keypair` JSON file |
-| 2 | Generate `--accounts` fresh keypairs in parallel (rayon) |
-| 3 | Create SPL mint via `initialize_mint` + retry backoff |
-| 4 | Create ATAs for every keypair in parallel (chunks of 64) |
-| 5 | Poll `getSignatureStatuses` until all ATAs are confirmed |
-| 6 | Mint `--initial-balance` tokens to every ATA in parallel |
-| 7 | Poll until all mint-to transactions are confirmed |
-| 8 | Fetch current blockhash → seed `BenchState` |
-
-**Why `send_transaction` + `poll_confirmations` instead of `send_and_confirm_transaction`?**
-The Contra node settles asynchronously through its pipeline. The built-in
-client timeout (tied to blockhash expiry, ~60 s) fires before settlement
-completes. The custom poller uses a 120 s deadline and 500 ms intervals.
-
-### Phase 2 — Background tasks (run concurrently with Phase 3)
-
-**Blockhash poller** — calls `getLatestBlockhash` every 80 ms and writes the
-result into `BenchState::current_blockhash`.  The node's dedup stage rejects
-transactions whose blockhash is older than ~15 s; 80 ms keeps the bench well
-within that window.  On RPC error the cached hash is kept (still valid for ~15 s).
-
-**Metrics sampler** — calls `getTransactionCount` every second using
-`CommitmentConfig::processed()` (most up-to-date view).  Diffs successive
-values to produce instantaneous TPS.  Returns `(start_count, end_count)` for
-the final drop-rate summary.
-
-### Phase 3 — Load generation
-
-```
-┌──────────────────────────────────────┐
-│  Generator task (async, tokio)       │  reads BenchState::current_blockhash
-│  signs batch of N transactions       │  cycles through accounts/destinations
-│  push Vec<Transaction> → BatchQueue  │  yields if queue depth >= 32
-└──────────────────────┬───────────────┘
-                       │ Mutex + Condvar
-          ┌────────────┼──────────────┐
-          ▼            ▼              ▼
-   Sender thread 0  Sender thread 1  ...  (--threads OS threads)
-   pop batch        pop batch
-   send_transaction (blocking RpcClient)
-   sent_count += batch.len()
-   sleep --sender-sleep-ms
-```
-
-**Generator** (async tokio task): signs batches of `--threads` transactions.
-Cycles through source keypairs and destination wallets using a wrapping counter
-so no two consecutive batches reuse the same pair.  Applies backpressure by
-yielding when the queue depth reaches `MAX_QUEUE_DEPTH = 32`.
-
-**Sender threads** (OS threads, blocking): each owns its own
-`solana_client::rpc_client::RpcClient` (no lock contention).  Waits on a
-condvar with a 50 ms timeout (so cancellation is checked promptly even when
-idle).  Calls the synchronous `send_transaction` for each transaction in the
-batch — the blocking call naturally throttles the sender to one RPC round-trip
-per transaction, giving the generator time to pre-sign the next batch.
-
-**Conflict groups** — `--num-conflict-groups` controls how many distinct
-destination ATAs the generator uses:
-- `1` → all transfers go to the same destination → every transaction conflicts
-  → sequencer must serialise them → maximum sequencer pressure
-- `== accounts` (default) → each source sends to a unique destination →
-  no conflicts → sequencer can parallelise freely → maximum throughput
-
-### Final summary
-
-```
-sent    — transactions dispatched by sender threads (AtomicU64 counter)
-landed  — getTransactionCount delta over the load window (node's own counter)
-dropped — sent - landed (rejected by dedup / sigverify / sequencer / network)
-drop_rate — dropped / sent as a percentage
-tps     — landed / duration_secs
-```
+| Flow | What it stresses |
+|------|-----------------|
+| `transfer` | L2 SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
+| `deposit` | L1 escrow deposits (Solana → contra, measured end-to-end via operator-solana) |
+| `withdraw` | L2 burn + L1 release (contra → Solana, measured end-to-end via operator-contra) |
 
 ---
 
-## Build
+## Quick start
 
 ```bash
-# Build the release binary (from repo root or bench-tps/)
-cargo build --release --manifest-path bench-tps/Cargo.toml
-
-# Binary lands at:
-bench-tps/target/release/contra-bench-tps
-```
-
----
-
-## Run
-
-### Quick start (via run.sh)
-
-`scripts/run.sh` handles everything: generates the admin keypair, builds
-Docker images if needed, starts all services, waits for them to stabilise,
-then runs the bench.
-
-```bash
-# First time setup — copy and edit the env file
+# 1. Copy env file and set values (defaults work for local runs)
 cp bench-tps/.env.sample bench-tps/.env
-# (edit bench-tps/.env — defaults work for local runs)
 
-# Build binary first
-cargo build --release --manifest-path bench-tps/Cargo.toml
+# 2. Build (from repo root)
+cargo build --release -p contra-bench-tps
+# Binary: target/release/contra-bench-tps
 
-# Run with defaults (50 accounts, 4 threads, 60 s)
-cd contra/
-./bench-tps/scripts/run.sh
+# 3. Run (from repo root)
+./bench-tps/scripts/run.sh                        # transfer flow, defaults
+./bench-tps/scripts/run.sh deposit                # deposit flow
+./bench-tps/scripts/run.sh withdraw               # withdraw flow
+./bench-tps/scripts/run.sh --rebuild              # force-rebuild images + keypair
+./bench-tps/scripts/run.sh --clean                # wipe volumes, start fresh
+```
 
-# Force-rebuild images and regenerate keypair
-./bench-tps/scripts/run.sh --rebuild
+`run.sh` handles everything: generates the admin keypair, starts the full Docker
+stack, waits for services to stabilise, runs the bench, then tears down all
+containers on exit.
 
-# Wipe corrupt data volumes and start clean
-./bench-tps/scripts/run.sh --clean
+---
 
-# Pass custom bench args (everything after script flags is forwarded)
-./bench-tps/scripts/run.sh --threads 20 --duration 120
+## Transfer flow
+
+### What it does
+
+Generates sustained L2 SPL token transfers against the Contra write-node
+(via the gateway).  Each sender thread cycles through funded source accounts,
+signing a unique transfer + memo instruction per transaction.
+
+### How to run
+
+```bash
+./bench-tps/scripts/run.sh \
+    --accounts 500 \
+    --threads 8 \
+    --duration 120
 
 # Maximum sequencer contention (all senders target one destination)
-./bench-tps/scripts/run.sh --num-conflict-groups 1 --threads 20 --duration 60
+./bench-tps/scripts/run.sh --num-conflict-groups 1 --threads 20
 ```
 
-### Manual run (binary only, services already running)
+### What it measures
 
-```bash
-./bench-tps/target/release/contra-bench-tps \
-  --admin-keypair ./bench-tps/admin-keypair.json \
-  --rpc-url http://localhost:8898 \
-  --accounts 50 \
-  --threads 8 \
-  --duration 120
-```
+| Field | Source | Meaning |
+|-------|--------|---------|
+| `sent` | `AtomicU64` counter | Transactions dispatched by sender threads |
+| `landed` | `getTransactionCount` delta | Transactions confirmed by the node |
+| `dropped` | `sent - landed` | Rejected by dedup / sigverify / sequencer / network |
+| `tps` | `landed / duration` | Effective pipeline throughput |
+
+### Config parameters
+
+| Flag | Env var | Default | Notes |
+|------|---------|---------|-------|
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | L2 gateway endpoint |
+| `--accounts` | `BENCH_ACCOUNTS` | `50` | Source keypairs; must be ≥ `--threads` |
+| `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
+| `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
+| `--num-conflict-groups` | `BENCH_NUM_CONFLICT_GROUPS` | `== accounts` | Distinct destination ATAs (1 = max contention) |
+| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Raw token units per account |
+| `--sender-sleep-ms` | `BENCH_SENDER_SLEEP_MS` | `5` | Throttle per-thread (0 = max throughput) |
 
 ---
 
-## Arguments
+## Deposit flow
 
-| Flag | Env var | Default | Description |
-|------|---------|---------|-------------|
-| `--admin-keypair` | `BENCH_ADMIN_KEYPAIR` | — | Path to admin keypair JSON (generated by run.sh) |
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Write-node or gateway endpoint |
-| `--accounts` | `BENCH_ACCOUNTS` | `50` | Number of funded source accounts |
-| `--duration` | `BENCH_DURATION` | `60` | Load phase duration in seconds |
-| `--threads` | `BENCH_THREADS` | `4` | Number of concurrent sender threads |
-| `--num-conflict-groups` | `BENCH_NUM_CONFLICT_GROUPS` | `== accounts` | Distinct destination accounts (1 = max contention) |
-| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Raw token units minted per account |
-| `--sender-sleep-ms` | `BENCH_SENDER_SLEEP_MS` | `10` | Sleep per sender thread after each batch (0 = no sleep) |
-| `--metrics-port` | `BENCH_METRICS_PORT` | — | Optional Prometheus `/metrics` port |
-| `--log-level` | `BENCH_LOG_LEVEL` | `info` | Tracing log level (`RUST_LOG` takes precedence) |
+### What it does
 
-**`--accounts` must be >= `--threads`** to avoid multiple senders sharing a
-keypair, which would cause nonce conflicts and failed transactions.
+Sends L1 `Deposit` instructions to the Solana validator's escrow program.
+Each transaction transfers tokens from a depositor's L1 ATA into the shared
+escrow instance ATA.  The full e2e path ends when `operator-solana` picks up
+the indexed deposit and mints an equivalent amount on L2.
+
+```
+bench → L1 Deposit → indexer-solana indexes event
+      → operator-solana mints on L2
+```
+
+### How to run
+
+```bash
+./bench-tps/scripts/run.sh deposit \
+    --accounts 500 \
+    --threads 8 \
+    --duration 120
+```
+
+### What it measures
+
+| Field | Source | Meaning |
+|-------|--------|---------|
+| `sent` | `AtomicU64` | Deposit txs dispatched |
+| `l1_landed` | `getTransactionCount` delta on L1 | Confirmed by validator |
+| `l2_minted` | `contra_operator_mints_sent_total{escrow}` delta | L2 mints confirmed by operator |
+| `drop` | `l1_landed - l2_minted` | Deposits landed but not yet minted (indexer/operator lag) |
+
+`l2_minted` requires `BENCH_OPERATOR_METRICS_URL` to be set (operator-solana
+exposes metrics on port 9102).
+
+### Config parameters
+
+| Flag | Env var | Default | Notes |
+|------|---------|---------|-------|
+| `--l1-rpc-url` | `BENCH_L1_RPC_URL` | `http://localhost:18899` | L1 validator endpoint |
+| `--accounts` | `BENCH_DEPOSIT_ACCOUNTS` | `20` | Depositor keypairs |
+| `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
+| `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
+| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | L1 token units per account |
+| `--operator-metrics-url` | `BENCH_OPERATOR_METRICS_URL` | — | `http://localhost:9102/metrics` for e2e tracking |
+| `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Reuse persistent escrow instance across runs |
+
+---
+
+## Withdraw flow
+
+### What it does
+
+The most complex flow — exercises the full cross-chain withdrawal path:
+
+```
+bench → L2 WithdrawFunds (burn) → indexer-contra indexes event
+      → operator-contra sends L1 ReleaseFunds → funds released on Solana
+```
+
+Setup creates both L1 and L2 state: an escrow instance on Solana, L2 ATAs
+funded with tokens, and L1 ATAs so that `ReleaseFunds` can transfer to them.
+
+### How to run
+
+```bash
+./bench-tps/scripts/run.sh withdraw \
+    --accounts 500 \
+    --threads 8 \
+    --duration 120
+```
+
+### What it measures
+
+| Field | Source | Meaning |
+|-------|--------|---------|
+| `sent` | `AtomicU64` | WithdrawFunds txs dispatched |
+| `l2_burned` | `getTransactionCount` delta on L2 | Burns confirmed by the write-node |
+| `l1_released` | `contra_operator_mints_sent_total{withdraw}` delta | L1 ReleaseFunds confirmed by operator |
+| `drop` | `l2_burned - l1_released` | Burns not yet released (indexer/operator lag) |
+
+`l1_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-contra
+on port 9103).
+
+### Config parameters
+
+| Flag | Env var | Default | Notes |
+|------|---------|---------|-------|
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | L2 gateway endpoint |
+| `--l1-rpc-url` | `BENCH_L1_RPC_URL` | `http://localhost:18899` | L1 validator endpoint |
+| `--accounts` | `BENCH_WITHDRAW_ACCOUNTS` | `20` | Withdrawer keypairs |
+| `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
+| `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
+| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | L2 token units per account |
+| `--operator-metrics-url` | `BENCH_WITHDRAW_OPERATOR_METRICS_URL` | — | `http://localhost:9103/metrics` for e2e tracking |
+| `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Must match `COMMON_ESCROW_INSTANCE_ID` in docker-compose |
 
 ---
 
@@ -189,87 +182,139 @@ keypair, which would cause nonce conflicts and failed transactions.
 
 ```
 INFO Loaded admin keypair pubkey=... path=...
-INFO Generated account keypairs count=50 elapsed_ms=12
+INFO Generated account keypairs count=500 elapsed_ms=12
 INFO Mint initialized mint=... elapsed_ms=1840
-INFO ATA transactions sent sent=50 total=50 elapsed_ms=430
-INFO ATAs confirmed confirmed=50 elapsed_ms=2100
-INFO Mint-to transactions sent sent=50 total=50 elapsed_ms=380
-INFO Mint-to confirmed confirmed=50 elapsed_ms=1950
-INFO Initial blockhash seeded — setup complete blockhash=... elapsed_ms=15
+INFO ATAs confirmed confirmed=500 elapsed_ms=2100
+INFO Mint-to confirmed confirmed=500 elapsed_ms=1950
+INFO Initial blockhash seeded — setup complete
 ```
 
-Long `elapsed_ms` on `Mint initialized` or confirmations is normal — the
-Contra pipeline settles asynchronously and may take 1–3 s per batch.
+Long `elapsed_ms` on confirmations is normal — the Contra pipeline settles
+asynchronously (1–3 s per batch).
 
-### Load phase (repeating every second)
+### Load phase (logged every second)
 
 ```
 INFO metrics tps=312 total_tx=18720 remaining_secs=47
+INFO operator confirmed/s confirmed_per_sec=8 total_confirmed=240 program_type=withdraw
 INFO blockhash_poller avg fetch latency fetches=25 avg_fetch_us=840
 ```
 
-- `tps` — transactions that landed at the node in the last second
-- `total_tx` — cumulative node transaction count since startup
-- `remaining_secs` — seconds left in the load phase
-- `avg_fetch_us` — average blockhash fetch round-trip in microseconds;
-  values consistently > 5000 µs suggest network latency to the node
-
 ### Final summary
 
+**Transfer:**
 ```
 INFO Final summary duration_secs=60 sent=18900 landed=18540 dropped=360 drop_rate=1.9% tps=309.0
 ```
 
-- **`sent`** — total transactions the bench dispatched
-- **`landed`** — transactions confirmed by the node (getTransactionCount delta)
-- **`dropped`** — transactions that did not land (`sent - landed`)
-- **`drop_rate`** — `dropped / sent` × 100; under 5% is healthy; consistently
-  above 10% indicates pipeline back-pressure (dedup saturated, sigverify
-  queue full, or sequencer overwhelmed)
-- **`tps`** — effective pipeline throughput over the entire run duration
+**Deposit:**
+```
+INFO Final summary duration_secs=60 sent=30000 l1_landed=28500 l2_minted=280 drop=28220 drop_rate=99.0% l1_tps=475.0 l2_tps=4.7
+```
+> High `drop` between `l1_landed` and `l2_minted` is expected during the run — the operator
+> pipeline has latency. Re-run with a longer `--duration` to reach steady state.
+
+**Withdraw:**
+```
+INFO Final summary duration_secs=60 sent=3000 l2_burned=2940 l1_released=21 drop=2919 drop_rate=99.3% l2_tps=49.0 l1_tps=0.4
+```
 
 ### Common warnings
 
 ```
-WARN initialize_mint send failed, retrying in 2s attempt=0 err=...502 Bad Gateway...
+WARN initialize_mint send failed, retrying in 2s attempt=0 err=...502...
 ```
-Write-node not yet ready; the retry loop handles this automatically.
+Write-node not ready — retry loop handles this automatically.
 
 ```
-WARN blockhash_poller: get_latest_blockhash failed, keeping cached hash err=...
+WARN blockhash_poller: get_latest_blockhash failed, keeping cached hash
 ```
-Transient RPC error; safe to ignore as long as it is infrequent (cached hash
-is valid for ~15 s).
+Transient RPC error; safe to ignore if infrequent (cached hash valid ~15 s).
 
 ```
 WARN sender: send_transaction failed err=...
 ```
-Individual transaction rejected — increments `dropped`.  Occasional failures
-are expected; a high rate points to dedup (stale blockhash), sigverify
-(invalid signature), or the node being overloaded.
+Individual transaction rejected — increments `dropped`. Occasional failures are
+expected; a high rate points to dedup (stale blockhash) or the node being
+overloaded.
 
 
+## Architecture
+
+```
+bench-tps/src/
+├── main.rs            Entry point — dispatches to run_transfer / run_deposit / run_withdraw
+├── args.rs            CLI argument definitions (clap + env vars)
+├── types.rs           Shared constants, BenchConfig, BenchState, BatchQueue
+├── setup.rs           Transfer setup — mint, ATAs, balances
+├── setup_deposit.rs   Deposit setup — escrow instance, depositor accounts
+├── setup_withdraw.rs  Withdraw setup — escrow instance, L2 accounts, L1 ATAs
+├── background.rs      Blockhash poller, metrics sampler, operator mints sampler
+├── load.rs            Transfer generator + sender threads
+├── load_deposit.rs    Deposit generator + sender threads
+├── load_withdraw.rs   Withdraw generator + sender threads
+└── rpc.rs             Helpers — send_parallel, poll_confirmations
+```
+
+### Three-phase structure (all flows)
+
+**Phase 1 — Setup**: creates all on-chain state before load begins.
+
+**Phase 2 — Background tasks** (concurrent with Phase 3):
+- **Blockhash poller** — refreshes `BenchState::current_blockhash` every 80 ms.
+  The dedup stage rejects transactions with a blockhash older than ~15 s.
+- **Metrics sampler** — polls `getTransactionCount` every second to compute
+  landed TPS and returns `(start, end)` counts for the final summary.
+- **Operator mints sampler** (deposit/withdraw only) — scrapes
+  `contra_operator_mints_sent_total` from the operator Prometheus endpoint
+  every second for e2e confirmation tracking.
+
+**Phase 3 — Load generation**:
+```
+Generator (async tokio task)
+  reads current_blockhash → signs batch → push to BatchQueue
+  yields if queue depth ≥ 32 (backpressure)
+        │
+        └─ BatchQueue (Mutex<VecDeque> + Condvar)
+              │
+        ┌─────┴──────┐
+    Sender 0      Sender N   (OS threads, --threads count)
+    pop batch → send_transaction (blocking RpcClient)
+    sent_count += batch.len()
+    sleep --sender-sleep-ms
+```
+
+### Uniqueness guarantee
+
+Every transaction includes a **memo instruction** encoding the monotonically
+increasing `tx_seq` counter as its data.  This ensures every transaction has a
+unique signature regardless of account or blockhash reuse, preventing the
+dedup stage from dropping them as duplicates.
+
+### Binary location
+
+`bench-tps` is a Cargo workspace member.  Cargo always writes the binary to
+the workspace root target directory:
+
+```
+target/release/contra-bench-tps   ← correct
+bench-tps/target/                  ← does not exist
+```
+
+Build command:
+```bash
+cargo build --release -p contra-bench-tps
+```
+
+---
 
 ## CPU pinning verification
 
-After starting `./bench-tps/scripts/run.sh`, verify that services and the bench
-process are pinned to non-overlapping CPU sets.
-
-1. Check container CPU pinning (services):
-
 ```bash
+# Container CPU sets
 docker ps --filter "name=contra-" --format "{{.Names}}" \
-| xargs -I{} docker inspect --format '{{.Name}} {{.HostConfig.CpusetCpus}}' {}
-```
+  | xargs -I{} docker inspect --format '{{.Name}} {{.HostConfig.CpusetCpus}}' {}
 
-2. Check bench CPU pinning (bench process):
-
-```bash
-pgrep -f contra-bench-tps
-```
-
-Use the PID printed above:
-
-```bash
-taskset -pc <PID>
+# Bench process CPU set
+taskset -pc $(pgrep -f contra-bench-tps)
 ```

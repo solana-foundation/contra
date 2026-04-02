@@ -30,7 +30,6 @@ use {
         CONTRA_ESCROW_PROGRAM_ID,
     },
     rayon::prelude::*,
-    serde_json,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
     solana_sdk::{
         commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,

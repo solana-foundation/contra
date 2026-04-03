@@ -1,11 +1,11 @@
-//! Phase 3 — Deposit load generation (L1 escrow)
+//! Phase 3 — Deposit load generation (Solana escrow)
 //!
-//! Mirrors the structure of `load.rs` but targets the L1 escrow program's
+//! Mirrors the structure of `load.rs` but targets the Solana escrow program's
 //! `Deposit` instruction instead of an SPL token transfer.
 //!
 //! The generator signs a batch of deposit transactions per cycle, pushing each
 //! batch onto a `BatchQueue`.  Sender threads pop batches and call
-//! `send_transaction` against the L1 RPC endpoint.
+//! `send_transaction` against the Solana RPC endpoint.
 
 use {
     crate::{
@@ -41,7 +41,7 @@ const DEPOSIT_AMOUNT: u64 = 1;
 /// transactions that share the same accounts and blockhash.
 const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/// Build a signed L1 deposit transaction.
+/// Build a signed Solana deposit transaction.
 ///
 /// `nonce` is encoded as 8 LE bytes in a memo instruction so that every
 /// transaction has a unique signature even when the accounts and blockhash
@@ -134,10 +134,10 @@ pub async fn run_deposit_generator(
 
 /// Blocking sender thread for deposit transactions.
 ///
-/// Identical in structure to `load::run_sender_thread` but sends to the L1
+/// Identical in structure to `load::run_sender_thread` but sends to the Solana
 /// RPC URL and increments metrics with `flow="deposit"`.
 pub fn run_deposit_sender_thread(
-    l1_rpc_url: String,
+    solana_rpc_url: String,
     queue: BatchQueue,
     cancel: CancellationToken,
     sent_count: Arc<AtomicU64>,
@@ -148,7 +148,7 @@ pub fn run_deposit_sender_thread(
     // The local validator finalises ~32 slots after confirmation (~13 s), which
     // can lag behind the load phase start.
     let rpc = solana_client::rpc_client::RpcClient::new_with_commitment(
-        l1_rpc_url,
+        solana_rpc_url,
         CommitmentConfig::confirmed(),
     );
 

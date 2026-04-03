@@ -67,11 +67,11 @@ async fn scrape_prometheus_metric(
 /// `/metrics` endpoint, logging instantaneous confirmed/s and remaining test time.
 ///
 /// Mirrors `run_metrics_sampler` but measures operator-confirmed transactions instead
-/// of raw L2 transaction count — giving the true end-to-end completion rate.
+/// of raw Contra transaction count — giving the true end-to-end completion rate.
 ///
 /// `program_type` selects which operator to sample:
-///   - `"escrow"`  → deposit operator (L2 mints confirmed)
-///   - `"withdraw"` → withdraw operator (L1 releases confirmed)
+///   - `"escrow"`  → deposit operator (Contra mints confirmed)
+///   - `"withdraw"` → withdraw operator (Solana releases confirmed)
 ///
 /// Returns `(start_count, final_count)` for drop-rate calculation.
 pub async fn run_operator_mints_sampler(

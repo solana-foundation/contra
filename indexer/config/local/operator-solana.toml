@@ -2,10 +2,10 @@
 
 [common]
 program_type = "escrow"
-# L2 write node (gateway) — where mint transactions are sent
+# Contra write node (gateway) — where mint transactions are sent
 rpc_url = "http://localhost:8898"
 
-# L1 Solana validator — source of escrow deposit metadata and mint account state
+# Solana Solana validator — source of escrow deposit metadata and mint account state
 source_rpc_url = "http://localhost:18899"
 
 # Placeholder — overridden at runtime by COMMON_ESCROW_INSTANCE_ID, which

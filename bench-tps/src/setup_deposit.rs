@@ -1,17 +1,17 @@
-//! Deposit setup phase — L1 escrow preparation.
+//! Deposit setup phase — Solana escrow preparation.
 //!
-//! Prepares all L1 on-chain state the deposit load phase needs:
+//! Prepares all Solana on-chain state the deposit load phase needs:
 //!   1. Loads the admin keypair from disk.
 //!   2. Generates a fresh instance-seed keypair and derives the escrow instance PDA.
-//!   3. Creates the escrow instance on L1 (CreateInstance instruction).
+//!   3. Creates the escrow instance on Solana (CreateInstance instruction).
 //!   4. Generates N fresh depositor keypairs.
 //!   5. Funds each depositor with SOL (via transfer from admin).
-//!   6. Creates a fresh L1 SPL mint (admin is mint authority).
+//!   6. Creates a fresh Solana SPL mint (admin is mint authority).
 //!   7. Calls AllowMint — registers the mint with the instance, creating both
-//!      the allowed_mint PDA and the instance ATA on-chain.
-//!   8. Creates L1 ATAs for each depositor.
+//!      the allowed_mint PDA and the instance ATA on Solana.
+//!   8. Creates Solana ATAs for each depositor.
 //!   9. Mints initial token balances to each depositor ATA.
-//!  10. Fetches the current L1 blockhash and seeds `BenchState`.
+//!  10. Fetches the current Solana blockhash and seeds `BenchState`.
 //!
 //! The function returns a `DepositConfig` that the deposit load phase uses
 //! directly.
@@ -78,10 +78,10 @@ fn find_event_authority() -> (Pubkey, u8) {
     Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID)
 }
 
-/// Run all L1 deposit setup tasks and return the `DepositConfig` needed by
+/// Run all Solana deposit setup tasks and return the `DepositConfig` needed by
 /// the deposit load phase.
 ///
-/// `l1_rpc_url`            — L1 validator RPC endpoint
+/// `solana_rpc_url`         — Solana validator RPC endpoint
 /// `admin_path`            — path to the admin keypair JSON file
 /// `instance_seed_path`    — optional path to save/load the instance-seed keypair;
 ///                           when `Some`, the keypair (and thus instance PDA) is
@@ -89,7 +89,7 @@ fn find_event_authority() -> (Pubkey, u8) {
 /// `num_accounts`          — number of depositor accounts to create
 /// `initial_balance`       — raw token units minted to each depositor ATA
 pub async fn run_setup_deposit_phase(
-    l1_rpc_url: &str,
+    solana_rpc_url: &str,
     admin_path: &Path,
     instance_seed_path: Option<&Path>,
     num_accounts: usize,
@@ -141,15 +141,15 @@ pub async fn run_setup_deposit_phase(
     // Finalized (which lags ~32 slots / ~13 s on a local validator).
     // Arc-wrapped so closures passed to send_parallel can share it cheaply.
     let rpc = Arc::new(RpcClient::new_with_commitment(
-        l1_rpc_url.to_owned(),
+        solana_rpc_url.to_owned(),
         CommitmentConfig::processed(),
     ));
     let send_retry_delays: &[u64] = &[1, 2, 4, 8, 16, 30];
 
     // ------------------------------------------------------------------
-    // Task 2b: Ensure admin has SOL on L1
+    // Task 2b: Ensure admin has SOL on Solana
     //
-    // The L1 local validator does not pre-fund the bench admin keypair.
+    // The Solana local validator does not pre-fund the bench admin keypair.
     // We need enough lamports to cover: CreateInstance + AllowMint fees
     // + N depositor SOL transfers + ATA creation fees.
     // Only airdrop if the current balance is below the threshold so that
@@ -158,13 +158,13 @@ pub async fn run_setup_deposit_phase(
     let balance = rpc
         .get_balance(&admin_keypair.pubkey())
         .await
-        .context("get_balance for admin on L1")?;
+        .context("get_balance for admin on Solana")?;
 
     if balance < MIN_ADMIN_LAMPORTS {
         let sig = rpc
             .request_airdrop(&admin_keypair.pubkey(), AIRDROP_LAMPORTS)
             .await
-            .context("airdrop to admin on L1")?;
+            .context("airdrop to admin on Solana")?;
         for _ in 0..60u32 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if rpc.get_balance(&admin_keypair.pubkey()).await.unwrap_or(0) >= AIRDROP_LAMPORTS {
@@ -176,13 +176,13 @@ pub async fn run_setup_deposit_phase(
                 "airdrop timed out: admin balance still below minimum after 60 attempts"
             ));
         }
-        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on L1");
+        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on Solana");
     } else {
-        info!(balance, "Admin already funded on L1, skipping airdrop");
+        info!(balance, "Admin already funded on Solana, skipping airdrop");
     }
 
     // ------------------------------------------------------------------
-    // Task 3: Create the escrow instance on L1
+    // Task 3: Create the escrow instance on Solana
     //
     // Both the admin keypair and the instance-seed keypair must sign.
     // ------------------------------------------------------------------
@@ -239,7 +239,7 @@ pub async fn run_setup_deposit_phase(
     info!(
         %instance_pda,
         elapsed_ms = t3.elapsed().as_millis(),
-        "Escrow instance created on L1",
+        "Escrow instance created on Solana",
     );
 
     // ------------------------------------------------------------------
@@ -287,22 +287,31 @@ pub async fn run_setup_deposit_phase(
                 "Sending SOL fund batch"
             );
 
-            let sigs = send_parallel(l1_rpc_url, batch, blockhash, "fund-sol", |kp, _url, bh| {
-                let admin = Arc::clone(&admin_keypair);
-                let rpc = Arc::clone(&rpc);
-                let dest = kp.pubkey();
-                async move {
-                    let ix =
-                        system_instruction::transfer(&admin.pubkey(), &dest, lamports_per_account);
-                    let tx = Transaction::new_signed_with_payer(
-                        &[ix],
-                        Some(&admin.pubkey()),
-                        &[admin.as_ref()],
-                        bh,
-                    );
-                    rpc.send_transaction(&tx).await
-                }
-            })
+            let sigs = send_parallel(
+                solana_rpc_url,
+                batch,
+                blockhash,
+                "fund-sol",
+                |kp, _url, bh| {
+                    let admin = Arc::clone(&admin_keypair);
+                    let rpc = Arc::clone(&rpc);
+                    let dest = kp.pubkey();
+                    async move {
+                        let ix = system_instruction::transfer(
+                            &admin.pubkey(),
+                            &dest,
+                            lamports_per_account,
+                        );
+                        let tx = Transaction::new_signed_with_payer(
+                            &[ix],
+                            Some(&admin.pubkey()),
+                            &[admin.as_ref()],
+                            bh,
+                        );
+                        rpc.send_transaction(&tx).await
+                    }
+                },
+            )
             .await;
 
             let retry_indices =
@@ -329,13 +338,13 @@ pub async fn run_setup_deposit_phase(
     );
 
     // ------------------------------------------------------------------
-    // Task 6: Create and initialise L1 SPL mint
+    // Task 6: Create and initialise Solana SPL mint
     //
-    // On a real Solana validator (L1) the mint account must be explicitly
+    // On a real Solana validator (Solana) the mint account must be explicitly
     // allocated via system_program::create_account before SPL token's
-    // initialize_mint can write into it.  The L2 write-node creates
+    // initialize_mint can write into it.  The Contra write-node creates
     // accounts implicitly (gasless), so create_admin_initialize_mint in
-    // core only sends initialize_mint and works on L2 but not L1.
+    // core only sends initialize_mint and works on Contra but not Solana.
     // ------------------------------------------------------------------
     let t6 = Instant::now();
     let mint_keypair = Keypair::new();
@@ -397,7 +406,7 @@ pub async fn run_setup_deposit_phase(
             "initialize_mint (deposit) failed to confirm on-chain"
         ));
     }
-    info!(%mint, elapsed_ms = t6.elapsed().as_millis(), "L1 mint initialized");
+    info!(%mint, elapsed_ms = t6.elapsed().as_millis(), "Solana mint initialized");
 
     // ------------------------------------------------------------------
     // Task 7: AllowMint — register the mint with the escrow instance
@@ -491,7 +500,7 @@ pub async fn run_setup_deposit_phase(
                 );
 
                 let sigs = send_parallel(
-                    l1_rpc_url,
+                    solana_rpc_url,
                     batch,
                     blockhash,
                     "create-ata(deposit)",
@@ -596,7 +605,7 @@ pub async fn run_setup_deposit_phase(
                 );
 
                 let sigs = send_parallel(
-                    l1_rpc_url,
+                    solana_rpc_url,
                     batch,
                     blockhash,
                     "mint-to(deposit)",
@@ -687,7 +696,7 @@ pub async fn run_setup_deposit_phase(
     }
 
     // ------------------------------------------------------------------
-    // Task 10: Seed BenchState with the current L1 blockhash
+    // Task 10: Seed BenchState with the current Solana blockhash
     // ------------------------------------------------------------------
     let t10 = Instant::now();
     let initial_blockhash = rpc
@@ -700,7 +709,7 @@ pub async fn run_setup_deposit_phase(
     info!(
         blockhash = %initial_blockhash,
         elapsed_ms = t10.elapsed().as_millis(),
-        "L1 blockhash seeded — deposit setup complete",
+        "Solana blockhash seeded — deposit setup complete",
     );
 
     Ok(DepositConfig {

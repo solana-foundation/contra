@@ -4,9 +4,9 @@ Load testing binary for the Contra payment channel. Supports three flows:
 
 | Flow | What it stresses |
 |------|-----------------|
-| `transfer` | L2 SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
-| `deposit` | L1 escrow deposits (Solana → contra, measured end-to-end via operator-solana) |
-| `withdraw` | L2 burn + L1 release (contra → Solana, measured end-to-end via operator-contra) |
+| \`transfer\` | Contra SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
+| `deposit` | Solana escrow deposits (Solana → Contra, measured end-to-end via operator-solana) |
+| `withdraw` | Contra burn + Solana release (Contra → Solana, measured end-to-end via operator-contra) |
 
 ---
 
@@ -38,7 +38,7 @@ containers on exit.
 
 ### What it does
 
-Generates sustained L2 SPL token transfers against the Contra write-node
+Generates sustained Contra SPL token transfers against the Contra write-node
 (via the gateway).  Each sender thread cycles through funded source accounts,
 signing a unique transfer + memo instruction per transaction.
 
@@ -67,7 +67,7 @@ signing a unique transfer + memo instruction per transaction.
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | L2 gateway endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Contra gateway endpoint |
 | `--accounts` | `BENCH_ACCOUNTS` | `50` | Source keypairs; must be ≥ `--threads` |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
@@ -81,14 +81,14 @@ signing a unique transfer + memo instruction per transaction.
 
 ### What it does
 
-Sends L1 `Deposit` instructions to the Solana validator's escrow program.
-Each transaction transfers tokens from a depositor's L1 ATA into the shared
+Sends `Deposit` instructions to the Solana validator's escrow program.
+Each transaction transfers tokens from a depositor's Solana ATA into the shared
 escrow instance ATA.  The full e2e path ends when `operator-solana` picks up
-the indexed deposit and mints an equivalent amount on L2.
+the indexed deposit and mints an equivalent amount on Contra.
 
 ```
-bench → L1 Deposit → indexer-solana indexes event
-      → operator-solana mints on L2
+bench → Solana Deposit → indexer-solana indexes event
+      → operator-solana mints on Contra
 ```
 
 ### How to run
@@ -105,22 +105,22 @@ bench → L1 Deposit → indexer-solana indexes event
 | Field | Source | Meaning |
 |-------|--------|---------|
 | `sent` | `AtomicU64` | Deposit txs dispatched |
-| `l1_landed` | `getTransactionCount` delta on L1 | Confirmed by validator |
-| `l2_minted` | `contra_operator_mints_sent_total{escrow}` delta | L2 mints confirmed by operator |
-| `drop` | `l1_landed - l2_minted` | Deposits landed but not yet minted (indexer/operator lag) |
+| `solana_landed` | `getTransactionCount` delta on Solana | Confirmed by validator |
+| `contra_minted` | `contra_operator_mints_sent_total{escrow}` delta | Contra mints confirmed by operator |
+| `drop` | `solana_landed - contra_minted` | Deposits landed but not yet minted (indexer/operator lag) |
 
-`l2_minted` requires `BENCH_OPERATOR_METRICS_URL` to be set (operator-solana
+`contra_minted` requires `BENCH_OPERATOR_METRICS_URL` to be set (operator-solana
 exposes metrics on port 9102).
 
 ### Config parameters
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--l1-rpc-url` | `BENCH_L1_RPC_URL` | `http://localhost:18899` | L1 validator endpoint |
+| `--solana-rpc-url` | `BENCH_SOLANA_RPC_URL` | `http://localhost:18899` | Solana validator endpoint |
 | `--accounts` | `BENCH_DEPOSIT_ACCOUNTS` | `20` | Depositor keypairs |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
-| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | L1 token units per account |
+| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Solana token units per account |
 | `--operator-metrics-url` | `BENCH_OPERATOR_METRICS_URL` | — | `http://localhost:9102/metrics` for e2e tracking |
 | `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Reuse persistent escrow instance across runs |
 
@@ -133,12 +133,12 @@ exposes metrics on port 9102).
 The most complex flow — exercises the full cross-chain withdrawal path:
 
 ```
-bench → L2 WithdrawFunds (burn) → indexer-contra indexes event
-      → operator-contra sends L1 ReleaseFunds → funds released on Solana
+bench → Contra WithdrawFunds (burn) → indexer-contra indexes event
+      → operator-contra sends Solana ReleaseFunds → funds released on Solana
 ```
 
-Setup creates both L1 and L2 state: an escrow instance on Solana, L2 ATAs
-funded with tokens, and L1 ATAs so that `ReleaseFunds` can transfer to them.
+Setup creates both Solana and Contra state: an escrow instance on Solana, Contra ATAs
+funded with tokens, and Solana ATAs so that `ReleaseFunds` can transfer to them.
 
 ### How to run
 
@@ -154,23 +154,23 @@ funded with tokens, and L1 ATAs so that `ReleaseFunds` can transfer to them.
 | Field | Source | Meaning |
 |-------|--------|---------|
 | `sent` | `AtomicU64` | WithdrawFunds txs dispatched |
-| `l2_burned` | `getTransactionCount` delta on L2 | Burns confirmed by the write-node |
-| `l1_released` | `contra_operator_mints_sent_total{withdraw}` delta | L1 ReleaseFunds confirmed by operator |
-| `drop` | `l2_burned - l1_released` | Burns not yet released (indexer/operator lag) |
+| `contra_burned` | `getTransactionCount` delta on Contra | Burns confirmed by the write-node |
+| `solana_released` | `contra_operator_mints_sent_total{withdraw}` delta | Solana ReleaseFunds confirmed by operator |
+| `drop` | `contra_burned - solana_released` | Burns not yet released (indexer/operator lag) |
 
-`l1_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-contra
+`solana_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-contra
 on port 9103).
 
 ### Config parameters
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | L2 gateway endpoint |
-| `--l1-rpc-url` | `BENCH_L1_RPC_URL` | `http://localhost:18899` | L1 validator endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Contra gateway endpoint |
+| `--solana-rpc-url` | `BENCH_SOLANA_RPC_URL` | `http://localhost:18899` | Solana validator endpoint |
 | `--accounts` | `BENCH_WITHDRAW_ACCOUNTS` | `20` | Withdrawer keypairs |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
-| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | L2 token units per account |
+| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Contra token units per account |
 | `--operator-metrics-url` | `BENCH_WITHDRAW_OPERATOR_METRICS_URL` | — | `http://localhost:9103/metrics` for e2e tracking |
 | `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Must match `COMMON_ESCROW_INSTANCE_ID` in docker-compose |
 
@@ -209,14 +209,14 @@ INFO Final summary duration_secs=60 sent=18900 landed=18540 dropped=360 drop_rat
 
 **Deposit:**
 ```
-INFO Final summary duration_secs=60 sent=30000 l1_landed=28500 l2_minted=280 drop=28220 drop_rate=99.0% l1_tps=475.0 l2_tps=4.7
+INFO Final summary duration_secs=60 sent=30000 solana_landed=28500 contra_minted=280 drop=28220 drop_rate=99.0% solana_tps=475.0 contra_tps=4.7
 ```
-> High `drop` between `l1_landed` and `l2_minted` is expected during the run — the operator
+> High `drop` between `solana_landed` and `contra_minted` is expected during the run — the operator
 > pipeline has latency. Re-run with a longer `--duration` to reach steady state.
 
 **Withdraw:**
 ```
-INFO Final summary duration_secs=60 sent=3000 l2_burned=2940 l1_released=21 drop=2919 drop_rate=99.3% l2_tps=49.0 l1_tps=0.4
+INFO Final summary duration_secs=60 sent=3000 contra_burned=2940 solana_released=21 drop=2919 drop_rate=99.3% contra_tps=49.0 solana_tps=0.4
 ```
 
 ### Common warnings
@@ -248,7 +248,7 @@ bench-tps/src/
 ├── types.rs           Shared constants, BenchConfig, BenchState, BatchQueue
 ├── setup.rs           Transfer setup — mint, ATAs, balances
 ├── setup_deposit.rs   Deposit setup — escrow instance, depositor accounts
-├── setup_withdraw.rs  Withdraw setup — escrow instance, L2 accounts, L1 ATAs
+├── setup_withdraw.rs  Withdraw setup — escrow instance, Contra accounts, Solana ATAs
 ├── background.rs      Blockhash poller, metrics sampler, operator mints sampler
 ├── load.rs            Transfer generator + sender threads
 ├── load_deposit.rs    Deposit generator + sender threads

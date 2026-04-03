@@ -19,9 +19,7 @@ fn main() -> Result<()> {
         eprintln!("\n⚠️  IMPORTANT: RPC URL must be Contra gateway (NOT Solana devnet)");
         eprintln!("  - Local:  http://localhost:8898");
         eprintln!("  - Docker: gateway:8899");
-        eprintln!(
-            "\nThis burns tokens on Contra. The operator will then release funds on Solana L1."
-        );
+        eprintln!("\nThis burns tokens on Contra. The operator will then release funds on Solana.");
         std::process::exit(1);
     }
 
@@ -41,7 +39,7 @@ fn main() -> Result<()> {
     println!("Mint: {}", mint);
     println!("Amount: {}", amount);
     if let Some(dest) = destination {
-        println!("Destination (Solana L1): {}", dest);
+        println!("Destination (Solana): {}", dest);
     } else {
         println!("Destination: Same as user (default)");
     }

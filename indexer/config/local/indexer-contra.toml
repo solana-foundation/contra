@@ -3,7 +3,7 @@
 [common]
 program_type = "withdraw"
 
-# L2 gateway — polls for WithdrawFunds instructions. Overridden at runtime by
+# Contra gateway — polls for WithdrawFunds instructions. Overridden at runtime by
 # COMMON_RPC_URL in docker-compose; update both if the gateway address changes.
 rpc_url = "http://gateway:8898"
 

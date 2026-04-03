@@ -13,9 +13,9 @@ mod helpers;
 #[path = "../setup.rs"]
 mod setup;
 
-use test_utils::indexer_helper::{start_contra_indexer, start_l1_indexer, IndexerHandle};
+use test_utils::indexer_helper::{start_contra_indexer, start_solana_indexer, IndexerHandle};
 use test_utils::operator_helper::{
-    start_contra_to_l1_operator, start_l1_to_contra_operator, OperatorHandle,
+    start_contra_to_solana_operator, start_solana_to_contra_operator, OperatorHandle,
 };
 use test_utils::validator_helper::start_test_validator;
 
@@ -37,18 +37,18 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(300);
 struct KeepAlive {
     _test_validator: solana_test_validator::TestValidator,
     _contra_indexer_db: ContainerAsync<Postgres>,
-    _l1_indexer_db: ContainerAsync<Postgres>,
+    _solana_indexer_db: ContainerAsync<Postgres>,
 }
 
 struct TestContext {
     _keep_alive: KeepAlive,
-    l1_to_contra_operator_handle: OperatorHandle,
-    contra_to_l1_operator_handle: OperatorHandle,
+    solana_to_contra_operator_handle: OperatorHandle,
+    contra_to_solana_operator_handle: OperatorHandle,
     contra_indexer_handle: IndexerHandle,
-    l1_indexer_handle: IndexerHandle,
+    solana_indexer_handle: IndexerHandle,
     contra_handles: NodeHandles,
     contra_ctx: ContraContext,
-    l1_ctx: L1Context,
+    solana_ctx: SolanaContext,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -79,7 +79,7 @@ async fn test_with_postgres() {
         );
 
         let test_context = setup(node_db_url.clone()).await.unwrap();
-        test_suite(&test_context.contra_ctx, &test_context.l1_ctx).await;
+        test_suite(&test_context.contra_ctx, &test_context.solana_ctx).await;
         shutdown(test_context).await;
 
         // Dedup persistence test runs with its own node instance against the same DB
@@ -148,7 +148,7 @@ async fn test_with_redis() {
         println!("Redis container started at: {}", redis_url);
 
         let test_context = setup(redis_url).await.unwrap();
-        test_suite(&test_context.contra_ctx, &test_context.l1_ctx).await;
+        test_suite(&test_context.contra_ctx, &test_context.solana_ctx).await;
 
         shutdown(test_context).await;
     })
@@ -180,7 +180,7 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
     let (
         (test_validator, faucet_keypair, geyser_port),
         contra_indexer_postgres_container,
-        l1_indexer_postgres_container,
+        solana_indexer_postgres_container,
     ) = tokio::join!(
         start_test_validator(),
         Postgres::default()
@@ -189,15 +189,15 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
             .with_password("password")
             .start(),
         Postgres::default()
-            .with_db_name("l1_indexer")
+            .with_db_name("solana_indexer")
             .with_user("postgres")
             .with_password("password")
             .start(),
     );
     let contra_indexer_postgres_container =
         contra_indexer_postgres_container.expect("Failed to start Contra PostgreSQL container");
-    let l1_indexer_postgres_container =
-        l1_indexer_postgres_container.expect("Failed to start L1 PostgreSQL container");
+    let solana_indexer_postgres_container =
+        solana_indexer_postgres_container.expect("Failed to start Solana PostgreSQL container");
 
     println!(
         "Solana test validator started on {}",
@@ -219,17 +219,17 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         contra_indexer_host, contra_indexer_port
     );
 
-    let l1_indexer_host = l1_indexer_postgres_container
+    let solana_indexer_host = solana_indexer_postgres_container
         .get_host()
         .await
         .expect("Failed to get host");
-    let l1_indexer_port = l1_indexer_postgres_container
+    let solana_indexer_port = solana_indexer_postgres_container
         .get_host_port_ipv4(5432)
         .await
         .expect("Failed to get port");
-    let l1_indexer_db_url = format!(
-        "postgres://postgres:password@{}:{}/l1_indexer",
-        l1_indexer_host, l1_indexer_port
+    let solana_indexer_db_url = format!(
+        "postgres://postgres:password@{}:{}/solana_indexer",
+        solana_indexer_host, solana_indexer_port
     );
 
     // Start the Contra node (requires the validator URL)
@@ -256,54 +256,54 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
     );
 
     // Start both indexers in parallel — each has its own DB and datasource
-    println!("\n=== Starting Contra Indexer and L1 Indexer in parallel ===");
+    println!("\n=== Starting Contra Indexer and Solana Indexer in parallel ===");
     let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
-    let (contra_indexer_result, l1_indexer_result) = tokio::join!(
+    let (contra_indexer_result, solana_indexer_result) = tokio::join!(
         start_contra_indexer(None, contra_rpc_url.clone(), contra_indexer_db_url.clone()),
-        start_l1_indexer(
+        start_solana_indexer(
             geyser_endpoint,
             test_validator.rpc_url(),
-            l1_indexer_db_url.clone(),
+            solana_indexer_db_url.clone(),
             Some(instance_pda),
         ),
     );
     let (contra_indexer_handle, contra_indexer_storage) =
         contra_indexer_result.expect("Failed to start Contra indexer");
-    let (l1_indexer_handle, l1_indexer_storage) =
-        l1_indexer_result.expect("Failed to start L1 indexer");
-    println!("Contra Indexer and L1 Indexer started successfully");
+    let (solana_indexer_handle, solana_indexer_storage) =
+        solana_indexer_result.expect("Failed to start Solana indexer");
+    println!("Contra Indexer and Solana Indexer started successfully");
 
     // Start both operators in parallel — they are independent of each other
     println!("\n=== Starting Operators in parallel ===");
-    let operator_key_l1_to_contra = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let operator_key_contra_to_l1 = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let (l1_to_contra_result, contra_to_l1_result) = tokio::join!(
-        start_l1_to_contra_operator(
+    let operator_key_solana_to_contra = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    let operator_key_contra_to_solana = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    let (solana_to_contra_result, contra_to_solana_result) = tokio::join!(
+        start_solana_to_contra_operator(
             contra_rpc_url.clone(),
-            l1_indexer_db_url.clone(),
-            operator_key_l1_to_contra,
+            solana_indexer_db_url.clone(),
+            operator_key_solana_to_contra,
             instance_pda,
         ),
-        start_contra_to_l1_operator(
+        start_contra_to_solana_operator(
             test_validator.rpc_url(),
             contra_indexer_db_url.clone(),
-            operator_key_contra_to_l1,
+            operator_key_contra_to_solana,
             instance_pda,
         ),
     );
-    let l1_to_contra_operator_handle =
-        l1_to_contra_result.expect("Failed to start L1 -> Contra operator");
-    let contra_to_l1_operator_handle =
-        contra_to_l1_result.expect("Failed to start Contra -> L1 operator");
-    println!("L1 -> Contra and Contra -> L1 Operators started successfully");
+    let solana_to_contra_operator_handle =
+        solana_to_contra_result.expect("Failed to start Solana -> Contra operator");
+    let contra_to_solana_operator_handle =
+        contra_to_solana_result.expect("Failed to start Contra -> Solana operator");
+    println!("Solana -> Contra and Contra -> Solana Operators started successfully");
 
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let l1_ctx = L1Context::new(
+    let solana_ctx = SolanaContext::new(
         test_validator.rpc_url(),
         operator_key_clone,
         faucet_keypair,
         escrow_instance,
-        l1_indexer_storage,
+        solana_indexer_storage,
     );
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     let contra_ctx = ContraContext::new(
@@ -318,22 +318,22 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         _keep_alive: KeepAlive {
             _test_validator: test_validator,
             _contra_indexer_db: contra_indexer_postgres_container,
-            _l1_indexer_db: l1_indexer_postgres_container,
+            _solana_indexer_db: solana_indexer_postgres_container,
         },
-        l1_to_contra_operator_handle,
-        contra_to_l1_operator_handle,
+        solana_to_contra_operator_handle,
+        contra_to_solana_operator_handle,
         contra_indexer_handle,
-        l1_indexer_handle,
+        solana_indexer_handle,
         contra_handles,
         contra_ctx,
-        l1_ctx,
+        solana_ctx,
     })
 }
 
-async fn test_suite(contra_ctx: &ContraContext, l1_ctx: &L1Context) {
+async fn test_suite(contra_ctx: &ContraContext, solana_ctx: &SolanaContext) {
     run_precompile_accounts_test(contra_ctx).await;
-    run_spl_token_test(contra_ctx, l1_ctx, spl_token::ID).await;
-    run_spl_token_test(contra_ctx, l1_ctx, spl_token_2022::ID).await;
+    run_spl_token_test(contra_ctx, solana_ctx, spl_token::ID).await;
+    run_spl_token_test(contra_ctx, solana_ctx, spl_token_2022::ID).await;
     run_tx_replay_test(contra_ctx).await;
     run_transaction_count_test(contra_ctx).await;
     run_get_transaction_test(contra_ctx).await;
@@ -357,9 +357,15 @@ async fn test_suite(contra_ctx: &ContraContext, l1_ctx: &L1Context) {
 async fn shutdown(test_context: TestContext) {
     println!("\n=== Shutting Down ===");
     drop(test_context._keep_alive);
-    test_context.l1_to_contra_operator_handle.shutdown().await;
-    test_context.contra_to_l1_operator_handle.shutdown().await;
+    test_context
+        .solana_to_contra_operator_handle
+        .shutdown()
+        .await;
+    test_context
+        .contra_to_solana_operator_handle
+        .shutdown()
+        .await;
     test_context.contra_indexer_handle.abort();
-    test_context.l1_indexer_handle.abort();
+    test_context.solana_indexer_handle.abort();
     test_context.contra_handles.shutdown().await;
 }

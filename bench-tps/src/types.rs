@@ -115,7 +115,7 @@ pub type BatchQueue = Arc<(Mutex<VecDeque<Vec<Transaction>>>, Condvar)>;
 ///
 /// Holds the on-chain state set up by `setup_deposit::run_setup_deposit_phase`.
 pub struct DepositConfig {
-    /// The L1 token mint being deposited into the escrow.
+    /// The Solana token mint being deposited into the escrow.
     pub mint: Pubkey,
     /// The escrow instance PDA derived from the instance seed.
     pub instance_pda: Pubkey,
@@ -125,20 +125,20 @@ pub struct DepositConfig {
     pub instance_ata: Pubkey,
     /// Event authority PDA for the escrow program (derived from "event_authority" seed).
     pub event_authority: Pubkey,
-    /// Depositor keypairs, one per account.  Each has an L1 ATA funded with tokens.
+    /// Depositor keypairs, one per account.  Each has a Solana ATA funded with tokens.
     pub keypairs: Vec<Arc<Keypair>>,
-    /// Shared mutable state seeded with the current L1 blockhash.
+    /// Shared mutable state seeded with the current Solana blockhash.
     pub state: Arc<BenchState>,
 }
 
 /// Configuration for the withdraw load phase.
 ///
-/// Holds the on-chain state set up by the L2 `setup::run_setup_phase`.
+/// Holds the on-chain state set up by the Contra `setup::run_setup_phase`.
 pub struct WithdrawConfig {
-    /// The L2 SPL mint whose tokens will be burned on withdraw.
+    /// The Contra SPL mint whose tokens will be burned on withdraw.
     pub mint: Pubkey,
-    /// Withdrawer keypairs, one per account.  Each has an L2 ATA funded with tokens.
+    /// Withdrawer keypairs, one per account.  Each has a Contra ATA funded with tokens.
     pub keypairs: Vec<Arc<Keypair>>,
-    /// Shared mutable state seeded with the current L2 blockhash.
+    /// Shared mutable state seeded with the current Contra blockhash.
     pub state: Arc<BenchState>,
 }

@@ -5,13 +5,13 @@
 //! The binary supports three subcommands for testing different parts of the Contra pipeline:
 //!
 //! **`transfer`** (default flow)
-//! Tests the L2 SPL transfer pipeline.
+//! Tests the Contra SPL transfer pipeline.
 //!
 //! **`deposit`**
-//! Tests the L1 → escrow deposit flow.
+//! Tests the Solana escrow deposit flow.
 //!
 //! **`withdraw`**
-//! Tests the L2 withdraw-burn flow.
+//! Tests the Contra withdraw-burn flow.
 //!
 //! Each flow follows the same three-phase structure:
 //!
@@ -238,7 +238,7 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
     }
 
     info!(
-        l1_rpc_url = %args.l1_rpc_url,
+        solana_rpc_url = %args.solana_rpc_url,
         accounts = args.accounts,
         threads = args.threads,
         duration = args.duration,
@@ -246,7 +246,7 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
     );
 
     let deposit_config = setup_deposit::run_setup_deposit_phase(
-        &args.l1_rpc_url,
+        &args.solana_rpc_url,
         &args.admin_keypair,
         args.instance_seed_keypair.as_deref(),
         args.accounts,
@@ -261,14 +261,14 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
     let cancel = CancellationToken::new();
 
     let bh_handle = tokio::spawn(run_blockhash_poller(
-        args.l1_rpc_url.clone(),
+        args.solana_rpc_url.clone(),
         Arc::clone(&deposit_config.state),
         cancel.clone(),
     ));
 
     let load_end = tokio::time::Instant::now() + Duration::from_secs(args.duration);
     let metrics_handle = tokio::spawn(run_metrics_sampler(
-        args.l1_rpc_url.clone(),
+        args.solana_rpc_url.clone(),
         load_end,
         cancel.clone(),
         FLOW_DEPOSIT,
@@ -285,7 +285,7 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
     let sent_count = Arc::new(AtomicU64::new(0));
     let mut sender_handles = Vec::with_capacity(args.threads);
     for _ in 0..args.threads {
-        let rpc_url = args.l1_rpc_url.clone();
+        let rpc_url = args.solana_rpc_url.clone();
         let q = Arc::clone(&queue);
         let c = cancel.clone();
         let sc = Arc::clone(&sent_count);
@@ -329,35 +329,35 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
     }
 
     let sent = sent_count.load(Ordering::Relaxed);
-    let l1_landed = end_tx_count.saturating_sub(start_tx_count);
-    let l2_minted = end_mints.saturating_sub(start_mints);
-    let l1_tps = l1_landed as f64 / args.duration as f64;
+    let solana_landed = end_tx_count.saturating_sub(start_tx_count);
+    let contra_minted = end_mints.saturating_sub(start_mints);
+    let solana_tps = solana_landed as f64 / args.duration as f64;
 
     if args.operator_metrics_url.is_some() {
-        let l2_tps = l2_minted as f64 / args.duration as f64;
-        let drop = l1_landed.saturating_sub(l2_minted);
-        let drop_rate = if l1_landed > 0 {
-            drop as f64 / l1_landed as f64 * 100.0
+        let contra_tps = contra_minted as f64 / args.duration as f64;
+        let drop = solana_landed.saturating_sub(contra_minted);
+        let drop_rate = if solana_landed > 0 {
+            drop as f64 / solana_landed as f64 * 100.0
         } else {
             0.0
         };
         info!(
             duration_secs = args.duration,
             sent,
-            l1_landed,
-            l2_minted,
+            solana_landed,
+            contra_minted,
             drop,
             drop_rate = format!("{drop_rate:.1}%"),
-            l1_tps = format!("{l1_tps:.1}"),
-            l2_tps = format!("{l2_tps:.1}"),
+            solana_tps = format!("{solana_tps:.1}"),
+            contra_tps = format!("{contra_tps:.1}"),
             "Final summary (deposit)",
         );
     } else {
         info!(
             duration_secs = args.duration,
             sent,
-            l1_landed,
-            l1_tps = format!("{l1_tps:.1}"),
+            solana_landed,
+            solana_tps = format!("{solana_tps:.1}"),
             "Final summary (deposit)",
         );
     }
@@ -377,7 +377,7 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     }
 
     info!(
-        l1_rpc_url = %args.l1_rpc_url,
+        solana_rpc_url = %args.solana_rpc_url,
         rpc_url = %args.rpc_url,
         accounts = args.accounts,
         threads = args.threads,
@@ -385,10 +385,10 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
         "Starting contra-bench-tps (withdraw)",
     );
 
-    // Full e2e setup: initialise L1 escrow infrastructure + L2 mint and accounts.
+    // Full e2e setup: initialise Solana escrow infrastructure + Contra mint and accounts.
     let withdraw_config = Arc::new(
         setup_withdraw::run_setup_withdraw_phase(
-            &args.l1_rpc_url,
+            &args.solana_rpc_url,
             &args.rpc_url,
             &args.admin_keypair,
             args.instance_seed_keypair.as_deref(),
@@ -409,14 +409,14 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     ));
 
     let load_end = tokio::time::Instant::now() + Duration::from_secs(args.duration);
-    // Measures L2 burn transactions confirmed on the write-node
-    let l2_metrics_handle = tokio::spawn(run_metrics_sampler(
+    // Measures burn transactions confirmed on the Contra write-node
+    let contra_metrics_handle = tokio::spawn(run_metrics_sampler(
         args.rpc_url.clone(),
         load_end,
         cancel.clone(),
         FLOW_WITHDRAW,
     ));
-    // Samples contra_operator_mints_sent_total from operator-contra for e2e l1_released count
+    // Samples contra_operator_mints_sent_total from operator-contra for e2e solana_released count
     let operator_handle = args.operator_metrics_url.clone().map(|url| {
         tokio::spawn(run_operator_mints_sampler(
             url,
@@ -461,7 +461,7 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
 
     let _ = gen_handle.await;
     let _ = bh_handle.await;
-    let (start_l2_count, end_l2_count) = l2_metrics_handle.await.unwrap_or((0, 0));
+    let (start_contra_count, end_contra_count) = contra_metrics_handle.await.unwrap_or((0, 0));
     let (start_mints, end_mints) = if let Some(h) = operator_handle {
         h.await.unwrap_or((0, 0))
     } else {
@@ -472,35 +472,35 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     }
 
     let sent = sent_count.load(Ordering::Relaxed);
-    let l2_burned = end_l2_count.saturating_sub(start_l2_count);
-    let l2_tps = l2_burned as f64 / args.duration as f64;
+    let contra_burned = end_contra_count.saturating_sub(start_contra_count);
+    let contra_tps = contra_burned as f64 / args.duration as f64;
 
     if args.operator_metrics_url.is_some() {
-        let l1_released = end_mints.saturating_sub(start_mints);
-        let l1_tps = l1_released as f64 / args.duration as f64;
-        let drop = l2_burned.saturating_sub(l1_released);
-        let drop_rate = if l2_burned > 0 {
-            drop as f64 / l2_burned as f64 * 100.0
+        let solana_released = end_mints.saturating_sub(start_mints);
+        let solana_tps = solana_released as f64 / args.duration as f64;
+        let drop = contra_burned.saturating_sub(solana_released);
+        let drop_rate = if contra_burned > 0 {
+            drop as f64 / contra_burned as f64 * 100.0
         } else {
             0.0
         };
         info!(
             duration_secs = args.duration,
             sent,
-            l2_burned,
-            l1_released,
+            contra_burned,
+            solana_released,
             drop,
             drop_rate = format!("{drop_rate:.1}%"),
-            l2_tps = format!("{l2_tps:.1}"),
-            l1_tps = format!("{l1_tps:.1}"),
+            contra_tps = format!("{contra_tps:.1}"),
+            solana_tps = format!("{solana_tps:.1}"),
             "Final summary (withdraw)",
         );
     } else {
         info!(
             duration_secs = args.duration,
             sent,
-            l2_burned,
-            l2_tps = format!("{l2_tps:.1}"),
+            contra_burned,
+            contra_tps = format!("{contra_tps:.1}"),
             "Final summary (withdraw)",
         );
     }

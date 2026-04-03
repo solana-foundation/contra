@@ -20,11 +20,11 @@ pub struct Cli {
 /// Available bench subcommands.
 #[derive(clap::Subcommand, Debug)]
 pub enum SubCommand {
-    /// SPL token transfer load test (L2 pipeline, default flow).
+    /// SPL token transfer load test (Contra pipeline, default flow).
     Transfer(TransferArgs),
-    /// Escrow deposit load test (L1 → escrow program).
+    /// Escrow deposit load test (Solana → escrow program).
     Deposit(DepositArgs),
-    /// Withdraw-burn load test (L2 withdraw program).
+    /// Withdraw-burn load test (Contra withdraw program).
     Withdraw(WithdrawArgs),
     /// Derive and print the escrow instance PDA for a given instance-seed keypair.
     ///
@@ -125,22 +125,24 @@ pub struct TransferArgs {
     pub log_level: String,
 }
 
-/// Arguments for the deposit subcommand (L1 escrow deposit load test).
+/// Arguments for the deposit subcommand (Solana escrow deposit load test).
 #[derive(Parser, Debug)]
 pub struct DepositArgs {
     /// Path to the admin keypair JSON file.
     ///
-    /// Used to fund depositor accounts with SOL and mint L1 tokens.
+    /// Used to fund depositor accounts with SOL and mint tokens.
     #[arg(long, env = "BENCH_ADMIN_KEYPAIR")]
     pub admin_keypair: PathBuf,
 
-    /// JSON-RPC endpoint of the L1 Solana validator (for deposit transactions).
+    /// JSON-RPC endpoint of the Solana validator (for deposit transactions).
+    ///
+    /// The local validator container exposes port 8899 → 18899 on the host.
     #[arg(
         long,
-        default_value = "http://localhost:8899",
-        env = "BENCH_L1_RPC_URL"
+        default_value = "http://localhost:18899",
+        env = "BENCH_SOLANA_RPC_URL"
     )]
-    pub l1_rpc_url: String,
+    pub solana_rpc_url: String,
 
     /// Number of depositor accounts to generate.
     #[arg(long, default_value_t = 20, env = "BENCH_DEPOSIT_ACCOUNTS")]
@@ -158,7 +160,7 @@ pub struct DepositArgs {
     #[arg(long, default_value_t = 5, env = "BENCH_SENDER_SLEEP_MS")]
     pub sender_sleep_ms: u64,
 
-    /// Initial L1 token balance (raw units) minted to each depositor ATA.
+    /// Initial token balance (raw units) minted to each depositor ATA.
     #[arg(long, default_value_t = 1_000_000, env = "BENCH_INITIAL_BALANCE")]
     pub initial_balance: u64,
 
@@ -189,25 +191,27 @@ pub struct DepositArgs {
     pub log_level: String,
 }
 
-/// Arguments for the withdraw subcommand (L2 withdraw-burn load test).
+/// Arguments for the withdraw subcommand (Contra withdraw-burn load test).
 #[derive(Parser, Debug)]
 pub struct WithdrawArgs {
     /// Path to the admin keypair JSON file.
     ///
-    /// Used to initialise the L1 escrow infrastructure and fund L2 withdrawer
-    /// accounts.  The same keypair is registered as the ReleaseFunds operator.
+    /// Used to initialise the Solana escrow infrastructure and fund Contra
+    /// withdrawer accounts.  The same keypair is registered as the ReleaseFunds operator.
     #[arg(long, env = "BENCH_ADMIN_KEYPAIR")]
     pub admin_keypair: PathBuf,
 
-    /// JSON-RPC endpoint of the L1 Solana validator (for L1 escrow setup).
+    /// JSON-RPC endpoint of the Solana validator (for escrow setup).
+    ///
+    /// The local validator container exposes port 8899 → 18899 on the host.
     #[arg(
         long,
-        default_value = "http://localhost:8899",
-        env = "BENCH_L1_RPC_URL"
+        default_value = "http://localhost:18899",
+        env = "BENCH_SOLANA_RPC_URL"
     )]
-    pub l1_rpc_url: String,
+    pub solana_rpc_url: String,
 
-    /// JSON-RPC endpoint of the L2 contra write-node (or gateway).
+    /// JSON-RPC endpoint of the Contra write-node (or gateway).
     #[arg(long, default_value = "http://localhost:8899", env = "BENCH_RPC_URL")]
     pub rpc_url: String,
 
@@ -236,7 +240,7 @@ pub struct WithdrawArgs {
     #[arg(long, default_value_t = 5, env = "BENCH_SENDER_SLEEP_MS")]
     pub sender_sleep_ms: u64,
 
-    /// Initial token balance (raw units) minted to each withdrawer's L2 ATA.
+    /// Initial token balance (raw units) minted to each withdrawer's Contra ATA.
     #[arg(long, default_value_t = 1_000_000, env = "BENCH_INITIAL_BALANCE")]
     pub initial_balance: u64,
 
@@ -247,7 +251,7 @@ pub struct WithdrawArgs {
     /// Prometheus /metrics URL of the operator-contra container.
     ///
     /// When set, samples `contra_operator_mints_sent_total` every second and
-    /// includes e2e l1_released count and drop rate in the final CLI summary.
+    /// includes e2e solana_released count and drop rate in the final CLI summary.
     #[arg(long, env = "BENCH_WITHDRAW_OPERATOR_METRICS_URL")]
     pub operator_metrics_url: Option<String>,
 

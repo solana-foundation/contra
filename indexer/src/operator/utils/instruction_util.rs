@@ -69,11 +69,11 @@ pub enum ExtraErrorCheckPolicy {
 /// Allows processor to send multiple builder types through a single channel to sender
 #[derive(Clone, Debug)]
 pub enum TransactionBuilder {
-    /// Release funds transaction (Contra → L1) - requires SMT proof
+    /// Release funds transaction (Contra → Solana) - requires SMT proof
     ReleaseFunds(Box<ReleaseFundsBuilderWithNonce>),
-    /// Initialize mint transaction (L1 → Contra) - simple initialize_mint instruction
+    /// Initialize mint transaction (Solana → Contra) - simple initialize_mint instruction
     InitializeMint(Box<InitializeMintBuilder>),
-    /// Mint transaction (L1 → Contra) - simple SPL mint, no proof needed
+    /// Mint transaction (Solana → Contra) - simple SPL mint, no proof needed
     Mint(Box<MintToBuilderWithTxnId>),
     /// Reset SMT root transaction - rotates to new tree
     ResetSmtRoot(Box<ResetSmtRootBuilder>),

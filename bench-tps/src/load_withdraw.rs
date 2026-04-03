@@ -1,11 +1,11 @@
-//! Phase 3 — Withdraw load generation (L2 withdraw-burn)
+//! Phase 3 — Withdraw load generation (Contra withdraw-burn)
 //!
-//! Mirrors the structure of `load.rs` but targets the L2 withdraw program's
+//! Mirrors the structure of `load.rs` but targets the Contra withdraw program's
 //! `WithdrawFunds` instruction instead of an SPL token transfer.
 //!
 //! The generator signs a batch of withdraw transactions per cycle, pushing each
 //! batch onto a `BatchQueue`.  Sender threads pop batches and call
-//! `send_transaction` against the L2 write-node RPC endpoint.
+//! `send_transaction` against the Contra write-node RPC endpoint.
 
 use {
     crate::{
@@ -34,7 +34,7 @@ const WITHDRAW_AMOUNT: u64 = 1;
 /// same withdrawer account reuses the same blockhash across batches.
 const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/// Build a signed L2 withdraw-burn transaction.
+/// Build a signed Contra withdraw-burn transaction.
 ///
 /// `nonce` is encoded as a decimal string in a memo instruction so that every
 /// transaction has a unique signature even when the same keypair and blockhash
@@ -120,15 +120,15 @@ pub async fn run_withdraw_generator(
 
 /// Blocking sender thread for withdraw transactions.
 ///
-/// Sends to the L2 write-node and increments metrics with `flow="withdraw"`.
+/// Sends to the Contra write-node and increments metrics with `flow="withdraw"`.
 pub fn run_withdraw_sender_thread(
-    l2_rpc_url: String,
+    contra_rpc_url: String,
     queue: BatchQueue,
     cancel: CancellationToken,
     sent_count: Arc<AtomicU64>,
     sleep_ms: u64,
 ) {
-    let rpc = solana_client::rpc_client::RpcClient::new(l2_rpc_url);
+    let rpc = solana_client::rpc_client::RpcClient::new(contra_rpc_url);
 
     loop {
         if cancel.is_cancelled() {

@@ -476,7 +476,7 @@
         "y": 34
       },
       "id": 30,
-      "title": "Deposit Flow  (L1 \u2192 L2)",
+      "title": "Deposit Flow  (Solana \u2192 Contra)",
       "type": "row"
     },
     {
@@ -525,7 +525,7 @@
           "step": "2s"
         }
       ],
-      "title": "1. L1 Sent TPS  (bench \u2192 Solana)",
+      "title": "1. Solana Sent TPS  (bench \u2192 Solana)",
       "type": "timeseries"
     },
     {
@@ -585,7 +585,7 @@
           "step": "2s"
         }
       ],
-      "title": "2. Indexer \u2014 L1 Events Indexed",
+      "title": "2. Indexer \u2014 Solana Events Indexed",
       "type": "timeseries"
     },
     {
@@ -694,7 +694,7 @@
           "step": "2s"
         }
       ],
-      "title": "4. L2 Mint Rate  (operator \u2192 L2)",
+      "title": "4. Contra Mint Rate  (operator \u2192 Contra)",
       "type": "timeseries"
     },
     {
@@ -706,7 +706,7 @@
         "y": 51
       },
       "id": 40,
-      "title": "Withdraw Flow  (L2 \u2192 L1)",
+      "title": "Withdraw Flow  (Contra \u2192 Solana)",
       "type": "row"
     },
     {
@@ -766,7 +766,7 @@
           "step": "2s"
         }
       ],
-      "title": "1. L2 Sent / Landed TPS  (bench \u2192 contra)",
+      "title": "1. Contra Sent / Landed TPS  (bench \u2192 contra)",
       "type": "timeseries"
     },
     {
@@ -826,7 +826,7 @@
           "step": "2s"
         }
       ],
-      "title": "2. Indexer \u2014 L2 Events Indexed",
+      "title": "2. Indexer \u2014 Contra Events Indexed",
       "type": "timeseries"
     },
     {
@@ -935,7 +935,7 @@
           "step": "2s"
         }
       ],
-      "title": "4. L1 Release Rate  (operator \u2192 Solana)",
+      "title": "4. Solana Release Rate  (operator \u2192 Solana)",
       "type": "timeseries"
     }
   ],

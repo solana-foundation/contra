@@ -25,7 +25,7 @@ use {
 };
 
 use super::{
-    test_context::{ContraContext, L1Context},
+    test_context::{ContraContext, SolanaContext},
     utils::{AIRDROP_LAMPORTS, LAMPORTS_PER_SOL, MINT_DECIMALS},
 };
 use crate::setup;
@@ -35,22 +35,22 @@ const INITIAL_ALICE_TOKENS: u64 = 1_000_000; // 1000 tokens
 const INITIAL_BOB_TOKENS: u64 = 500_000; // 500 tokens
 const INITIAL_CHARLIE_TOKENS: u64 = 300_000; // 300 tokens
 
-// L1 Escrow deposit amounts (these get minted on Contra by the operator)
-const L1_ALICE_DEPOSIT: u64 = 200_000; // 200 tokens
-const L1_BOB_DEPOSIT: u64 = 150_000; // 150 tokens
-const L1_CHARLIE_DEPOSIT: u64 = 100_000; // 100 tokens
+// Solana Escrow deposit amounts (these get minted on Contra by the operator)
+const SOLANA_ALICE_DEPOSIT: u64 = 200_000; // 200 tokens
+const SOLANA_BOB_DEPOSIT: u64 = 150_000; // 150 tokens
+const SOLANA_CHARLIE_DEPOSIT: u64 = 100_000; // 100 tokens
 
 /// Request SOL airdrops for all accounts that will need it
 async fn request_airdrops(
     contra_ctx: &ContraContext,
-    l1_ctx: &L1Context,
+    solana_ctx: &SolanaContext,
     user_keypairs: &[&Keypair],
 ) -> Result<()> {
     println!("\n=== Requesting SOL airdrops on test validator ===");
 
     // Fund user keypairs
     for keypair in user_keypairs {
-        l1_ctx
+        solana_ctx
             .fund_account(&keypair.pubkey(), AIRDROP_LAMPORTS)
             .await?;
         println!(
@@ -59,13 +59,13 @@ async fn request_airdrops(
             AIRDROP_LAMPORTS / LAMPORTS_PER_SOL
         );
         assert!(
-            l1_ctx.get_balance(&keypair.pubkey()).await? > 0,
+            solana_ctx.get_balance(&keypair.pubkey()).await? > 0,
             "User should have non-zero SOL balance"
         );
     }
 
     // Fund admin
-    l1_ctx
+    solana_ctx
         .fund_account(&contra_ctx.operator_key.pubkey(), AIRDROP_LAMPORTS)
         .await?;
     println!(
@@ -73,7 +73,7 @@ async fn request_airdrops(
         AIRDROP_LAMPORTS / LAMPORTS_PER_SOL
     );
     assert!(
-        l1_ctx
+        solana_ctx
             .get_balance(&contra_ctx.operator_key.pubkey())
             .await?
             > 0,
@@ -83,47 +83,50 @@ async fn request_airdrops(
     Ok(())
 }
 
-/// Initialize the escrow instance and allow the mint on L1 test validator
-async fn setup_l1_contra_instance(l1_ctx: &L1Context) -> Result<()> {
+/// Initialize the escrow instance and allow the mint on Solana test validator
+async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> {
     println!("\n=== Setting up Contra escrow instance on test validator ===");
 
     // Derive instance PDA
     let (instance_pda, instance_bump) = Pubkey::find_program_address(
-        &[b"instance", l1_ctx.escrow_instance.pubkey().as_ref()],
+        &[b"instance", solana_ctx.escrow_instance.pubkey().as_ref()],
         &CONTRA_ESCROW_PROGRAM_ID,
     );
-    println!("Instance seed: {}", l1_ctx.escrow_instance.pubkey());
+    println!("Instance seed: {}", solana_ctx.escrow_instance.pubkey());
     println!("Instance PDA: {} (bump: {})", instance_pda, instance_bump);
 
-    if let Ok(_pda_account) = l1_ctx.client.get_account(&instance_pda).await {
+    if let Ok(_pda_account) = solana_ctx.client.get_account(&instance_pda).await {
         println!("Instance PDA account found, skipping creation");
         return Ok(());
     }
     println!("Instance PDA account not found, creating...");
 
     let create_instance_ix = CreateInstanceBuilder::new()
-        .payer(l1_ctx.operator_key.pubkey())
-        .admin(l1_ctx.operator_key.pubkey())
-        .instance_seed(l1_ctx.escrow_instance.pubkey())
+        .payer(solana_ctx.operator_key.pubkey())
+        .admin(solana_ctx.operator_key.pubkey())
+        .instance_seed(solana_ctx.escrow_instance.pubkey())
         .instance(instance_pda)
         .bump(instance_bump)
         .instruction();
 
-    let blockhash = l1_ctx.get_latest_blockhash().await?;
+    let blockhash = solana_ctx.get_latest_blockhash().await?;
     let create_instance_tx = Transaction::new_signed_with_payer(
         &[create_instance_ix],
-        Some(&l1_ctx.operator_key.pubkey()),
-        &[&l1_ctx.operator_key, &l1_ctx.escrow_instance],
+        Some(&solana_ctx.operator_key.pubkey()),
+        &[&solana_ctx.operator_key, &solana_ctx.escrow_instance],
         blockhash,
     );
 
-    let sig = l1_ctx.send_transaction(&create_instance_tx).await.unwrap();
+    let sig = solana_ctx
+        .send_transaction(&create_instance_tx)
+        .await
+        .unwrap();
     println!("Escrow instance created: {}", sig);
 
     println!(
         "Escrow instance PDA: {} {}",
         instance_pda,
-        l1_ctx.get_balance(&instance_pda).await?
+        solana_ctx.get_balance(&instance_pda).await?
     );
 
     // Add the operator to the escrow instance
@@ -132,29 +135,29 @@ async fn setup_l1_contra_instance(l1_ctx: &L1Context) -> Result<()> {
         &[
             b"operator",
             instance_pda.as_ref(),
-            l1_ctx.operator_key.pubkey().as_ref(),
+            solana_ctx.operator_key.pubkey().as_ref(),
         ],
         &CONTRA_ESCROW_PROGRAM_ID,
     );
 
     let add_operator_ix = AddOperatorBuilder::new()
-        .payer(l1_ctx.operator_key.pubkey())
-        .admin(l1_ctx.operator_key.pubkey())
+        .payer(solana_ctx.operator_key.pubkey())
+        .admin(solana_ctx.operator_key.pubkey())
         .instance(instance_pda)
-        .operator(l1_ctx.operator_key.pubkey())
+        .operator(solana_ctx.operator_key.pubkey())
         .operator_pda(operator_pda)
         .bump(operator_bump)
         .instruction();
 
-    let blockhash = l1_ctx.get_latest_blockhash().await.unwrap();
+    let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
     let add_operator_tx = Transaction::new_signed_with_payer(
         &[add_operator_ix],
-        Some(&l1_ctx.operator_key.pubkey()),
-        &[&l1_ctx.operator_key],
+        Some(&solana_ctx.operator_key.pubkey()),
+        &[&solana_ctx.operator_key],
         blockhash,
     );
 
-    let sig = l1_ctx.send_transaction(&add_operator_tx).await.unwrap();
+    let sig = solana_ctx.send_transaction(&add_operator_tx).await.unwrap();
     println!("Operator added to escrow instance: {}", sig);
     println!("Operator PDA: {} (bump: {})", operator_pda, operator_bump);
 
@@ -162,7 +165,7 @@ async fn setup_l1_contra_instance(l1_ctx: &L1Context) -> Result<()> {
 }
 
 async fn allow_mint_on_escrow_instance(
-    l1_ctx: &L1Context,
+    solana_ctx: &SolanaContext,
     mint_keypair: &Keypair,
     token_program_id: &Pubkey,
 ) -> Result<()> {
@@ -170,7 +173,7 @@ async fn allow_mint_on_escrow_instance(
 
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
-        &[b"instance", l1_ctx.escrow_instance.pubkey().as_ref()],
+        &[b"instance", solana_ctx.escrow_instance.pubkey().as_ref()],
         &CONTRA_ESCROW_PROGRAM_ID,
     );
 
@@ -190,8 +193,8 @@ async fn allow_mint_on_escrow_instance(
     let instance_ata_pubkey = Pubkey::from(instance_ata.to_bytes());
 
     let allow_mint_ix = AllowMintBuilder::new()
-        .payer(l1_ctx.operator_key.pubkey())
-        .admin(l1_ctx.operator_key.pubkey())
+        .payer(solana_ctx.operator_key.pubkey())
+        .admin(solana_ctx.operator_key.pubkey())
         .instance(instance_pda)
         .mint(mint_pubkey)
         .allowed_mint(allowed_mint_pda)
@@ -200,15 +203,15 @@ async fn allow_mint_on_escrow_instance(
         .bump(allowed_mint_bump)
         .instruction();
 
-    let blockhash = l1_ctx.get_latest_blockhash().await.unwrap();
+    let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
     let allow_mint_tx = Transaction::new_signed_with_payer(
         &[allow_mint_ix],
-        Some(&l1_ctx.operator_key.pubkey()),
-        &[&l1_ctx.operator_key],
+        Some(&solana_ctx.operator_key.pubkey()),
+        &[&solana_ctx.operator_key],
         blockhash,
     );
 
-    let sig = l1_ctx.send_transaction(&allow_mint_tx).await.unwrap();
+    let sig = solana_ctx.send_transaction(&allow_mint_tx).await.unwrap();
     println!("Mint allowed in escrow: {}", sig);
     println!(
         "Allowed mint PDA: {} (bump: {})",
@@ -219,9 +222,9 @@ async fn allow_mint_on_escrow_instance(
     Ok(())
 }
 
-/// Setup token accounts and mint tokens to users on L1 test validator
-async fn setup_l1_token_accounts(
-    l1_ctx: &L1Context,
+/// Setup token accounts and mint tokens to users on Solana test validator
+async fn setup_solana_token_accounts(
+    solana_ctx: &SolanaContext,
     mint_keypair: &Keypair,
     user_keypairs: &[&Keypair],
     token_amounts: &[u64],
@@ -237,7 +240,7 @@ async fn setup_l1_token_accounts(
 
     // Create token accounts
     println!("\nCreating token accounts on test validator...");
-    l1_ctx
+    solana_ctx
         .create_token_accounts(&mint_keypair.pubkey(), user_keypairs, token_program_id)
         .await
         .unwrap();
@@ -250,7 +253,7 @@ async fn setup_l1_token_accounts(
             &mint_keypair.pubkey(),
             token_program_id,
         );
-        let sig = l1_ctx
+        let sig = solana_ctx
             .mint_to(
                 &mint_keypair.pubkey(),
                 &token_account,
@@ -276,7 +279,7 @@ async fn setup_l1_token_accounts(
             &mint_keypair.pubkey(),
             token_program_id,
         );
-        let balance = l1_ctx.get_token_balance(&token_account).await.unwrap();
+        let balance = solana_ctx.get_token_balance(&token_account).await.unwrap();
         println!("  {}: {} tokens", keypair.pubkey(), balance);
         assert_eq!(
             balance,
@@ -290,27 +293,27 @@ async fn setup_l1_token_accounts(
     Ok(())
 }
 
-/// Step 1: Setup L1 test validator with funded accounts, mint, and token accounts
-async fn setup_l1_accounts(
+/// Step 1: Setup Solana test validator with funded accounts, mint, and token accounts
+async fn setup_solana_accounts(
     contra_ctx: &ContraContext,
-    l1_ctx: &L1Context,
+    solana_ctx: &SolanaContext,
     mint_keypair: &Keypair,
     user_keypairs: &[&Keypair],
     token_amounts: &[u64],
     token_program_id: &Pubkey,
 ) -> Result<()> {
-    println!("\n=== Step 1: Setup L1 Environment ===");
+    println!("\n=== Step 1: Setup Solana Environment ===");
     println!("Mint: {}", mint_keypair.pubkey());
 
     // Request SOL airdrops first
-    request_airdrops(contra_ctx, l1_ctx, user_keypairs)
+    request_airdrops(contra_ctx, solana_ctx, user_keypairs)
         .await
         .unwrap();
 
     // Create and initialize mint
     println!("\nCreating mint on test validator...");
     let sig = if token_program_id == &spl_token_2022::ID {
-        l1_ctx
+        solana_ctx
             .create_t22_mint(
                 mint_keypair,
                 &contra_ctx.operator_key.pubkey(),
@@ -319,7 +322,7 @@ async fn setup_l1_accounts(
             .await
             .unwrap()
     } else if token_program_id == &spl_token::ID {
-        l1_ctx
+        solana_ctx
             .create_mint(
                 mint_keypair,
                 &contra_ctx.operator_key.pubkey(),
@@ -332,13 +335,13 @@ async fn setup_l1_accounts(
     };
     println!("Mint created: {}", sig);
 
-    setup_l1_contra_instance(l1_ctx).await?;
+    setup_solana_escrow_instance(solana_ctx).await?;
 
-    allow_mint_on_escrow_instance(l1_ctx, mint_keypair, token_program_id).await?;
+    allow_mint_on_escrow_instance(solana_ctx, mint_keypair, token_program_id).await?;
 
     // Setup token accounts and mint tokens to users
-    setup_l1_token_accounts(
-        l1_ctx,
+    setup_solana_token_accounts(
+        solana_ctx,
         mint_keypair,
         user_keypairs,
         token_amounts,
@@ -350,22 +353,22 @@ async fn setup_l1_accounts(
     Ok(())
 }
 
-/// Step 2: Make deposits to L1 Escrow
-async fn l1_deposit(
-    l1_ctx: &L1Context,
+/// Step 2: Make deposits to Solana Escrow
+async fn solana_deposit(
+    solana_ctx: &SolanaContext,
     mint_keypair: &Keypair,
     alice: &Keypair,
     bob: &Keypair,
     charlie: &Keypair,
     token_program_id: &Pubkey,
 ) {
-    println!("\n=== Step 2: L1 Escrow Deposits ===");
+    println!("\n=== Step 2: Solana Escrow Deposits ===");
 
-    let l1_mint = &mint_keypair.pubkey();
+    let solana_mint = &mint_keypair.pubkey();
 
-    // Reuse the existing escrow instance from l1_ctx (created in setup_l1_accounts)
-    // This is the SAME instance that the Contra->L1 operator is configured to use
-    let instance_seed_pubkey = Pubkey::from(l1_ctx.escrow_instance.pubkey().to_bytes());
+    // Reuse the existing escrow instance from solana_ctx (created in setup_solana_accounts)
+    // This is the SAME instance that the Contra->Solana operator is configured to use
+    let instance_seed_pubkey = Pubkey::from(solana_ctx.escrow_instance.pubkey().to_bytes());
 
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
@@ -380,32 +383,32 @@ async fn l1_deposit(
     println!("Using existing Escrow instance PDA: {}", instance_pda);
 
     // Derive the allowed_mint PDA and instance_ata for this mint
-    // These should already exist from the setup_l1_contra_instance call
-    let mint_pubkey = Pubkey::from(l1_mint.to_bytes());
+    // These should already exist from the setup_solana_escrow_instance call
+    let mint_pubkey = Pubkey::from(solana_mint.to_bytes());
     let (allowed_mint_pda, _) = Pubkey::find_program_address(
         &[b"allowed_mint", instance_pda.as_ref(), mint_pubkey.as_ref()],
         &CONTRA_ESCROW_PROGRAM_ID,
     );
     let instance_ata =
-        get_associated_token_address_with_program_id(&instance_pda, l1_mint, token_program_id);
+        get_associated_token_address_with_program_id(&instance_pda, solana_mint, token_program_id);
     let instance_ata_pubkey = Pubkey::from(instance_ata.to_bytes());
 
-    // Now have Alice, Bob, and Charlie deposit into the escrow on L1
-    println!("\n=== Making L1 Escrow deposits ===");
+    // Now have Alice, Bob, and Charlie deposit into the escrow on Solana
+    println!("\n=== Making Solana Escrow deposits ===");
     let mut deposit_signatures = Vec::new();
 
     for (name, keypair, amount) in [
-        ("Alice", alice, L1_ALICE_DEPOSIT),
-        ("Bob", bob, L1_BOB_DEPOSIT),
-        ("Charlie", charlie, L1_CHARLIE_DEPOSIT),
+        ("Alice", alice, SOLANA_ALICE_DEPOSIT),
+        ("Bob", bob, SOLANA_BOB_DEPOSIT),
+        ("Charlie", charlie, SOLANA_CHARLIE_DEPOSIT),
     ] {
         let user_pubkey = Pubkey::from(keypair.pubkey().to_bytes());
-        let user_l1_ata = get_associated_token_address_with_program_id(
+        let user_solana_ata = get_associated_token_address_with_program_id(
             &keypair.pubkey(),
-            l1_mint,
+            solana_mint,
             token_program_id,
         );
-        let user_ata_pubkey = Pubkey::from(user_l1_ata.to_bytes());
+        let user_ata_pubkey = Pubkey::from(user_solana_ata.to_bytes());
 
         let deposit_ix = DepositBuilder::new()
             .payer(user_pubkey)
@@ -419,7 +422,7 @@ async fn l1_deposit(
             .amount(amount)
             .instruction();
 
-        let blockhash = l1_ctx.get_latest_blockhash().await.unwrap();
+        let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
         let deposit_tx = Transaction::new_signed_with_payer(
             &[deposit_ix],
             Some(&keypair.pubkey()),
@@ -427,33 +430,33 @@ async fn l1_deposit(
             blockhash,
         );
 
-        let sig = l1_ctx.send_transaction(&deposit_tx).await.unwrap();
+        let sig = solana_ctx.send_transaction(&deposit_tx).await.unwrap();
         println!(
-            "  {} deposited {} tokens to L1 Escrow: {}",
+            "  {} deposited {} tokens to Solana Escrow: {}",
             name, amount, sig
         );
         deposit_signatures.push((name, sig, amount));
     }
 
-    // Verify the L1 indexer captured these deposits
-    println!("\n=== Verifying L1 Escrow deposits in L1 indexer database ===");
+    // Verify the Solana indexer captured these deposits
+    println!("\n=== Verifying Solana Escrow deposits in Solana indexer database ===");
 
     let poll_start = std::time::Instant::now();
     let max_poll_duration = Duration::from_secs(20);
     let mut found_deposits = Vec::new();
 
     while poll_start.elapsed() < max_poll_duration {
-        let deposits = l1_ctx
+        let deposits = solana_ctx
             .indexer_storage
             .get_all_db_transactions(TransactionType::Deposit, 100)
             .await
-            .expect("Failed to query deposits from L1 indexer database");
+            .expect("Failed to query deposits from Solana indexer database");
 
         for (name, sig, amount) in &deposit_signatures {
             if let Some(deposit_tx) = deposits.iter().find(|tx| tx.signature == sig.to_string()) {
                 if !found_deposits.iter().any(|s| s == name) {
                     println!(
-                        "  ✓ Found {} L1 Escrow deposit: {} tokens (sig: {})",
+                        "  ✓ Found {} Solana Escrow deposit: {} tokens (sig: {})",
                         name, amount, sig
                     );
                     found_deposits.push(name.to_string());
@@ -466,7 +469,7 @@ async fn l1_deposit(
 
         if found_deposits.len() == deposit_signatures.len() {
             println!(
-                "\n  ✓ All {} L1 Escrow deposits verified after {:?}",
+                "\n  ✓ All {} Solana Escrow deposits verified after {:?}",
                 deposit_signatures.len(),
                 poll_start.elapsed()
             );
@@ -474,7 +477,7 @@ async fn l1_deposit(
         }
 
         println!(
-            "  ✗ Found {} L1 Escrow deposits, expected {}. Trying again...",
+            "  ✗ Found {} Solana Escrow deposits, expected {}. Trying again...",
             found_deposits.len(),
             deposit_signatures.len()
         );
@@ -484,7 +487,7 @@ async fn l1_deposit(
     assert_eq!(
         found_deposits.len(),
         deposit_signatures.len(),
-        "Should have found all {} L1 Escrow deposits in database",
+        "Should have found all {} Solana Escrow deposits in database",
         deposit_signatures.len()
     );
 }
@@ -515,13 +518,13 @@ async fn setup_contra_accounts(
         &spl_token::id(),
     );
 
-    // Wait for the operator to mint tokens based on L1 deposits
+    // Wait for the operator to mint tokens based on Solana deposits
     // Note: The operator automatically creates token accounts (ATAs) when minting
-    println!("\n=== Waiting for Operator to Mint Tokens from L1 Deposits ===");
-    println!("The operator should automatically mint tokens based on L1 deposit events");
+    println!("\n=== Waiting for Operator to Mint Tokens from Solana Deposits ===");
+    println!("The operator should automatically mint tokens based on Solana deposit events");
     println!(
         "Expected deposits: Alice={}, Bob={}, Charlie={}",
-        L1_ALICE_DEPOSIT, L1_BOB_DEPOSIT, L1_CHARLIE_DEPOSIT
+        SOLANA_ALICE_DEPOSIT, SOLANA_BOB_DEPOSIT, SOLANA_CHARLIE_DEPOSIT
     );
 
     // Poll for balances to be minted by operator
@@ -545,9 +548,9 @@ async fn setup_contra_accounts(
             .await
             .unwrap_or(0);
 
-        if alice_balance >= L1_ALICE_DEPOSIT
-            && bob_balance >= L1_BOB_DEPOSIT
-            && charlie_balance >= L1_CHARLIE_DEPOSIT
+        if alice_balance >= SOLANA_ALICE_DEPOSIT
+            && bob_balance >= SOLANA_BOB_DEPOSIT
+            && charlie_balance >= SOLANA_CHARLIE_DEPOSIT
         {
             println!("✓ Operator minted tokens after {:?}", poll_start.elapsed());
             println!("  Alice: {} tokens", alice_balance / 1000);
@@ -558,24 +561,24 @@ async fn setup_contra_accounts(
         sleep(Duration::from_millis(500)).await;
     }
 
-    // Verify balances match L1 deposits
+    // Verify balances match Solana deposits
     assert_eq!(
         alice_balance,
-        L1_ALICE_DEPOSIT,
-        "Alice should have {} tokens minted by operator from L1 deposit",
-        L1_ALICE_DEPOSIT / 1000
+        SOLANA_ALICE_DEPOSIT,
+        "Alice should have {} tokens minted by operator from Solana deposit",
+        SOLANA_ALICE_DEPOSIT / 1000
     );
     assert_eq!(
         bob_balance,
-        L1_BOB_DEPOSIT,
-        "Bob should have {} tokens minted by operator from L1 deposit",
-        L1_BOB_DEPOSIT / 1000
+        SOLANA_BOB_DEPOSIT,
+        "Bob should have {} tokens minted by operator from Solana deposit",
+        SOLANA_BOB_DEPOSIT / 1000
     );
     assert_eq!(
         charlie_balance,
-        L1_CHARLIE_DEPOSIT,
-        "Charlie should have {} tokens minted by operator from L1 deposit",
-        L1_CHARLIE_DEPOSIT / 1000
+        SOLANA_CHARLIE_DEPOSIT,
+        "Charlie should have {} tokens minted by operator from Solana deposit",
+        SOLANA_CHARLIE_DEPOSIT / 1000
     );
 
     // Transfer tokens from Alice to Charlie (Alice has 200, send 100 to Charlie)
@@ -634,9 +637,9 @@ async fn setup_contra_accounts(
 
     // Verify final balances
     println!("\n=== Verifying Final Balances ===");
-    let alice_final = L1_ALICE_DEPOSIT - transfer_amount; // 200 - 100 = 100
-    let bob_final = L1_BOB_DEPOSIT; // 150 (unchanged)
-    let charlie_final = L1_CHARLIE_DEPOSIT + transfer_amount; // 100 + 100 = 200
+    let alice_final = SOLANA_ALICE_DEPOSIT - transfer_amount; // 200 - 100 = 100
+    let bob_final = SOLANA_BOB_DEPOSIT; // 150 (unchanged)
+    let charlie_final = SOLANA_CHARLIE_DEPOSIT + transfer_amount; // 100 + 100 = 200
 
     println!("Alice token account {}", alice_token_account);
     println!("Bob token account {}", bob_token_account);
@@ -676,7 +679,7 @@ async fn setup_contra_accounts(
 /// Step 4: Withdraw from Contra and verify in indexer
 async fn contra_burn(
     contra_ctx: &ContraContext,
-    l1_ctx: &L1Context,
+    solana_ctx: &SolanaContext,
     mint_pubkey: &Pubkey,
     alice: &Keypair,
     token_program_id: &Pubkey,
@@ -691,9 +694,9 @@ async fn contra_burn(
     );
 
     // Calculate expected balance before withdrawal
-    // Alice received 200 from L1 deposit, sent 100 to Charlie, so has 100
+    // Alice received 200 from Solana deposit, sent 100 to Charlie, so has 100
     let transfer_amount = 100_000; // Same as used in setup_contra_accounts
-    let alice_balance_before = L1_ALICE_DEPOSIT - transfer_amount;
+    let alice_balance_before = SOLANA_ALICE_DEPOSIT - transfer_amount;
 
     // Alice withdraws 50 tokens (half of her remaining balance)
     let withdrawal_amount = 50_000; // 50 tokens
@@ -780,22 +783,25 @@ async fn contra_burn(
 
     println!("\n✓ Withdrawal successfully recorded in Contra indexer database");
 
-    // Poll for Alice's balance to be 850_000 (1_000_000 start, 200_000 escrowed on L1, 50_000 withdrawn)
-    println!("\n=== Polling for Alice's updated L1 balance after withdrawal ===");
-    let expected_alice_balance = INITIAL_ALICE_TOKENS - L1_ALICE_DEPOSIT + withdrawal_amount;
+    // Poll for Alice's balance to be 850_000 (1_000_000 start, 200_000 escrowed on Solana, 50_000 withdrawn)
+    println!("\n=== Polling for Alice's updated Solana balance after withdrawal ===");
+    let expected_alice_balance = INITIAL_ALICE_TOKENS - SOLANA_ALICE_DEPOSIT + withdrawal_amount;
     let poll_start = std::time::Instant::now();
     let max_poll_duration = Duration::from_secs(10);
-    let alice_l1_ata = get_associated_token_address_with_program_id(
+    let alice_solana_ata = get_associated_token_address_with_program_id(
         &alice.pubkey(),
         mint_pubkey,
         token_program_id,
     );
 
     loop {
-        let balance = l1_ctx.get_token_balance(&alice_l1_ata).await.unwrap_or(0);
+        let balance = solana_ctx
+            .get_token_balance(&alice_solana_ata)
+            .await
+            .unwrap_or(0);
         if balance == expected_alice_balance {
             println!(
-                "✓ Alice's L1 balance updated to {} after withdrawal (after {:?})",
+                "✓ Alice's Solana balance updated to {} after withdrawal (after {:?})",
                 balance,
                 poll_start.elapsed()
             );
@@ -803,16 +809,19 @@ async fn contra_burn(
         }
         if poll_start.elapsed() >= max_poll_duration {
             panic!(
-                "Timeout waiting for Alice's L1 balance to reach {} (got {})",
+                "Timeout waiting for Alice's Solana balance to reach {} (got {})",
                 expected_alice_balance, balance
             );
         }
         sleep(Duration::from_millis(300)).await;
     }
     assert_eq!(
-        l1_ctx.get_token_balance(&alice_l1_ata).await.unwrap(),
+        solana_ctx
+            .get_token_balance(&alice_solana_ata)
+            .await
+            .unwrap(),
         expected_alice_balance,
-        "Alice's L1 token balance should update to {} after withdrawal",
+        "Alice's Solana token balance should update to {} after withdrawal",
         expected_alice_balance
     );
 }
@@ -821,7 +830,7 @@ async fn contra_burn(
 /// Runs all 4 steps in order with a single mint for the entire test
 pub async fn run_spl_token_test(
     contra_ctx: &ContraContext,
-    l1_ctx: &L1Context,
+    solana_ctx: &SolanaContext,
     token_program_id: Pubkey,
 ) {
     if token_program_id == spl_token::ID {
@@ -838,7 +847,7 @@ pub async fn run_spl_token_test(
     let charlie = Keypair::new();
 
     // Generate a SINGLE mint keypair for the entire test
-    // This mint will be created on L1 and its pubkey will be used on Contra
+    // This mint will be created on Solana and its pubkey will be used on Contra
     let mint_keypair = Keypair::new();
 
     println!("\n=== Test Participants ===");
@@ -847,10 +856,10 @@ pub async fn run_spl_token_test(
     println!("  Bob: {}", bob.pubkey());
     println!("  Charlie: {}", charlie.pubkey());
 
-    // Step 1: Setup accounts in L1
-    setup_l1_accounts(
+    // Step 1: Setup accounts in Solana
+    setup_solana_accounts(
         contra_ctx,
-        l1_ctx,
+        solana_ctx,
         &mint_keypair,
         &[&alice, &bob, &charlie],
         &[
@@ -861,11 +870,11 @@ pub async fn run_spl_token_test(
         &token_program_id,
     )
     .await
-    .expect("L1 environment setup failed");
+    .expect("Solana environment setup failed");
 
-    // Step 2: Deposit in L1
-    l1_deposit(
-        l1_ctx,
+    // Step 2: Deposit in Solana
+    solana_deposit(
+        solana_ctx,
         &mint_keypair,
         &alice,
         &bob,
@@ -880,7 +889,7 @@ pub async fn run_spl_token_test(
     // Step 4: Withdraw from Contra
     contra_burn(
         contra_ctx,
-        l1_ctx,
+        solana_ctx,
         &mint_keypair.pubkey(),
         &alice,
         &token_program_id,

@@ -237,7 +237,7 @@ echo "Patched CONTRA_ADMIN_KEYS and ADMIN_PRIVATE_KEY in ${BENCH_ENV}"
 # ---------------------------------------------------------------------------
 # Step 5b — Generate / reuse the deposit instance-seed keypair and derive PDA
 #
-# The bench deposit subcommand creates an escrow instance on L1 during setup.
+# The bench deposit subcommand creates an escrow instance on Solana during setup.
 # indexer-solana and operator-solana must be pre-configured with the matching
 # instance PDA so they can observe deposits as they land.
 #
@@ -648,8 +648,8 @@ echo "All services stable."
 #   --metrics-port   fixed at 9101 (scraped by Prometheus)
 #
 # Subcommand-specific RPC injection:
-#   transfer/withdraw → --rpc-url  (L2 gateway)
-#   deposit           → --l1-rpc-url (L1 validator, host port 18899)
+#   transfer/withdraw → --rpc-url  (Contra gateway)
+#   deposit           → --solana-rpc-url (Solana validator, host port 18899)
 #
 # Any extra arguments passed to run.sh (i.e. those not consumed in step 1)
 # are forwarded verbatim, allowing callers to override defaults:
@@ -703,12 +703,12 @@ BASE_FLAGS=(
     --metrics-port 9101
 )
 
-# --rpc-url is used by transfer and withdraw (L2 gateway); deposit and withdraw
-# also need --l1-rpc-url for L1 escrow setup.
-L1_RPC="${BENCH_L1_RPC_URL:-http://localhost:${CONTRA_VALIDATOR_PORT:-18899}}"
+# --rpc-url is used by transfer and withdraw (Contra gateway); deposit and withdraw
+# also need --solana-rpc-url for Solana escrow setup.
+SOLANA_RPC="${BENCH_SOLANA_RPC_URL:-http://localhost:${CONTRA_VALIDATOR_PORT:-18899}}"
 
 if [ "${SUBCOMMAND}" = "deposit" ]; then
-    BASE_FLAGS+=(--l1-rpc-url "${L1_RPC}")
+    BASE_FLAGS+=(--solana-rpc-url "${SOLANA_RPC}")
     # Pass the persistent instance-seed keypair so the bench reuses the same
     # instance PDA that indexer-solana and operator-solana are watching.
     if [ -f "${INSTANCE_SEED_FILE}" ]; then
@@ -716,7 +716,7 @@ if [ "${SUBCOMMAND}" = "deposit" ]; then
     fi
 elif [ "${SUBCOMMAND}" = "withdraw" ]; then
     BASE_FLAGS+=(--rpc-url "http://localhost:${GATEWAY_PORT}")
-    BASE_FLAGS+=(--l1-rpc-url "${L1_RPC}")
+    BASE_FLAGS+=(--solana-rpc-url "${SOLANA_RPC}")
     # Reuse the same instance-seed as deposit so COMMON_ESCROW_INSTANCE_ID matches
     # the PDA that operator-contra is watching.
     if [ -f "${INSTANCE_SEED_FILE}" ]; then

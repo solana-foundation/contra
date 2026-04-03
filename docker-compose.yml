@@ -375,13 +375,13 @@ services:
     depends_on:
       postgres-indexer:
         condition: service_healthy
-      # Watches L2 write-node for WithdrawFunds instructions
+      # Watches Contra write-node for WithdrawFunds instructions
       gateway:
         condition: service_started
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      # rpc_url = L2 gateway — polls for WithdrawFunds (burn) instructions on L2.
+      # rpc_url = Contra gateway — polls for WithdrawFunds (burn) instructions on Contra.
       - COMMON_RPC_URL=http://gateway:${GATEWAY_PORT}
       - METRICS_PORT=9100
     volumes:
@@ -412,9 +412,9 @@ services:
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      # rpc_url = L2 gateway (routes reads→read-node, writes→write-node)
+      # rpc_url = Contra gateway (routes reads→read-node, writes→write-node)
       - COMMON_RPC_URL=http://gateway:${GATEWAY_PORT}
-      # source_rpc_url = L1 Solana validator 
+      # source_rpc_url = Solana Solana validator 
       - COMMON_SOURCE_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
       # Injected by bench-tps/scripts/run.sh, the full-stack orchestration script that
       # derives the escrow instance PDA and writes it to .env before starting services.
@@ -456,9 +456,9 @@ services:
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      # rpc_url = L1 Solana validator (where ReleaseFunds transactions are sent)
+      # rpc_url = Solana Solana validator (where ReleaseFunds transactions are sent)
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
-      # source_rpc_url = L2 gateway (source of withdrawal/burn state)
+      # source_rpc_url = Contra gateway (source of withdrawal/burn state)
       - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}

@@ -1,22 +1,22 @@
-//! Withdraw setup phase — L1 escrow bootstrap + L2 mint preparation.
+//! Withdraw setup phase — Solana escrow bootstrap + Contra mint preparation.
 //!
 //! Creates all on-chain state needed for the full e2e withdraw load test
 //! **without** running operator-solana or waiting for deposits to land.
 //!
-//! L1 (Solana validator / escrow program):
+//! Solana (validator / escrow program):
 //!   1. Load admin keypair and instance-seed keypair.
 //!   2. CreateInstance — initialises the escrow instance PDA.
 //!   3. AddOperator   — registers admin as the ReleaseFunds operator.
-//!   4. Create L1 SPL mint (admin = mint authority, same keypair reused on L2).
+//!   4. Create Solana SPL mint (admin = mint authority, same keypair reused on Contra).
 //!   5. AllowMint     — registers the mint; creates allowed_mint PDA and
-//!      instance ATA on L1.
+//!      instance ATA on Solana.
 //!   6. Seed the instance ATA with `num_accounts × initial_balance` tokens so
 //!      ReleaseFunds has enough tokens to release for every withdrawal.
 //!
-//! L2 (contra write-node):
-//!   7. Initialize the same mint on L2 (same pubkey, implicit account creation).
-//!   8. Create L2 ATAs for each withdrawer account.
-//!   9. Mint `initial_balance` tokens to each L2 ATA.
+//! Contra (write-node):
+//!   7. Initialize the same mint on Contra (same pubkey, implicit account creation).
+//!   8. Create Contra ATAs for each withdrawer account.
+//!   9. Mint `initial_balance` tokens to each Contra ATA.
 //!
 //! This bypasses operator-solana entirely — setup completes in seconds rather
 //! than waiting for the full deposit → mint pipeline.
@@ -56,7 +56,7 @@ const ALLOWED_MINT_SEED_PREFIX: &[u8] = b"allowed_mint";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const OPERATOR_SEED: &[u8] = b"operator";
 
-/// 10 SOL minimum on L1 (covers CreateInstance + AddOperator + AllowMint fees
+/// 10 SOL minimum on Solana (covers CreateInstance + AddOperator + AllowMint fees
 /// plus seed ATA mint-to fees).
 const MIN_ADMIN_LAMPORTS: u64 = 10_000_000_000;
 /// 100 SOL top-up
@@ -87,20 +87,20 @@ fn find_operator_pda(instance_pda: &Pubkey, operator: &Pubkey) -> (Pubkey, u8) {
 /// Run the full withdraw setup phase and return the `WithdrawConfig` needed by
 /// the withdraw load phase.
 ///
-/// `l1_rpc_url`         — L1 Solana validator RPC endpoint
-/// `l2_rpc_url`         — L2 contra write-node / gateway RPC endpoint
+/// `solana_rpc_url`     — Solana validator RPC endpoint
+/// `contra_rpc_url`     — Contra write-node / gateway RPC endpoint
 /// `admin_path`         — path to the admin keypair JSON file
 /// `instance_seed_path` — optional path to save/load the instance-seed keypair;
 ///                        reuse the same file as the deposit bench so that
 ///                        operator-contra (pre-configured with the matching PDA)
 ///                        can observe the resulting ReleaseFunds calls.
-/// `num_accounts`       — number of L2 withdrawer accounts to create
-/// `initial_balance`    — raw token units minted to each L2 withdrawer ATA;
-///                        also determines the total seed amount for the L1
+/// `num_accounts`       — number of Contra withdrawer accounts to create
+/// `initial_balance`    — raw token units minted to each Contra withdrawer ATA;
+///                        also determines the total seed amount for the Solana
 ///                        instance ATA (`num_accounts × initial_balance`).
 pub async fn run_setup_withdraw_phase(
-    l1_rpc_url: &str,
-    l2_rpc_url: &str,
+    solana_rpc_url: &str,
+    contra_rpc_url: &str,
     admin_path: &Path,
     instance_seed_path: Option<&Path>,
     num_accounts: usize,
@@ -147,27 +147,27 @@ pub async fn run_setup_withdraw_phase(
         "Derived PDAs for withdraw setup",
     );
 
-    let l1_rpc = Arc::new(RpcClient::new_with_commitment(
-        l1_rpc_url.to_owned(),
+    let solana_rpc = Arc::new(RpcClient::new_with_commitment(
+        solana_rpc_url.to_owned(),
         CommitmentConfig::processed(),
     ));
     let send_retry_delays: &[u64] = &[1, 2, 4, 8, 16, 30];
 
     // ------------------------------------------------------------------
-    // Task 2b: Ensure admin has SOL on L1
+    // Task 2b: Ensure admin has SOL on Solana
     // ------------------------------------------------------------------
-    let balance = l1_rpc
+    let balance = solana_rpc
         .get_balance(&admin_keypair.pubkey())
         .await
-        .context("get_balance for admin on L1")?;
+        .context("get_balance for admin on Solana")?;
     if balance < MIN_ADMIN_LAMPORTS {
-        let sig = l1_rpc
+        let sig = solana_rpc
             .request_airdrop(&admin_keypair.pubkey(), AIRDROP_LAMPORTS)
             .await
-            .context("airdrop to admin on L1")?;
+            .context("airdrop to admin on Solana")?;
         for _ in 0..60u32 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if l1_rpc
+            if solana_rpc
                 .get_balance(&admin_keypair.pubkey())
                 .await
                 .unwrap_or(0)
@@ -176,7 +176,7 @@ pub async fn run_setup_withdraw_phase(
                 break;
             }
         }
-        if l1_rpc
+        if solana_rpc
             .get_balance(&admin_keypair.pubkey())
             .await
             .unwrap_or(0)
@@ -186,19 +186,19 @@ pub async fn run_setup_withdraw_phase(
                 "airdrop timed out: admin balance still below minimum after 60 attempts"
             ));
         }
-        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on L1");
+        info!(lamports = AIRDROP_LAMPORTS, sig = %sig, "Admin airdropped on Solana");
     } else {
-        info!(balance, "Admin already funded on L1, skipping airdrop");
+        info!(balance, "Admin already funded on Solana, skipping airdrop");
     }
 
     // ------------------------------------------------------------------
-    // Task 3: CreateInstance on L1
+    // Task 3: CreateInstance on Solana
     // ------------------------------------------------------------------
     let t3 = Instant::now();
     let create_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match l1_rpc.get_latest_blockhash().await {
+            match solana_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
                         "get_latest_blockhash failed (create_instance), retrying in {delay_secs}s");
@@ -223,7 +223,7 @@ pub async fn run_setup_withdraw_phase(
                         &[admin_keypair.as_ref(), &instance_seed_keypair],
                         blockhash,
                     );
-                    match l1_rpc.send_transaction(&tx).await {
+                    match solana_rpc.send_transaction(&tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
                             warn!(attempt, err = %e, "create_instance send failed, retrying");
@@ -238,16 +238,17 @@ pub async fn run_setup_withdraw_phase(
             "create_instance: all retries exhausted: {last_err}"
         ));
     };
-    let retry = poll_confirmations(&l1_rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
+    let retry =
+        poll_confirmations(&solana_rpc, &[Some(create_sig)], "create_instance", 0, 1).await?;
     if !retry.is_empty() {
         return Err(anyhow::anyhow!(
             "create_instance failed to confirm on-chain"
         ));
     }
-    info!(%instance_pda, elapsed_ms = t3.elapsed().as_millis(), "Escrow instance created on L1");
+    info!(%instance_pda, elapsed_ms = t3.elapsed().as_millis(), "Escrow instance created on Solana");
 
     // ------------------------------------------------------------------
-    // Task 4: AddOperator on L1
+    // Task 4: AddOperator on Solana
     //
     // Register admin as the ReleaseFunds operator so operator-contra
     // (which signs with the admin key) can call ReleaseFunds on this instance.
@@ -256,7 +257,7 @@ pub async fn run_setup_withdraw_phase(
     let add_op_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match l1_rpc.get_latest_blockhash().await {
+            match solana_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
                         "get_latest_blockhash failed (add_operator), retrying in {delay_secs}s");
@@ -282,7 +283,7 @@ pub async fn run_setup_withdraw_phase(
                         &[admin_keypair.as_ref()],
                         blockhash,
                     );
-                    match l1_rpc.send_transaction(&tx).await {
+                    match solana_rpc.send_transaction(&tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
                             warn!(attempt, err = %e, "add_operator send failed, retrying");
@@ -297,33 +298,33 @@ pub async fn run_setup_withdraw_phase(
             "add_operator: all retries exhausted: {last_err}"
         ));
     };
-    let retry = poll_confirmations(&l1_rpc, &[Some(add_op_sig)], "add_operator", 0, 1).await?;
+    let retry = poll_confirmations(&solana_rpc, &[Some(add_op_sig)], "add_operator", 0, 1).await?;
     if !retry.is_empty() {
         return Err(anyhow::anyhow!("add_operator failed to confirm on-chain"));
     }
-    info!(%operator_pda, elapsed_ms = t4.elapsed().as_millis(), "Operator registered on L1");
+    info!(%operator_pda, elapsed_ms = t4.elapsed().as_millis(), "Operator registered on Solana");
 
     // ------------------------------------------------------------------
-    // Task 5: Create L1 SPL mint
+    // Task 5: Create Solana SPL mint
     //
-    // A single mint keypair is generated here and reused for L2 (Task 7)
+    // A single mint keypair is generated here and reused for Contra (Task 7)
     // so both chains share the same mint pubkey — required for ReleaseFunds
-    // to use the correct L1 token_program when deriving ATAs.
+    // to use the correct Solana token_program when deriving ATAs.
     // ------------------------------------------------------------------
     let t5 = Instant::now();
     let mint_keypair = Arc::new(Keypair::new());
     let mint = mint_keypair.pubkey();
-    let mint_rent = l1_rpc
+    let mint_rent = solana_rpc
         .get_minimum_balance_for_rent_exemption(SplMint::LEN)
         .await
         .context("get_minimum_balance_for_rent_exemption (mint)")?;
     let mint_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match l1_rpc.get_latest_blockhash().await {
+            match solana_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
-                        "get_latest_blockhash failed (l1 mint init), retrying in {delay_secs}s");
+                        "get_latest_blockhash failed (solana mint init), retrying in {delay_secs}s");
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
@@ -348,10 +349,10 @@ pub async fn run_setup_withdraw_phase(
                         &[admin_keypair.as_ref(), mint_keypair.as_ref()],
                         blockhash,
                     );
-                    match l1_rpc.send_transaction(&tx).await {
+                    match solana_rpc.send_transaction(&tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
-                            warn!(attempt, err = %e, "l1 mint init send failed, retrying");
+                            warn!(attempt, err = %e, "solana mint init send failed, retrying");
                             last_err = e.to_string();
                         }
                     }
@@ -360,19 +361,22 @@ pub async fn run_setup_withdraw_phase(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
         return Err(anyhow::anyhow!(
-            "l1 mint init: all retries exhausted: {last_err}"
+            "solana mint init: all retries exhausted: {last_err}"
         ));
     };
-    let retry = poll_confirmations(&l1_rpc, &[Some(mint_sig)], "l1_mint_init", 0, 1).await?;
+    let retry =
+        poll_confirmations(&solana_rpc, &[Some(mint_sig)], "solana_mint_init", 0, 1).await?;
     if !retry.is_empty() {
-        return Err(anyhow::anyhow!("l1_mint_init failed to confirm on-chain"));
+        return Err(anyhow::anyhow!(
+            "solana_mint_init failed to confirm on-chain"
+        ));
     }
-    info!(%mint, elapsed_ms = t5.elapsed().as_millis(), "L1 mint initialized");
+    info!(%mint, elapsed_ms = t5.elapsed().as_millis(), "Solana mint initialized");
 
     // ------------------------------------------------------------------
     // Task 6: AllowMint — register mint with the escrow instance
     //
-    // Creates the allowed_mint PDA and the instance ATA on L1.
+    // Creates the allowed_mint PDA and the instance ATA on Solana.
     // ------------------------------------------------------------------
     let t6 = Instant::now();
     let (allowed_mint_pda, allow_bump) = find_allowed_mint_pda(&instance_pda, &mint);
@@ -380,7 +384,7 @@ pub async fn run_setup_withdraw_phase(
     let allow_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match l1_rpc.get_latest_blockhash().await {
+            match solana_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
                         "get_latest_blockhash failed (allow_mint), retrying in {delay_secs}s");
@@ -407,7 +411,7 @@ pub async fn run_setup_withdraw_phase(
                         &[admin_keypair.as_ref()],
                         blockhash,
                     );
-                    match l1_rpc.send_transaction(&tx).await {
+                    match solana_rpc.send_transaction(&tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
                             warn!(attempt, err = %e, "allow_mint send failed, retrying");
@@ -422,7 +426,7 @@ pub async fn run_setup_withdraw_phase(
             "allow_mint: all retries exhausted: {last_err}"
         ));
     };
-    let retry = poll_confirmations(&l1_rpc, &[Some(allow_sig)], "allow_mint", 0, 1).await?;
+    let retry = poll_confirmations(&solana_rpc, &[Some(allow_sig)], "allow_mint", 0, 1).await?;
     if !retry.is_empty() {
         return Err(anyhow::anyhow!("allow_mint failed to confirm on-chain"));
     }
@@ -430,11 +434,11 @@ pub async fn run_setup_withdraw_phase(
         %allowed_mint_pda,
         %instance_ata,
         elapsed_ms = t6.elapsed().as_millis(),
-        "AllowMint confirmed — instance ATA created on L1",
+        "AllowMint confirmed — instance ATA created on Solana",
     );
 
     // ------------------------------------------------------------------
-    // Task 7: Seed instance ATA with tokens on L1
+    // Task 7: Seed instance ATA with tokens on Solana
     //
     // Mint num_accounts × initial_balance tokens directly to the instance ATA.
     // This is the pool that ReleaseFunds draws from — no real deposits needed.
@@ -444,7 +448,7 @@ pub async fn run_setup_withdraw_phase(
     let seed_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match l1_rpc.get_latest_blockhash().await {
+            match solana_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
                         "get_latest_blockhash failed (seed_instance_ata), retrying in {delay_secs}s");
@@ -458,7 +462,7 @@ pub async fn run_setup_withdraw_phase(
                         seed_amount,
                         blockhash,
                     );
-                    match l1_rpc
+                    match solana_rpc
                         .send_transaction_with_config(
                             &tx,
                             RpcSendTransactionConfig {
@@ -482,7 +486,8 @@ pub async fn run_setup_withdraw_phase(
             "seed_instance_ata: all retries exhausted: {last_err}"
         ));
     };
-    let retry = poll_confirmations(&l1_rpc, &[Some(seed_sig)], "seed_instance_ata", 0, 1).await?;
+    let retry =
+        poll_confirmations(&solana_rpc, &[Some(seed_sig)], "seed_instance_ata", 0, 1).await?;
     if !retry.is_empty() {
         return Err(anyhow::anyhow!(
             "seed_instance_ata failed to confirm on-chain"
@@ -492,13 +497,13 @@ pub async fn run_setup_withdraw_phase(
         %instance_ata,
         seed_amount,
         elapsed_ms = t7.elapsed().as_millis(),
-        "Instance ATA seeded on L1",
+        "Instance ATA seeded on Solana",
     );
 
     // ------------------------------------------------------------------
     // Task 8: Generate N withdrawer keypairs
     //
-    // Generated here (before L2 phase) so that L1 ATAs can be created
+    // Generated here (before Contra phase) so that Solana ATAs can be created
     // for the same pubkeys that will be used as ReleaseFunds recipients.
     // ------------------------------------------------------------------
     let keypairs: Vec<Arc<Keypair>> = (0..num_accounts)
@@ -508,11 +513,11 @@ pub async fn run_setup_withdraw_phase(
     info!(count = keypairs.len(), "Generated withdrawer keypairs");
 
     // ------------------------------------------------------------------
-    // Task 8b: Create L1 ATAs for all withdrawer keypairs
+    // Task 8b: Create Solana ATAs for all withdrawer keypairs
     //
-    // ReleaseFunds calls validate_ata() on the recipient's L1 ATA, which
+    // ReleaseFunds calls validate_ata() on the recipient's Solana ATA, which
     // returns InvalidInstructionData if the account is empty (doesn't
-    // exist). Create all recipient ATAs on L1 before any withdrawals
+    // exist). Create all recipient ATAs on Solana before any withdrawals
     // can be released.
     // ------------------------------------------------------------------
     {
@@ -525,21 +530,21 @@ pub async fn run_setup_withdraw_phase(
             let mut next_round: Vec<Arc<Keypair>> = Vec::new();
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = l1_rpc
+                let blockhash = solana_rpc
                     .get_latest_blockhash()
                     .await
-                    .context("get_latest_blockhash (l1 create-ata)")?;
+                    .context("get_latest_blockhash (solana create-ata)")?;
                 info!(
                     batch = batch_num,
                     size = batch.len(),
                     total,
-                    "Creating L1 withdrawer ATA batch"
+                    "Creating Solana withdrawer ATA batch"
                 );
                 let sigs = send_parallel(
-                    l1_rpc_url,
+                    solana_rpc_url,
                     batch,
                     blockhash,
-                    "create-l1-ata(withdraw)",
+                    "create-solana-ata(withdraw)",
                     |kp, url, bh| {
                         let admin = Arc::clone(&admin_keypair);
                         let owner = kp.pubkey();
@@ -560,9 +565,9 @@ pub async fn run_setup_withdraw_phase(
                 )
                 .await;
                 let retry_indices = poll_confirmations(
-                    &l1_rpc,
+                    &solana_rpc,
                     &sigs,
-                    "create-l1-ata(withdraw)",
+                    "create-solana-ata(withdraw)",
                     confirmed_so_far,
                     total,
                 )
@@ -574,41 +579,44 @@ pub async fn run_setup_withdraw_phase(
             }
             to_send = next_round;
             if !to_send.is_empty() {
-                warn!(count = to_send.len(), "Retrying failed L1 ATA transactions");
+                warn!(
+                    count = to_send.len(),
+                    "Retrying failed Solana ATA transactions"
+                );
             }
         }
         info!(
             total,
             elapsed_ms = t8b.elapsed().as_millis(),
-            "All L1 withdrawer ATAs created"
+            "All Solana withdrawer ATAs created"
         );
     }
 
     // ====================================================================
-    // L2 phase — contra write-node
+    // Contra phase — write-node
     // ====================================================================
 
-    let t_l2 = Instant::now();
-    info!("Starting L2 setup phase");
+    let t_contra = Instant::now();
+    info!("Starting Contra setup phase");
 
-    let l2_rpc = RpcClient::new(l2_rpc_url.to_owned());
+    let contra_rpc = RpcClient::new(contra_rpc_url.to_owned());
 
     // ------------------------------------------------------------------
-    // Task 9: Initialize same mint on L2
+    // Task 9: Initialize same mint on Contra
     //
-    // The L2 write-node creates accounts implicitly (gasless), so only
-    // `initialize_mint` is needed — no `create_account` like on L1.
-    // Using the same mint pubkey ensures ReleaseFunds on L1 looks up the
-    // correct token_program (spl_token) via the existing L1 mint account.
+    // The Contra write-node creates accounts implicitly (gasless), so only
+    // `initialize_mint` is needed — no `create_account` like on Solana.
+    // Using the same mint pubkey ensures ReleaseFunds on Solana looks up the
+    // correct token_program (spl_token) via the existing Solana mint account.
     // ------------------------------------------------------------------
     let t9 = Instant::now();
-    let l2_mint_sig = 'send: {
+    let contra_mint_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match l2_rpc.get_latest_blockhash().await {
+            match contra_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
-                        "get_latest_blockhash failed (l2 mint init), retrying in {delay_secs}s");
+                        "get_latest_blockhash failed (contra mint init), retrying in {delay_secs}s");
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
@@ -618,10 +626,10 @@ pub async fn run_setup_withdraw_phase(
                         MINT_DECIMALS,
                         blockhash,
                     );
-                    match l2_rpc.send_transaction(&init_tx).await {
+                    match contra_rpc.send_transaction(&init_tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
-                            warn!(attempt, err = %e, "l2 mint init send failed, retrying");
+                            warn!(attempt, err = %e, "contra mint init send failed, retrying");
                             last_err = e.to_string();
                         }
                     }
@@ -630,17 +638,26 @@ pub async fn run_setup_withdraw_phase(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
         return Err(anyhow::anyhow!(
-            "l2 mint init: all retries exhausted: {last_err}"
+            "contra mint init: all retries exhausted: {last_err}"
         ));
     };
-    let retry = poll_confirmations(&l2_rpc, &[Some(l2_mint_sig)], "l2_mint_init", 0, 1).await?;
+    let retry = poll_confirmations(
+        &contra_rpc,
+        &[Some(contra_mint_sig)],
+        "contra_mint_init",
+        0,
+        1,
+    )
+    .await?;
     if !retry.is_empty() {
-        return Err(anyhow::anyhow!("l2_mint_init failed to confirm on-chain"));
+        return Err(anyhow::anyhow!(
+            "contra_mint_init failed to confirm on-chain"
+        ));
     }
-    info!(%mint, elapsed_ms = t9.elapsed().as_millis(), "Mint initialized on L2");
+    info!(%mint, elapsed_ms = t9.elapsed().as_millis(), "Mint initialized on Contra");
 
     // ------------------------------------------------------------------
-    // Tasks 10 + 11: Create L2 ATAs and mint tokens in batches
+    // Tasks 10 + 11: Create Contra ATAs and mint tokens in batches
     // ------------------------------------------------------------------
     let total = keypairs.len();
 
@@ -653,18 +670,18 @@ pub async fn run_setup_withdraw_phase(
             let mut next_round: Vec<Arc<Keypair>> = Vec::new();
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = l2_rpc
+                let blockhash = contra_rpc
                     .get_latest_blockhash()
                     .await
-                    .context("get_latest_blockhash (l2 create-ata)")?;
+                    .context("get_latest_blockhash (contra create-ata)")?;
                 info!(
                     batch = batch_num,
                     size = batch.len(),
                     total,
-                    "Sending L2 ATA batch"
+                    "Sending Contra ATA batch"
                 );
                 let sigs = send_parallel(
-                    l2_rpc_url,
+                    contra_rpc_url,
                     batch,
                     blockhash,
                     "create-ata(withdraw)",
@@ -681,7 +698,7 @@ pub async fn run_setup_withdraw_phase(
                 )
                 .await;
                 let retry_indices = poll_confirmations(
-                    &l2_rpc,
+                    &contra_rpc,
                     &sigs,
                     "create-ata(withdraw)",
                     confirmed_so_far,
@@ -695,11 +712,14 @@ pub async fn run_setup_withdraw_phase(
             }
             to_send = next_round;
             if !to_send.is_empty() {
-                warn!(count = to_send.len(), "Retrying failed L2 ATA transactions");
+                warn!(
+                    count = to_send.len(),
+                    "Retrying failed Contra ATA transactions"
+                );
             }
         }
     }
-    info!(total, "All L2 withdrawer ATAs confirmed");
+    info!(total, "All Contra withdrawer ATAs confirmed");
 
     // Mint-to
     {
@@ -710,18 +730,18 @@ pub async fn run_setup_withdraw_phase(
             let mut next_round: Vec<Arc<Keypair>> = Vec::new();
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = l2_rpc
+                let blockhash = contra_rpc
                     .get_latest_blockhash()
                     .await
-                    .context("get_latest_blockhash (l2 mint-to)")?;
+                    .context("get_latest_blockhash (contra mint-to)")?;
                 info!(
                     batch = batch_num,
                     size = batch.len(),
                     total,
-                    "Sending L2 mint-to batch"
+                    "Sending Contra mint-to batch"
                 );
                 let sigs = send_parallel(
-                    l2_rpc_url,
+                    contra_rpc_url,
                     batch,
                     blockhash,
                     "mint-to(withdraw)",
@@ -744,7 +764,7 @@ pub async fn run_setup_withdraw_phase(
                 )
                 .await;
                 let retry_indices = poll_confirmations(
-                    &l2_rpc,
+                    &contra_rpc,
                     &sigs,
                     "mint-to(withdraw)",
                     confirmed_so_far,
@@ -760,27 +780,27 @@ pub async fn run_setup_withdraw_phase(
             if !to_send.is_empty() {
                 warn!(
                     count = to_send.len(),
-                    "Retrying failed L2 mint-to transactions"
+                    "Retrying failed Contra mint-to transactions"
                 );
             }
         }
     }
-    info!(total, "All L2 mint-to confirmed");
+    info!(total, "All Contra mint-to confirmed");
 
     // ------------------------------------------------------------------
-    // Task 12: Seed BenchState with current L2 blockhash
+    // Task 12: Seed BenchState with current Contra blockhash
     // ------------------------------------------------------------------
-    let initial_blockhash = l2_rpc
+    let initial_blockhash = contra_rpc
         .get_latest_blockhash()
         .await
-        .context("get_latest_blockhash (l2 seed)")?;
+        .context("get_latest_blockhash (contra seed)")?;
     let state = Arc::new(BenchState {
         current_blockhash: RwLock::new(initial_blockhash),
     });
     info!(
         blockhash = %initial_blockhash,
-        l2_elapsed_ms = t_l2.elapsed().as_millis(),
-        "L2 blockhash seeded — withdraw setup complete",
+        contra_elapsed_ms = t_contra.elapsed().as_millis(),
+        "Contra blockhash seeded — withdraw setup complete",
     );
 
     Ok(WithdrawConfig {

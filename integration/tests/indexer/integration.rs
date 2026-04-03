@@ -19,8 +19,10 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::SeedDerivable;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signer};
 use std::sync::{Arc, Once};
-use test_utils::indexer_helper::{start_contra_indexer, start_l1_indexer};
-use test_utils::operator_helper::{start_contra_to_l1_operator, start_l1_to_contra_operator};
+use test_utils::indexer_helper::{start_contra_indexer, start_solana_indexer};
+use test_utils::operator_helper::{
+    start_contra_to_solana_operator, start_solana_to_contra_operator,
+};
 use test_utils::validator_helper::start_test_validator;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -872,45 +874,45 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
 
     println!("Contra Indexer started successfully");
 
-    // Start L1 indexer (Yellowstone geyser) in background
-    println!("\n=== Starting L1 Indexer (Yellowstone Geyser) ===");
+    // Start Solana indexer (Yellowstone geyser) in background
+    println!("\n=== Starting Solana Indexer (Yellowstone Geyser) ===");
     let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
-    let (_l1_indexer_handle, _l1_indexer_storage) = start_l1_indexer(
+    let (_solana_indexer_handle, _solana_indexer_storage) = start_solana_indexer(
         geyser_endpoint,
         test_validator.rpc_url(),
         indexer_db_url.clone(),
         Some(instance_pda),
     )
     .await
-    .expect("Failed to start L1 indexer");
+    .expect("Failed to start Solana indexer");
 
-    println!("L1 Indexer started successfully");
+    println!("Solana Indexer started successfully");
 
-    // Start L1 -> Contra operator
+    // Start Solana -> Contra operator
     let operator_key = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).unwrap();
-    println!("\n=== Starting L1 -> Contra Operator ===");
+    println!("\n=== Starting Solana -> Contra Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let _l1_to_contra_operator_handle = start_l1_to_contra_operator(
+    let _solana_to_contra_operator_handle = start_solana_to_contra_operator(
         test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,
     )
     .await
-    .expect("Failed to start L1 -> Contra operator");
-    println!("L1 -> Contra Operator started successfully");
+    .expect("Failed to start Solana -> Contra operator");
+    println!("Solana -> Contra Operator started successfully");
 
-    println!("\n=== Starting Contra -> L1 Operator ===");
+    println!("\n=== Starting Contra -> Solana Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let _contra_to_l1_operator_handle = start_contra_to_l1_operator(
+    let _contra_to_solana_operator_handle = start_contra_to_solana_operator(
         test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,
     )
     .await
-    .expect("Failed to start Contra -> L1 operator");
-    println!("Contra -> L1 Operator started successfully");
+    .expect("Failed to start Contra -> Solana operator");
+    println!("Contra -> Solana Operator started successfully");
 
     println!("\n{}{}", GREEN, "=".repeat(40));
     println!("{}PHASE 2: Verify Backfill{}", BOLD, RESET);

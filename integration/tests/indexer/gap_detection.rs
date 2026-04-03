@@ -1,6 +1,6 @@
 //! Integration test for indexer gap detection and restart recovery.
 //!
-//! Verifies that when the L1 indexer is stopped while on-chain deposits occur,
+//! Verifies that when the Solana indexer is stopped while on-chain deposits occur,
 //! it correctly re-indexes the missed ("gap") slots when it is restarted, and
 //! that the checkpoint advances past every recovered deposit's slot.
 //!
@@ -26,7 +26,7 @@ use solana_sdk::signature::Keypair;
 use solana_sdk::signer::SeedDerivable;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signer};
 use std::sync::Arc;
-use test_utils::indexer_helper::{start_l1_indexer, start_l1_indexer_rpc_polling};
+use test_utils::indexer_helper::{start_solana_indexer, start_solana_indexer_rpc_polling};
 use test_utils::validator_helper::{start_test_validator, start_test_validator_no_geyser};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -178,8 +178,8 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
     all_signatures.push(tx2);
 
     // ── Phase 3: Start indexer — should backfill the 2 deposits ─────────
-    println!("\n## Phase 3: Start L1 indexer (first run — backfill expected)");
-    let (indexer_handle, _storage) = start_l1_indexer(
+    println!("\n## Phase 3: Start Solana indexer (first run — backfill expected)");
+    let (indexer_handle, _storage) = start_solana_indexer(
         geyser_endpoint.clone(),
         test_validator.rpc_url(),
         db_url.clone(),
@@ -250,8 +250,8 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
     all_signatures.push(tx4);
 
     // ── Phase 7: Restart indexer — backfill should recover the gap ──────
-    println!("\n## Phase 7: Start NEW L1 indexer (second run — gap recovery expected)");
-    let (indexer_handle_2, _storage_2) = start_l1_indexer(
+    println!("\n## Phase 7: Start NEW Solana indexer (second run — gap recovery expected)");
+    let (indexer_handle_2, _storage_2) = start_solana_indexer(
         geyser_endpoint.clone(),
         test_validator.rpc_url(),
         db_url.clone(),
@@ -406,9 +406,10 @@ async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::er
     }
 
     // ── Phase 3: Start RPC-polling indexer — backfill expected ───────────
-    println!("\n## Phase 3: Start RPC-polling L1 indexer");
+    println!("\n## Phase 3: Start RPC-polling Solana indexer");
     let (indexer_handle, _storage) =
-        start_l1_indexer_rpc_polling(rpc_url.clone(), db_url.clone(), Some(instance_pda)).await?;
+        start_solana_indexer_rpc_polling(rpc_url.clone(), db_url.clone(), Some(instance_pda))
+            .await?;
     println!("  Indexer started (RPC-polling mode)");
 
     // ── Phase 4: Verify backfill ─────────────────────────────────────────
@@ -448,7 +449,8 @@ async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::er
     // ── Phase 7: Restart indexer ─────────────────────────────────────────
     println!("\n## Phase 7: Restart RPC-polling indexer (gap recovery)");
     let (indexer_handle_2, _storage_2) =
-        start_l1_indexer_rpc_polling(rpc_url.clone(), db_url.clone(), Some(instance_pda)).await?;
+        start_solana_indexer_rpc_polling(rpc_url.clone(), db_url.clone(), Some(instance_pda))
+            .await?;
     println!("  Indexer restarted");
 
     // ── Phase 8: Verify all 4 deposits ──────────────────────────────────

@@ -43,15 +43,15 @@ fn set_operator_env_vars(keypair: &Keypair) {
     std::env::set_var("OPERATOR_PRIVATE_KEY", &private_key_base58);
 }
 
-/// Start the operator that reads from L1 indexer and mints tokens on Contra.
-pub async fn start_l1_to_contra_operator(
+/// Start the operator that reads from Solana indexer and mints tokens on Contra.
+pub async fn start_solana_to_contra_operator(
     contra_rpc_url: String,
-    l1_indexer_db_url: String,
+    solana_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
     let postgres_config = PostgresConfig {
-        database_url: l1_indexer_db_url,
+        database_url: solana_indexer_db_url,
         max_connections: 10,
     };
 
@@ -81,9 +81,9 @@ pub async fn start_l1_to_contra_operator(
     })
 }
 
-/// Start the operator that reads from Contra indexer and releases funds on L1.
-pub async fn start_contra_to_l1_operator(
-    l1_rpc_url: String,
+/// Start the operator that reads from Contra indexer and releases funds on Solana.
+pub async fn start_contra_to_solana_operator(
+    solana_rpc_url: String,
     contra_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
@@ -98,7 +98,7 @@ pub async fn start_contra_to_l1_operator(
     let common_config = ContraIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
-        rpc_url: l1_rpc_url,
+        rpc_url: solana_rpc_url,
         source_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),

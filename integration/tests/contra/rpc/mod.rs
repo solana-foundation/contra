@@ -24,7 +24,7 @@ mod test_vote_accounts;
 mod utils;
 
 pub use test_blockhash_validation::run_blockhash_validation_test;
-pub use test_context::{ContraContext, L1Context};
+pub use test_context::{ContraContext, SolanaContext};
 pub use test_dedup_persistence::run_dedup_persistence_test;
 pub use test_empty_transaction::run_empty_transaction_test;
 pub use test_epoch_info::run_epoch_info_test;

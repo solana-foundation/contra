@@ -39,7 +39,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::sync::Arc;
 use std::time::Duration;
-use test_utils::operator_helper::start_l1_to_contra_operator;
+use test_utils::operator_helper::start_solana_to_contra_operator;
 use test_utils::operator_helper::OperatorHandle;
 use test_utils::validator_helper::start_test_validator_no_geyser;
 use testcontainers::runners::AsyncRunner;
@@ -206,7 +206,7 @@ fn make_withdrawal_transaction(
     }
 }
 
-/// Happy path: a single pending deposit is picked up by the L1→Contra operator,
+/// Happy path: a single pending deposit is picked up by the Solana→Contra operator,
 /// minted on the channel, and the DB row transitions to `completed` with a
 /// non-null `counterpart_signature`.
 ///
@@ -259,9 +259,9 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 
     storage.insert_db_transaction(&deposit_txn).await?;
 
-    // 3. Start start_l1_to_contra_operator()
+    // 3. Start start_solana_to_contra_operator()
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_l1_to_contra_operator(
+    let operator_handle = start_solana_to_contra_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -341,7 +341,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     let balance_before = get_token_balance(&client, &user_pubkey, &env.mint).await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_l1_to_contra_operator(
+    let operator_handle = start_solana_to_contra_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -363,7 +363,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 }
 
 /// Inserts a withdrawal row twice (same signature / nonce 0), starts the
-/// Contra→L1 operator, and asserts the user receives `50_000` tokens — not
+/// Contra→Solana operator, and asserts the user receives `50_000` tokens — not
 /// `100_000`.  Confirms that the duplicate DB row does not result in two
 /// `ReleaseFunds` instructions being sent to the escrow program.
 #[tokio::test(flavor = "multi_thread")]
@@ -498,14 +498,14 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
         .create_async()
         .await;
 
-    // Start L1 -> Contra operator with alert URL and low retry count so bad
+    // Start Solana -> Contra operator with alert URL and low retry count so bad
     // transactions fail quickly without exhausting a long wait window.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let fast_fail_config = OperatorConfig {
         retry_max_attempts: 3,
         ..default_operator_config(Some(server.url()))
     };
-    let l1_to_contra = start_operator_with_config(
+    let solana_to_contra = start_operator_with_config(
         ProgramType::Escrow,
         test_validator.rpc_url(),
         db_url.clone(),
@@ -575,13 +575,13 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     );
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
-    // Start Contra -> L1 operator with same alert URL and low retry count.
+    // Start Contra -> Solana operator with same alert URL and low retry count.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let fast_fail_config = OperatorConfig {
         retry_max_attempts: 3,
         ..default_operator_config(Some(server.url()))
     };
-    let contra_to_l1 = start_operator_with_config(
+    let contra_to_solana = start_operator_with_config(
         ProgramType::Withdraw,
         test_validator.rpc_url(),
         db_url.clone(),
@@ -595,8 +595,8 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
 
     alert_mock.assert();
 
-    l1_to_contra.shutdown().await;
-    contra_to_l1.shutdown().await;
+    solana_to_contra.shutdown().await;
+    contra_to_solana.shutdown().await;
     Ok(())
 }
 
@@ -657,9 +657,9 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         signatures.push(sig);
     }
 
-    // Start the L1 → Contra operator and wait for all deposits to be processed.
+    // Start the Solana → Contra operator and wait for all deposits to be processed.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_l1_to_contra_operator(
+    let operator_handle = start_solana_to_contra_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -732,7 +732,7 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
     let env = TestEnvironment::setup(&client, &faucet_keypair, 0, 0, None).await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_l1_to_contra_operator(
+    let operator_handle = start_solana_to_contra_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,

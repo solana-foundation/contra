@@ -493,6 +493,10 @@ pub(super) async fn handle_success(
         state.pending_signatures.remove(&nonce);
         info!("Cleaned up state for withdrawal_nonce {}", nonce);
 
+        metrics::OPERATOR_MINTS_SENT
+            .with_label_values(&[state.program_type.as_label()])
+            .inc();
+
         if let Some(txn_id) = ctx.transaction_id {
             send_guaranteed(
                 storage_tx,

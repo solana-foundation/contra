@@ -339,6 +339,7 @@ services:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      - COMMON_SOURCE_RPC_URL=${GATEWAY_URL}
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}

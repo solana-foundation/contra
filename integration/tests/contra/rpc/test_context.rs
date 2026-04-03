@@ -206,7 +206,7 @@ impl ContraContext {
     }
 }
 
-pub struct L1Context {
+pub struct SolanaContext {
     pub client: RpcClient,
     pub operator_key: Keypair,
     pub faucet: Keypair,
@@ -214,7 +214,7 @@ pub struct L1Context {
     pub indexer_storage: Storage,
 }
 
-impl L1Context {
+impl SolanaContext {
     pub fn new(
         validator_url: String,
         admin_key: Keypair,
@@ -385,7 +385,7 @@ impl L1Context {
             self.client
                 .send_and_confirm_transaction(&create_ata_tx)
                 .await?;
-            println!("  Created L1 token account: {}", token_account);
+            println!("  Created Solana token account: {}", token_account);
         }
 
         Ok(())

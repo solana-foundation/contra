@@ -2,49 +2,61 @@
 //!
 //! # Overview
 //!
-//! The binary runs in three sequential phases:
+//! The binary supports three subcommands for testing different parts of the Contra pipeline:
 //!
-//! **Phase 1 — Setup** (`setup` module)
-//! Creates all on-chain state required by the load phase: a fresh SPL mint,
-//! Associated Token Accounts for every generated keypair, and an initial token
-//! balance for each account.  All setup transactions use fire-and-forget
-//! `send_transaction` followed by a custom `poll_confirmations` loop because
-//! the contra node's asynchronous pipeline outlasts the blockhash-expiry
-//! timeout baked into `send_and_confirm_transaction`.
+//! **`transfer`** (default flow)
+//! Tests the Contra SPL transfer pipeline.
 //!
-//! **Phase 2 — Background tasks** (`background` module)
-//! Two tasks run concurrently for the entire load phase:
-//!   - *Blockhash poller*: refreshes `BenchState::current_blockhash` every
-//!     80 ms so the generator always signs with a recent hash.
-//!   - *Metrics sampler*: calls `getTransactionCount` every second, logs
-//!     instantaneous TPS and remaining test time, and returns the start/end
-//!     counts for the final summary.
+//! **`deposit`**
+//! Tests the Solana escrow deposit flow.
 //!
-//! **Phase 3 — Load** (`load` module)
-//! A single async generator task signs batches of SPL transfer transactions
-//! and pushes them onto a `BatchQueue`.  A pool of `--threads` OS threads each
-//! pop one batch at a time and send every transaction via a synchronous
-//! `RpcClient`.  A shared `AtomicU64` tracks total transactions sent so the
-//! final summary can compute the drop rate against the node's own transaction
-//! counter.
+//! **`withdraw`**
+//! Tests the Contra withdraw-burn flow.
+//!
+//! Each flow follows the same three-phase structure:
+//!
+//! **Phase 1 — Setup**
+//! Creates all on-chain state required by the load phase.
+//!
+//! **Phase 2 — Background tasks**
+//! Blockhash poller + metrics sampler run concurrently.
+//!
+//! **Phase 3 — Load**
+//! Generator task signs batches; sender threads dispatch them.
 
 mod args;
 mod background;
 mod bench_metrics;
 mod load;
+mod load_deposit;
+mod load_withdraw;
 mod rpc;
 mod setup;
+mod setup_deposit;
+mod setup_withdraw;
 mod types;
 
 use {
     anyhow::Result,
-    args::Args,
-    background::{run_blockhash_poller, run_metrics_sampler},
+    args::{Cli, DerivePdaArgs, SubCommand},
+    background::{run_blockhash_poller, run_metrics_sampler, run_operator_mints_sampler},
+    bench_metrics::{
+        bench_metrics_init, {FLOW_DEPOSIT, FLOW_TRANSFER, FLOW_WITHDRAW},
+    },
     clap::Parser,
+    contra_core::client::load_keypair,
     load::{build_destinations, run_generator, run_sender_thread},
-    std::sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+    load_deposit::{run_deposit_generator, run_deposit_sender_thread},
+    load_withdraw::{run_withdraw_generator, run_withdraw_sender_thread},
+    setup_deposit::find_instance_pda,
+    solana_sdk::{signature::Keypair, signer::Signer},
+    std::{
+        collections::VecDeque,
+        fs::write,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Condvar, Mutex,
+        },
     },
     tokio::time::Duration,
     tokio_util::sync::CancellationToken,
@@ -54,16 +66,23 @@ use {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level)),
-        )
-        .init();
+    match cli.subcommand {
+        SubCommand::Transfer(args) => run_transfer(args).await,
+        SubCommand::Deposit(args) => run_deposit(args).await,
+        SubCommand::Withdraw(args) => run_withdraw(args).await,
+        SubCommand::DerivePda(args) => run_derive_pda(args),
+    }
+}
 
-    bench_metrics::init();
+// ---------------------------------------------------------------------------
+// Transfer subcommand
+// ---------------------------------------------------------------------------
+
+async fn run_transfer(args: args::TransferArgs) -> Result<()> {
+    init_logging(&args.log_level);
+    bench_metrics_init();
     if let Some(port) = args.metrics_port {
         contra_metrics::start_metrics_server(port);
     }
@@ -73,7 +92,7 @@ async fn main() -> Result<()> {
         accounts = args.accounts,
         threads = args.threads,
         duration = args.duration,
-        "Starting contra-bench-tps",
+        "Starting contra-bench-tps (transfer)",
     );
 
     // -------------------------------------------------------------------------
@@ -132,6 +151,7 @@ async fn main() -> Result<()> {
         args.rpc_url.clone(),
         load_end,
         cancel.clone(),
+        FLOW_TRANSFER,
     ));
 
     // Generator: signs batches of `threads` transactions and enqueues them.
@@ -160,13 +180,11 @@ async fn main() -> Result<()> {
     info!(
         duration_secs = args.duration,
         threads = args.threads,
-        "Load phase started"
+        "Transfer load phase started"
     );
     tokio::time::sleep(Duration::from_secs(args.duration)).await;
 
-    // Cancel all background tasks and wake any sender threads parked on the
-    // condvar so they observe the cancellation without waiting up to 50 ms.
-    info!("Load phase complete — shutting down");
+    info!("Transfer load phase complete — shutting down");
     cancel.cancel();
     let (_, cvar) = queue.as_ref();
     cvar.notify_all();
@@ -202,8 +220,329 @@ async fn main() -> Result<()> {
         dropped,
         drop_rate = format!("{drop_rate:.1}%"),
         tps = format!("{tps:.1}"),
-        "Final summary",
+        "Final summary (transfer)",
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Deposit subcommand
+// ---------------------------------------------------------------------------
+
+async fn run_deposit(args: args::DepositArgs) -> Result<()> {
+    init_logging(&args.log_level);
+    bench_metrics_init();
+    if let Some(port) = args.metrics_port {
+        contra_metrics::start_metrics_server(port);
+    }
+
+    info!(
+        solana_rpc_url = %args.solana_rpc_url,
+        accounts = args.accounts,
+        threads = args.threads,
+        duration = args.duration,
+        "Starting contra-bench-tps (deposit)",
+    );
+
+    let deposit_config = setup_deposit::run_setup_deposit_phase(
+        &args.solana_rpc_url,
+        &args.admin_keypair,
+        args.instance_seed_keypair.as_deref(),
+        args.accounts,
+        args.initial_balance,
+    )
+    .await?;
+
+    let deposit_config = Arc::new(deposit_config);
+
+    let queue: BatchQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+
+    let cancel = CancellationToken::new();
+
+    let bh_handle = tokio::spawn(run_blockhash_poller(
+        args.solana_rpc_url.clone(),
+        Arc::clone(&deposit_config.state),
+        cancel.clone(),
+    ));
+
+    let load_end = tokio::time::Instant::now() + Duration::from_secs(args.duration);
+    let metrics_handle = tokio::spawn(run_metrics_sampler(
+        args.solana_rpc_url.clone(),
+        load_end,
+        cancel.clone(),
+        FLOW_DEPOSIT,
+    ));
+
+    let gen_handle = tokio::spawn(run_deposit_generator(
+        Arc::clone(&deposit_config),
+        Arc::clone(&deposit_config.state),
+        Arc::clone(&queue),
+        args.threads,
+        cancel.clone(),
+    ));
+
+    let sent_count = Arc::new(AtomicU64::new(0));
+    let mut sender_handles = Vec::with_capacity(args.threads);
+    for _ in 0..args.threads {
+        let rpc_url = args.solana_rpc_url.clone();
+        let q = Arc::clone(&queue);
+        let c = cancel.clone();
+        let sc = Arc::clone(&sent_count);
+        let ms = args.sender_sleep_ms;
+        sender_handles.push(std::thread::spawn(move || {
+            run_deposit_sender_thread(rpc_url, q, c, sc, ms)
+        }));
+    }
+
+    let operator_handle = args.operator_metrics_url.clone().map(|url| {
+        tokio::spawn(run_operator_mints_sampler(
+            url,
+            load_end,
+            cancel.clone(),
+            "escrow",
+        ))
+    });
+
+    info!(
+        duration_secs = args.duration,
+        threads = args.threads,
+        "Deposit load phase started"
+    );
+    tokio::time::sleep(Duration::from_secs(args.duration)).await;
+
+    info!("Deposit load phase complete — shutting down");
+    cancel.cancel();
+    let (_, cvar) = queue.as_ref();
+    cvar.notify_all();
+
+    let _ = gen_handle.await;
+    let _ = bh_handle.await;
+    let (start_tx_count, end_tx_count) = metrics_handle.await.unwrap_or((0, 0));
+    let (start_mints, end_mints) = if let Some(h) = operator_handle {
+        h.await.unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    for h in sender_handles {
+        let _ = h.join();
+    }
+
+    let sent = sent_count.load(Ordering::Relaxed);
+    let solana_landed = end_tx_count.saturating_sub(start_tx_count);
+    let contra_minted = end_mints.saturating_sub(start_mints);
+    let solana_tps = solana_landed as f64 / args.duration as f64;
+
+    if args.operator_metrics_url.is_some() {
+        let contra_tps = contra_minted as f64 / args.duration as f64;
+        let drop = solana_landed.saturating_sub(contra_minted);
+        let drop_rate = if solana_landed > 0 {
+            drop as f64 / solana_landed as f64 * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            duration_secs = args.duration,
+            sent,
+            solana_landed,
+            contra_minted,
+            drop,
+            drop_rate = format!("{drop_rate:.1}%"),
+            solana_tps = format!("{solana_tps:.1}"),
+            contra_tps = format!("{contra_tps:.1}"),
+            "Final summary (deposit)",
+        );
+    } else {
+        info!(
+            duration_secs = args.duration,
+            sent,
+            solana_landed,
+            solana_tps = format!("{solana_tps:.1}"),
+            "Final summary (deposit)",
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Withdraw subcommand
+// ---------------------------------------------------------------------------
+
+async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
+    init_logging(&args.log_level);
+    bench_metrics_init();
+    if let Some(port) = args.metrics_port {
+        contra_metrics::start_metrics_server(port);
+    }
+
+    info!(
+        solana_rpc_url = %args.solana_rpc_url,
+        rpc_url = %args.rpc_url,
+        accounts = args.accounts,
+        threads = args.threads,
+        duration = args.duration,
+        "Starting contra-bench-tps (withdraw)",
+    );
+
+    // Full e2e setup: initialise Solana escrow infrastructure + Contra mint and accounts.
+    let withdraw_config = Arc::new(
+        setup_withdraw::run_setup_withdraw_phase(
+            &args.solana_rpc_url,
+            &args.rpc_url,
+            &args.admin_keypair,
+            args.instance_seed_keypair.as_deref(),
+            args.accounts,
+            args.initial_balance,
+        )
+        .await?,
+    );
+
+    let queue: BatchQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+
+    let cancel = CancellationToken::new();
+
+    let bh_handle = tokio::spawn(run_blockhash_poller(
+        args.rpc_url.clone(),
+        Arc::clone(&withdraw_config.state),
+        cancel.clone(),
+    ));
+
+    let load_end = tokio::time::Instant::now() + Duration::from_secs(args.duration);
+    // Measures burn transactions confirmed on the Contra write-node
+    let contra_metrics_handle = tokio::spawn(run_metrics_sampler(
+        args.rpc_url.clone(),
+        load_end,
+        cancel.clone(),
+        FLOW_WITHDRAW,
+    ));
+    // Samples contra_operator_mints_sent_total from operator-contra for e2e solana_released count
+    let operator_handle = args.operator_metrics_url.clone().map(|url| {
+        tokio::spawn(run_operator_mints_sampler(
+            url,
+            load_end,
+            cancel.clone(),
+            "withdraw",
+        ))
+    });
+
+    let gen_handle = tokio::spawn(run_withdraw_generator(
+        Arc::clone(&withdraw_config),
+        Arc::clone(&withdraw_config.state),
+        Arc::clone(&queue),
+        args.threads,
+        cancel.clone(),
+    ));
+
+    let sent_count = Arc::new(AtomicU64::new(0));
+    let mut sender_handles = Vec::with_capacity(args.threads);
+    for _ in 0..args.threads {
+        let rpc_url = args.rpc_url.clone();
+        let q = Arc::clone(&queue);
+        let c = cancel.clone();
+        let sc = Arc::clone(&sent_count);
+        let ms = args.sender_sleep_ms;
+        sender_handles.push(std::thread::spawn(move || {
+            run_withdraw_sender_thread(rpc_url, q, c, sc, ms)
+        }));
+    }
+
+    info!(
+        duration_secs = args.duration,
+        threads = args.threads,
+        "Withdraw load phase started"
+    );
+    tokio::time::sleep(Duration::from_secs(args.duration)).await;
+
+    info!("Withdraw load phase complete — shutting down");
+    cancel.cancel();
+    let (_, cvar) = queue.as_ref();
+    cvar.notify_all();
+
+    let _ = gen_handle.await;
+    let _ = bh_handle.await;
+    let (start_contra_count, end_contra_count) = contra_metrics_handle.await.unwrap_or((0, 0));
+    let (start_mints, end_mints) = if let Some(h) = operator_handle {
+        h.await.unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    for h in sender_handles {
+        let _ = h.join();
+    }
+
+    let sent = sent_count.load(Ordering::Relaxed);
+    let contra_burned = end_contra_count.saturating_sub(start_contra_count);
+    let contra_tps = contra_burned as f64 / args.duration as f64;
+
+    if args.operator_metrics_url.is_some() {
+        let solana_released = end_mints.saturating_sub(start_mints);
+        let solana_tps = solana_released as f64 / args.duration as f64;
+        let drop = contra_burned.saturating_sub(solana_released);
+        let drop_rate = if contra_burned > 0 {
+            drop as f64 / contra_burned as f64 * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            duration_secs = args.duration,
+            sent,
+            contra_burned,
+            solana_released,
+            drop,
+            drop_rate = format!("{drop_rate:.1}%"),
+            contra_tps = format!("{contra_tps:.1}"),
+            solana_tps = format!("{solana_tps:.1}"),
+            "Final summary (withdraw)",
+        );
+    } else {
+        info!(
+            duration_secs = args.duration,
+            sent,
+            contra_burned,
+            contra_tps = format!("{contra_tps:.1}"),
+            "Final summary (withdraw)",
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DerivePda subcommand
+// ---------------------------------------------------------------------------
+
+/// Derives and prints the escrow instance PDA for a given instance-seed keypair.
+///
+/// If the keypair file does not exist, a new keypair is generated and saved
+/// to the specified path before printing the PDA.  This lets run.sh use a
+/// single command to both create the keypair and read the PDA.
+fn run_derive_pda(args: DerivePdaArgs) -> Result<()> {
+    let keypair: Keypair = if args.instance_seed_keypair.exists() {
+        load_keypair(&args.instance_seed_keypair)
+            .map_err(|e| anyhow::anyhow!("failed to load instance-seed keypair: {e}"))?
+    } else {
+        let kp = Keypair::new();
+        let bytes = kp.to_bytes();
+        let json = serde_json::to_string(&bytes.to_vec())?;
+        write(&args.instance_seed_keypair, json)?;
+        kp
+    };
+
+    let (pda, _) = find_instance_pda(&keypair.pubkey());
+    println!("{pda}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn init_logging(log_level: &str) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
+        )
+        .init();
 }

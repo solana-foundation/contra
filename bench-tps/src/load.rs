@@ -22,7 +22,7 @@
 
 use {
     crate::{
-        bench_metrics::{BENCH_SENT_TOTAL, NO_LABELS},
+        bench_metrics::{BENCH_SENT_TOTAL, FLOW_TRANSFER},
         types::{BatchQueue, BenchConfig, BenchState, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT},
     },
     solana_sdk::{
@@ -73,12 +73,10 @@ fn build_transfer(
     )
     .unwrap();
 
-    // Memo carries the 8-byte little-endian encoding of `nonce` (= tx_seq).
-    // The memo program requires no accounts and accepts any byte sequence.
     let memo_ix = Instruction {
         program_id: MEMO_PROGRAM_ID,
         accounts: vec![],
-        data: nonce.to_le_bytes().to_vec(),
+        data: nonce.to_string().into_bytes(),
     };
 
     Transaction::new_signed_with_payer(
@@ -237,7 +235,7 @@ pub fn run_sender_thread(
         // trip time of one HTTP request, giving the generator time to pre-sign
         // the next batch while this one is in flight.
         for tx in &batch {
-            BENCH_SENT_TOTAL.with_label_values(&NO_LABELS).inc();
+            BENCH_SENT_TOTAL.with_label_values(&[FLOW_TRANSFER]).inc();
             match rpc.send_transaction(tx) {
                 Ok(_) => {}
                 Err(e) => warn!(err = %e, "sender: send_transaction failed"),

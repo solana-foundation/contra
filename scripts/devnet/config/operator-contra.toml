@@ -5,6 +5,9 @@
 program_type = "withdraw"
 # TODO: Add solana devnet rpc url
 rpc_url = "your_solana_devnet_rpc_url"
+# Contra gateway URL — operator-contra reads withdrawal events from the Contra write-node
+# TODO: Add devnet contra gateway url
+source_rpc_url = "your_devnet_gateway_url"
 # TODO: Add escrow instance id
 escrow_instance_id = "your_escrow_instance_id"
 

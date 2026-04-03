@@ -108,9 +108,9 @@ pub async fn start_contra_indexer(
     ))
 }
 
-/// Start the L1 indexer using RPC polling (no Yellowstone geyser required).
+/// Start the Solana indexer using RPC polling (no Yellowstone geyser required).
 /// Suitable for environments where the test validator has no geyser plugin.
-pub async fn start_l1_indexer_rpc_polling(
+pub async fn start_solana_indexer_rpc_polling(
     rpc_url: String,
     database_url: String,
     escrow_instance_id: Option<Pubkey>,
@@ -167,7 +167,7 @@ pub async fn start_l1_indexer_rpc_polling(
 
     let indexer_handle = tokio::spawn(async move {
         if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
-            eprintln!("L1 RPC-polling Indexer error: {}", e);
+            eprintln!("Solana RPC-polling Indexer error: {}", e);
         }
     });
 
@@ -181,8 +181,8 @@ pub async fn start_l1_indexer_rpc_polling(
     ))
 }
 
-/// Start the L1 indexer using Yellowstone geyser.
-pub async fn start_l1_indexer(
+/// Start the Solana indexer using Yellowstone geyser.
+pub async fn start_solana_indexer(
     geyser_endpoint: String,
     rpc_url: String,
     database_url: String,
@@ -246,7 +246,7 @@ pub async fn start_l1_indexer(
 
     let indexer_handle = tokio::spawn(async move {
         if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
-            eprintln!("L1 Indexer error: {}", e);
+            eprintln!("Solana Indexer error: {}", e);
         }
     });
 

@@ -125,6 +125,7 @@ pub async fn run_sender(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::storage::common::storage::mock::MockStorage;
     use crate::ContraIndexerConfig;
@@ -170,7 +171,7 @@ mod tests {
             cancellation_token,
             storage,
             3,
-            1000,
+            DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
         )
         .await;
@@ -203,7 +204,7 @@ mod tests {
             cancellation_token,
             storage,
             3,
-            1000,
+            DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
         )
         .await;

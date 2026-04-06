@@ -270,7 +270,16 @@ pub struct OperatorConfig {
     /// How often to check the feepayer SOL balance (escrow operators only)
     #[serde(default = "default_feepayer_monitor_interval")]
     pub feepayer_monitor_interval: std::time::Duration,
+    /// Milliseconds between `getSignatureStatuses` polls when confirming a sent transaction.
+    /// Lower values reduce per-tx latency on Contra (~100 ms); higher values suit Solana
+    /// (~400 ms block time). Defaults to `DEFAULT_CONFIRMATION_POLL_INTERVAL_MS`.
+    #[serde(default = "default_confirmation_poll_interval_ms")]
+    pub confirmation_poll_interval_ms: u64,
 }
+
+/// Default poll interval for `confirmation_poll_interval_ms`, matching Solana's ~400 ms block time.
+/// operator-solana overrides this to 100 ms since Contra confirms faster.
+pub const DEFAULT_CONFIRMATION_POLL_INTERVAL_MS: u64 = 400;
 
 fn default_reconciliation_interval() -> std::time::Duration {
     std::time::Duration::from_secs(5 * 60) // 5 minutes
@@ -282,6 +291,10 @@ fn default_reconciliation_tolerance() -> u16 {
 
 fn default_feepayer_monitor_interval() -> std::time::Duration {
     std::time::Duration::from_secs(60)
+}
+
+fn default_confirmation_poll_interval_ms() -> u64 {
+    DEFAULT_CONFIRMATION_POLL_INTERVAL_MS
 }
 
 impl OperatorConfig {

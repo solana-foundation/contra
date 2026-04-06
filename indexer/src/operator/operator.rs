@@ -115,6 +115,7 @@ pub async fn run(
             sender_token,
             sender_storage,
             config.retry_max_attempts,
+            config.confirmation_poll_interval_ms,
             sender_source_rpc,
         )
         .await

@@ -116,6 +116,7 @@ mod tests {
             reconciliation_tolerance_bps: 10,
             reconciliation_webhook_url: None,
             feepayer_monitor_interval: Duration::from_secs(60),
+            confirmation_poll_interval_ms: 400,
         }
     }
 

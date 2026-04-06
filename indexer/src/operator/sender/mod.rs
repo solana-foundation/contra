@@ -38,6 +38,7 @@ pub async fn run_sender(
     cancellation_token: tokio_util::sync::CancellationToken,
     storage: Arc<Storage>,
     retry_max_attempts: u32,
+    confirmation_poll_interval_ms: u64,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
@@ -53,6 +54,7 @@ pub async fn run_sender(
         instance_pda,
         storage,
         retry_max_attempts,
+        confirmation_poll_interval_ms,
         source_rpc_client,
     )?;
 
@@ -168,6 +170,7 @@ mod tests {
             cancellation_token,
             storage,
             3,
+            1000,
             None,
         )
         .await;
@@ -200,6 +203,7 @@ mod tests {
             cancellation_token,
             storage,
             3,
+            1000,
             None,
         )
         .await;

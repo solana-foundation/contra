@@ -29,6 +29,7 @@ impl SenderState {
         instance_pda: Option<Pubkey>,
         storage: Arc<Storage>,
         retry_max_attempts: u32,
+        confirmation_poll_interval_ms: u64,
         source_rpc_client: Option<Arc<RpcClientWithRetry>>,
     ) -> Result<Self, OperatorError> {
         // Initialize global RPC client with retry
@@ -52,6 +53,7 @@ impl SenderState {
             mint_cache,
             mint_builders: HashMap::new(),
             retry_max_attempts,
+            confirmation_poll_interval_ms,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: config.program_type,
@@ -349,6 +351,7 @@ mod tests {
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
@@ -801,6 +804,7 @@ mod tests {
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
@@ -849,7 +853,15 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let config = make_config();
 
-        let result = SenderState::new(&config, CommitmentLevel::Confirmed, None, storage, 3, None);
+        let result = SenderState::new(
+            &config,
+            CommitmentLevel::Confirmed,
+            None,
+            storage,
+            3,
+            400,
+            None,
+        );
 
         assert!(result.is_ok());
         let state = result.unwrap();
@@ -874,6 +886,7 @@ mod tests {
             Some(instance_pda),
             storage,
             5,
+            400,
             None,
         );
 

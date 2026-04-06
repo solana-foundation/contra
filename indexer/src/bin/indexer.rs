@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use contra_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
 use contra_indexer::{
     BackfillConfig, ContraIndexerConfig, DatasourceType, IndexerConfig, OperatorConfig,
     PostgresConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
@@ -96,6 +97,8 @@ struct OperatorSection {
     reconciliation_webhook_url: Option<String>,
     #[serde(default = "default_feepayer_monitor_interval_secs")]
     feepayer_monitor_interval_secs: u64,
+    #[serde(default = "default_confirmation_poll_interval_ms")]
+    confirmation_poll_interval_ms: u64,
 }
 
 fn default_reconciliation_interval_secs() -> u64 {
@@ -108,6 +111,10 @@ fn default_reconciliation_tolerance_bps() -> u16 {
 
 fn default_feepayer_monitor_interval_secs() -> u64 {
     60
+}
+
+fn default_confirmation_poll_interval_ms() -> u64 {
+    DEFAULT_CONFIRMATION_POLL_INTERVAL_MS
 }
 
 #[derive(Parser, Debug)]
@@ -401,6 +408,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
         reconciliation_webhook_url: operator.reconciliation_webhook_url,
         feepayer_monitor_interval: Duration::from_secs(operator.feepayer_monitor_interval_secs),
+        confirmation_poll_interval_ms: operator.confirmation_poll_interval_ms,
     };
 
     // Validate signer configuration early (from environment variables)

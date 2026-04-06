@@ -15,7 +15,6 @@ use solana_sdk::{
 use tracing::{debug, warn};
 
 const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
-const POLL_INTERVAL_MS_CONFIRMATION: u64 = 1000;
 
 /// Result of transaction confirmation
 #[derive(Debug, Clone)]
@@ -85,14 +84,16 @@ pub async fn sign_and_send_transaction(
     Ok(signature)
 }
 
-/// Check transaction status WITH polling
+/// Check transaction status with polling.
 ///
-/// Polls up to MAX_POLL_ATTEMPTS_CONFIRMATION times for transaction to land on-chain
+/// Polls up to `MAX_POLL_ATTEMPTS_CONFIRMATION` times, sleeping `poll_interval_ms` between
+/// each attempt. Pass `OperatorConfig::confirmation_poll_interval_ms` as the interval.
 pub async fn check_transaction_status(
     rpc_client: Arc<RpcClientWithRetry>,
     signature: &Signature,
     commitment_config: CommitmentConfig,
     extra_error_checks_policy: &ExtraErrorCheckPolicy,
+    poll_interval_ms: u64,
 ) -> Result<ConfirmationResult, TransactionError> {
     debug!("Checking transaction status: {}", signature);
 
@@ -133,10 +134,7 @@ pub async fn check_transaction_status(
 
         attempts += 1;
         if attempts < MAX_POLL_ATTEMPTS_CONFIRMATION {
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                POLL_INTERVAL_MS_CONFIRMATION,
-            ))
-            .await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
         }
     }
 
@@ -338,6 +336,7 @@ mod tests {
             &sig,
             CommitmentConfig::confirmed(),
             &ExtraErrorCheckPolicy::None,
+            400,
         )
         .await;
 
@@ -382,6 +381,7 @@ mod tests {
             &sig,
             CommitmentConfig::confirmed(),
             &ExtraErrorCheckPolicy::None,
+            400,
         )
         .await;
 
@@ -422,6 +422,7 @@ mod tests {
             &sig,
             CommitmentConfig::confirmed(),
             &ExtraErrorCheckPolicy::None,
+            400,
         )
         .await;
 

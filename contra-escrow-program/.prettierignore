@@ -8,6 +8,7 @@ clients/typescript/src/generated/
 dist/
 build/
 target/
+tests/fuzz/hfuzz_target/
 
 # Dependencies
 node_modules/

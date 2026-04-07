@@ -13,7 +13,7 @@ use tests_contra_escrow_program::{
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
     },
-    utils::{set_mint, set_token_balance, ATA_PROGRAM_ID, CONTRA_ESCROW_PROGRAM_ID, TestContext},
+    utils::{set_mint, set_token_balance, TestContext, ATA_PROGRAM_ID, CONTRA_ESCROW_PROGRAM_ID},
 };
 
 /// Data retained from a successful release so `DoubleSpend` can replay it.

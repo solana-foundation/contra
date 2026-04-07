@@ -36,16 +36,12 @@
 
 use arbitrary::Arbitrary;
 use contra_escrow_fuzz::{
-    build_release_ix, clamp_amount, clamp_nonce, setup_fuzz_context, FuzzContext,
-    SuccessfulRelease,
+    build_release_ix, clamp_amount, clamp_nonce, setup_fuzz_context, FuzzContext, SuccessfulRelease,
 };
 use honggfuzz::fuzz;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
-use tests_contra_escrow_program::{
-    state_utils::assert_get_or_deposit,
-    utils::get_token_balance,
-};
+use tests_contra_escrow_program::{state_utils::assert_get_or_deposit, utils::get_token_balance};
 
 // ── Fuzz input ───────────────────────────────────────────────────────────────
 
@@ -303,7 +299,11 @@ fn run_fuzz(input: FuzzInput, fuzz_context: &mut FuzzContext) {
                     )
                     .map(|_| ());
 
-                assert!(result.is_err(), "double-spend replay must fail: nonce={}", nonce);
+                assert!(
+                    result.is_err(),
+                    "double-spend replay must fail: nonce={}",
+                    nonce
+                );
 
                 // No tokens should have moved.
                 assert_eq!(

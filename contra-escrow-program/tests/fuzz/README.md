@@ -14,11 +14,10 @@ The integration tests cover correctness of individual instructions. These harnes
 
 ## Harnesses
 
-| Binary | What it covers |
-|---|---|
-| `fuzz_escrow` | Core deposit → release → double-spend lifecycle. Verifies that valid SMT proofs succeed, invalid/replayed proofs are rejected, and balances are conserved across all combinations. |
-| `fuzz_reset_smt` | SMT reset lifecycle. Verifies that nonces from a previous tree generation are permanently rejected after a reset, and that balances are conserved across any number of resets. |
-
+| Binary           | What it covers                                                                                                                                                                     |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fuzz_escrow`    | Core deposit → release → double-spend lifecycle. Verifies that valid SMT proofs succeed, invalid/replayed proofs are rejected, and balances are conserved across all combinations. |
+| `fuzz_reset_smt` | SMT reset lifecycle. Verifies that nonces from a previous tree generation are permanently rejected after a reset, and that balances are conserved across any number of resets.     |
 
 ## Prerequisites
 
@@ -43,11 +42,11 @@ HFUZZ_RUN_ARGS="-n 4 -t 30" cargo hfuzz run fuzz_reset_smt
 
 Useful flags:
 
-| Flag | Meaning |
-|---|---|
-| `-n <N>` | Number of threads |
-| `-t <S>` | Per-iteration timeout in seconds (default: 1 — too short for LiteSVM, use 30) |
-| `--exit_upon_crash` | Stop as soon as a crash is found |
+| Flag                | Meaning                                                                       |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `-n <N>`            | Number of threads                                                             |
+| `-t <S>`            | Per-iteration timeout in seconds (default: 1 — too short for LiteSVM, use 30) |
+| `--exit_upon_crash` | Stop as soon as a crash is found                                              |
 
 ## Debugging crashes
 
@@ -77,10 +76,10 @@ Replace `fuzz_reset_smt` with `fuzz_escrow` as needed. The full panic message an
 
 The program has two build modes:
 
-| Build | Feature | `MAX_TREE_LEAVES` | `TREE_HEIGHT` | Command |
-|---|---|---|---|---|
-| Production | _(none)_ | 65,536 | 16 | `make build` |
-| Test | `test-tree` | 8 | 3 | `make build-test` |
+| Build      | Feature     | `MAX_TREE_LEAVES` | `TREE_HEIGHT` | Command           |
+| ---------- | ----------- | ----------------- | ------------- | ----------------- |
+| Production | _(none)_    | 65,536            | 16            | `make build`      |
+| Test       | `test-tree` | 8                 | 3             | `make build-test` |
 
 The fuzz harnesses always assume the production binary. If `target/deploy/contra_escrow_program.so` was built with `make build-test`, nonces above 7 will hit `InvalidTransactionNonceForCurrentTreeIndex` (error 13) and the harness will panic.
 

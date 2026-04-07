@@ -189,7 +189,8 @@ jobs:
             --exclude contra-core \
             --exclude contra-integration \
             --exclude tests-contra-escrow-program \
-            --exclude tests-contra-withdraw-program
+            --exclude tests-contra-withdraw-program \
+            --exclude contra-escrow-fuzz
 
   fmt:
     name: Format
@@ -254,6 +255,7 @@ jobs:
             --exclude contra-integration \
             --exclude tests-contra-escrow-program \
             --exclude tests-contra-withdraw-program \
+            --exclude contra-escrow-fuzz \
             -- -D warnings
 
   integration-tests:

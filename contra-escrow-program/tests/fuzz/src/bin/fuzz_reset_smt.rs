@@ -18,9 +18,7 @@
 //! | `ReleaseStaleNonce` | Attempts a release with a nonce from the previous tree — must always fail.|
 
 use arbitrary::Arbitrary;
-use contra_escrow_fuzz::{
-    build_release_ix, clamp_amount, setup_fuzz_context, FuzzContext,
-};
+use contra_escrow_fuzz::{build_release_ix, clamp_amount, setup_fuzz_context, FuzzContext};
 use contra_escrow_program_client::instructions::ResetSmtRootBuilder;
 use honggfuzz::fuzz;
 use solana_sdk::signature::Signer;
@@ -62,9 +60,7 @@ fn clamp_nonce_offset(raw: u16) -> u64 {
 
 // ── Instruction builder ───────────────────────────────────────────────────────
 
-fn build_reset_ix(
-    ctx: &FuzzContext,
-) -> solana_sdk::instruction::Instruction {
+fn build_reset_ix(ctx: &FuzzContext) -> solana_sdk::instruction::Instruction {
     let (event_authority_pda, _) = find_event_authority_pda();
     ResetSmtRootBuilder::new()
         .payer(ctx.test_context.payer.pubkey())
@@ -118,7 +114,10 @@ fn run_fuzz(input: FuzzInput, ctx: &mut FuzzContext) {
             }
 
             // ── Release ───────────────────────────────────────────────────────
-            Op::Release { amount, nonce_offset } => {
+            Op::Release {
+                amount,
+                nonce_offset,
+            } => {
                 let release_amount = clamp_amount(amount);
                 // Nonces are partitioned by tree generation: generation N owns
                 // the range [N * MAX_TREE_LEAVES, (N+1) * MAX_TREE_LEAVES).
@@ -164,10 +163,12 @@ fn run_fuzz(input: FuzzInput, ctx: &mut FuzzContext) {
                         false,
                         Some(1_200_000),
                     )
-                    .unwrap_or_else(|e| panic!(
-                        "valid release must succeed: tree={} nonce={} amount={} err={e:?}",
-                        current_tree_index, nonce, release_amount
-                    ));
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "valid release must succeed: tree={} nonce={} amount={} err={e:?}",
+                            current_tree_index, nonce, release_amount
+                        )
+                    });
 
                 smt.insert(nonce);
                 total_released = total_released
@@ -207,8 +208,7 @@ fn run_fuzz(input: FuzzInput, ctx: &mut FuzzContext) {
 
                 let instance_balance_before =
                     get_token_balance(&mut ctx.test_context, &instance_ata);
-                let user_balance_before =
-                    get_token_balance(&mut ctx.test_context, &ctx.user_ata);
+                let user_balance_before = get_token_balance(&mut ctx.test_context, &ctx.user_ata);
 
                 let release_ix = build_release_ix(
                     &ctx.test_context,

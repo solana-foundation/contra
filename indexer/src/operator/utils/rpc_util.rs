@@ -1,7 +1,9 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_rpc_client_api::client_error;
+use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::config::RpcTransactionConfig;
+use solana_rpc_client_api::request::RpcError;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
@@ -37,6 +39,18 @@ impl Default for RetryConfig {
             max_delay: DEFAULT_MAX_DELAY,
         }
     }
+}
+
+/// Returns `true` for errors that will never succeed on retry.
+///
+/// `-32601` (Method not found) is a permanent protocol-level rejection; retrying
+/// wastes the full backoff budget without any chance of recovery.
+// TODO: remove once the RPC endpoint implements all required methods.
+fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
+    )
 }
 
 pub struct RpcClientWithRetry {
@@ -91,12 +105,15 @@ impl RpcClientWithRetry {
                     match f().await {
                         Ok(result) => return Ok(result),
                         Err(e) => {
-                            if attempts >= self.retry_config.max_attempts {
+                            let err: Box<client_error::Error> = e.into();
+                            if attempts >= self.retry_config.max_attempts
+                                || is_permanent_rpc_error(&err)
+                            {
                                 warn!(
                                     "{} failed after {} attempts: {}",
-                                    operation_name, attempts, e
+                                    operation_name, attempts, err
                                 );
-                                return Err(e.into());
+                                return Err(err);
                             }
 
                             let delay = self.retry_config.base_delay * 2_u32.pow(attempts - 1);

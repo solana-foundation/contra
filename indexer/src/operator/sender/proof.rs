@@ -229,6 +229,7 @@ mod tests {
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,

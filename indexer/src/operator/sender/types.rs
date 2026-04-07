@@ -46,6 +46,8 @@ pub struct SenderState {
     pub mint_builders: HashMap<i64, MintToBuilder>,
     pub mint_cache: MintCache,
     pub retry_max_attempts: u32,
+    /// Milliseconds between `getSignatureStatuses` polls. Populated from `OperatorConfig`.
+    pub confirmation_poll_interval_ms: u64,
     pub rotation_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
     /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
     pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,

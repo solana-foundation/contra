@@ -119,6 +119,7 @@ fn create_test_config(tolerance_bps: u16, webhook_url: Option<String>) -> Operat
         reconciliation_tolerance_bps: tolerance_bps,
         reconciliation_webhook_url: webhook_url,
         feepayer_monitor_interval: Duration::from_secs(60),
+        confirmation_poll_interval_ms: 400,
     }
 }
 

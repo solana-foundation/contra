@@ -14,8 +14,10 @@ type = "postgres"
 max_connections = 10
 
 [operator]
-poll_interval_secs = 5
-batch_size = 10
+poll_interval_secs = 1
+batch_size = 100
 retry_max_attempts = 3
 retry_base_delay_secs = 1
-channel_buffer_size = 100
+channel_buffer_size = 1000
+# Contra block time is ~100 ms; poll quickly to reduce per-mint latency
+confirmation_poll_interval_ms = 100

@@ -65,7 +65,8 @@ RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/i
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/clients/rust/src/lib.rs \
     core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs && \
-    printf 'fn main() {}\n' > bench-tps/src/main.rs
+    printf 'fn main() {}\n' > bench-tps/src/main.rs && \
+    printf 'fn main() {}\n' > auth/src/main.rs
 
 # Build the project with the dummy files. We can cache this layer.
 RUN cargo build --release

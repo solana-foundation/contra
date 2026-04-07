@@ -120,6 +120,7 @@ pub(super) async fn try_jit_mint_initialization(
         &sig,
         CommitmentConfig::confirmed(),
         &init_tx_builder.extra_error_checks_policy(),
+        state.confirmation_poll_interval_ms,
     )
     .await
     {

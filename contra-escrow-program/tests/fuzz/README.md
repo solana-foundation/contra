@@ -64,7 +64,7 @@ cd contra-escrow-program && make build
 
 ```
 cd contra-escrow-program/tests/fuzz
-export CRASH_FILE=$(ls hfuzz_workspace/fuzz_reset_smt/*.fuzz | head -1)
+export CRASH_FILE=$(ls -t hfuzz_workspace/fuzz_reset_smt/*.fuzz | head -1)
 RUST_BACKTRACE=1 cargo test --bin fuzz_reset_smt replay -- --nocapture
 ```
 

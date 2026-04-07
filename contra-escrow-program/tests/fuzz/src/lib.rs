@@ -34,8 +34,12 @@ pub struct FuzzContext {
     pub operator_pda: Pubkey,
     pub user_ata: Pubkey,
     /// Local mirror of the on-chain SMT; kept in sync after every successful release.
+    /// Used by `fuzz_escrow`. `fuzz_reset_smt` manages its own local SMT instead,
+    /// because it needs to reset the tree in lockstep with `Op::ResetSmtRoot`.
     pub smt: ProcessorSMT,
     /// Maps `nonce -> release data` for every release that succeeded on-chain.
+    /// Used by `fuzz_escrow` to drive double-spend replay attempts.
+    /// Unused by `fuzz_reset_smt`, which does not test double-spend scenarios.
     pub successful_releases: HashMap<u64, SuccessfulRelease>,
 }
 

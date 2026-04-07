@@ -264,6 +264,20 @@ fn run_fuzz(input: FuzzInput, ctx: &mut FuzzContext) {
         total_deposited,
         total_released
     );
+
+    let initial_user_balance: u64 = 10_000_000_000_000; // set in setup_fuzz_context
+    let expected_user = initial_user_balance
+        .checked_sub(total_deposited)
+        .and_then(|x| x.checked_add(total_released))
+        .expect("user balance model overflow/underflow");
+    assert_eq!(
+        get_token_balance(&mut ctx.test_context, &ctx.user_ata),
+        expected_user,
+        "user balance mismatch after {} resets: deposited={} released={}",
+        current_tree_index,
+        total_deposited,
+        total_released
+    );
 }
 
 #[cfg(test)]

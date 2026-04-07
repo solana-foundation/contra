@@ -8,6 +8,7 @@ honggfuzz = "0.5"
 arbitrary = { version = "1", features = ["derive"] }
 tests-contra-escrow-program = { path = "../integration-tests" }
 contra-escrow-program-client = { workspace = true }
+# Use LiteSVM compatible versions instead of workspace versions
 solana-sdk = "2.3.1"
 spl-token = "6.0.0"
 spl-associated-token-account = { version = "4.0.0", features = ["no-entrypoint"] }

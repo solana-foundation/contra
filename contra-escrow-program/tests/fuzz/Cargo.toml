@@ -12,6 +12,14 @@ solana-sdk = "2.3.1"
 spl-token = "6.0.0"
 spl-associated-token-account = { version = "4.0.0", features = ["no-entrypoint"] }
 
+[lib]
+name = "contra_escrow_fuzz"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fuzz_escrow"
 path = "src/bin/fuzz_escrow.rs"
+
+[[bin]]
+name = "fuzz_reset_smt"
+path = "src/bin/fuzz_reset_smt.rs"

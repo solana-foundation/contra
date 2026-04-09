@@ -55,6 +55,15 @@ impl AccountsDB {
         super::get_transaction::get_transaction(self, signature).await
     }
 
+    pub async fn get_signatures_for_address(
+        &self,
+        address: &Pubkey,
+        limit: usize,
+    ) -> Result<Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>>
+    {
+        super::get_signatures_for_address::get_signatures_for_address(self, address, limit).await
+    }
+
     pub async fn get_latest_slot(&self) -> Result<Option<u64>> {
         super::get_latest_slot::get_latest_slot(self).await
     }
@@ -426,6 +435,68 @@ mod tests {
 
         // latest blockhash was updated
         assert_eq!(db.get_latest_blockhash().await.unwrap(), bh);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_found() {
+        use crate::test_helpers::create_test_sanitized_transaction;
+        use solana_sdk::signature::{Keypair, Signer};
+        use solana_svm::account_loader::LoadedTransaction;
+        use solana_svm::transaction_execution_result::{
+            ExecutedTransaction, TransactionExecutionDetails,
+        };
+        use solana_svm::transaction_processing_result::ProcessedTransaction;
+        use std::collections::HashMap;
+
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let sig = *tx.signature();
+
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, 7, 1_700_000_000, &processed)],
+            Some(create_test_block_info(7, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .get_signatures_for_address(&from.pubkey(), 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].signature, sig.to_string());
+        assert_eq!(results[0].slot, 7);
+        assert!(results[0].err.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_empty() {
+        let (db, _pg) = start_test_postgres().await;
+        let results = db
+            .get_signatures_for_address(&Pubkey::new_unique(), 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

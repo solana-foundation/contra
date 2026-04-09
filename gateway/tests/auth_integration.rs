@@ -1010,3 +1010,138 @@ async fn test_empty_jwt_secret_disables_auth() {
         "empty JWT_SECRET should disable auth enforcement"
     );
 }
+
+/// `getSignaturesForAddress` with no token must return 401.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_no_token_returns_401() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let generic_response = json!({"jsonrpc":"2.0","id":1,"result":[]}).to_string();
+    let backend = start_mock_backend_with_body(generic_response).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["So11111111111111111111111111111111111111112"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 401);
+}
+
+/// `getSignaturesForAddress` with a User JWT for an address they own must be proxied.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_owned_wallet_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let pubkey = "So11111111111111111111111111111111111111112";
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    // The backend is called twice: first to fetch account data for ownership
+    // check (Phase 2), then to proxy the actual getSignaturesForAddress request.
+    let backend = start_mock_backend_with_body(system_account_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
+/// `getSignaturesForAddress` with a User JWT for an address they do not own must return 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_unowned_address_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let user_id = insert_user(&pool, "user").await;
+    let token = generate_token(user_id, "user");
+
+    // User has no registered wallets — ownership check will fail.
+    let backend = start_mock_backend_with_body(system_account_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["So11111111111111111111111111111111111111112"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
+/// `getSignaturesForAddress` with an Operator JWT must be proxied for any address.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_operator_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let operator_id = insert_user(&pool, "operator").await;
+    let token = generate_token(operator_id, "operator");
+
+    let generic_response = json!({"jsonrpc":"2.0","id":1,"result":[]}).to_string();
+    let backend = start_mock_backend_with_body(generic_response).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["So11111111111111111111111111111111111111112"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}

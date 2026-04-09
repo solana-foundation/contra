@@ -15,6 +15,7 @@ use {
             get_recent_blockhash_impl::get_recent_blockhash_impl,
             get_recent_performance_samples_impl::get_recent_performance_samples_impl,
             get_signature_statuses_impl::get_signature_statuses_impl,
+            get_signatures_for_address_impl::get_signatures_for_address_impl,
             get_slot_impl::get_slot_impl,
             get_slot_leaders_impl::get_slot_leaders_impl,
             get_supply_impl::get_supply_impl,
@@ -32,6 +33,7 @@ use {
     solana_account_decoder_client_types::{token::UiTokenAmount, UiAccount},
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
+    solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
     solana_rpc_client_types::{
         config::{
             RpcAccountInfoConfig, RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
@@ -221,6 +223,15 @@ impl ContraRpcServer for ContraRpcImpl {
     ) -> RpcResult<Response<bool>> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         is_blockhash_valid_impl(read_deps, blockhash, _config).await
+    }
+
+    async fn get_signatures_for_address(
+        &self,
+        address: String,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_signatures_for_address_impl(read_deps, address, config).await
     }
 
     async fn simulate_transaction(

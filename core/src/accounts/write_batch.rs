@@ -108,6 +108,21 @@ async fn write_batch_postgres(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to store transaction: {}", e))?;
+
+        // Index every account key in the transaction so getSignaturesForAddress can find it
+        for pubkey in transaction.message().account_keys().iter() {
+            let addr_bytes = pubkey.to_bytes();
+            sqlx::query(
+                "INSERT INTO address_signatures (address, slot, signature) VALUES ($1, $2, $3)
+                     ON CONFLICT DO NOTHING",
+            )
+            .bind(&addr_bytes[..])
+            .bind(tx_slot as i64)
+            .bind(sig_bytes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to store address signature: {}", e))?;
+        }
     }
 
     // Update transaction count

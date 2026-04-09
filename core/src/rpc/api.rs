@@ -2,6 +2,7 @@ use {
     jsonrpsee::{core::RpcResult, proc_macros::rpc},
     serde_json::Value,
     solana_account_decoder_client_types::{token::UiTokenAmount, UiAccount},
+    solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
     solana_rpc_client_types::{
         config::{
             RpcAccountInfoConfig, RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
@@ -145,6 +146,14 @@ pub trait ContraRpc {
         blockhash: String,
         config: Option<RpcContextConfig>,
     ) -> RpcResult<Response<bool>>;
+
+    /// Get signatures for a given address
+    #[method(name = "getSignaturesForAddress")]
+    async fn get_signatures_for_address(
+        &self,
+        address: String,
+        config: Option<serde_json::Value>,
+    ) -> RpcResult<Vec<RpcConfirmedTransactionStatusWithSignature>>;
 
     /// Simulate a transaction
     #[method(name = "simulateTransaction")]

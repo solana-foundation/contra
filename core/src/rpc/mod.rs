@@ -12,6 +12,7 @@ mod get_latest_blockhash_impl;
 mod get_recent_blockhash_impl;
 mod get_recent_performance_samples_impl;
 mod get_signature_statuses_impl;
+mod get_signatures_for_address_impl;
 mod get_slot_impl;
 mod get_slot_leaders_impl;
 mod get_supply_impl;
@@ -38,7 +39,12 @@ mod tests {
     use crate::accounts::{traits::BlockInfo, AccountsDB};
     use crate::test_helpers::create_test_sanitized_transaction;
     use solana_rpc_client_types::response::RpcPerfSample;
-    use solana_sdk::{account::AccountSharedData, hash::Hash, pubkey::Pubkey, signature::Keypair};
+    use solana_sdk::{
+        account::AccountSharedData,
+        hash::Hash,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+    };
     use solana_svm::account_loader::LoadedTransaction;
     use solana_svm::transaction_execution_result::{
         ExecutedTransaction, TransactionExecutionDetails,
@@ -587,6 +593,135 @@ mod tests {
         assert_eq!(resp.value.amount, "500000");
         assert_eq!(resp.value.decimals, 6);
         assert_eq!(resp.value.ui_amount_string, "0.5");
+    }
+
+    // ── get_signatures_for_address ────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_found() {
+        let (mut db, _pg) = start_pg().await;
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let sig = *tx.signature();
+        let processed = make_executed_tx(vec![]);
+
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, 5, 1_700_000_000, &processed)],
+            Some(make_block_info(5, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let deps = make_read_deps(db);
+        let sigs = get_signatures_for_address_impl::get_signatures_for_address_impl(
+            &deps,
+            from.pubkey().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].signature, sig.to_string());
+        assert_eq!(sigs[0].slot, 5);
+        assert!(sigs[0].err.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_empty() {
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+        let sigs = get_signatures_for_address_impl::get_signatures_for_address_impl(
+            &deps,
+            Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(sigs.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_invalid_address() {
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+        let result = get_signatures_for_address_impl::get_signatures_for_address_impl(
+            &deps,
+            "not_a_pubkey".to_string(),
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_limit() {
+        let (mut db, _pg) = start_pg().await;
+        let from = Keypair::new();
+        let processed = make_executed_tx(vec![]);
+
+        for slot in [1u64, 2, 3] {
+            let to = Pubkey::new_unique();
+            let tx = create_test_sanitized_transaction(&from, &to, slot);
+            let sig = *tx.signature();
+            db.write_batch(
+                &[],
+                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                Some(make_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        let deps = make_read_deps(db);
+        let config = serde_json::json!({ "limit": 2 });
+        let sigs = get_signatures_for_address_impl::get_signatures_for_address_impl(
+            &deps,
+            from.pubkey().to_string(),
+            Some(config),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sigs.len(), 2);
+        assert!(sigs[0].slot >= sigs[1].slot);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_newest_first() {
+        let (mut db, _pg) = start_pg().await;
+        let from = Keypair::new();
+        let processed = make_executed_tx(vec![]);
+
+        for slot in [10u64, 20, 30] {
+            let to = Pubkey::new_unique();
+            let tx = create_test_sanitized_transaction(&from, &to, slot);
+            let sig = *tx.signature();
+            db.write_batch(
+                &[],
+                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                Some(make_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        let deps = make_read_deps(db);
+        let sigs = get_signatures_for_address_impl::get_signatures_for_address_impl(
+            &deps,
+            from.pubkey().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sigs.len(), 3);
+        assert_eq!(sigs[0].slot, 30);
+        assert_eq!(sigs[1].slot, 20);
+        assert_eq!(sigs[2].slot, 10);
     }
 
     // ── rpc_impl ContraRpcImpl ────────────────────────────────────────────

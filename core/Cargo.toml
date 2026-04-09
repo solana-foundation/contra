@@ -40,6 +40,7 @@ solana-hash = { workspace = true }
 solana-loader-v3-interface = { workspace = true }
 solana-program-runtime = { workspace = true }
 solana-rent-collector = { workspace = true }
+solana-rpc-client-api = { workspace = true }
 solana-rpc-client-types = { workspace = true }
 solana-runtime-transaction = { workspace = true }
 solana-sdk = { workspace = true }

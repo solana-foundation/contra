@@ -13,6 +13,7 @@ pub mod get_first_available_block;
 pub mod get_latest_blockhash;
 pub mod get_latest_slot;
 pub mod get_recent_performance_samples;
+pub mod get_signatures_for_address;
 pub mod get_transaction;
 pub mod get_transaction_count;
 pub mod postgres;

@@ -149,6 +149,19 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS address_signatures (
+                address   BYTEA  NOT NULL,
+                slot      BIGINT NOT NULL,
+                signature BYTEA  NOT NULL,
+                PRIMARY KEY (address, slot, signature)
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("PostgreSQL tables initialized");
     Ok(())
 }

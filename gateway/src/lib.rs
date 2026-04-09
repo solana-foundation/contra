@@ -50,6 +50,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getSupply",
     "getSlotLeaders",
     "isBlockhashValid",
+    "getSignaturesForAddress",
     "simulateTransaction",
 ];
 

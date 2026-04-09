@@ -61,7 +61,11 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 /// JSON-RPC spec:
 ///   getAccountInfo:         params: [pubkey, {encoding, ...}]
 ///   getTokenAccountBalance: params: [pubkey]
-const ACCOUNT_GATED_METHODS: &[&str] = &["getAccountInfo", "getTokenAccountBalance"];
+const ACCOUNT_GATED_METHODS: &[&str] = &[
+    "getAccountInfo",
+    "getTokenAccountBalance",
+    "getSignaturesForAddress",
+];
 
 // ---------------------------------------------------------------------------
 // Token program IDs
@@ -521,6 +525,62 @@ mod tests {
             Some(&format!("Bearer {token}")),
             &decoding_key(),
             "getAccountInfo",
+            &json!([]),
+        );
+        assert!(matches!(
+            decision,
+            AuthDecision::Reject(StatusCode::BAD_REQUEST, _)
+        ));
+    }
+
+    #[test]
+    fn get_signatures_for_address_no_token_is_401() {
+        let decision = check_request_auth(
+            None,
+            &decoding_key(),
+            "getSignaturesForAddress",
+            &json!(["So11111111111111111111111111111111111111112"]),
+        );
+        assert!(matches!(
+            decision,
+            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
+        ));
+    }
+
+    #[test]
+    fn get_signatures_for_address_operator_proceeds() {
+        let token = forge_token(Role::Operator, 3600);
+        let decision = check_request_auth(
+            Some(&format!("Bearer {token}")),
+            &decoding_key(),
+            "getSignaturesForAddress",
+            &json!(["So11111111111111111111111111111111111111112"]),
+        );
+        assert!(matches!(decision, AuthDecision::Proceed));
+    }
+
+    #[test]
+    fn get_signatures_for_address_user_role_returns_needs_account_fetch() {
+        let token = forge_token(Role::User, 3600);
+        let decision = check_request_auth(
+            Some(&format!("Bearer {token}")),
+            &decoding_key(),
+            "getSignaturesForAddress",
+            &json!(["So11111111111111111111111111111111111111112"]),
+        );
+        assert!(matches!(
+            decision,
+            AuthDecision::NeedsAccountFetch { ref pubkey, .. } if pubkey == "So11111111111111111111111111111111111111112"
+        ));
+    }
+
+    #[test]
+    fn get_signatures_for_address_user_missing_pubkey_is_400() {
+        let token = forge_token(Role::User, 3600);
+        let decision = check_request_auth(
+            Some(&format!("Bearer {token}")),
+            &decoding_key(),
+            "getSignaturesForAddress",
             &json!([]),
         );
         assert!(matches!(

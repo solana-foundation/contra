@@ -7,11 +7,7 @@ use {
     solana_sdk::signature::Keypair,
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_test_validator::{TestValidator, TestValidatorGenesis, UpgradeableProgramInfo},
-    std::{
-        io::Write,
-        net::TcpListener,
-        path::PathBuf,
-    },
+    std::{io::Write, net::TcpListener, path::PathBuf},
 };
 
 fn get_free_port() -> u16 {

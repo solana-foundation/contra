@@ -17,10 +17,10 @@ use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info};
 
-use super::types::{InFlightQueue, SenderSMTState, SenderState};
+use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
     pub(super) fn new(
@@ -61,6 +61,7 @@ impl SenderState {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
     }
 
@@ -322,7 +323,6 @@ impl SenderState {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -361,6 +361,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -815,6 +816,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -900,4 +902,3 @@ mod tests {
         assert_eq!(state.retry_max_attempts, 5);
     }
 }
-

@@ -1,6 +1,6 @@
-use super::types::SenderState;
 #[cfg(test)]
 use super::types::InFlightQueue;
+use super::types::SenderState;
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
@@ -308,7 +308,9 @@ pub async fn process_pending_remints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::sender::types::{PendingRemint, SenderState, TransactionContext};
+    use crate::operator::sender::types::{
+        PendingRemint, SenderState, TransactionContext, MAX_IN_FLIGHT,
+    };
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
@@ -316,7 +318,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Once;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Semaphore};
 
     static INIT_TEST_SIGNER: Once = Once::new();
     fn ensure_test_signer() {
@@ -353,6 +355,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -397,6 +400,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 

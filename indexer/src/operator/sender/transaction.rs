@@ -17,7 +17,7 @@ use contra_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
@@ -191,17 +191,15 @@ pub async fn handle_transaction_submission(
                 // proof ordering requires at-most-one in-flight withdrawal at a time.
                 match &tx_builder {
                     TransactionBuilder::Mint(_) | TransactionBuilder::InitializeMint(_) => {
-                        fire_and_store(
+                        spawn_fire_and_store(
                             state,
                             instruction,
                             compute_unit_price,
                             ctx.clone(),
                             retry_policy,
                             extra_error_checks_policy,
-                            storage_tx,
-                            0,
-                        )
-                        .await;
+                            storage_tx.clone(),
+                        );
                     }
                     _ => {
                         send_and_confirm(
@@ -727,12 +725,13 @@ pub(super) async fn handle_permanent_failure(
 
 /// Sign, send, and store a Mint or InitializeMint tx in `state.in_flight`.
 ///
-/// The confirmation step is deferred: `poll_in_flight` checks all in-flight signatures
-/// on each timer tick via one batched `getSignatureStatuses` call, so the sender loop
-/// can accept new transactions immediately without waiting for confirmation.
+/// Called from the `route_poll_results` retry path where the caller already holds a
+/// semaphore permit (carried inside the timed-out `InFlightTx`).  The permit transfers
+/// to the new `InFlightTx` on success, or is dropped (slot released) on send failure.
 ///
-/// On send failure the tx routes directly to `handle_permanent_failure` — no signature
-/// means we can't safely check idempotency later, so the failure is declared permanent.
+/// New incoming transactions use `spawn_fire_and_store` instead, which acquires the
+/// permit and offloads the blocking send to a background task.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn fire_and_store(
     state: &mut SenderState,
     instruction: InstructionWithSigners,
@@ -742,24 +741,8 @@ pub(super) async fn fire_and_store(
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     resend_count: u32,
+    permit: OwnedSemaphorePermit,
 ) {
-    // Safety net: in normal operation the select! guard in run_sender prevents this
-    // branch from being reached for new incoming transactions.  It can still fire for
-    // idempotent retries emitted by route_poll_results.  Leave the DB status unchanged
-    // so the fetcher can re-emit the transaction on the next poll cycle — permanent
-    // failure here would silently lose deposits.
-    if state.in_flight.len() >= MAX_IN_FLIGHT {
-        metrics::OPERATOR_TRANSACTION_ERRORS
-            .with_label_values(&[state.program_type.as_label(), "in_flight_cap_exceeded"])
-            .inc();
-        warn!(
-            "In-flight cap ({MAX_IN_FLIGHT}) reached — skipping send for txn {:?}; \
-             DB status unchanged, will be re-fetched",
-            ctx.transaction_id,
-        );
-        return;
-    }
-
     let pt = state.program_type.as_label();
     let send_start = std::time::Instant::now();
 
@@ -781,9 +764,11 @@ pub(super) async fn fire_and_store(
                 extra_error_checks_policy,
                 poll_attempts: 0,
                 resend_count,
+                permit,
             });
         }
         Err(e) => {
+            drop(permit);
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, "error"])
                 .observe(send_start.elapsed().as_secs_f64());
@@ -794,6 +779,82 @@ pub(super) async fn fire_and_store(
             handle_permanent_failure(state, &ctx, storage_tx, &e.to_string()).await;
         }
     }
+}
+
+/// Acquire a semaphore permit and spawn a background task that signs and sends
+/// the transaction without blocking the sender loop's `recv` arm.
+///
+/// The permit is held from acquisition until the entry reaches a terminal state:
+///  - **Success**: permit moves into `InFlightTx` in `in_flight`; dropped when the
+///    poll task (or drain loop) confirms the tx.
+///  - **Send error**: permit dropped before reporting the failure to storage.
+///
+/// Returns `false` if the semaphore is already at `MAX_IN_FLIGHT` capacity.  The DB
+/// status is left unchanged so the fetcher re-emits the transaction on the next poll
+/// cycle.
+pub(super) fn spawn_fire_and_store(
+    state: &SenderState,
+    instruction: InstructionWithSigners,
+    compute_unit_price: Option<u64>,
+    ctx: TransactionContext,
+    retry_policy: RetryPolicy,
+    extra_error_checks_policy: ExtraErrorCheckPolicy,
+    storage_tx: mpsc::Sender<TransactionStatusUpdate>,
+) -> bool {
+    let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "in_flight_cap_exceeded"])
+                .inc();
+            warn!(
+                "In-flight cap ({MAX_IN_FLIGHT}) reached — skipping send for txn {:?}; \
+                 DB status unchanged, will be re-fetched",
+                ctx.transaction_id,
+            );
+            return false;
+        }
+    };
+
+    let rpc_client = state.rpc_client.clone();
+    let in_flight = state.in_flight.clone();
+    let program_type = state.program_type;
+
+    tokio::spawn(async move {
+        let send_start = std::time::Instant::now();
+        match sign_and_send_transaction(rpc_client, instruction.clone(), retry_policy).await {
+            Ok(signature) => {
+                metrics::OPERATOR_RPC_SEND_DURATION
+                    .with_label_values(&[program_type.as_label(), "in_flight"])
+                    .observe(send_start.elapsed().as_secs_f64());
+                info!("Transaction sent: {}", signature);
+                in_flight.push(InFlightTx {
+                    signature,
+                    ctx,
+                    instruction,
+                    compute_unit_price,
+                    retry_policy,
+                    extra_error_checks_policy,
+                    poll_attempts: 0,
+                    resend_count: 0,
+                    permit,
+                });
+            }
+            Err(e) => {
+                drop(permit);
+                metrics::OPERATOR_RPC_SEND_DURATION
+                    .with_label_values(&[program_type.as_label(), "error"])
+                    .observe(send_start.elapsed().as_secs_f64());
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), "rpc_send_error"])
+                    .inc();
+                error!("Failed to send transaction (fire-and-forget): {}", e);
+                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+            }
+        }
+    });
+
+    true
 }
 
 /// Route a batch of `(InFlightTx, Option<TransactionStatus>)` pairs returned by a
@@ -908,6 +969,7 @@ pub(super) async fn route_poll_results(
                                     tx.extra_error_checks_policy,
                                     storage_tx,
                                     next_resend,
+                                    tx.permit, // transfer permit to new InFlightTx
                                 )
                                 .await;
                             }
@@ -1080,7 +1142,7 @@ pub(super) async fn run_poll_task(
                     } else {
                         // ── Confirmed with on-chain error ─────────────────────────────
                         // Needs SenderState for error routing (cleanup, remint, etc.).
-                        results.push(PollTaskResult::NeedsRouting(tx, Some(status)));
+                        results.push(PollTaskResult::NeedsRouting(Box::new(tx), Some(status)));
                     }
                 }
                 _ => {
@@ -1091,7 +1153,7 @@ pub(super) async fn run_poll_task(
                     if tx.poll_attempts + 1 >= MAX_POLL_ATTEMPTS_CONFIRMATION {
                         // Do NOT increment here; route_poll_results will increment it
                         // to MAX and fire the timeout branch.
-                        results.push(PollTaskResult::NeedsRouting(tx, None));
+                        results.push(PollTaskResult::NeedsRouting(Box::new(tx), None));
                     } else {
                         tx.poll_attempts += 1;
                         in_flight.push(tx);
@@ -1151,6 +1213,7 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     fn dummy_instruction() -> InstructionWithSigners {
         InstructionWithSigners {
@@ -1187,6 +1250,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -1219,6 +1283,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -2062,6 +2127,7 @@ mod tests {
                 pending_signatures: HashMap::new(),
                 pending_remints: Vec::new(),
                 in_flight: InFlightQueue::new(),
+                semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             }
         };
 
@@ -2081,6 +2147,9 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             &storage_tx,
             0,
+            Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
         )
         .await;
 
@@ -2172,6 +2241,7 @@ mod tests {
                 pending_signatures: HashMap::new(),
                 pending_remints: Vec::new(),
                 in_flight: InFlightQueue::new(),
+                semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             }
         };
 
@@ -2191,6 +2261,9 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             &storage_tx,
             0,
+            Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
         )
         .await;
 
@@ -2224,6 +2297,9 @@ mod tests {
             extra_error_checks_policy: ExtraErrorCheckPolicy::None,
             poll_attempts: 0,
             resend_count: 0,
+            permit: Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
         }
     }
 
@@ -2290,6 +2366,7 @@ mod tests {
                 q.push(make_in_flight_tx(sig, 77));
                 q
             },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -2365,6 +2442,7 @@ mod tests {
                 q.push(make_in_flight_tx(sig, 88));
                 q
             },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -2436,6 +2514,7 @@ mod tests {
                 q.push(make_in_flight_tx(sig, 99));
                 q
             },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -2518,6 +2597,7 @@ mod tests {
                 q.push(tx);
                 q
             },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -2630,6 +2710,7 @@ mod tests {
                 q.push(make_in_flight_tx(sig2, 202));
                 q
             },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         };
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -2775,23 +2856,21 @@ mod tests {
         );
     }
 
-    // ── fire_and_store: cap exceeded ──────────────────────────────────
+    // ── spawn_fire_and_store: cap enforcement ─────────────────────────
 
-    /// When the in-flight queue is at MAX_IN_FLIGHT, fire_and_store must return
-    /// without emitting any storage update — DB stays unchanged so the fetcher
-    /// can re-emit the transaction on the next poll cycle.
+    /// When the semaphore is exhausted (all MAX_IN_FLIGHT slots occupied),
+    /// `spawn_fire_and_store` must return `false` without spawning any task
+    /// or emitting any storage update. DB status stays unchanged so the
+    /// fetcher can re-emit the transaction on the next poll cycle.
     #[tokio::test]
-    async fn fire_and_store_cap_exceeded_emits_no_storage_update() {
-        let mut state = make_sender_state();
+    async fn spawn_fire_and_store_cap_exhausted_returns_false() {
+        let state = make_sender_state();
 
-        // Fill the queue to the cap.
-        {
-            let mut entries = state.in_flight.entries.lock().unwrap();
-            for i in 0..MAX_IN_FLIGHT {
-                entries.push(make_in_flight_tx(Signature::new_unique(), i as i64));
-            }
-        }
-        assert_eq!(state.in_flight.len(), MAX_IN_FLIGHT);
+        // Hold all permits — simulates MAX_IN_FLIGHT tasks in-flight.
+        let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(state.semaphore.available_permits(), 0);
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         let ctx = TransactionContext {
@@ -2800,22 +2879,56 @@ mod tests {
             trace_id: None,
         };
 
-        fire_and_store(
-            &mut state,
+        let result = spawn_fire_and_store(
+            &state,
             dummy_instruction(),
             None,
             ctx,
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
-            &storage_tx,
-            0,
-        )
-        .await;
+            storage_tx,
+        );
 
-        // Queue must be unchanged — no new entry pushed.
-        assert_eq!(state.in_flight.len(), MAX_IN_FLIGHT);
-        // No storage update must have been emitted.
+        assert!(!result, "must return false when at capacity");
+        // Yield to ensure any erroneously spawned tasks have time to run.
+        tokio::task::yield_now().await;
         assert!(storage_rx.try_recv().is_err(), "no storage update expected");
+        // Queue stays empty — no entry pushed.
+        assert!(state.in_flight.is_empty());
+    }
+
+    /// When capacity is available, `spawn_fire_and_store` must return `true` and
+    /// the permit must be consumed immediately (before the RPC call completes),
+    /// so back-pressure is applied as soon as the task starts, not after it finishes.
+    #[tokio::test]
+    async fn spawn_fire_and_store_available_capacity_returns_true_and_consumes_permit() {
+        let state = make_sender_state();
+        assert_eq!(state.semaphore.available_permits(), MAX_IN_FLIGHT);
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let result = spawn_fire_and_store(
+            &state,
+            dummy_instruction(),
+            None,
+            TransactionContext {
+                transaction_id: Some(1),
+                withdrawal_nonce: None,
+                trace_id: None,
+            },
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+        );
+
+        assert!(result, "must return true when capacity is available");
+        // Permit must be consumed before spawn returns — regardless of whether
+        // the RPC call has completed yet.
+        assert_eq!(
+            state.semaphore.available_permits(),
+            MAX_IN_FLIGHT - 1,
+            "one permit must be held by the spawned task"
+        );
     }
 
     // ── run_poll_task: cancellation ───────────────────────────────────

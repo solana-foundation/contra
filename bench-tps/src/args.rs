@@ -193,7 +193,7 @@ pub struct DepositArgs {
     #[arg(
         long,
         default_value = "http://localhost:8898",
-        env = "BENCH_RPC_URL"
+        env = "BENCH_CONTRA_RPC_URL"
     )]
     pub contra_rpc_url: String,
 

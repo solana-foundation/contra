@@ -13,6 +13,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Maximum number of fire-and-forget transactions allowed in-flight simultaneously.
 /// New sends are rejected with a permanent failure once this cap is reached,
@@ -27,14 +28,14 @@ pub const MAX_IN_FLIGHT: usize = 1000;
 /// never busy-loops when the queue is empty.
 pub struct InFlightQueue {
     pub entries: std::sync::Mutex<Vec<InFlightTx>>,
-    pub notify:  tokio::sync::Notify,
+    pub notify: tokio::sync::Notify,
 }
 
 impl InFlightQueue {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             entries: std::sync::Mutex::new(Vec::with_capacity(MAX_IN_FLIGHT)),
-            notify:  tokio::sync::Notify::new(),
+            notify: tokio::sync::Notify::new(),
         })
     }
 
@@ -126,6 +127,13 @@ pub struct InFlightTx {
     /// before each re-send; once the cap is reached even an Idempotent tx is
     /// declared a permanent failure rather than looping forever.
     pub resend_count: u32,
+    /// Semaphore permit held for the lifetime of this entry.
+    ///
+    /// Acquired before spawning the send task; dropped when the entry is removed
+    /// from the queue (on confirmation, permanent failure, or transfer to a retry).
+    /// This is the sole mechanism that enforces `MAX_IN_FLIGHT` across both
+    /// in-flight entries and send tasks that have not yet pushed to the queue.
+    pub permit: OwnedSemaphorePermit,
 }
 
 /// Sender state tracking SMT and pending transactions
@@ -154,6 +162,12 @@ pub struct SenderState {
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.
     /// Shared with the dedicated poll task via `Arc`; capped at `MAX_IN_FLIGHT`.
     pub in_flight: Arc<InFlightQueue>,
+    /// Enforces the `MAX_IN_FLIGHT` cap across both entries in `in_flight` and
+    /// in-progress spawned send tasks.  A permit is acquired before spawning a
+    /// send task and released only when the entry reaches a terminal state
+    /// (confirmed, permanent failure, or transfer to a retry), so
+    /// `available_permits()` accurately reflects remaining capacity at all times.
+    pub semaphore: Arc<Semaphore>,
 }
 
 /// A remint deferred until Solana finality window passes, allowing us to verify
@@ -186,7 +200,10 @@ pub enum PollTaskResult {
     ConfirmedSuccess(Option<i64>),
     /// Needs routing via `SenderState` — either an on-chain error was returned
     /// or the entry timed out.  `None` status means timeout (not an RPC null).
-    NeedsRouting(InFlightTx, Option<solana_transaction_status::TransactionStatus>),
+    NeedsRouting(
+        Box<InFlightTx>,
+        Option<solana_transaction_status::TransactionStatus>,
+    ),
 }
 
 pub struct SenderSMTState {

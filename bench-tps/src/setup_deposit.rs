@@ -6,9 +6,9 @@
 //!   3. Creates the escrow instance on Solana (CreateInstance instruction).
 //!   4. Generates N fresh depositor keypairs.
 //!   5. Funds each depositor with SOL (via transfer from admin).
-//!   6. Creates a fresh Solana SPL mint (admin is mint authority).
-//!  6b. Initialises the same mint on **Contra** so the operator can mint
-//!      immediately without JIT initialisation.
+//!   6. Creates a fresh Solana SPL mint (admin is mint authority) and
+//!      initialises it on **Contra** so the operator can mint immediately
+//!      without JIT initialisation.
 //!   7. Calls AllowMint — registers the mint with the instance, creating both
 //!      the allowed_mint PDA and the instance ATA on Solana.
 //!   8. Creates Solana ATAs for each depositor.

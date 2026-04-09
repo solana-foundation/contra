@@ -211,7 +211,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::operator::sender::types::MAX_IN_FLIGHT;
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+    use tokio::sync::Semaphore;
 
     /// Build a minimal SenderState for testing (no RPC needed)
     fn make_sender_state() -> SenderState {
@@ -239,6 +241,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 

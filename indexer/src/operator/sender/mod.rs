@@ -25,7 +25,7 @@ use proof::take_pending_rotation_if_ready;
 use transaction::{
     handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
 };
-use types::{PollTaskResult, SenderState, MAX_IN_FLIGHT};
+use types::{PollTaskResult, SenderState};
 
 /// Sends transactions to the blockchain and updates their status
 ///
@@ -102,9 +102,13 @@ pub async fn run_sender(
                     drained_count += 1;
                 }
                 info!("Sender drained {} new transactions from channel", drained_count);
-                // Wait for any fire-and-forget txs to confirm before exiting.
-                // The poll task has already been cancelled; drain_in_flight calls
-                // poll_in_flight directly (single-cycle, no dedicated task needed).
+                // Stop the poll task before draining so it no longer races with
+                // drain_in_flight over state.in_flight entries.  Any NeedsRouting
+                // results it may have queued in poll_result_rx are discarded — those
+                // transactions remain in Processing and are recovered on restart.
+                poll_shutdown.cancel();
+                drop(poll_result_rx);
+                let _ = poll_task_handle.await;
                 drain_in_flight(&mut state, &storage_tx).await;
                 break;
             }
@@ -127,7 +131,7 @@ pub async fn run_sender(
                             }
                         }
                         PollTaskResult::NeedsRouting(tx, status) => {
-                            to_route.push((tx, status));
+                            to_route.push((*tx, status));
                         }
                     }
                 }
@@ -171,31 +175,32 @@ pub async fn run_sender(
             }
 
             // Back-pressure: stop consuming new transactions when in_flight is full.
+            // `available_permits()` reflects both in-flight entries AND spawned send
+            // tasks that have not yet pushed to the queue, so this guard is tight.
             // The channel fills up → processor blocks → fetcher stops polling the DB.
-            // Resumes automatically once the poll task confirms entries and drains the queue.
-            tx_builder = processor_rx.recv(), if state.in_flight.len() < MAX_IN_FLIGHT => {
+            // Resumes automatically once the poll task confirms entries and permits are returned.
+            tx_builder = processor_rx.recv(), if state.semaphore.available_permits() > 0 => {
                 if let Some(tx_builder) = tx_builder {
-                    let in_flight_len = state.in_flight.len();
                     debug!(
-                        in_flight = in_flight_len,
+                        in_flight = state.in_flight.len(),
+                        available_permits = state.semaphore.available_permits(),
                         processor_channel_capacity = processor_rx.len(),
                         "Sender received transaction from processor"
                     );
                     handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
                 } else {
                     info!("Sender channel closed");
-                    // Wait for any fire-and-forget txs to confirm before exiting.
+                    // Stop the poll task before draining (same reasoning as the
+                    // cancellation path above — prevent races over in_flight).
+                    poll_shutdown.cancel();
+                    drop(poll_result_rx);
+                    let _ = poll_task_handle.await;
                     drain_in_flight(&mut state, &storage_tx).await;
                     break;
                 }
             }
         }
     }
-
-    // Shut down the poll task regardless of which exit path fired.
-    poll_shutdown.cancel();
-    drop(poll_result_rx);
-    let _ = poll_task_handle.await;
 
     info!("Sender stopped gracefully");
     Ok(())
@@ -254,6 +259,7 @@ mod tests {
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::sender::types::{
         InFlightQueue, InFlightTx, InstructionWithSigners, SenderState, TransactionContext,
+        MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy};
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
@@ -266,7 +272,7 @@ mod tests {
     use solana_sdk::signature::Signature;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Semaphore};
     use tokio_util::sync::CancellationToken;
 
     fn make_sender_state(rpc_url: &str) -> SenderState {
@@ -297,6 +303,7 @@ mod tests {
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -320,6 +327,9 @@ mod tests {
             extra_error_checks_policy: ExtraErrorCheckPolicy::None,
             poll_attempts: 0,
             resend_count: 0,
+            permit: Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
         }
     }
 

@@ -3,14 +3,13 @@ use {
     contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
     solana_address::Address,
     solana_client::rpc_client::RpcClient,
-    solana_net_utils::{find_available_port_in_range, sockets::unique_port_range_for_tests},
     solana_rpc::rpc::JsonRpcConfig,
     solana_sdk::signature::Keypair,
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_test_validator::{TestValidator, TestValidatorGenesis, UpgradeableProgramInfo},
     std::{
         io::Write,
-        net::{IpAddr, Ipv4Addr, TcpListener},
+        net::TcpListener,
         path::PathBuf,
     },
 };
@@ -59,24 +58,11 @@ fn make_program_info(program_id_bytes: [u8; 32], program_path: &str) -> Upgradea
 /// Start the solana-test-validator on free ports with geyser plugin enabled.
 /// Returns the test validator instance, the mint keypair, and the geyser port.
 pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
-    // `unique_port_range_for_tests` uses a process-global AtomicU16 to hand out
-    // non-overlapping 200-port blocks.  Under nextest each test is its own process
-    // so the atomic always starts at 0 and the NEXTEST_TEST_GLOBAL_SLOT env var
-    // (set by nextest) provides per-worker isolation.  Under plain `cargo test`
-    // all tests share one process; the non-nextest path of the function simply
-    // increments the atomic, giving each concurrent test a distinct block
-    // (2000–2200, 2200–2400, …) without any per-slot cap.  Do NOT force-set
-    // NEXTEST_TEST_GLOBAL_SLOT here: doing so switches the function into the
-    // nextest path which has a 990-port-per-process cap, causing the
-    // "Overrunning into the port range" panic when more than ~4 tests run in
-    // parallel within the same process.
-    let port_range = unique_port_range_for_tests(200);
-    let port_range = (port_range.start, port_range.end);
-    // Find the first available TCP port within our allocated range for the RPC server.
-    let rpc_port = find_available_port_in_range(IpAddr::V4(Ipv4Addr::LOCALHOST), port_range)
-        .expect("Failed to find available RPC port in range");
-    // gossip_port=0 lets the OS pick a port; port_range below constrains all other validator
-    // sockets (TPU, TVU, …) to the same allocated block, keeping them off other tests' ranges.
+    // Bind to port 0 and let the OS pick a free port for RPC and geyser.
+    // Concurrent validators (nextest runs each test in its own process) never
+    // collide: the kernel assigns OS-level sockets atomically.
+    // All other validator sockets (gossip, TPU, TVU) use port=0 as well.
+    let rpc_port = get_free_port();
     let gossip_port = 0u16;
     let geyser_port = get_free_port();
 
@@ -118,9 +104,6 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
             .rpc_config(rpc_config)
             .rpc_port(rpc_port)
             .gossip_port(gossip_port)
-            // Constrain all validator sockets to the allocated range so parallel validators
-            // stay within their own non-overlapping port blocks.
-            .port_range(port_range)
             .add_upgradeable_programs_with_path(&[escrow_program, withdraw_program])
             .start()
     })
@@ -152,11 +135,8 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
 /// Start the solana-test-validator without the geyser plugin enabled.
 /// Returns the test validator instance and the mint keypair.
 pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
-    // Same port-isolation strategy as start_test_validator — see the comment there.
-    let port_range = unique_port_range_for_tests(200);
-    let port_range = (port_range.start, port_range.end);
-    let rpc_port = find_available_port_in_range(IpAddr::V4(Ipv4Addr::LOCALHOST), port_range)
-        .expect("Failed to find available RPC port in range");
+    // Same port strategy as start_test_validator — see the comment there.
+    let rpc_port = get_free_port();
     let gossip_port = 0u16;
 
     let rpc_config = JsonRpcConfig {
@@ -180,9 +160,6 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
             .rpc_config(rpc_config)
             .rpc_port(rpc_port)
             .gossip_port(gossip_port)
-            // Constrain all validator sockets to the allocated range so parallel validators
-            // stay within their own non-overlapping port blocks.
-            .port_range(port_range)
             .add_upgradeable_programs_with_path(&[escrow_program, withdraw_program])
             .start()
     })

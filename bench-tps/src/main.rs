@@ -247,6 +247,7 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
 
     let deposit_config = setup_deposit::run_setup_deposit_phase(
         &args.solana_rpc_url,
+        &args.contra_rpc_url,
         &args.admin_keypair,
         args.instance_seed_keypair.as_deref(),
         args.accounts,

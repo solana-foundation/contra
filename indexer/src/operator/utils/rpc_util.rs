@@ -42,15 +42,18 @@ impl Default for RetryConfig {
 }
 
 /// Returns `true` for errors that will never succeed on retry.
-///
-/// `-32601` (Method not found) is a permanent protocol-level rejection; retrying
-/// wastes the full backoff budget without any chance of recovery.
-// TODO: remove once the RPC endpoint implements all required methods.
+// TODO: remove -32601 check once the RPC endpoint implements all required methods.
 fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
-    )
+    let ErrorKind::RpcError(rpc_err) = e.kind() else {
+        return false;
+    };
+    match rpc_err {
+        // Method not supported by this RPC endpoint — protocol-level rejection.
+        RpcError::RpcResponseError { code: -32601, .. } => true,
+        // "AccountNotFound" is a definitive answer, not a transient failure.
+        RpcError::ForUser(msg) => msg.contains("AccountNotFound"),
+        _ => false,
+    }
 }
 
 pub struct RpcClientWithRetry {
@@ -404,5 +407,151 @@ mod tests {
         // Should complete quickly because max_delay clamps the large base_delay
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    fn make_client_fast() -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig {
+                max_attempts: 5,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    fn rpc_method_not_found() -> client_error::Error {
+        client_error::Error::new_with_request(
+            client_error::ErrorKind::RpcError(RpcError::RpcResponseError {
+                code: -32601,
+                message: "Method not found".to_string(),
+                data: solana_rpc_client_api::request::RpcResponseErrorData::Empty,
+            }),
+            solana_rpc_client_api::request::RpcRequest::GetBalance,
+        )
+    }
+
+    fn rpc_account_not_found() -> client_error::Error {
+        client_error::Error::new_with_request(
+            client_error::ErrorKind::RpcError(RpcError::ForUser(
+                "AccountNotFound: pubkey=So11111111111111111111111111111111111111112".to_string(),
+            )),
+            solana_rpc_client_api::request::RpcRequest::GetAccountInfo,
+        )
+    }
+
+    fn rpc_transient() -> client_error::Error {
+        client_error::Error::new_with_request(
+            client_error::ErrorKind::RpcError(RpcError::ForUser("NodeUnhealthy".to_string())),
+            solana_rpc_client_api::request::RpcRequest::GetBalance,
+        )
+    }
+
+    /// -32601 (Method not found) must abort on the first attempt — no retries.
+    #[tokio::test]
+    async fn permanent_error_method_not_found_stops_immediately() {
+        let client = make_client_fast();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, client_error::Error>(rpc_method_not_found())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "-32601 must not be retried"
+        );
+    }
+
+    /// AccountNotFound is a definitive answer — must abort on the first attempt.
+    #[tokio::test]
+    async fn permanent_error_account_not_found_stops_immediately() {
+        let client = make_client_fast();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, client_error::Error>(rpc_account_not_found())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "AccountNotFound must not be retried"
+        );
+    }
+
+    /// Transient RPC errors (e.g. NodeUnhealthy) must be retried up to max_attempts.
+    #[tokio::test]
+    async fn transient_rpc_error_is_retried() {
+        let client = make_client_fast();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, client_error::Error>(rpc_transient())
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            5,
+            "transient error must be retried to max_attempts"
+        );
+    }
+
+    /// ForUser message that mentions AccountNotFound only as a substring of a larger word
+    /// must NOT be treated as permanent — only exact "AccountNotFound" prefix matches.
+    #[tokio::test]
+    async fn for_user_error_unrelated_message_is_retried() {
+        let client = make_client_fast();
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc = call_count.clone();
+
+        // Message does not contain "AccountNotFound"
+        let result: Result<u32, Box<client_error::Error>> = client
+            .with_retry("op", RetryPolicy::Idempotent, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<u32, client_error::Error>(client_error::Error::new_with_request(
+                        client_error::ErrorKind::RpcError(RpcError::ForUser(
+                            "BlockNotFound".to_string(),
+                        )),
+                        solana_rpc_client_api::request::RpcRequest::GetBalance,
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            5,
+            "unrelated ForUser error must be retried"
+        );
     }
 }

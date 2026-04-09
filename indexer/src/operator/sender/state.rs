@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use super::types::{SenderSMTState, SenderState};
+use super::types::{InFlightQueue, SenderSMTState, SenderState};
 
 impl SenderState {
     pub(super) fn new(
@@ -60,6 +60,7 @@ impl SenderState {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
         })
     }
 
@@ -291,7 +292,7 @@ impl SenderState {
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
-                trace_id: tx.trace_id,
+                trace_id: tx.trace_id.clone(),
                 mint,
                 user,
                 user_ata,
@@ -321,6 +322,7 @@ impl SenderState {
 
         Ok(())
     }
+
 }
 
 #[cfg(test)]
@@ -358,6 +360,7 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
         }
     }
 
@@ -811,6 +814,7 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
         }
     }
 
@@ -896,3 +900,4 @@ mod tests {
         assert_eq!(state.retry_max_attempts, 5);
     }
 }
+

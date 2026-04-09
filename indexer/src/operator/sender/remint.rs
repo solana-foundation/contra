@@ -1,4 +1,6 @@
 use super::types::SenderState;
+#[cfg(test)]
+use super::types::InFlightQueue;
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
@@ -350,6 +352,7 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
         }
     }
 
@@ -393,6 +396,7 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
         }
     }
 

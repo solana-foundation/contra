@@ -1,12 +1,14 @@
-//! Deposit setup phase — Solana escrow preparation.
+//! Deposit setup phase — Solana escrow + Contra mint preparation.
 //!
-//! Prepares all Solana on-chain state the deposit load phase needs:
+//! Prepares all on-chain state the deposit load phase needs:
 //!   1. Loads the admin keypair from disk.
 //!   2. Generates a fresh instance-seed keypair and derives the escrow instance PDA.
 //!   3. Creates the escrow instance on Solana (CreateInstance instruction).
 //!   4. Generates N fresh depositor keypairs.
 //!   5. Funds each depositor with SOL (via transfer from admin).
 //!   6. Creates a fresh Solana SPL mint (admin is mint authority).
+//!  6b. Initialises the same mint on **Contra** so the operator can mint
+//!      immediately without JIT initialisation.
 //!   7. Calls AllowMint — registers the mint with the instance, creating both
 //!      the allowed_mint PDA and the instance ATA on Solana.
 //!   8. Creates Solana ATAs for each depositor.
@@ -22,7 +24,9 @@ use {
         types::{BenchState, DepositConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
-    contra_core::client::{create_admin_mint_to, create_ata_transaction},
+    contra_core::client::{
+        create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction,
+    },
     contra_escrow_program_client::{
         instructions::{
             AllowMint, AllowMintInstructionArgs, CreateInstance, CreateInstanceInstructionArgs,
@@ -78,18 +82,20 @@ fn find_event_authority() -> (Pubkey, u8) {
     Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID)
 }
 
-/// Run all Solana deposit setup tasks and return the `DepositConfig` needed by
-/// the deposit load phase.
+/// Run all deposit setup tasks and return the `DepositConfig` needed by the
+/// deposit load phase.
 ///
-/// `solana_rpc_url`         — Solana validator RPC endpoint
-/// `admin_path`            — path to the admin keypair JSON file
-/// `instance_seed_path`    — optional path to save/load the instance-seed keypair;
-///                           when `Some`, the keypair (and thus instance PDA) is
-///                           reused across runs so the indexer can track it.
-/// `num_accounts`          — number of depositor accounts to create
-/// `initial_balance`       — raw token units minted to each depositor ATA
+/// `solana_rpc_url`  — Solana validator RPC endpoint
+/// `contra_rpc_url`  — Contra gateway / write-node RPC endpoint
+/// `admin_path`      — path to the admin keypair JSON file
+/// `instance_seed_path` — optional path to save/load the instance-seed keypair;
+///                        when `Some`, the keypair (and thus instance PDA) is
+///                        reused across runs so the indexer can track it.
+/// `num_accounts`    — number of depositor accounts to create
+/// `initial_balance` — raw token units minted to each depositor ATA
 pub async fn run_setup_deposit_phase(
     solana_rpc_url: &str,
+    contra_rpc_url: &str,
     admin_path: &Path,
     instance_seed_path: Option<&Path>,
     num_accounts: usize,
@@ -340,11 +346,9 @@ pub async fn run_setup_deposit_phase(
     // ------------------------------------------------------------------
     // Task 6: Create and initialise Solana SPL mint
     //
-    // On a real Solana validator (Solana) the mint account must be explicitly
-    // allocated via system_program::create_account before SPL token's
-    // initialize_mint can write into it.  The Contra write-node creates
-    // accounts implicitly (gasless), so create_admin_initialize_mint in
-    // core only sends initialize_mint and works on Contra but not Solana.
+    // On Solana the mint account must be explicitly allocated via
+    // system_program::create_account before SPL token's initialize_mint
+    // can write into it.
     // ------------------------------------------------------------------
     let t6 = Instant::now();
     let mint_keypair = Keypair::new();
@@ -407,6 +411,68 @@ pub async fn run_setup_deposit_phase(
         ));
     }
     info!(%mint, elapsed_ms = t6.elapsed().as_millis(), "Solana mint initialized");
+
+    // ------------------------------------------------------------------
+    // Task 6b: Initialise the same mint on Contra
+    //
+    // The Contra write-node creates accounts implicitly (gasless), so
+    // create_admin_initialize_mint only sends the initialize_mint
+    // instruction — no preceding create_account is needed.
+    //
+    // Without this step the operator would attempt JIT initialisation for
+    // every first deposit, blocking the sender loop ~200 ms each time.
+    // ------------------------------------------------------------------
+    let t6b = Instant::now();
+    let contra_rpc =
+        RpcClient::new_with_commitment(contra_rpc_url.to_string(), CommitmentConfig::confirmed());
+    let contra_mint_sig = 'send: {
+        let mut last_err = String::new();
+        for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
+            match contra_rpc.get_latest_blockhash().await {
+                Err(e) => {
+                    warn!(attempt, err = %e,
+                        "get_latest_blockhash failed (Contra mint init), retrying in {delay_secs}s");
+                    last_err = e.to_string();
+                }
+                Ok(blockhash) => {
+                    let init_tx = create_admin_initialize_mint(
+                        &admin_keypair,
+                        &mint,
+                        MINT_DECIMALS,
+                        blockhash,
+                    );
+                    match contra_rpc.send_transaction(&init_tx).await {
+                        Ok(sig) => break 'send sig,
+                        Err(e) => {
+                            warn!(attempt, err = %e,
+                                "Contra initialize_mint send failed, retrying in {delay_secs}s");
+                            last_err = e.to_string();
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        }
+        return Err(anyhow::anyhow!(
+            "Contra initialize_mint: all retries exhausted: {last_err}"
+        ));
+    };
+    let retry = poll_confirmations(
+        &contra_rpc,
+        &[Some(contra_mint_sig)],
+        "initialize_mint(contra)",
+        0,
+        1,
+    )
+    .await?;
+    if !retry.is_empty() {
+        return Err(anyhow::anyhow!("Contra initialize_mint failed to confirm"));
+    }
+    info!(
+        %mint,
+        elapsed_ms = t6b.elapsed().as_millis(),
+        "Contra mint initialized",
+    );
 
     // ------------------------------------------------------------------
     // Task 7: AllowMint — register the mint with the escrow instance

@@ -21,6 +21,9 @@ pub async fn run(
     info!("Starting Contra Operator");
     info!("Program: {:?}", common_config.program_type);
     info!("Poll interval: {:?}", config.db_poll_interval);
+    info!("Batch size: {}", config.batch_size);
+    info!("Channel buffer size: {}", config.channel_buffer_size);
+    info!("Confirmation poll interval: {}ms", config.confirmation_poll_interval_ms);
     info!("Retry max attempts: {}", config.retry_max_attempts);
 
     let cancellation_token = CancellationToken::new();

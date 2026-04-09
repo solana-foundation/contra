@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, info_span, Instrument};
+use tracing::{debug, info, info_span, Instrument};
 
 pub struct ProcessorState {
     pub admin_pubkey: Pubkey,
@@ -275,6 +275,7 @@ pub async fn process_deposit_funds(
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
         async {
+            let proc_t0 = tokio::time::Instant::now();
             let mint =
                 Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
                     pubkey: transaction.mint.clone(),
@@ -303,7 +304,8 @@ pub async fn process_deposit_funds(
                 .amount(transaction.amount as u64)
                 .idempotency_memo(mint_idempotency_memo(transaction.id));
 
-            info!("Processing deposit");
+            let proc_elapsed_ms = proc_t0.elapsed().as_millis();
+            info!(proc_elapsed_ms, "Processing deposit");
 
             let wrapped = TransactionBuilder::Mint(Box::new(MintToBuilderWithTxnId {
                 builder,
@@ -311,9 +313,19 @@ pub async fn process_deposit_funds(
                 trace_id: transaction.trace_id.clone(),
             }));
 
+            let send_t0 = tokio::time::Instant::now();
             send_guaranteed(&sender_tx, wrapped, "processed deposit")
                 .await
                 .map_err(OperatorError::ChannelSend)?;
+            let send_elapsed_ms = send_t0.elapsed().as_millis();
+            // Any wait >1ms means the sender channel is full — sender is the bottleneck.
+            if send_elapsed_ms > 1 {
+                debug!(
+                    send_elapsed_ms,
+                    sender_capacity = sender_tx.capacity(),
+                    "Processor blocked sending to sender (sender back-pressure)"
+                );
+            }
 
             Ok::<(), OperatorError>(())
         }

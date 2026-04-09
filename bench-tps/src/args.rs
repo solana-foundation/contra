@@ -186,6 +186,17 @@ pub struct DepositArgs {
     #[arg(long, env = "BENCH_INSTANCE_SEED_KEYPAIR")]
     pub instance_seed_keypair: Option<PathBuf>,
 
+    /// JSON-RPC endpoint of the Contra write-node (or gateway).
+    ///
+    /// Used during setup to initialise the SPL mint on Contra so the operator
+    /// can mint immediately without JIT initialisation.
+    #[arg(
+        long,
+        default_value = "http://localhost:8898",
+        env = "BENCH_RPC_URL"
+    )]
+    pub contra_rpc_url: String,
+
     /// Tracing log level.
     #[arg(long, default_value = "info", env = "BENCH_LOG_LEVEL")]
     pub log_level: String,

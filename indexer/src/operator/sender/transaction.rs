@@ -1,9 +1,15 @@
 use crate::channel_utils::send_guaranteed;
+use crate::config::ProgramType;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::utils::instruction_util::TransactionBuilder;
-use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
-use crate::operator::{sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy};
+use crate::operator::utils::transaction_util::parse_program_error;
+use crate::operator::utils::transaction_util::{
+    check_transaction_status, ConfirmationResult, MAX_POLL_ATTEMPTS_CONFIRMATION,
+};
+use crate::operator::{
+    sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, RpcClientWithRetry,
+};
 use crate::storage::common::models::TransactionStatus;
 use chrono::Utc;
 use contra_escrow_program_client::errors::ContraEscrowProgramError;
@@ -11,7 +17,7 @@ use contra_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
@@ -19,14 +25,19 @@ use super::mint::{
 };
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
-    InstructionWithSigners, PendingRemint, SenderState, TransactionContext, TransactionStatusUpdate,
+    InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PollTaskResult, SenderState,
+    TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
 };
+
+use std::sync::Arc;
 
 use std::time::Duration;
 
 /// Safety delay before checking finality and reminting.
 /// Solana finalized ≈ 32 slots × 400ms = ~12.8s. We use 2.5× safety factor.
 pub const FINALITY_SAFETY_DELAY: Duration = Duration::from_secs(32);
+
+const MAX_SIGS_PER_CALL: usize = 256;
 
 impl SenderState {
     /// Handle incoming transaction builder (either ReleaseFunds or Mint)
@@ -143,7 +154,8 @@ pub async fn handle_transaction_submission(
     };
     let retry_policy = tx_builder.retry_policy();
     let compute_unit_price = tx_builder.compute_unit_price();
-    let extra_error_checks_policy = &tx_builder.extra_error_checks_policy();
+    // Owned so it can be moved into InFlightTx
+    let extra_error_checks_policy = tx_builder.extra_error_checks_policy();
 
     let span = info_span!(
         "tx",
@@ -173,16 +185,35 @@ pub async fn handle_transaction_submission(
         match state.handle_transaction_builder(tx_builder.clone()).await {
             Ok(instruction) => {
                 info!("Transaction instruction ready for submission");
-                send_and_confirm(
-                    state,
-                    instruction,
-                    compute_unit_price,
-                    &ctx,
-                    retry_policy,
-                    extra_error_checks_policy,
-                    storage_tx,
-                )
-                .await;
+                // Mint and InitializeMint use fire-and-forget: send immediately,
+                // defer confirmation to the batch timer poll in `poll_in_flight`.
+                // ReleaseFunds and ResetSmtRoot use the blocking path because SMT
+                // proof ordering requires at-most-one in-flight withdrawal at a time.
+                match &tx_builder {
+                    TransactionBuilder::Mint(_) | TransactionBuilder::InitializeMint(_) => {
+                        spawn_fire_and_store(
+                            state,
+                            instruction,
+                            compute_unit_price,
+                            ctx.clone(),
+                            retry_policy,
+                            extra_error_checks_policy,
+                            storage_tx.clone(),
+                        );
+                    }
+                    _ => {
+                        send_and_confirm(
+                            state,
+                            instruction,
+                            compute_unit_price,
+                            &ctx,
+                            retry_policy,
+                            &extra_error_checks_policy,
+                            storage_tx,
+                        )
+                        .await;
+                    }
+                }
             }
             Err(OperatorError::Program(ProgramError::RotationPending { in_flight_count })) => {
                 info!(
@@ -692,6 +723,451 @@ pub(super) async fn handle_permanent_failure(
     });
 }
 
+/// Sign, send, and store a Mint or InitializeMint tx in `state.in_flight`.
+///
+/// Called from the `route_poll_results` retry path where the caller already holds a
+/// semaphore permit (carried inside the timed-out `InFlightTx`).  The permit transfers
+/// to the new `InFlightTx` on success, or is dropped (slot released) on send failure.
+///
+/// New incoming transactions use `spawn_fire_and_store` instead, which acquires the
+/// permit and offloads the blocking send to a background task.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fire_and_store(
+    state: &mut SenderState,
+    instruction: InstructionWithSigners,
+    compute_unit_price: Option<u64>,
+    ctx: TransactionContext,
+    retry_policy: RetryPolicy,
+    extra_error_checks_policy: ExtraErrorCheckPolicy,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    resend_count: u32,
+    permit: OwnedSemaphorePermit,
+) {
+    let pt = state.program_type.as_label();
+    let send_start = std::time::Instant::now();
+
+    match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
+        .await
+    {
+        Ok(signature) => {
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "in_flight"])
+                .observe(send_start.elapsed().as_secs_f64());
+            info!("Transaction sent: {}", signature);
+            // push() also notifies the poll task if it is waiting on an empty queue.
+            state.in_flight.push(InFlightTx {
+                signature,
+                ctx,
+                instruction,
+                compute_unit_price,
+                retry_policy,
+                extra_error_checks_policy,
+                poll_attempts: 0,
+                resend_count,
+                permit,
+            });
+        }
+        Err(e) => {
+            drop(permit);
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "rpc_send_error"])
+                .inc();
+            error!("Failed to send transaction (fire-and-forget): {}", e);
+            handle_permanent_failure(state, &ctx, storage_tx, &e.to_string()).await;
+        }
+    }
+}
+
+/// Acquire a semaphore permit and spawn a background task that signs and sends
+/// the transaction without blocking the sender loop's `recv` arm.
+///
+/// The permit is held from acquisition until the entry reaches a terminal state:
+///  - **Success**: permit moves into `InFlightTx` in `in_flight`; dropped when the
+///    poll task (or drain loop) confirms the tx.
+///  - **Send error**: permit dropped before reporting the failure to storage.
+///
+/// Returns `false` if the semaphore is already at `MAX_IN_FLIGHT` capacity.  The DB
+/// status is left unchanged so the fetcher re-emits the transaction on the next poll
+/// cycle.
+pub(super) fn spawn_fire_and_store(
+    state: &SenderState,
+    instruction: InstructionWithSigners,
+    compute_unit_price: Option<u64>,
+    ctx: TransactionContext,
+    retry_policy: RetryPolicy,
+    extra_error_checks_policy: ExtraErrorCheckPolicy,
+    storage_tx: mpsc::Sender<TransactionStatusUpdate>,
+) -> bool {
+    let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "in_flight_cap_exceeded"])
+                .inc();
+            warn!(
+                "In-flight cap ({MAX_IN_FLIGHT}) reached — skipping send for txn {:?}; \
+                 DB status unchanged, will be re-fetched",
+                ctx.transaction_id,
+            );
+            return false;
+        }
+    };
+
+    let rpc_client = state.rpc_client.clone();
+    let in_flight = state.in_flight.clone();
+    let program_type = state.program_type;
+
+    tokio::spawn(async move {
+        let send_start = std::time::Instant::now();
+        match sign_and_send_transaction(rpc_client, instruction.clone(), retry_policy).await {
+            Ok(signature) => {
+                metrics::OPERATOR_RPC_SEND_DURATION
+                    .with_label_values(&[program_type.as_label(), "in_flight"])
+                    .observe(send_start.elapsed().as_secs_f64());
+                info!("Transaction sent: {}", signature);
+                in_flight.push(InFlightTx {
+                    signature,
+                    ctx,
+                    instruction,
+                    compute_unit_price,
+                    retry_policy,
+                    extra_error_checks_policy,
+                    poll_attempts: 0,
+                    resend_count: 0,
+                    permit,
+                });
+            }
+            Err(e) => {
+                drop(permit);
+                metrics::OPERATOR_RPC_SEND_DURATION
+                    .with_label_values(&[program_type.as_label(), "error"])
+                    .observe(send_start.elapsed().as_secs_f64());
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), "rpc_send_error"])
+                    .inc();
+                error!("Failed to send transaction (fire-and-forget): {}", e);
+                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+            }
+        }
+    });
+
+    true
+}
+
+/// Route a batch of `(InFlightTx, Option<TransactionStatus>)` pairs returned by a
+/// `getSignatureStatuses` call.
+///
+/// Called from both `poll_in_flight` (test / shutdown drain path) and the sender
+/// loop's `poll_result_rx` arm (normal production path).
+///
+/// Unconfirmed entries are pushed back into `state.in_flight`, which automatically
+/// re-arms the poll task's `Notify` for the next cycle.
+pub(super) async fn route_poll_results(
+    state: &mut SenderState,
+    results: Vec<(
+        InFlightTx,
+        Option<solana_transaction_status::TransactionStatus>,
+    )>,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    for (mut tx, status_opt) in results {
+        match status_opt {
+            Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                let result = if let Some(err) = &status.err {
+                    let mut extra_result = None;
+                    if let ExtraErrorCheckPolicy::Extra(ref checks) = tx.extra_error_checks_policy {
+                        for check in checks.iter() {
+                            if let Some(r) = check(err) {
+                                extra_result = Some(Ok(r));
+                                break;
+                            }
+                        }
+                    }
+                    extra_result
+                        .unwrap_or_else(|| Ok(ConfirmationResult::Failed(parse_program_error(err))))
+                } else {
+                    Ok(ConfirmationResult::Confirmed)
+                };
+
+                handle_confirmation_result(
+                    state,
+                    result,
+                    tx.signature,
+                    tx.compute_unit_price,
+                    &tx.ctx,
+                    tx.instruction,
+                    tx.retry_policy,
+                    &tx.extra_error_checks_policy,
+                    storage_tx,
+                )
+                .await;
+            }
+            _ => {
+                tx.poll_attempts += 1;
+                if tx.poll_attempts >= MAX_POLL_ATTEMPTS_CONFIRMATION {
+                    match tx.retry_policy {
+                        RetryPolicy::None => {
+                            metrics::OPERATOR_TRANSACTION_ERRORS
+                                .with_label_values(&[
+                                    state.program_type.as_label(),
+                                    "confirmation_timeout_non_idempotent",
+                                ])
+                                .inc();
+                            warn!(
+                                "Confirmation timeout for non-idempotent tx {} after {} polls — permanent failure",
+                                tx.signature, tx.poll_attempts,
+                            );
+                            handle_permanent_failure(
+                                state,
+                                &tx.ctx,
+                                storage_tx,
+                                "Confirmation failed - transaction status unknown, unsafe to retry",
+                            )
+                            .await;
+                        }
+                        RetryPolicy::Idempotent => {
+                            metrics::OPERATOR_TRANSACTION_ERRORS
+                                .with_label_values(&[
+                                    state.program_type.as_label(),
+                                    "confirmation_timeout",
+                                ])
+                                .inc();
+
+                            let next_resend = tx.resend_count + 1;
+                            if next_resend > state.retry_max_attempts {
+                                metrics::OPERATOR_TRANSACTION_ERRORS
+                                    .with_label_values(&[
+                                        state.program_type.as_label(),
+                                        "confirmation_timeout_resend_limit",
+                                    ])
+                                    .inc();
+                                warn!(
+                                    "Confirmation timeout for idempotent tx {} — resend limit ({}) reached, permanent failure",
+                                    tx.signature, state.retry_max_attempts,
+                                );
+                                handle_permanent_failure(
+                                    state,
+                                    &tx.ctx,
+                                    storage_tx,
+                                    "Confirmation timeout: resend limit exceeded",
+                                )
+                                .await;
+                            } else {
+                                warn!(
+                                    "Confirmation timeout for idempotent tx {} after {} polls — re-sending (attempt {}/{})",
+                                    tx.signature, tx.poll_attempts, next_resend, state.retry_max_attempts,
+                                );
+                                fire_and_store(
+                                    state,
+                                    tx.instruction,
+                                    tx.compute_unit_price,
+                                    tx.ctx,
+                                    tx.retry_policy,
+                                    tx.extra_error_checks_policy,
+                                    storage_tx,
+                                    next_resend,
+                                    tx.permit, // transfer permit to new InFlightTx
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                } else {
+                    // Still pending — push back into the shared queue.
+                    // push() notifies the poll task so it wakes on the next cycle.
+                    state.in_flight.push(tx);
+                }
+            }
+        }
+    }
+}
+
+/// Single-cycle poll: drain the shared queue, call `getSignatureStatuses`, then
+/// route results via `route_poll_results`.
+///
+/// Used by `drain_in_flight` (shutdown) and by tests.  Normal production polling
+/// is handled by the dedicated `run_poll_task` task so it doesn't block the send loop.
+pub(super) async fn poll_in_flight(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    if state.in_flight.is_empty() {
+        return;
+    }
+    let batch = state.in_flight.drain_all();
+    let signatures: Vec<Signature> = batch.iter().map(|t| t.signature).collect();
+    let mut statuses: Vec<Option<_>> = Vec::with_capacity(signatures.len());
+
+    for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
+        match state.rpc_client.get_signature_statuses(chunk).await {
+            Ok(resp) => statuses.extend(resp.value),
+            Err(e) => {
+                warn!(
+                    "getSignatureStatuses failed ({} in-flight) — will retry next tick: {}",
+                    batch.len(),
+                    e
+                );
+                // Put everything back so the next drain_in_flight iteration retries.
+                for tx in batch {
+                    state.in_flight.push(tx);
+                }
+                return;
+            }
+        }
+    }
+
+    let results: Vec<_> = batch.into_iter().zip(statuses).collect();
+    route_poll_results(state, results, storage_tx).await;
+}
+
+/// Dedicated poll task: sleeps until entries arrive, then batches
+/// `getSignatureStatuses` calls and forwards raw results to the sender loop.
+///
+/// Running in a separate task means `getSignatureStatuses` RPC latency (~50–200 ms)
+/// never blocks the sender from processing new incoming transactions.
+///
+/// # No busy loop
+/// The task waits on `in_flight.notify` (a `tokio::sync::Notify`) before each cycle.
+/// Every `InFlightQueue::push` call fires `notify_one`, which stores at most one permit,
+/// so the task wakes exactly once per "there is work" event even if many entries are
+/// added simultaneously.  When the queue drains to zero and no new entries arrive the
+/// task blocks indefinitely — zero CPU while idle.
+/// Dedicated async task that owns the confirmation polling loop.
+///
+/// Confirmed-success entries are handled entirely within this task:
+/// the `Completed` storage update is sent and `OPERATOR_MINTS_SENT` is
+/// incremented without touching `SenderState`.  Only on-chain errors and
+/// confirmation timeouts — rare events — are forwarded to the sender loop
+/// via `result_tx` as `PollTaskResult::NeedsRouting`.  Unconfirmed entries
+/// are pushed straight back into `in_flight`.
+///
+/// This means the `Some(results) = poll_result_rx.recv()` arm in the main
+/// `select!` loop fires only for exceptions, keeping the common path off the
+/// main task entirely.
+pub(super) async fn run_poll_task(
+    in_flight: Arc<InFlightQueue>,
+    result_tx: mpsc::Sender<Vec<PollTaskResult>>,
+    rpc_client: Arc<RpcClientWithRetry>,
+    storage_tx: mpsc::Sender<TransactionStatusUpdate>,
+    program_type: ProgramType,
+    poll_interval_ms: u64,
+    cancellation_token: tokio_util::sync::CancellationToken,
+) {
+    // Reused across poll cycles to avoid per-cycle heap allocation.
+    // Signature is Copy ([u8; 64]) so extend() is a plain memcopy.
+    let mut signatures: Vec<Signature> = Vec::with_capacity(MAX_IN_FLIGHT);
+
+    loop {
+        // Block until at least one entry is present (no busy loop when idle).
+        tokio::select! {
+            _ = cancellation_token.cancelled() => break,
+            _ = in_flight.notify.notified() => {},
+        }
+
+        // Sleep the poll interval to batch entries that arrive in quick succession.
+        tokio::select! {
+            _ = cancellation_token.cancelled() => break,
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
+        }
+
+        let batch = in_flight.drain_all();
+        if batch.is_empty() {
+            continue;
+        }
+
+        signatures.clear();
+        signatures.extend(batch.iter().map(|t| t.signature));
+        let mut statuses: Vec<Option<_>> = Vec::with_capacity(signatures.len());
+        let mut rpc_ok = true;
+
+        for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
+            match rpc_client.get_signature_statuses(chunk).await {
+                Ok(resp) => statuses.extend(resp.value),
+                Err(e) => {
+                    warn!(
+                        "getSignatureStatuses failed ({} in-flight) — will retry next tick: {}",
+                        batch.len(),
+                        e
+                    );
+                    rpc_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if !rpc_ok {
+            // Put everything back in one lock acquisition.
+            in_flight.push_all(batch);
+            continue;
+        }
+
+        let mut results: Vec<PollTaskResult> = Vec::with_capacity(batch.len());
+
+        for (mut tx, status_opt) in batch.into_iter().zip(statuses) {
+            match status_opt {
+                Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                    if status.err.is_none() {
+                        // ── Confirmed success (hot path) ──────────────────────────────
+                        // Handle entirely here — no need to wake the sender loop.
+                        metrics::OPERATOR_MINTS_SENT
+                            .with_label_values(&[program_type.as_label()])
+                            .inc();
+
+                        if let Some(txn_id) = tx.ctx.transaction_id {
+                            if storage_tx
+                                .send(TransactionStatusUpdate {
+                                    transaction_id: txn_id,
+                                    trace_id: tx.ctx.trace_id,
+                                    status: TransactionStatus::Completed,
+                                    counterpart_signature: Some(tx.signature.to_string()),
+                                    processed_at: Some(Utc::now()),
+                                    error_message: None,
+                                    remint_signature: None,
+                                    remint_attempted: false,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                warn!(
+                                    "Storage channel closed — Completed update lost for txn {}",
+                                    txn_id
+                                );
+                            }
+                        }
+                        // Notify sender loop to clean up mint_builders (O(1) HashMap remove).
+                        results.push(PollTaskResult::ConfirmedSuccess(tx.ctx.transaction_id));
+                    } else {
+                        // ── Confirmed with on-chain error ─────────────────────────────
+                        // Needs SenderState for error routing (cleanup, remint, etc.).
+                        results.push(PollTaskResult::NeedsRouting(Box::new(tx), Some(status)));
+                    }
+                }
+                _ => {
+                    // ── Not yet confirmed ─────────────────────────────────────────────
+                    // If we're one poll away from MAX, hand to the sender loop so it can
+                    // run the timeout branch (which needs SenderState).  Otherwise push
+                    // straight back — no result channel traffic needed.
+                    if tx.poll_attempts + 1 >= MAX_POLL_ATTEMPTS_CONFIRMATION {
+                        // Do NOT increment here; route_poll_results will increment it
+                        // to MAX and fire the timeout branch.
+                        results.push(PollTaskResult::NeedsRouting(Box::new(tx), None));
+                    } else {
+                        tx.poll_attempts += 1;
+                        in_flight.push(tx);
+                    }
+                }
+            }
+        }
+
+        if !results.is_empty() && result_tx.send(results).await.is_err() {
+            break; // Sender loop gone — clean up and exit.
+        }
+    }
+}
+
 /// Helper for fatal errors (Failed status, no signature)
 pub(super) async fn send_fatal_error(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
@@ -737,6 +1213,7 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     fn dummy_instruction() -> InstructionWithSigners {
         InstructionWithSigners {
@@ -772,6 +1249,41 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        }
+    }
+
+    fn make_sender_state_with_server(url: &str) -> SenderState {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        ));
+        SenderState {
+            rpc_client: rpc_client.clone(),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -1538,5 +2050,1023 @@ mod tests {
         let update = rx.recv().await.unwrap();
         assert_eq!(update.transaction_id, 15);
         assert_eq!(update.status, TransactionStatus::Failed);
+    }
+
+    // ── fire_and_store ────────────────────────────────────────────────
+
+    /// A successful send must push exactly one InFlightTx with poll_attempts=0
+    /// and the returned signature; no storage update must be emitted yet.
+    #[tokio::test]
+    async fn fire_and_store_success_pushes_to_in_flight() {
+        let mut server = mockito::Server::new_async().await;
+
+        let expected_sig = Signature::default().to_string();
+
+        let _m_hash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                            "lastValidBlockHeight": 100
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let _m_send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": expected_sig
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut state = {
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            SenderState {
+                rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::utils::rpc_util::RetryConfig {
+                        max_attempts: 1,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(1),
+                    },
+                    CommitmentConfig::confirmed(),
+                )),
+                storage: storage.clone(),
+                instance_pda: None,
+                smt_state: None,
+                retry_counts: HashMap::new(),
+                mint_builders: HashMap::new(),
+                mint_cache: crate::operator::MintCache::new(storage),
+                retry_max_attempts: 3,
+                confirmation_poll_interval_ms: 400,
+                rotation_retry_queue: Vec::new(),
+                pending_rotation: None,
+                program_type: ProgramType::Escrow,
+                remint_cache: HashMap::new(),
+                pending_signatures: HashMap::new(),
+                pending_remints: Vec::new(),
+                in_flight: InFlightQueue::new(),
+                semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            }
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: Some(42),
+            withdrawal_nonce: None,
+            trace_id: Some("trace-fire".to_string()),
+        };
+
+        fire_and_store(
+            &mut state,
+            dummy_instruction(),
+            None,
+            ctx.clone(),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            &storage_tx,
+            0,
+            Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
+        )
+        .await;
+
+        // No storage update yet — confirmation is deferred.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "fire_and_store must not emit a status update immediately"
+        );
+
+        // Exactly one in-flight entry with the expected signature.
+        assert_eq!(state.in_flight.len(), 1);
+        let guard = state.in_flight.entries.lock().unwrap();
+        let entry = &guard[0];
+        assert_eq!(entry.signature.to_string(), expected_sig);
+        assert_eq!(entry.ctx.transaction_id, Some(42));
+        assert_eq!(entry.poll_attempts, 0);
+    }
+
+    /// When sendTransaction fails, fire_and_store must route to permanent failure
+    /// and emit a Failed status — no in-flight entry should be added.
+    #[tokio::test]
+    async fn fire_and_store_send_failure_routes_to_permanent_failure() {
+        let mut server = mockito::Server::new_async().await;
+
+        // getLatestBlockhash succeeds
+        let _m_hash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                            "lastValidBlockHeight": 100
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        // sendTransaction returns an RPC error
+        let _m_send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut state = {
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            SenderState {
+                rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::utils::rpc_util::RetryConfig {
+                        max_attempts: 1,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(1),
+                    },
+                    CommitmentConfig::confirmed(),
+                )),
+                storage: storage.clone(),
+                instance_pda: None,
+                smt_state: None,
+                retry_counts: HashMap::new(),
+                mint_builders: HashMap::new(),
+                mint_cache: crate::operator::MintCache::new(storage),
+                retry_max_attempts: 3,
+                confirmation_poll_interval_ms: 400,
+                rotation_retry_queue: Vec::new(),
+                pending_rotation: None,
+                program_type: ProgramType::Escrow,
+                remint_cache: HashMap::new(),
+                pending_signatures: HashMap::new(),
+                pending_remints: Vec::new(),
+                in_flight: InFlightQueue::new(),
+                semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            }
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: Some(55),
+            withdrawal_nonce: None,
+            trace_id: None,
+        };
+
+        fire_and_store(
+            &mut state,
+            dummy_instruction(),
+            None,
+            ctx,
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            &storage_tx,
+            0,
+            Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
+        )
+        .await;
+
+        // Failed status must be emitted immediately.
+        let update = storage_rx
+            .try_recv()
+            .expect("expected Failed status update");
+        assert_eq!(update.transaction_id, 55);
+        assert_eq!(update.status, TransactionStatus::Failed);
+
+        // Nothing pushed to in_flight.
+        assert!(
+            state.in_flight.is_empty(),
+            "in_flight must stay empty on send failure"
+        );
+    }
+
+    // ── poll_in_flight ────────────────────────────────────────────────
+
+    fn make_in_flight_tx(sig: Signature, txn_id: i64) -> super::super::types::InFlightTx {
+        super::super::types::InFlightTx {
+            signature: sig,
+            ctx: TransactionContext {
+                transaction_id: Some(txn_id),
+                withdrawal_nonce: None,
+                trace_id: Some(format!("trace-{txn_id}")),
+            },
+            instruction: dummy_instruction(),
+            compute_unit_price: None,
+            retry_policy: RetryPolicy::None,
+            extra_error_checks_policy: ExtraErrorCheckPolicy::None,
+            poll_attempts: 0,
+            resend_count: 0,
+            permit: Arc::new(Semaphore::new(MAX_IN_FLIGHT))
+                .try_acquire_owned()
+                .unwrap(),
+        }
+    }
+
+    /// A confirmed signature in the batch must route to handle_success, emitting
+    /// a Completed status and removing the entry from in_flight.
+    #[tokio::test]
+    async fn poll_in_flight_confirmed_tx_emits_completed() {
+        let mut server = mockito::Server::new_async().await;
+
+        let sig = Signature::new_unique();
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "confirmed",
+                            "confirmations": 1,
+                            "err": null,
+                            "slot": 100,
+                            "status": {"Ok": null}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut state = SenderState {
+            rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: crate::operator::MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: {
+                let q = InFlightQueue::new();
+                q.push(make_in_flight_tx(sig, 77));
+                q
+            },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // Entry removed from in_flight after confirmation.
+        assert!(
+            state.in_flight.is_empty(),
+            "in_flight must be empty after confirmation"
+        );
+
+        // Completed status emitted.
+        let update = storage_rx.try_recv().expect("expected Completed status");
+        assert_eq!(update.transaction_id, 77);
+        assert_eq!(update.status, TransactionStatus::Completed);
+    }
+
+    /// A not-yet-confirmed tx should stay in in_flight with an incremented poll_attempts counter
+    /// and no storage update must be emitted.
+    #[tokio::test]
+    async fn poll_in_flight_unconfirmed_tx_stays_in_flight() {
+        let mut server = mockito::Server::new_async().await;
+
+        let sig = Signature::new_unique();
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 10},
+                        "value": [null]   // not yet seen by RPC
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut state = SenderState {
+            rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: crate::operator::MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: {
+                let q = InFlightQueue::new();
+                q.push(make_in_flight_tx(sig, 88));
+                q
+            },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // Still in-flight with incremented counter.
+        assert_eq!(state.in_flight.len(), 1);
+        assert_eq!(state.in_flight.entries.lock().unwrap()[0].poll_attempts, 1);
+
+        // No storage update.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update for pending tx"
+        );
+    }
+
+    /// On RPC error, the entire batch must be kept in-flight untouched for retry on the
+    /// next tick — poll_attempts must NOT be incremented (the RPC call did not count).
+    #[tokio::test]
+    async fn poll_in_flight_rpc_error_keeps_batch_unchanged() {
+        let mut server = mockito::Server::new_async().await;
+
+        let sig = Signature::new_unique();
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut state = SenderState {
+            rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: crate::operator::MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: {
+                let q = InFlightQueue::new();
+                q.push(make_in_flight_tx(sig, 99));
+                q
+            },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // Batch unchanged — RPC error is transient.
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "in_flight must be unchanged on RPC error"
+        );
+        assert_eq!(
+            state.in_flight.entries.lock().unwrap()[0].poll_attempts,
+            0,
+            "poll_attempts must not increment on RPC error"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no storage update on RPC error"
+        );
+    }
+
+    /// When poll_attempts reaches MAX_POLL_ATTEMPTS_CONFIRMATION for a RetryPolicy::None tx,
+    /// it must be declared a permanent failure and removed from in_flight.
+    #[tokio::test]
+    async fn poll_in_flight_timeout_none_policy_permanent_failure() {
+        let mut server = mockito::Server::new_async().await;
+
+        let sig = Signature::new_unique();
+
+        // Return "not confirmed" enough times to trigger timeout
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"context": {"slot": 10}, "value": [null]}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut state = SenderState {
+            rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: crate::operator::MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: {
+                let q = InFlightQueue::new();
+                let mut tx = make_in_flight_tx(sig, 101);
+                // Pre-fill poll_attempts to one below MAX so this poll tips it over.
+                tx.poll_attempts = MAX_POLL_ATTEMPTS_CONFIRMATION - 1;
+                q.push(tx);
+                q
+            },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // Entry removed from in_flight.
+        assert!(
+            state.in_flight.is_empty(),
+            "timed-out tx must leave in_flight"
+        );
+
+        // Failed status emitted.
+        let update = storage_rx
+            .try_recv()
+            .expect("expected Failed status for non-idempotent timeout");
+        assert_eq!(update.transaction_id, 101);
+        assert_eq!(update.status, TransactionStatus::Failed);
+        assert!(
+            update
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown"),
+            "error should mention unknown status: {:?}",
+            update.error_message,
+        );
+    }
+
+    /// poll_in_flight with an empty in_flight must be a no-op (no RPC call, no storage update).
+    #[tokio::test]
+    async fn poll_in_flight_empty_is_noop() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // No mock server needed — should not make any RPC call.
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert!(state.in_flight.is_empty());
+        assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// A mixed batch (one confirmed, one pending) must resolve the confirmed entry while
+    /// keeping the pending entry in in_flight with an incremented poll_attempts.
+    #[tokio::test]
+    async fn poll_in_flight_mixed_batch_partial_resolution() {
+        let mut server = mockito::Server::new_async().await;
+
+        let sig1 = Signature::new_unique();
+        let sig2 = Signature::new_unique();
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 200},
+                        "value": [
+                            // sig1 confirmed
+                            {
+                                "confirmationStatus": "confirmed",
+                                "confirmations": 1,
+                                "err": null,
+                                "slot": 200,
+                                "status": {"Ok": null}
+                            },
+                            // sig2 not yet confirmed
+                            null
+                        ]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut state = SenderState {
+            rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: crate::operator::MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 400,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: {
+                let q = InFlightQueue::new();
+                q.push(make_in_flight_tx(sig1, 201));
+                q.push(make_in_flight_tx(sig2, 202));
+                q
+            },
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        };
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // sig1 resolved — only sig2 remains.
+        assert_eq!(state.in_flight.len(), 1, "only pending tx remains");
+        {
+            let guard = state.in_flight.entries.lock().unwrap();
+            assert_eq!(guard[0].ctx.transaction_id, Some(202));
+            assert_eq!(guard[0].poll_attempts, 1);
+        }
+
+        // Completed for sig1, nothing for sig2 yet.
+        let update = storage_rx.try_recv().expect("expected Completed for sig1");
+        assert_eq!(update.transaction_id, 201);
+        assert_eq!(update.status, TransactionStatus::Completed);
+        assert!(storage_rx.try_recv().is_err(), "no update for pending sig2");
+    }
+
+    // ── poll_in_flight: chunking ──────────────────────────────────────
+
+    /// When in_flight exceeds 256 entries (the getSignatureStatuses limit), poll_in_flight
+    /// must issue multiple RPC calls — one per 256-sig chunk — and merge the results.
+    ///
+    /// Strategy: mock returns all-null statuses (not yet confirmed) so every entry stays
+    /// in `remaining` after the call.  We seed 300 entries and assert the mock was hit
+    /// at least twice (≥ 2 chunks: 256 + 44), and that all 300 entries are still in-flight.
+    #[tokio::test]
+    async fn poll_in_flight_chunks_large_batch() {
+        // Build a response body with 256 null slots — enough for the largest chunk.
+        // The zip in poll_in_flight stops at the shorter of (batch, statuses), so
+        // returning 256 nulls for both the 256-sig chunk and the 44-sig chunk is fine:
+        // extra slots are ignored, missing slots cause zip to stop early (entries stay).
+        let null_statuses: Vec<serde_json::Value> = vec![serde_json::Value::Null; 256];
+        let response_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "context": {"slot": 1},
+                "value": null_statuses
+            }
+        })
+        .to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(response_body)
+            .expect_at_least(2) // 256 sigs → chunk 1; 44 sigs → chunk 2
+            .create();
+
+        let total = 300usize;
+        let mut state = make_sender_state_with_server(&server.url());
+        for i in 0..total {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), i as i64 + 1));
+        }
+
+        let (storage_tx, _rx) = mpsc::channel(10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // All entries stay in-flight (all statuses were null → not confirmed).
+        assert_eq!(
+            state.in_flight.len(),
+            total,
+            "all entries must stay in-flight"
+        );
+        _m.assert(); // verifies ≥ 2 RPC calls were made
+    }
+
+    /// An idempotent tx that exhausts its resend_count budget must be declared a
+    /// permanent failure rather than re-queued indefinitely (infinite loop guard).
+    #[tokio::test]
+    async fn poll_in_flight_idempotent_resend_limit_triggers_permanent_failure() {
+        let mut server = mockito::Server::new_async().await;
+
+        let sig = Signature::new_unique();
+
+        // RPC returns null (not confirmed) — triggering the timeout arm.
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 10},
+                        "value": [null]
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+
+        let retry_max = 2u32;
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = retry_max;
+        {
+            let mut tx = make_in_flight_tx(sig, 77);
+            tx.retry_policy = RetryPolicy::Idempotent;
+            // Already at the cap — next_resend (3) > retry_max (2).
+            tx.resend_count = retry_max;
+            tx.poll_attempts = MAX_POLL_ATTEMPTS_CONFIRMATION; // trigger timeout arm
+            *state.in_flight.entries.lock().unwrap() = vec![tx];
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        // Must have been removed from in_flight.
+        assert!(
+            state.in_flight.is_empty(),
+            "exhausted tx must leave in_flight"
+        );
+
+        // Permanent failure status must be emitted.
+        let update = storage_rx
+            .try_recv()
+            .expect("expected permanent-failure status update");
+        assert_eq!(update.transaction_id, 77);
+        assert_eq!(update.status, TransactionStatus::Failed);
+        assert!(
+            update
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("resend limit"),
+            "error message should mention resend limit: {:?}",
+            update.error_message
+        );
+    }
+
+    // ── spawn_fire_and_store: cap enforcement ─────────────────────────
+
+    /// When the semaphore is exhausted (all MAX_IN_FLIGHT slots occupied),
+    /// `spawn_fire_and_store` must return `false` without spawning any task
+    /// or emitting any storage update. DB status stays unchanged so the
+    /// fetcher can re-emit the transaction on the next poll cycle.
+    #[tokio::test]
+    async fn spawn_fire_and_store_cap_exhausted_returns_false() {
+        let state = make_sender_state();
+
+        // Hold all permits — simulates MAX_IN_FLIGHT tasks in-flight.
+        let _permits: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(state.semaphore.available_permits(), 0);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: Some(9999),
+            withdrawal_nonce: None,
+            trace_id: None,
+        };
+
+        let result = spawn_fire_and_store(
+            &state,
+            dummy_instruction(),
+            None,
+            ctx,
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+        );
+
+        assert!(!result, "must return false when at capacity");
+        // Yield to ensure any erroneously spawned tasks have time to run.
+        tokio::task::yield_now().await;
+        assert!(storage_rx.try_recv().is_err(), "no storage update expected");
+        // Queue stays empty — no entry pushed.
+        assert!(state.in_flight.is_empty());
+    }
+
+    /// When capacity is available, `spawn_fire_and_store` must return `true` and
+    /// the permit must be consumed immediately (before the RPC call completes),
+    /// so back-pressure is applied as soon as the task starts, not after it finishes.
+    #[tokio::test]
+    async fn spawn_fire_and_store_available_capacity_returns_true_and_consumes_permit() {
+        let state = make_sender_state();
+        assert_eq!(state.semaphore.available_permits(), MAX_IN_FLIGHT);
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let result = spawn_fire_and_store(
+            &state,
+            dummy_instruction(),
+            None,
+            TransactionContext {
+                transaction_id: Some(1),
+                withdrawal_nonce: None,
+                trace_id: None,
+            },
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+        );
+
+        assert!(result, "must return true when capacity is available");
+        // Permit must be consumed before spawn returns — regardless of whether
+        // the RPC call has completed yet.
+        assert_eq!(
+            state.semaphore.available_permits(),
+            MAX_IN_FLIGHT - 1,
+            "one permit must be held by the spawned task"
+        );
+    }
+
+    // ── run_poll_task: cancellation ───────────────────────────────────
+
+    /// Cancelling while the task is blocked waiting for entries (idle queue) must
+    /// cause it to exit cleanly without hanging.
+    #[tokio::test]
+    async fn run_poll_task_cancels_while_waiting_for_entries() {
+        let in_flight = InFlightQueue::new();
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let (storage_tx, _storage_rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        ));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            50,
+            token.clone(),
+        ));
+
+        // Cancel immediately — task is blocked on notified(), must wake and exit.
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit within 2s after cancellation")
+            .expect("task must not panic");
+    }
+
+    /// Cancelling while the task is sleeping between notify and drain must cause
+    /// it to exit without processing any entries.
+    #[tokio::test]
+    async fn run_poll_task_cancels_during_poll_interval_sleep() {
+        let in_flight = InFlightQueue::new();
+        let (result_tx, _result_rx) = mpsc::channel(8);
+        let (storage_tx, _storage_rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://localhost:8899".to_string(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        ));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            60_000, // very long interval — task will be sleeping here when we cancel
+            token.clone(),
+        ));
+
+        // Push an entry to unblock the first select (notified), then cancel
+        // while the task is in the poll_interval sleep.
+        in_flight.push(make_in_flight_tx(Signature::new_unique(), 1));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit within 2s after cancellation")
+            .expect("task must not panic");
+    }
+
+    /// When the result_tx receiver is dropped (sender loop gone), the task must
+    /// detect the closed channel and exit cleanly rather than looping forever.
+    #[tokio::test]
+    async fn run_poll_task_exits_when_result_channel_closed() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Return a confirmed-with-error status so a NeedsRouting result is produced,
+        // which forces a send on result_tx (the closed channel) → task must exit.
+        let sig = Signature::new_unique();
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 5},
+                        "value": [{
+                            "slot": 5,
+                            "confirmations": null,
+                            "confirmationStatus": "finalized",
+                            "err": {"InstructionError": [0, "GenericError"]},
+                            "status": {"Err": {"InstructionError": [0, "GenericError"]}}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+
+        let in_flight = InFlightQueue::new();
+        // Drop result_rx immediately to close the channel from the receiver side.
+        let (result_tx, result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);
+        drop(result_rx);
+        let (storage_tx, _storage_rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        ));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        in_flight.push(make_in_flight_tx(sig, 42));
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            1, // minimal sleep
+            token.clone(),
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("task must exit within 3s when result channel is closed")
+            .expect("task must not panic");
     }
 }

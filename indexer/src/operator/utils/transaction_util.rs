@@ -14,7 +14,7 @@ use solana_sdk::{
 };
 use tracing::{debug, warn};
 
-const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
+pub const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
 
 /// Result of transaction confirmation
 #[derive(Debug, Clone)]

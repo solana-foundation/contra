@@ -17,10 +17,10 @@ use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info};
 
-use super::types::{SenderSMTState, SenderState};
+use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
     pub(super) fn new(
@@ -60,6 +60,8 @@ impl SenderState {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
     }
 
@@ -291,7 +293,7 @@ impl SenderState {
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
-                trace_id: tx.trace_id,
+                trace_id: tx.trace_id.clone(),
                 mint,
                 user,
                 user_ata,
@@ -358,6 +360,8 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -811,6 +815,8 @@ mod tests {
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 

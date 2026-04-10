@@ -4,7 +4,7 @@ use crate::rpc::{
 };
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::str::FromStr;
 
 // Solana RPC spec: limit must be between 1 and 1000 (inclusive).
@@ -27,9 +27,25 @@ pub async fn get_signatures_for_address_impl(
         .unwrap_or(DEFAULT_LIMIT)
         .clamp(1, MAX_LIMIT);
 
+    let before = config
+        .as_ref()
+        .and_then(|c| c.get("before"))
+        .and_then(|v| v.as_str())
+        .map(Signature::from_str)
+        .transpose()
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid 'before': {}", e)))?;
+
+    let until = config
+        .as_ref()
+        .and_then(|c| c.get("until"))
+        .and_then(|v| v.as_str())
+        .map(Signature::from_str)
+        .transpose()
+        .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid 'until': {}", e)))?;
+
     let signatures = read_deps
         .accounts_db
-        .get_signatures_for_address(&pubkey, limit)
+        .get_signatures_for_address(&pubkey, limit, before.as_ref(), until.as_ref())
         .await
         .map_err(|e| {
             custom_error(

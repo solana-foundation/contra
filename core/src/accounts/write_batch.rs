@@ -213,13 +213,25 @@ pub(crate) async fn write_batch_redis(
         }
     }
 
-    // Store transactions
+    // Store transactions and build the address→signatures index used by
+    // getSignaturesForAddress. For each account key touched by the transaction
+    // we ZADD one entry to a per-address sorted set:
+    //   key:    addr_sigs:{pubkey}
+    //   score:  tx_slot as f64  (enables ZREVRANGEBYSCORE ordering by recency)
+    //   member: signature string (base58)
+    // Mirrors what address_signatures does in Postgres.
+    // redis-rs 0.27: zadd(key, member, score) — member first, score second.
     let tx_count = transactions.len();
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         let key = format!("tx:{}", signature);
         let serialized = bincode::serialize(&stored_tx).unwrap();
         pipe.set(key, serialized);
+
+        for pubkey in transaction.message().account_keys().iter() {
+            let addr_key = format!("addr_sigs:{}", pubkey);
+            pipe.zadd(addr_key, signature.to_string(), tx_slot as f64);
+        }
     }
 
     // Increment transaction count

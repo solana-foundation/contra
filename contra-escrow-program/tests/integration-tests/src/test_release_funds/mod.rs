@@ -1331,7 +1331,8 @@ fn test_release_funds_full_balance() {
 // the existing balance check (`escrow_after == escrow_before - amount`) stays correct.
 //
 // Mint config: 100 basis points (1%), max fee 1_000_000.
-// Deposit: 1_000_000 gross, escrow receives 990_000 (fee withheld at escrow ATA on deposit).
+// The escrow is seeded directly via mint_to (no deposit flow), so it starts with exactly
+// DEPOSIT_AMOUNT tokens — no fee is applied on mint_to.
 // Release: operator releases 500_000 from escrow; user receives 495_000 (fee withheld at
 // user ATA on release); escrow decreases by exactly 500_000.
 #[test]
@@ -1457,7 +1458,8 @@ fn test_release_funds_token_2022_transfer_fee_success() {
     );
 
     // The user receives release amount minus the transfer fee.
-    let expected_fee = (RELEASE_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128 / 10_000) as u64;
+    // SPL Token 2022 uses ceiling division for fee calculation.
+    let expected_fee = ((RELEASE_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128 + 9_999) / 10_000) as u64;
     let expected_received = RELEASE_AMOUNT - expected_fee;
     assert_eq!(
         user_balance_after,

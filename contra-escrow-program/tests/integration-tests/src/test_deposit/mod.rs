@@ -443,7 +443,8 @@ fn test_deposit_token_2022_transfer_fee_success() {
 
     // The escrow receives less than the deposit amount because the transfer fee is
     // withheld at the destination. The received amount is deposit - fee.
-    let expected_fee = (DEPOSIT_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128 / 10_000) as u64;
+    // SPL Token 2022 uses ceiling division for fee calculation.
+    let expected_fee = ((DEPOSIT_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128 + 9_999) / 10_000) as u64;
     let expected_received = DEPOSIT_AMOUNT - expected_fee;
     assert_eq!(
         instance_balance_after,

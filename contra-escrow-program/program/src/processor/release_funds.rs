@@ -5,7 +5,7 @@ use crate::{
     error::ContraEscrowProgramError,
     events::ReleaseFundsEvent,
     processor::{
-        get_token_account_balance,
+        get_mint_decimals, get_token_account_balance,
         shared::{
             account_check::verify_signer,
             event_utils::emit_event,
@@ -24,7 +24,9 @@ use pinocchio::{
     error::ProgramError,
     Address, ProgramResult,
 };
-use pinocchio_token_2022::{instructions::Transfer as Transfer2022, ID as TOKEN_2022_PROGRAM_ID};
+use pinocchio_token_2022::{
+    instructions::TransferChecked as TransferChecked2022, ID as TOKEN_2022_PROGRAM_ID,
+};
 
 // amount (8) + user (32) + new_root (32) + transaction_nonce (8) + sibling_proofs (TREE_HEIGHT * 32)
 const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 32 + 8 + (TREE_HEIGHT * 32);
@@ -141,14 +143,21 @@ pub fn process_release_funds(
 
     drop(instance_data);
 
-    Transfer2022 {
+    TransferChecked2022 {
         from: instance_ata_info,
         to: user_ata_info,
         authority: instance_info,
-        token_program: token_program_info.address(),
         amount: args.amount,
+        token_program: token_program_info.address(),
+        mint: mint_info,
+        decimals: get_mint_decimals(mint_info)?,
     }
     .invoke_signed(&[signer])?;
+
+    let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
+    let released = escrow_token_balance_before
+        .checked_sub(escrow_token_balance_after)
+        .ok_or(ContraEscrowProgramError::InvalidEscrowBalance)?;
 
     instance.withdrawal_transactions_root = args.new_withdrawal_root;
     let updated_instance_data = instance.to_bytes();
@@ -159,7 +168,7 @@ pub fn process_release_funds(
     let event = ReleaseFundsEvent::new(
         instance.instance_seed,
         *operator_info.address(),
-        args.amount,
+        released,
         args.user,
         *mint_info.address(),
         args.new_withdrawal_root,
@@ -170,15 +179,6 @@ pub fn process_release_funds(
         program_info,
         &event.to_bytes(),
     )?;
-
-    let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
-    if escrow_token_balance_after
-        != escrow_token_balance_before
-            .checked_sub(args.amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-    {
-        return Err(ContraEscrowProgramError::InvalidEscrowBalance.into());
-    }
 
     Ok(())
 }

@@ -4,7 +4,7 @@ use crate::{
     error::ContraEscrowProgramError,
     events::DepositEvent,
     processor::{
-        get_token_account_balance,
+        get_mint_decimals, get_token_account_balance,
         shared::{
             account_check::{verify_signer, verify_system_program},
             event_utils::emit_event,
@@ -18,7 +18,9 @@ use crate::{
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
-use pinocchio_token_2022::{instructions::Transfer as Transfer2022, ID as TOKEN_2022_PROGRAM_ID};
+use pinocchio_token_2022::{
+    instructions::TransferChecked as TransferChecked2022, ID as TOKEN_2022_PROGRAM_ID,
+};
 
 /// Processes the Deposit instruction.
 ///
@@ -100,20 +102,27 @@ pub fn process_deposit(
 
     let escrow_token_balance_before = get_token_account_balance(instance_ata_info)?;
 
-    Transfer2022 {
+    TransferChecked2022 {
         from: user_ata_info,
         to: instance_ata_info,
         authority: user_info,
         amount: args.amount,
         token_program: token_program_info.address(),
+        mint: mint_info,
+        decimals: get_mint_decimals(mint_info)?,
     }
     .invoke_signed(&[])?;
+
+    let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
+    let received = escrow_token_balance_after
+        .checked_sub(escrow_token_balance_before)
+        .ok_or(ContraEscrowProgramError::InvalidEscrowBalance)?;
 
     let recipient = args.recipient.unwrap_or(*user_info.address());
     let event = DepositEvent::new(
         instance.instance_seed,
         *user_info.address(),
-        args.amount,
+        received,
         recipient,
         *mint_info.address(),
     );
@@ -123,15 +132,6 @@ pub fn process_deposit(
         program_info,
         &event.to_bytes(),
     )?;
-
-    let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
-    if escrow_token_balance_after
-        != escrow_token_balance_before
-            .checked_add(args.amount)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-    {
-        return Err(ContraEscrowProgramError::InvalidEscrowBalance.into());
-    }
 
     Ok(())
 }

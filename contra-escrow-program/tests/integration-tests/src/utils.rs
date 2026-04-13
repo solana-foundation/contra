@@ -19,7 +19,8 @@ use spl_token::{
 use spl_token_2022::{
     extension::{
         pausable::PausableConfig, permanent_delegate::PermanentDelegate,
-        BaseStateWithExtensionsMut, ExtensionType,
+        transfer_fee::instruction::initialize_transfer_fee_config, BaseStateWithExtensionsMut,
+        ExtensionType,
     },
     state::Mint as Token2022Mint,
 };
@@ -274,9 +275,11 @@ pub fn get_token_balance(context: &mut TestContext, ata: &Pubkey) -> u64 {
                     TokenAccount::unpack(&account.data).expect("Should deserialize token account");
                 token_account.amount
             } else if account.owner == TOKEN_2022_PROGRAM_ID {
-                let token_account = Token2022Account::unpack(&account.data)
-                    .expect("Should deserialize Token2022 account");
-                token_account.amount
+                let token_account = spl_token_2022::extension::StateWithExtensions::<
+                    Token2022Account,
+                >::unpack(&account.data)
+                .expect("Should deserialize Token2022 account");
+                token_account.base.amount
             } else {
                 0
             }
@@ -591,6 +594,58 @@ pub fn set_mint_2022_with_pausable(context: &mut TestContext, mint: &Pubkey, aut
             },
         )
         .expect("Failed to set Token 2022 mint account with Pausable");
+}
+
+pub fn create_mint_2022_with_transfer_fee(
+    context: &mut TestContext,
+    mint: &Keypair,
+    transfer_fee_basis_points: u16,
+    maximum_fee: u64,
+) {
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+        ExtensionType::TransferFeeConfig,
+    ])
+    .unwrap();
+    let rent = context.svm.minimum_balance_for_rent_exemption(space);
+
+    let create_account_ix = solana_sdk::system_instruction::create_account(
+        &context.payer.pubkey(),
+        &mint.pubkey(),
+        rent,
+        space as u64,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+
+    let init_transfer_fee_ix = initialize_transfer_fee_config(
+        &TOKEN_2022_PROGRAM_ID,
+        &mint.pubkey(),
+        Some(&context.payer.pubkey()),
+        Some(&context.payer.pubkey()),
+        transfer_fee_basis_points,
+        maximum_fee,
+    )
+    .unwrap();
+
+    let init_mint_ix = spl_token_2022::instruction::initialize_mint(
+        &TOKEN_2022_PROGRAM_ID,
+        &mint.pubkey(),
+        &context.payer.pubkey(),
+        None,
+        6,
+    )
+    .unwrap();
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[create_account_ix, init_transfer_fee_ix, init_mint_ix],
+        Some(&context.payer.pubkey()),
+        &[&context.payer, mint],
+        context.svm.latest_blockhash(),
+    );
+
+    context
+        .svm
+        .send_transaction(transaction)
+        .expect("Failed to create mint with transfer fee");
 }
 
 pub fn get_or_create_associated_token_account_2022(

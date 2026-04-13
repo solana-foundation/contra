@@ -1459,7 +1459,8 @@ fn test_release_funds_token_2022_transfer_fee_success() {
 
     // The user receives release amount minus the transfer fee.
     // SPL Token 2022 uses ceiling division for fee calculation.
-    let expected_fee = ((RELEASE_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128 + 9_999) / 10_000) as u64;
+    let expected_fee =
+        (RELEASE_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128).div_ceil(10_000) as u64;
     let expected_received = RELEASE_AMOUNT - expected_fee;
     assert_eq!(
         user_balance_after,

@@ -499,15 +499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2028,19 +2019,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "contra-escrow-fuzz"
-version = "0.1.0"
-dependencies = [
- "arbitrary",
- "contra-escrow-program-client",
- "honggfuzz",
- "solana-sdk",
- "spl-associated-token-account 4.0.0",
- "spl-token 6.0.0",
- "tests-contra-escrow-program",
-]
-
-[[package]]
 name = "contra-escrow-program"
 version = "0.1.0"
 dependencies = [
@@ -2605,17 +2583,6 @@ name = "derive-where"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef941ded77d15ca19b40374869ac6000af1c9f2a4c0f3d4c70926287e6364a8f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.106",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3814,19 +3781,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
 dependencies = [
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "honggfuzz"
-version = "0.5.60"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d6510a410acedd7a7683b3a45dafdc5ccf3c72d6addaa373497005964fc4e23"
-dependencies = [
- "arbitrary",
- "lazy_static",
- "memmap2 0.9.8",
- "rustc_version",
- "semver",
 ]
 
 [[package]]

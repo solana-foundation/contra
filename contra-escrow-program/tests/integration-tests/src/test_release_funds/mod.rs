@@ -9,10 +9,12 @@ use crate::{
         assert_get_or_deposit, assert_get_or_release_funds, assert_get_or_reset_smt_root,
     },
     utils::{
-        assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        CONTRA_ESCROW_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR, INVALID_OPERATOR_ERROR,
-        INVALID_SMT_PROOF_ERROR, INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        assert_program_error, create_mint_2022_with_transfer_fee,
+        get_or_create_associated_token_account_2022, get_token_balance, set_mint,
+        setup_test_balances, TestContext, ATA_PROGRAM_ID, CONTRA_ESCROW_PROGRAM_ID,
+        INVALID_INSTRUCTION_DATA_ERROR, INVALID_OPERATOR_ERROR, INVALID_SMT_PROOF_ERROR,
+        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
 
@@ -1320,5 +1322,149 @@ fn test_release_funds_full_balance() {
     assert_eq!(
         balance, 0,
         "Instance ATA should be empty after full release"
+    );
+}
+
+// Transfer fee mints require TransferChecked for the SPL Token 2022 runtime to accept
+// the transfer. On release, the escrow sends `amount` and the user receives `amount - fee`
+// (the fee is withheld at the destination). The escrow is debited the full `amount`, so
+// the existing balance check (`escrow_after == escrow_before - amount`) stays correct.
+//
+// Mint config: 100 basis points (1%), max fee 1_000_000.
+// The escrow is seeded directly via mint_to (no deposit flow), so it starts with exactly
+// DEPOSIT_AMOUNT tokens — no fee is applied on mint_to.
+// Release: operator releases 500_000 from escrow; user receives 495_000 (fee withheld at
+// user ATA on release); escrow decreases by exactly 500_000.
+#[test]
+fn test_release_funds_token_2022_transfer_fee_success() {
+    const TRANSFER_FEE_BASIS_POINTS: u16 = 100; // 1%
+    const TRANSFER_FEE_MAX: u64 = 1_000_000;
+
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    // Initialize the mint through SPL Token 2022 so the fee extension is properly
+    // recognized by the runtime during transfers.
+    create_mint_2022_with_transfer_fee(
+        &mut context,
+        &mint,
+        TRANSFER_FEE_BASIS_POINTS,
+        TRANSFER_FEE_MAX,
+    );
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Create ATAs through SPL Token 2022 so they get the TransferFeeAmount extension,
+    // which is required for fee tracking on fee-bearing mints.
+    let user_ata =
+        get_or_create_associated_token_account_2022(&mut context, &user.pubkey(), &mint.pubkey());
+    let instance_ata =
+        get_or_create_associated_token_account_2022(&mut context, &instance_pda, &mint.pubkey());
+
+    // Fund the escrow directly via mint_to to simulate a prior deposit already being
+    // in the escrow (avoids a full deposit flow in this test).
+    let mint_to_ix = spl_token_2022::instruction::mint_to(
+        &TOKEN_2022_PROGRAM_ID,
+        &mint.pubkey(),
+        &instance_ata,
+        &context.payer.pubkey(),
+        &[],
+        DEPOSIT_AMOUNT,
+    )
+    .unwrap();
+    context
+        .send_transaction(mint_to_ix)
+        .expect("mint_to should succeed");
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
+    smt.insert(TRANSACTION_NONCE);
+    let new_withdrawal_root = smt.current_root();
+
+    let user_balance_before = get_token_balance(&mut context, &user_ata);
+    let instance_balance_before = get_token_balance(&mut context, &instance_ata);
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .new_withdrawal_root(new_withdrawal_root)
+        .transaction_nonce(TRANSACTION_NONCE)
+        .sibling_proofs(sibling_proofs)
+        .instruction();
+
+    context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[&operator],
+            false,
+            Some(1_200_000),
+        )
+        .expect("Release with transfer fee mint should succeed");
+
+    let user_balance_after = get_token_balance(&mut context, &user_ata);
+    let instance_balance_after = get_token_balance(&mut context, &instance_ata);
+
+    // The escrow is debited the full release amount — the fee is withheld at the
+    // destination (user ATA), not the source.
+    assert_eq!(
+        instance_balance_after,
+        instance_balance_before - RELEASE_AMOUNT,
+        "Escrow should be debited the full release amount"
+    );
+
+    // The user receives release amount minus the transfer fee.
+    // SPL Token 2022 uses ceiling division for fee calculation.
+    let expected_fee =
+        (RELEASE_AMOUNT as u128 * TRANSFER_FEE_BASIS_POINTS as u128).div_ceil(10_000) as u64;
+    let expected_received = RELEASE_AMOUNT - expected_fee;
+    assert_eq!(
+        user_balance_after,
+        user_balance_before + expected_received,
+        "User should receive release amount minus transfer fee"
     );
 }

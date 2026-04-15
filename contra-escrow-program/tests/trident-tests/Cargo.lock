@@ -1579,7 +1579,6 @@ dependencies = [
 name = "fuzz_tests"
 version = "0.1.0"
 dependencies = [
- "borsh 1.6.1",
  "contra-escrow-program-client",
  "solana-sdk",
  "spl-associated-token-account",

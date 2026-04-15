@@ -278,6 +278,14 @@ impl FuzzTest {
         let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
+        // Use a valid exclusion proof against the current (freshly reset) SMT so
+        // the transaction is rejected specifically by the stale-nonce/generation
+        // check, not by proof verification.
+        let (_, proofs) = self.smt.generate_exclusion_proof(stale_nonce);
+        let mut next = self.smt.clone();
+        next.insert(stale_nonce);
+        let new_root = next.current_root();
+
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
             .payer(self.trident.payer().pubkey())
@@ -290,9 +298,9 @@ impl FuzzTest {
             .instance_ata(instance_ata)
             .amount(1)
             .user(user)
-            .new_withdrawal_root([0xffu8; 32])
+            .new_withdrawal_root(new_root)
             .transaction_nonce(stale_nonce)
-            .sibling_proofs([0xddu8; 512])
+            .sibling_proofs(proofs)
             .instruction();
 
         let res = self

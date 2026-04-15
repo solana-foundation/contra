@@ -3,6 +3,7 @@ use {
     crate::stages::AccountSettlement,
     anyhow::Result,
     serde::{Deserialize, Serialize},
+    solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
     solana_sdk::{
         account::AccountSharedData, clock::UnixTimestamp, hash::Hash, pubkey::Pubkey,
         signature::Signature, transaction::SanitizedTransaction,
@@ -59,10 +60,9 @@ impl AccountsDB {
         &self,
         address: &Pubkey,
         limit: usize,
-        before: Option<&solana_sdk::signature::Signature>,
-        until: Option<&solana_sdk::signature::Signature>,
-    ) -> Result<Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>>
-    {
+        before: Option<&Signature>,
+        until: Option<&Signature>,
+    ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
         super::get_signatures_for_address::get_signatures_for_address(
             self, address, limit, before, until,
         )
@@ -681,11 +681,10 @@ mod tests {
 
         let _sig_old = store_tx_at_slot(&mut db, &to, 10).await;
         let sig_mid = store_tx_at_slot(&mut db, &to, 20).await;
-        let _sig_new = store_tx_at_slot(&mut db, &to, 30).await;
+        let sig_new = store_tx_at_slot(&mut db, &to, 30).await;
 
         // Combining both cursors must return exactly sig_mid (slot 20):
         // older than slot 30 (before=sig_new) AND as recent as slot 20 (until=sig_mid).
-        let sig_new = _sig_new;
         let results = db
             .get_signatures_for_address(&to, 10, Some(&sig_new), Some(&sig_mid))
             .await
@@ -693,6 +692,44 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].signature, sig_mid.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_unknown_before_cursor_returns_error() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        store_tx_at_slot(&mut db, &to, 10).await;
+
+        // A randomly generated signature that was never stored — resolve_cursor
+        // should catch this and return Err instead of silently returning empty.
+        let ghost_sig = solana_sdk::signature::Signature::new_unique();
+        let result = db
+            .get_signatures_for_address(&to, 10, Some(&ghost_sig), None)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("'before' is unavailable"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_unknown_until_cursor_returns_error() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        store_tx_at_slot(&mut db, &to, 10).await;
+
+        let ghost_sig = solana_sdk::signature::Signature::new_unique();
+        let result = db
+            .get_signatures_for_address(&to, 10, None, Some(&ghost_sig))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("'until' is unavailable"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

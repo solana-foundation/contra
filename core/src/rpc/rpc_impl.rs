@@ -38,8 +38,8 @@ use {
         config::{
             RpcAccountInfoConfig, RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
             RpcEpochConfig, RpcGetVoteAccountsConfig, RpcSendTransactionConfig,
-            RpcSignatureStatusConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
-            RpcTransactionConfig,
+            RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcSimulateTransactionConfig,
+            RpcSupplyConfig, RpcTransactionConfig,
         },
         response::{
             Response, RpcBlockhash, RpcBlockhashFeeCalculator, RpcPerfSample,
@@ -228,7 +228,7 @@ impl ContraRpcServer for ContraRpcImpl {
     async fn get_signatures_for_address(
         &self,
         address: String,
-        config: Option<serde_json::Value>,
+        config: Option<RpcSignaturesForAddressConfig>,
     ) -> RpcResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_signatures_for_address_impl(read_deps, address, config).await

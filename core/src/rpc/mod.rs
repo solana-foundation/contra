@@ -677,7 +677,10 @@ mod tests {
         }
 
         let deps = make_read_deps(db);
-        let config = serde_json::json!({ "limit": 2 });
+        let config = solana_rpc_client_types::config::RpcSignaturesForAddressConfig {
+            limit: Some(2),
+            ..Default::default()
+        };
         let sigs = get_signatures_for_address_impl::get_signatures_for_address_impl(
             &deps,
             from.pubkey().to_string(),

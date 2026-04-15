@@ -7,8 +7,8 @@ use {
         config::{
             RpcAccountInfoConfig, RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
             RpcEpochConfig, RpcGetVoteAccountsConfig, RpcSendTransactionConfig,
-            RpcSignatureStatusConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
-            RpcTransactionConfig,
+            RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcSimulateTransactionConfig,
+            RpcSupplyConfig, RpcTransactionConfig,
         },
         response::{
             Response, RpcBlockhash, RpcBlockhashFeeCalculator, RpcPerfSample,
@@ -152,7 +152,7 @@ pub trait ContraRpc {
     async fn get_signatures_for_address(
         &self,
         address: String,
-        config: Option<serde_json::Value>,
+        config: Option<RpcSignaturesForAddressConfig>,
     ) -> RpcResult<Vec<RpcConfirmedTransactionStatusWithSignature>>;
 
     /// Simulate a transaction

@@ -179,8 +179,18 @@ impl AccountsDB {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{create_test_block_info, start_test_postgres};
+    use crate::stages::AccountSettlement;
+    use crate::test_helpers::{
+        create_test_block_info, create_test_sanitized_transaction, start_test_postgres,
+    };
     use solana_sdk::account::AccountSharedData;
+    use solana_sdk::signature::{Keypair, Signer};
+    use solana_svm::account_loader::LoadedTransaction;
+    use solana_svm::transaction_execution_result::{
+        ExecutedTransaction, TransactionExecutionDetails,
+    };
+    use std::collections::HashMap;
+    use std::str::FromStr;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unsupported_url_scheme_rejected() {
@@ -412,8 +422,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn write_batch_stores_accounts_and_block() {
-        use crate::stages::AccountSettlement;
-
         let (mut db, _pg) = start_test_postgres().await;
 
         let pk = Pubkey::new_unique();
@@ -444,15 +452,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn get_signatures_for_address_found() {
-        use crate::test_helpers::create_test_sanitized_transaction;
-        use solana_sdk::signature::{Keypair, Signer};
-        use solana_svm::account_loader::LoadedTransaction;
-        use solana_svm::transaction_execution_result::{
-            ExecutedTransaction, TransactionExecutionDetails,
-        };
-        use solana_svm::transaction_processing_result::ProcessedTransaction;
-        use std::collections::HashMap;
-
         let (mut db, _pg) = start_test_postgres().await;
 
         let from = Keypair::new();
@@ -506,16 +505,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn get_signatures_for_address_same_slot_ordered_by_signature_desc() {
-        use crate::test_helpers::create_test_sanitized_transaction;
-        use solana_sdk::signature::Keypair;
-        use solana_svm::account_loader::LoadedTransaction;
-        use solana_svm::transaction_execution_result::{
-            ExecutedTransaction, TransactionExecutionDetails,
-        };
-        use solana_svm::transaction_processing_result::ProcessedTransaction;
-        use std::collections::HashMap;
-        use std::str::FromStr;
-
         let (mut db, _pg) = start_test_postgres().await;
 
         let to = Pubkey::new_unique();
@@ -595,15 +584,6 @@ mod tests {
         to: &Pubkey,
         slot: u64,
     ) -> solana_sdk::signature::Signature {
-        use crate::test_helpers::create_test_sanitized_transaction;
-        use solana_sdk::signature::Keypair;
-        use solana_svm::account_loader::LoadedTransaction;
-        use solana_svm::transaction_execution_result::{
-            ExecutedTransaction, TransactionExecutionDetails,
-        };
-        use solana_svm::transaction_processing_result::ProcessedTransaction;
-        use std::collections::HashMap;
-
         let from = Keypair::new();
         let tx = create_test_sanitized_transaction(&from, to, 1);
         let sig = *tx.signature();
@@ -734,8 +714,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn write_batch_deleted_account_removes_from_db() {
-        use crate::stages::AccountSettlement;
-
         let (mut db, _pg) = start_test_postgres().await;
 
         let pk = Pubkey::new_unique();

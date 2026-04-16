@@ -121,9 +121,10 @@ pub(crate) async fn start_test_redis() -> (
     crate::accounts::RedisAccountsDB,
     testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
 ) {
-    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{runners::AsyncRunner, ImageExt};
 
     let container = testcontainers_modules::redis::Redis::default()
+        .with_tag("7.0")
         .start()
         .await
         .unwrap();

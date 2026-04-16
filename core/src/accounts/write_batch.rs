@@ -218,7 +218,7 @@ pub(crate) async fn write_batch_redis(
     // we ZADD one entry to a per-address sorted set:
     //   key:    addr_sigs:{pubkey}
     //   score:  tx_slot as f64  (enables ZRANGE BYSCORE REV ordering by recency)
-    //   member: signature string (base58)
+    //   member: hex-encoded signature (preserves byte ordering for same-slot DESC sort)
     // Mirrors what address_signatures does in Postgres.
     // redis-rs 0.27: zadd(key, member, score) — member first, score second.
     let tx_count = transactions.len();
@@ -230,7 +230,7 @@ pub(crate) async fn write_batch_redis(
 
         for pubkey in transaction.message().account_keys().iter() {
             let addr_key = format!("addr_sigs:{}", pubkey);
-            pipe.zadd(addr_key, signature.to_string(), tx_slot as f64);
+            pipe.zadd(addr_key, hex::encode(signature.as_ref()), tx_slot as f64);
         }
     }
 

@@ -18,6 +18,7 @@ contra-metrics = { path = "../metrics" }
 contra-withdraw-program-client = { path = "../contra-withdraw-program/clients/rust" }
 enum_dispatch = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

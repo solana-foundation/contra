@@ -1962,6 +1962,7 @@ dependencies = [
  "contra-withdraw-program-client",
  "enum_dispatch",
  "futures 0.3.31",
+ "hex",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",

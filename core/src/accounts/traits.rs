@@ -182,6 +182,7 @@ mod tests {
     use crate::stages::AccountSettlement;
     use crate::test_helpers::{
         create_test_block_info, create_test_sanitized_transaction, start_test_postgres,
+        start_test_redis,
     };
     use solana_sdk::account::AccountSharedData;
     use solana_sdk::signature::{Keypair, Signer};
@@ -311,6 +312,25 @@ mod tests {
             db.store_block(create_test_block_info(slot, Hash::new_unique()))
                 .await
                 .unwrap();
+        }
+
+        let slots = db.get_blocks(0, Some(20)).await.unwrap();
+        assert_eq!(slots, vec![1, 3, 7, 10]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_blocks_redis_returns_slot_numbers_in_order() {
+        let (redis_raw, _redis) = start_test_redis().await;
+        let mut db = AccountsDB::Redis(redis_raw);
+
+        for slot in [3u64, 7, 1, 10] {
+            db.write_batch(
+                &[],
+                vec![],
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
         }
 
         let slots = db.get_blocks(0, Some(20)).await.unwrap();
@@ -710,6 +730,78 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("'until' is unavailable"));
+    }
+
+    /// Verifies that Redis and Postgres return same-slot signatures in identical order.
+    /// Redis stores members as hex-encoded signatures so that sorted-set lex ordering
+    /// matches Postgres's `ORDER BY signature DESC` (raw bytes). This test catches
+    /// any regression where the member encoding no longer preserves byte ordering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_redis_same_slot_ordering_matches_postgres() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let (redis_raw, _redis) = start_test_redis().await;
+        let mut redis_db = AccountsDB::Redis(redis_raw);
+
+        let to = Pubkey::new_unique();
+        let slot = 42u64;
+        let block_time = 1_700_000_000;
+
+        let make_processed = || {
+            ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+                loaded_transaction: LoadedTransaction {
+                    accounts: vec![],
+                    ..Default::default()
+                },
+                execution_details: TransactionExecutionDetails {
+                    status: Ok(()),
+                    log_messages: None,
+                    inner_instructions: None,
+                    return_data: None,
+                    executed_units: 0,
+                    accounts_data_len_delta: 0,
+                },
+                programs_modified_by_tx: HashMap::new(),
+            }))
+        };
+
+        let txs: Vec<_> = (0..10)
+            .map(|_| {
+                let kp = Keypair::new();
+                (create_test_sanitized_transaction(&kp, &to, 1), make_processed())
+            })
+            .collect();
+
+        let batch_refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, slot, block_time, p))
+            .collect();
+
+        let block = create_test_block_info(slot, Hash::new_unique());
+        pg_db
+            .write_batch(&[], batch_refs.clone(), Some(block.clone()))
+            .await
+            .unwrap();
+        redis_db
+            .write_batch(&[], batch_refs, Some(block))
+            .await
+            .unwrap();
+
+        let pg_sigs = pg_db
+            .get_signatures_for_address(&to, 10, None, None)
+            .await
+            .unwrap();
+        let redis_sigs = redis_db
+            .get_signatures_for_address(&to, 10, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(pg_sigs.len(), 10);
+        let pg_order: Vec<&str> = pg_sigs.iter().map(|s| s.signature.as_str()).collect();
+        let redis_order: Vec<&str> = redis_sigs.iter().map(|s| s.signature.as_str()).collect();
+        assert_eq!(
+            pg_order, redis_order,
+            "Redis and Postgres must return same-slot signatures in identical order"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

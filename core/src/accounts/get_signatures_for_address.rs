@@ -11,6 +11,14 @@ use {
     std::sync::Arc,
 };
 
+/// Decodes a hex-encoded signature string into a base58 string.
+/// Signatures are stored as hex in Redis sorted sets to preserve byte ordering.
+fn hex_to_b58(hex_str: &str) -> Result<String> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| anyhow::anyhow!("Invalid hex signature {}: {}", hex_str, e))?;
+    Ok(bs58::encode(bytes).into_string())
+}
+
 pub async fn get_signatures_for_address(
     db: &AccountsDB,
     address: &Pubkey,
@@ -230,7 +238,8 @@ async fn get_signatures_for_address_redis(
 
     // ZRANGE ... BYSCORE REV returns members with the highest score (most recent
     // slot) first, matching the Postgres ORDER BY slot DESC behaviour.
-    // Uses the modern ZRANGE form (Redis 6.2+), consistent with get_blocks_redis.
+    // Requires Redis 6.2+. Members are hex-encoded so same-slot lex ordering
+    // matches Postgres's ORDER BY signature DESC (raw bytes).
     let sig_strings: Vec<String> = redis::cmd("ZRANGE")
         .arg(&key)
         .arg("+inf")
@@ -248,15 +257,23 @@ async fn get_signatures_for_address_redis(
         return Ok(vec![]);
     }
 
+    let sig_b58_strings: Vec<String> = sig_strings
+        .iter()
+        .map(|s| hex_to_b58(s))
+        .collect::<Result<Vec<String>>>()?;
+
     // Fetch all transaction blobs in a single MGET to avoid N round trips.
-    let tx_keys: Vec<String> = sig_strings.iter().map(|s| format!("tx:{}", s)).collect();
+    let tx_keys: Vec<String> = sig_b58_strings
+        .iter()
+        .map(|s| format!("tx:{}", s))
+        .collect();
     let tx_blobs: Vec<Option<Vec<u8>>> = conn
         .mget(&tx_keys)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to MGET transactions for {}: {}", address, e))?;
 
-    let mut results = Vec::with_capacity(sig_strings.len());
-    for (sig_str, blob) in sig_strings.iter().zip(tx_blobs) {
+    let mut results = Vec::with_capacity(sig_b58_strings.len());
+    for (sig_str, blob) in sig_b58_strings.iter().zip(tx_blobs) {
         let data = match blob {
             Some(d) => d,
             // addr_sigs and tx:{sig} are written in the same pipeline MULTI/EXEC,

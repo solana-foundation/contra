@@ -767,7 +767,10 @@ mod tests {
         let txs: Vec<_> = (0..10)
             .map(|_| {
                 let kp = Keypair::new();
-                (create_test_sanitized_transaction(&kp, &to, 1), make_processed())
+                (
+                    create_test_sanitized_transaction(&kp, &to, 1),
+                    make_processed(),
+                )
             })
             .collect();
 

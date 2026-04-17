@@ -511,12 +511,18 @@ pub async fn execute_batch(
             // HashMap entries that regular-tx workers will never look up.
             let snapshot =
                 SnapshotCallback::from_bob(&execution_deps.bob, &accounts_to_preload, fee_payers);
-            execute_parallel(
-                &execution_deps.vm,
-                &snapshot,
-                &regular_transactions,
-                execution_deps.max_svm_workers,
-            )
+            // `execute_parallel` uses `std::thread::scope`, which parks this
+            // OS thread until the worker threads join. Because we're on a
+            // tokio worker, `block_in_place` lets tokio migrate other queued
+            // tasks off this thread first so the async pipeline isn't stalled.
+            tokio::task::block_in_place(|| {
+                execute_parallel(
+                    &execution_deps.vm,
+                    &snapshot,
+                    &regular_transactions,
+                    execution_deps.max_svm_workers,
+                )
+            })
         } else {
             // Sequential path: direct BOB access, no snapshot cost.
             let gasless_callback = GaslessCallback::new(&execution_deps.bob, fee_payers);

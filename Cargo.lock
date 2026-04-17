@@ -1939,6 +1939,7 @@ name = "contra-bench-tps"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "clap 4.5.48",
  "contra-core",
  "contra-escrow-program-client",

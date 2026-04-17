@@ -35,7 +35,6 @@ use {
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
     tracing::warn,
 };
@@ -118,20 +117,20 @@ pub fn build_destinations(
 }
 
 /// Async generator task: signs batches of SPL transfer transactions and pushes
-/// them onto the mpsc channel for sender tasks to consume.
+/// them onto the async_channel for sender tasks to consume.
 ///
 /// The generator cycles through `config.accounts` and `config.destinations`
 /// using a wrapping sequence counter so that no two consecutive batches use
 /// the same (source, destination) pair (assuming accounts > 1).
 ///
-/// Backpressure is provided by the bounded mpsc channel — when the channel is
+/// Backpressure is provided by the bounded channel — when the channel is
 /// full, `batch_tx.send()` awaits until a sender task pops a batch.
 ///
 /// Exits when `cancel` is triggered.
 pub async fn run_generator(
     config: Arc<BenchConfig>,
     state: Arc<BenchState>,
-    batch_tx: mpsc::Sender<Vec<Transaction>>,
+    batch_tx: async_channel::Sender<Vec<Transaction>>,
     batch_size: usize,
     cancel: CancellationToken,
 ) {
@@ -179,18 +178,20 @@ pub async fn run_generator(
     }
 }
 
-/// Async sender task: pops one batch at a time from the shared mpsc receiver
-/// and sends all transactions in the batch concurrently via the async
-/// `RpcClient` using `futures::future::join_all`.
+/// Async sender task: pops one batch at a time from a cloned receiver and
+/// sends all transactions in the batch concurrently via the async `RpcClient`
+/// using `futures::future::join_all`.
 ///
-/// Multiple sender tasks share a single `mpsc::Receiver` behind an
-/// `Arc<tokio::sync::Mutex>`, so each batch is consumed by exactly one task.
+/// Each sender owns its own `async_channel::Receiver` clone; the channel's
+/// built-in MPMC fan-out ensures every batch is delivered to exactly one
+/// task. No mutex is involved, so a cancellation signal interrupts every
+/// task immediately instead of cascading through a shared lock.
 ///
 /// `sent_count` is incremented by the number of transactions attempted
 /// (batch length), matching the BENCH_SENT_TOTAL metric.
 pub async fn run_sender_task(
     rpc_url: String,
-    batch_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<Transaction>>>>,
+    batch_rx: async_channel::Receiver<Vec<Transaction>>,
     cancel: CancellationToken,
     sent_count: Arc<AtomicU64>,
     sleep_ms: u64,
@@ -200,16 +201,12 @@ pub async fn run_sender_task(
     let rpc = RpcClient::new(rpc_url);
 
     loop {
-        // Acquire the receiver lock, then select on cancellation vs next batch.
-        let batch = {
-            let mut rx = batch_rx.lock().await;
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                msg = rx.recv() => match msg {
-                    Some(b) => b,
-                    None => break, // channel closed — generator exited
-                }
+        let batch = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            msg = batch_rx.recv() => match msg {
+                Ok(b) => b,
+                Err(_) => break, // channel closed — generator exited
             }
         };
 

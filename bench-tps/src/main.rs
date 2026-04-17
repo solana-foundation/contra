@@ -128,13 +128,14 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
         destinations,
     });
 
-    // Bounded mpsc channel replaces the old Mutex<VecDeque> + Condvar queue.
+    // Bounded async_channel replaces the old Mutex<VecDeque> + Condvar queue.
     // The channel capacity provides backpressure — the generator awaits when
-    // all slots are occupied, preventing unbounded memory growth.
-    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<
-        Vec<solana_sdk::transaction::Transaction>,
-    >(types::MAX_QUEUE_DEPTH);
-    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+    // all slots are occupied, preventing unbounded memory growth. The MPMC
+    // fan-out lets every sender task hold its own cloned receiver, so
+    // cancellation interrupts every task immediately without the shared-mutex
+    // cascade that `tokio::sync::mpsc` would require.
+    let (batch_tx, batch_rx) =
+        async_channel::bounded::<Vec<solana_sdk::transaction::Transaction>>(types::MAX_QUEUE_DEPTH);
 
     let cancel = CancellationToken::new();
 
@@ -171,12 +172,16 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
     let mut sender_handles = Vec::with_capacity(args.threads);
     for _ in 0..args.threads {
         let rpc_url = args.rpc_url.clone();
-        let rx = Arc::clone(&batch_rx);
+        let rx = batch_rx.clone();
         let c = cancel.clone();
         let sc = Arc::clone(&sent_count);
         let sleep_ms = args.sender_sleep_ms;
         sender_handles.push(tokio::spawn(run_sender_task(rpc_url, rx, c, sc, sleep_ms)));
     }
+    // Drop the main-task receiver clone; each sender task owns its own. When
+    // the generator exits and drops batch_tx the channel closes and every
+    // sender's recv() returns Err immediately.
+    drop(batch_rx);
 
     info!(
         duration_secs = args.duration,

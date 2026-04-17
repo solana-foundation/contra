@@ -125,7 +125,7 @@ async fn write_batch_postgres(
 
     // ── Accounts: bulk DELETE pre-serialized buffers ──
     if !delete_pubkeys.is_empty() {
-        sqlx::query("DELETE FROM accounts WHERE pubkey = ANY($1)")
+        sqlx::query("DELETE FROM accounts WHERE pubkey = ANY($1::bytea[])")
             .bind(&delete_pubkeys)
             .execute(&mut *tx)
             .await

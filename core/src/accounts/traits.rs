@@ -428,6 +428,27 @@ mod tests {
         assert_eq!(db.get_latest_blockhash().await.unwrap(), bh);
     }
 
+    /// A fully-empty batch (no accounts, no transactions, no block) must be a
+    /// silent no-op: no BEGIN/COMMIT round-trip, no error, no observable state
+    /// change. Hot path for slots that produce no work, and a regression test
+    /// for the short-circuit that skips opening a Postgres transaction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_batch_empty_inputs_is_noop() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        // Seed a known blockhash so we can detect any unintended mutation.
+        let seeded_bh = Hash::new_unique();
+        db.write_batch(&[], vec![], Some(create_test_block_info(7, seeded_bh)))
+            .await
+            .unwrap();
+        assert_eq!(db.get_latest_blockhash().await.unwrap(), seeded_bh);
+
+        // Empty batch must not error and must not mutate any observable state.
+        db.write_batch(&[], vec![], None).await.unwrap();
+        assert_eq!(db.get_latest_blockhash().await.unwrap(), seeded_bh);
+        assert!(db.get_block(7).await.is_some());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_batch_deleted_account_removes_from_db() {
         use crate::stages::AccountSettlement;

@@ -19,7 +19,6 @@ use {
     solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput,
     std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, task::JoinHandle},
-    tokio_mpmc,
     tokio_util::sync::CancellationToken,
     tracing::{error, info, warn},
 };
@@ -42,6 +41,12 @@ pub struct NodeConfig {
     pub sigverify_workers: usize,
     pub max_connections: usize,
     pub max_tx_per_batch: usize,
+    pub batch_deadline_ms: u64,
+    pub batch_channel_capacity: usize,
+    /// Max parallel SVM worker threads per batch (including the calling thread).
+    /// Set to 1 to disable intra-batch parallelism entirely. Effective only for
+    /// batches ≥ `MIN_PARALLEL_BATCH_SIZE`; smaller batches always run sequentially.
+    pub max_svm_workers: usize,
     pub accountsdb_connection_url: String,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
     pub transaction_expiration_ms: u64,
@@ -67,6 +72,9 @@ impl Default for NodeConfig {
             sigverify_workers: 4,
             max_connections: 100,
             max_tx_per_batch: 64,
+            batch_deadline_ms: 10,
+            batch_channel_capacity: 16,
+            max_svm_workers: 8,
             accountsdb_connection_url: "postgresql://user:password@localhost:5432/contra"
                 .to_string(),
             admin_keys: vec![],               // No admin keys by default
@@ -121,13 +129,14 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
             // Create the sigverify channel (needed for NodeHandles in all modes)
             let (sigverify_tx, sigverify_rx) =
-                tokio_mpmc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
+                async_channel::bounded::<SanitizedTransaction>(config.sigverify_queue_size);
 
             // Create sequencer channel (unbounded mpsc for single consumer)
             let (sequencer_tx, sequencer_rx) = mpsc::unbounded_channel::<SanitizedTransaction>();
 
-            // Create batch channel between sequencer and executor (unbounded for pipelining)
-            let (batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
+            // Create batch channel between sequencer and executor (bounded for back-pressure)
+            let (batch_tx, batch_rx) =
+                mpsc::channel::<ConflictFreeBatch>(config.batch_channel_capacity);
 
             // Create execution results channel between executor and settler (unbounded for pipelining)
             let (execution_results_tx, execution_results_rx) = mpsc::unbounded_channel::<(
@@ -179,6 +188,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // Start sequencer (produces conflict-free batches)
             let sequence = start_sequence_worker(crate::stages::SequencerArgs {
                 max_tx_per_batch: config.max_tx_per_batch,
+                batch_deadline_ms: config.batch_deadline_ms,
                 rx: sequencer_rx,
                 batch_tx,
                 shutdown_token: shutdown_token.clone(),
@@ -195,6 +205,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
+                max_svm_workers: config.max_svm_workers,
             })
             .await;
             write_workers.push(execution);
@@ -250,6 +261,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
         info!("  Sigverify workers: {}", config.sigverify_workers);
         info!("  Max transactions per batch: {}", config.max_tx_per_batch);
+        info!("  Max SVM workers: {}", config.max_svm_workers);
     }
     info!("  Max connections: {}", config.max_connections);
 

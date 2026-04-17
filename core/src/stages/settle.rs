@@ -214,10 +214,23 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 _ => None,
             };
             let mut processing_results = Vec::new();
+
+            // Tick-driven block production: the blocktime tick is the sole
+            // trigger for producing blocks.  Between ticks, execution results
+            // accumulate in `processing_results`.  On each tick, everything is
+            // flushed in a single settle call — could be 0 txs, could be 2000.
+            //
+            // MissedTickBehavior::Delay ensures that if a settle takes longer
+            // than blocktime_ms, the next tick is pushed out rather than
+            // bursting to catch up.  This guarantees:
+            //   - Exactly one block per tick
+            //   - Ticks are never faster than blocktime_ms
+            //   - Under slow DB, rate degrades gracefully instead of bursting
             let mut blocktime_interval = tokio::time::interval_at(
                 Instant::now() + Duration::from_millis(SETTLE_START_DELAY_MS),
                 Duration::from_millis(blocktime_ms),
             );
+            blocktime_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             // Performance sample tracking
             let mut perf_sample_interval = tokio::time::interval_at(
@@ -228,32 +241,67 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             let mut perf_num_transactions = 0u64;
 
             loop {
+                // `biased` keeps block cadence crisp under sustained load:
+                // shutdown is handled promptly, the blocktime tick is polled
+                // before the (almost-always-ready) result-buffer arm so a
+                // tick is never delayed by an arbitrary number of recvs, and
+                // MissedTickBehavior::Delay won't slide the schedule out.
                 tokio::select! {
-                    // Settle transactions every BLOCKTIME_MS
-                    _ = blocktime_interval.tick() => {
-                        if let Ok(settle_result) = settle_transactions(last_block.clone(), &mut accounts_db, redis_db.as_mut(), &processing_results).await {
-                            // Track performance metrics
-                            let num_txs = processing_results.len() as u64;
-                            perf_num_transactions += num_txs;
-                            metrics.settler_txs_settled(processing_results.len());
+                    biased;
 
-                            last_block = Some(LastBlock {
-                                slot: settle_result.slot,
-                                blockhash: settle_result.blockhash,
-                            });
-                            processing_results.clear();
-                            debug!("Settled {} transactions in slot {}, blockhash {}", settle_result.account_settlements.len(), settle_result.slot, settle_result.blockhash);
-                            if let Err(e) = settled_accounts_tx.send(settle_result.account_settlements) {
-                                warn!("Failed to send settled accounts: {:?}", e);
+                    // Handle shutdown signal
+                    _ = shutdown_token.cancelled() => {
+                        info!("Settle worker received shutdown signal");
+                        break;
+                    }
+
+                    // Blocktime tick: unconditionally produce a block with
+                    // whatever has accumulated since the last tick.
+                    _ = blocktime_interval.tick() => {
+                        let num_results = processing_results.len();
+                        match settle_transactions(
+                            last_block.clone(),
+                            &mut accounts_db,
+                            redis_db.as_mut(),
+                            &processing_results,
+                            &metrics,
+                        )
+                        .await
+                        {
+                            Ok(settle_result) => {
+                                perf_num_transactions += num_results as u64;
+                                if num_results > 0 {
+                                    metrics.settler_txs_settled(num_results);
+                                }
+
+                                last_block = Some(LastBlock {
+                                    slot: settle_result.slot,
+                                    blockhash: settle_result.blockhash,
+                                });
+                                processing_results.clear();
+                                debug!(
+                                    "Settled {} transactions in slot {}, blockhash {}",
+                                    num_results,
+                                    settle_result.slot,
+                                    settle_result.blockhash
+                                );
+                                if let Err(e) =
+                                    settled_accounts_tx.send(settle_result.account_settlements)
+                                {
+                                    warn!("Failed to send settled accounts: {:?}", e);
+                                    break;
+                                }
+                                if let Err(e) =
+                                    settled_blockhashes_tx.send(settle_result.blockhash)
+                                {
+                                    warn!("Failed to send settled blockhashes: {:?}", e);
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                error!("Failed to settle transactions");
                                 break;
                             }
-                            if let Err(e) = settled_blockhashes_tx.send(settle_result.blockhash) {
-                                warn!("Failed to send settled blockhashes: {:?}", e);
-                                break;
-                            }
-                        } else {
-                            error!("Failed to settle transactions");
-                            break;
                         }
                     }
 
@@ -285,7 +333,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         }
                     }
 
-                    // Process execution results
+                    // Accumulate execution results — never flush here, just buffer.
                     result = execution_results_rx.recv() => {
                         match result {
                             Some((svm_output, transactions)) => {
@@ -304,12 +352,38 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         }
                     }
 
-                    // Handle shutdown signal
-                    _ = shutdown_token.cancelled() => {
-                        info!("Settle worker received shutdown signal");
-                        break;
+                }
+            }
+
+            // Flush any results buffered between the last tick and the loop
+            // exit — without this, the final partial block is silently dropped
+            if !processing_results.is_empty() {
+                let num_results = processing_results.len();
+                match settle_transactions(
+                    last_block.clone(),
+                    &mut accounts_db,
+                    redis_db.as_mut(),
+                    &processing_results,
+                    &metrics,
+                )
+                .await
+                {
+                    Ok(settle_result) => {
+                        if num_results > 0 {
+                            metrics.settler_txs_settled(num_results);
+                        }
+                        let _ = settled_accounts_tx.send(settle_result.account_settlements);
+                        let _ = settled_blockhashes_tx.send(settle_result.blockhash);
+                        info!(
+                            "Final flush settled {} buffered transactions in slot {}",
+                            num_results, settle_result.slot
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Final flush failed (buffered txs lost): {:?}", e);
                     }
                 }
+                processing_results.clear();
             }
 
             info!("Settle worker stopped");
@@ -341,7 +415,9 @@ async fn settle_transactions(
     accounts_db: &mut AccountsDB,
     redis_db: Option<&mut RedisAccountsDB>,
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
+    metrics: &crate::stage_metrics::SharedMetrics,
 ) -> Result<SettleResult, Box<dyn std::error::Error>> {
+    let t_total = tokio::time::Instant::now();
     let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> = HashMap::new();
 
     // Determine block time
@@ -369,7 +445,8 @@ async fn settle_transactions(
             (Hash::default(), 0, Hash::default(), 0)
         };
 
-    // Start collecting transaction signatures for this block
+    // Phase 1: build account maps and transaction lists
+    let t_processing_start = tokio::time::Instant::now();
     let mut block_transaction_signatures = Vec::new();
     let mut block_transaction_recent_blockhashes = Vec::new();
     let mut transactions_for_db = Vec::new();
@@ -434,6 +511,8 @@ async fn settle_transactions(
         }
     }
 
+    let t_processing_ms = t_processing_start.elapsed().as_secs_f64() * 1000.0;
+
     // Convert final_accounts to Vec for batch write
     let accounts_vec: Vec<(Pubkey, AccountSettlement)> =
         final_accounts_actual.into_iter().collect();
@@ -451,7 +530,8 @@ async fn settle_transactions(
         transaction_recent_blockhashes: block_transaction_recent_blockhashes,
     };
 
-    // Write to Postgres (source of truth, fatal on failure)
+    // Phase 2: Postgres write (source of truth, fatal on failure)
+    let t_db_start = tokio::time::Instant::now();
     accounts_db
         .write_batch(
             &accounts_vec,
@@ -459,8 +539,10 @@ async fn settle_transactions(
             Some(block_info.clone()),
         )
         .await?;
+    let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Write to Redis best-effort (non-fatal)
+    // Phase 3: Redis write best-effort (non-fatal)
+    let t_redis_start = tokio::time::Instant::now();
     if let Some(redis) = redis_db {
         if let Err(e) = crate::accounts::write_batch::write_batch_redis(
             redis,
@@ -476,6 +558,17 @@ async fn settle_transactions(
             );
         }
     }
+    let t_redis_ms = t_redis_start.elapsed().as_secs_f64() * 1000.0;
+    let t_total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+
+    let num_txs = processing_results.len();
+    debug!(
+        "settle_batch complete: txs={} | processing={:.3}ms db_write={:.3}ms redis={:.3}ms total={:.3}ms",
+        num_txs, t_processing_ms, t_db_ms, t_redis_ms, t_total_ms
+    );
+    metrics.settler_settle_duration_ms(t_total_ms);
+    metrics.settler_db_write_duration_ms(t_db_ms);
+    metrics.settler_processing_duration_ms(t_processing_ms);
 
     Ok(SettleResult {
         slot: next_slot,
@@ -489,7 +582,7 @@ mod tests {
     use super::*;
 
     use crate::{
-        stage_metrics::NoopMetrics,
+        stage_metrics::{NoopMetrics, SharedMetrics},
         test_helpers::{
             create_test_sanitized_transaction, postgres_container_url, start_test_postgres,
             start_test_redis,
@@ -533,7 +626,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_empty_results() {
         let (mut db, _pg) = start_test_postgres().await;
-        let result = settle_transactions(None, &mut db, None, &[]).await;
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await;
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.slot, 0);
@@ -545,16 +645,30 @@ mod tests {
     async fn test_settle_increments_slot() {
         let (mut db, _pg) = start_test_postgres().await;
 
-        let r1 = settle_transactions(None, &mut db, None, &[]).await.unwrap();
+        let r1 = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
         assert_eq!(r1.slot, 0);
 
         let last = LastBlock {
             slot: r1.slot,
             blockhash: r1.blockhash,
         };
-        let r2 = settle_transactions(Some(last), &mut db, None, &[])
-            .await
-            .unwrap();
+        let r2 = settle_transactions(
+            Some(last),
+            &mut db,
+            None,
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
         assert_eq!(r2.slot, 1);
         assert_ne!(r2.blockhash, Hash::default());
     }
@@ -573,9 +687,15 @@ mod tests {
         let processed = make_executed(vec![(account_pk, account_data)]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // Should have stored a block, and the transaction signature
         let block = db.get_block(result.slot).await;
@@ -605,9 +725,15 @@ mod tests {
         ]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // Writable accounts should be in settlements, readonly (system program) should not
         let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
@@ -630,9 +756,15 @@ mod tests {
         let processed = make_executed(vec![(pk, AccountSharedData::default())]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // The deleted account should be flagged
         let settlement = result.account_settlements.iter().find(|(k, _)| k == &pk);
@@ -655,9 +787,15 @@ mod tests {
             tx,
         )];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // Failed transactions still get their signature recorded in the block
         let block = db.get_block(result.slot).await.unwrap();
@@ -681,9 +819,15 @@ mod tests {
         )]);
         let results1: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed1), tx1)];
 
-        let r1 = settle_transactions(None, &mut db, None, &results1)
-            .await
-            .unwrap();
+        let r1 = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results1,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
         assert_eq!(r1.slot, 0);
 
         // Settle second batch, chaining from first
@@ -701,9 +845,15 @@ mod tests {
         )]);
         let results2: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed2), tx2)];
 
-        let r2 = settle_transactions(Some(last), &mut db, None, &results2)
-            .await
-            .unwrap();
+        let r2 = settle_transactions(
+            Some(last),
+            &mut db,
+            None,
+            &results2,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
         assert_eq!(r2.slot, 1);
         assert_ne!(r2.blockhash, r1.blockhash);
 
@@ -736,9 +886,15 @@ mod tests {
         }));
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(fees_only), tx)];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // Signature should be recorded in the block
         let block = db.get_block(result.slot).await.unwrap();
@@ -1031,9 +1187,15 @@ mod tests {
         let results: Vec<(TransactionProcessingResult, _)> =
             vec![(Ok(executed), tx1), (Ok(fees_only), tx2), (Err(err), tx3)];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // All three signatures should be recorded in the block
         assert_eq!(
@@ -1071,9 +1233,15 @@ mod tests {
         )]);
         let results1 = vec![(Ok(executed1), tx1)];
 
-        let r1 = settle_transactions(None, &mut db, None, &results1)
-            .await
-            .unwrap();
+        let r1 = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results1,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
         assert_eq!(r1.slot, 0);
 
         let block1 = db.get_block(0).await.unwrap();
@@ -1096,9 +1264,15 @@ mod tests {
         )]);
         let results2 = vec![(Ok(executed2), tx2)];
 
-        let r2 = settle_transactions(Some(last), &mut db, None, &results2)
-            .await
-            .unwrap();
+        let r2 = settle_transactions(
+            Some(last),
+            &mut db,
+            None,
+            &results2,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
         assert_eq!(r2.slot, 1);
 
         let block2 = db.get_block(1).await.unwrap();
@@ -1155,9 +1329,15 @@ mod tests {
             (Ok(executed3), tx3),
         ];
 
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         let block = db.get_block(result.slot).await.unwrap();
         assert_eq!(
@@ -1207,9 +1387,15 @@ mod tests {
         }));
 
         let results = vec![(Ok(executed), tx)];
-        let result = settle_transactions(None, &mut db, None, &results)
-            .await
-            .unwrap();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // Both writable accounts (payer and recipient) should be settled
         assert_eq!(
@@ -1242,9 +1428,15 @@ mod tests {
             pk,
             AccountSharedData::new(500, 0, &Pubkey::new_unique()),
         )]);
-        settle_transactions(None, &mut pg_db, None, &[(Ok(executed), tx)])
-            .await
-            .unwrap();
+        settle_transactions(
+            None,
+            &mut pg_db,
+            None,
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        )
+        .await
+        .unwrap();
 
         // Get the PostgresAccountsDB variant for warm_redis_cache
         let AccountsDB::Postgres(ref pg) = pg_db else {

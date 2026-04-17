@@ -57,6 +57,12 @@ BENCH_ENV="${BENCH_DIR}/.env"
 #                       script refreshes them to reload scrape config and
 #                       dashboards (safe; does not delete data volumes).
 #
+# --no-teardown         Skip `docker compose down` at exit.  Containers keep
+#                       running after the bench finishes (or is interrupted)
+#                       so logs and metrics can be collected for offline
+#                       analysis.  Stop them manually afterwards with
+#                       `docker compose -f <repo>/docker-compose.yml down`.
+#
 # --contra-threads N  Pin Contra service containers to the first N CPU cores
 #                     and the bench binary to the remaining cores.  When
 #                     omitted the default 75% / 25% split is used.
@@ -67,6 +73,7 @@ BENCH_ENV="${BENCH_DIR}/.env"
 REBUILD=0
 CLEAN=1          # default: always wipe volumes because validator resets each run
 REFRESH_METRICS=1
+TEARDOWN=1       # default: tear down containers on exit
 CONTRA_THREADS=""   # explicit core count for services (optional)
 BENCH_ARGS=()
 SKIP_NEXT=0
@@ -80,6 +87,7 @@ for arg in "$@"; do
         --rebuild)        REBUILD=1 ;;
         --no-clean)       CLEAN=0 ;;
         --no-refresh-metrics) REFRESH_METRICS=0 ;;
+        --no-teardown)    TEARDOWN=0 ;;
         --contra-threads) SKIP_NEXT=1 ;;  # value is the next token
         *)                BENCH_ARGS+=("${arg}") ;;
     esac
@@ -673,6 +681,12 @@ cleanup() {
     [ "${_CLEANUP_DONE}" -eq 1 ] && return
     _CLEANUP_DONE=1
     echo ""
+    if [ "${TEARDOWN}" -eq 0 ]; then
+        echo "Skipping teardown (--no-teardown). Containers are still running."
+        echo "  Inspect logs:  docker logs <container>"
+        echo "  Stop later:    docker compose -f ${REPO_ROOT}/docker-compose.yml down"
+        return
+    fi
     echo "Tearing down all services..."
     "${COMPOSE[@]}" down 2>/dev/null || true
     echo "Done."

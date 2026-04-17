@@ -10,29 +10,42 @@ use {
         stages::AccountSettlement,
         transactions::is_admin_instruction,
         vm::{
-            admin::AdminVm, gasless_callback::GaslessCallback,
+            admin::AdminVm,
+            gasless_callback::{GaslessCallback, SnapshotCallback},
             gasless_rent_collector::GaslessRentCollector,
         },
     },
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
     solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::SanitizedTransaction},
-    solana_svm::transaction_processor::{
-        LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
-        TransactionProcessingConfig, TransactionProcessingEnvironment,
+    solana_svm::{
+        transaction_error_metrics::TransactionErrorMetrics,
+        transaction_processor::{
+            LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
+            TransactionProcessingConfig, TransactionProcessingEnvironment,
+        },
     },
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
+    solana_timings::ExecuteTimings,
     std::{
         collections::HashSet,
         sync::{Arc, RwLock},
+        time::{Duration, Instant},
     },
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
     tracing::{debug, error, info},
 };
 
+/// Minimum transactions per worker to justify taking the parallel path.
+/// The parallel gate is `regular_txs >= max_svm_workers * MIN_PARALLEL_BATCH_FACTOR`,
+/// so each worker ends up with at least this many transactions. Below that,
+/// thread-spawn + snapshot-build overhead eats the parallel win — keep the
+/// sequential GaslessCallback path.
+const MIN_PARALLEL_BATCH_FACTOR: usize = 4;
+
 pub struct ExecutionArgs {
-    pub batch_rx: mpsc::UnboundedReceiver<ConflictFreeBatch>,
+    pub batch_rx: mpsc::Receiver<ConflictFreeBatch>,
     pub settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
     pub execution_results_tx: mpsc::UnboundedSender<(
         LoadAndExecuteSanitizedTransactionsOutput,
@@ -41,12 +54,19 @@ pub struct ExecutionArgs {
     pub accountsdb_connection_url: String,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
+    /// Max parallel SVM workers per batch (including calling thread).
+    /// 1 disables parallelism; >=2 enables it once the batch is large enough
+    /// to give each worker ≥ MIN_PARALLEL_BATCH_FACTOR transactions.
+    pub max_svm_workers: usize,
 }
 
 pub struct ExecutionDeps {
     pub bob: BOB,
     pub vm: TransactionBatchProcessor<ContraForkGraph>,
     pub admin_vm: AdminVm,
+    /// Effective parallel-worker cap used by `execute_parallel`. Captured at
+    /// worker startup so hot-path batch execution never touches shared config.
+    pub max_svm_workers: usize,
 
     // Must prevent this from being dropped
     _fork_graph: Arc<RwLock<ContraForkGraph>>,
@@ -67,14 +87,19 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         accountsdb_connection_url,
         shutdown_token,
         metrics,
+        max_svm_workers,
     } = args;
     let handle = tokio::spawn(async move {
-        info!("Execution worker started");
+        info!(
+            "Execution worker started (max_svm_workers={})",
+            max_svm_workers
+        );
 
         let accounts_db = AccountsDB::new(&accountsdb_connection_url, true)
             .await
             .unwrap();
-        let mut execution_deps = get_execution_deps(accounts_db, settled_accounts_rx).await;
+        let mut execution_deps =
+            get_execution_deps(accounts_db, settled_accounts_rx, max_svm_workers).await;
 
         let mut total_transactions_executed = 0u64;
         let mut total_batches_processed = 0u64;
@@ -91,6 +116,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             let execution_result = execute_batch(
                                 batch,
                                 &mut execution_deps,
+                                &metrics,
                             ).await;
 
                             let num_transactions_executed = execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
@@ -157,6 +183,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
 pub async fn get_execution_deps(
     accounts_db: AccountsDB,
     settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
+    max_svm_workers: usize,
 ) -> ExecutionDeps {
     let bob = BOB::new(accounts_db, settled_accounts_rx).await;
     let feature_set = SVMFeatureSet::all_enabled();
@@ -168,14 +195,158 @@ pub async fn get_execution_deps(
         bob,
         vm,
         admin_vm,
+        max_svm_workers,
         _fork_graph,
     }
+}
+
+/// Execute a chunk of transactions on the shared SVM with a dedicated
+/// per-thread processing environment.
+///
+/// Each thread creates its own `TransactionProcessingEnvironment` because it
+/// contains `Option<&dyn SVMRentCollector>` and that trait has no `Sync`
+/// supertrait — so the environment can't be shared across threads. The
+/// environment is trivially cheap to construct, so per-thread construction has
+/// negligible cost compared to the SVM call it frames.
+fn execute_chunk(
+    vm: &TransactionBatchProcessor<ContraForkGraph>,
+    callback: &SnapshotCallback,
+    transactions: &[SanitizedTransaction],
+) -> LoadAndExecuteSanitizedTransactionsOutput {
+    let gasless_rent_collector = GaslessRentCollector::new();
+    let processing_environment = TransactionProcessingEnvironment {
+        blockhash: Hash::default(),
+        blockhash_lamports_per_signature: 0,
+        feature_set: SVMFeatureSet::all_enabled(),
+        rent_collector: Some(
+            &gasless_rent_collector
+                as &dyn solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
+        ),
+        ..Default::default()
+    };
+    let processing_config = TransactionProcessingConfig::default();
+    let check_results = get_transaction_check_results(transactions.len());
+
+    vm.load_and_execute_sanitized_transactions(
+        callback,
+        transactions,
+        check_results,
+        &processing_environment,
+        &processing_config,
+    )
+}
+
+/// Merge chunk outputs into a single `LoadAndExecuteSanitizedTransactionsOutput`.
+///
+/// - `processing_results` are concatenated in chunk order, preserving the
+///   original transaction ordering (chunks were built via `.chunks()` so
+///   iterating them in order gives transactions in their original order).
+/// - `error_metrics` and `execute_timings` are accumulated across chunks.
+/// - `balance_collector` is always `None` — we don't use balance recording.
+///
+/// The destination `Vec` is preallocated to the exact total length to avoid
+/// reallocations during the extend loop.
+fn merge_svm_outputs(
+    chunk_outputs: Vec<LoadAndExecuteSanitizedTransactionsOutput>,
+) -> LoadAndExecuteSanitizedTransactionsOutput {
+    let total_len: usize = chunk_outputs
+        .iter()
+        .map(|o| o.processing_results.len())
+        .sum();
+
+    let mut merged = LoadAndExecuteSanitizedTransactionsOutput {
+        processing_results: Vec::with_capacity(total_len),
+        error_metrics: TransactionErrorMetrics::default(),
+        execute_timings: ExecuteTimings::default(),
+        balance_collector: None,
+    };
+
+    for output in chunk_outputs {
+        merged.processing_results.extend(output.processing_results);
+        merged.error_metrics.accumulate(&output.error_metrics);
+        merged.execute_timings.accumulate(&output.execute_timings);
+    }
+
+    merged
+}
+
+/// Execute regular transactions across multiple worker threads.
+///
+/// Correctness:Within a `ConflictFreeBatch`, transactions have disjoint
+/// write sets by construction. Nothing mutates shared state
+/// during execution, so parallel chunks cannot conflict.
+///
+/// Threading model: `std::thread::scope` — stdlib-only, no dependency,
+/// allows borrowing non-`'static` data (the VM reference, the snapshot).
+/// The calling thread processes `chunks[0]` itself, so only `N-1` OS
+/// threads are spawned for `N` chunks. On Linux, spawn cost is ~15µs per
+/// thread.
+///
+/// Preallocation: `chunks` Vec capacity set to exactly `num_workers`,
+/// `outputs` Vec capacity set to exactly `num_workers`. No reallocations.
+///
+/// Caller must ensure `max_svm_workers >= 2` — this function assumes the
+/// parallel path is wanted and will always split into at least 2 chunks.
+fn execute_parallel(
+    vm: &TransactionBatchProcessor<ContraForkGraph>,
+    snapshot: &SnapshotCallback,
+    transactions: &[SanitizedTransaction],
+    max_svm_workers: usize,
+) -> LoadAndExecuteSanitizedTransactionsOutput {
+    debug_assert!(
+        max_svm_workers >= 2,
+        "execute_parallel requires max_svm_workers >= 2; gate this at the call site"
+    );
+    // Pick worker count: at least 2 (caller already gates on max_svm_workers>=2),
+    // at most max_svm_workers (config cap), and proportional to the batch so
+    // each worker gets ~MIN_PARALLEL_BATCH_FACTOR transactions.
+    let num_workers = (transactions.len() / MIN_PARALLEL_BATCH_FACTOR).clamp(2, max_svm_workers);
+    // Ceiling division so the last chunk is the smallest (not largest).
+    let chunk_size = transactions.len().div_ceil(num_workers);
+
+    // Collect chunk slices first so we can index them by worker id.
+    // Preallocate exactly — chunks.len() == num_workers in the common case
+    // (could be one less if transactions.len() divides evenly and the last
+    // chunk would be empty; .chunks() skips empty chunks).
+    let mut chunks: Vec<&[SanitizedTransaction]> = Vec::with_capacity(num_workers);
+    chunks.extend(transactions.chunks(chunk_size));
+
+    // Defensive: .chunks(n) on a non-empty slice never yields zero chunks
+    // when n >= 1, so this holds. Guard anyway for clarity.
+    debug_assert!(!chunks.is_empty(), "non-empty batch must produce ≥1 chunk");
+
+    let chunk_outputs: Vec<LoadAndExecuteSanitizedTransactionsOutput> = std::thread::scope(|s| {
+        // Spawn workers for chunks[1..]; chunks[0] runs on the calling thread.
+        // This saves one thread spawn and keeps a hot CPU doing real work.
+        let mut handles = Vec::with_capacity(chunks.len().saturating_sub(1));
+        for chunk in &chunks[1..] {
+            let chunk: &[SanitizedTransaction] = chunk;
+            handles.push(s.spawn(move || execute_chunk(vm, snapshot, chunk)));
+        }
+
+        // Do chunks[0] inline on this thread while workers run.
+        let mut outputs: Vec<LoadAndExecuteSanitizedTransactionsOutput> =
+            Vec::with_capacity(chunks.len());
+        outputs.push(execute_chunk(vm, snapshot, chunks[0]));
+
+        // Join in spawn order to preserve original transaction ordering.
+        // A panic in any worker propagates to the executor — we want the
+        // process to crash rather than silently drop transactions.
+        for handle in handles {
+            outputs.push(handle.join().expect("SVM worker thread panicked"));
+        }
+        outputs
+    });
+
+    merge_svm_outputs(chunk_outputs)
 }
 
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
+    metrics: &SharedMetrics,
 ) -> ExecutionResult {
+    let t_batch = Instant::now();
     let batch_size = batch.transactions.len();
     debug!("Executing batch with {} transactions", batch_size);
 
@@ -196,6 +367,7 @@ pub async fn execute_batch(
     let mut fee_payers = HashSet::new();
     let mut accounts_to_preload = HashSet::new();
 
+    let t_op = Instant::now();
     for tx in all_transactions {
         // Collect fee payer BEFORE moving tx
         fee_payers.insert(*tx.fee_payer());
@@ -223,20 +395,31 @@ pub async fn execute_batch(
             regular_transactions.push(tx);
         }
     }
+    let t_partition = t_op.elapsed();
 
     let num_admin_transactions = admin_transactions.len();
     let num_regular_transactions = regular_transactions.len();
-    info!(
-        "Batch contains {} admin, and {} regular transactions",
-        num_admin_transactions, num_regular_transactions
+    debug!(
+        "partition: {} admin, {} regular in {:?}",
+        num_admin_transactions, num_regular_transactions, t_partition
     );
 
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
-    execution_deps
+    let t_op = Instant::now();
+    let (preload_fetched, preload_cached) = execution_deps
         .bob
         .preload_accounts(&accounts_to_preload)
         .await;
+    let t_preload = t_op.elapsed();
+    debug!(
+        "preload: {} accounts ({} fetched, {} cached) in {:?}",
+        accounts_to_preload.len(),
+        preload_fetched,
+        preload_cached,
+        t_preload
+    );
+    metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
 
     // Create processing environment and config
     let feature_set: SVMFeatureSet = SVMFeatureSet::all_enabled();
@@ -263,35 +446,79 @@ pub async fn execute_batch(
         ..Default::default()
     };
 
+    // Timing accumulators — stay zero when the corresponding path is skipped.
+    let mut t_svm_admin = Duration::ZERO;
+    let mut t_bob_admin = Duration::ZERO;
+    let mut t_svm_reg = Duration::ZERO;
+    let mut t_bob_reg = Duration::ZERO;
+
     // Settle admin transactions immediately so regular transactions see the updates
     let admin_results = if !admin_transactions.is_empty() {
-        let admin_results = {
-            execution_deps
-                .admin_vm
-                .load_and_execute_sanitized_transactions(
-                    &execution_deps.bob,
-                    admin_transactions.as_slice(),
-                    get_transaction_check_results(admin_transactions.len()),
-                    &processing_environment,
-                    &processing_config,
-                )
-        };
+        let t_op = Instant::now();
+        let admin_results = execution_deps
+            .admin_vm
+            .load_and_execute_sanitized_transactions(
+                &execution_deps.bob,
+                admin_transactions.as_slice(),
+                get_transaction_check_results(admin_transactions.len()),
+                &processing_environment,
+                &processing_config,
+            );
+        t_svm_admin = t_op.elapsed();
+        debug!(
+            "svm_admin: {} txs in {:?}",
+            num_admin_transactions, t_svm_admin
+        );
+        metrics.executor_svm_duration_ms("admin", t_svm_admin.as_secs_f64() * 1000.0);
 
         // Update BOB's in-memory accounts with the execution results
+        let t_op = Instant::now();
         execution_deps
             .bob
             .update_accounts(&admin_results, &admin_transactions);
+        t_bob_admin = t_op.elapsed();
+        debug!("bob_update_admin: {:?}", t_bob_admin);
+        metrics.executor_bob_update_duration_ms("admin", t_bob_admin.as_secs_f64() * 1000.0);
+
         Some(admin_results)
     } else {
         None
     };
 
-    // Now execute regular transactions with updated state
-
-    // Settle regular transactions
+    // Parallel path is taken when the batch is large enough to give each of
+    // `max_svm_workers` workers at least `MIN_PARALLEL_BATCH_FACTOR` txs, and
+    // the operator has configured >=2 workers. Within a `ConflictFreeBatch`
+    // write sets are disjoint, so parallel chunks cannot conflict on account
+    // state. For smaller batches we keep the single-threaded `GaslessCallback`
+    // path, which reads BOB directly and avoids snapshot + thread-spawn overhead.
     let regular_results = if !regular_transactions.is_empty() {
-        let regular_results = {
-            // Maybe just move this to the bob
+        let t_op = Instant::now();
+
+        // Gate: batch must be large enough to amortise parallel overhead
+        // across workers, and operator must have enabled parallelism
+        // (max_svm_workers >= 2). Setting max_svm_workers=1 (or 0, treated the
+        // same) forces the sequential path regardless of batch size — useful
+        // for profiling or single-core deployments.
+        let parallel_min = execution_deps
+            .max_svm_workers
+            .saturating_mul(MIN_PARALLEL_BATCH_FACTOR);
+        let use_parallel =
+            execution_deps.max_svm_workers >= 2 && regular_transactions.len() >= parallel_min;
+        let regular_results = if use_parallel {
+            // Parallel path: snapshot BOB + spawn workers.
+            // `accounts_to_preload` covers admin+regular keys; harmless
+            // over-inclusion — admin keys in the snapshot just add a few
+            // HashMap entries that regular-tx workers will never look up.
+            let snapshot =
+                SnapshotCallback::from_bob(&execution_deps.bob, &accounts_to_preload, fee_payers);
+            execute_parallel(
+                &execution_deps.vm,
+                &snapshot,
+                &regular_transactions,
+                execution_deps.max_svm_workers,
+            )
+        } else {
+            // Sequential path: direct BOB access, no snapshot cost.
             let gasless_callback = GaslessCallback::new(&execution_deps.bob, fee_payers);
             execution_deps.vm.load_and_execute_sanitized_transactions(
                 &gasless_callback,
@@ -302,14 +529,49 @@ pub async fn execute_batch(
             )
         };
 
+        t_svm_reg = t_op.elapsed();
+        debug!(
+            "svm_regular: {} txs ({}) in {:?}",
+            num_regular_transactions,
+            if use_parallel {
+                "parallel"
+            } else {
+                "sequential"
+            },
+            t_svm_reg
+        );
+        metrics.executor_svm_duration_ms("regular", t_svm_reg.as_secs_f64() * 1000.0);
+
         // Update BOB's in-memory accounts with the execution results
+        let t_op = Instant::now();
         execution_deps
             .bob
             .update_accounts(&regular_results, &regular_transactions);
+        t_bob_reg = t_op.elapsed();
+        debug!("bob_update_regular: {:?}", t_bob_reg);
+        metrics.executor_bob_update_duration_ms("regular", t_bob_reg.as_secs_f64() * 1000.0);
+
         Some(regular_results)
     } else {
         None
     };
+
+    let t_total = t_batch.elapsed();
+    debug!(
+        "execute_batch complete: total={} admin={} regular={} | \
+         partition={:?} preload={:?} svm_admin={:?} bob_admin={:?} svm_reg={:?} bob_reg={:?} total={:?}",
+        batch_size,
+        num_admin_transactions,
+        num_regular_transactions,
+        t_partition,
+        t_preload,
+        t_svm_admin,
+        t_bob_admin,
+        t_svm_reg,
+        t_bob_reg,
+        t_total,
+    );
+    metrics.executor_batch_duration_ms(t_total.as_secs_f64() * 1000.0);
 
     ExecutionResult {
         admin_transactions,
@@ -349,17 +611,75 @@ mod tests {
             .expect("failed to create test transaction")
     }
 
+    /// Trigger the parallel path: enough txs to give every configured worker
+    /// a non-trivial chunk. Verifies result count + ordering match the input.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_parallel_path() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let workers = 4;
+        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+
+        // 2× the parallel threshold so each worker gets 2× MIN_PARALLEL_BATCH_FACTOR
+        // transactions — comfortably inside the parallel regime.
+        let n = workers * MIN_PARALLEL_BATCH_FACTOR * 2;
+        let transactions: Vec<_> = (0..n)
+            .map(|i| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(create_test_transaction()),
+                index: i,
+            })
+            .collect();
+        let batch = ConflictFreeBatch { transactions };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        assert_eq!(result.regular_transactions.len(), n);
+        assert!(result.admin_transactions.is_empty());
+        let results = result
+            .regular_results
+            .expect("parallel path must produce regular results");
+        // Merged output must have exactly one processing result per input tx.
+        assert_eq!(results.processing_results.len(), n);
+    }
+
+    /// Exercise the exact parallel threshold (lowest batch size that takes
+    /// the parallel path): `max_svm_workers * MIN_PARALLEL_BATCH_FACTOR` txs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_parallel_threshold_boundary() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let workers = 4;
+        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+
+        let n = workers * MIN_PARALLEL_BATCH_FACTOR;
+        let transactions: Vec<_> = (0..n)
+            .map(|i| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(create_test_transaction()),
+                index: i,
+            })
+            .collect();
+        let batch = ConflictFreeBatch { transactions };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        let results = result.regular_results.unwrap();
+        assert_eq!(results.processing_results.len(), n);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_empty_batch() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
 
         let empty_batch = ConflictFreeBatch {
             transactions: vec![],
         };
 
-        let result = execute_batch(empty_batch, &mut deps).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(empty_batch, &mut deps, &noop).await;
         assert!(result.admin_transactions.is_empty());
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_none());
@@ -370,7 +690,7 @@ mod tests {
     async fn test_execute_batch_single_normal_transaction() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
 
         let tx = create_test_transaction();
         let batch = ConflictFreeBatch {
@@ -380,7 +700,8 @@ mod tests {
             }],
         };
 
-        let result = execute_batch(batch, &mut deps).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
         assert!(!result.regular_transactions.is_empty());
         assert!(result.admin_transactions.is_empty());
         assert!(
@@ -397,7 +718,7 @@ mod tests {
     async fn test_execute_batch_multiple_normal_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
 
         let tx1 = create_test_transaction();
         let tx2 = create_test_transaction();
@@ -414,7 +735,8 @@ mod tests {
             ],
         };
 
-        let result = execute_batch(batch, &mut deps).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
         assert_eq!(result.regular_transactions.len(), 2);
         assert!(result.admin_transactions.is_empty());
         let results = result.regular_results.unwrap();
@@ -426,7 +748,7 @@ mod tests {
         let (_accounts_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (_batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
+        let (_batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
         let (execution_results_tx, _execution_results_rx) = mpsc::unbounded_channel::<(
             LoadAndExecuteSanitizedTransactionsOutput,
@@ -441,6 +763,7 @@ mod tests {
             accountsdb_connection_url: url,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            max_svm_workers: 4,
         })
         .await;
 
@@ -450,12 +773,306 @@ mod tests {
         assert!(result.is_ok(), "worker should exit promptly after shutdown");
     }
 
+    // --- Corner-case coverage for the parallel SVM execution path.
+    //
+    // The tests above establish that the parallel path produces the right
+    // number of results for "typical" batch sizes. The tests below target
+    // invariants that a count-only assertion would miss: ordering across
+    // worker-thread joins, uneven-chunk handling, the gate that forces the
+    // sequential path, and the accumulation contract of merge_svm_outputs.
+
+    /// Order preservation end-to-end through the parallel path.
+    ///
+    /// `execute_batch` must return `regular_transactions` and the merged
+    /// `processing_results` in input order, even when execute_parallel
+    /// splits them across worker threads. This test would fail if a future
+    /// refactor joined workers in completion order instead of spawn order
+    /// (e.g. switching to a FuturesUnordered-style collector).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_parallel_path_preserves_transaction_order() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let workers = 4;
+        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+
+        // 2× the parallel threshold so the batch is comfortably in the
+        // parallel regime and splits into multiple chunks.
+        let n = workers * MIN_PARALLEL_BATCH_FACTOR * 2;
+        let inputs: Vec<SanitizedTransaction> = (0..n).map(|_| create_test_transaction()).collect();
+        let input_signatures: Vec<_> = inputs.iter().map(|tx| *tx.signature()).collect();
+
+        let transactions: Vec<_> = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, tx)| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: i,
+            })
+            .collect();
+        let batch = ConflictFreeBatch { transactions };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        let output_signatures: Vec<_> = result
+            .regular_transactions
+            .iter()
+            .map(|tx| *tx.signature())
+            .collect();
+        assert_eq!(
+            output_signatures, input_signatures,
+            "regular_transactions must be in input order after parallel execution"
+        );
+
+        let results = result
+            .regular_results
+            .expect("parallel path must produce regular results");
+        assert_eq!(
+            results.processing_results.len(),
+            n,
+            "merge_svm_outputs must produce exactly one processing_result per input"
+        );
+    }
+
+    /// Uneven chunking: a batch size that does not divide evenly across
+    /// workers. For `max_svm_workers=4` and `n=17`, chunks are sized
+    /// `[5, 5, 5, 2]` — exercises the small tail-chunk path and ensures
+    /// all 17 transactions appear in the merged output in input order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_parallel_path_uneven_chunking() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let workers = 4;
+        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+
+        // 17 is intentional: > threshold (16), not divisible by 4, last
+        // chunk is much smaller than the others.
+        let n = 17;
+        let inputs: Vec<SanitizedTransaction> = (0..n).map(|_| create_test_transaction()).collect();
+        let input_signatures: Vec<_> = inputs.iter().map(|tx| *tx.signature()).collect();
+
+        let transactions: Vec<_> = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, tx)| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: i,
+            })
+            .collect();
+        let batch = ConflictFreeBatch { transactions };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        let output_signatures: Vec<_> = result
+            .regular_transactions
+            .iter()
+            .map(|tx| *tx.signature())
+            .collect();
+        assert_eq!(
+            output_signatures, input_signatures,
+            "uneven chunks must not reorder transactions"
+        );
+        let results = result
+            .regular_results
+            .expect("parallel path must produce regular results");
+        assert_eq!(
+            results.processing_results.len(),
+            n,
+            "all {n} transactions (including the small tail chunk) must appear in the merged output"
+        );
+    }
+
+    /// `max_svm_workers = 1` forces the sequential path regardless of batch
+    /// size. The gate is `max_svm_workers >= 2 && len >= parallel_min`;
+    /// with workers=1 the gate is false by construction.
+    ///
+    /// This test doubles as a structural guard on the gate itself: if
+    /// someone removed the `max_svm_workers >= 2` check,
+    /// `execute_parallel`'s `num_workers.clamp(2, 1)` would panic at
+    /// runtime (clamp requires min <= max), so the test would surface a
+    /// regression even without a dedicated "which path was taken" probe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_max_svm_workers_one_forces_sequential() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1).await;
+
+        // Deliberately well above any reasonable parallel threshold — with
+        // workers=2 this size would split; with workers=1 the gate keeps
+        // it sequential.
+        let n = 64;
+        let inputs: Vec<SanitizedTransaction> = (0..n).map(|_| create_test_transaction()).collect();
+        let input_signatures: Vec<_> = inputs.iter().map(|tx| *tx.signature()).collect();
+
+        let transactions: Vec<_> = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(i, tx)| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: i,
+            })
+            .collect();
+        let batch = ConflictFreeBatch { transactions };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        let output_signatures: Vec<_> = result
+            .regular_transactions
+            .iter()
+            .map(|tx| *tx.signature())
+            .collect();
+        assert_eq!(
+            output_signatures, input_signatures,
+            "sequential path must preserve input order"
+        );
+        let results = result
+            .regular_results
+            .expect("sequential path must produce regular results");
+        assert_eq!(results.processing_results.len(), n);
+    }
+
+    // --- merge_svm_outputs unit tests ---
+    //
+    // merge_svm_outputs is pure, so we can test it directly with fabricated
+    // outputs instead of going through the SVM. These cover the contract
+    // execute_parallel relies on: concatenation in chunk-vec order,
+    // accumulation of error_metrics and execute_timings, and the constant
+    // `balance_collector = None`.
+
+    fn fabricate_output(
+        results: Vec<solana_svm::transaction_processing_result::TransactionProcessingResult>,
+    ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: results,
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_svm_outputs_empty_input() {
+        let merged = merge_svm_outputs(vec![]);
+        assert!(merged.processing_results.is_empty());
+        assert!(merged.balance_collector.is_none());
+        // Default metrics and timings are all zero; spot-check one counter.
+        assert_eq!(merged.error_metrics.account_not_found.0, 0);
+    }
+
+    #[test]
+    fn test_merge_svm_outputs_single_chunk_passthrough() {
+        use solana_transaction_error::TransactionError;
+        let chunk = fabricate_output(vec![
+            Err(TransactionError::AccountNotFound),
+            Err(TransactionError::AccountNotFound),
+            Err(TransactionError::AccountNotFound),
+        ]);
+        let merged = merge_svm_outputs(vec![chunk]);
+        assert_eq!(merged.processing_results.len(), 3);
+        assert!(merged
+            .processing_results
+            .iter()
+            .all(|r| matches!(r, Err(TransactionError::AccountNotFound))));
+    }
+
+    /// Multiple uneven chunks: each chunk uses a distinct `TransactionError`
+    /// variant, so after merge we can positionally verify the concatenation
+    /// order. If merge interleaved or reordered chunks, the variant
+    /// sequence would not match.
+    #[test]
+    fn test_merge_svm_outputs_preserves_chunk_order() {
+        use solana_transaction_error::TransactionError;
+        let chunk_a = fabricate_output(vec![
+            Err(TransactionError::AccountNotFound),
+            Err(TransactionError::AccountNotFound),
+            Err(TransactionError::AccountNotFound),
+        ]);
+        let chunk_b = fabricate_output(vec![Err(TransactionError::BlockhashNotFound)]);
+        let chunk_c = fabricate_output(vec![
+            Err(TransactionError::AccountInUse),
+            Err(TransactionError::AccountInUse),
+        ]);
+
+        let merged = merge_svm_outputs(vec![chunk_a, chunk_b, chunk_c]);
+        assert_eq!(merged.processing_results.len(), 6);
+
+        let tag =
+            |r: &solana_svm::transaction_processing_result::TransactionProcessingResult| match r {
+                Err(TransactionError::AccountNotFound) => "anf",
+                Err(TransactionError::BlockhashNotFound) => "bnf",
+                Err(TransactionError::AccountInUse) => "aiu",
+                _ => "other",
+            };
+        let order: Vec<_> = merged.processing_results.iter().map(tag).collect();
+        assert_eq!(
+            order,
+            vec!["anf", "anf", "anf", "bnf", "aiu", "aiu"],
+            "chunks must concatenate in input vec order, never interleave"
+        );
+    }
+
+    #[test]
+    fn test_merge_svm_outputs_accumulates_error_metrics() {
+        use std::num::Saturating;
+
+        let mut chunk_a = fabricate_output(vec![]);
+        chunk_a.error_metrics.account_not_found = Saturating(3);
+        chunk_a.error_metrics.insufficient_funds = Saturating(1);
+
+        let mut chunk_b = fabricate_output(vec![]);
+        chunk_b.error_metrics.account_not_found = Saturating(5);
+        chunk_b.error_metrics.blockhash_not_found = Saturating(2);
+
+        let merged = merge_svm_outputs(vec![chunk_a, chunk_b]);
+
+        // Fields that appear in both chunks sum; fields that appear in only
+        // one carry through; untouched fields stay zero.
+        assert_eq!(merged.error_metrics.account_not_found.0, 8);
+        assert_eq!(merged.error_metrics.insufficient_funds.0, 1);
+        assert_eq!(merged.error_metrics.blockhash_not_found.0, 2);
+        assert_eq!(merged.error_metrics.already_processed.0, 0);
+    }
+
+    #[test]
+    fn test_merge_svm_outputs_accumulates_execute_timings() {
+        use solana_timings::ExecuteTimingType;
+        use std::num::Saturating;
+
+        let mut chunk_a = fabricate_output(vec![]);
+        chunk_a.execute_timings.metrics[ExecuteTimingType::LoadUs] = Saturating(100);
+        chunk_a.execute_timings.metrics[ExecuteTimingType::ExecuteUs] = Saturating(200);
+
+        let mut chunk_b = fabricate_output(vec![]);
+        chunk_b.execute_timings.metrics[ExecuteTimingType::LoadUs] = Saturating(50);
+        chunk_b.execute_timings.metrics[ExecuteTimingType::StoreUs] = Saturating(75);
+
+        let merged = merge_svm_outputs(vec![chunk_a, chunk_b]);
+
+        assert_eq!(
+            merged.execute_timings.metrics[ExecuteTimingType::LoadUs].0,
+            150,
+            "overlapping timing fields must sum"
+        );
+        assert_eq!(
+            merged.execute_timings.metrics[ExecuteTimingType::ExecuteUs].0,
+            200,
+            "fields set in only one chunk must carry through"
+        );
+        assert_eq!(
+            merged.execute_timings.metrics[ExecuteTimingType::StoreUs].0,
+            75,
+            "fields set in only one chunk must carry through"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execution_worker_channel_closed_exits() {
         let (_accounts_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (batch_tx, batch_rx) = mpsc::unbounded_channel::<ConflictFreeBatch>();
+        let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
         let (execution_results_tx, _execution_results_rx) = mpsc::unbounded_channel::<(
             LoadAndExecuteSanitizedTransactionsOutput,
@@ -470,6 +1087,7 @@ mod tests {
             accountsdb_connection_url: url,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            max_svm_workers: 4,
         })
         .await;
 

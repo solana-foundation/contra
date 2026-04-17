@@ -41,6 +41,10 @@ pub async fn write_batch(
 /// Writes a complete slot batch (accounts + transactions + block metadata) atomically.
 /// Either every write in this batch commits, or none do — no partial slot state
 /// is ever visible to readers.
+///
+/// Uses bulk SQL operations (UNNEST for upserts, ANY for deletes) to collapse
+/// hundreds of per-row round-trips into 2-3 queries per batch. This is the
+/// critical performance path.
 async fn write_batch_postgres(
     db: &mut PostgresAccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],
@@ -58,61 +62,110 @@ async fn write_batch_postgres(
         return Ok(());
     }
 
+    if account_settlements.is_empty() && transactions.is_empty() && block_info.is_none() {
+        return Ok(());
+    }
+
     let pool = Arc::clone(&db.pool);
 
-    // Start a transaction
+    // ──────────────────────────────────────────────────────────────────
+    // Pre-serialize EVERYTHING before opening the Postgres transaction.
+    //
+    // Doing that work while holding an open BEGIN…COMMIT pins one
+    // pool connection the whole time, starving the executor's
+    // get_account_shared_data callbacks (which acquire from the same pool).
+    // Atomicity is preserved: every DB write below still happens inside the
+    // same BEGIN/COMMIT — we just shorten the window.
+    // ──────────────────────────────────────────────────────────────────
+
+    // Accounts: partition into upserts vs deletes and serialize upserts up front.
+    let mut upsert_pubkeys: Vec<Vec<u8>> = Vec::new();
+    let mut upsert_data: Vec<Vec<u8>> = Vec::new();
+    let mut delete_pubkeys: Vec<Vec<u8>> = Vec::new();
+    if !account_settlements.is_empty() {
+        upsert_pubkeys.reserve(account_settlements.len());
+        upsert_data.reserve(account_settlements.len());
+        for (pubkey, settlement) in account_settlements {
+            if settlement.deleted {
+                delete_pubkeys.push(pubkey.to_bytes().to_vec());
+            } else {
+                let data = bincode::serialize(&settlement.account)
+                    .map_err(|e| format!("Failed to serialize account: {}", e))?;
+                upsert_pubkeys.push(pubkey.to_bytes().to_vec());
+                upsert_data.push(data);
+            }
+        }
+    }
+
+    // Transactions: build StoredTransaction bytes up front.
+    let tx_count = transactions.len() as i64;
+    let mut sig_bytes_vec: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+    let mut tx_data_vec: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+    for (signature, transaction, tx_slot, block_time, processed) in transactions {
+        let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
+        sig_bytes_vec.push(signature.as_ref().to_vec());
+        let data = bincode::serialize(&stored_tx)
+            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
+        tx_data_vec.push(data);
+    }
+
+    // Block info: serialize the row payload up front.
+    let block_data: Option<Vec<u8>> = match &block_info {
+        Some(b) => {
+            Some(bincode::serialize(b).map_err(|e| format!("Failed to serialize block: {}", e))?)
+        }
+        None => None,
+    };
+
+    // Start a Postgres transaction — all writes are atomic.
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-    // Store accounts
-    for (pubkey, account_settlement) in account_settlements {
-        let pubkey_bytes = pubkey.to_bytes();
-        if account_settlement.deleted {
-            sqlx::query("DELETE FROM accounts WHERE pubkey = $1")
-                .bind(&pubkey_bytes[..])
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("Failed to delete account {}: {}", pubkey, e))?;
-        } else {
-            let account_data = bincode::serialize(&account_settlement.account)
-                .map_err(|e| format!("Failed to serialize account: {}", e))?;
-
-            sqlx::query(
-                "INSERT INTO accounts (pubkey, data) VALUES ($1, $2)
-                 ON CONFLICT (pubkey) DO UPDATE SET data = $2",
-            )
-            .bind(&pubkey_bytes[..])
-            .bind(&account_data)
+    // ── Accounts: bulk DELETE pre-serialized buffers ──
+    if !delete_pubkeys.is_empty() {
+        sqlx::query("DELETE FROM accounts WHERE pubkey = ANY($1)")
+            .bind(&delete_pubkeys)
             .execute(&mut *tx)
             .await
-            .map_err(|e| format!("Failed to store account: {}", e))?;
-        }
+            .map_err(|e| format!("Failed to bulk delete accounts: {}", e))?;
     }
 
-    // Store transactions and increment transaction count
-    let tx_count = transactions.len() as i64;
-    for (signature, transaction, tx_slot, block_time, processed) in transactions {
-        let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
-        let sig_bytes = signature.as_ref();
-        let tx_data = bincode::serialize(&stored_tx)
-            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
-
+    // UNNEST expands parallel arrays into rows for a single-query bulk upsert.
+    // Invariant: `upsert_pubkeys` is unique within this call — duplicates would
+    // trigger Postgres SQLSTATE 21000. Callers dedupe via a HashMap of settlements.
+    if !upsert_pubkeys.is_empty() {
         sqlx::query(
-            "INSERT INTO transactions (signature, data) VALUES ($1, $2)
-                 ON CONFLICT (signature) DO UPDATE SET data = $2",
+            "INSERT INTO accounts (pubkey, data)
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[])
+             ON CONFLICT (pubkey) DO UPDATE SET data = EXCLUDED.data",
         )
-        .bind(sig_bytes)
-        .bind(&tx_data)
+        .bind(&upsert_pubkeys)
+        .bind(&upsert_data)
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("Failed to store transaction: {}", e))?;
+        .map_err(|e| format!("Failed to bulk upsert accounts: {}", e))?;
     }
 
-    // Update transaction count
+    // Same UNNEST pattern and duplicate-key invariant as the accounts upsert:
+    // signatures within a block are unique (dedup stage rejects replays upstream).
+    if !sig_bytes_vec.is_empty() {
+        sqlx::query(
+            "INSERT INTO transactions (signature, data)
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[])
+             ON CONFLICT (signature) DO UPDATE SET data = EXCLUDED.data",
+        )
+        .bind(&sig_bytes_vec)
+        .bind(&tx_data_vec)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
+    }
+
+    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
+    // via this path and MVCC returns the caller's own last commit.
     if tx_count > 0 {
-        // Fetch current count
         let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT value FROM metadata WHERE key = 'transaction_count'",
         )
@@ -136,25 +189,21 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to update transaction count: {}", e))?;
     }
 
-    // Store block info if provided
-    if let Some(block_info) = &block_info {
-        let block_data = bincode::serialize(block_info)
-            .map_err(|e| format!("Failed to serialize block: {}", e))?;
-
+    // ── Block info: at most 2 queries (block row + latest_blockhash) ──
+    if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
         sqlx::query(
             "INSERT INTO blocks (slot, data) VALUES ($1, $2)
-                 ON CONFLICT (slot) DO UPDATE SET data = $2",
+                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data",
         )
         .bind(block_info.slot as i64)
-        .bind(&block_data)
+        .bind(block_data)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to store block: {}", e))?;
 
-        // Update latest blockhash
         sqlx::query(
             "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
-                 ON CONFLICT (key) DO UPDATE SET value = $1",
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(block_info.blockhash.as_ref())
         .execute(&mut *tx)
@@ -162,7 +211,7 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
     }
 
-    // Commit the transaction
+    // Commit — if this fails, the entire batch is rolled back.
     tx.commit()
         .await
         .map_err(|e| format!("Failed to commit transaction: {}", e))?;

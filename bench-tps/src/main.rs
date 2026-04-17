@@ -45,7 +45,7 @@ use {
     },
     clap::Parser,
     contra_core::client::load_keypair,
-    load::{build_destinations, run_generator, run_sender_thread},
+    load::{build_destinations, run_generator, run_sender_task},
     load_deposit::{run_deposit_generator, run_deposit_sender_thread},
     load_withdraw::{run_withdraw_generator, run_withdraw_sender_thread},
     setup_deposit::find_instance_pda,
@@ -91,6 +91,7 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
         rpc_url = %args.rpc_url,
         accounts = args.accounts,
         threads = args.threads,
+        batch_size = args.batch_size,
         duration = args.duration,
         "Starting contra-bench-tps (transfer)",
     );
@@ -127,13 +128,13 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
         destinations,
     });
 
-    // The queue is an Arc-wrapped (Mutex<VecDeque>, Condvar) pair.  The
-    // generator pushes onto it from an async context; sender threads pop from
-    // it in a blocking context using the condvar for efficient waiting.
-    let queue: BatchQueue = Arc::new((
-        std::sync::Mutex::new(std::collections::VecDeque::new()),
-        std::sync::Condvar::new(),
-    ));
+    // Bounded mpsc channel replaces the old Mutex<VecDeque> + Condvar queue.
+    // The channel capacity provides backpressure — the generator awaits when
+    // all slots are occupied, preventing unbounded memory growth.
+    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<
+        Vec<solana_sdk::transaction::Transaction>,
+    >(types::MAX_QUEUE_DEPTH);
+    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
     let cancel = CancellationToken::new();
 
@@ -154,55 +155,58 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
         FLOW_TRANSFER,
     ));
 
-    // Generator: signs batches of `threads` transactions and enqueues them.
+    // Generator: signs batches of `batch_size` transactions and sends them
+    // through the mpsc channel for sender tasks to consume.
     let gen_handle = tokio::spawn(run_generator(
         Arc::clone(&config),
         Arc::clone(&setup_result.state),
-        Arc::clone(&queue),
-        args.threads,
+        batch_tx,
+        args.batch_size,
         cancel.clone(),
     ));
 
-    // Sender threads: each pops one batch and calls send_transaction for every
-    // transaction in the batch using the blocking RPC client.
+    // Sender tasks: each pops one batch and sends all transactions concurrently
+    // via `join_all` on the async RPC client.  Tokio tasks replace OS threads.
     let sent_count = Arc::new(AtomicU64::new(0));
     let mut sender_handles = Vec::with_capacity(args.threads);
     for _ in 0..args.threads {
         let rpc_url = args.rpc_url.clone();
-        let q = Arc::clone(&queue);
+        let rx = Arc::clone(&batch_rx);
         let c = cancel.clone();
         let sc = Arc::clone(&sent_count);
-        sender_handles.push(std::thread::spawn(move || {
-            run_sender_thread(rpc_url, q, c, sc, args.sender_sleep_ms)
-        }));
+        let sleep_ms = args.sender_sleep_ms;
+        sender_handles.push(tokio::spawn(run_sender_task(rpc_url, rx, c, sc, sleep_ms)));
     }
 
     info!(
         duration_secs = args.duration,
         threads = args.threads,
+        batch_size = args.batch_size,
         "Transfer load phase started"
     );
     tokio::time::sleep(Duration::from_secs(args.duration)).await;
 
     info!("Transfer load phase complete — shutting down");
     cancel.cancel();
-    let (_, cvar) = queue.as_ref();
-    cvar.notify_all();
 
-    // Await async tasks first, then join OS threads.
+    // Await all async tasks.
     let _ = gen_handle.await;
     let _ = bh_handle.await;
     let (start_tx_count, end_tx_count) = metrics_handle.await.unwrap_or((0, 0));
     for h in sender_handles {
-        let _ = h.join();
+        let _ = h.await;
     }
 
     // -------------------------------------------------------------------------
     // Final summary
     //
-    // `sent`   — transactions dispatched by sender threads (from AtomicU64)
-    // `landed` — transactions confirmed by the node (from getTransactionCount)
-    // `dropped`— sent - landed (rejected by dedup / sigverify / sequencer)
+    // `sent`    — transactions accepted by the RPC server (from AtomicU64)
+    // `landed`  — transactions settled by the pipeline during the test window
+    //             (`getTransactionCount` sampled at t=duration by the metrics
+    //             sampler). Reflects steady-state capacity during the run.
+    // `dropped` — sent - landed. Includes both true drops (rejected by dedup /
+    //             sigverify / sequencer) and any in-flight tail still in the
+    //             pipeline at shutdown.
     // -------------------------------------------------------------------------
     let sent = sent_count.load(Ordering::Relaxed);
     let landed = end_tx_count.saturating_sub(start_tx_count);

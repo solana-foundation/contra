@@ -91,9 +91,17 @@ impl BOB {
             burn_percent: 0,
         };
 
-        // Load system program
+        // Load system program.
+        //
+        // lamports=1 (not 0): the SVM's AccountLoader caches loaded accounts
+        // across transactions within a single batch, and if a cached entry has
+        // `lamports == 0` it is treated as "previously deallocated" and
+        // returned as `None` on subsequent loads. A zero-lamport precompile
+        // therefore becomes invisible to the second transaction in a batch,
+        // breaking any CPI into system_program (e.g. ATA account creation).
+        // Same applies to the rent sysvar below.
         let system_account = Account {
-            lamports: 0,
+            lamports: 1,
             data: b"solana_system_program".to_vec(),
             owner: solana_sdk_ids::native_loader::ID,
             executable: true,
@@ -119,9 +127,9 @@ impl BOB {
         precompiles.insert(ata_id, AccountSharedData::from(ata_account));
         info!("Loaded Associated Token Account program");
 
-        // Load rent sysvar
+        // Load rent sysvar. lamports=1 for the same reason as system_program above.
         let rent_account = Account {
-            lamports: 0,
+            lamports: 1,
             data: bincode::serialize(&rent).unwrap(),
             owner: solana_sdk_ids::sysvar::ID,
             executable: false,

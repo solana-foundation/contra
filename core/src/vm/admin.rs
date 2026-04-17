@@ -58,10 +58,7 @@ impl AdminVm {
         let mut mint_data = vec![0u8; Mint::LEN];
         Mint::pack(mint, &mut mint_data).expect("Failed to pack mint");
 
-        // lamports=1 so the SVM's AccountLoader cache doesn't treat the mint
-        // as deallocated on subsequent loads within the same batch. See the
-        // equivalent comment on system_program in bob.rs::BOB::new.
-        let mut account = AccountSharedData::new(1, Mint::LEN, &spl_token::id());
+        let mut account = AccountSharedData::new(0, Mint::LEN, &spl_token::id());
         account.set_data_from_slice(&mint_data);
         account
     }

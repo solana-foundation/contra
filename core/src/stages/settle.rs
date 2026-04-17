@@ -342,7 +342,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     error!("Processing results and transactions length mismatch");
                                     break;
                                 }
-                                info!("Extending {} processing results", svm_output.processing_results.len());
+                                debug!("Extending {} processing results", svm_output.processing_results.len());
                                 processing_results.extend(svm_output.processing_results.into_iter().zip(transactions.into_iter()));
                             }
                             None => {

@@ -18,6 +18,8 @@ use solana_transaction_status::{
     EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage, UiParsedInstruction,
     UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
 };
+use spl_token::solana_program::program_pack::Pack;
+use spl_token::state::Mint;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
@@ -137,11 +139,46 @@ pub(super) async fn try_jit_mint_initialization(
             Some(instruction)
         }
         _ => {
+            // Non-`Confirmed` may just mean the mint was already initialized (stale existence
+            // check or RPC-error fail-safe above raced the InitializeMint). Re-read on-chain;
+            // if initialized, JIT is effectively done.
+            if mint_is_initialized_on_chain(&state.rpc_client, &mint).await {
+                info!(
+                    "InitializeMint tx {} not confirmed (result={:?}), but mint {} is already \
+                     initialized on-chain — treating JIT as success",
+                    sig, result, mint
+                );
+                return Some(instruction);
+            }
             error!(
                 "InitializeMint transaction could not be confirmed: {:?}",
                 result
             );
             None
+        }
+    }
+}
+
+/// returns true if `data` decodes as an initialized SPL `Mint`.
+/// Non-Mint-length or malformed data → false. Zeroed Mint::LEN data → false.
+fn is_initialized_mint_data(data: &[u8]) -> bool {
+    Mint::unpack(data)
+        .map(|m| m.is_initialized)
+        .unwrap_or(false)
+}
+
+/// Re-queries the mint account on Contra and reports whether it is initialized.
+/// RPC errors and missing/empty accounts are treated as "not initialized" so the
+/// caller falls through to the original error path.
+async fn mint_is_initialized_on_chain(rpc_client: &RpcClientWithRetry, mint: &Pubkey) -> bool {
+    match rpc_client.get_account_data(mint).await {
+        Ok(data) => is_initialized_mint_data(&data),
+        Err(e) => {
+            warn!(
+                "RPC error re-checking mint {} after failed JIT init: {}",
+                mint, e
+            );
+            false
         }
     }
 }
@@ -604,7 +641,7 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 mod tests {
     use super::{
         accounts_and_amount_match, expected_mint_instruction, instruction_has_expected_mint,
-        instruction_has_memo, is_method_not_found_error, memo_matches,
+        instruction_has_memo, is_initialized_mint_data, is_method_not_found_error, memo_matches,
         parse_token_instruction_mint_amount, partially_decoded_instruction_has_expected_mint,
         raw_instruction_has_expected_mint, strip_memo_length_prefix,
         transaction_matches_expected_mint, ExpectedMintInstruction,
@@ -623,6 +660,9 @@ mod tests {
         UiParsedInstruction, UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
         UiTransaction, UiTransactionStatusMeta,
     };
+    use spl_token::solana_program::program_option::COption;
+    use spl_token::solana_program::program_pack::Pack;
+    use spl_token::state::Mint;
 
     fn make_expected() -> (Pubkey, Pubkey, Pubkey, ExpectedMintInstruction) {
         let mint = Pubkey::new_unique();
@@ -1459,5 +1499,65 @@ mod tests {
     #[test]
     fn strip_memo_length_prefix_no_space_after_bracket() {
         assert_eq!(strip_memo_length_prefix("[123]no-space"), "[123]no-space");
+    }
+
+    // Tests for the pure `is_initialized_mint_data` helper that drives the
+    // on-chain re-check in `try_jit_mint_initialization`. The async
+    // `mint_is_initialized_on_chain` wrapper is exercised indirectly via this
+    // helper plus the RPC boundary.
+
+    fn pack_mint(is_initialized: bool) -> Vec<u8> {
+        let mint = Mint {
+            mint_authority: COption::Some(Pubkey::new_unique()),
+            supply: 0,
+            decimals: 6,
+            is_initialized,
+            freeze_authority: COption::None,
+        };
+        let mut data = vec![0u8; Mint::LEN];
+        Mint::pack(mint, &mut data).expect("pack mint");
+        data
+    }
+
+    // Empty account data means the mint account was never created.
+    #[test]
+    fn is_initialized_mint_data_empty_is_false() {
+        assert!(!is_initialized_mint_data(&[]));
+    }
+
+    // Data of the wrong length (too short or too long) cannot be a valid mint.
+    #[test]
+    fn is_initialized_mint_data_wrong_length_is_false() {
+        assert!(!is_initialized_mint_data(&[0u8; 10]));
+        assert!(!is_initialized_mint_data(&[0xFFu8; Mint::LEN + 1]));
+    }
+
+    // A rent-exempt-but-uninitialized mint account (correct length, all zeros)
+    // is rejected by `Mint::unpack` because `is_initialized` is 0.
+    #[test]
+    fn is_initialized_mint_data_zeroed_mint_len_is_false() {
+        assert!(!is_initialized_mint_data(&vec![0u8; Mint::LEN]));
+    }
+
+    // Properly packed, initialized mint data is recognized as initialized.
+    #[test]
+    fn is_initialized_mint_data_packed_initialized_mint_is_true() {
+        let data = pack_mint(true);
+        assert!(is_initialized_mint_data(&data));
+    }
+
+    // `Mint::pack` with `is_initialized = false` produces data that
+    // `Mint::unpack` rejects, so the helper reports "not initialized".
+    #[test]
+    fn is_initialized_mint_data_packed_uninitialized_mint_is_false() {
+        let data = pack_mint(false);
+        assert!(!is_initialized_mint_data(&data));
+    }
+
+    // Arbitrary bytes of the correct length are not a valid mint layout.
+    #[test]
+    fn is_initialized_mint_data_random_bytes_is_false() {
+        let data: Vec<u8> = (0u8..Mint::LEN as u8).collect();
+        assert!(!is_initialized_mint_data(&data));
     }
 }

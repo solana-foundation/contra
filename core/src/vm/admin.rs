@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use solana_sdk::{account::AccountSharedData, pubkey::Pubkey};
+use solana_sdk::{
+    account::{AccountSharedData, ReadableAccount},
+    instruction::InstructionError,
+    pubkey::Pubkey,
+    transaction::TransactionError,
+};
 use solana_svm::{
     account_loader::{LoadedTransaction, TransactionCheckResult},
     transaction_error_metrics::TransactionErrorMetrics,
@@ -17,7 +22,7 @@ use solana_timings::ExecuteTimings;
 use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const SPL_TOKEN_ID: Pubkey = spl_token::id();
 
@@ -66,8 +71,11 @@ impl AdminVm {
         account
     }
 
-    /// Creates an ExecutedTransaction result
+    /// Creates an ExecutedTransaction result carrying the given status.
+    /// On failure (`status.is_err()`), callers pass `vec![]` so nothing persists —
+    /// this matches real-SVM atomicity.
     fn create_executed_transaction(
+        status: Result<(), TransactionError>,
         accounts: Vec<(Pubkey, AccountSharedData)>,
     ) -> ExecutedTransaction {
         ExecutedTransaction {
@@ -76,7 +84,7 @@ impl AdminVm {
                 ..Default::default()
             },
             execution_details: TransactionExecutionDetails {
-                status: Ok(()),
+                status,
                 log_messages: None,
                 inner_instructions: None,
                 return_data: None,
@@ -87,9 +95,21 @@ impl AdminVm {
         }
     }
 
+    /// Process each tx's instructions in order. On the first failing instruction,
+    /// short-circuit via `break 'tx` with a failed `ExecutedTransaction`
+    ///
+    /// Failure mapping:
+    /// - non-`spl_token` program id             -> InvalidInstructionData
+    /// - empty instruction data                 -> InvalidInstructionData
+    /// - unsupported SPL instruction type       -> InvalidInstructionData
+    /// - InitializeMint data < 34 bytes         -> InvalidAccountData
+    /// - InitializeMint empty accounts          -> InvalidAccountData
+    /// - freeze authority tag=1, <32 trailing   -> InvalidAccountData
+    /// - mint index out of `account_keys`       -> NotEnoughAccountKeys
+    /// - mint already initialized               -> AccountAlreadyInitialized
     pub fn load_and_execute_sanitized_transactions<CB: TransactionProcessingCallback>(
         &self,
-        _callbacks: &CB,
+        callbacks: &CB,
         sanitized_txs: &[impl SVMTransaction],
         _check_results: Vec<TransactionCheckResult>,
         _environment: &TransactionProcessingEnvironment,
@@ -98,65 +118,65 @@ impl AdminVm {
         let mut processing_results: Vec<TransactionProcessingResult> = vec![];
         for tx in sanitized_txs {
             let mut accounts = vec![];
-            for (program_id, instruction) in tx.program_instructions_iter() {
-                match *program_id {
-                    SPL_TOKEN_ID => {
-                        let Some(instruction_type) = instruction.data.first() else {
-                            warn!("[admin-vm] SPL Token instruction has empty data, skipping");
-                            continue;
-                        };
-                        match *instruction_type {
-                            INSTRUCTION_INITIALIZE_MINT => {
-                                // Parse InitializeMint instruction
-                                if !instruction.accounts.is_empty() && instruction.data.len() >= 34
-                                {
-                                    // Parse instruction data
-                                    // TODO: Instruction data could be invalid,
-                                    // so we need to handle it without causing a
-                                    // panic
-                                    let account_keys = tx.account_keys();
-                                    let mint_index = instruction.accounts[0] as usize;
-                                    let mint_pubkey = account_keys.get(mint_index).unwrap();
+            let executed: ExecutedTransaction = 'tx: {
+                for (ix_index, (program_id, instruction)) in
+                    tx.program_instructions_iter().enumerate()
+                {
+                    // Solana's InstructionError index is a u8;
+                    let ix_idx_u8 = u8::try_from(ix_index).unwrap_or(u8::MAX);
 
-                                    // Extract parameters from instruction data
-                                    let decimals = instruction.data[1];
-                                    let mint_authority = &instruction.data[2..34];
+                    if *program_id != SPL_TOKEN_ID {
+                        warn!("[admin-vm] Unsupported program ID: {}", program_id);
+                        break 'tx Self::create_executed_transaction(
+                            Err(TransactionError::InstructionError(
+                                ix_idx_u8,
+                                InstructionError::InvalidInstructionData,
+                            )),
+                            vec![],
+                        );
+                    }
 
-                                    // Check for optional freeze authority
-                                    let freeze_authority = if instruction.data.len() > 34
-                                        && instruction.data[34] == 1
-                                    {
-                                        Some(&instruction.data[35..67])
-                                    } else {
-                                        None
-                                    };
+                    let Some(&instruction_type) = instruction.data.first() else {
+                        warn!("[admin-vm] SPL Token instruction has empty data");
+                        break 'tx Self::create_executed_transaction(
+                            Err(TransactionError::InstructionError(
+                                ix_idx_u8,
+                                InstructionError::InvalidInstructionData,
+                            )),
+                            vec![],
+                        );
+                    };
 
-                                    // Create the mint account
-                                    let mint_account = Self::create_mint_account(
-                                        decimals,
-                                        mint_authority,
-                                        freeze_authority,
+                    match instruction_type {
+                        INSTRUCTION_INITIALIZE_MINT => {
+                            match Self::process_initialize_mint(callbacks, tx, instruction) {
+                                Ok((pubkey, account)) => accounts.push((pubkey, account)),
+                                Err(err) => {
+                                    break 'tx Self::create_executed_transaction(
+                                        Err(TransactionError::InstructionError(ix_idx_u8, err)),
+                                        vec![],
                                     );
-
-                                    accounts.push((*mint_pubkey, mint_account));
                                 }
                             }
-                            _ => {
-                                warn!(
-                                    "[admin-vm] Unsupported SPL token instruction type: {}",
-                                    instruction_type
-                                );
-                            }
+                        }
+                        _ => {
+                            warn!(
+                                "[admin-vm] Unsupported SPL token instruction type: {}",
+                                instruction_type
+                            );
+                            break 'tx Self::create_executed_transaction(
+                                Err(TransactionError::InstructionError(
+                                    ix_idx_u8,
+                                    InstructionError::InvalidInstructionData,
+                                )),
+                                vec![],
+                            );
                         }
                     }
-                    _ => {
-                        warn!("[admin-vm] Unsupported program ID: {}", program_id);
-                    }
                 }
-            }
-            // Create successful processing result
-            let executed_tx = Self::create_executed_transaction(accounts);
-            processing_results.push(Ok(ProcessedTransaction::Executed(Box::new(executed_tx))))
+                Self::create_executed_transaction(Ok(()), accounts)
+            };
+            processing_results.push(Ok(ProcessedTransaction::Executed(Box::new(executed))));
         }
 
         LoadAndExecuteSanitizedTransactionsOutput {
@@ -169,6 +189,78 @@ impl AdminVm {
             processing_results,
         }
     }
+
+    /// Validate and process a single SPL Token `InitializeMint` instruction.
+    /// Returns the (pubkey, Mint account) on success, or the
+    /// appropriate `InstructionError` on any validation failure.
+    ///
+    /// SPL Token `InitializeMint` wire layout
+    /// (see `spl_token::instruction::TokenInstruction::pack`):
+    ///
+    /// ```text
+    /// byte  0       : discriminator = 0   (already checked by caller)
+    /// byte  1       : decimals (u8)
+    /// bytes 2..34   : mint_authority      (Pubkey, 32 bytes)
+    /// byte  34      : freeze_authority COption tag: 0 = None, 1 = Some
+    /// bytes 35..67  : freeze_authority    (present only when tag = 1)
+    /// ```
+    ///
+    /// All byte indices below refer to this layout.
+    fn process_initialize_mint<CB: TransactionProcessingCallback>(
+        callbacks: &CB,
+        tx: &impl SVMTransaction,
+        instruction: solana_svm_transaction::instruction::SVMInstruction,
+    ) -> Result<(Pubkey, AccountSharedData), InstructionError> {
+        // Minimum payload: instruction must reference the mint as an account,
+        // and data must span discriminator + decimals + mint_authority (up to
+        // byte 34). The COption tag at byte 34 is inspected separately below.
+        if instruction.accounts.is_empty() || instruction.data.len() < 34 {
+            debug!("[admin-vm] InitializeMint: malformed (len or accounts)");
+            return Err(InstructionError::InvalidAccountData);
+        }
+
+        // Freeze-authority COption: byte 34 is the tag (0 = None, 1 = Some).
+        // When Some, bytes 35..67 carry the 32-byte pubkey; reject if truncated.
+        let freeze_authority = if instruction.data.len() > 34 && instruction.data[34] == 1 {
+            if instruction.data.len() < 67 {
+                debug!("[admin-vm] InitializeMint: truncated freeze authority");
+                return Err(InstructionError::InvalidAccountData);
+            }
+            Some(&instruction.data[35..67])
+        } else {
+            None
+        };
+
+        // Resolve the mint pubkey: InitializeMint places the mint at
+        // `instruction.accounts[0]`
+        let account_keys = tx.account_keys();
+        let mint_index = instruction.accounts[0] as usize;
+        let Some(mint_pubkey) = account_keys.get(mint_index).copied() else {
+            return Err(InstructionError::NotEnoughAccountKeys);
+        };
+
+        // Refuse re-init on a live mint: if an account already exists at
+        // `mint_pubkey` and unpacks as an initialized Mint, a second
+        // InitializeMint would silently overwrite supply / decimals / authority.
+        // Zero-initialized allocations (is_initialized = false) still proceed.
+        if let Some(existing) = callbacks.get_account_shared_data(&mint_pubkey) {
+            if Mint::unpack(existing.data())
+                .map(|m| m.is_initialized)
+                .unwrap_or(false)
+            {
+                debug!(
+                    "[admin-vm] InitializeMint: {} already initialized",
+                    mint_pubkey
+                );
+                return Err(InstructionError::AccountAlreadyInitialized);
+            }
+        }
+
+        let decimals = instruction.data[1];
+        let mint_authority = &instruction.data[2..34];
+        let mint_account = Self::create_mint_account(decimals, mint_authority, freeze_authority);
+        Ok((mint_pubkey, mint_account))
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +270,9 @@ mod tests {
     use spl_token::solana_program::program_pack::Pack;
     use spl_token::state::Mint;
 
+    /// `create_mint_account` packs a Mint with the given decimals + authority
+    /// and no freeze authority; the packed bytes round-trip through
+    /// `Mint::unpack` to the same values.
     #[test]
     fn test_create_mint_account_roundtrip() {
         let authority = Pubkey::new_unique();
@@ -191,6 +286,8 @@ mod tests {
         assert_eq!(mint.freeze_authority, COption::None);
     }
 
+    /// `create_mint_account` sets `freeze_authority` to `Some` when one is
+    /// supplied, and the packed bytes round-trip to the same pubkey.
     #[test]
     fn test_initialize_mint_with_freeze_authority() {
         let authority = Pubkey::new_unique();
@@ -203,7 +300,14 @@ mod tests {
         assert_eq!(mint.freeze_authority, COption::Some(freeze));
     }
 
-    // Shared dummy callback for all admin VM tests
+    // ─── Test callbacks ─────────────────────────────────────────────────────
+    //
+    // DummyCb: account lookups always return None → "fresh" state, good for the
+    // happy path and most malformed-input cases.
+    //
+    // StubCbWithInitializedMint / StubCbWithUninitialized: return a specific
+    // account for a specific pubkey so the AlreadyInUse + "pre-existing but
+    // uninitialized account" paths are exercisable.
     struct DummyCb;
     impl solana_svm_callback::TransactionProcessingCallback for DummyCb {
         fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<AccountSharedData> {
@@ -215,23 +319,107 @@ mod tests {
     }
     impl solana_svm_callback::InvokeContextCallback for DummyCb {}
 
+    /// Returns a pre-initialized SPL Mint for the configured pubkey, None for anything else.
+    struct StubCbWithInitializedMint {
+        mint: Pubkey,
+    }
+    impl solana_svm_callback::TransactionProcessingCallback for StubCbWithInitializedMint {
+        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+            if *pubkey == self.mint {
+                Some(AdminVm::create_mint_account(
+                    6,
+                    &Pubkey::new_unique().to_bytes(),
+                    None,
+                ))
+            } else {
+                None
+            }
+        }
+        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
+            None
+        }
+    }
+    impl solana_svm_callback::InvokeContextCallback for StubCbWithInitializedMint {}
+
+    /// Returns an allocated but NOT-initialized account for the configured pubkey.
+    /// Simulates the real-Solana case where `create_account` ran but `initialize_mint`
+    /// has not — we should still let InitializeMint succeed in that case.
+    struct StubCbWithUninitialized {
+        mint: Pubkey,
+    }
+    impl solana_svm_callback::TransactionProcessingCallback for StubCbWithUninitialized {
+        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+            if *pubkey == self.mint {
+                // Zeroed data of Mint::LEN → is_initialized = false
+                let mut acct = AccountSharedData::new(0, Mint::LEN, &spl_token::id());
+                acct.set_data_from_slice(&vec![0u8; Mint::LEN]);
+                Some(acct)
+            } else {
+                None
+            }
+        }
+        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
+            None
+        }
+    }
+    impl solana_svm_callback::InvokeContextCallback for StubCbWithUninitialized {}
+
+    // ─── Helpers ────────────────────────────────────────────────────────────
+
     fn run_admin_vm(
         txs: &[solana_sdk::transaction::SanitizedTransaction],
+    ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        run_admin_vm_with_cb(txs, &DummyCb)
+    }
+
+    fn run_admin_vm_with_cb<CB: solana_svm_callback::TransactionProcessingCallback>(
+        txs: &[solana_sdk::transaction::SanitizedTransaction],
+        cb: &CB,
     ) -> LoadAndExecuteSanitizedTransactionsOutput {
         let vm = AdminVm::default();
         let check_results = crate::processor::get_transaction_check_results(txs.len());
         let env = solana_svm::transaction_processor::TransactionProcessingEnvironment::default();
         let config = solana_svm::transaction_processor::TransactionProcessingConfig::default();
-        vm.load_and_execute_sanitized_transactions(&DummyCb, txs, check_results, &env, &config)
+        vm.load_and_execute_sanitized_transactions(cb, txs, check_results, &env, &config)
+    }
+
+    /// Unwrap a single `ProcessedTransaction::Executed` from the VM output and
+    /// assert that its `execution_details.status` matches `expected`. Returns
+    /// the `ExecutedTransaction` so callers can inspect `accounts` afterwards.
+    ///
+    /// Every test in this module asserts on `execution_details.status` via
+    /// this helper; asserting only on `accounts` contents is not sufficient.
+    fn assert_executed_with_status(
+        output: LoadAndExecuteSanitizedTransactionsOutput,
+        expected: Result<(), TransactionError>,
+    ) -> Box<ExecutedTransaction> {
+        assert_eq!(output.processing_results.len(), 1);
+        let result = output
+            .processing_results
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        match result {
+            ProcessedTransaction::Executed(executed) => {
+                assert_eq!(
+                    executed.execution_details.status, expected,
+                    "status mismatch"
+                );
+                executed
+            }
+            _ => panic!("Expected Executed variant"),
+        }
     }
 
     /// Build a SanitizedTransaction with a single instruction targeting the given
-    /// program_id, with the given accounts and data.
-    fn make_spl_tx(
+    /// program_id, with the mint as the FIRST account meta (as SPL Token
+    /// `InitializeMint` expects). Returns both the tx and the mint pubkey so
+    /// tests can stub the callback keyed on the same pubkey the VM will query.
+    fn make_spl_tx_with_mint(
         program_id: Pubkey,
-        accounts_indices: &[u8],
         data: Vec<u8>,
-    ) -> solana_sdk::transaction::SanitizedTransaction {
+    ) -> (solana_sdk::transaction::SanitizedTransaction, Pubkey) {
         use solana_sdk::{
             instruction::{AccountMeta, Instruction},
             message::Message,
@@ -242,17 +430,11 @@ mod tests {
 
         let payer = Keypair::new();
         let mint = Pubkey::new_unique();
-
-        // Build account metas: payer (signer), mint, program
-        let mut account_metas = vec![
-            AccountMeta::new(payer.pubkey(), true),
+        // Mint first — SPL Token InitializeMint semantics: accounts[0] is the mint.
+        let account_metas = vec![
             AccountMeta::new(mint, false),
+            AccountMeta::new(payer.pubkey(), true),
         ];
-        // If test wants more accounts, add dummies
-        for _ in 2..accounts_indices.iter().copied().max().unwrap_or(0) as usize + 1 {
-            account_metas.push(AccountMeta::new(Pubkey::new_unique(), false));
-        }
-
         let ix = Instruction {
             program_id,
             accounts: account_metas,
@@ -260,67 +442,37 @@ mod tests {
         };
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let tx = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
-        solana_sdk::transaction::SanitizedTransaction::try_from_legacy_transaction(
+        let sanitized = solana_sdk::transaction::SanitizedTransaction::try_from_legacy_transaction(
             tx,
             &HashSet::new(),
         )
-        .unwrap()
+        .unwrap();
+        (sanitized, mint)
     }
 
-    #[test]
-    fn test_load_and_execute_unsupported_program() {
-        let from = solana_sdk::signature::Keypair::new();
-        let to = Pubkey::new_unique();
-        let tx = crate::test_helpers::create_test_sanitized_transaction(&from, &to, 100);
-
-        let output = run_admin_vm(&[tx]);
-
-        // Should still produce a result (with empty accounts since program is unsupported)
-        assert_eq!(output.processing_results.len(), 1);
-        let result = output
-            .processing_results
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        match result {
-            ProcessedTransaction::Executed(executed) => {
-                assert!(executed.loaded_transaction.accounts.is_empty());
-            }
-            _ => panic!("Expected Executed variant"),
-        }
+    fn make_spl_tx(
+        program_id: Pubkey,
+        _accounts_indices: &[u8],
+        data: Vec<u8>,
+    ) -> solana_sdk::transaction::SanitizedTransaction {
+        make_spl_tx_with_mint(program_id, data).0
     }
 
-    #[test]
-    fn test_spl_empty_data_skips_gracefully() {
-        // SPL Token instruction with empty data → skips without panic
-        let tx = make_spl_tx(spl_token::id(), &[1], vec![]);
-        let output = run_admin_vm(&[tx]);
-        assert_eq!(output.processing_results.len(), 1);
-        let result = output
-            .processing_results
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        match result {
-            ProcessedTransaction::Executed(executed) => {
-                assert!(executed.loaded_transaction.accounts.is_empty());
-            }
-            _ => panic!("Expected Executed variant"),
-        }
+    /// Build a valid-looking 35-byte InitializeMint instruction data blob.
+    fn valid_init_mint_data(decimals: u8, authority: Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; 35];
+        data[1] = decimals;
+        data[2..34].copy_from_slice(&authority.to_bytes());
+        data[34] = 0; // COption::None for freeze authority
+        data
     }
 
-    #[test]
-    fn test_spl_compiled_indices_prevent_oob() {
-        // InitializeMint instruction where accounts[0] = 255 (way out of bounds)
-        // data: [0 (InitializeMint), decimals, 32 bytes mint_authority]
-        let mut data = vec![0u8; 34]; // type=0, decimals=6, then 32 bytes authority
-        data[1] = 6;
-        data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
-
-        // Build tx with program_id = spl_token, but the instruction's account index
-        // points beyond the transaction's account_keys
+    /// Build a SanitizedTransaction carrying TWO instructions so we can prove
+    /// multi-instruction atomicity (real-SVM semantics: fails at first bad ix).
+    fn make_two_instruction_spl_tx(
+        ix1_data: Vec<u8>,
+        ix2_data: Vec<u8>,
+    ) -> solana_sdk::transaction::SanitizedTransaction {
         use solana_sdk::{
             instruction::{AccountMeta, Instruction},
             message::Message,
@@ -330,9 +482,242 @@ mod tests {
         use std::collections::HashSet;
 
         let payer = Keypair::new();
-        // Only 2 account keys total (payer + program), but instruction.accounts[0] = 1
-        // which is valid. Let's use accounts[0] = 200 to trigger OOB.
-        // We need raw control: create instruction with accounts = [200]
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let ix1 = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint_a, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data: ix1_data,
+        };
+        let ix2 = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint_b, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data: ix2_data,
+        };
+        let msg = Message::new(&[ix1, ix2], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
+        solana_sdk::transaction::SanitizedTransaction::try_from_legacy_transaction(
+            tx,
+            &HashSet::new(),
+        )
+        .unwrap()
+    }
+
+    // ─── Happy path ─────────────────────────────────────────────────────────
+
+    /// A well-formed InitializeMint tx succeeds and produces a Mint account
+    /// whose packed bytes carry the declared decimals and mint authority.
+    #[test]
+    fn test_spl_valid_initialize_mint() {
+        let authority = Pubkey::new_unique();
+        let data = valid_init_mint_data(9, authority);
+        let tx = make_spl_tx(spl_token::id(), &[1], data);
+
+        let executed = assert_executed_with_status(run_admin_vm(&[tx]), Ok(()));
+
+        assert_eq!(executed.loaded_transaction.accounts.len(), 1);
+        let (_, account) = &executed.loaded_transaction.accounts[0];
+        let mint = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint.decimals, 9);
+        assert_eq!(mint.mint_authority, COption::Some(authority));
+    }
+
+    // ─── Failure paths ──────────────────────────────────────────────────────
+
+    /// An admin-routed tx whose program is not spl_token surfaces
+    /// `InstructionError(0, InvalidInstructionData)` and persists no accounts.
+    #[test]
+    fn test_load_and_execute_unsupported_program_returns_invalid_instruction_data() {
+        let from = solana_sdk::signature::Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = crate::test_helpers::create_test_sanitized_transaction(&from, &to, 100);
+
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidInstructionData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// An spl_token instruction with empty `data` surfaces
+    /// `InvalidInstructionData` at ix index 0.
+    #[test]
+    fn test_spl_empty_data_returns_invalid_instruction_data() {
+        let tx = make_spl_tx(spl_token::id(), &[1], vec![]);
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidInstructionData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// InitializeMint (type byte 0) with data shorter than the minimum
+    /// required payload surfaces `InvalidAccountData`.
+    #[test]
+    fn test_spl_short_data_returns_invalid_account_data() {
+        let data = vec![0u8; 10];
+        let tx = make_spl_tx(spl_token::id(), &[1], data);
+
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidAccountData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// An spl_token instruction whose first byte is a non-InitializeMint
+    /// discriminator (here Transfer = 3) surfaces `InvalidInstructionData`.
+    #[test]
+    fn test_spl_unsupported_instruction_type_returns_invalid_instruction_data() {
+        let data = vec![3u8; 10];
+        let tx = make_spl_tx(spl_token::id(), &[1], data);
+
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidInstructionData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// When the callback reports an already-initialized Mint at the target
+    /// pubkey, InitializeMint is rejected with `AccountAlreadyInitialized`
+    /// and no accounts are persisted (preventing overwrite of the live mint).
+    #[test]
+    fn test_already_initialized_mint_returns_already_in_use() {
+        let authority = Pubkey::new_unique();
+        let data = valid_init_mint_data(6, authority);
+        let (tx, mint_pubkey) = make_spl_tx_with_mint(spl_token::id(), data);
+        let cb = StubCbWithInitializedMint { mint: mint_pubkey };
+
+        let executed = assert_executed_with_status(
+            run_admin_vm_with_cb(&[tx], &cb),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::AccountAlreadyInitialized,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// A pre-existing but zero-initialized account (allocated, never
+    /// initialized) does not block InitializeMint — the VM still succeeds
+    /// and produces the fresh Mint.
+    #[test]
+    fn test_uninitialized_existing_account_still_initializes() {
+        let authority = Pubkey::new_unique();
+        let data = valid_init_mint_data(6, authority);
+        let (tx, mint_pubkey) = make_spl_tx_with_mint(spl_token::id(), data);
+        let cb = StubCbWithUninitialized { mint: mint_pubkey };
+
+        let executed = assert_executed_with_status(run_admin_vm_with_cb(&[tx], &cb), Ok(()));
+        assert_eq!(executed.loaded_transaction.accounts.len(), 1);
+    }
+
+    /// InitializeMint data with the freeze-authority COption tag set to 1
+    /// (Some) but missing the trailing 32-byte pubkey surfaces
+    /// `InvalidAccountData` rather than panicking on the slice.
+    #[test]
+    fn test_short_freeze_authority_data_errors() {
+        let mut data = vec![0u8; 35];
+        data[1] = 6;
+        data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
+        data[34] = 1; // COption::Some but no trailing 32 bytes
+
+        let tx = make_spl_tx(spl_token::id(), &[1], data);
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidAccountData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    // ─── Multi-instruction atomicity ───────────────────────────────────────
+
+    /// A two-instruction tx with a valid ix followed by a bad ix fails at
+    /// the bad ix's index, and no accounts from the earlier valid ix are
+    /// persisted (atomicity: all-or-nothing).
+    #[test]
+    fn test_multi_instruction_first_bad_fails_at_correct_index() {
+        let authority = Pubkey::new_unique();
+        let valid = valid_init_mint_data(6, authority);
+        // Second instruction: unsupported SPL Token type 3 (Transfer).
+        let bad = vec![3u8; 10];
+
+        let tx = make_two_instruction_spl_tx(valid, bad);
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                1,
+                InstructionError::InvalidInstructionData,
+            )),
+        );
+        assert!(
+            executed.loaded_transaction.accounts.is_empty(),
+            "multi-instruction atomicity violated: partial accounts leaked"
+        );
+    }
+
+    /// If the first instruction fails, subsequent instructions are not
+    /// processed — the reported error index is 0 and no accounts persist.
+    #[test]
+    fn test_multi_instruction_second_valid_not_reached() {
+        let authority = Pubkey::new_unique();
+        let bad = vec![3u8; 10];
+        let valid = valid_init_mint_data(6, authority);
+
+        let tx = make_two_instruction_spl_tx(bad, valid);
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[tx]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::InvalidInstructionData,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    // ─── Low-level invariants ───────────────────────────────────────────────
+
+    /// `SanitizedTransaction` guarantees that compiled
+    /// `instruction.accounts` indices are in-range for `account_keys`, so
+    /// the VM's index lookups are safe. This test exercises a minimal valid
+    /// InitializeMint that relies on that invariant.
+    #[test]
+    fn test_spl_compiled_indices_prevent_oob() {
+        let mut data = vec![0u8; 34];
+        data[1] = 6;
+        data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
+
+        use solana_sdk::{
+            instruction::{AccountMeta, Instruction},
+            message::Message,
+            signature::{Keypair, Signer},
+            transaction::Transaction,
+        };
+        use std::collections::HashSet;
+
+        let payer = Keypair::new();
         let ix = Instruction {
             program_id: spl_token::id(),
             accounts: vec![AccountMeta::new(payer.pubkey(), true)],
@@ -346,89 +731,9 @@ mod tests {
         )
         .unwrap();
 
-        // The instruction.accounts[0] in the compiled instruction will be a valid
-        // index since Message compilation maps AccountMeta → indices. So OOB via
-        // SanitizedTransaction is hard to achieve. Instead, verify the short-data
-        // path handles correctly (data.len() >= 34 but accounts is empty).
-        // This is the more realistic attack vector.
+        // accounts[0] is the payer (valid index). The ix is a valid InitializeMint
+        // targeting the payer pubkey as the mint → VM succeeds.
         let output = run_admin_vm(&[sanitized]);
-        // With valid compiled indices this won't panic — the accounts[0] maps correctly.
         assert_eq!(output.processing_results.len(), 1);
-    }
-
-    #[test]
-    fn test_spl_short_data_skips_mint_creation() {
-        // InitializeMint type byte (0) but data too short (< 34 bytes)
-        let data = vec![0u8; 10]; // type=0, but only 10 bytes total
-        let tx = make_spl_tx(spl_token::id(), &[1], data);
-
-        let output = run_admin_vm(&[tx]);
-        assert_eq!(output.processing_results.len(), 1);
-        let result = output
-            .processing_results
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        match result {
-            ProcessedTransaction::Executed(executed) => {
-                // Short data → guard clause skips mint creation → empty accounts
-                assert!(executed.loaded_transaction.accounts.is_empty());
-            }
-            _ => panic!("Expected Executed variant"),
-        }
-    }
-
-    #[test]
-    fn test_spl_unsupported_instruction_type() {
-        // SPL Token Transfer instruction (type = 3) → logs warning, empty accounts
-        let data = vec![3u8; 10]; // type=3 (Transfer)
-        let tx = make_spl_tx(spl_token::id(), &[1], data);
-
-        let output = run_admin_vm(&[tx]);
-        assert_eq!(output.processing_results.len(), 1);
-        let result = output
-            .processing_results
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        match result {
-            ProcessedTransaction::Executed(executed) => {
-                assert!(executed.loaded_transaction.accounts.is_empty());
-            }
-            _ => panic!("Expected Executed variant"),
-        }
-    }
-
-    #[test]
-    fn test_spl_valid_initialize_mint() {
-        // Valid InitializeMint: type=0, decimals=9, 32-byte authority
-        let authority = Pubkey::new_unique();
-        let mut data = vec![0u8; 34];
-        data[1] = 9; // decimals
-        data[2..34].copy_from_slice(&authority.to_bytes());
-
-        let tx = make_spl_tx(spl_token::id(), &[1], data);
-        let output = run_admin_vm(&[tx]);
-
-        assert_eq!(output.processing_results.len(), 1);
-        let result = output
-            .processing_results
-            .into_iter()
-            .next()
-            .unwrap()
-            .unwrap();
-        match result {
-            ProcessedTransaction::Executed(executed) => {
-                // Should have created one mint account
-                assert_eq!(executed.loaded_transaction.accounts.len(), 1);
-                let (_, account) = &executed.loaded_transaction.accounts[0];
-                let mint = Mint::unpack(account.data()).unwrap();
-                assert_eq!(mint.decimals, 9);
-                assert_eq!(mint.mint_authority, COption::Some(authority));
-            }
-            _ => panic!("Expected Executed variant"),
-        }
     }
 }

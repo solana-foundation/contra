@@ -102,7 +102,7 @@ impl AdminVm {
     /// - non-`spl_token` program id             -> InvalidInstructionData
     /// - empty instruction data                 -> InvalidInstructionData
     /// - unsupported SPL instruction type       -> InvalidInstructionData
-    /// - InitializeMint data < 34 bytes         -> InvalidAccountData
+    /// - InitializeMint data < 35 bytes         -> InvalidAccountData
     /// - InitializeMint empty accounts          -> InvalidAccountData
     /// - freeze authority tag=1, <32 trailing   -> InvalidAccountData
     /// - mint index out of `account_keys`       -> NotEnoughAccountKeys
@@ -212,16 +212,17 @@ impl AdminVm {
         instruction: solana_svm_transaction::instruction::SVMInstruction,
     ) -> Result<(Pubkey, AccountSharedData), InstructionError> {
         // Minimum payload: instruction must reference the mint as an account,
-        // and data must span discriminator + decimals + mint_authority (up to
-        // byte 34). The COption tag at byte 34 is inspected separately below.
-        if instruction.accounts.is_empty() || instruction.data.len() < 34 {
+        // and data must span discriminator + decimals + mint_authority + the
+        // freeze_authority COption tag at byte 34. `TokenInstruction::pack`
+        // always emits the tag, so any shorter payload is malformed.
+        if instruction.accounts.is_empty() || instruction.data.len() < 35 {
             debug!("[admin-vm] InitializeMint: malformed (len or accounts)");
             return Err(InstructionError::InvalidAccountData);
         }
 
         // Freeze-authority COption: byte 34 is the tag (0 = None, 1 = Some).
         // When Some, bytes 35..67 carry the 32-byte pubkey; reject if truncated.
-        let freeze_authority = if instruction.data.len() > 34 && instruction.data[34] == 1 {
+        let freeze_authority = if instruction.data[34] == 1 {
             if instruction.data.len() < 67 {
                 debug!("[admin-vm] InitializeMint: truncated freeze authority");
                 return Err(InstructionError::InvalidAccountData);
@@ -705,9 +706,10 @@ mod tests {
     /// InitializeMint that relies on that invariant.
     #[test]
     fn test_spl_compiled_indices_prevent_oob() {
-        let mut data = vec![0u8; 34];
+        let mut data = vec![0u8; 35];
         data[1] = 6;
         data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
+        data[34] = 0; // COption::None for freeze authority
 
         use solana_sdk::{
             instruction::{AccountMeta, Instruction},

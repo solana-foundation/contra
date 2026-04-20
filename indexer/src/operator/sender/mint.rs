@@ -47,12 +47,16 @@ pub(super) async fn try_jit_mint_initialization(
     // 2. Extract mint pubkey
     let mint = builder.get_mint()?;
 
-    // 3. Check if mint exists on Contra
+    // 3. Check if mint is initialized on Contra. An account may exist at the
+    // mint address (allocated via `create_account`) with non-empty zeroed data
+    // and `is_initialized = false`; treating that as "present" skips JIT and
+    // the subsequent `mint_to` fails with `UninitializedAccount`. Gate on
+    // initialization, matching the `mint_is_initialized_on_chain` fallback.
     match state.rpc_client.get_account_data(&mint).await {
-        Ok(data) if !data.is_empty() => return Some(instruction),
+        Ok(data) if is_initialized_mint_data(&data) => return Some(instruction),
         Ok(_) => {
             info!(
-                "Mint {} not found on Contra - attempting JIT initialization",
+                "Mint {} not initialized on Contra - attempting JIT initialization",
                 mint
             );
         }

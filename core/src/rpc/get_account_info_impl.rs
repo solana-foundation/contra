@@ -6,17 +6,22 @@ use crate::{
     },
 };
 use jsonrpsee::core::RpcResult;
-use solana_account_decoder::encode_ui_account;
+use solana_account_decoder::{
+    encode_ui_account,
+    parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
+};
 use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
 use solana_client::{
     rpc_config::RpcAccountInfoConfig,
     rpc_response::{Response, RpcResponseContext},
 };
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{account::ReadableAccount, pubkey::Pubkey};
 use solana_svm_callback::TransactionProcessingCallback;
+use spl_token::solana_program::program_pack::Pack;
+use spl_token::state::{Account as TokenAccount, Mint};
 use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn get_account_info_impl(
     read_deps: &ReadDeps,
@@ -40,9 +45,15 @@ pub async fn get_account_info_impl(
     let bob = BOB::new(read_deps.accounts_db.clone(), settled_accounts_rx).await;
     let account_data = bob.get_account_shared_data(&pubkey);
     let encoding = config.encoding.unwrap_or(UiAccountEncoding::Base64);
+
+    let additional_data = if encoding == UiAccountEncoding::JsonParsed {
+        build_token_additional_data(account_data.as_ref(), &bob)
+    } else {
+        None
+    };
+
     let value = account_data.map(|account| {
-        // Encode data based on requested encoding
-        encode_ui_account(&pubkey, &account, encoding, None, config.data_slice)
+        encode_ui_account(&pubkey, &account, encoding, additional_data, config.data_slice)
     });
     info!("Account info: {:?}", value);
 
@@ -50,5 +61,27 @@ pub async fn get_account_info_impl(
     Ok(Response {
         context: RpcResponseContext::new(slot),
         value,
+    })
+}
+
+fn build_token_additional_data(
+    account: Option<&solana_sdk::account::AccountSharedData>,
+    bob: &BOB,
+) -> Option<AccountAdditionalDataV3> {
+    let account = account?;
+    if *account.owner() != spl_token::id() {
+        return None;
+    }
+    let token_account = TokenAccount::unpack(account.data()).ok()?;
+    let mint_account = bob.get_account_shared_data(&token_account.mint).or_else(|| {
+        warn!("mint account {} not found for jsonParsed encoding, falling back to base64", token_account.mint);
+        None
+    })?;
+    let mint = Mint::unpack(mint_account.data()).ok()?;
+    Some(AccountAdditionalDataV3 {
+        spl_token_additional_data: Some(SplTokenAdditionalDataV2 {
+            decimals: mint.decimals,
+            ..Default::default()
+        }),
     })
 }

@@ -1536,7 +1536,7 @@ mod tests {
     // is rejected by `Mint::unpack` because `is_initialized` is 0.
     #[test]
     fn is_initialized_mint_data_zeroed_mint_len_is_false() {
-        assert!(!is_initialized_mint_data(&vec![0u8; Mint::LEN]));
+        assert!(!is_initialized_mint_data(&[0u8; Mint::LEN]));
     }
 
     // Properly packed, initialized mint data is recognized as initialized.

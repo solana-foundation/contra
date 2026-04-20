@@ -352,7 +352,7 @@ mod tests {
             if *pubkey == self.mint {
                 // Zeroed data of Mint::LEN → is_initialized = false
                 let mut acct = AccountSharedData::new(0, Mint::LEN, &spl_token::id());
-                acct.set_data_from_slice(&vec![0u8; Mint::LEN]);
+                acct.set_data_from_slice(&[0u8; Mint::LEN]);
                 Some(acct)
             } else {
                 None

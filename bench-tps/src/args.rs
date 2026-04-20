@@ -71,20 +71,29 @@ pub struct TransferArgs {
     /// Each account gets its own keypair, ATA, and initial token balance.
     /// Must be >= `--threads` to avoid multiple senders sharing a keypair
     /// (which would cause nonce conflicts).
-    #[arg(long, default_value_t = 50, env = "BENCH_ACCOUNTS")]
+    #[arg(long, default_value_t = 200, env = "BENCH_ACCOUNTS")]
     pub accounts: usize,
 
     /// Duration of the load phase in seconds.
     #[arg(long, default_value_t = 60, env = "BENCH_DURATION")]
     pub duration: u64,
 
-    /// Number of concurrent sender threads.
+    /// Number of concurrent sender tasks.
     ///
-    /// Each sender thread runs a blocking loop: pop batch → send each tx →
-    /// sleep `--sender-sleep-ms` → repeat.  More threads = higher throughput
-    /// up to the point where the node or network becomes the bottleneck.
-    #[arg(long, default_value_t = 4, env = "BENCH_THREADS")]
+    /// Each sender task runs an async loop: pop batch → send all txs
+    /// concurrently via `join_all` → sleep `--sender-sleep-ms` → repeat.
+    /// More tasks = higher throughput up to the point where the node or
+    /// network becomes the bottleneck.
+    #[arg(long, default_value_t = 16, env = "BENCH_THREADS")]
     pub threads: usize,
+
+    /// Number of transactions per batch produced by the generator.
+    ///
+    /// Each batch is sent concurrently by a single sender task using
+    /// `join_all`, so larger batches increase per-task parallelism.
+    /// Decoupled from `--threads` to allow independent tuning.
+    #[arg(long, default_value_t = 200, env = "BENCH_BATCH_SIZE")]
+    pub batch_size: usize,
 
     /// Number of distinct receiver accounts.
     ///
@@ -115,7 +124,7 @@ pub struct TransferArgs {
     ///
     /// Use this to throttle the send rate without reducing `--threads`.
     /// A value of 0 disables the sleep entirely (maximum throughput mode).
-    #[arg(long, default_value_t = 5, env = "BENCH_SENDER_SLEEP_MS")]
+    #[arg(long, default_value_t = 0, env = "BENCH_SENDER_SLEEP_MS")]
     pub sender_sleep_ms: u64,
 
     /// Tracing log level.  One of: error, warn, info, debug, trace.

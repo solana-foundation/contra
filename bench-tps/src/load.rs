@@ -23,8 +23,9 @@
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_TRANSFER},
-        types::{BatchQueue, BenchConfig, BenchState, MAX_QUEUE_DEPTH, TRANSFER_AMOUNT},
+        types::{BenchConfig, BenchState, TRANSFER_AMOUNT},
     },
+    solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
         hash::Hash, instruction::Instruction, pubkey::Pubkey, signature::Keypair, signer::Signer,
         transaction::Transaction,
@@ -44,7 +45,7 @@ use {
 const MEMO_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 /// Build a signed SPL token transfer transaction with a memo instruction that
-/// encodes `nonce` as 8 little-endian bytes.
+/// encodes `nonce` as a decimal string.
 ///
 /// Appending a unique nonce guarantees that every transaction has distinct
 /// bytes — and therefore a distinct signature — regardless of whether the
@@ -100,11 +101,6 @@ fn build_transfer(
 /// (clamped to the size of the receiver pool):
 ///   - 1         → every sender targets the same receiver (maximum contention)
 ///   - pool size → each sender has a unique receiver (zero contention)
-///
-/// Unlike a self-transfer (`src == dst`), each transaction produces a real
-/// balance change.  Senders drain at `TRANSFER_AMOUNT` per transaction, but
-/// with `--initial-balance 1_000_000` and `TRANSFER_AMOUNT = 1` there is
-/// ample runway for any typical bench run.
 pub fn build_destinations(
     accounts: &[Arc<solana_sdk::signature::Keypair>],
     num_conflict_groups: usize,
@@ -112,25 +108,29 @@ pub fn build_destinations(
     let mid = accounts.len() / 2;
     let senders = accounts[..mid].to_vec();
     let n = num_conflict_groups.min(mid).max(1);
-    let receivers = accounts[mid..mid + n]
+    let receivers: Vec<Pubkey> = accounts[mid..mid + n]
         .iter()
         .map(|kp| kp.pubkey())
         .collect();
+
     (senders, receivers)
 }
 
 /// Async generator task: signs batches of SPL transfer transactions and pushes
-/// them onto `queue` for sender threads to consume.
+/// them onto the async_channel for sender tasks to consume.
 ///
 /// The generator cycles through `config.accounts` and `config.destinations`
 /// using a wrapping sequence counter so that no two consecutive batches use
 /// the same (source, destination) pair (assuming accounts > 1).
 ///
+/// Backpressure is provided by the bounded channel — when the channel is
+/// full, `batch_tx.send()` awaits until a sender task pops a batch.
+///
 /// Exits when `cancel` is triggered.
 pub async fn run_generator(
     config: Arc<BenchConfig>,
     state: Arc<BenchState>,
-    queue: BatchQueue,
+    batch_tx: async_channel::Sender<Vec<Transaction>>,
     batch_size: usize,
     cancel: CancellationToken,
 ) {
@@ -141,17 +141,6 @@ pub async fn run_generator(
     loop {
         if cancel.is_cancelled() {
             break;
-        }
-
-        // Backpressure: if the queue is full the senders are the bottleneck.
-        // Yield to the tokio scheduler and check again on the next turn rather
-        // than spinning or sleeping.
-        {
-            let (lock, _) = queue.as_ref();
-            if lock.lock().unwrap().len() >= MAX_QUEUE_DEPTH {
-                tokio::task::yield_now().await;
-                continue;
-            }
         }
 
         // Read the latest blockhash.  The blockhash poller keeps this fresh
@@ -176,10 +165,12 @@ pub async fn run_generator(
             tx_seq = tx_seq.wrapping_add(1);
         }
 
-        // Push the batch and wake one waiting sender thread.
-        let (lock, cvar) = queue.as_ref();
-        lock.lock().unwrap().push_back(batch);
-        cvar.notify_one();
+        // Send the batch to the channel.  The bounded channel provides
+        // backpressure — this awaits when the channel is full.
+        if batch_tx.send(batch).await.is_err() {
+            // Receiver dropped — all sender tasks have exited.
+            break;
+        }
 
         // Yield after each batch so the blockhash poller and metrics sampler
         // stay responsive on the same tokio thread.
@@ -187,68 +178,60 @@ pub async fn run_generator(
     }
 }
 
-/// Blocking sender thread: pops one batch at a time and sends each transaction
-/// via the synchronous (blocking) `RpcClient`.
+/// Async sender task: pops one batch at a time from a cloned receiver and
+/// sends all transactions in the batch concurrently via the async `RpcClient`
+/// using `futures::future::join_all`.
 ///
-/// The condvar wait uses a 50 ms timeout so that a cancellation signal is
-/// checked at least every 50 ms even when the queue is idle.
+/// Each sender owns its own `async_channel::Receiver` clone; the channel's
+/// built-in MPMC fan-out ensures every batch is delivered to exactly one
+/// task. No mutex is involved, so a cancellation signal interrupts every
+/// task immediately instead of cascading through a shared lock.
 ///
-/// `sent_count` is incremented by `batch.len()` (not by 1) so the counter
-/// reflects individual transactions, not batches.
-pub fn run_sender_thread(
+/// `sent_count` is incremented by the number of transactions attempted
+/// (batch length), matching the BENCH_SENT_TOTAL metric.
+pub async fn run_sender_task(
     rpc_url: String,
-    queue: BatchQueue,
+    batch_rx: async_channel::Receiver<Vec<Transaction>>,
     cancel: CancellationToken,
     sent_count: Arc<AtomicU64>,
     sleep_ms: u64,
 ) {
-    // Each sender thread owns its own blocking RpcClient so there is no lock
-    // contention between threads on the connection pool.
-    let rpc = solana_client::rpc_client::RpcClient::new(rpc_url);
+    // Each sender task owns its own async RpcClient so there is no lock
+    // contention between tasks on the connection pool.
+    let rpc = RpcClient::new(rpc_url);
 
     loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-
-        // Block until a batch is available or a 50 ms timeout elapses.
-        // The timeout ensures we re-check `cancel` even when the queue is idle.
-        let batch = {
-            let (lock, cvar) = queue.as_ref();
-            let mut q = lock.lock().unwrap();
-            loop {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                if let Some(batch) = q.pop_front() {
-                    break batch;
-                }
-                let (new_q, _) = cvar
-                    .wait_timeout(q, std::time::Duration::from_millis(50))
-                    .unwrap();
-                q = new_q;
+        let batch = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            msg = batch_rx.recv() => match msg {
+                Ok(b) => b,
+                Err(_) => break, // channel closed — generator exited
             }
         };
 
-        // Send each transaction in the batch sequentially.  A synchronous call
-        // here is intentional: it naturally throttles the sender to the round-
-        // trip time of one HTTP request, giving the generator time to pre-sign
-        // the next batch while this one is in flight.
-        for tx in &batch {
-            BENCH_SENT_TOTAL.with_label_values(&[FLOW_TRANSFER]).inc();
-            match rpc.send_transaction(tx) {
-                Ok(_) => {}
-                Err(e) => warn!(err = %e, "sender: send_transaction failed"),
+        // Send all transactions in the batch concurrently.  Each send is an
+        // independent HTTP POST, so `join_all` fires them all at once and
+        // waits for the slowest one — dramatically reducing per-batch latency
+        // compared to sequential sends.
+        BENCH_SENT_TOTAL
+            .with_label_values(&[FLOW_TRANSFER])
+            .inc_by(batch.len() as f64);
+        let futs: Vec<_> = batch.iter().map(|tx| rpc.send_transaction(tx)).collect();
+        let results = futures::future::join_all(futs).await;
+
+        for result in &results {
+            if let Err(e) = result {
+                warn!(err = %e, "sender: send_transaction failed");
             }
         }
 
-        // Record the number of transactions dispatched in this batch.
         sent_count.fetch_add(batch.len() as u64, Ordering::Relaxed);
 
         // Optional throttle: a non-zero sleep_ms limits the peak send rate
-        // without reducing the number of sender threads.
+        // without reducing the number of sender tasks.
         if sleep_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
         }
     }
 }

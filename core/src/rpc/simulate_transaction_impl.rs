@@ -5,6 +5,7 @@ use crate::{
         ReadDeps,
     },
     scheduler::{ConflictFreeBatch, TransactionWithIndex},
+    stage_metrics::{NoopMetrics, SharedMetrics},
     stages::{execute_batch, get_execution_deps, sigverify_transaction, SigverifyResult},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -133,9 +134,12 @@ pub async fn simulate_transaction(
         index: 0,
     });
     let (_settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
+    // Simulation runs a single transaction; intra-batch parallelism is
+    // unnecessary, so disable it (max_svm_workers=1 forces sequential path).
     let mut execution_deps =
-        get_execution_deps(read_deps.accounts_db.clone(), settled_accounts_rx).await;
-    let execution_result = execute_batch(batch, &mut execution_deps).await;
+        get_execution_deps(read_deps.accounts_db.clone(), settled_accounts_rx, 1).await;
+    let noop: SharedMetrics = std::sync::Arc::new(NoopMetrics);
+    let execution_result = execute_batch(batch, &mut execution_deps, &noop).await;
 
     let result = if let Some(regular_results) = execution_result.regular_results {
         regular_results

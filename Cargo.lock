@@ -718,6 +718,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-channel"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
+dependencies = [
+ "concurrent-queue",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1927,6 +1939,7 @@ name = "contra-bench-tps"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "clap 4.5.48",
  "contra-core",
  "contra-escrow-program-client",
@@ -1953,6 +1966,7 @@ name = "contra-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "axum 0.8.4",
  "base64 0.21.7",
  "bincode",
@@ -2009,7 +2023,6 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "tokio",
- "tokio-mpmc",
  "tokio-util 0.7.16",
  "tower-http",
  "tracing",
@@ -12536,7 +12549,7 @@ version = "2.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1faa9bfb0bc556b77d836cacf347c4e1754a0334e8b9946dbed49ead4e1c0eb2"
 dependencies = [
- "async-channel",
+ "async-channel 1.9.0",
  "bytes",
  "crossbeam-channel",
  "dashmap",
@@ -12584,7 +12597,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e49b16c113860eda6f3fc68a5b0df11d448de8585870d9bc3b431903a27d52f2"
 dependencies = [
  "arc-swap",
- "async-channel",
+ "async-channel 1.9.0",
  "bytes",
  "crossbeam-channel",
  "dashmap",
@@ -15788,20 +15801,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
-]
-
-[[package]]
-name = "tokio-mpmc"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffadf729b08a5df966b11daa6faee399f72a4ddb00125c0e8853aa4e0f08006c"
-dependencies = [
- "crossbeam-queue",
- "futures 0.3.31",
- "rand 0.9.2",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

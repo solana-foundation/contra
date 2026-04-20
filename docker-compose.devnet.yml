@@ -47,6 +47,10 @@ services:
       dockerfile: Dockerfile
     container_name: contra-write-node
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       - postgres-primary
     environment:
@@ -57,7 +61,11 @@ services:
       - CONTRA_SIGVERIFY_QUEUE_SIZE=${CONTRA_SIGVERIFY_QUEUE_SIZE}
       - CONTRA_SIGVERIFY_WORKERS=${CONTRA_SIGVERIFY_WORKERS}
       - CONTRA_MAX_CONNECTIONS=${CONTRA_WRITE_MAX_CONNECTIONS}
+      - CONTRA_PG_MAX_CONNECTIONS=${CONTRA_PG_MAX_CONNECTIONS:-32}
       - CONTRA_MAX_TX_PER_BATCH=${CONTRA_MAX_TX_PER_BATCH}
+      - CONTRA_BATCH_DEADLINE_MS=${CONTRA_BATCH_DEADLINE_MS:-10}
+      - CONTRA_BATCH_CHANNEL_CAPACITY=${CONTRA_BATCH_CHANNEL_CAPACITY:-16}
+      - CONTRA_MAX_SVM_WORKERS=${CONTRA_MAX_SVM_WORKERS:-8}
       - CONTRA_LOG_LEVEL=info
       - CONTRA_JSON_LOGS=false
       - CONTRA_MODE=write
@@ -126,6 +134,10 @@ services:
       dockerfile: Dockerfile
     container_name: contra-read-node
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       - postgres-replica
       - write-node
@@ -134,6 +146,7 @@ services:
       - CONTRA_PORT=${CONTRA_READ_PORT}
       - CONTRA_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
       - CONTRA_MAX_CONNECTIONS=${CONTRA_READ_MAX_CONNECTIONS}
+      - CONTRA_PG_MAX_CONNECTIONS=${CONTRA_PG_MAX_CONNECTIONS:-32}
       - CONTRA_ENABLE_WRITE=false
       - CONTRA_ENABLE_READ=true
       - CONTRA_LOG_LEVEL=info
@@ -152,6 +165,10 @@ services:
       dockerfile: Dockerfile
     container_name: contra-gateway
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       - write-node
       - read-node

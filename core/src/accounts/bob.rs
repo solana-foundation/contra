@@ -65,6 +65,11 @@ struct AccountWithMeta {
     deleted: bool,
 }
 
+/// How often (in batches) to run the expensive eviction sweep in garbage_collect.
+/// The settled_accounts channel is still drained on every preload to keep
+/// dirty/clean tracking current; only the O(N) `retain()` scan is deferred.
+const GC_EVICTION_INTERVAL: u64 = 100;
+
 pub struct BOB {
     /// The in-memory account state
     accounts: HashMap<Pubkey, AccountWithMeta>,
@@ -74,6 +79,8 @@ pub struct BOB {
     settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
     /// AccountsDB account state
     pub accounts_db: AccountsDB,
+    /// Counts preload calls since last eviction sweep
+    batches_since_eviction: u64,
 }
 
 impl BOB {
@@ -91,9 +98,17 @@ impl BOB {
             burn_percent: 0,
         };
 
-        // Load system program
+        // Load system program.
+        //
+        // lamports=1 (not 0): the SVM's AccountLoader caches loaded accounts
+        // across transactions within a single batch, and if a cached entry has
+        // `lamports == 0` it is treated as "previously deallocated" and
+        // returned as `None` on subsequent loads. A zero-lamport precompile
+        // therefore becomes invisible to the second transaction in a batch,
+        // breaking any CPI into system_program (e.g. ATA account creation).
+        // Same applies to the rent sysvar below.
         let system_account = Account {
-            lamports: 0,
+            lamports: 1,
             data: b"solana_system_program".to_vec(),
             owner: solana_sdk_ids::native_loader::ID,
             executable: true,
@@ -119,9 +134,9 @@ impl BOB {
         precompiles.insert(ata_id, AccountSharedData::from(ata_account));
         info!("Loaded Associated Token Account program");
 
-        // Load rent sysvar
+        // Load rent sysvar. lamports=1 for the same reason as system_program above.
         let rent_account = Account {
-            lamports: 0,
+            lamports: 1,
             data: bincode::serialize(&rent).unwrap(),
             owner: solana_sdk_ids::sysvar::ID,
             executable: false,
@@ -159,6 +174,7 @@ impl BOB {
             precompiles,
             settled_accounts_rx,
             accounts_db,
+            batches_since_eviction: 0,
         }
     }
 
@@ -166,35 +182,59 @@ impl BOB {
         &self.precompiles
     }
 
-    pub async fn preload_accounts(&mut self, pubkeys: &[Pubkey]) {
-        // First, process any settled accounts and perform garbage collection
+    /// Preloads accounts into BOB from the database.
+    ///
+    /// Returns `(fetched, cached)` where:
+    /// - `fetched` = accounts that were missing from BOB and loaded from the DB.
+    /// - `cached`  = accounts that were already warm in BOB (no DB round-trip needed).
+    ///
+    /// Only queries the database for accounts that are actual cache misses
+    /// (not in BOB's HashMap and not a precompile). Once the working set is
+    /// warm, most batches will skip the DB entirely.
+    pub async fn preload_accounts(&mut self, pubkeys: &[Pubkey]) -> (usize, usize) {
+        // Drain settled_accounts channel to keep dirty/clean tracking current.
+        // The expensive eviction sweep only runs every GC_EVICTION_INTERVAL batches.
         self.garbage_collect();
 
-        // Filter out precompiles since they're already in memory
-        let accounts_to_load: Vec<Pubkey> = pubkeys
-            .iter()
-            .filter(|pubkey| !self.precompiles.contains_key(pubkey))
-            .copied()
-            .collect();
+        // Partition pubkeys into cache hits vs misses, skipping precompiles
+        // (which are always in memory and never need DB lookup).
+        let mut already_cached = 0usize;
+        let mut miss_keys: Vec<Pubkey> = Vec::new();
 
-        if accounts_to_load.is_empty() {
-            return;
+        for pubkey in pubkeys {
+            if self.precompiles.contains_key(pubkey) {
+                continue;
+            }
+            if self.accounts.contains_key(pubkey) {
+                already_cached += 1;
+            } else {
+                miss_keys.push(*pubkey);
+            }
         }
 
-        let accounts = self.accounts_db.get_accounts(&accounts_to_load).await;
+        // If everything is warm, skip the DB round-trip entirely.
+        if miss_keys.is_empty() {
+            return (0, already_cached);
+        }
+
+        // Only fetch the cache-miss keys from the database.
+        let accounts = self.accounts_db.get_accounts(&miss_keys).await;
+        let mut fetched = 0usize;
         for (index, account_opt) in accounts.iter().enumerate() {
             if let Some(account) = account_opt {
-                let pubkey = accounts_to_load[index];
-                // Only load in the account if it DNE in-memory
-                self.accounts
-                    .entry(pubkey)
-                    .or_insert_with(|| AccountWithMeta {
+                self.accounts.insert(
+                    miss_keys[index],
+                    AccountWithMeta {
                         account: account.clone(),
                         synced_since: None,
                         deleted: false,
-                    });
+                    },
+                );
+                fetched += 1;
             }
         }
+
+        (fetched, already_cached)
     }
 
     // TODO: Merge this implementation with the one in the settlement stage
@@ -214,7 +254,6 @@ impl BOB {
                         "Executed transaction: {:?}",
                         sanitized_transaction.signature()
                     );
-                    info!("Executed transaction: {:?}", tx);
 
                     for (index, (pubkey, account_data)) in executed_transaction
                         .loaded_transaction
@@ -255,12 +294,22 @@ impl BOB {
         }
     }
 
-    /// Drain the settled accounts channel and remove accounts that are in sync with the AccountsDB
+    /// Drain the settled accounts channel and periodically evict stale entries.
+    ///
+    /// Split into two phases:
+    /// 1. **Channel drain** (every call): process settled_accounts messages to
+    ///    update `synced_since` and remove deleted tombstones. This is lightweight
+    ///    — just a `try_recv` loop over whatever messages are pending.
+    /// 2. **Eviction sweep** (every `GC_EVICTION_INTERVAL` batches): scan the
+    ///    entire HashMap to evict entries that have been synced for longer than
+    ///    `OLDEST_SYNCED_ACCOUNT_AGE`. This is O(N) so we avoid it on every batch.
     fn garbage_collect(&mut self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+
+        // Phase 1: always drain the channel to keep dirty/clean state current.
         while let Ok(account_settlements) = self.settled_accounts_rx.try_recv() {
             for (pubkey, account_settlement) in account_settlements {
                 if account_settlement.deleted {
@@ -288,13 +337,19 @@ impl BOB {
                 }
             }
         }
-        self.accounts.retain(|_pubkey, account| {
-            if let Some(synced_since) = account.synced_since {
-                synced_since + OLDEST_SYNCED_ACCOUNT_AGE >= now
-            } else {
-                true // Always keep accounts with synced_since = None
-            }
-        });
+
+        // Phase 2: only run the O(N) eviction sweep periodically.
+        self.batches_since_eviction += 1;
+        if self.batches_since_eviction >= GC_EVICTION_INTERVAL {
+            self.batches_since_eviction = 0;
+            self.accounts.retain(|_pubkey, account| {
+                if let Some(synced_since) = account.synced_since {
+                    synced_since + OLDEST_SYNCED_ACCOUNT_AGE >= now
+                } else {
+                    true // Always keep accounts with synced_since = None
+                }
+            });
+        }
     }
 }
 
@@ -311,7 +366,20 @@ impl BOB {
             precompiles: HashMap::new(),
             settled_accounts_rx,
             accounts_db,
+            batches_since_eviction: 0,
         }
+    }
+
+    /// Insert an account directly into BOB's cache (test-only).
+    pub(crate) fn insert_account_for_test(&mut self, pubkey: Pubkey, account: AccountSharedData) {
+        self.accounts.insert(
+            pubkey,
+            AccountWithMeta {
+                account,
+                synced_since: None,
+                deleted: false,
+            },
+        );
     }
 }
 
@@ -552,6 +620,8 @@ mod tests {
             },
         );
 
+        // Force the eviction sweep to run on the next garbage_collect call
+        bob.batches_since_eviction = GC_EVICTION_INTERVAL - 1;
         bob.garbage_collect();
 
         assert!(
@@ -782,6 +852,8 @@ mod tests {
             },
         );
 
+        // Force the eviction sweep to run on the next garbage_collect call
+        bob.batches_since_eviction = GC_EVICTION_INTERVAL - 1;
         bob.garbage_collect();
 
         assert!(

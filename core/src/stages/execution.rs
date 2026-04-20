@@ -1173,7 +1173,7 @@ mod tests {
         // A tx whose only instruction is an admin instruction routes to the Admin VM.
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
 
         let tx = create_admin_initialize_mint_tx();
         let batch = ConflictFreeBatch {
@@ -1183,7 +1183,8 @@ mod tests {
             }],
         };
 
-        let result = execute_batch(batch, &mut deps).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
         assert_eq!(result.admin_transactions.len(), 1);
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_some());
@@ -1198,7 +1199,7 @@ mod tests {
         // path stays strictly single-purpose.
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
 
         let tx = create_mixed_admin_and_regular_tx();
         let batch = ConflictFreeBatch {
@@ -1208,7 +1209,8 @@ mod tests {
             }],
         };
 
-        let result = execute_batch(batch, &mut deps).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
         assert!(
             result.admin_transactions.is_empty(),
             "mixed tx must not be admin-routed"
@@ -1224,7 +1226,7 @@ mod tests {
     async fn test_execute_batch_partitions_admin_and_regular_separately() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
 
         let admin_tx = create_admin_initialize_mint_tx();
         let regular_tx = create_test_transaction();
@@ -1241,7 +1243,8 @@ mod tests {
             ],
         };
 
-        let result = execute_batch(batch, &mut deps).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
         assert_eq!(result.admin_transactions.len(), 1);
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());

@@ -171,20 +171,31 @@ fn is_initialized_mint_data(data: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Re-queries the mint account on Contra and reports whether it is initialized.
-/// RPC errors and missing/empty accounts are treated as "not initialized" so the
-/// caller falls through to the original error path.
+/// Returns whether the mint is initialized on Contra, retrying with backoff
+/// to absorb read-RPC lag after a racing InitializeMint. Any error or
+/// uninitialized result on the final attempt is reported as `false`.
 async fn mint_is_initialized_on_chain(rpc_client: &RpcClientWithRetry, mint: &Pubkey) -> bool {
-    match rpc_client.get_account_data(mint).await {
-        Ok(data) => is_initialized_mint_data(&data),
-        Err(e) => {
-            warn!(
-                "RPC error re-checking mint {} after failed JIT init: {}",
-                mint, e
-            );
-            false
+    const ATTEMPTS: u32 = 4;
+    const BACKOFF_MS: u64 = 250;
+
+    for attempt in 0..ATTEMPTS {
+        match rpc_client.get_account_data(mint).await {
+            Ok(data) if is_initialized_mint_data(&data) => return true,
+            Ok(_) => {}
+            Err(e) => {
+                if attempt + 1 == ATTEMPTS {
+                    warn!(
+                        "RPC error re-checking mint {} after failed JIT init: {}",
+                        mint, e
+                    );
+                }
+            }
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(tokio::time::Duration::from_millis(BACKOFF_MS)).await;
         }
     }
+    false
 }
 
 /// Check recent ATA signatures for an already-confirmed mint carrying this transaction's

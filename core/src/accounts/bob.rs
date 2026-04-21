@@ -29,13 +29,12 @@
 /// evict less frequently accessed accounts.
 use {
     crate::{
-        accounts::{bpf_loader_program_account, AccountsDB},
+        accounts::{precompiles::PRECOMPILES, AccountsDB},
         stages::AccountSettlement,
     },
     solana_sdk::{
-        account::{Account, AccountSharedData, ReadableAccount},
+        account::{AccountSharedData, ReadableAccount},
         pubkey::Pubkey,
-        rent::Rent,
         transaction::SanitizedTransaction,
     },
     solana_svm::{
@@ -49,7 +48,7 @@ use {
         time::{SystemTime, UNIX_EPOCH},
     },
     tokio::sync::mpsc,
-    tracing::{debug, info, warn},
+    tracing::{debug, warn},
 };
 
 // TODO: Make this a config parameter
@@ -88,90 +87,12 @@ impl BOB {
         accounts_db: AccountsDB,
         settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
     ) -> Self {
-        // Initialize precompiles that are always kept in memory
-        let mut precompiles = HashMap::new();
-
-        // Use zero rent for gasless operation
-        let rent = Rent {
-            lamports_per_byte_year: 0,
-            exemption_threshold: 0.0,
-            burn_percent: 0,
-        };
-
-        // Load system program.
-        //
-        // lamports=1 (not 0): the SVM's AccountLoader caches loaded accounts
-        // across transactions within a single batch, and if a cached entry has
-        // `lamports == 0` it is treated as "previously deallocated" and
-        // returned as `None` on subsequent loads. A zero-lamport precompile
-        // therefore becomes invisible to the second transaction in a batch,
-        // breaking any CPI into system_program (e.g. ATA account creation).
-        // Same applies to the rent sysvar below.
-        let system_account = Account {
-            lamports: 1,
-            data: b"solana_system_program".to_vec(),
-            owner: solana_sdk_ids::native_loader::ID,
-            executable: true,
-            rent_epoch: u64::MAX,
-        };
-        precompiles.insert(
-            solana_sdk_ids::system_program::ID,
-            AccountSharedData::from(system_account),
-        );
-        info!("Loaded system program");
-
-        // Load SPL Token program
-        let spl_token_elf = include_bytes!("../../precompiles/spl_token-8.0.0.so");
-        let (spl_token_id, spl_token_account) =
-            bpf_loader_program_account(&spl_token::ID, spl_token_elf, &rent);
-        precompiles.insert(spl_token_id, AccountSharedData::from(spl_token_account));
-        info!("Loaded SPL Token program");
-
-        // Load Associated Token Account program
-        let ata_elf = include_bytes!("../../precompiles/spl_associated_token_account-1.1.1.so");
-        let (ata_id, ata_account) =
-            bpf_loader_program_account(&spl_associated_token_account::ID, ata_elf, &rent);
-        precompiles.insert(ata_id, AccountSharedData::from(ata_account));
-        info!("Loaded Associated Token Account program");
-
-        // Load rent sysvar. lamports=1 for the same reason as system_program above.
-        let rent_account = Account {
-            lamports: 1,
-            data: bincode::serialize(&rent).unwrap(),
-            owner: solana_sdk_ids::sysvar::ID,
-            executable: false,
-            rent_epoch: u64::MAX,
-        };
-        precompiles.insert(
-            solana_sdk_ids::sysvar::rent::ID,
-            AccountSharedData::from(rent_account),
-        );
-        info!("Loaded rent sysvar");
-
-        // Load SPL Memo v3 program
-        let memo_v3_elf = include_bytes!("../../precompiles/spl_memo-3.0.0.so");
-        let (memo_v3_id, memo_v3_account) =
-            bpf_loader_program_account(&spl_memo::id(), memo_v3_elf, &rent);
-        precompiles.insert(memo_v3_id, AccountSharedData::from(memo_v3_account));
-        info!("Loaded SPL Memo v3 program");
-
-        // Load Contra Withdraw program
-        let withdraw_elf = include_bytes!("../../precompiles/contra_withdraw_program.so");
-        // Convert from solana_pubkey::Pubkey to solana_sdk::pubkey::Pubkey
-        let (_, withdraw_account) = bpf_loader_program_account(
-            &contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
-            withdraw_elf,
-            &rent,
-        );
-        precompiles.insert(
-            contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
-            AccountSharedData::from(withdraw_account),
-        );
-        info!("Loaded Contra Withdraw program");
-
+        // Precompile ELFs are parsed once process-wide; see
+        // `crate::accounts::precompiles`. Cloning the map is cheap, the
+        // heavy work of parsing BPF bytes happens at first LazyLock access.
         Self {
             accounts: HashMap::new(),
-            precompiles,
+            precompiles: PRECOMPILES.clone(),
             settled_accounts_rx,
             accounts_db,
             batches_since_eviction: 0,
@@ -411,7 +332,9 @@ impl TransactionProcessingCallback for BOB {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_svm_callback::TransactionProcessingCallback};
+    use {
+        super::*, solana_sdk::account::Account, solana_svm_callback::TransactionProcessingCallback,
+    };
 
     fn create_test_bob() -> (BOB, mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>) {
         crate::test_helpers::create_test_bob()

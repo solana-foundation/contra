@@ -27,6 +27,9 @@ pub struct MockStorage {
     pub pending_remint_signatures: std::sync::Arc<Mutex<Vec<PendingRemintRecord>>>,
     /// Transactions currently in PendingRemint status, used in tests to simulate startup recovery.
     pub pending_remint_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
+    /// Transaction IDs on which `reset_transaction_to_pending` was invoked — used by tests
+    /// to verify the pre-flight pausable path deferred a withdrawal instead of sending it.
+    pub reset_to_pending_ids: std::sync::Arc<Mutex<Vec<i64>>>,
 }
 
 impl MockStorage {
@@ -208,6 +211,24 @@ impl MockStorage {
         Ok(self.mints.lock().unwrap().get(mint_address).cloned())
     }
 
+    pub async fn set_mint_pausable(
+        &self,
+        mint_address: &str,
+        is_pausable: bool,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("set_mint_pausable")?;
+        let mut mints = self.mints.lock().unwrap();
+        match mints.get_mut(mint_address) {
+            Some(mint) => {
+                mint.is_pausable = Some(is_pausable);
+                Ok(())
+            }
+            None => Err(StorageError::DatabaseError {
+                message: format!("set_mint_pausable: no mints row for {mint_address}"),
+            }),
+        }
+    }
+
     pub fn set_mint_balances(&self, balances: Vec<MintDbBalance>) {
         *self.mint_balances.lock().unwrap() = balances;
     }
@@ -261,6 +282,15 @@ impl MockStorage {
             .filter(|n| n >= &min_nonce && n < &max_nonce)
             .collect();
         Ok(nonces)
+    }
+
+    pub async fn reset_transaction_to_pending(
+        &self,
+        transaction_id: i64,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("reset_transaction_to_pending")?;
+        self.reset_to_pending_ids.lock().unwrap().push(transaction_id);
+        Ok(())
     }
 
     pub async fn set_pending_remint(

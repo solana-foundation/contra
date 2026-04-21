@@ -49,8 +49,6 @@ pub const INVALID_INSTANCE_ERROR: u32 = ContraEscrowProgramError::InvalidInstanc
 pub const INVALID_ADMIN_ERROR: u32 = ContraEscrowProgramError::InvalidAdmin as u32;
 pub const PERMANENT_DELEGATE_NOT_ALLOWED_ERROR: u32 =
     ContraEscrowProgramError::PermanentDelegateNotAllowed as u32;
-pub const PAUSABLE_MINT_NOT_ALLOWED_ERROR: u32 =
-    ContraEscrowProgramError::PausableMintNotAllowed as u32;
 pub const INVALID_ALLOWED_MINT_ERROR: u32 = ContraEscrowProgramError::InvalidAllowedMint as u32;
 pub const INVALID_OPERATOR_ERROR: u32 = ContraEscrowProgramError::InvalidOperatorPda as u32;
 pub const INVALID_SMT_PROOF_ERROR: u32 = ContraEscrowProgramError::InvalidSmtProof as u32;

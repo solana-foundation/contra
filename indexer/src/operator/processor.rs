@@ -19,12 +19,17 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, info_span, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 pub struct ProcessorState {
     pub admin_pubkey: Pubkey,
     pub release_funds_state: Option<ReleaseFundsState>,
     pub mint_cache: MintCache,
+    /// Direct handle on storage. The release-funds path needs to reset a
+    /// transaction back to `pending` when a pausable mint is currently
+    /// paused — MintCache's internal storage is for its own lookups and
+    /// shouldn't double as an escape hatch for transaction-state writes.
+    pub storage: Arc<Storage>,
 }
 
 pub struct ReleaseFundsState {
@@ -57,7 +62,8 @@ impl ProcessorState {
                 allowed_mints: HashMap::new(),
                 instance_atas: HashMap::new(),
             }),
-            mint_cache: MintCache::with_rpc(storage, rpc_client),
+            mint_cache: MintCache::with_rpc(storage.clone(), rpc_client),
+            storage,
         }
     }
 
@@ -68,7 +74,8 @@ impl ProcessorState {
         Self {
             admin_pubkey: SignerUtil::get_admin_pubkey(),
             release_funds_state: None,
-            mint_cache: MintCache::with_rpc(storage, mint_rpc_client),
+            mint_cache: MintCache::with_rpc(storage.clone(), mint_rpc_client),
+            storage,
         }
     }
 }
@@ -154,6 +161,41 @@ pub async fn process_release_funds(
                 .expect("withdrawal transaction must have withdrawal_nonce")
                 as u64;
 
+            let mint =
+                Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+                    pubkey: transaction.mint.clone(),
+                    reason: e.to_string(),
+                })?;
+            let recipient = Pubkey::from_str(&transaction.recipient).map_err(|e| {
+                OperatorError::InvalidPubkey {
+                    pubkey: transaction.recipient.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+
+            // Fetch mint metadata from cache (or storage if not cached).
+            // Resolved *before* the tree-rotation check so the pause pre-flight
+            // below can bail out without emitting a rotation for a withdrawal
+            // we didn't actually execute.
+            let mint_metadata = processor_state.mint_cache.get_mint_metadata(&mint).await?;
+            let token_program = mint_metadata.token_program;
+
+            // Pause pre-flight for mints carrying the Token-2022 PausableConfig
+            // extension. If currently paused, release-funds would fail on-chain
+            // and burn fees — revert the row to `pending` so the fetcher
+            // re-picks it on the next poll, and check again then.
+            if mint_metadata.is_pausable {
+                let paused = processor_state.mint_cache.check_paused(&mint).await?;
+                if paused {
+                    warn!(mint = %mint, "Mint is paused; deferring withdrawal to next poll");
+                    processor_state
+                        .storage
+                        .reset_transaction_to_pending(transaction.id)
+                        .await?;
+                    return Ok(());
+                }
+            }
+
             // Check if we need to rotate the tree before processing this transaction
             if nonce > 0 && nonce.is_multiple_of(MAX_TREE_LEAVES as u64) {
                 info!("Tree rotation boundary detected at nonce {}", nonce);
@@ -177,22 +219,6 @@ pub async fn process_release_funds(
             }
 
             let mut builder = ReleaseFundsBuilder::new();
-
-            let mint =
-                Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
-                    pubkey: transaction.mint.clone(),
-                    reason: e.to_string(),
-                })?;
-            let recipient = Pubkey::from_str(&transaction.recipient).map_err(|e| {
-                OperatorError::InvalidPubkey {
-                    pubkey: transaction.recipient.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
-
-            // Fetch mint metadata from cache (or storage if not cached)
-            let mint_metadata = processor_state.mint_cache.get_mint_metadata(&mint).await?;
-            let token_program = mint_metadata.token_program;
 
             let allowed_mint_pda = release_funds_state.get_allowed_mint_pda(&mint);
             let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
@@ -416,7 +442,8 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage,
         };
         // Keep tx alive so channel isn't closed — error must come from missing state
         let (_tx, rx) = mpsc::channel::<DbTransaction>(1);
@@ -440,6 +467,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage: storage.clone(),
         };
 
         // Add a mint to the mock storage so mint_cache can find it
@@ -457,6 +485,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    is_pausable: Some(false),
                 },
             );
         }
@@ -510,6 +539,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage: storage.clone(),
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -526,6 +556,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    is_pausable: Some(false),
                 },
             );
         }
@@ -590,7 +621,8 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -639,7 +671,8 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -692,7 +725,8 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -741,7 +775,8 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -769,7 +804,8 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -819,6 +855,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
+            storage: storage.clone(),
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -834,6 +871,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    is_pausable: Some(false),
                 },
             );
         }

@@ -39,7 +39,7 @@
 - `test_allow_mint_invalid_instance_account_owner` — wrong owner rejected
 - `test_allow_mint_token_2022_basic_success` — Token2022 mint allowed
 - `test_allow_mint_token_2022_permanent_delegate_blocked` — PermanentDelegateNotAllowed
-- `test_allow_mint_token_2022_pausable_blocked` — PausableMintNotAllowed
+- `test_allow_mint_token_2022_pausable_accepted` — pausable Token-2022 mint allowed; pause state is enforced by the operator at withdrawal time
 
 ### BlockMint (9 integration tests)
 

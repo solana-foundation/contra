@@ -10,7 +10,7 @@ use pinocchio_token_2022::{
 };
 use spl_token_2022::extension::StateWithExtensions;
 use spl_token_2022::extension::{
-    pausable::PausableConfig, permanent_delegate::PermanentDelegate, BaseStateWithExtensions,
+    permanent_delegate::PermanentDelegate, BaseStateWithExtensions,
 };
 use spl_token_2022::state::Mint as Token2022MintState;
 
@@ -111,7 +111,8 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(ContraEscrowProgramError::InvalidMint.into())
 }
 
-/// Blocks mints with PermanentDelegate or Pausable extensions.
+/// Blocks mints with the PermanentDelegate extension. Pausable mints are
+/// accepted — the operator checks the live pause state before withdrawal.
 #[inline(always)]
 pub fn validate_token2022_extensions(mint_info: &AccountView) -> ProgramResult {
     let data = mint_info.try_borrow()?;
@@ -121,9 +122,6 @@ pub fn validate_token2022_extensions(mint_info: &AccountView) -> ProgramResult {
 
     if mint.get_extension::<PermanentDelegate>().is_ok() {
         return Err(ContraEscrowProgramError::PermanentDelegateNotAllowed.into());
-    }
-    if mint.get_extension::<PausableConfig>().is_ok() {
-        return Err(ContraEscrowProgramError::PausableMintNotAllowed.into());
     }
 
     Ok(())

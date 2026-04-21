@@ -1,8 +1,12 @@
-use crate::error::{AccountError, OperatorError, StorageError};
+use crate::error::{AccountError, OperatorError};
 use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_token_2022::extension::{
+    pausable::PausableConfig, BaseStateWithExtensions, StateWithExtensions,
+};
+use spl_token_2022::state::Mint as Token2022MintState;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -10,9 +14,14 @@ use std::sync::Arc;
 
 const DECIMALS_OFFSET: usize = 44;
 
-/// In-memory cache for mint metadata (token_program and decimals)
-/// Fetches from storage once and caches for subsequent lookups
-/// Falls back to on-chain RPC if not in storage
+/// In-memory cache for mint metadata (`token_program`, `decimals`,
+/// `is_pausable`). On a miss, falls through to the DB; if the DB row
+/// exists but `is_pausable` hasn't been resolved yet (indexer writes it
+/// as `None` at `AllowMint` time), the cache RPC-fetches the on-chain
+/// mint to detect the Token-2022 `PausableConfig` extension, writes the
+/// resolved value back via `set_mint_pausable`, and caches it. Also
+/// exposes `check_paused` for the dynamic `PausableConfig.paused` check
+/// that the release-funds pre-flight needs.
 pub struct MintCache {
     storage: Arc<Storage>,
     rpc_client: Option<Arc<RpcClientWithRetry>>,
@@ -24,6 +33,11 @@ pub struct MintCache {
 pub struct MintMetadata {
     pub token_program: Pubkey,
     pub decimals: u8,
+    /// True iff the on-chain mint carries the Token-2022 PausableConfig
+    /// extension. This is a static property of the mint; the *current*
+    /// `PausableConfig.paused` bool is dynamic and must be re-fetched —
+    /// see `MintCache::check_paused`.
+    pub is_pausable: bool,
 }
 
 impl MintCache {
@@ -43,48 +57,98 @@ impl MintCache {
         }
     }
 
-    /// Get mint metadata from cache or fetch from storage
-    /// Falls back to RPC if not in storage
+    /// Get mint metadata, resolving and caching `is_pausable` on first sight.
+    ///
+    /// Order:
+    /// 1. In-memory cache hit → return.
+    /// 2. Storage row with `is_pausable = Some(_)` → return (fast path).
+    /// 3. Anything else (no row, or `is_pausable = None`) → RPC-fetch the
+    ///    mint account, parse the PausableConfig extension presence, and
+    ///    write the result back to storage so subsequent restarts skip
+    ///    the RPC. Write-back is skipped if no row exists yet — the
+    ///    indexer is expected to land the row shortly.
     pub async fn get_mint_metadata(
         &mut self,
         mint: &Pubkey,
     ) -> Result<MintMetadata, OperatorError> {
         let mint_str = mint.to_string();
 
-        // Check cache first
         if let Some(metadata) = self.cache.get(&mint_str) {
             return Ok(metadata.clone());
         }
 
-        // Try storage
-        if let Some(db_mint) = self.storage.get_mint(&mint_str).await? {
-            let token_program = Pubkey::from_str(&db_mint.token_program).map_err(|e| {
-                OperatorError::InvalidPubkey {
-                    pubkey: db_mint.token_program.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
+        let db_mint = self.storage.get_mint(&mint_str).await?;
 
-            let metadata = MintMetadata {
-                token_program,
-                decimals: db_mint.decimals as u8,
-            };
-
-            self.cache.insert(mint_str, metadata.clone());
-            return Ok(metadata);
+        if let Some(ref m) = db_mint {
+            if let Some(is_pausable) = m.is_pausable {
+                let token_program = Pubkey::from_str(&m.token_program).map_err(|e| {
+                    OperatorError::InvalidPubkey {
+                        pubkey: m.token_program.clone(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                let metadata = MintMetadata {
+                    token_program,
+                    decimals: m.decimals as u8,
+                    is_pausable,
+                };
+                self.cache.insert(mint_str, metadata.clone());
+                return Ok(metadata);
+            }
         }
 
-        // Fallback to RPC if available
-        if let Some(rpc) = &self.rpc_client {
-            let metadata = self.fetch_mint_from_rpc(mint, rpc).await?;
-            self.cache.insert(mint_str, metadata.clone());
-            return Ok(metadata);
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError(format!(
+                "MintCache needs RPC to resolve mint {mint_str} (storage row {}), but no RPC client is configured",
+                if db_mint.is_some() { "lacks is_pausable" } else { "is absent" },
+            ))
+        })?;
+
+        let metadata = self.fetch_mint_from_rpc(mint, rpc).await?;
+
+        // Only persist is_pausable if the indexer has already landed a row.
+        // The row is the authoritative source for is_pausable going forward;
+        // no row means this is a pre-AllowMint-ingested edge case, so we
+        // keep the resolution in-memory only.
+        if db_mint.is_some() {
+            self.storage
+                .set_mint_pausable(&mint_str, metadata.is_pausable)
+                .await?;
         }
 
-        Err(StorageError::DatabaseError {
-            message: format!("Mint not found in storage: {}", mint_str),
-        }
-        .into())
+        self.cache.insert(mint_str, metadata.clone());
+        Ok(metadata)
+    }
+
+    /// Live check of the `PausableConfig.paused` flag. Intended for the
+    /// pre-flight pause check in the operator's ReleaseFunds path: only
+    /// call this after `MintMetadata.is_pausable` came back true.
+    pub async fn check_paused(&self, mint: &Pubkey) -> Result<bool, OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError("check_paused requires an RPC client".to_string())
+        })?;
+
+        let account = rpc
+            .get_account(mint)
+            .await
+            .map_err(|_| AccountError::AccountNotFound { pubkey: *mint })?;
+
+        let state = StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(
+            |_| AccountError::InvalidMint {
+                pubkey: *mint,
+                reason: "failed to parse Token-2022 mint".to_string(),
+            },
+        )?;
+
+        let cfg = state.get_extension::<PausableConfig>().map_err(|_| {
+            AccountError::InvalidMint {
+                pubkey: *mint,
+                reason: "mint is tagged is_pausable but PausableConfig extension is missing"
+                    .to_string(),
+            }
+        })?;
+
+        Ok(bool::from(cfg.paused))
     }
 
     async fn fetch_mint_from_rpc(
@@ -97,7 +161,6 @@ impl MintCache {
             .await
             .map_err(|_| AccountError::AccountNotFound { pubkey: *mint })?;
 
-        // Determine token program from account owner
         let token_program = account.owner;
 
         if ![TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].contains(&token_program) {
@@ -120,9 +183,23 @@ impl MintCache {
 
         let decimals = account.data[DECIMALS_OFFSET];
 
+        // PausableConfig can only exist on Token-2022 mints. If the account
+        // isn't well-formed for the extension parser (e.g. an uninitialized
+        // base Mint in a test fixture), we conservatively treat it as
+        // "no extension" rather than erroring — callers only need
+        // is_pausable to gate the pre-flight pause check.
+        let is_pausable = if token_program == TOKEN_2022_PROGRAM_ID {
+            StateWithExtensions::<Token2022MintState>::unpack(&account.data)
+                .map(|m| m.get_extension::<PausableConfig>().is_ok())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         Ok(MintMetadata {
             token_program,
             decimals,
+            is_pausable,
         })
     }
 
@@ -215,6 +292,7 @@ mod tests {
             decimals,
             token_program: token_program.to_string(),
             created_at: chrono::Utc::now(),
+            is_pausable: Some(false),
         });
 
         Arc::new(Storage::Mock(mock))
@@ -279,6 +357,7 @@ mod tests {
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
+                is_pausable: Some(false),
             });
         }
 
@@ -307,12 +386,14 @@ mod tests {
             decimals: 6,
             token_program: TOKEN_PROGRAM_ID.to_string(),
             created_at: chrono::Utc::now(),
+            is_pausable: Some(false),
         });
         mock.add_mint(DbMint {
             mint_address: t22_mint.to_string(),
             decimals: 9,
             token_program: TOKEN_2022_PROGRAM_ID.to_string(),
             created_at: chrono::Utc::now(),
+            is_pausable: Some(false),
         });
 
         let storage = Arc::new(Storage::Mock(mock));
@@ -366,6 +447,92 @@ mod tests {
         let metadata = cache.get_mint_metadata(&mint).await.unwrap();
         assert_eq!(metadata.token_program, TOKEN_2022_PROGRAM_ID);
         assert_eq!(metadata.decimals, 6);
+    }
+
+    #[tokio::test]
+    async fn storage_row_without_is_pausable_triggers_rpc_resolution_and_write_back() {
+        let mint = create_test_mint();
+
+        // Indexer has landed the mints row but the operator hasn't resolved
+        // is_pausable yet — this is the state we need to lazily fill.
+        let mock_storage = MockStorage::new();
+        mock_storage.mints.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: TOKEN_PROGRAM_ID.to_string(),
+                created_at: chrono::Utc::now(),
+                is_pausable: None,
+            },
+        );
+
+        // Plain SPL Token mint on RPC → no extensions → is_pausable=false.
+        let account_response = create_mock_account_response(&TOKEN_PROGRAM_ID, 6);
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let storage = Arc::new(Storage::Mock(mock_storage.clone()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
+
+        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
+        assert!(!metadata.is_pausable);
+
+        // Write-back happened — subsequent reads don't need RPC.
+        let stored = mock_storage
+            .mints
+            .lock()
+            .unwrap()
+            .get(&mint.to_string())
+            .cloned()
+            .expect("mint row should still exist after write-back");
+        assert_eq!(stored.is_pausable, Some(false));
+    }
+
+    #[tokio::test]
+    async fn get_mint_metadata_errors_when_is_pausable_unresolved_and_no_rpc() {
+        let mint = create_test_mint();
+
+        // DB row lacks is_pausable — resolution would need RPC, which is absent.
+        let mock_storage = MockStorage::new();
+        mock_storage.mints.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: TOKEN_PROGRAM_ID.to_string(),
+                created_at: chrono::Utc::now(),
+                is_pausable: None,
+            },
+        );
+
+        let storage = Arc::new(Storage::Mock(mock_storage));
+        let mut cache = MintCache::new(storage);
+
+        let err = cache
+            .get_mint_metadata(&mint)
+            .await
+            .expect_err("should error without RPC");
+        assert!(
+            matches!(err, crate::error::OperatorError::RpcError(_)),
+            "expected RpcError, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn check_paused_errors_without_rpc() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::new(storage);
+
+        let err = cache
+            .check_paused(&create_test_mint())
+            .await
+            .expect_err("check_paused should require RPC");
+        assert!(
+            matches!(err, crate::error::OperatorError::RpcError(_)),
+            "expected RpcError, got {err:?}",
+        );
     }
 
     #[tokio::test]

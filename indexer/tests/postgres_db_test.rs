@@ -562,3 +562,75 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
     assert!(result.is_err(), "should fail when status is not processing");
     Ok(())
 }
+
+// ── reset_transaction_to_pending status guard ────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_to_pending_succeeds_when_processing() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let txn = make_db_transaction("reset_processing", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    storage.reset_transaction_to_pending(id).await?;
+
+    let row: (String,) = sqlx::query_as("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(row.0, "pending");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_to_pending_fails_when_not_processing() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    // Freshly inserted row starts in `pending`, not `processing` — guard should reject.
+    let txn = make_db_transaction("reset_pending", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    let result = storage.reset_transaction_to_pending(id).await;
+
+    assert!(result.is_err(), "should fail when status is not processing");
+    Ok(())
+}
+
+// ── set_mint_pausable row-exists guard ───────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_mint_pausable_updates_existing_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    let m = DbMint::new("mint_pausable".to_string(), 6, "TokenkegQ".to_string());
+    storage.upsert_mints_batch(&[m]).await?;
+    assert_eq!(
+        storage.get_mint("mint_pausable").await?.unwrap().is_pausable,
+        None,
+        "upsert should not set is_pausable",
+    );
+
+    storage.set_mint_pausable("mint_pausable", true).await?;
+    assert_eq!(
+        storage.get_mint("mint_pausable").await?.unwrap().is_pausable,
+        Some(true),
+    );
+
+    // Idempotent — writing the same value again is fine.
+    storage.set_mint_pausable("mint_pausable", true).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_mint_pausable_fails_when_no_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    let result = storage.set_mint_pausable("mint_never_upserted", true).await;
+
+    assert!(result.is_err(), "should fail when mints row doesn't exist");
+    Ok(())
+}

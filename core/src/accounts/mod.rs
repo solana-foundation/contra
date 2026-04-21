@@ -16,6 +16,7 @@ pub mod get_recent_performance_samples;
 pub mod get_transaction;
 pub mod get_transaction_count;
 pub mod postgres;
+pub mod precompiles;
 pub mod redis;
 pub mod set_account;
 pub mod set_latest_slot;

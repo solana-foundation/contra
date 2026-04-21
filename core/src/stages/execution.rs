@@ -377,21 +377,25 @@ pub async fn execute_batch(
             accounts_to_preload.insert(*account);
         }
 
-        if tx
-            .message()
-            .program_instructions_iter()
-            .any(|(program_id, instruction)| {
-                program_id == &spl_token::id()
-                    && instruction
-                        .data
-                        .first()
-                        .is_some_and(|t| is_admin_instruction(program_id, *t))
-            })
-        {
-            // Admin SPL transactions
+        // Router contract: a tx is admin-routed only when EVERY instruction is
+        // listed in ADMIN_INSTRUCTIONS_MAP. A mixed tx is routed to
+        // the regular SVM where the admin instruction will fail naturally
+        let mut has_any_admin = false;
+        let mut all_admin = true;
+        for (program_id, instruction) in tx.message().program_instructions_iter() {
+            let is_admin = instruction
+                .data
+                .first()
+                .is_some_and(|t| is_admin_instruction(program_id, *t));
+            has_any_admin |= is_admin;
+            all_admin &= is_admin;
+        }
+
+        if has_any_admin && all_admin {
+            // Pure admin tx, Admin VM.
             admin_transactions.push(tx);
         } else {
-            // Regular transactions
+            // Pure regular OR mixed, real SVM.
             regular_transactions.push(tx);
         }
     }
@@ -674,6 +678,61 @@ mod tests {
         assert_eq!(results.processing_results.len(), n);
     }
 
+    /// Build a well-formed admin InitializeMint tx (single SPL Token ix, type=0).
+    fn create_admin_initialize_mint_tx() -> SanitizedTransaction {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let mut data = vec![0u8; 35];
+        data[1] = 6; // decimals
+        data[2..34].copy_from_slice(&authority.to_bytes());
+        data[34] = 0; // no freeze authority
+        let ix = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data,
+        };
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to create admin init-mint tx")
+    }
+
+    /// Build a mixed tx: one admin instruction (InitializeMint) + one
+    /// non-admin instruction (system transfer). Router must NOT send this to
+    /// the Admin VM.
+    fn create_mixed_admin_and_regular_tx() -> SanitizedTransaction {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut data = vec![0u8; 35];
+        data[1] = 6;
+        data[2..34].copy_from_slice(&authority.to_bytes());
+        let init_mint_ix = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data,
+        };
+        let transfer_ix =
+            solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 100);
+        let msg = Message::new(&[init_mint_ix, transfer_ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to create mixed tx")
+    }
+
+    // An empty batch yields empty partitions and no VM invocations.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_empty_batch() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -1105,5 +1164,90 @@ mod tests {
             result.is_ok(),
             "worker should exit when input channel is closed"
         );
+    }
+
+    // ─── Router tests (admin routing must be all-or-nothing) ───
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_routes_pure_admin_tx_to_admin_vm() {
+        // A tx whose only instruction is an admin instruction routes to the Admin VM.
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+
+        let tx = create_admin_initialize_mint_tx();
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: 0,
+            }],
+        };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        assert_eq!(result.admin_transactions.len(), 1);
+        assert!(result.regular_transactions.is_empty());
+        assert!(result.admin_results.is_some());
+        assert!(result.regular_results.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_routes_mixed_admin_regular_to_real_svm() {
+        // A tx that mixes one admin instruction (InitializeMint) with one
+        // non-admin instruction (system transfer) must NOT be sent to the
+        // Admin VM. The router sends it to the regular SVM path; the admin
+        // path stays strictly single-purpose.
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+
+        let tx = create_mixed_admin_and_regular_tx();
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: 0,
+            }],
+        };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        assert!(
+            result.admin_transactions.is_empty(),
+            "mixed tx must not be admin-routed"
+        );
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(result.admin_results.is_none());
+        assert!(result.regular_results.is_some());
+    }
+
+    // In a batch with one pure-admin tx and one pure-regular tx, each routes
+    // to the correct VM and both partitions produce results.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_partitions_admin_and_regular_separately() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+
+        let admin_tx = create_admin_initialize_mint_tx();
+        let regular_tx = create_test_transaction();
+        let batch = ConflictFreeBatch {
+            transactions: vec![
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(admin_tx),
+                    index: 0,
+                },
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(regular_tx),
+                    index: 1,
+                },
+            ],
+        };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        assert_eq!(result.admin_transactions.len(), 1);
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(result.admin_results.is_some());
+        assert!(result.regular_results.is_some());
     }
 }

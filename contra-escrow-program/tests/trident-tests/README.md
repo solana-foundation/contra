@@ -8,10 +8,10 @@ Stateful fuzz tests for the escrow program using [Trident](https://github.com/Ac
 
 Tests the core escrow lifecycle in a single tree generation.
 
-| Flow | Description |
-|------|-------------|
-| `fuzz_deposit` | Deposits a random amount. Asserts exact ATA balance movement. |
-| `fuzz_release` | 50% valid proof release / 50% garbage proof. Asserts success/failure and balance invariants. |
+| Flow                | Description                                                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------- |
+| `fuzz_deposit`      | Deposits a random amount. Asserts exact ATA balance movement.                                |
+| `fuzz_release`      | 50% valid proof release / 50% garbage proof. Asserts success/failure and balance invariants. |
 | `fuzz_double_spend` | Replays a previously successful release with the exact same proof — must always be rejected. |
 
 **Final invariant:** `escrow_balance == total_deposited - total_released`
@@ -20,12 +20,12 @@ Tests the core escrow lifecycle in a single tree generation.
 
 Tests the SMT reset lifecycle across multiple tree generations.
 
-| Flow | Description |
-|------|-------------|
-| `fuzz_deposit` | Deposits a random amount. |
-| `fuzz_release` | Valid release within the current tree generation. Skipped silently if preconditions aren't met. |
+| Flow                  | Description                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------- |
+| `fuzz_deposit`        | Deposits a random amount.                                                                           |
+| `fuzz_release`        | Valid release within the current tree generation. Skipped silently if preconditions aren't met.     |
 | `fuzz_reset_smt_root` | Resets the on-chain SMT root, advancing the tree generation index. Asserts balances are unaffected. |
-| `fuzz_stale_nonce` | Attempts a release with a nonce from the previous generation — must always be rejected. |
+| `fuzz_stale_nonce`    | Attempts a release with a nonce from the previous generation — must always be rejected.             |
 
 **Final invariant:** `escrow_balance == total_deposited - total_released`
 

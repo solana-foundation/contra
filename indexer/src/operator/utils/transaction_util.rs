@@ -165,6 +165,26 @@ pub fn is_mint_not_initialized_error(
     None
 }
 
+/// Treat `AccountAlreadyInitialized` as a confirmed `InitializeMint`: another
+/// caller (or a racing retry) initialized the same mint first, which is the
+/// desired end state. Returning `Confirmed` avoids a read-RPC re-check that
+/// can lose to replication lag.
+pub fn is_mint_already_initialized_error(
+    err: &solana_sdk::transaction::TransactionError,
+) -> Option<ConfirmationResult> {
+    if matches!(
+        err,
+        solana_sdk::transaction::TransactionError::InstructionError(
+            _,
+            InstructionError::AccountAlreadyInitialized
+        )
+    ) {
+        return Some(ConfirmationResult::Confirmed);
+    }
+
+    None
+}
+
 /// Parse program error code from transaction error
 ///
 /// Extracts ContraEscrowProgramError from Solana transaction errors.
@@ -236,6 +256,32 @@ mod tests {
     fn mint_not_init_non_instruction_error_returns_none() {
         let err = TransactionError::InsufficientFundsForFee;
         assert!(is_mint_not_initialized_error(&err).is_none());
+    }
+
+    // ====================================================================
+    // is_mint_already_initialized_error
+    // ====================================================================
+
+    #[test]
+    fn mint_already_init_maps_to_confirmed() {
+        let err =
+            TransactionError::InstructionError(0, InstructionError::AccountAlreadyInitialized);
+        assert!(matches!(
+            is_mint_already_initialized_error(&err),
+            Some(ConfirmationResult::Confirmed)
+        ));
+    }
+
+    #[test]
+    fn mint_already_init_other_instruction_error_returns_none() {
+        let err = TransactionError::InstructionError(0, InstructionError::InvalidAccountData);
+        assert!(is_mint_already_initialized_error(&err).is_none());
+    }
+
+    #[test]
+    fn mint_already_init_non_instruction_error_returns_none() {
+        let err = TransactionError::InsufficientFundsForFee;
+        assert!(is_mint_already_initialized_error(&err).is_none());
     }
 
     // ====================================================================

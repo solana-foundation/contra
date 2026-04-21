@@ -139,13 +139,15 @@ pub(super) async fn try_jit_mint_initialization(
 
     match result {
         ConfirmationResult::Confirmed => {
+            // `Confirmed` covers both a successful InitializeMint and the
+            // `AccountAlreadyInitialized` race, which the extra error check
+            // on this builder remaps to `Confirmed` without an RPC re-check.
             info!("InitializeMint transaction confirmed: {}", sig);
             Some(instruction)
         }
         _ => {
-            // Non-`Confirmed` may just mean the mint was already initialized (stale existence
-            // check or RPC-error fail-safe above raced the InitializeMint). Re-read on-chain;
-            // if initialized, JIT is effectively done.
+            // Fallback for unknown failures (network blips, timeouts): re-read
+            // the mint on-chain with backoff in case it was initialized out-of-band.
             if mint_is_initialized_on_chain(&state.rpc_client, &mint).await {
                 info!(
                     "InitializeMint tx {} not confirmed (result={:?}), but mint {} is already \

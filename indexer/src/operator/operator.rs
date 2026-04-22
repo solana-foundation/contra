@@ -1,5 +1,6 @@
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
+use crate::metrics;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
     RpcClientWithRetry,
@@ -7,11 +8,12 @@ use crate::operator::{
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
 use crate::ContraIndexerConfig;
+use contra_metrics::MetricLabel;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub async fn run(
     storage: Arc<Storage>,
@@ -74,15 +76,21 @@ pub async fn run(
     });
 
     // Start processor task
+    //
+    // storage_tx is cloned into the processor so per-transaction quarantine
+    // updates (ManualReview) flow through the same DbTransactionWriter path
+    // the sender uses for status updates.
     let program_type = common_config.program_type;
     let instance_pda = common_config.escrow_instance_id;
     let processor_storage = storage.clone();
     let processor_rpc = rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
+    let processor_storage_tx = storage_tx.clone();
     let processor_handle = tokio::spawn(async move {
         processor::run_processor(
             processor_rx,
             sender_tx,
+            processor_storage_tx,
             program_type,
             instance_pda,
             processor_storage,
@@ -92,7 +100,7 @@ pub async fn run(
         .await;
     });
 
-    // Start storage writer task (receives updates from sender)
+    // Start storage writer task (receives updates from sender + processor)
     let writer_storage = storage.clone();
     let storage_writer = DbTransactionWriter::new(
         writer_storage,
@@ -188,15 +196,49 @@ pub async fn run(
             tokio::spawn(async {})
         };
 
-    info!("Operator started, waiting for shutdown signal...");
+    info!("Operator started, waiting for shutdown signal or task exit...");
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|_| OperatorError::ShutdownChannelSend)?;
-    info!("Shutdown signal received, initiating graceful shutdown...");
+    // Task supervision.
+    //
+    // We race ctrl-c against each critical task's JoinHandle — whichever
+    // fires first wins — and fall through to the shutdown path either way.
+    // A task exit increments the OPERATOR_TASK_EXIT metric with a task
+    // label so dashboards can tell which one failed without tailing logs.
+    //
+    // Non-critical tasks (reconciliation, feepayer monitor) are not watched
+    // here.
+    //
+    // Handles are polled by mutable reference so ownership stays here and
+    // they can still be moved into `shutdown_operator` below — awaiting an
+    // already-completed JoinHandle is a no-op.
+    let mut fetcher_handle = fetcher_handle;
+    let mut processor_handle = processor_handle;
+    let mut sender_handle = sender_handle;
+    let mut storage_writer_handle = storage_writer_handle;
+    let pt_label = program_type.as_label();
 
-    // Graceful shutdown
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|_| OperatorError::ShutdownChannelSend)?;
+            info!("Shutdown signal received, initiating graceful shutdown...");
+        }
+        _ = &mut fetcher_handle => {
+            critical_exit(pt_label, "fetcher");
+        }
+        _ = &mut processor_handle => {
+            critical_exit(pt_label, "processor");
+        }
+        _ = &mut sender_handle => {
+            critical_exit(pt_label, "sender");
+        }
+        _ = &mut storage_writer_handle => {
+            critical_exit(pt_label, "storage_writer");
+        }
+    }
+
+    // Graceful shutdown — runs on both the ctrl-c path and the critical-task-
+    // exit path.  On the exit path, the handle that tripped the select is
+    // already completed; shutdown_operator will wait on the others.
     shutdown_operator(
         cancellation_token,
         storage,
@@ -214,4 +256,20 @@ pub async fn run(
 
     info!("Operator shutdown complete");
     Ok(())
+}
+
+/// Log + metric for a critical task that exited before cancellation.
+///
+/// We don't abort the process here — the caller falls through to
+/// `shutdown_operator` so the remaining tasks get the usual graceful-shutdown
+/// treatment.  The process will exit naturally once `shutdown_operator`
+/// returns, and the supervisor will restart the operator.
+fn critical_exit(program_type_label: &str, task_name: &str) {
+    error!(
+        task = task_name,
+        "Critical operator task exited unexpectedly — triggering shutdown",
+    );
+    metrics::OPERATOR_TASK_EXIT
+        .with_label_values(&[program_type_label, task_name])
+        .inc();
 }

@@ -134,6 +134,28 @@ gauge_vec!(
     &["program_type"]
 );
 
+// Poison-pill: a single transaction that could not be sent on-chain was
+// quarantined to ManualReview so the pipeline could keep moving.  The `reason`
+// label mirrors the error classification (`invalid_pubkey`, `invalid_builder`,
+// `missing_nonce`, ...) so dashboards can distinguish systemic bugs from
+// one-off bad rows.
+counter_vec!(
+    OPERATOR_TRANSACTION_QUARANTINED,
+    "contra_operator_transaction_quarantined_total",
+    "Transactions quarantined to ManualReview by the processor",
+    &["program_type", "reason"]
+);
+
+// Supervision: a critical task inside the operator exited.  The supervisor
+// aborts the process immediately when this increments; the counter exists
+// so dashboards can alert even if the restart is fast.
+counter_vec!(
+    OPERATOR_TASK_EXIT,
+    "contra_operator_task_exit_total",
+    "Critical operator task exits observed by the supervisor",
+    &["program_type", "task"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -179,6 +201,29 @@ pub fn init_labels(program_type: &str) {
 
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
     FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
+
+    // Quarantine reasons roughly track the OperatorError variants the processor
+    // classifies as deterministic (see classify_processor_error).
+    for reason in &[
+        "invalid_pubkey",
+        "invalid_builder",
+        "missing_nonce",
+        "program_error",
+        "other",
+    ] {
+        OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
+    }
+
+    for task in &[
+        "fetcher",
+        "processor",
+        "sender",
+        "storage_writer",
+        "reconciliation",
+        "feepayer_monitor",
+    ] {
+        OPERATOR_TASK_EXIT.with_label_values(&[program_type, task]);
+    }
 }
 
 pub fn init() {
@@ -201,6 +246,8 @@ pub fn init() {
         OPERATOR_MINTS_SENT,
         OPERATOR_BACKLOG_DEPTH,
         FEEPAYER_BALANCE_LAMPORTS,
+        OPERATOR_TRANSACTION_QUARANTINED,
+        OPERATOR_TASK_EXIT,
     );
 }
 
@@ -285,6 +332,8 @@ mod tests {
             "contra_operator_mints_sent_total",
             "contra_operator_backlog_depth",
             "contra_feepayer_balance_lamports",
+            "contra_operator_transaction_quarantined_total",
+            "contra_operator_task_exit_total",
         ];
 
         let families = prometheus::gather();

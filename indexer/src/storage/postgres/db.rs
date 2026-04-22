@@ -861,6 +861,25 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.
+    ///
+    /// Terminal rows are left untouched so the webhook does not re-alert on
+    /// already-handled transactions. Returns the number of rows affected.
+    pub async fn quarantine_all_active_withdrawals_internal(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'manual_review', updated_at = NOW()
+            WHERE transaction_type = 'withdrawal'
+              AND status IN ('pending', 'processing')
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
     pub async fn upsert_mints_batch_internal(&self, mints: &[DbMint]) -> Result<(), StorageError> {
         if mints.is_empty() {
             return Ok(());

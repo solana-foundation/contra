@@ -15,6 +15,7 @@ pub mod get_pending_remint_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
+pub mod quarantine_all_active_withdrawals;
 pub mod set_pending_remint;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
@@ -194,6 +195,16 @@ impl Storage {
         &self,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         get_pending_remint_transactions::get_pending_remint_transactions(self).await
+    }
+
+    /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.
+    ///
+    /// Invoked by the processor when a single withdrawal is unprocessable:
+    /// the whole withdrawal pipeline halts so a human can inspect and
+    /// decide on rotation/reinsert before drains resume. Returns the number
+    /// of rows flipped.
+    pub async fn quarantine_all_active_withdrawals(&self) -> Result<u64, StorageError> {
+        quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self).await
     }
 }
 
@@ -618,5 +629,121 @@ mod tests {
         let ids = storage.insert_db_transactions_batch(&txns).await.unwrap();
         assert_eq!(ids.len(), 2);
         assert_eq!(mock.inserted_transactions.lock().unwrap().len(), 1);
+    }
+
+    // ── quarantine_all_active_withdrawals ─────────────────────────────
+
+    /// Only Pending and Processing withdrawals flip to ManualReview.
+    /// Returns the exact number of rows affected so the caller can log
+    /// the blast radius.
+    #[tokio::test]
+    async fn quarantine_all_active_withdrawals_flips_pending_and_processing_only() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut a = make_db_transaction();
+            a.transaction_type = TransactionType::Withdrawal;
+            a.status = TransactionStatus::Pending;
+            a.withdrawal_nonce = Some(1);
+            let mut b = make_db_transaction();
+            b.transaction_type = TransactionType::Withdrawal;
+            b.status = TransactionStatus::Processing;
+            b.withdrawal_nonce = Some(2);
+            db.push(a);
+            db.push(b);
+        }
+
+        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        assert_eq!(affected, 2);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        for txn in rows.iter() {
+            assert_eq!(txn.status, TransactionStatus::ManualReview);
+        }
+    }
+
+    /// Deposits are never touched by the withdrawal-halt path — a
+    /// poisoned withdrawal must not strand deposits, which have no nonce
+    /// and no gap semantics.
+    #[tokio::test]
+    async fn quarantine_all_active_withdrawals_leaves_deposits_untouched() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut dep = make_db_transaction();
+            dep.transaction_type = TransactionType::Deposit;
+            dep.status = TransactionStatus::Pending;
+            let mut wd = make_db_transaction();
+            wd.transaction_type = TransactionType::Withdrawal;
+            wd.status = TransactionStatus::Pending;
+            wd.withdrawal_nonce = Some(1);
+            db.push(dep);
+            db.push(wd);
+        }
+
+        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        let dep = rows
+            .iter()
+            .find(|t| t.transaction_type == TransactionType::Deposit)
+            .expect("deposit present");
+        assert_eq!(dep.status, TransactionStatus::Pending);
+
+        let wd = rows
+            .iter()
+            .find(|t| t.transaction_type == TransactionType::Withdrawal)
+            .expect("withdrawal present");
+        assert_eq!(wd.status, TransactionStatus::ManualReview);
+    }
+
+    /// Terminal statuses (Completed, Failed, ManualReview, PendingRemint)
+    /// are left alone so the webhook does not re-alert on already-handled
+    /// rows.
+    #[tokio::test]
+    async fn quarantine_all_active_withdrawals_leaves_terminal_rows_untouched() {
+        let (storage, mock) = make_mock_storage();
+        let terminal = [
+            TransactionStatus::Completed,
+            TransactionStatus::Failed,
+            TransactionStatus::ManualReview,
+            TransactionStatus::PendingRemint,
+        ];
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            for (i, status) in terminal.iter().enumerate() {
+                let mut t = make_db_transaction();
+                t.transaction_type = TransactionType::Withdrawal;
+                t.status = *status;
+                t.withdrawal_nonce = Some(i as i64 + 1);
+                db.push(t);
+            }
+        }
+
+        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        assert_eq!(affected, 0);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        for (i, status) in terminal.iter().enumerate() {
+            assert_eq!(rows[i].status, *status);
+        }
+    }
+
+    /// Storage-level failure surfaces as an `Err` so the processor can log
+    /// and continue the channel drain without silent loss.
+    #[tokio::test]
+    async fn quarantine_all_active_withdrawals_propagates_mock_failure() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_should_fail("quarantine_all_active_withdrawals", true);
+        assert!(storage.quarantine_all_active_withdrawals().await.is_err());
+    }
+
+    /// The empty-DB case returns `0` — a successful no-op, not an error.
+    #[tokio::test]
+    async fn quarantine_all_active_withdrawals_empty_db_returns_zero() {
+        let (storage, _mock) = make_mock_storage();
+        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        assert_eq!(affected, 0);
     }
 }

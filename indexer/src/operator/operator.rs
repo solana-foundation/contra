@@ -217,7 +217,10 @@ pub async fn run(
     let mut storage_writer_handle = storage_writer_handle;
     let pt_label = program_type.as_label();
 
+    // `biased;` makes ctrl-c win on concurrent readiness — avoids a
+    // false-positive `critical_exit` when a task ends at the same instant.
     tokio::select! {
+        biased;
         result = tokio::signal::ctrl_c() => {
             result.map_err(|_| OperatorError::ShutdownChannelSend)?;
             info!("Shutdown signal received, initiating graceful shutdown...");

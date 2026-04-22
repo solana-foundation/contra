@@ -189,12 +189,18 @@ async fn quarantine_single(
 ///   2. Flip every other `Pending`/`Processing` withdrawal in the DB to
 ///      `ManualReview` so the fetcher has nothing left to pull.
 ///
+/// `poison_id` is the row the caller has already individually quarantined
+/// via `storage_tx`; it is excluded from the DB sweep so we don't fire a
+/// second `ManualReview` webhook for the same transaction if the async
+/// status update has not yet committed.
+///
 /// Recovery is manual — see the
 /// runbook `withdrawal_pipeline_halt_runbook.md`.
 async fn halt_withdrawal_pipeline(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     fetcher_rx: &mut mpsc::Receiver<DbTransaction>,
+    poison_id: Option<i64>,
 ) {
     // Drain anything already delivered by the fetcher.  These rows were
     // flipped to `Processing` by `get_and_lock_pending_transactions` but
@@ -214,7 +220,7 @@ async fn halt_withdrawal_pipeline(
     // Sweep the rest of the pipeline: any row still `Pending` (never
     // fetched) or `Processing` (locked but unsent, e.g. a sibling was mid-
     // flight in another instance) is flipped to `ManualReview`.
-    match storage.quarantine_all_active_withdrawals().await {
+    match storage.quarantine_all_active_withdrawals(poison_id).await {
         Ok(affected) => {
             warn!(
                 drained_from_channel = drained,
@@ -489,7 +495,13 @@ pub async fn process_release_funds(
                         .with_label_values(&[pt_label, reason])
                         .inc();
                     quarantine_single(&storage_tx, &transaction, err.to_string()).await;
-                    halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx).await;
+                    halt_withdrawal_pipeline(
+                        &storage,
+                        &storage_tx,
+                        &mut fetcher_rx,
+                        Some(transaction.id),
+                    )
+                    .await;
                     return Ok(());
                 }
                 ErrorDisposition::Transient => {
@@ -1380,7 +1392,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(4);
         let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
 
         // No in-flight rows were buffered — no channel-side quarantines.
         assert!(storage_rx.try_recv().is_err());
@@ -1416,7 +1428,7 @@ mod tests {
         }
         drop(fetcher_tx);
 
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
 
         let mut ids = Vec::new();
         while let Ok(update) = storage_rx.try_recv() {
@@ -1452,7 +1464,7 @@ mod tests {
         drop(fetcher_tx);
 
         // Must not panic; must complete.
-        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx).await;
+        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, None).await;
 
         let update = storage_rx.recv().await.expect("buffered row quarantined");
         assert_eq!(update.transaction_id, 42);

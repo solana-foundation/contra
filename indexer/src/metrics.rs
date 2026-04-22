@@ -136,9 +136,9 @@ gauge_vec!(
 
 // Poison-pill: a single transaction that could not be sent on-chain was
 // quarantined to ManualReview so the pipeline could keep moving.  The `reason`
-// label mirrors the error classification (`invalid_pubkey`, `invalid_builder`,
-// `missing_nonce`, ...) so dashboards can distinguish systemic bugs from
-// one-off bad rows.
+// label mirrors `classify_processor_error` (`invalid_pubkey`, `invalid_builder`,
+// `program_error`) so dashboards can distinguish systemic bugs from one-off
+// bad rows.  Keep `init_labels` in sync when adding a new variant.
 counter_vec!(
     OPERATOR_TRANSACTION_QUARANTINED,
     "contra_operator_transaction_quarantined_total",
@@ -202,15 +202,10 @@ pub fn init_labels(program_type: &str) {
     OPERATOR_BACKLOG_DEPTH.with_label_values(&[program_type]);
     FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
 
-    // Quarantine reasons roughly track the OperatorError variants the processor
-    // classifies as deterministic (see classify_processor_error).
-    for reason in &[
-        "invalid_pubkey",
-        "invalid_builder",
-        "missing_nonce",
-        "program_error",
-        "other",
-    ] {
+    // Quarantine reasons must match the string constants returned by
+    // `classify_processor_error` in processor.rs — any mismatch is a dead
+    // label (visible in Prometheus, never incremented).
+    for reason in &["invalid_pubkey", "invalid_builder", "program_error"] {
         OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
     }
 

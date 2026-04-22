@@ -201,10 +201,15 @@ impl Storage {
     ///
     /// Invoked by the processor when a single withdrawal is unprocessable:
     /// the whole withdrawal pipeline halts so a human can inspect and
-    /// decide on rotation/reinsert before drains resume. Returns the number
-    /// of rows flipped.
-    pub async fn quarantine_all_active_withdrawals(&self) -> Result<u64, StorageError> {
-        quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self).await
+    /// decide on rotation/reinsert before drains resume. `exclude_id` is
+    /// the poison row already quarantined through the async status-update
+    /// channel — excluding it here avoids a duplicate webhook. Returns the
+    /// number of rows flipped.
+    pub async fn quarantine_all_active_withdrawals(
+        &self,
+        exclude_id: Option<i64>,
+    ) -> Result<u64, StorageError> {
+        quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
 }
 
@@ -653,7 +658,7 @@ mod tests {
             db.push(b);
         }
 
-        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
         assert_eq!(affected, 2);
 
         let rows = mock.pending_transactions.lock().unwrap();
@@ -681,7 +686,7 @@ mod tests {
             db.push(wd);
         }
 
-        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
         assert_eq!(affected, 1);
 
         let rows = mock.pending_transactions.lock().unwrap();
@@ -721,7 +726,7 @@ mod tests {
             }
         }
 
-        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
         assert_eq!(affected, 0);
 
         let rows = mock.pending_transactions.lock().unwrap();
@@ -736,14 +741,52 @@ mod tests {
     async fn quarantine_all_active_withdrawals_propagates_mock_failure() {
         let (storage, mock) = make_mock_storage();
         mock.set_should_fail("quarantine_all_active_withdrawals", true);
-        assert!(storage.quarantine_all_active_withdrawals().await.is_err());
+        assert!(storage
+            .quarantine_all_active_withdrawals(None)
+            .await
+            .is_err());
     }
 
     /// The empty-DB case returns `0` — a successful no-op, not an error.
     #[tokio::test]
     async fn quarantine_all_active_withdrawals_empty_db_returns_zero() {
         let (storage, _mock) = make_mock_storage();
-        let affected = storage.quarantine_all_active_withdrawals().await.unwrap();
+        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
         assert_eq!(affected, 0);
+    }
+
+    /// `exclude_id` must skip the poison row so it is not flipped twice —
+    /// the caller has already quarantined it via the async status-update
+    /// channel and a second flip here would fire a duplicate webhook.
+    #[tokio::test]
+    async fn quarantine_all_active_withdrawals_exclude_id_skips_poison_row() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut poison = make_db_transaction();
+            poison.id = 42;
+            poison.transaction_type = TransactionType::Withdrawal;
+            poison.status = TransactionStatus::Processing;
+            poison.withdrawal_nonce = Some(1);
+            let mut sibling = make_db_transaction();
+            sibling.id = 43;
+            sibling.transaction_type = TransactionType::Withdrawal;
+            sibling.status = TransactionStatus::Pending;
+            sibling.withdrawal_nonce = Some(2);
+            db.push(poison);
+            db.push(sibling);
+        }
+
+        let affected = storage
+            .quarantine_all_active_withdrawals(Some(42))
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        let poison = rows.iter().find(|t| t.id == 42).unwrap();
+        assert_eq!(poison.status, TransactionStatus::Processing);
+        let sibling = rows.iter().find(|t| t.id == 43).unwrap();
+        assert_eq!(sibling.status, TransactionStatus::ManualReview);
     }
 }

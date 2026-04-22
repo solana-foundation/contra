@@ -296,7 +296,10 @@ impl MockStorage {
         Ok(pending.clone())
     }
 
-    pub async fn quarantine_all_active_withdrawals(&self) -> Result<u64, StorageError> {
+    pub async fn quarantine_all_active_withdrawals(
+        &self,
+        exclude_id: Option<i64>,
+    ) -> Result<u64, StorageError> {
         self.check_should_fail("quarantine_all_active_withdrawals")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         let mut affected = 0u64;
@@ -305,7 +308,8 @@ impl MockStorage {
                 txn.status,
                 TransactionStatus::Pending | TransactionStatus::Processing
             );
-            if txn.transaction_type == TransactionType::Withdrawal && quarantinable {
+            let excluded = exclude_id.is_some_and(|id| txn.id == id);
+            if txn.transaction_type == TransactionType::Withdrawal && quarantinable && !excluded {
                 txn.status = TransactionStatus::ManualReview;
                 affected += 1;
             }

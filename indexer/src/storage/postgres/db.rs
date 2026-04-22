@@ -863,17 +863,34 @@ impl PostgresDb {
 
     /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.
     ///
+    /// `exclude_id` is the poison row that the caller has already quarantined
+    /// via the async `storage_tx` writer. That update may not have hit the DB
+    /// yet when this sweep runs, so the row's status is still
+    /// `Pending`/`Processing` here; excluding it prevents a second
+    /// `ManualReview` webhook for the same transaction.
+    ///
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
-    pub async fn quarantine_all_active_withdrawals_internal(&self) -> Result<u64, sqlx::Error> {
+    ///
+    /// Scope is intentionally DB-wide over `transaction_type = 'withdrawal'`
+    /// to match the fetcher's own scope. The data model assumes a single
+    /// withdrawal operator per database; multi-instance isolation would
+    /// require an `instance_pda` column on `transactions` that does not exist
+    /// today.
+    pub async fn quarantine_all_active_withdrawals_internal(
+        &self,
+        exclude_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE transactions
             SET status = 'manual_review', updated_at = NOW()
             WHERE transaction_type = 'withdrawal'
               AND status IN ('pending', 'processing')
+              AND ($1::BIGINT IS NULL OR id <> $1)
             "#,
         )
+        .bind(exclude_id)
         .execute(&self.pool)
         .await?;
 

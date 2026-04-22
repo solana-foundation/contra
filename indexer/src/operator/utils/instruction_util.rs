@@ -1,7 +1,7 @@
 use crate::error::ProgramError;
 use crate::operator::{
-    is_mint_not_initialized_error, ConfirmationResult, SignerUtil, DEFAULT_CU_MINT,
-    DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
+    is_mint_already_initialized_error, is_mint_not_initialized_error, ConfirmationResult,
+    SignerUtil, DEFAULT_CU_MINT, DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
@@ -165,9 +165,10 @@ impl TransactionBuilder {
             Self::Mint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
             }
-            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::ResetSmtRoot(_) => {
-                ExtraErrorCheckPolicy::None
+            Self::InitializeMint(_) => {
+                ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_already_initialized_error)])
             }
+            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => ExtraErrorCheckPolicy::None,
         }
     }
 }
@@ -639,7 +640,7 @@ mod tests {
         ));
         assert!(matches!(
             make_init_mint_builder().extra_error_checks_policy(),
-            ExtraErrorCheckPolicy::None
+            ExtraErrorCheckPolicy::Extra(_)
         ));
         assert!(matches!(
             make_mint_builder().extra_error_checks_policy(),

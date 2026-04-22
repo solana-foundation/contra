@@ -26,6 +26,7 @@ package.edition = "2021"
 [workspace.dependencies]
 anyhow = "1.0.100"
 argon2 = "0.5"
+async-channel = "2"
 base64 = "0.21"
 bincode = "1.3.3"
 borsh = "1.5.5"
@@ -118,7 +119,6 @@ testcontainers = "0.25"
 testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }
 thiserror = "2.0.17"
 tokio = { version = "=1.47.1", features = ["full"] }
-tokio-mpmc = "0.2.4"
 tokio-util = { version = "0.7", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

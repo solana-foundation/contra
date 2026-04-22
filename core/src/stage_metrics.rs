@@ -17,13 +17,22 @@ pub trait StageMetrics: Send + Sync {
     fn sequencer_collected(&self, tx_count: usize);
     fn sequencer_transactions_emitted(&self, tx_count: usize);
 
-    // Executor
+    // Executor — throughput counters
     fn executor_results_sent(&self, tx_count: usize);
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
 
+    // Executor — latency histograms (durations in milliseconds)
+    fn executor_batch_duration_ms(&self, ms: f64);
+    fn executor_preload_duration_ms(&self, ms: f64);
+    fn executor_svm_duration_ms(&self, kind: &'static str, ms: f64);
+    fn executor_bob_update_duration_ms(&self, kind: &'static str, ms: f64);
+
     // Settler
     fn settler_txs_settled(&self, count: usize);
+    fn settler_settle_duration_ms(&self, ms: f64);
+    fn settler_db_write_duration_ms(&self, ms: f64);
+    fn settler_processing_duration_ms(&self, ms: f64);
 }
 
 pub type SharedMetrics = Arc<dyn StageMetrics>;
@@ -68,8 +77,29 @@ impl StageMetrics for NoopMetrics {
     fn executor_missing_results(&self, kind: &'static str) {
         debug!("executor: missing results kind={}", kind);
     }
+    fn executor_batch_duration_ms(&self, ms: f64) {
+        debug!("executor: batch_duration={:.3}ms", ms);
+    }
+    fn executor_preload_duration_ms(&self, ms: f64) {
+        debug!("executor: preload_duration={:.3}ms", ms);
+    }
+    fn executor_svm_duration_ms(&self, kind: &'static str, ms: f64) {
+        debug!("executor: svm_duration kind={} {:.3}ms", kind, ms);
+    }
+    fn executor_bob_update_duration_ms(&self, kind: &'static str, ms: f64) {
+        debug!("executor: bob_update_duration kind={} {:.3}ms", kind, ms);
+    }
     fn settler_txs_settled(&self, n: usize) {
         debug!("settler: settled {}", n);
+    }
+    fn settler_settle_duration_ms(&self, ms: f64) {
+        debug!("settler: settle_duration={:.3}ms", ms);
+    }
+    fn settler_db_write_duration_ms(&self, ms: f64) {
+        debug!("settler: db_write_duration={:.3}ms", ms);
+    }
+    fn settler_processing_duration_ms(&self, ms: f64) {
+        debug!("settler: processing_duration={:.3}ms", ms);
     }
 }
 
@@ -154,7 +184,54 @@ counter_vec!(
 );
 
 // Gauges
-// Histograms — registered directly so we can specify custom buckets (in seconds).
+
+// Executor latency histograms — buckets cover sub-millisecond to ~500 ms range.
+use contra_metrics::histogram_vec;
+
+histogram_vec!(
+    EXECUTOR_BATCH_DURATION,
+    "contra_executor_batch_duration_ms",
+    "Total execute_batch wall time in milliseconds",
+    &[]
+);
+histogram_vec!(
+    EXECUTOR_PRELOAD_DURATION,
+    "contra_executor_preload_duration_ms",
+    "Account preload DB round-trip time in milliseconds",
+    &[]
+);
+histogram_vec!(
+    EXECUTOR_SVM_DURATION,
+    "contra_executor_svm_duration_ms",
+    "SVM load_and_execute time in milliseconds",
+    &["kind"]
+);
+histogram_vec!(
+    EXECUTOR_BOB_UPDATE_DURATION,
+    "contra_executor_bob_update_duration_ms",
+    "BOB update_accounts time in milliseconds",
+    &["kind"]
+);
+
+// Settler latency histograms
+histogram_vec!(
+    SETTLER_SETTLE_DURATION,
+    "contra_settler_settle_duration_ms",
+    "Total settle_transactions wall time in milliseconds",
+    &[]
+);
+histogram_vec!(
+    SETTLER_DB_WRITE_DURATION,
+    "contra_settler_db_write_duration_ms",
+    "Postgres write_batch time in milliseconds",
+    &[]
+);
+histogram_vec!(
+    SETTLER_PROCESSING_DURATION,
+    "contra_settler_processing_duration_ms",
+    "Pre-DB account map building time in milliseconds",
+    &[]
+);
 
 pub struct PrometheusMetrics;
 
@@ -200,10 +277,43 @@ impl StageMetrics for PrometheusMetrics {
     fn executor_missing_results(&self, kind: &'static str) {
         EXECUTOR_MISSING_RESULTS.with_label_values(&[kind]).inc();
     }
+    fn executor_batch_duration_ms(&self, ms: f64) {
+        EXECUTOR_BATCH_DURATION
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
+    }
+    fn executor_preload_duration_ms(&self, ms: f64) {
+        EXECUTOR_PRELOAD_DURATION
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
+    }
+    fn executor_svm_duration_ms(&self, kind: &'static str, ms: f64) {
+        EXECUTOR_SVM_DURATION.with_label_values(&[kind]).observe(ms);
+    }
+    fn executor_bob_update_duration_ms(&self, kind: &'static str, ms: f64) {
+        EXECUTOR_BOB_UPDATE_DURATION
+            .with_label_values(&[kind])
+            .observe(ms);
+    }
     fn settler_txs_settled(&self, n: usize) {
         SETTLER_TXS_SETTLED
             .with_label_values(&[] as &[&str])
             .inc_by(n as f64);
+    }
+    fn settler_settle_duration_ms(&self, ms: f64) {
+        SETTLER_SETTLE_DURATION
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
+    }
+    fn settler_db_write_duration_ms(&self, ms: f64) {
+        SETTLER_DB_WRITE_DURATION
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
+    }
+    fn settler_processing_duration_ms(&self, ms: f64) {
+        SETTLER_PROCESSING_DURATION
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
     }
 }
 
@@ -221,7 +331,14 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_RESULTS_SENT,
         EXECUTOR_RESULTS_SEND_FAILED,
         EXECUTOR_MISSING_RESULTS,
-        SETTLER_TXS_SETTLED
+        SETTLER_TXS_SETTLED,
+        // Executor latency histograms
+        EXECUTOR_BATCH_DURATION,
+        EXECUTOR_PRELOAD_DURATION,
+        EXECUTOR_SVM_DURATION,
+        EXECUTOR_BOB_UPDATE_DURATION,
+        SETTLER_SETTLE_DURATION,
+        SETTLER_DB_WRITE_DURATION,
+        SETTLER_PROCESSING_DURATION
     );
-    // Force histogram statics too
 }

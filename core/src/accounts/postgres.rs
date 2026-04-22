@@ -7,6 +7,25 @@ use {
     tracing::{debug, info},
 };
 
+/// Default pool size. Needs headroom so the settler's BEGIN…COMMIT doesn't
+/// starve the executor's concurrent account-read callbacks on the same pool.
+pub(crate) const DEFAULT_PG_MAX_CONNECTIONS: u32 = 32;
+
+/// Hard ceiling — prevents a fat-fingered env var from exhausting Postgres'
+/// default `max_connections = 100` across co-located services.
+pub(crate) const MAX_PG_MAX_CONNECTIONS: u32 = 256;
+
+/// Reads `CONTRA_PG_MAX_CONNECTIONS`; falls back to the default on unset/empty/
+/// unparseable/zero; clamps above the ceiling.
+pub(crate) fn resolve_pool_size() -> u32 {
+    std::env::var("CONTRA_PG_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_PG_MAX_CONNECTIONS))
+        .unwrap_or(DEFAULT_PG_MAX_CONNECTIONS)
+}
+
 #[derive(Clone)]
 pub struct PostgresAccountsDB {
     pub pool: Arc<PgPool>,
@@ -29,16 +48,16 @@ impl PostgresAccountsDB {
         };
         info!("Connecting to PostgreSQL: {}", sanitized_url);
 
-        // Create connection pool
+        let max_connections = resolve_pool_size();
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections)
             .min_connections(1)
             .acquire_timeout(std::time::Duration::from_secs(30))
             .idle_timeout(std::time::Duration::from_secs(60))
             .connect(database_url)
             .await?;
 
-        info!("Successfully connected to PostgreSQL");
+        info!(max_connections, "Connected to PostgreSQL");
 
         if !read_only {
             info!("Creating PostgreSQL tables");
@@ -173,9 +192,101 @@ mod tests {
         postgres_container_url, start_test_postgres, start_test_postgres_raw,
         start_test_postgres_with_new_instance,
     };
+    use serial_test::serial;
     use solana_sdk::account::{AccountSharedData, ReadableAccount};
     use solana_sdk::pubkey::Pubkey;
     use solana_svm_callback::TransactionProcessingCallback;
+
+    const ENV_VAR: &str = "CONTRA_PG_MAX_CONNECTIONS";
+
+    /// Snapshot the env var, run `body`, restore. `serial_test` prevents
+    /// concurrent tests from racing on the shared process env.
+    fn with_env_var<F: FnOnce()>(value: Option<&str>, body: F) {
+        let original = std::env::var(ENV_VAR).ok();
+        match value {
+            Some(v) => std::env::set_var(ENV_VAR, v),
+            None => std::env::remove_var(ENV_VAR),
+        }
+        body();
+        match original {
+            Some(v) => std::env::set_var(ENV_VAR, v),
+            None => std::env::remove_var(ENV_VAR),
+        }
+    }
+
+    /// Unset → default (pins the documented value against silent drift).
+    #[test]
+    #[serial]
+    fn resolve_pool_size_defaults_when_unset() {
+        with_env_var(None, || {
+            assert_eq!(resolve_pool_size(), DEFAULT_PG_MAX_CONNECTIONS);
+            assert_eq!(DEFAULT_PG_MAX_CONNECTIONS, 32);
+        });
+    }
+
+    /// Valid u32 is honored verbatim.
+    #[test]
+    #[serial]
+    fn resolve_pool_size_parses_valid_value() {
+        with_env_var(Some("64"), || {
+            assert_eq!(resolve_pool_size(), 64);
+        });
+    }
+
+    /// Non-numeric → default (no panic).
+    #[test]
+    #[serial]
+    fn resolve_pool_size_invalid_value_falls_back_to_default() {
+        with_env_var(Some("not-a-number"), || {
+            assert_eq!(resolve_pool_size(), DEFAULT_PG_MAX_CONNECTIONS);
+        });
+    }
+
+    /// Empty string → default.
+    #[test]
+    #[serial]
+    fn resolve_pool_size_empty_value_falls_back_to_default() {
+        with_env_var(Some(""), || {
+            assert_eq!(resolve_pool_size(), DEFAULT_PG_MAX_CONNECTIONS);
+        });
+    }
+
+    /// Negative → default (fails u32 parse).
+    #[test]
+    #[serial]
+    fn resolve_pool_size_negative_value_falls_back_to_default() {
+        with_env_var(Some("-1"), || {
+            assert_eq!(resolve_pool_size(), DEFAULT_PG_MAX_CONNECTIONS);
+        });
+    }
+
+    /// 0 → default. Parses as u32 but would crash sqlx (min=1 > max=0).
+    #[test]
+    #[serial]
+    fn resolve_pool_size_zero_falls_back_to_default() {
+        with_env_var(Some("0"), || {
+            assert_eq!(resolve_pool_size(), DEFAULT_PG_MAX_CONNECTIONS);
+        });
+    }
+
+    /// Above ceiling → clamped to `MAX_PG_MAX_CONNECTIONS`.
+    #[test]
+    #[serial]
+    fn resolve_pool_size_above_ceiling_is_clamped() {
+        with_env_var(Some("100000"), || {
+            assert_eq!(resolve_pool_size(), MAX_PG_MAX_CONNECTIONS);
+        });
+    }
+
+    /// Exactly at ceiling → preserved (off-by-one guard).
+    #[test]
+    #[serial]
+    fn resolve_pool_size_at_ceiling_is_preserved() {
+        let ceiling = MAX_PG_MAX_CONNECTIONS.to_string();
+        with_env_var(Some(&ceiling), || {
+            assert_eq!(resolve_pool_size(), MAX_PG_MAX_CONNECTIONS);
+        });
+    }
 
     /// PostgresAccountsDB::new with read_only=false must create all tables.
     /// Calling it twice must not fail (IF NOT EXISTS idempotency).

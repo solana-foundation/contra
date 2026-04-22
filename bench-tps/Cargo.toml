@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+async-channel = { workspace = true }
 clap = { workspace = true }
 contra-core = { workspace = true }
 contra-metrics = { workspace = true }

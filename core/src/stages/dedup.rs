@@ -17,7 +17,7 @@ pub struct DedupArgs {
     pub max_blockhashes: usize,
     pub input_rx: mpsc::UnboundedReceiver<SanitizedTransaction>,
     pub settled_blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
-    pub output_tx: tokio_mpmc::Sender<SanitizedTransaction>,
+    pub output_tx: async_channel::Sender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
     /// Pre-populated from DB on startup; empty on a fresh node.
     pub initial_live_blockhashes: LinkedList<Hash>,
@@ -79,6 +79,42 @@ pub async fn load_dedup_state(
 
 type DedupState = (LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>);
 
+/// Ingest pending blockhash updates into `live_blockhashes`
+///
+/// If `first` is `Some`, it is the blockhash the caller already pulled
+/// from the channel via `.recv()`; it is applied first and then any
+/// additional hashes already in the channel are drained. If `first`
+/// is `None`, the function peeks with `try_recv` and returns without
+/// touching the lock when nothing is pending — so the hot path where
+/// no blockhash has arrived does not block RPC readers of
+/// `live_blockhashes`.
+///
+/// Ensures the dedup window is fully up-to-date before any transaction
+/// is checked, preventing false "unknown blockhash" rejections caused
+/// by stale state under load.
+fn ingest_blockhashes(
+    first: Option<Hash>,
+    settled_blockhashes_rx: &mut mpsc::UnboundedReceiver<Hash>,
+    live_blockhashes: &RwLock<LinkedList<Hash>>,
+    dedup_cache: &mut HashMap<Hash, HashSet<Signature>>,
+    max_blockhashes: usize,
+) {
+    let first = match first.or_else(|| settled_blockhashes_rx.try_recv().ok()) {
+        Some(h) => h,
+        None => return,
+    };
+    let mut bh_list = live_blockhashes.write().expect("blockhash lock poisoned");
+    bh_list.push_back(first);
+    while let Ok(blockhash) = settled_blockhashes_rx.try_recv() {
+        bh_list.push_back(blockhash);
+    }
+    while bh_list.len() > max_blockhashes {
+        if let Some(expired) = bh_list.pop_front() {
+            dedup_cache.remove(&expired);
+        }
+    }
+}
+
 /// Pure computation: build `(live_blockhashes, dedup_cache)` from an ordered
 /// slice of blocks. Extracted so it can be unit-tested without a live DB.
 fn build_dedup_state(blocks: &[crate::accounts::traits::BlockInfo]) -> Result<DedupState> {
@@ -136,19 +172,41 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
         let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = initial_dedup_cache;
 
         loop {
+            // Before blocking on select, drain any already-pending blockhash
+            // updates so the live set is current.
+            ingest_blockhashes(
+                None,
+                &mut settled_blockhashes_rx,
+                &live_blockhashes_clone,
+                &mut dedup_cache,
+                max_blockhashes,
+            );
+
             tokio::select! {
-                // Process incoming settled blockhashes
+                biased;
+
+                // Shutdown signal — checked first so shutdown is prompt.
+                _ = shutdown_token.cancelled() => {
+                    info!("Dedup received shutdown signal");
+                    break;
+                }
+
+                // Blockhash updates have priority over transaction processing.
+                // When both channels are ready, `biased` ensures we ingest new
+                // blockhashes before checking transactions.
                 result = settled_blockhashes_rx.recv() => {
                     match result {
                         Some(blockhash) => {
-                            let mut blockhashes = live_blockhashes_clone.write()
-                                .expect("blockhash lock poisoned");
-                            blockhashes.push_back(blockhash);
-                            while blockhashes.len() > max_blockhashes {
-                                if let Some(expired_blockhash) = blockhashes.pop_front() {
-                                    dedup_cache.remove(&expired_blockhash);
-                                }
-                            }
+                            // Apply the hash we just received along with any
+                            // others that arrived in the meantime, under a
+                            // single write lock.
+                            ingest_blockhashes(
+                                Some(blockhash),
+                                &mut settled_blockhashes_rx,
+                                &live_blockhashes_clone,
+                                &mut dedup_cache,
+                                max_blockhashes,
+                            );
                         }
                         None => {
                             warn!("Dedup settled blockhashes channel closed, shutting down");
@@ -156,13 +214,37 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                         }
                     }
                 }
-                // Process incoming transactions
+
+                // Process incoming transactions.
+                //
+                // The output channel (`output_tx`) is bounded, so `send().await`
+                // can block when the sigverify stage is saturated.  While this
+                // task is suspended on that await, new blockhash updates pile up
+                // in `settled_blockhashes_rx` and the live-hash window falls
+                // behind what `getLatestBlockhash` returns to clients.
+                //
+                // To avoid this, we race the send against incoming blockhash
+                // updates using a nested `tokio::select!`.  When a new blockhash
+                // arrives while we're waiting to send, we ingest it immediately,
+                // then re-check the send.  The transaction is only forwarded once
+                // the channel has capacity; blockhashes are never delayed.
                 result = input_rx.recv() => {
                     match result {
                         Some(transaction) => {
                             metrics.dedup_received();
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
+
+                            // Drain any blockhash updates that arrived while we
+                            // were processing the previous transaction (or while
+                            // output_tx.send() was awaiting).
+                            ingest_blockhashes(
+                                None,
+                                &mut settled_blockhashes_rx,
+                                &live_blockhashes_clone,
+                                &mut dedup_cache,
+                                max_blockhashes,
+                            );
 
                             if !live_blockhashes_clone.read()
                                 .expect("blockhash lock poisoned")
@@ -191,10 +273,41 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                 .insert(signature);
 
                             metrics.dedup_forwarded();
-                            // Forward to sigverify
-                            if let Err(e) = output_tx.send(transaction).await {
-                                warn!("Failed to forward transaction to sigverify: {}", e);
-                                break;
+
+                            // Forward to sigverify.  While waiting for capacity on
+                            // the bounded output channel, keep draining blockhash
+                            // updates so the live set stays current even when
+                            // backpressure stalls the pipeline.
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    bh = settled_blockhashes_rx.recv() => {
+                                        match bh {
+                                            Some(bh) => {
+                                                ingest_blockhashes(
+                                                    Some(bh),
+                                                    &mut settled_blockhashes_rx,
+                                                    &live_blockhashes_clone,
+                                                    &mut dedup_cache,
+                                                    max_blockhashes,
+                                                );
+                                                // Loop back to retry the send.
+                                            }
+                                            None => {
+                                                warn!("Dedup settled blockhashes channel closed");
+                                                // Fall through — the outer loop
+                                                // will detect the closed channel.
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    send_result = output_tx.send(transaction.clone()) => {
+                                        if let Err(e) = send_result {
+                                            warn!("Failed to forward transaction to sigverify: {}", e);
+                                        }
+                                        break;
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -202,12 +315,6 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                             break;
                         }
                     }
-                }
-
-                // Shutdown signal
-                _ = shutdown_token.cancelled() => {
-                    info!("Dedup received shutdown signal");
-                    break;
                 }
             }
         }
@@ -264,12 +371,12 @@ mod tests {
     fn start_test_dedup() -> (
         mpsc::UnboundedSender<SanitizedTransaction>,
         mpsc::UnboundedSender<Hash>,
-        tokio_mpmc::Receiver<SanitizedTransaction>,
+        async_channel::Receiver<SanitizedTransaction>,
         CancellationToken,
     ) {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (bh_tx, bh_rx) = mpsc::unbounded_channel();
-        let (output_tx, output_rx) = tokio_mpmc::channel(64);
+        let (output_tx, output_rx) = async_channel::bounded(64);
         let shutdown = CancellationToken::new();
 
         let args = DedupArgs {
@@ -351,7 +458,7 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
         match result {
-            Ok(Ok(Some(forwarded))) => {
+            Ok(Ok(forwarded)) => {
                 assert_eq!(*forwarded.signature(), expected_sig);
             }
             other => panic!("expected forwarded tx, got {:?}", other),

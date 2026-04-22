@@ -42,6 +42,20 @@ struct Args {
     #[arg(long, default_value_t = 64, env = "CONTRA_MAX_TX_PER_BATCH")]
     max_tx_per_batch: usize,
 
+    /// Batch collection deadline in milliseconds (0 = disable, dispatch immediately)
+    #[arg(long, default_value_t = 10, env = "CONTRA_BATCH_DEADLINE_MS")]
+    batch_deadline_ms: u64,
+
+    /// Sequencer→executor batch channel capacity (bounded for back-pressure).
+    #[arg(long, default_value_t = 16, env = "CONTRA_BATCH_CHANNEL_CAPACITY")]
+    batch_channel_capacity: usize,
+
+    /// Maximum parallel SVM worker threads per batch (including the calling thread).
+    /// Set to 1 to disable intra-batch parallelism. Effective only for batches
+    /// large enough to amortize the snapshot + thread spawn overhead.
+    #[arg(long, default_value_t = 8, env = "CONTRA_MAX_SVM_WORKERS")]
+    max_svm_workers: usize,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info", env = "CONTRA_LOG_LEVEL")]
     log_level: String,
@@ -133,6 +147,9 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         sigverify_workers: args.sigverify_workers,
         max_connections: args.max_connections,
         max_tx_per_batch: args.max_tx_per_batch,
+        batch_deadline_ms: args.batch_deadline_ms,
+        batch_channel_capacity: args.batch_channel_capacity,
+        max_svm_workers: args.max_svm_workers,
         accountsdb_connection_url: args.accountsdb_connection_url,
         admin_keys,
         transaction_expiration_ms: args.transaction_expiration_ms,

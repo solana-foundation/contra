@@ -10,7 +10,7 @@ use {
         TransactionStatusMeta, UiTransactionEncoding, UiTransactionStatusMeta,
     },
     solana_transaction_status_client_types::InnerInstructions,
-    tracing::info,
+    tracing::debug,
 };
 
 pub fn get_stored_transaction(
@@ -19,7 +19,7 @@ pub fn get_stored_transaction(
     block_time: UnixTimestamp,
     processed: &ProcessedTransaction,
 ) -> StoredTransaction {
-    info!("Stored transaction: {:?}", processed);
+    debug!("Stored transaction: {:?}", processed);
 
     let meta = match processed {
         ProcessedTransaction::Executed(executed) => {

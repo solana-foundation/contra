@@ -101,12 +101,26 @@ async fn write_batch_postgres(
     let tx_count = transactions.len() as i64;
     let mut sig_bytes_vec: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
     let mut tx_data_vec: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+    // Parallel arrays for the address_signatures index. We can't size these up
+    // front because each transaction contributes a variable number of rows
+    // (one per account key referenced in the message).
+    let mut addr_sig_addresses: Vec<Vec<u8>> = Vec::new();
+    let mut addr_sig_slots: Vec<i64> = Vec::new();
+    let mut addr_sig_signatures: Vec<Vec<u8>> = Vec::new();
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         sig_bytes_vec.push(signature.as_ref().to_vec());
         let data = bincode::serialize(&stored_tx)
             .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
         tx_data_vec.push(data);
+        // Index every account key the transaction touches, not just the fee
+        // payer — getSignaturesForAddress must return a hit for any address
+        // that appeared in the message (writable or read-only).
+        for pubkey in transaction.message().account_keys().iter() {
+            addr_sig_addresses.push(pubkey.to_bytes().to_vec());
+            addr_sig_slots.push(tx_slot as i64);
+            addr_sig_signatures.push(signature.as_ref().to_vec());
+        }
     }
 
     // Block info: serialize the row payload up front.
@@ -161,6 +175,25 @@ async fn write_batch_postgres(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
+    }
+
+    // Bulk-insert address_signatures in the same atomic transaction as the
+    // rows they point at — a reader on a partial commit would see a signature
+    // in the index with no matching transactions row. ON CONFLICT DO NOTHING
+    // because the same (address, slot, signature) triple can legitimately
+    // recur across retries of the same batch.
+    if !addr_sig_addresses.is_empty() {
+        sqlx::query(
+            "INSERT INTO address_signatures (address, slot, signature)
+             SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::bytea[])
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&addr_sig_addresses)
+        .bind(&addr_sig_slots)
+        .bind(&addr_sig_signatures)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to bulk insert address signatures: {}", e))?;
     }
 
     // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
@@ -247,13 +280,25 @@ pub(crate) async fn write_batch_redis(
         }
     }
 
-    // Store transactions
+    // Store transactions and build the address→signatures index used by
+    // getSignaturesForAddress. For each account key touched by the transaction
+    // we ZADD one entry to a per-address sorted set:
+    //   key:    addr_sigs:{pubkey}
+    //   score:  tx_slot as f64  (enables ZRANGE BYSCORE REV ordering by recency)
+    //   member: hex-encoded signature (preserves byte ordering for same-slot DESC sort)
+    // Mirrors what address_signatures does in Postgres.
+    // redis-rs 0.27: zadd(key, member, score) — member first, score second.
     let tx_count = transactions.len();
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         let key = format!("tx:{}", signature);
         let serialized = bincode::serialize(&stored_tx).unwrap();
         pipe.set(key, serialized);
+
+        for pubkey in transaction.message().account_keys().iter() {
+            let addr_key = format!("addr_sigs:{}", pubkey);
+            pipe.zadd(addr_key, hex::encode(signature.as_ref()), tx_slot as f64);
+        }
     }
 
     // Increment transaction count

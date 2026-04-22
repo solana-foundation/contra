@@ -3,6 +3,7 @@ use {
     crate::stages::AccountSettlement,
     anyhow::Result,
     serde::{Deserialize, Serialize},
+    solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
     solana_sdk::{
         account::AccountSharedData, clock::UnixTimestamp, hash::Hash, pubkey::Pubkey,
         signature::Signature, transaction::SanitizedTransaction,
@@ -53,6 +54,19 @@ impl AccountsDB {
 
     pub async fn get_transaction(&self, signature: &Signature) -> Option<StoredTransaction> {
         super::get_transaction::get_transaction(self, signature).await
+    }
+
+    pub async fn get_signatures_for_address(
+        &self,
+        address: &Pubkey,
+        limit: usize,
+        before: Option<&Signature>,
+        until: Option<&Signature>,
+    ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        super::get_signatures_for_address::get_signatures_for_address(
+            self, address, limit, before, until,
+        )
+        .await
     }
 
     pub async fn get_latest_slot(&self) -> Result<Option<u64>> {
@@ -165,8 +179,19 @@ impl AccountsDB {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{create_test_block_info, start_test_postgres};
+    use crate::stages::AccountSettlement;
+    use crate::test_helpers::{
+        create_test_block_info, create_test_sanitized_transaction, start_test_postgres,
+        start_test_redis,
+    };
     use solana_sdk::account::AccountSharedData;
+    use solana_sdk::signature::{Keypair, Signer};
+    use solana_svm::account_loader::LoadedTransaction;
+    use solana_svm::transaction_execution_result::{
+        ExecutedTransaction, TransactionExecutionDetails,
+    };
+    use std::collections::HashMap;
+    use std::str::FromStr;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unsupported_url_scheme_rejected() {
@@ -294,6 +319,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn get_blocks_redis_returns_slot_numbers_in_order() {
+        let (redis_raw, _redis) = start_test_redis().await;
+        let mut db = AccountsDB::Redis(redis_raw);
+
+        for slot in [3u64, 7, 1, 10] {
+            db.write_batch(
+                &[],
+                vec![],
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        let slots = db.get_blocks(0, Some(20)).await.unwrap();
+        assert_eq!(slots, vec![1, 3, 7, 10]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn get_blocks_in_range_filters_correctly() {
         let (mut db, _pg) = start_test_postgres().await;
 
@@ -398,8 +442,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn write_batch_stores_accounts_and_block() {
-        use crate::stages::AccountSettlement;
-
         let (mut db, _pg) = start_test_postgres().await;
 
         let pk = Pubkey::new_unique();
@@ -450,9 +492,344 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_batch_deleted_account_removes_from_db() {
-        use crate::stages::AccountSettlement;
+    async fn get_signatures_for_address_found() {
+        let (mut db, _pg) = start_test_postgres().await;
 
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let sig = *tx.signature();
+
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, 7, 1_700_000_000, &processed)],
+            Some(create_test_block_info(7, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .get_signatures_for_address(&from.pubkey(), 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].signature, sig.to_string());
+        assert_eq!(results[0].slot, 7);
+        assert!(results[0].err.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_empty() {
+        let (db, _pg) = start_test_postgres().await;
+        let results = db
+            .get_signatures_for_address(&Pubkey::new_unique(), 10, None, None)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_same_slot_ordered_by_signature_desc() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let to = Pubkey::new_unique();
+
+        // Three different senders, all to the same recipient, all in slot 5.
+        let from_a = Keypair::new();
+        let from_b = Keypair::new();
+        let from_c = Keypair::new();
+        let tx_a = create_test_sanitized_transaction(&from_a, &to, 1);
+        let tx_b = create_test_sanitized_transaction(&from_b, &to, 1);
+        let tx_c = create_test_sanitized_transaction(&from_c, &to, 1);
+        let sig_a = *tx_a.signature();
+        let sig_b = *tx_b.signature();
+        let sig_c = *tx_c.signature();
+
+        let make_processed = || {
+            ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+                loaded_transaction: LoadedTransaction {
+                    accounts: vec![],
+                    ..Default::default()
+                },
+                execution_details: TransactionExecutionDetails {
+                    status: Ok(()),
+                    log_messages: None,
+                    inner_instructions: None,
+                    return_data: None,
+                    executed_units: 0,
+                    accounts_data_len_delta: 0,
+                },
+                programs_modified_by_tx: HashMap::new(),
+            }))
+        };
+
+        db.write_batch(
+            &[],
+            vec![
+                (sig_a, &tx_a, 5, 1_700_000_000, &make_processed()),
+                (sig_b, &tx_b, 5, 1_700_000_000, &make_processed()),
+                (sig_c, &tx_c, 5, 1_700_000_000, &make_processed()),
+            ],
+            Some(create_test_block_info(5, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let results = db
+            .get_signatures_for_address(&to, 10, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3, "expected all 3 transactions");
+
+        // All three are in the same slot — verify the tiebreaker: signature DESC.
+        // Postgres bytea DESC is byte-by-byte lexicographic descending.
+        let mut expected_bytes: Vec<Vec<u8>> = vec![
+            sig_a.as_ref().to_vec(),
+            sig_b.as_ref().to_vec(),
+            sig_c.as_ref().to_vec(),
+        ];
+        expected_bytes.sort_by(|a, b| b.cmp(a));
+
+        let result_bytes: Vec<Vec<u8>> = results
+            .iter()
+            .map(|r| Signature::from_str(&r.signature).unwrap().as_ref().to_vec())
+            .collect();
+
+        assert_eq!(
+            result_bytes, expected_bytes,
+            "same-slot results must be ordered by signature DESC"
+        );
+    }
+
+    /// Helper used by the cursor tests: stores a single transaction for `to` at `slot`
+    /// and returns its signature.
+    async fn store_tx_at_slot(
+        db: &mut AccountsDB,
+        to: &Pubkey,
+        slot: u64,
+    ) -> solana_sdk::signature::Signature {
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, to, 1);
+        let sig = *tx.signature();
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+            Some(create_test_block_info(slot, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+        sig
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_before_cursor() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        // Three transactions in ascending slot order.
+        let sig_old = store_tx_at_slot(&mut db, &to, 10).await;
+        let sig_mid = store_tx_at_slot(&mut db, &to, 20).await;
+        let _sig_new = store_tx_at_slot(&mut db, &to, 30).await;
+
+        // `before=sig_mid` must return only the transaction older than sig_mid (slot 10).
+        let results = db
+            .get_signatures_for_address(&to, 10, Some(&sig_mid), None)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].slot, 10);
+        assert_eq!(results[0].signature, sig_old.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_until_cursor() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        let _sig_old = store_tx_at_slot(&mut db, &to, 10).await;
+        let sig_mid = store_tx_at_slot(&mut db, &to, 20).await;
+        let sig_new = store_tx_at_slot(&mut db, &to, 30).await;
+
+        // `until=sig_mid` must return transactions from newest down to and
+        // including sig_mid (slots 30 and 20), but not slot 10.
+        let results = db
+            .get_signatures_for_address(&to, 10, None, Some(&sig_mid))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].signature, sig_new.to_string()); // newest first
+        assert_eq!(results[1].signature, sig_mid.to_string()); // until is inclusive
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_before_and_until_cursors() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        let _sig_old = store_tx_at_slot(&mut db, &to, 10).await;
+        let sig_mid = store_tx_at_slot(&mut db, &to, 20).await;
+        let sig_new = store_tx_at_slot(&mut db, &to, 30).await;
+
+        // Combining both cursors must return exactly sig_mid (slot 20):
+        // older than slot 30 (before=sig_new) AND as recent as slot 20 (until=sig_mid).
+        let results = db
+            .get_signatures_for_address(&to, 10, Some(&sig_new), Some(&sig_mid))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].signature, sig_mid.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_unknown_before_cursor_returns_error() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        store_tx_at_slot(&mut db, &to, 10).await;
+
+        // A randomly generated signature that was never stored — resolve_cursor
+        // should catch this and return Err instead of silently returning empty.
+        let ghost_sig = solana_sdk::signature::Signature::new_unique();
+        let result = db
+            .get_signatures_for_address(&to, 10, Some(&ghost_sig), None)
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("'before' is unavailable"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_unknown_until_cursor_returns_error() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        store_tx_at_slot(&mut db, &to, 10).await;
+
+        let ghost_sig = solana_sdk::signature::Signature::new_unique();
+        let result = db
+            .get_signatures_for_address(&to, 10, None, Some(&ghost_sig))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("'until' is unavailable"));
+    }
+
+    /// Verifies that Redis and Postgres return same-slot signatures in identical order.
+    /// Redis stores members as hex-encoded signatures so that sorted-set lex ordering
+    /// matches Postgres's `ORDER BY signature DESC` (raw bytes). This test catches
+    /// any regression where the member encoding no longer preserves byte ordering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signatures_for_address_redis_same_slot_ordering_matches_postgres() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let (redis_raw, _redis) = start_test_redis().await;
+        let mut redis_db = AccountsDB::Redis(redis_raw);
+
+        let to = Pubkey::new_unique();
+        let slot = 42u64;
+        let block_time = 1_700_000_000;
+
+        let make_processed = || {
+            ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+                loaded_transaction: LoadedTransaction {
+                    accounts: vec![],
+                    ..Default::default()
+                },
+                execution_details: TransactionExecutionDetails {
+                    status: Ok(()),
+                    log_messages: None,
+                    inner_instructions: None,
+                    return_data: None,
+                    executed_units: 0,
+                    accounts_data_len_delta: 0,
+                },
+                programs_modified_by_tx: HashMap::new(),
+            }))
+        };
+
+        let txs: Vec<_> = (0..10)
+            .map(|_| {
+                let kp = Keypair::new();
+                (
+                    create_test_sanitized_transaction(&kp, &to, 1),
+                    make_processed(),
+                )
+            })
+            .collect();
+
+        let batch_refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, slot, block_time, p))
+            .collect();
+
+        let block = create_test_block_info(slot, Hash::new_unique());
+        pg_db
+            .write_batch(&[], batch_refs.clone(), Some(block.clone()))
+            .await
+            .unwrap();
+        redis_db
+            .write_batch(&[], batch_refs, Some(block))
+            .await
+            .unwrap();
+
+        let pg_sigs = pg_db
+            .get_signatures_for_address(&to, 10, None, None)
+            .await
+            .unwrap();
+        let redis_sigs = redis_db
+            .get_signatures_for_address(&to, 10, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(pg_sigs.len(), 10);
+        let pg_order: Vec<&str> = pg_sigs.iter().map(|s| s.signature.as_str()).collect();
+        let redis_order: Vec<&str> = redis_sigs.iter().map(|s| s.signature.as_str()).collect();
+        assert_eq!(
+            pg_order, redis_order,
+            "Redis and Postgres must return same-slot signatures in identical order"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_batch_deleted_account_removes_from_db() {
         let (mut db, _pg) = start_test_postgres().await;
 
         let pk = Pubkey::new_unique();

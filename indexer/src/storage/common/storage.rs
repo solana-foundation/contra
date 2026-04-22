@@ -658,7 +658,10 @@ mod tests {
             db.push(b);
         }
 
-        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
+        let affected = storage
+            .quarantine_all_active_withdrawals(None)
+            .await
+            .unwrap();
         assert_eq!(affected, 2);
 
         let rows = mock.pending_transactions.lock().unwrap();
@@ -686,7 +689,10 @@ mod tests {
             db.push(wd);
         }
 
-        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
+        let affected = storage
+            .quarantine_all_active_withdrawals(None)
+            .await
+            .unwrap();
         assert_eq!(affected, 1);
 
         let rows = mock.pending_transactions.lock().unwrap();
@@ -726,7 +732,10 @@ mod tests {
             }
         }
 
-        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
+        let affected = storage
+            .quarantine_all_active_withdrawals(None)
+            .await
+            .unwrap();
         assert_eq!(affected, 0);
 
         let rows = mock.pending_transactions.lock().unwrap();
@@ -751,7 +760,10 @@ mod tests {
     #[tokio::test]
     async fn quarantine_all_active_withdrawals_empty_db_returns_zero() {
         let (storage, _mock) = make_mock_storage();
-        let affected = storage.quarantine_all_active_withdrawals(None).await.unwrap();
+        let affected = storage
+            .quarantine_all_active_withdrawals(None)
+            .await
+            .unwrap();
         assert_eq!(affected, 0);
     }
 

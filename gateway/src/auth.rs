@@ -61,6 +61,14 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 /// JSON-RPC spec:
 ///   getAccountInfo:         params: [pubkey, {encoding, ...}]
 ///   getTokenAccountBalance: params: [pubkey]
+///
+/// Known limitation for `getSignaturesForAddress`: ownership is derived from
+/// the current on-chain account state. If a TokenAccount has been closed, the
+/// account fetch returns `None` and the User is rejected with 403 — even for
+/// signatures from when they owned the account. We accept this: closing a
+/// TokenAccount is rare in our context (no rent to reclaim for users), and the
+/// alternatives (snapshotting ownership at ingest, or deriving ATAs from a
+/// mint param) add schema or API complexity that isn't justified today.
 const ACCOUNT_GATED_METHODS: &[&str] = &[
     "getAccountInfo",
     "getTokenAccountBalance",

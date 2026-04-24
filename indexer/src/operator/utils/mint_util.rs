@@ -4,40 +4,36 @@ use crate::storage::Storage;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
-    pausable::PausableConfig, BaseStateWithExtensions, StateWithExtensions,
+    pausable::PausableConfig, permanent_delegate::PermanentDelegate, BaseStateWithExtensions,
+    StateWithExtensions,
 };
 use spl_token_2022::state::Mint as Token2022MintState;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::warn;
 
 const DECIMALS_OFFSET: usize = 44;
 
-/// In-memory cache for mint metadata (`token_program`, `decimals`,
-/// `is_pausable`). On a miss, falls through to the DB; if the DB row
-/// exists but `is_pausable` hasn't been resolved yet (indexer writes it
-/// as `None` at `AllowMint` time), the cache RPC-fetches the on-chain
-/// mint to detect the Token-2022 `PausableConfig` extension, writes the
-/// resolved value back via `set_mint_pausable`, and caches it. Also
-/// exposes `check_paused` for the dynamic `PausableConfig.paused` check
-/// that the release-funds pre-flight needs.
+/// In-memory cache for basic mint metadata (`token_program`, `decimals`).
+/// Token-2022 extension flags (`is_pausable`, `has_permanent_delegate`) are
+/// resolved separately via [`MintCache::get_extension_flags`], because the
+/// deposit-side sender JIT-init path has a `MintCache` pointed at the
+/// **Contra** RPC where the mint doesn't yet exist — forcing extension
+/// resolution from `get_mint_metadata` made that path fail with
+/// `AccountNotFound` and broke every fresh deposit.
 pub struct MintCache {
     storage: Arc<Storage>,
     rpc_client: Option<Arc<RpcClientWithRetry>>,
     cache: HashMap<String, MintMetadata>,
+    extension_flags_cache: HashMap<String, (bool, bool)>,
 }
 
-/// Cached mint metadata
 #[derive(Clone, Debug, PartialEq)]
 pub struct MintMetadata {
     pub token_program: Pubkey,
     pub decimals: u8,
-    /// True iff the on-chain mint carries the Token-2022 PausableConfig
-    /// extension. This is a static property of the mint; the *current*
-    /// `PausableConfig.paused` bool is dynamic and must be re-fetched —
-    /// see `MintCache::check_paused`.
-    pub is_pausable: bool,
 }
 
 impl MintCache {
@@ -46,6 +42,7 @@ impl MintCache {
             storage,
             rpc_client: None,
             cache: HashMap::new(),
+            extension_flags_cache: HashMap::new(),
         }
     }
 
@@ -54,19 +51,20 @@ impl MintCache {
             storage,
             rpc_client: Some(rpc_client),
             cache: HashMap::new(),
+            extension_flags_cache: HashMap::new(),
         }
     }
 
-    /// Get mint metadata, resolving and caching `is_pausable` on first sight.
+    /// Basic mint metadata (decimals + token program). Cache → DB → RPC
+    /// fallback only when no DB row exists.
     ///
-    /// Order:
-    /// 1. In-memory cache hit → return.
-    /// 2. Storage row with `is_pausable = Some(_)` → return (fast path).
-    /// 3. Anything else (no row, or `is_pausable = None`) → RPC-fetch the
-    ///    mint account, parse the PausableConfig extension presence, and
-    ///    write the result back to storage so subsequent restarts skip
-    ///    the RPC. Write-back is skipped if no row exists yet — the
-    ///    indexer is expected to land the row shortly.
+    /// Opportunistically warms `extension_flags_cache` on both the DB-hit
+    /// and RPC-fallback branches: the DB row already carries the flags if
+    /// they've been resolved before, and the RPC fallback's
+    /// `fetch_mint_from_rpc` returns them as a by-product of parsing the
+    /// mint account. This saves the subsequent `get_extension_flags` call
+    /// on the withdrawal pre-flight a second DB round-trip (or, on the
+    /// RPC-fallback path, a second RPC parse of the same mint).
     pub async fn get_mint_metadata(
         &mut self,
         mint: &Pubkey,
@@ -77,47 +75,88 @@ impl MintCache {
             return Ok(metadata.clone());
         }
 
-        let db_mint = self.storage.get_mint(&mint_str).await?;
-
-        if let Some(ref m) = db_mint {
-            if let Some(is_pausable) = m.is_pausable {
-                let token_program = Pubkey::from_str(&m.token_program).map_err(|e| {
-                    OperatorError::InvalidPubkey {
-                        pubkey: m.token_program.clone(),
-                        reason: e.to_string(),
-                    }
+        if let Some(m) = self.storage.get_mint(&mint_str).await? {
+            let token_program =
+                Pubkey::from_str(&m.token_program).map_err(|e| OperatorError::InvalidPubkey {
+                    pubkey: m.token_program.clone(),
+                    reason: e.to_string(),
                 })?;
-                let metadata = MintMetadata {
-                    token_program,
-                    decimals: m.decimals as u8,
-                    is_pausable,
-                };
-                self.cache.insert(mint_str, metadata.clone());
-                return Ok(metadata);
+            let metadata = MintMetadata {
+                token_program,
+                decimals: m.decimals as u8,
+            };
+            self.cache.insert(mint_str.clone(), metadata.clone());
+            if let (Some(p), Some(d)) = (m.is_pausable, m.has_permanent_delegate) {
+                self.extension_flags_cache.insert(mint_str, (p, d));
+            }
+            return Ok(metadata);
+        }
+
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError(format!(
+                "MintCache needs RPC for unknown mint {mint_str}, but no RPC client is configured",
+            ))
+        })?;
+
+        let (metadata, flags) = self.fetch_mint_from_rpc(mint, rpc).await?;
+        self.cache.insert(mint_str.clone(), metadata.clone());
+        self.extension_flags_cache.insert(mint_str, flags);
+        Ok(metadata)
+    }
+
+    /// Returns `(is_pausable, has_permanent_delegate)` for the mint.
+    /// Cache → DB (if both flags resolved) → RPC + write-back. Used by the
+    /// withdraw pre-flight; the deposit path never calls this.
+    pub async fn get_extension_flags(
+        &mut self,
+        mint: &Pubkey,
+    ) -> Result<(bool, bool), OperatorError> {
+        let mint_str = mint.to_string();
+
+        if let Some(flags) = self.extension_flags_cache.get(&mint_str) {
+            return Ok(*flags);
+        }
+
+        let db_mint = self.storage.get_mint(&mint_str).await?;
+        if let Some(ref m) = db_mint {
+            if let (Some(p), Some(d)) = (m.is_pausable, m.has_permanent_delegate) {
+                self.extension_flags_cache.insert(mint_str, (p, d));
+                return Ok((p, d));
             }
         }
 
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
             OperatorError::RpcError(format!(
-                "MintCache needs RPC to resolve mint {mint_str} (storage row {}), but no RPC client is configured",
-                if db_mint.is_some() { "lacks is_pausable" } else { "is absent" },
+                "MintCache needs RPC to resolve extension flags for mint {mint_str}",
             ))
         })?;
 
-        let metadata = self.fetch_mint_from_rpc(mint, rpc).await?;
+        let (_metadata, flags) = self.fetch_mint_from_rpc(mint, rpc).await?;
 
-        // Only persist is_pausable if the indexer has already landed a row.
-        // The row is the authoritative source for is_pausable going forward;
-        // no row means this is a pre-AllowMint-ingested edge case, so we
-        // keep the resolution in-memory only.
+        // Write-back only when the indexer has already landed a row. No row
+        // means this is a pre-AllowMint-ingested edge case; we keep the
+        // resolution in-memory and let the indexer's upsert land.
+        //
+        // Write-back failure is logged but not propagated: the in-memory
+        // flags are authoritative for this process's lifetime, and a
+        // transient DB blip would otherwise escalate a healthy withdrawal
+        // to ManualReview via the caller's bail path. A later restart will
+        // naturally retry the write-back on the next RPC fetch.
         if db_mint.is_some() {
-            self.storage
-                .set_mint_pausable(&mint_str, metadata.is_pausable)
-                .await?;
+            if let Err(e) = self
+                .storage
+                .set_mint_extension_flags(&mint_str, flags.0, flags.1)
+                .await
+            {
+                warn!(
+                    mint = %mint_str, error = %e,
+                    "extension-flag write-back failed; continuing with in-memory resolution",
+                );
+            }
         }
 
-        self.cache.insert(mint_str, metadata.clone());
-        Ok(metadata)
+        self.extension_flags_cache.insert(mint_str, flags);
+        Ok(flags)
     }
 
     /// Live check of the `PausableConfig.paused` flag. Intended for the
@@ -133,29 +172,54 @@ impl MintCache {
             .await
             .map_err(|_| AccountError::AccountNotFound { pubkey: *mint })?;
 
-        let state = StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(
-            |_| AccountError::InvalidMint {
-                pubkey: *mint,
-                reason: "failed to parse Token-2022 mint".to_string(),
-            },
-        )?;
+        let state =
+            StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(|_| {
+                AccountError::InvalidMint {
+                    pubkey: *mint,
+                    reason: "failed to parse Token-2022 mint".to_string(),
+                }
+            })?;
 
-        let cfg = state.get_extension::<PausableConfig>().map_err(|_| {
-            AccountError::InvalidMint {
-                pubkey: *mint,
-                reason: "mint is tagged is_pausable but PausableConfig extension is missing"
-                    .to_string(),
-            }
-        })?;
+        let cfg =
+            state
+                .get_extension::<PausableConfig>()
+                .map_err(|_| AccountError::InvalidMint {
+                    pubkey: *mint,
+                    reason: "mint is tagged is_pausable but PausableConfig extension is missing"
+                        .to_string(),
+                })?;
 
         Ok(bool::from(cfg.paused))
+    }
+
+    /// Live fetch of a token account's raw balance (base units).
+    ///
+    /// Intended for the permanent-delegate pre-flight: we can't trust our
+    /// indexed balance because a permanent delegate may have moved tokens
+    /// out of the escrow ATA without emitting a Contra program event. Only
+    /// call this after `MintMetadata.has_permanent_delegate` came back true.
+    pub async fn get_ata_balance(&self, ata: &Pubkey) -> Result<u64, OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError("get_ata_balance requires an RPC client".to_string())
+        })?;
+
+        let ui_amount = rpc.get_token_account_balance(ata).await.map_err(|e| {
+            OperatorError::RpcError(format!("get_token_account_balance({ata}): {e}"))
+        })?;
+
+        ui_amount.amount.parse::<u64>().map_err(|e| {
+            OperatorError::RpcError(format!(
+                "failed to parse token balance '{}' for {ata}: {e}",
+                ui_amount.amount
+            ))
+        })
     }
 
     async fn fetch_mint_from_rpc(
         &self,
         mint: &Pubkey,
         rpc: &RpcClientWithRetry,
-    ) -> Result<MintMetadata, OperatorError> {
+    ) -> Result<(MintMetadata, (bool, bool)), OperatorError> {
         let account = rpc
             .get_account(mint)
             .await
@@ -171,8 +235,8 @@ impl MintCache {
             .into());
         }
 
-        // Parse SPL token mint data directly (decimals is at offset 44 for both SPL and T22)
-        // Mint layout: [option(coption_authority): 36 bytes, supply: 8 bytes, decimals: 1 byte, ...]
+        // Mint layout: [option(coption_authority): 36 bytes, supply: 8 bytes,
+        // decimals: 1 byte, ...]. Offset 44 works for both SPL and T22.
         if account.data.len() < DECIMALS_OFFSET + 1 {
             return Err(AccountError::InvalidMint {
                 pubkey: *mint,
@@ -183,24 +247,33 @@ impl MintCache {
 
         let decimals = account.data[DECIMALS_OFFSET];
 
-        // PausableConfig can only exist on Token-2022 mints. If the account
-        // isn't well-formed for the extension parser (e.g. an uninitialized
-        // base Mint in a test fixture), we conservatively treat it as
-        // "no extension" rather than erroring — callers only need
-        // is_pausable to gate the pre-flight pause check.
-        let is_pausable = if token_program == TOKEN_2022_PROGRAM_ID {
-            StateWithExtensions::<Token2022MintState>::unpack(&account.data)
-                .map(|m| m.get_extension::<PausableConfig>().is_ok())
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        // PausableConfig and PermanentDelegate can only exist on Token-2022.
+        // For a Token-2022-owned account that fails to parse we surface
+        // InvalidMint rather than silently caching `(false, false)`: the
+        // latter would poison the DB row and permanently bypass the pause
+        // and drain pre-flights for that mint.
+        let mut is_pausable = false;
+        let mut has_permanent_delegate = false;
+        if token_program == TOKEN_2022_PROGRAM_ID {
+            let m =
+                StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(|_| {
+                    AccountError::InvalidMint {
+                        pubkey: *mint,
+                        reason: "failed to parse Token-2022 mint for extension detection"
+                            .to_string(),
+                    }
+                })?;
+            is_pausable = m.get_extension::<PausableConfig>().is_ok();
+            has_permanent_delegate = m.get_extension::<PermanentDelegate>().is_ok();
+        }
 
-        Ok(MintMetadata {
-            token_program,
-            decimals,
-            is_pausable,
-        })
+        Ok((
+            MintMetadata {
+                token_program,
+                decimals,
+            },
+            (is_pausable, has_permanent_delegate),
+        ))
     }
 
     /// Pre-populate cache with mint metadata
@@ -255,8 +328,12 @@ mod tests {
     }
 
     fn create_mock_mint_account_data(decimals: u8) -> Vec<u8> {
+        // Base SPL Mint layout (82 bytes). is_initialized sits at offset 45 —
+        // must be 1 so Token-2022 `StateWithExtensions::unpack` accepts the
+        // account; otherwise the parser surfaces UninitializedAccount.
         let mut data = vec![0u8; 82];
         data[DECIMALS_OFFSET] = decimals;
+        data[45] = 1;
         data
     }
 
@@ -293,6 +370,7 @@ mod tests {
             token_program: token_program.to_string(),
             created_at: chrono::Utc::now(),
             is_pausable: Some(false),
+            has_permanent_delegate: Some(false),
         });
 
         Arc::new(Storage::Mock(mock))
@@ -358,6 +436,7 @@ mod tests {
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
                 is_pausable: Some(false),
+                has_permanent_delegate: Some(false),
             });
         }
 
@@ -387,6 +466,7 @@ mod tests {
             token_program: TOKEN_PROGRAM_ID.to_string(),
             created_at: chrono::Utc::now(),
             is_pausable: Some(false),
+            has_permanent_delegate: Some(false),
         });
         mock.add_mint(DbMint {
             mint_address: t22_mint.to_string(),
@@ -394,6 +474,7 @@ mod tests {
             token_program: TOKEN_2022_PROGRAM_ID.to_string(),
             created_at: chrono::Utc::now(),
             is_pausable: Some(false),
+            has_permanent_delegate: Some(false),
         });
 
         let storage = Arc::new(Storage::Mock(mock));
@@ -450,11 +531,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_row_without_is_pausable_triggers_rpc_resolution_and_write_back() {
+    async fn get_extension_flags_resolves_via_rpc_and_writes_back_when_db_flags_unresolved() {
         let mint = create_test_mint();
 
         // Indexer has landed the mints row but the operator hasn't resolved
-        // is_pausable yet — this is the state we need to lazily fill.
+        // the extension flags yet — this is the state we lazily fill.
         let mock_storage = MockStorage::new();
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
@@ -464,10 +545,11 @@ mod tests {
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
                 is_pausable: None,
+                has_permanent_delegate: None,
             },
         );
 
-        // Plain SPL Token mint on RPC → no extensions → is_pausable=false.
+        // Plain SPL Token mint on RPC → no extensions → both flags false.
         let account_response = create_mock_account_response(&TOKEN_PROGRAM_ID, 6);
         let mut mocks = std::collections::HashMap::new();
         mocks.insert(RpcRequest::GetAccountInfo, account_response);
@@ -476,8 +558,9 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock_storage.clone()));
         let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
 
-        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
-        assert!(!metadata.is_pausable);
+        let (is_pausable, has_permanent_delegate) = cache.get_extension_flags(&mint).await.unwrap();
+        assert!(!is_pausable);
+        assert!(!has_permanent_delegate);
 
         // Write-back happened — subsequent reads don't need RPC.
         let stored = mock_storage
@@ -488,13 +571,18 @@ mod tests {
             .cloned()
             .expect("mint row should still exist after write-back");
         assert_eq!(stored.is_pausable, Some(false));
+        assert_eq!(stored.has_permanent_delegate, Some(false));
     }
 
     #[tokio::test]
-    async fn get_mint_metadata_errors_when_is_pausable_unresolved_and_no_rpc() {
+    async fn get_mint_metadata_does_not_require_rpc_when_db_flags_are_unresolved() {
         let mint = create_test_mint();
 
-        // DB row lacks is_pausable — resolution would need RPC, which is absent.
+        // DB row has flags = None. Pre-fix, `get_mint_metadata` would force
+        // RPC resolution and fail here (breaking JIT-mint init on the
+        // deposit path, where the mint-cache RPC can't see the mint yet).
+        // Post-fix, `get_mint_metadata` is pure decimals + token_program —
+        // flags are resolved separately via `get_extension_flags`.
         let mock_storage = MockStorage::new();
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
@@ -504,6 +592,32 @@ mod tests {
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
                 is_pausable: None,
+                has_permanent_delegate: None,
+            },
+        );
+
+        let storage = Arc::new(Storage::Mock(mock_storage));
+        let mut cache = MintCache::new(storage);
+
+        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
+        assert_eq!(metadata.token_program, TOKEN_PROGRAM_ID);
+        assert_eq!(metadata.decimals, 6);
+    }
+
+    #[tokio::test]
+    async fn get_extension_flags_errors_when_unresolved_and_no_rpc() {
+        let mint = create_test_mint();
+
+        let mock_storage = MockStorage::new();
+        mock_storage.mints.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: TOKEN_PROGRAM_ID.to_string(),
+                created_at: chrono::Utc::now(),
+                is_pausable: None,
+                has_permanent_delegate: None,
             },
         );
 
@@ -511,13 +625,52 @@ mod tests {
         let mut cache = MintCache::new(storage);
 
         let err = cache
-            .get_mint_metadata(&mint)
+            .get_extension_flags(&mint)
             .await
             .expect_err("should error without RPC");
         assert!(
             matches!(err, crate::error::OperatorError::RpcError(_)),
             "expected RpcError, got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn get_ata_balance_errors_without_rpc() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::new(storage);
+
+        let err = cache
+            .get_ata_balance(&create_test_mint())
+            .await
+            .expect_err("get_ata_balance should require RPC");
+        assert!(
+            matches!(err, crate::error::OperatorError::RpcError(_)),
+            "expected RpcError, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn get_ata_balance_parses_amount_from_rpc() {
+        let ata = Pubkey::new_unique();
+        let balance_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "amount": "123456789",
+                "decimals": 6,
+                "uiAmount": 123.456789,
+                "uiAmountString": "123.456789"
+            }
+        });
+
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetTokenAccountBalance, balance_response);
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
+
+        let balance = cache.get_ata_balance(&ata).await.unwrap();
+        assert_eq!(balance, 123_456_789);
     }
 
     #[tokio::test]

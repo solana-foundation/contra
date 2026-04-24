@@ -3,15 +3,17 @@ use crate::error::{OperatorError, ProgramError};
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
 };
+use crate::operator::sender::TransactionStatusUpdate;
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
     find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
     tree_constants::MAX_TREE_LEAVES, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce,
     SignerUtil,
 };
-use crate::storage::common::models::DbTransaction;
+use crate::storage::common::models::{DbTransaction, TransactionStatus};
 use crate::storage::Storage;
 use crate::ProgramType;
+use chrono::Utc;
 use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -25,11 +27,10 @@ pub struct ProcessorState {
     pub admin_pubkey: Pubkey,
     pub release_funds_state: Option<ReleaseFundsState>,
     pub mint_cache: MintCache,
-    /// Direct handle on storage. The release-funds path needs to reset a
-    /// transaction back to `pending` when a pausable mint is currently
-    /// paused — MintCache's internal storage is for its own lookups and
-    /// shouldn't double as an escape hatch for transaction-state writes.
-    pub storage: Arc<Storage>,
+    /// Shared with the sender — pre-flight bails route through this channel
+    /// so the `DbTransactionWriter` performs the DB status update and fires
+    /// the webhook alert in one flow.
+    pub storage_tx: mpsc::Sender<TransactionStatusUpdate>,
 }
 
 pub struct ReleaseFundsState {
@@ -46,6 +47,7 @@ impl ProcessorState {
         instance_pda: Pubkey,
         storage: Arc<Storage>,
         rpc_client: Arc<crate::operator::RpcClientWithRetry>,
+        storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     ) -> Self {
         let operator_pubkey = SignerUtil::get_operator_pubkey();
         let operator_pda = find_operator_pda(&instance_pda, &operator_pubkey);
@@ -62,20 +64,21 @@ impl ProcessorState {
                 allowed_mints: HashMap::new(),
                 instance_atas: HashMap::new(),
             }),
-            mint_cache: MintCache::with_rpc(storage.clone(), rpc_client),
-            storage,
+            mint_cache: MintCache::with_rpc(storage, rpc_client),
+            storage_tx,
         }
     }
 
     pub fn new_with_storage(
         storage: Arc<Storage>,
         mint_rpc_client: Arc<crate::operator::RpcClientWithRetry>,
+        storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     ) -> Self {
         Self {
             admin_pubkey: SignerUtil::get_admin_pubkey(),
             release_funds_state: None,
-            mint_cache: MintCache::with_rpc(storage.clone(), mint_rpc_client),
-            storage,
+            mint_cache: MintCache::with_rpc(storage, mint_rpc_client),
+            storage_tx,
         }
     }
 }
@@ -105,6 +108,7 @@ impl ReleaseFundsState {
 /// Processes and validates transactions before sending to blockchain
 ///
 /// Receives transactions from fetcher, validates them, and forwards to sender
+#[allow(clippy::too_many_arguments)]
 pub async fn run_processor(
     fetcher_rx: mpsc::Receiver<DbTransaction>,
     sender_tx: mpsc::Sender<TransactionBuilder>,
@@ -113,6 +117,7 @@ pub async fn run_processor(
     storage: Arc<Storage>,
     rpc_client: Arc<crate::operator::RpcClientWithRetry>,
     source_rpc_client: Option<Arc<crate::operator::RpcClientWithRetry>>,
+    storage_tx: mpsc::Sender<TransactionStatusUpdate>,
 ) {
     info!("Starting processor");
 
@@ -122,6 +127,7 @@ pub async fn run_processor(
                 instance_pda.expect("Missing instance PDA"),
                 storage,
                 rpc_client,
+                storage_tx,
             );
 
             if let Err(e) = process_release_funds(&mut processor_state, fetcher_rx, sender_tx).await
@@ -132,7 +138,8 @@ pub async fn run_processor(
         ProgramType::Escrow => {
             // Use source_rpc_client for mint cache if available, otherwise fall back to rpc_client
             let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
-            let mut processor_state = ProcessorState::new_with_storage(storage, mint_rpc_client);
+            let mut processor_state =
+                ProcessorState::new_with_storage(storage, mint_rpc_client, storage_tx);
 
             if let Err(e) = process_deposit_funds(&mut processor_state, fetcher_rx, sender_tx).await
             {
@@ -140,6 +147,38 @@ pub async fn run_processor(
             }
         }
     }
+}
+
+/// Route a withdrawal to `ManualReview` via the shared status-update
+/// channel. Webhook alerting is driven by the status, so this is the single
+/// point that keeps the pre-flight bail sites from drifting (missing a
+/// field or using the wrong status silently skips the alert).
+async fn bail_to_manual_review(
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    transaction: &DbTransaction,
+    mint: &Pubkey,
+    context: &'static str,
+    error_message: String,
+) -> Result<(), OperatorError> {
+    warn!(
+        mint = %mint,
+        transaction_id = transaction.id,
+        "Routing withdrawal to ManualReview ({context}): {error_message}",
+    );
+    let update = TransactionStatusUpdate {
+        transaction_id: transaction.id,
+        trace_id: Some(transaction.trace_id.clone()),
+        status: TransactionStatus::ManualReview,
+        counterpart_signature: None,
+        processed_at: Some(Utc::now()),
+        error_message: Some(error_message),
+        remint_signature: None,
+        remint_attempted: false,
+    };
+    send_guaranteed(storage_tx, update, context)
+        .await
+        .map_err(OperatorError::ChannelSend)?;
+    Ok(())
 }
 
 pub async fn process_release_funds(
@@ -177,22 +216,123 @@ pub async fn process_release_funds(
             // Resolved *before* the tree-rotation check so the pause pre-flight
             // below can bail out without emitting a rotation for a withdrawal
             // we didn't actually execute.
-            let mint_metadata = processor_state.mint_cache.get_mint_metadata(&mint).await?;
+            //
+            // Pre-flight errors (RPC failure, malformed Token-2022 mint data,
+            // unresolved extension flags with no RPC configured) route to
+            // ManualReview rather than bail the processor loop — propagating
+            // an error here would kill the withdrawal pipeline and strand the
+            // row in `Processing` with no webhook alert.
+            let mint_metadata = match processor_state.mint_cache.get_mint_metadata(&mint).await {
+                Ok(m) => m,
+                Err(e) => {
+                    return bail_to_manual_review(
+                        &processor_state.storage_tx,
+                        &transaction,
+                        &mint,
+                        "get_mint_metadata preflight",
+                        format!("pre-flight get_mint_metadata failed: {e}"),
+                    )
+                    .await;
+                }
+            };
             let token_program = mint_metadata.token_program;
+
+            // Resolve the static Token-2022 extension flags (presence of
+            // PausableConfig / PermanentDelegate). Separate from the metadata
+            // call above because the deposit-side sender's MintCache is wired
+            // to the Contra RPC where the mint doesn't yet exist — forcing
+            // this resolution inside `get_mint_metadata` breaks JIT init.
+            let (is_pausable, has_permanent_delegate) =
+                match processor_state.mint_cache.get_extension_flags(&mint).await {
+                    Ok(flags) => flags,
+                    Err(e) => {
+                        return bail_to_manual_review(
+                            &processor_state.storage_tx,
+                            &transaction,
+                            &mint,
+                            "get_extension_flags preflight",
+                            format!("pre-flight get_extension_flags failed: {e}"),
+                        )
+                        .await;
+                    }
+                };
 
             // Pause pre-flight for mints carrying the Token-2022 PausableConfig
             // extension. If currently paused, release-funds would fail on-chain
-            // and burn fees — revert the row to `pending` so the fetcher
-            // re-picks it on the next poll, and check again then.
-            if mint_metadata.is_pausable {
-                let paused = processor_state.mint_cache.check_paused(&mint).await?;
+            // and burn fees — route the transaction to ManualReview via the
+            // status-update channel so the DbTransactionWriter persists the
+            // status and fires the webhook alert in one flow.
+            if is_pausable {
+                let paused = match processor_state.mint_cache.check_paused(&mint).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return bail_to_manual_review(
+                            &processor_state.storage_tx,
+                            &transaction,
+                            &mint,
+                            "check_paused preflight",
+                            format!("pre-flight check_paused failed: {e}"),
+                        )
+                        .await;
+                    }
+                };
                 if paused {
-                    warn!(mint = %mint, "Mint is paused; deferring withdrawal to next poll");
-                    processor_state
-                        .storage
-                        .reset_transaction_to_pending(transaction.id)
-                        .await?;
-                    return Ok(());
+                    return bail_to_manual_review(
+                        &processor_state.storage_tx,
+                        &transaction,
+                        &mint,
+                        "pausable preflight",
+                        format!("mint paused: {mint}"),
+                    )
+                    .await;
+                }
+            }
+
+            let amount = u64::try_from(transaction.amount).map_err(|_| {
+                OperatorError::Program(ProgramError::InvalidBuilder {
+                    reason: format!(
+                        "negative withdrawal amount {} for transaction {}",
+                        transaction.amount, transaction.id
+                    ),
+                })
+            })?;
+
+            let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
+
+            // Permanent-delegate pre-flight for mints carrying the Token-2022
+            // PermanentDelegate extension. The delegate can move tokens out of
+            // the escrow ATA without emitting a Contra event, so our indexed
+            // balance can silently diverge from on-chain. If on-chain is short,
+            // release-funds would fail and burn fees — route to ManualReview.
+            if has_permanent_delegate {
+                let on_chain = match processor_state
+                    .mint_cache
+                    .get_ata_balance(&instance_ata)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return bail_to_manual_review(
+                            &processor_state.storage_tx,
+                            &transaction,
+                            &mint,
+                            "get_ata_balance preflight",
+                            format!("pre-flight get_ata_balance failed: {e}"),
+                        )
+                        .await;
+                    }
+                };
+                if on_chain < amount {
+                    return bail_to_manual_review(
+                        &processor_state.storage_tx,
+                        &transaction,
+                        &mint,
+                        "permanent-delegate preflight",
+                        format!(
+                            "insufficient escrow balance: on_chain={on_chain}, needed={amount}"
+                        ),
+                    )
+                    .await;
                 }
             }
 
@@ -221,7 +361,6 @@ pub async fn process_release_funds(
             let mut builder = ReleaseFundsBuilder::new();
 
             let allowed_mint_pda = release_funds_state.get_allowed_mint_pda(&mint);
-            let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
 
             let recipient_ata =
                 get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
@@ -238,17 +377,8 @@ pub async fn process_release_funds(
                 .instance_ata(instance_ata)
                 .token_program(token_program)
                 .user(recipient)
-                .transaction_nonce(nonce);
-
-            let amount = u64::try_from(transaction.amount).map_err(|_| {
-                OperatorError::Program(ProgramError::InvalidBuilder {
-                    reason: format!(
-                        "negative withdrawal amount {} for transaction {}",
-                        transaction.amount, transaction.id
-                    ),
-                })
-            })?;
-            builder.amount(amount);
+                .transaction_nonce(nonce)
+                .amount(amount);
 
             // Build remint info for token recovery on permanent failure.
             // Uses Contra token program (not mainnet) since remint happens on Contra.
@@ -443,7 +573,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage,
+            storage_tx: mpsc::channel(1).0,
         };
         // Keep tx alive so channel isn't closed — error must come from missing state
         let (_tx, rx) = mpsc::channel::<DbTransaction>(1);
@@ -467,7 +597,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage: storage.clone(),
+            storage_tx: mpsc::channel(1).0,
         };
 
         // Add a mint to the mock storage so mint_cache can find it
@@ -486,6 +616,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     is_pausable: Some(false),
+                    has_permanent_delegate: Some(false),
                 },
             );
         }
@@ -539,7 +670,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage: storage.clone(),
+            storage_tx: mpsc::channel(1).0,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -557,6 +688,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     is_pausable: Some(false),
+                    has_permanent_delegate: Some(false),
                 },
             );
         }
@@ -622,7 +754,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage,
+            storage_tx: mpsc::channel(1).0,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -672,7 +804,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage,
+            storage_tx: mpsc::channel(1).0,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -726,7 +858,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage,
+            storage_tx: mpsc::channel(1).0,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -776,7 +908,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage,
+            storage_tx: mpsc::channel(1).0,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -805,7 +937,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage,
+            storage_tx: mpsc::channel(1).0,
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
@@ -855,7 +987,7 @@ mod tests {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
-            storage: storage.clone(),
+            storage_tx: mpsc::channel(1).0,
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -872,6 +1004,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     is_pausable: Some(false),
+                    has_permanent_delegate: Some(false),
                 },
             );
         }
@@ -910,6 +1043,192 @@ mod tests {
             matches!(err, OperatorError::InvalidPubkey { ref pubkey, .. } if pubkey == "not_a_valid_pubkey"),
             "expected InvalidPubkey for bad recipient, got: {:?}",
             err
+        );
+    }
+
+    /// When a mint carries the PermanentDelegate extension and the escrow ATA
+    /// balance is below the withdrawal amount, the withdrawal must be routed to
+    /// ManualReview via `storage_tx` (no TransactionBuilder emitted).
+    #[tokio::test]
+    async fn process_release_funds_permanent_delegate_insufficient_balance_routes_to_manual_review()
+    {
+        use crate::operator::rpc_util::RpcClientWithRetry;
+        use solana_client::rpc_request::RpcRequest;
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        mock.mints.lock().unwrap().insert(
+            mint_pubkey.to_string(),
+            crate::storage::common::models::DbMint {
+                mint_address: mint_pubkey.to_string(),
+                decimals: 6,
+                token_program: spl_token_2022::id().to_string(),
+                created_at: chrono::Utc::now(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(true),
+            },
+        );
+        let storage = Arc::new(Storage::Mock(mock));
+
+        // On-chain balance < amount → should bail to ManualReview.
+        let balance_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "amount": "500",
+                "decimals": 6,
+                "uiAmount": 0.0005,
+                "uiAmountString": "0.0005"
+            }
+        });
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetTokenAccountBalance, balance_response);
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage, Arc::new(rpc_client)),
+            storage_tx,
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 42,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-42".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: recipient.to_string(),
+            mint: mint_pubkey.to_string(),
+            amount: 1000, // > on-chain balance of 500
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
+            withdrawal_nonce: Some(5),
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_release_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap();
+
+        let update = storage_rx
+            .try_recv()
+            .expect("ManualReview status update should have been sent");
+        assert_eq!(update.transaction_id, 42);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err_msg = update.error_message.expect("error_message must be set");
+        assert!(
+            err_msg.contains("insufficient escrow balance")
+                && err_msg.contains("on_chain=500")
+                && err_msg.contains("needed=1000"),
+            "unexpected error_message: {err_msg}",
+        );
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "no TransactionBuilder should have been emitted",
+        );
+    }
+
+    /// When the escrow ATA balance is sufficient, the permanent-delegate
+    /// pre-flight is a no-op and the withdrawal proceeds to the sender.
+    #[tokio::test]
+    async fn process_release_funds_permanent_delegate_sufficient_balance_proceeds() {
+        use crate::operator::rpc_util::RpcClientWithRetry;
+        use solana_client::rpc_request::RpcRequest;
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        mock.mints.lock().unwrap().insert(
+            mint_pubkey.to_string(),
+            crate::storage::common::models::DbMint {
+                mint_address: mint_pubkey.to_string(),
+                decimals: 6,
+                token_program: spl_token_2022::id().to_string(),
+                created_at: chrono::Utc::now(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(true),
+            },
+        );
+        let storage = Arc::new(Storage::Mock(mock));
+
+        let balance_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "amount": "5000",
+                "decimals": 6,
+                "uiAmount": 0.005,
+                "uiAmountString": "0.005"
+            }
+        });
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetTokenAccountBalance, balance_response);
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage, Arc::new(rpc_client)),
+            storage_tx,
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+
+        let txn = DbTransaction {
+            id: 7,
+            signature: "test_sig".to_string(),
+            trace_id: "trace-7".to_string(),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: recipient.to_string(),
+            mint: mint_pubkey.to_string(),
+            amount: 1000, // < on-chain balance of 5000
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
+            withdrawal_nonce: Some(5),
+            status: crate::storage::common::models::TransactionStatus::Processing,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        };
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_release_funds(&mut ps, fetcher_rx, sender_tx)
+            .await
+            .unwrap();
+
+        let msg = sender_rx.recv().await.expect("ReleaseFunds should be sent");
+        let TransactionBuilder::ReleaseFunds(b) = msg else {
+            panic!("expected ReleaseFunds, got a different variant");
+        };
+        assert_eq!(b.transaction_id, 7);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no ManualReview update should have been sent",
         );
     }
 }

@@ -8,9 +8,8 @@ use pinocchio_token_2022::{
     state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
     ID as TOKEN_2022_PROGRAM_ID,
 };
-use spl_token_2022::extension::StateWithExtensions;
 use spl_token_2022::extension::{
-    permanent_delegate::PermanentDelegate, BaseStateWithExtensions,
+    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::Mint as Token2022MintState;
 
@@ -111,8 +110,18 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(ContraEscrowProgramError::InvalidMint.into())
 }
 
-/// Blocks mints with the PermanentDelegate extension. Pausable mints are
-/// accepted — the operator checks the live pause state before withdrawal.
+/// Validates the mint's data parses as a Token-2022 mint and rejects
+/// mints carrying the `TransferHook` extension.
+///
+/// Pausable and permanent-delegate mints are accepted — the operator
+/// enforces pause and drain states off-chain via a withdrawal pre-flight.
+/// `TransferHook` is a different class of problem: honoring the hook would
+/// require the program to resolve `ExtraAccountMetaList` PDAs and forward
+/// them through the `TransferChecked` CPI, which the current pinocchio
+/// builder does not do. Accepting such a mint would cause every deposit /
+/// release to fail on-chain (Token-2022 invokes the hook program without
+/// the required extra accounts), so we reject it at the validation seam
+/// rather than let downstream transfers burn fees.
 #[inline(always)]
 pub fn validate_token2022_extensions(mint_info: &AccountView) -> ProgramResult {
     let data = mint_info.try_borrow()?;
@@ -120,8 +129,8 @@ pub fn validate_token2022_extensions(mint_info: &AccountView) -> ProgramResult {
     let mint = StateWithExtensions::<Token2022MintState>::unpack(&data)
         .map_err(|_| ContraEscrowProgramError::InvalidMint)?;
 
-    if mint.get_extension::<PermanentDelegate>().is_ok() {
-        return Err(ContraEscrowProgramError::PermanentDelegateNotAllowed.into());
+    if mint.get_extension::<TransferHook>().is_ok() {
+        return Err(ContraEscrowProgramError::TransferHookNotAllowed.into());
     }
 
     Ok(())

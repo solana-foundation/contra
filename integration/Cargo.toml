@@ -43,6 +43,10 @@ path = "tests/indexer/reconciliation_e2e.rs"
 name = "pausable_mint_integration"
 path = "tests/indexer/pausable_mint.rs"
 
+[[test]]
+name = "permanent_delegate_mint_integration"
+path = "tests/indexer/permanent_delegate_mint.rs"
+
 [features]
 test-tree = ["contra-indexer/test-tree"]
 

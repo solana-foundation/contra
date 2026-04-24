@@ -98,6 +98,9 @@ pub struct DbMint {
     /// `None` = the on-chain PausableConfig extension state is unknown to us yet.
     /// Resolved lazily by the operator's MintCache on first RPC fetch.
     pub is_pausable: Option<bool>,
+    /// `None` = the on-chain PermanentDelegate extension state is unknown to us yet.
+    /// Resolved lazily alongside `is_pausable` in a single RPC fetch.
+    pub has_permanent_delegate: Option<bool>,
 }
 
 impl DbMint {
@@ -108,6 +111,7 @@ impl DbMint {
             token_program,
             created_at: Utc::now(),
             is_pausable: None,
+            has_permanent_delegate: None,
         }
     }
 }

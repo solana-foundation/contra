@@ -289,14 +289,13 @@ The program defines the following custom errors:
 | 3 | `InvalidInstanceId` | Instance ID invalid or does not respect rules |
 | 4 | `InvalidInstance` | Invalid instance provided |
 | 5 | `InvalidAdmin` | Invalid admin provided |
-| 6 | `PermanentDelegateNotAllowed` | Permanent delegate extension not allowed |
-| 7 | `PausableMintNotAllowed` | Pausable mint extension not allowed |
-| 8 | `InvalidOperatorPda` | Invalid operator PDA provided |
-| 9 | `InvalidTokenAccount` | Invalid token account provided |
-| 10 | `InvalidEscrowBalance` | Invalid escrow balance |
-| 11 | `InvalidAllowedMint` | Invalid allowed mint |
-| 12 | `InvalidSmtProof` | Invalid SMT proof provided |
-| 13 | `InvalidTransactionNonceForCurrentTreeIndex` | Invalid transaction nonce for current tree index |
+| 6 | `TransferHookNotAllowed` | Transfer hook extension not allowed |
+| 7 | `InvalidOperatorPda` | Invalid operator PDA provided |
+| 8 | `InvalidTokenAccount` | Invalid token account provided |
+| 9 | `InvalidEscrowBalance` | Invalid escrow balance |
+| 10 | `InvalidAllowedMint` | Invalid allowed mint |
+| 11 | `InvalidSmtProof` | Invalid SMT proof provided |
+| 12 | `InvalidTransactionNonceForCurrentTreeIndex` | Invalid transaction nonce for current tree index |
 
 ## Other Constants
 

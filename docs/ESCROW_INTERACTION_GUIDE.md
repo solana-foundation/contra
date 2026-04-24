@@ -102,7 +102,8 @@ const allowMintIx = await getAllowMintInstructionAsync({
 
 **Security Notes:**
 - Supports Token Program and Token-2022
-- Token-2022 mints with permanent delegate or pausable extensions are rejected
+- Token-2022 mints with the `TransferHook` extension are rejected (the program's `TransferChecked` CPI does not resolve extra-account metas, so every deposit/release would fail on-chain)
+- Token-2022 mints with `PermanentDelegate` or `PausableConfig` extensions are accepted; the operator enforces drain detection and pause state off-chain via a withdrawal pre-flight
 - Only the instance admin can allow mints
 - **Token-2022 usage**: The `tokenProgram` parameter defaults to the legacy Token Program. For Token-2022 mints, you must explicitly pass the Token-2022 program ID (e.g., `tokenProgram: TOKEN_2022_PROGRAM_ADDRESS`). This also applies to the `Deposit` instruction.
 

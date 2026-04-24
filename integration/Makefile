@@ -24,6 +24,10 @@ integration-test:
 	@cargo test --test gap_detection_integration -- --nocapture
 	@echo "Running truncate integration tests..."
 	@cargo test --test truncate_integration -- --nocapture
+	@echo "Running pausable mint integration tests..."
+	@cargo test --test pausable_mint_integration -- --nocapture
+	@echo "Running permanent delegate mint integration tests..."
+	@cargo test --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Running operator lifecycle integration tests (requires test-tree build)..."
 	@cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@echo "Running resync integration tests..."
@@ -62,6 +66,10 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
 	@echo "Running truncate integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test truncate_integration -- --nocapture
+	@echo "Running pausable mint integration tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test pausable_mint_integration -- --nocapture
+	@echo "Running permanent delegate mint integration tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Running operator lifecycle integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@echo "Running resync integration tests with coverage instrumentation..."

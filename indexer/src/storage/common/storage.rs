@@ -15,8 +15,7 @@ pub mod get_pending_remint_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
-pub mod reset_transaction_to_pending;
-pub mod set_mint_pausable;
+pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
@@ -141,14 +140,22 @@ impl Storage {
         get_mint::get_mint(self, mint_address).await
     }
 
-    /// Write-back the on-chain PausableConfig extension presence for a mint,
-    /// called by the operator's MintCache after an RPC resolution.
-    pub async fn set_mint_pausable(
+    /// Write-back the on-chain extension presence (PausableConfig,
+    /// PermanentDelegate) for a mint. Called by the operator's MintCache
+    /// after a single RPC fetch that resolves both flags together.
+    pub async fn set_mint_extension_flags(
         &self,
         mint_address: &str,
         is_pausable: bool,
+        has_permanent_delegate: bool,
     ) -> Result<(), StorageError> {
-        set_mint_pausable::set_mint_pausable(self, mint_address, is_pausable).await
+        set_mint_extension_flags::set_mint_extension_flags(
+            self,
+            mint_address,
+            is_pausable,
+            has_permanent_delegate,
+        )
+        .await
     }
 
     /// Return per-mint aggregate balances (completed deposits minus withdrawals) for startup reconciliation.
@@ -186,17 +193,6 @@ impl Storage {
     ) -> Result<Vec<u64>, StorageError> {
         get_completed_withdrawal_nonces::get_completed_withdrawal_nonces(self, min_nonce, max_nonce)
             .await
-    }
-
-    /// Reverts a transaction from `Processing` back to `Pending` so the
-    /// fetcher will re-pick it on the next poll. Used by the operator
-    /// pre-flight to defer a withdrawal without consuming it (e.g. the
-    /// mint is currently paused).
-    pub async fn reset_transaction_to_pending(
-        &self,
-        transaction_id: i64,
-    ) -> Result<(), StorageError> {
-        reset_transaction_to_pending::reset_transaction_to_pending(self, transaction_id).await
     }
 
     /// Transitions a withdrawal to PendingRemint, storing withdrawal

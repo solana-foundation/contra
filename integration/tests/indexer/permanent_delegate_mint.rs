@@ -1,21 +1,25 @@
-//! Integration test for the Token-2022 PausableConfig pre-flight on the
+//! Integration test for the Token-2022 PermanentDelegate pre-flight on the
 //! withdrawal operator.
 //!
-//! Scenario:
-//! 1. Create a Token-2022 mint with the PausableConfig extension initialized
-//!    (unpaused at creation), AllowMint it on the escrow instance, and fund
-//!    the escrow ATA so a withdrawal has tokens to release.
-//! 2. Pause the mint on-chain.
-//! 3. Seed a `DbMint` row with `is_pausable = None` (the state the indexer
-//!    leaves behind at AllowMint time) and a pending `DbTransaction`
-//!    withdrawal at nonce 0.
-//! 4. Start the Contra→Solana withdrawal operator.
-//! 5. Assert the operator routes the withdrawal to `manual_review`: the row
-//!    status flips from `pending` to `manual_review`, and `mints.is_pausable`
-//!    flips from `None` to `Some(true)` (lazy RPC resolution + write-back).
-//!    No tokens are released to the recipient. The webhook alert payload is
-//!    covered by unit tests in `db_transaction_writer`; here we just assert
-//!    the terminal DB state the operator bailed into.
+//! Scenario — the attack the pre-flight exists to block:
+//! 1. Create a Token-2022 mint with the PermanentDelegate extension; the
+//!    delegate is a keypair we control. AllowMint it on the escrow instance.
+//! 2. Fund the escrow ATA with 2x the withdrawal amount via `mint_to`. This
+//!    is the only way the escrow balance gets bumped in this test — sidesteps
+//!    the deposit path so the operator has no Contra-side event for the
+//!    drain that follows.
+//! 3. Use the permanent delegate to drain the escrow ATA below the withdrawal
+//!    amount. The escrow program is never invoked, so the indexer sees
+//!    nothing and the DB's implied balance (still 2x) diverges from on-chain.
+//! 4. Seed the DB: `mints` row with `has_permanent_delegate = None` (what the
+//!    indexer writes at AllowMint time) and a pending withdrawal for the full
+//!    amount at nonce 0.
+//! 5. Start the Contra→Solana withdrawal operator.
+//! 6. Assert the operator routes the withdrawal to `manual_review`: the row
+//!    status flips from `pending` to `manual_review`, `has_permanent_delegate`
+//!    flips from `None` to `Some(true)` (lazy RPC resolution + write-back),
+//!    and no tokens reach the recipient. Webhook firing is covered by the
+//!    db_transaction_writer unit tests.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -43,7 +47,7 @@ use spl_associated_token_account::{
     get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
-use spl_token_2022::extension::{pausable, ExtensionType};
+use spl_token_2022::extension::ExtensionType;
 use spl_token_2022::state::Mint as Token2022Mint;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::time::Duration;
@@ -53,20 +57,25 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
+const MINT_DECIMALS: u8 = 6;
+
 // ---------------------------------------------------------------------------
-// Local helpers — Token-2022 mint with PausableConfig
+// Local helpers — Token-2022 mint with PermanentDelegate + delegate-driven drain
 // ---------------------------------------------------------------------------
 
-/// Create a Token-2022 mint on-chain with the PausableConfig extension.
-/// `authority` is the mint authority AND the pause authority.
-async fn generate_pausable_mint_2022(
+/// Create a Token-2022 mint on-chain with the PermanentDelegate extension.
+/// The returned mint has `delegate` as its permanent delegate; the delegate
+/// can transfer out of any ATA for this mint without the owner's consent.
+async fn generate_permanent_delegate_mint_2022(
     client: &RpcClient,
     payer: &Keypair,
     authority: &Keypair,
+    delegate: &Pubkey,
     mint: &Keypair,
 ) -> Result<Pubkey, Box<dyn std::error::Error>> {
-    let space =
-        ExtensionType::try_calculate_account_len::<Token2022Mint>(&[ExtensionType::Pausable])?;
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+        ExtensionType::PermanentDelegate,
+    ])?;
     let rent = client.get_minimum_balance_for_rent_exemption(space).await?;
 
     // Three-instruction sequence: allocate, init extension, init mint.
@@ -79,17 +88,17 @@ async fn generate_pausable_mint_2022(
             space as u64,
             &TOKEN_2022_PROGRAM_ID,
         ),
-        pausable::instruction::initialize(
+        spl_token_2022::instruction::initialize_permanent_delegate(
             &TOKEN_2022_PROGRAM_ID,
             &mint.pubkey(),
-            &authority.pubkey(),
+            delegate,
         )?,
         spl_token_2022::instruction::initialize_mint2(
             &TOKEN_2022_PROGRAM_ID,
             &mint.pubkey(),
             &authority.pubkey(),
             Some(&authority.pubkey()),
-            6,
+            MINT_DECIMALS,
         )?,
     ];
 
@@ -145,33 +154,55 @@ async fn mint_2022_to_owner(
     Ok(ata)
 }
 
-async fn set_mint_paused(
+/// Use the permanent delegate to move tokens out of `source_ata` into a
+/// fresh ATA owned by `drain_owner`. Simulates the attack the pre-flight
+/// is designed to catch: the escrow program is never invoked, so no
+/// Contra-side event ever reaches the indexer.
+async fn drain_via_permanent_delegate(
     client: &RpcClient,
     payer: &Keypair,
-    authority: &Keypair,
-    mint: &Pubkey,
-    paused: bool,
+    mint: Pubkey,
+    source_ata: Pubkey,
+    delegate: &Keypair,
+    drain_owner: Pubkey,
+    amount: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ix = if paused {
-        pausable::instruction::pause(&TOKEN_2022_PROGRAM_ID, mint, &authority.pubkey(), &[])?
-    } else {
-        pausable::instruction::resume(&TOKEN_2022_PROGRAM_ID, mint, &authority.pubkey(), &[])?
-    };
+    let drain_ata =
+        get_associated_token_address_with_program_id(&drain_owner, &mint, &TOKEN_2022_PROGRAM_ID);
+
+    let ixs = vec![
+        create_associated_token_account_idempotent(
+            &payer.pubkey(),
+            &drain_owner,
+            &mint,
+            &TOKEN_2022_PROGRAM_ID,
+        ),
+        spl_token_2022::instruction::transfer_checked(
+            &TOKEN_2022_PROGRAM_ID,
+            &source_ata,
+            &mint,
+            &drain_ata,
+            &delegate.pubkey(),
+            &[],
+            amount,
+            MINT_DECIMALS,
+        )?,
+    ];
 
     let recent_blockhash = client.get_latest_blockhash().await?;
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &ixs,
         Some(&payer.pubkey()),
-        &[payer, authority],
+        &[payer, delegate],
         recent_blockhash,
     );
     client.send_and_confirm_transaction(&tx).await?;
     Ok(())
 }
 
-/// Allow a mint on the escrow instance, binding it to `token_program`. Unlike
-/// the shared `TestEnvironment::setup` which hardcodes SPL Token, this one
-/// accepts any token program — needed for Token-2022.
+/// Allow a mint on the escrow instance, binding it to `token_program`. The
+/// shared `TestEnvironment::setup` hardcodes SPL Token, so we replicate the
+/// AllowMint call here against Token-2022.
 async fn allow_mint_for_program(
     client: &RpcClient,
     admin: &Keypair,
@@ -258,9 +289,9 @@ async fn get_token_2022_balance(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
+async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained_escrow(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Pausable Mint: Withdrawal → ManualReview While Paused ===");
+    println!("=== Permanent Delegate: Withdrawal → ManualReview When Escrow Drained ===");
 
     set_operator_env_vars();
 
@@ -269,7 +300,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
 
     let pg_container = Postgres::default()
-        .with_db_name("pausable_mint")
+        .with_db_name("permanent_delegate_mint")
         .with_user("postgres")
         .with_password("password")
         .start()
@@ -277,7 +308,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     let pg_host = pg_container.get_host().await?;
     let pg_port = pg_container.get_host_port_ipv4(5432).await?;
     let db_url = format!(
-        "postgres://postgres:password@{}:{}/pausable_mint",
+        "postgres://postgres:password@{}:{}/permanent_delegate_mint",
         pg_host, pg_port
     );
 
@@ -294,16 +325,41 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     // Instance + operator (reuses shared setup — pure escrow state, no mint).
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let recipient = Keypair::new();
+    let delegate = Keypair::new();
+    let drainer = Keypair::new();
 
     let (_, instance_pda) = TestEnvironment::setup_instance(&client, &faucet_keypair, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, instance_pda).await?;
 
-    // Pausable Token-2022 mint. Admin is both mint and pause authority.
-    let mint_keypair = Keypair::new();
-    let mint_pubkey = generate_pausable_mint_2022(&client, &admin, &admin, &mint_keypair).await?;
-    println!("Created pausable Token-2022 mint {}", mint_pubkey);
+    // Fund the delegate so it can pay tx fees when draining.
+    let fund_delegate_ix = solana_system_interface::instruction::transfer(
+        &faucet_keypair.pubkey(),
+        &delegate.pubkey(),
+        1_000_000_000,
+    );
+    let bh = client.get_latest_blockhash().await?;
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[fund_delegate_ix],
+        Some(&faucet_keypair.pubkey()),
+        &[&faucet_keypair],
+        bh,
+    );
+    client.send_and_confirm_transaction(&fund_tx).await?;
 
-    // AllowMint on the escrow — this would fail before our program-side change.
+    // Token-2022 mint with PermanentDelegate. Admin is mint authority; a
+    // separate keypair holds the permanent-delegate authority.
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = generate_permanent_delegate_mint_2022(
+        &client,
+        &admin,
+        &admin,
+        &delegate.pubkey(),
+        &mint_keypair,
+    )
+    .await?;
+    println!("Created permanent-delegate Token-2022 mint {}", mint_pubkey);
+
+    // AllowMint on the escrow instance — accepted post-change.
     allow_mint_for_program(
         &client,
         &admin,
@@ -312,12 +368,12 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
         TOKEN_2022_PROGRAM_ID,
     )
     .await?;
-    println!("AllowMint succeeded for pausable mint");
+    println!("AllowMint succeeded for permanent-delegate mint");
 
-    // Fund the escrow ATA directly. Sidesteps the deposit path — only the
-    // escrow ATA balance matters for release_funds.
+    // Fund the escrow ATA with 2x the withdrawal amount. Sidesteps the
+    // deposit path so no Contra-side deposit event is ever produced.
     let withdraw_amount: u64 = 50_000;
-    mint_2022_to_owner(
+    let escrow_ata = mint_2022_to_owner(
         &client,
         &admin,
         mint_pubkey,
@@ -329,29 +385,43 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
 
     // release_funds requires the recipient ATA to already exist — the escrow
     // program's `validate_ata` rejects empty-data ATAs. Pre-create it here
-    // by minting zero tokens (ATA idempotent creation + mint_to amount=0).
+    // by minting zero tokens to it.
     mint_2022_to_owner(&client, &admin, mint_pubkey, recipient.pubkey(), &admin, 0).await?;
 
-    // Pause the mint BEFORE the operator sees the withdrawal.
-    set_mint_paused(&client, &admin, &admin, &mint_pubkey, true).await?;
-    println!("Mint paused on-chain");
+    // Drain the escrow ATA below the withdrawal amount using the permanent
+    // delegate. The escrow program is never invoked; the indexer sees
+    // nothing; the DB's derived balance remains at 2x the amount.
+    let drain_amount = withdraw_amount * 2 - (withdraw_amount / 2); // leave 25k, need 50k
+    drain_via_permanent_delegate(
+        &client,
+        &admin,
+        mint_pubkey,
+        escrow_ata,
+        &delegate,
+        drainer.pubkey(),
+        drain_amount,
+    )
+    .await?;
+    println!(
+        "Permanent delegate drained {} tokens from the escrow ATA",
+        drain_amount
+    );
 
-    // Seed DB: mints row with is_pausable=None (what the indexer would write
-    // at AllowMint time), and a pending withdrawal at nonce 0.
+    // Seed DB: mints row with has_permanent_delegate=None (what the indexer
+    // writes at AllowMint time), and a pending withdrawal at nonce 0.
     let mint_meta = DbMint::new(
         mint_pubkey.to_string(),
-        6,
+        MINT_DECIMALS as i16,
         TOKEN_2022_PROGRAM_ID.to_string(),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    let pre = storage
+        .get_mint(&mint_pubkey.to_string())
+        .await?
+        .expect("mints row");
     assert!(
-        storage
-            .get_mint(&mint_pubkey.to_string())
-            .await?
-            .expect("mints row")
-            .is_pausable
-            .is_none(),
-        "pre-condition: DB mints row should have is_pausable = None",
+        pre.has_permanent_delegate.is_none(),
+        "pre-condition: DB mints row should have has_permanent_delegate = None",
     );
 
     let withdrawal_sig = Signature::new_unique().to_string();
@@ -373,8 +443,8 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     )
     .await?;
 
-    // Mint is paused → pre-flight must route the withdrawal to manual_review
-    // (terminal status; no self-recovery on unpause).
+    // On-chain balance < withdrawal amount → pre-flight must route to
+    // manual_review (terminal; no self-recovery).
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(tx) = db::get_transaction(&pool, &withdrawal_sig).await? {
@@ -397,7 +467,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
         .expect("withdrawal row should still exist");
     assert_eq!(
         row.status, "manual_review",
-        "paused mint should route the withdrawal to manual_review",
+        "drained escrow should route the withdrawal to manual_review",
     );
 
     let stored_mint = storage
@@ -405,9 +475,9 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
         .await?
         .expect("mints row");
     assert_eq!(
-        stored_mint.is_pausable,
+        stored_mint.has_permanent_delegate,
         Some(true),
-        "operator should have resolved is_pausable via RPC and written it back",
+        "operator should have resolved has_permanent_delegate via RPC and written it back",
     );
 
     let recipient_balance =

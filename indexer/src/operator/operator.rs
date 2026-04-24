@@ -79,6 +79,7 @@ pub async fn run(
     let processor_storage = storage.clone();
     let processor_rpc = rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
+    let processor_storage_tx = storage_tx.clone();
     let processor_handle = tokio::spawn(async move {
         processor::run_processor(
             processor_rx,
@@ -88,6 +89,7 @@ pub async fn run(
             processor_storage,
             processor_rpc,
             processor_source_rpc,
+            processor_storage_tx,
         )
         .await;
     });

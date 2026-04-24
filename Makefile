@@ -74,6 +74,10 @@ integration-test:
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
 	@echo "Running truncate integration tests..."
 	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@echo "Running pausable mint integration tests..."
+	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
+	@echo "Running permanent delegate mint integration tests..."
+	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
 	@$(MAKE) -C contra-escrow-program build-test
 	@echo "Running indexer integration test (with test-tree build)..."

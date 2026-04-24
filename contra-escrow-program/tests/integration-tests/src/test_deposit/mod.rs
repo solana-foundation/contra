@@ -4,12 +4,11 @@ use crate::{
     utils::{
         assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account, get_or_create_associated_token_account_2022,
-        get_token_balance, set_mint, set_mint_2022_basic, set_mint_2022_with_permanent_delegate,
+        get_token_balance, set_mint, set_mint_2022_basic, set_mint_2022_with_transfer_hook,
         set_token_balance, setup_test_balances, TestContext, ATA_PROGRAM_ID,
         CONTRA_ESCROW_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
-        INVALID_INSTRUCTION_DATA_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
-        PERMANENT_DELEGATE_NOT_ALLOWED_ERROR, TOKEN_2022_PROGRAM_ID,
-        TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        INVALID_INSTRUCTION_DATA_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR, TOKEN_2022_PROGRAM_ID,
+        TOKEN_INSUFFICIENT_FUNDS_ERROR, TRANSFER_HOOK_NOT_ALLOWED_ERROR,
     },
 };
 
@@ -454,8 +453,17 @@ fn test_deposit_token_2022_transfer_fee_success() {
     );
 }
 
+// `validate_token2022_extensions` runs on the deposit path as well as AllowMint
+// (deposit.rs:100, allow_mint.rs:70). Without a deposit-side test, a future
+// refactor that moves the check out of `validate_token2022_extensions` for
+// just one path would pass CI. Test strategy mirrors the old
+// `test_deposit_token_2022_permanent_delegate_rejected`: stand up a clean
+// Token-2022 mint, AllowMint it (check passes), prime the user's balance,
+// then swap the mint account data for a TransferHook mint via the litesvm
+// cheat code. The deposit must then fail with TransferHookNotAllowed — proving
+// the check is live on the deposit path, independent of AllowMint.
 #[test]
-fn test_deposit_token_2022_permanent_delegate_rejected() {
+fn test_deposit_token_2022_transfer_hook_rejected() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let user = Keypair::new();
@@ -464,10 +472,9 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
 
     let instance_seed = Keypair::new();
 
-    // Step 1: Create a normal Token2022 mint without permanent delegate
+    // 1. Clean Token-2022 mint (no extensions) — passes AllowMint.
     set_mint_2022_basic(&mut context, &good_mint.pubkey());
 
-    // Step 2: Create instance and allow the good mint
     let (instance_pda, _) =
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
             .expect("CreateInstance should succeed");
@@ -482,7 +489,6 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
     )
     .expect("AllowMint should succeed for normal mint");
 
-    // Step 3: Set up deposit test with good mint
     setup_test_balances(
         &mut context,
         &user,
@@ -493,22 +499,23 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
         0,
     );
 
-    // Step 4: Create a bad mint with permanent delegate extension (we only need its account data)
-    set_mint_2022_with_permanent_delegate(&mut context, &bad_mint.pubkey());
+    // 2. Build a separate mint account with the TransferHook extension
+    //    initialized — we only need its account data.
+    let hook_program_id = Keypair::new().pubkey();
+    set_mint_2022_with_transfer_hook(&mut context, &bad_mint.pubkey(), &hook_program_id);
 
-    // Step 5: Use LiteSVM cheat code to replace the good mint's account data with bad mint data
-    // This simulates a scenario where a legitimate mint gets compromised with permanent delegate
+    // 3. litesvm cheat: overwrite the good mint's account with the bad mint's
+    //    data. AllowMint has already landed, but the deposit handler re-runs
+    //    `validate_token2022_extensions` against the live mint account.
     let bad_mint_account = context
         .get_account(&bad_mint.pubkey())
         .expect("Bad mint account should exist");
-
-    // Replace the good mint account with bad mint account data (which has permanent delegate)
     context
         .svm
         .set_account(good_mint.pubkey(), bad_mint_account)
-        .expect("Failed to set good mint account with bad mint data");
+        .expect("Failed to overwrite good mint with TransferHook mint data");
 
-    // Step 6: Try to deposit - should fail because good_mint now has permanent delegate data
+    // 4. Attempt to deposit — the deposit-side validation must reject.
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
@@ -516,12 +523,12 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
 
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
-        &good_mint.pubkey(), // Use good mint (the one we originally set up)
+        &good_mint.pubkey(),
         &TOKEN_2022_PROGRAM_ID,
     );
     let instance_ata = get_associated_token_address_with_program_id(
         &instance_pda,
-        &good_mint.pubkey(), // Use good mint (the one we originally set up)
+        &good_mint.pubkey(),
         &TOKEN_2022_PROGRAM_ID,
     );
 
@@ -529,8 +536,8 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
         .payer(context.payer.pubkey())
         .user(user.pubkey())
         .instance(instance_pda)
-        .mint(good_mint.pubkey()) // Use good mint (but it now has bad mint data)
-        .allowed_mint(allowed_mint_pda) // AllowedMint for good mint
+        .mint(good_mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
         .user_ata(user_ata)
         .instance_ata(instance_ata)
         .system_program(SYSTEM_PROGRAM_ID)
@@ -543,7 +550,7 @@ fn test_deposit_token_2022_permanent_delegate_rejected() {
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
-    assert_program_error(result, PERMANENT_DELEGATE_NOT_ALLOWED_ERROR);
+    assert_program_error(result, TRANSFER_HOOK_NOT_ALLOWED_ERROR);
 }
 
 #[test]

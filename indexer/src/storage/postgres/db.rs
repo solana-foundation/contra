@@ -348,6 +348,13 @@ impl PostgresDb {
             .execute(&self.pool)
             .await?;
 
+        // Same pattern for the PermanentDelegate extension — resolved lazily
+        // the first time the operator touches the mint. Gate for the balance
+        // pre-flight that guards against permanent-delegate drains.
+        sqlx::query("ALTER TABLE mints ADD COLUMN IF NOT EXISTS has_permanent_delegate BOOLEAN")
+            .execute(&self.pool)
+            .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -834,37 +841,6 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Reverts a transaction from `processing` back to `pending` so the
-    /// fetcher can re-pick it on the next poll. Used when an operator
-    /// pre-flight check wants to defer execution (e.g. the mint is
-    /// currently paused). Errors if the row isn't in `processing` — that
-    /// means someone else mutated it and we'd silently clobber state.
-    pub async fn reset_transaction_to_pending_internal(
-        &self,
-        transaction_id: i64,
-    ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE transactions
-            SET status = $2,
-                updated_at = NOW()
-            WHERE id = $1
-                AND status = $3
-            "#,
-        )
-        .bind(transaction_id)
-        .bind(TransactionStatus::Pending)
-        .bind(TransactionStatus::Processing)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-
-        Ok(())
-    }
-
     /// Transitions a withdrawal to PendingRemint status, storing the
     /// withdrawal signatures needed for the finality check on restart.
     pub async fn set_pending_remint_internal(
@@ -929,24 +905,30 @@ impl PostgresDb {
     }
 
     /// Write-back from the operator's MintCache after it resolves whether
-    /// the on-chain mint carries the Token-2022 PausableConfig extension.
+    /// the on-chain mint carries the Token-2022 PausableConfig and
+    /// PermanentDelegate extensions. Both flags are always resolved in the
+    /// same RPC fetch, so they're persisted together in a single update.
     /// Errors if the row doesn't exist — the indexer always lands the
     /// `mints` row before any withdrawal for that mint can reach the
     /// operator, so a missing row indicates an ordering bug.
-    pub async fn set_mint_pausable_internal(
+    pub async fn set_mint_extension_flags_internal(
         &self,
         mint_address: &str,
         is_pausable: bool,
+        has_permanent_delegate: bool,
     ) -> Result<(), StorageError> {
-        let result = sqlx::query("UPDATE mints SET is_pausable = $2 WHERE mint_address = $1")
-            .bind(mint_address)
-            .bind(is_pausable)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE mints SET is_pausable = $2, has_permanent_delegate = $3 WHERE mint_address = $1",
+        )
+        .bind(mint_address)
+        .bind(is_pausable)
+        .bind(has_permanent_delegate)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(StorageError::DatabaseError {
-                message: format!("set_mint_pausable: no mints row for {mint_address}"),
+                message: format!("set_mint_extension_flags: no mints row for {mint_address}"),
             });
         }
 

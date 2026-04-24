@@ -19,8 +19,8 @@ use spl_token::{
 use spl_token_2022::{
     extension::{
         pausable::PausableConfig, permanent_delegate::PermanentDelegate,
-        transfer_fee::instruction::initialize_transfer_fee_config, BaseStateWithExtensionsMut,
-        ExtensionType,
+        transfer_fee::instruction::initialize_transfer_fee_config, transfer_hook::TransferHook,
+        BaseStateWithExtensionsMut, ExtensionType,
     },
     state::Mint as Token2022Mint,
 };
@@ -47,11 +47,11 @@ pub const INVALID_ATA_ERROR: u32 = ContraEscrowProgramError::InvalidAta as u32;
 pub const INVALID_MINT_ERROR: u32 = ContraEscrowProgramError::InvalidMint as u32;
 pub const INVALID_INSTANCE_ERROR: u32 = ContraEscrowProgramError::InvalidInstance as u32;
 pub const INVALID_ADMIN_ERROR: u32 = ContraEscrowProgramError::InvalidAdmin as u32;
-pub const PERMANENT_DELEGATE_NOT_ALLOWED_ERROR: u32 =
-    ContraEscrowProgramError::PermanentDelegateNotAllowed as u32;
 pub const INVALID_ALLOWED_MINT_ERROR: u32 = ContraEscrowProgramError::InvalidAllowedMint as u32;
 pub const INVALID_OPERATOR_ERROR: u32 = ContraEscrowProgramError::InvalidOperatorPda as u32;
 pub const INVALID_SMT_PROOF_ERROR: u32 = ContraEscrowProgramError::InvalidSmtProof as u32;
+pub const TRANSFER_HOOK_NOT_ALLOWED_ERROR: u32 =
+    ContraEscrowProgramError::TransferHookNotAllowed as u32;
 pub const INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR: u32 =
     ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex as u32;
 
@@ -592,6 +592,51 @@ pub fn set_mint_2022_with_pausable(context: &mut TestContext, mint: &Pubkey, aut
             },
         )
         .expect("Failed to set Token 2022 mint account with Pausable");
+}
+
+pub fn set_mint_2022_with_transfer_hook(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    hook_program_id: &Pubkey,
+) {
+    let extensions = [ExtensionType::TransferHook];
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
+
+    let transfer_hook = state.init_extension::<TransferHook>(true).unwrap();
+    *transfer_hook = TransferHook {
+        authority: OptionalNonZeroPubkey::try_from(Some(context.payer.pubkey())).unwrap(),
+        program_id: OptionalNonZeroPubkey::try_from(Some(*hook_program_id)).unwrap(),
+    };
+
+    let pod_mint = PodMint {
+        mint_authority: COption::Some(context.payer.pubkey()).into(),
+        supply: 1_000_000u64.into(),
+        decimals: 6,
+        is_initialized: true.into(),
+        freeze_authority: COption::None.into(),
+    };
+    *state.base = pod_mint;
+
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set Token 2022 mint account with TransferHook");
 }
 
 pub fn create_mint_2022_with_transfer_fee(

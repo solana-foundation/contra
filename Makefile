@@ -149,7 +149,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
-	@$(MAKE) -C contra-escrow-program build
+	@$(MAKE) -C contra-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
 	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture

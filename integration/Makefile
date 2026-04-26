@@ -39,7 +39,7 @@ integration-test:
 	@cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
-	@$(MAKE) -C ../contra-escrow-program build
+	@$(MAKE) -C ../contra-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cargo test --test reconciliation_integration -- --nocapture
 	@cargo test --test mint_idempotency_integration -- --nocapture
@@ -219,7 +219,10 @@ integration-coverage-indexer:
 	@echo "Running withdrawal NULL-nonce quarantine tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in production configuration for prod-feature tests ==="
-	@$(MAKE) -C ../contra-escrow-program build
+	@# Use `build-no-clients` to skip pnpm-driven IDL / client regeneration —
+	@# clients are already present from the initial `make build` (or, in CI,
+	@# from the restored `ci-build-artifacts` tarball).
+	@$(MAKE) -C ../contra-escrow-program build-no-clients
 	@echo "=== prod feature group ==="
 	@echo "Running reconciliation integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture

@@ -239,8 +239,14 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         sigverify_queue_size: 100,
         sigverify_workers: 2,
         max_connections: 50,
-        max_tx_per_batch: 10,
-        batch_deadline_ms: 5,
+        // Raise the per-batch cap so a deliberate burst-of-20 test
+        // (`run_parallel_svm_burst_test`) can fill a single batch with enough
+        // txs to exceed the parallel-execution threshold
+        // (`max_svm_workers * MIN_PARALLEL_BATCH_FACTOR = 4 * 4 = 16`). Raising
+        // the cap is a no-op for tests that submit 1-2 txs at a time — the cap
+        // only matters once a batch actually fills.
+        max_tx_per_batch: 32,
+        batch_deadline_ms: 50,
         batch_channel_capacity: 16,
         max_svm_workers: 4,
         accountsdb_connection_url: accountsdb_connection_url.clone(),
@@ -353,6 +359,21 @@ async fn test_suite(contra_ctx: &ContraContext, solana_ctx: &SolanaContext) {
     run_non_admin_sending_admin_instruction_test(contra_ctx).await;
     run_empty_transaction_test(contra_ctx).await;
     run_mixed_transaction_test(contra_ctx).await;
+
+    run_oversized_body_test(contra_ctx).await;
+    run_health_endpoint_test(contra_ctx).await;
+    run_blocks_in_range_boundaries_test(contra_ctx).await;
+    run_sig_statuses_search_depth_test(contra_ctx).await;
+    run_send_transaction_errors_test(contra_ctx).await;
+    run_simulate_transaction_preflight_test(contra_ctx).await;
+    run_simulate_transaction_account_writes_test(contra_ctx).await;
+
+    // admin-vm malformed InitializeMint coverage.
+    run_admin_vm_initialize_mint_malformed_test(contra_ctx).await;
+
+    // parallel-SVM SnapshotCallback coverage (20-tx burst).
+    run_parallel_svm_burst_test(contra_ctx).await;
+
     // Must be last to collect all samples
     run_performance_samples_test(contra_ctx).await;
 }

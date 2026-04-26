@@ -12,7 +12,7 @@ pub async fn get_pending_remint_transactions(
 
             Ok(pending_remints)
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.get_pending_remint_transactions().await,
     }
 }

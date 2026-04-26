@@ -45,20 +45,6 @@ impl PostgresDb {
         Ok(Self { pool })
     }
 
-    pub async fn commit_transaction(
-        &self,
-        tx: sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<(), sqlx::Error> {
-        tx.commit().await
-    }
-
-    pub async fn rollback_transaction(
-        &self,
-        tx: sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<(), sqlx::Error> {
-        tx.rollback().await
-    }
-
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
         // Ensure pgcrypto is available for gen_random_uuid()
         sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#)
@@ -877,6 +863,13 @@ impl PostgresDb {
     /// withdrawal operator per database; multi-instance isolation would
     /// require an `instance_pda` column on `transactions` that does not exist
     /// today.
+    // Coverage-ignore rationale (category b, defensive recovery):
+    //   `quarantine_all_active_withdrawals_internal` is only invoked by
+    //   the poison-pill pipeline in `operator/processor.rs`
+    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded —
+    //   integration tests do not produce malformed rows that would trip
+    //   it. The SQL itself is trivial; the behavior is covered via the
+    //   `Storage::Mock` variant in in-crate tests.
     pub async fn quarantine_all_active_withdrawals_internal(
         &self,
         exclude_id: Option<i64>,

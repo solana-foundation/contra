@@ -23,6 +23,20 @@ mod test_tx_replay;
 mod test_vote_accounts;
 mod utils;
 
+mod test_blocks_in_range_boundaries;
+mod test_health_endpoint;
+mod test_oversized_body;
+mod test_send_transaction_errors;
+mod test_sig_statuses_search_depth;
+mod test_simulate_transaction_account_writes;
+mod test_simulate_transaction_preflight;
+
+// admin-vm malformed InitializeMint coverage.
+mod test_admin_vm_initialize_mint_malformed;
+
+// parallel-SVM SnapshotCallback coverage.
+mod test_parallel_svm_burst;
+
 pub use test_blockhash_validation::run_blockhash_validation_test;
 pub use test_context::{ContraContext, SolanaContext};
 pub use test_dedup_persistence::run_dedup_persistence_test;
@@ -45,3 +59,14 @@ pub use test_transaction_count::run_transaction_count_test;
 pub use test_tx_replay::run_tx_replay_test;
 pub use test_vote_accounts::run_vote_accounts_test;
 pub use utils::*;
+
+pub use test_blocks_in_range_boundaries::run_blocks_in_range_boundaries_test;
+pub use test_health_endpoint::run_health_endpoint_test;
+pub use test_oversized_body::run_oversized_body_test;
+pub use test_send_transaction_errors::run_send_transaction_errors_test;
+pub use test_sig_statuses_search_depth::run_sig_statuses_search_depth_test;
+pub use test_simulate_transaction_account_writes::run_simulate_transaction_account_writes_test;
+pub use test_simulate_transaction_preflight::run_simulate_transaction_preflight_test;
+
+pub use test_admin_vm_initialize_mint_malformed::run_admin_vm_initialize_mint_malformed_test;
+pub use test_parallel_svm_burst::run_parallel_svm_burst_test;

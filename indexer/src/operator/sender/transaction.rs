@@ -360,7 +360,7 @@ pub(super) async fn send_and_confirm(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_confirmation_result<'a>(
+pub(super) fn handle_confirmation_result<'a>(
     state: &'a mut SenderState,
     result: Result<ConfirmationResult, crate::error::TransactionError>,
     signature: Signature,

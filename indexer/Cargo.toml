@@ -17,6 +17,12 @@ datasource-yellowstone = [
 # Test features
 test-tree = [] # Use smaller tree size for integration tests
 
+# Expose `Storage::Mock` and `mock::MockStorage` outside of `#[cfg(test)]`
+# so integration-test binaries in other crates can inject deterministic
+# storage faults without touching production code paths. Never enable
+# for a release build.
+test-mock-storage = []
+
 [lib]
 path = "src/lib.rs"
 

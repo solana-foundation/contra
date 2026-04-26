@@ -190,7 +190,7 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
 
     // ── Phase 4: Verify initial backfill ────────────────────────────────
     println!("\n## Phase 4: Wait for 2 deposits in DB");
-    let ready = db::wait_for_count(&pool, 2, WAIT_TIMEOUT_SECS).await?;
+    let ready = db::wait_for_count(&pool, 2, *WAIT_TIMEOUT_SECS).await?;
     assert!(
         ready,
         "Indexer did not backfill 2 pre-indexer deposits within timeout"
@@ -262,7 +262,7 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
 
     // ── Phase 8: Verify all 4 deposits recovered ────────────────────────
     println!("\n## Phase 8: Wait for all 4 deposits in DB");
-    let ready = db::wait_for_count(&pool, 4, WAIT_TIMEOUT_SECS).await?;
+    let ready = db::wait_for_count(&pool, 4, *WAIT_TIMEOUT_SECS).await?;
     assert!(ready, "Indexer did not recover gap deposits within timeout");
 
     for tx in &all_signatures {
@@ -294,7 +294,7 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
     // The deposits are in the DB, but the checkpoint update is asynchronous
     // so we must poll rather than read immediately.
     let checkpoint_ready =
-        db::wait_for_checkpoint(&pool, "escrow", gap_deposit_max_slot, WAIT_TIMEOUT_SECS).await?;
+        db::wait_for_checkpoint(&pool, "escrow", gap_deposit_max_slot, *WAIT_TIMEOUT_SECS).await?;
     assert!(
         checkpoint_ready,
         "Checkpoint did not advance past gap deposits' max slot ({}) within timeout",
@@ -414,7 +414,7 @@ async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::er
 
     // ── Phase 4: Verify backfill ─────────────────────────────────────────
     println!("\n## Phase 4: Wait for 2 deposits in DB");
-    let ready = db::wait_for_count(&pool, 2, WAIT_TIMEOUT_SECS).await?;
+    let ready = db::wait_for_count(&pool, 2, *WAIT_TIMEOUT_SECS).await?;
     assert!(
         ready,
         "RPC-polling indexer did not backfill 2 pre-indexer deposits within timeout"
@@ -455,7 +455,7 @@ async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::er
 
     // ── Phase 8: Verify all 4 deposits ──────────────────────────────────
     println!("\n## Phase 8: Wait for all 4 deposits in DB");
-    let ready = db::wait_for_count(&pool, 4, WAIT_TIMEOUT_SECS).await?;
+    let ready = db::wait_for_count(&pool, 4, *WAIT_TIMEOUT_SECS).await?;
     assert!(
         ready,
         "RPC-polling indexer did not recover gap deposits within timeout"
@@ -463,7 +463,7 @@ async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::er
 
     let gap_max_slot = all_txs.iter().map(|t| t.slot).max().unwrap();
     let checkpoint_ready =
-        db::wait_for_checkpoint(&pool, "escrow", gap_max_slot, WAIT_TIMEOUT_SECS).await?;
+        db::wait_for_checkpoint(&pool, "escrow", gap_max_slot, *WAIT_TIMEOUT_SECS).await?;
     assert!(
         checkpoint_ready,
         "Checkpoint did not advance past gap deposits' max slot ({}) within timeout",

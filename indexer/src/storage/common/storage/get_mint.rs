@@ -9,7 +9,7 @@ pub async fn get_mint(
 ) -> Result<Option<DbMint>, StorageError> {
     match storage {
         Storage::Postgres(db) => db.get_mint_internal(mint_address).await,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.get_mint(mint_address).await,
     }
 }

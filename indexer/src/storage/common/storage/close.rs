@@ -6,7 +6,7 @@ pub async fn close(storage: &Storage) -> Result<(), StorageError> {
             db.close().await?;
             Ok(())
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.close().await,
     }
 }

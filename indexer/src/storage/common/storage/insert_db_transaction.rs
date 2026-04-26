@@ -9,7 +9,7 @@ pub async fn insert_db_transaction(
 ) -> Result<i64, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.insert_transaction_internal(transaction).await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.insert_db_transaction(transaction).await,
     }
 }

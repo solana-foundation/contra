@@ -18,7 +18,7 @@ install:
 # Build the program
 build:
 	$(MAKE) generate-clients
-	cargo-build-sbf
+	cd program && cargo-build-sbf
 
 # Build the program with test-tree feature for integration tests
 build-test:

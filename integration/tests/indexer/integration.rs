@@ -6,6 +6,11 @@ mod helpers;
 #[path = "setup.rs"]
 mod setup;
 
+// Parser malformation: pure-function tests of `parse_escrow_instruction`
+// against deliberately-malformed payloads.
+#[path = "parser_malformation.rs"]
+mod parser_malformation;
+
 use contra_indexer::operator::tree_constants::MAX_TREE_LEAVES;
 use contra_indexer::storage::{PostgresDb, Storage};
 use contra_indexer::PostgresConfig;
@@ -306,7 +311,7 @@ async fn verify_backfill_phase(
     );
 
     let expected_count = pre_indexer_transactions.len() as i64;
-    let ready = db::wait_for_count(pool, expected_count, WAIT_TIMEOUT_SECS).await?;
+    let ready = db::wait_for_count(pool, expected_count, *WAIT_TIMEOUT_SECS).await?;
 
     assert!(
         ready,
@@ -406,7 +411,7 @@ async fn verify_deposit_indexing(
     );
 
     let expected_count = count_before + expected_total as i64;
-    let ready = db::wait_for_count(pool, expected_count, WAIT_TIMEOUT_SECS).await?;
+    let ready = db::wait_for_count(pool, expected_count, *WAIT_TIMEOUT_SECS).await?;
 
     assert!(
         ready,
@@ -531,7 +536,7 @@ async fn verify_withdrawal_processing(
     let total_expected_txs =
         count_before + deposit_transactions.len() as i64 + expected_withdrawals as i64;
 
-    let withdraw_ready = db::wait_for_count(pool, total_expected_txs, WAIT_TIMEOUT_SECS).await?;
+    let withdraw_ready = db::wait_for_count(pool, total_expected_txs, *WAIT_TIMEOUT_SECS).await?;
     assert!(
         withdraw_ready,
         "Withdraw indexer did not process all withdrawals within timeout"
@@ -654,7 +659,7 @@ async fn execute_tree_rotation_boundary_phase(
         }
 
         println!(
-            "✓ Created {} withdrawals (), all processed by operator",
+            "✓ Created {} withdrawals, all processed by operator",
             withdrawals_needed
         );
     }
@@ -1000,4 +1005,116 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
 
     println!("\n=== All Verifications Passed (Including Tree Rotation & Post-Rotation) ===");
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Config-validation tests
+//
+// These two tests exercise `ContraIndexerConfig::validate()` and the
+// startup-reconciliation skip branch logic. They are intentionally placed
+// in the `indexer_integration` binary so they share its build artefacts
+// with the main chaos test — but they require *no* fixtures (no Postgres,
+// no validator, no Yellowstone) and run in well under a second each.
+// Cargo executes tests in parallel by default, so they complete long
+// before `test_master_chaos_stress_test`'s ~30 s fixture boot.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Config validation rejects Escrow mode without an `escrow_instance_id`.
+///
+/// Targets `contra_indexer::config::ContraIndexerConfig::validate()`. The error
+/// message contract is part of the CLI's public surface (operators rely on it
+/// to diagnose startup failures), so we assert the exact substring.
+#[test]
+fn test_indexer_missing_escrow_instance_id_fails() {
+    let bad = contra_indexer::ContraIndexerConfig {
+        program_type: contra_indexer::ProgramType::Escrow,
+        storage_type: contra_indexer::StorageType::Postgres,
+        rpc_url: "http://localhost:0".to_string(),
+        source_rpc_url: None,
+        postgres: contra_indexer::PostgresConfig {
+            database_url: "postgresql://unused".to_string(),
+            max_connections: 1,
+        },
+        escrow_instance_id: None, // ← the violation
+    };
+
+    let err = bad
+        .validate()
+        .expect_err("Escrow config without escrow_instance_id must fail validation");
+
+    assert!(
+        err.contains("--escrow-instance-id required"),
+        "error message must name the missing CLI flag, got: {err:?}"
+    );
+}
+
+/// Complement of the Escrow-validation test above: Withdraw mode must
+/// reject an *unexpected* `escrow_instance_id` for symmetry. Exercises
+/// the matching arm of `ContraIndexerConfig::validate()` that the config
+/// unit tests also lock in.
+#[test]
+fn test_indexer_withdraw_with_instance_id_fails() {
+    use std::str::FromStr;
+
+    let bad = contra_indexer::ContraIndexerConfig {
+        program_type: contra_indexer::ProgramType::Withdraw,
+        storage_type: contra_indexer::StorageType::Postgres,
+        rpc_url: "http://localhost:0".to_string(),
+        source_rpc_url: None,
+        postgres: contra_indexer::PostgresConfig {
+            database_url: "postgresql://unused".to_string(),
+            max_connections: 1,
+        },
+        escrow_instance_id: Some(
+            solana_sdk::pubkey::Pubkey::from_str("11111111111111111111111111111111").unwrap(),
+        ),
+    };
+
+    let err = bad
+        .validate()
+        .expect_err("Withdraw config with escrow_instance_id must fail validation");
+
+    assert!(
+        err.contains("should not be set for Withdraw program"),
+        "error message must explain why, got: {err:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `validate_gap` boundary tests
+//
+// Pure-function unit-of-behaviour tests for `indexer::backfill::validate_gap`
+// that lift integration coverage on the function's body without needing RPC
+// or Postgres. Same shape and cost as the config-validation tests above.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_backfill_validate_gap_no_gap() {
+    use contra_indexer::indexer::backfill::validate_gap;
+    assert!(matches!(validate_gap(100, 100, 50), Ok(None)));
+    assert!(matches!(validate_gap(99, 100, 50), Ok(None)));
+}
+
+#[test]
+fn test_backfill_validate_gap_within_threshold() {
+    use contra_indexer::indexer::backfill::validate_gap;
+    let r = validate_gap(150, 100, 50).expect("gap within threshold must be Ok");
+    assert_eq!(r, Some(50));
+
+    let r = validate_gap(101, 100, 50).expect("minimal gap must be Ok");
+    assert_eq!(r, Some(1));
+}
+
+#[test]
+fn test_backfill_validate_gap_rejects_too_large() {
+    use contra_indexer::error::BackfillError;
+    use contra_indexer::indexer::backfill::validate_gap;
+    let err = validate_gap(200, 100, 50).expect_err("gap > max must be rejected");
+    match err {
+        BackfillError::GapTooLarge { gap, max_gap } => {
+            assert_eq!(gap, 100);
+            assert_eq!(max_gap, 50);
+        }
+        other => panic!("expected GapTooLarge, got {other:?}"),
+    }
 }

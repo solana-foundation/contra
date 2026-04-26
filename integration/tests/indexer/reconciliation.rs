@@ -13,6 +13,19 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
+// Pure-function coverage of `compare_balances` branches that aren't hit
+// by the end-to-end reconciliation tests below.
+#[path = "reconciliation_compare.rs"]
+mod compare_balances;
+
+// DB migration idempotency + insert-race safety on PostgresDb.
+#[path = "db_migration_race.rs"]
+mod db_migration_race;
+
+// Pending-remint storage round-trip (set/get public API).
+#[path = "pending_remint_storage.rs"]
+mod pending_remint_storage;
+
 use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
 use contra_indexer::{
     config::{ProgramType, ReconciliationConfig},

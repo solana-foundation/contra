@@ -6,7 +6,7 @@ pub async fn drop_tables(storage: &Storage) -> Result<(), StorageError> {
             db.drop_tables().await?;
             Ok(())
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.drop_tables().await,
     }
 }

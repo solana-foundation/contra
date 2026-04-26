@@ -274,6 +274,38 @@ docker compose --profile auth up
 
 Once running, the auth service is available at `http://localhost:${AUTH_PORT}` (default `8903`). See [auth/README.md](auth/README.md) for the full API reference, role definitions, and wallet verification flow.
 
+## Pinned tooling versions
+
+CI pins the following tool versions. Local development environments should
+match these to keep coverage reports and test behavior reproducible between
+CI and local runs.
+
+| Tool             | Version    | Install command                                        |
+|------------------|------------|--------------------------------------------------------|
+| Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically |
+| cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
+| cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
+| Solana CLI       | `2.2.19`   | `sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.19/install)"` |
+| Node.js          | `22.x`     | See your distro's package manager                      |
+| pnpm             | `10.15.1`  | `npm install -g pnpm@10.15.1` (also pinned via `packageManager` in each `package.json`) |
+
+Container images used by integration tests (pulled automatically by
+`testcontainers` at test time):
+
+| Image                | Notes                                          |
+|----------------------|------------------------------------------------|
+| `postgres:11-alpine` | Default of `testcontainers-modules 0.13`.      |
+| `redis:7`            | Warmed in CI before each integration run.      |
+
+Source of truth for tool versions:
+- Rust + `cargo-llvm-cov` + pnpm: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
+- `cargo-nextest`: [`.github/workflows/rust.yml`](.github/workflows/rust.yml) (`Install cargo-nextest` step)
+- Solana CLI: [`.github/actions/setup-solana/action.yml`](.github/actions/setup-solana/action.yml)
+- pnpm (also): `packageManager` field in `contra-escrow-program/package.json`
+
+When bumping any version, update the CI config **and** this section in the
+same PR so the two stay in sync.
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

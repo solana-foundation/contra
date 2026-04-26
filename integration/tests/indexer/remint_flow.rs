@@ -39,7 +39,7 @@ use {
         operator::{
             sender::{
                 test_hooks,
-                types::{PendingRemint, SenderState, TransactionContext, TransactionStatusUpdate},
+                types::{PendingRemint, SenderState, TransactionStatusUpdate},
             },
             utils::instruction_util::{remint_idempotency_memo, WithdrawalRemintInfo},
             SignerUtil,
@@ -48,12 +48,11 @@ use {
     },
     sender_fixtures::{
         blockhash_reply, confirmed_status_reply, ensure_admin_signer_env, make_config,
-        send_transaction_echo_reply,
+        make_remint_info, send_transaction_echo_reply, withdrawal_ctx,
     },
     serde_json::json,
     solana_keychain::SolanaSigner,
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
-    spl_associated_token_account::get_associated_token_address_with_program_id,
+    solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
     std::{str::FromStr, sync::Arc},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -84,22 +83,6 @@ async fn build_state(
     (state, storage_rx, storage_tx)
 }
 
-fn make_remint_info(transaction_id: i64) -> WithdrawalRemintInfo {
-    let mint = Pubkey::new_unique();
-    let user = Pubkey::new_unique();
-    let token_program = spl_token::id();
-    let user_ata = get_associated_token_address_with_program_id(&user, &mint, &token_program);
-    WithdrawalRemintInfo {
-        transaction_id,
-        trace_id: format!("trace-{transaction_id}"),
-        mint,
-        user,
-        user_ata,
-        token_program,
-        amount: 50_000,
-    }
-}
-
 fn make_pending_remint(
     transaction_id: i64,
     nonce: u64,
@@ -108,11 +91,7 @@ fn make_pending_remint(
     info: WithdrawalRemintInfo,
 ) -> PendingRemint {
     PendingRemint {
-        ctx: TransactionContext {
-            transaction_id: Some(transaction_id),
-            withdrawal_nonce: Some(nonce),
-            trace_id: Some(format!("trace-{transaction_id}")),
-        },
+        ctx: withdrawal_ctx(transaction_id, nonce),
         remint_info: info,
         signatures,
         original_error: "release_funds failed".to_string(),

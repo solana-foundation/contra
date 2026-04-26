@@ -1,7 +1,8 @@
 //! Database migration idempotency + insert-race safety
 //!
 //! Target file: `indexer/src/storage/postgres/db.rs`.
-//! Binary: `indexer_integration` (existing — attached via `#[path]` mod).
+//! Binary: `reconciliation_integration` (existing — attached via `#[path]`
+//! mod from `tests/indexer/reconciliation.rs`).
 //!
 //! Two tests:
 //!

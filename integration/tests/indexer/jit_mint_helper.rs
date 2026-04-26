@@ -26,7 +26,7 @@ use {
     },
     sender_fixtures::{
         blockhash_reply, confirmed_status_reply, ensure_admin_signer_env, make_config,
-        null_status_reply, send_transaction_echo_reply,
+        make_instruction, null_status_reply, send_transaction_echo_reply,
     },
     serde_json::json,
     solana_keychain::SolanaSigner,
@@ -71,21 +71,6 @@ fn account_info_reply(data: &[u8]) -> Reply {
     }))
 }
 
-/// Build a minimal `InstructionWithSigners` to hand into the JIT hook.
-/// The helper passes this through verbatim on success and never inspects
-/// its contents, so an empty instruction list with the admin fee-payer is
-/// sufficient.
-fn make_passthrough_instruction() -> InstructionWithSigners {
-    let admin = SignerUtil::admin_signer();
-    InstructionWithSigners {
-        instructions: vec![],
-        fee_payer: admin.pubkey(),
-        signers: vec![admin],
-        compute_unit_price: None,
-        compute_budget: None,
-    }
-}
-
 /// Build a `MintToBuilder` with the minimum field set
 /// `try_jit_mint_initialization` reads (`get_mint`, plus enough to flow
 /// through `handle_transaction_builder` if scenarios 2–6 reach the
@@ -113,7 +98,6 @@ struct Fixture {
     state: contra_indexer::operator::sender::types::SenderState,
     mock: MockRpcServer,
     txn_id: i64,
-    mint: Pubkey,
     instruction: InstructionWithSigners,
 }
 
@@ -153,12 +137,11 @@ async fn build_fixture(populate_builder: bool) -> Fixture {
         state.mint_builders.insert(txn_id, make_mint_builder(mint));
     }
 
-    let instruction = make_passthrough_instruction();
+    let instruction = make_instruction();
     Fixture {
         state,
         mock,
         txn_id,
-        mint,
         instruction,
     }
 }
@@ -177,7 +160,6 @@ async fn jit_returns_some_when_mint_already_initialized() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 
@@ -212,7 +194,6 @@ async fn jit_completes_full_initialize_then_returns_some() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 
@@ -252,7 +233,6 @@ async fn jit_falls_through_when_initial_probe_returns_rpc_error() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 
@@ -293,7 +273,6 @@ async fn jit_returns_none_when_send_transaction_fails() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 
@@ -337,7 +316,6 @@ async fn jit_returns_some_when_backoff_recovers_from_unconfirmed() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 
@@ -387,7 +365,6 @@ async fn jit_returns_none_when_backoff_exhausts_with_uninit() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 
@@ -431,7 +408,6 @@ async fn jit_returns_none_when_no_cached_builder() {
         mut state,
         mock,
         txn_id,
-        mint: _mint,
         instruction,
     } = fixture;
 

@@ -25,53 +25,19 @@
 mod sender_fixtures;
 
 use {
-    contra_indexer::config::ProgramType,
     contra_indexer::{
         operator::{
-            sender::{
-                test_hooks,
-                types::{SenderState, TransactionStatusUpdate},
-            },
+            sender::test_hooks,
             utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
         },
-        storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
+        storage::TransactionStatus,
     },
     sender_fixtures::{
-        blockhash_reply, confirmed_status_reply, deposit_ctx, ensure_admin_signer_env, make_config,
+        blockhash_reply, build_default_sender_state, confirmed_status_reply, deposit_ctx,
         make_instruction, send_transaction_echo_reply,
     },
-    solana_sdk::commitment_config::CommitmentLevel,
-    std::sync::Arc,
-    test_utils::mock_rpc::{MockRpcServer, Reply},
-    tokio::sync::mpsc,
+    test_utils::mock_rpc::Reply,
 };
-
-/// Build a fresh `SenderState` wired to the mock RPC, plus the
-/// `(storage_tx, storage_rx)` pair the helper writes status updates to.
-async fn build_fixture() -> (
-    SenderState,
-    mpsc::Receiver<TransactionStatusUpdate>,
-    mpsc::Sender<TransactionStatusUpdate>,
-    MockRpcServer,
-) {
-    ensure_admin_signer_env();
-    let mock = MockRpcServer::start().await;
-    let storage = Arc::new(Storage::Mock(MockStorage::new()));
-    let state = test_hooks::new_sender_state(
-        &make_config(mock.url(), ProgramType::Escrow),
-        CommitmentLevel::Confirmed,
-        None,
-        storage,
-        // retry_max_attempts: irrelevant here (no withdrawal_nonce → no
-        // sender-level retry counter). 1 is fine.
-        1,
-        1,
-        None,
-    )
-    .expect("SenderState construction must succeed under Mock storage");
-    let (storage_tx, storage_rx) = mpsc::channel(8);
-    (state, storage_rx, storage_tx, mock)
-}
 
 // ─────────────────────────────────────────────────────────────────────
 // Happy path — full success branch through to Completed status.
@@ -87,7 +53,7 @@ async fn build_fixture() -> (
 // the `Completed` direct-emit path.
 #[tokio::test]
 async fn happy_path_emits_completed_status() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
@@ -131,7 +97,7 @@ async fn happy_path_emits_completed_status() {
 // and emits a `TransactionStatus::Failed` update.
 #[tokio::test]
 async fn none_policy_routes_send_error_to_failed_status() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue(
@@ -187,7 +153,7 @@ async fn none_policy_routes_send_error_to_failed_status() {
 // `Failed` status update.
 #[tokio::test]
 async fn idempotent_permanent_error_short_circuits_to_failed_status() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", Reply::error(-32601, "method not found"));

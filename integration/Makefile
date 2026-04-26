@@ -1,4 +1,4 @@
-.PHONY: install integration-test fmt test-lcov-filter check-coverage-floor
+.PHONY: install integration-test fmt check-coverage-floor
 .PHONY: integration-coverage integration-coverage-contra integration-coverage-contra-redis integration-coverage-indexer integration-coverage-report
 
 COVERAGE_DIR ?= ../coverage
@@ -284,31 +284,16 @@ integration-coverage-report:
 	@cargo llvm-cov report --lcov \
 		-p contra-core -p contra-indexer \
 		--ignore-filename-regex '$(COV_IGNORE_REGEX)' \
-		--output-path $(COVERAGE_DIR)/coverage-integration-e2e.raw.lcov
-	@# Line-level exclusion pass: strip DA: records whose line number matches
-	@# LCOV_EXCL_LINE / LCOV_EXCL_START..STOP markers in the source tree.
-	@# Recomputes LF/LH per file. See scripts/lcov_filter.py.
-	@python3 scripts/lcov_filter.py \
-		$(COVERAGE_DIR)/coverage-integration-e2e.raw.lcov \
-		$(COVERAGE_DIR)/coverage-integration-e2e.lcov
-	@rm -f $(COVERAGE_DIR)/coverage-integration-e2e.raw.lcov
-	@echo "Coverage report (filtered): $(COVERAGE_DIR)/coverage-integration-e2e.lcov"
+		--output-path $(COVERAGE_DIR)/coverage-integration-e2e.lcov
+	@echo "Coverage report: $(COVERAGE_DIR)/coverage-integration-e2e.lcov"
 	@$(MAKE) check-coverage-floor
 
 # Coverage ratchet — fail CI if filtered E2E coverage falls below this floor.
-# Current floor is set conservatively below the observed value to allow for
-# normal variance (small test-ordering / timing effects on hit counts).
-# Ratchet up as coverage lands durably above the floor.
-#
-# This floor applies to whichever combination of suites ran in the current
-# invocation:
-#   - `make integration-coverage-indexer` only     → floor ~45 % (indexer-only
-#                                                     denominator excludes core/)
-#   - `make integration-coverage` (full run)       → floor ~79 % (combined)
-#
-# If CI invokes only the indexer subset, export COVERAGE_FLOOR=45 before the
-# call — the default targets the combined run.
-COVERAGE_FLOOR ?= 45.0
+# The default targets the combined run (`make integration-coverage`), which is
+# what CI executes. The floor sits a few points below the latest observed
+# combined value so normal test-ordering / timing variance doesn't trip the
+# gate. Ratchet up as coverage lands durably above the floor.
+COVERAGE_FLOOR ?= 75.0
 
 check-coverage-floor:
 	@python3 -c "import sys, pathlib; \
@@ -320,10 +305,6 @@ check-coverage-floor:
 	print(f'E2E Integration coverage: {pct:.2f}% (LF={lf} LH={lh})  floor={floor}%'); \
 	sys.exit(0 if pct >= floor else 1)" \
 	|| { echo 'ERROR: coverage regressed below the floor. Either raise coverage or justify lowering COVERAGE_FLOOR.' ; exit 1 ; }
-
-# Run the filter's self-tests. Invoked by CI before the coverage build.
-test-lcov-filter:
-	@python3 scripts/test_lcov_filter.py
 
 # Local convenience target: builds the required .so artifacts before running coverage.
 # CI calls integration-coverage-contra and integration-coverage-indexer directly,

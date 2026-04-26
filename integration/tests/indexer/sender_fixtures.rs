@@ -24,15 +24,25 @@ use {
     contra_indexer::{
         config::{ContraIndexerConfig, PostgresConfig, ProgramType, StorageType},
         operator::{
-            sender::types::{InstructionWithSigners, TransactionContext},
+            sender::{
+                test_hooks,
+                types::{
+                    InstructionWithSigners, SenderState, TransactionContext,
+                    TransactionStatusUpdate,
+                },
+            },
+            utils::instruction_util::WithdrawalRemintInfo,
             SignerUtil,
         },
+        storage::{common::storage::mock::MockStorage, Storage},
     },
     serde_json::{json, Value},
     solana_keychain::SolanaSigner,
-    solana_sdk::signature::Keypair,
-    std::sync::Once,
-    test_utils::mock_rpc::Reply,
+    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Keypair},
+    spl_associated_token_account::get_associated_token_address_with_program_id,
+    std::sync::{Arc, Once},
+    test_utils::mock_rpc::{MockRpcServer, Reply},
+    tokio::sync::mpsc,
 };
 
 /// Set `ADMIN_SIGNER` / `OPERATOR_SIGNER` env vars exactly once per
@@ -163,4 +173,57 @@ pub fn withdrawal_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
         withdrawal_nonce: Some(nonce),
         trace_id: Some(format!("trace-{transaction_id}")),
     }
+}
+
+/// Plausible `WithdrawalRemintInfo` for tests that exercise the
+/// remint-deferral path. The mint/user/ATA pubkeys are unique per
+/// call; only `transaction_id` is caller-controlled, since several
+/// tests cross-reference it against status-update payloads.
+pub fn make_remint_info(transaction_id: i64) -> WithdrawalRemintInfo {
+    let mint = Pubkey::new_unique();
+    let user = Pubkey::new_unique();
+    let token_program = spl_token::id();
+    let user_ata = get_associated_token_address_with_program_id(&user, &mint, &token_program);
+    WithdrawalRemintInfo {
+        transaction_id,
+        trace_id: format!("trace-{transaction_id}"),
+        mint,
+        user,
+        user_ata,
+        token_program,
+        amount: 50_000,
+    }
+}
+
+/// Build a `MockRpcServer` + `SenderState` wired against `MockStorage`,
+/// plus the `(storage_tx, storage_rx)` pair tests use to observe
+/// `TransactionStatusUpdate`s emitted by the production helpers.
+///
+/// `retry_max_attempts = 1` and `confirmation_poll_interval_ms = 1`
+/// keep the wall-clock low for the per-scenario tick. Tests that need
+/// a different shape — e.g. `MockStorage` handle for fault injection,
+/// non-default retry budget, withdrawal-side program type — keep their
+/// own `build_fixture` local. This default helper covers the
+/// deposit-side / Escrow shape that several files share.
+pub async fn build_default_sender_state() -> (
+    SenderState,
+    mpsc::Receiver<TransactionStatusUpdate>,
+    mpsc::Sender<TransactionStatusUpdate>,
+    MockRpcServer,
+) {
+    ensure_admin_signer_env();
+    let mock = MockRpcServer::start().await;
+    let storage = Arc::new(Storage::Mock(MockStorage::new()));
+    let state = test_hooks::new_sender_state(
+        &make_config(mock.url(), ProgramType::Escrow),
+        CommitmentLevel::Confirmed,
+        None,
+        storage,
+        1,
+        1,
+        None,
+    )
+    .expect("SenderState construction must succeed under Mock storage");
+    let (storage_tx, storage_rx) = mpsc::channel(8);
+    (state, storage_rx, storage_tx, mock)
 }

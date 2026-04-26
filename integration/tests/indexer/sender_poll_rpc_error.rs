@@ -28,28 +28,24 @@ mod sender_fixtures;
 
 use {
     contra_indexer::{
-        config::ProgramType,
         operator::{
             sender::{
                 test_hooks,
-                types::{
-                    InFlightTx, SenderState, TransactionContext, TransactionStatusUpdate,
-                    MAX_IN_FLIGHT,
-                },
+                types::{InFlightTx, TransactionContext, MAX_IN_FLIGHT},
             },
             utils::{
                 instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
                 transaction_util::MAX_POLL_ATTEMPTS_CONFIRMATION,
             },
         },
-        storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
+        storage::TransactionStatus,
     },
-    sender_fixtures::{ensure_admin_signer_env, make_config, make_instruction, null_status_reply},
+    sender_fixtures::{build_default_sender_state, make_instruction, null_status_reply},
     serde_json::json,
-    solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
+    solana_sdk::signature::Signature,
     std::sync::Arc,
-    test_utils::mock_rpc::{MockRpcServer, Reply},
-    tokio::sync::{mpsc, Semaphore},
+    test_utils::mock_rpc::Reply,
+    tokio::sync::Semaphore,
 };
 
 /// Construct an `InFlightTx` for a Mint (deposit) transaction. The
@@ -85,33 +81,6 @@ fn make_in_flight_tx(
     }
 }
 
-async fn build_fixture() -> (
-    SenderState,
-    mpsc::Receiver<TransactionStatusUpdate>,
-    mpsc::Sender<TransactionStatusUpdate>,
-    MockRpcServer,
-) {
-    ensure_admin_signer_env();
-    let mock = MockRpcServer::start().await;
-    let storage = Arc::new(Storage::Mock(MockStorage::new()));
-    let state = test_hooks::new_sender_state(
-        &make_config(mock.url(), ProgramType::Escrow),
-        CommitmentLevel::Confirmed,
-        None,
-        storage,
-        // retry_max_attempts: irrelevant for the poll path. 1 keeps the
-        // test honest in case any unexpected resend logic kicks in.
-        1,
-        // confirmation_poll_interval_ms: shaves wall-clock for the few
-        // sleeps `RpcClientWithRetry` performs between retries.
-        1,
-        None,
-    )
-    .expect("SenderState construction must succeed under Mock storage");
-    let (storage_tx, storage_rx) = mpsc::channel(8);
-    (state, storage_rx, storage_tx, mock)
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // RPC error during poll — batch returned to queue unchanged.
 // ─────────────────────────────────────────────────────────────────────
@@ -122,7 +91,7 @@ async fn build_fixture() -> (
 // without emitting a status update.
 #[tokio::test]
 async fn rpc_error_returns_batch_to_queue_without_status_update() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let sig = Signature::new_unique();
     state
@@ -171,7 +140,7 @@ async fn rpc_error_returns_batch_to_queue_without_status_update() {
 // emits a `Completed` status update and removes the entry from the queue.
 #[tokio::test]
 async fn transient_error_then_confirmed_completes_entry() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let sig = Signature::new_unique();
     state
@@ -223,7 +192,7 @@ async fn transient_error_then_confirmed_completes_entry() {
 // ─────────────────────────────────────────────────────────────────────
 #[tokio::test]
 async fn null_status_below_max_pushes_back_and_increments_poll_attempts() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let sig = Signature::new_unique();
     state
@@ -260,7 +229,7 @@ async fn null_status_below_max_pushes_back_and_increments_poll_attempts() {
 // distinct "transaction status unknown, unsafe to retry" label.
 #[tokio::test]
 async fn null_status_at_max_with_none_policy_routes_to_permanent_failure() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let sig = Signature::new_unique();
     state.in_flight.push(make_in_flight_tx(
@@ -304,7 +273,7 @@ async fn null_status_at_max_with_none_policy_routes_to_permanent_failure() {
 #[tokio::test]
 async fn null_status_at_max_idempotent_resend_cap_exceeded_routes_to_permanent_failure() {
     // build_fixture default: retry_max_attempts = 1.
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let sig = Signature::new_unique();
     state.in_flight.push(make_in_flight_tx(
@@ -348,7 +317,7 @@ async fn null_status_at_max_idempotent_resend_cap_exceeded_routes_to_permanent_f
 // of the program error.
 #[tokio::test]
 async fn confirmed_with_onchain_error_routes_via_handle_confirmation_result() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let sig = Signature::new_unique();
     state

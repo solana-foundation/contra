@@ -25,52 +25,22 @@ mod sender_fixtures;
 use {
     contra_escrow_program_client::errors::ContraEscrowProgramError,
     contra_indexer::{
-        config::ProgramType,
         error::{ProgramError, TransactionError},
         operator::{
-            sender::{
-                test_hooks,
-                types::{SenderState, TransactionStatusUpdate},
-            },
+            sender::{test_hooks, types::TransactionStatusUpdate},
             utils::{
                 instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
                 transaction_util::ConfirmationResult,
             },
         },
-        storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
+        storage::TransactionStatus,
     },
     sender_fixtures::{
-        blockhash_reply, confirmed_status_reply, deposit_ctx, ensure_admin_signer_env, make_config,
+        blockhash_reply, build_default_sender_state, confirmed_status_reply, deposit_ctx,
         make_instruction, send_transaction_echo_reply,
     },
-    solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
-    std::sync::Arc,
-    test_utils::mock_rpc::MockRpcServer,
-    tokio::sync::mpsc,
+    solana_sdk::signature::Signature,
 };
-
-async fn build_fixture() -> (
-    SenderState,
-    mpsc::Receiver<TransactionStatusUpdate>,
-    mpsc::Sender<TransactionStatusUpdate>,
-    MockRpcServer,
-) {
-    ensure_admin_signer_env();
-    let mock = MockRpcServer::start().await;
-    let storage = Arc::new(Storage::Mock(MockStorage::new()));
-    let state = test_hooks::new_sender_state(
-        &make_config(mock.url(), ProgramType::Escrow),
-        CommitmentLevel::Confirmed,
-        None,
-        storage,
-        1,
-        1,
-        None,
-    )
-    .expect("SenderState construction must succeed under Mock storage");
-    let (storage_tx, storage_rx) = mpsc::channel(8);
-    (state, storage_rx, storage_tx, mock)
-}
 
 /// Drive the hook with a synthesised `result` and return the single
 /// status update the production code emits.
@@ -79,7 +49,7 @@ async fn drive_and_recv(
     retry_policy: RetryPolicy,
     txn_id: i64,
 ) -> TransactionStatusUpdate {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
     let ctx = deposit_ctx(txn_id);
     test_hooks::handle_confirmation_result(
         &mut state,
@@ -223,7 +193,7 @@ async fn err_result_routes_to_confirmation_error_arm() {
 // arm above.
 #[tokio::test]
 async fn retry_under_idempotent_policy_recursively_resends_and_completes() {
-    let (mut state, mut storage_rx, storage_tx, mock) = build_fixture().await;
+    let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     // Scripts for the recursive send_and_confirm call.
     mock.enqueue("getLatestBlockhash", blockhash_reply());

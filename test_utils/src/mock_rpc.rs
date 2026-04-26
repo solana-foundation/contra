@@ -112,13 +112,26 @@ impl Reply {
 
 /// Handle to a running mock JSON-RPC server.
 ///
-/// Drops the underlying task when the handle is dropped; call
-/// `shutdown().await` if you want to wait for graceful teardown.
+/// The accept loop is aborted when the handle is dropped — even on
+/// panic-unwind — so tests that fail before reaching
+/// `mock.shutdown().await` don't leak the TCP fd until process exit.
+/// Call `shutdown().await` if you want to wait for the task to
+/// actually finish.
 pub struct MockRpcServer {
     addr: SocketAddr,
     state: Arc<MockState>,
     stop: Arc<Notify>,
-    _task: JoinHandle<()>,
+    /// `Option` so `shutdown` can `take()` ownership and `await` the
+    /// handle without conflicting with this struct's `Drop` impl.
+    task: Option<JoinHandle<()>>,
+}
+
+impl Drop for MockRpcServer {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl MockRpcServer {
@@ -163,7 +176,7 @@ impl MockRpcServer {
             addr,
             state,
             stop,
-            _task: task,
+            task: Some(task),
         }
     }
 
@@ -241,10 +254,13 @@ impl MockRpcServer {
     /// lost and the loop sits forever in `listener.accept()`. We abort the
     /// task as a safety net — graceful shutdown isn't a contract we need
     /// to honour for a mock.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.stop.notify_waiters();
-        self._task.abort();
-        let _ = self._task.await; // swallows the JoinError from abort
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await; // swallows the JoinError from abort
+        }
+        // The `Drop` impl below sees `task = None` after this and is a no-op.
     }
 }
 

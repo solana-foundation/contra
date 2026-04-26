@@ -29,15 +29,15 @@ use {
                 test_hooks,
                 types::{SenderState, TransactionStatusUpdate},
             },
-            utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy, WithdrawalRemintInfo},
+            utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
         },
         storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
     },
     sender_fixtures::{
-        blockhash_reply, ensure_admin_signer_env, make_config, make_instruction, withdrawal_ctx,
+        blockhash_reply, ensure_admin_signer_env, make_config, make_instruction, make_remint_info,
+        withdrawal_ctx,
     },
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
-    spl_associated_token_account::get_associated_token_address_with_program_id,
+    solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
     std::sync::Arc,
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -82,22 +82,9 @@ async fn build_fixture(
 /// the deferral path itself — they only matter once
 /// `attempt_remint` actually runs (covered by `remint_flow.rs`).
 fn seed_remint_cache(state: &mut SenderState, transaction_id: i64, nonce: u64) {
-    let mint = Pubkey::new_unique();
-    let user = Pubkey::new_unique();
-    let token_program = spl_token::id();
-    let user_ata = get_associated_token_address_with_program_id(&user, &mint, &token_program);
-    state.remint_cache.insert(
-        nonce,
-        WithdrawalRemintInfo {
-            transaction_id,
-            trace_id: format!("trace-{transaction_id}"),
-            mint,
-            user,
-            user_ata,
-            token_program,
-            amount: 50_000,
-        },
-    );
+    state
+        .remint_cache
+        .insert(nonce, make_remint_info(transaction_id));
 }
 
 /// Helper: enqueue one (`getLatestBlockhash`, `sendTransaction`-error)

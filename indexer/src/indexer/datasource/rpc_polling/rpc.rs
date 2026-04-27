@@ -245,9 +245,7 @@ mod tests {
                 ]
             })))
             .with_status(200)
-            .with_body(
-                r#"{"jsonrpc":"2.0","result":null,"id":1}"#,
-            )
+            .with_body(r#"{"jsonrpc":"2.0","result":null,"id":1}"#)
             .expect(1)
             .create_async()
             .await;

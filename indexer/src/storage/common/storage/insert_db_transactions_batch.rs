@@ -9,7 +9,7 @@ pub async fn insert_db_transactions_batch(
 ) -> Result<Vec<i64>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.insert_transactions_batch_internal(transactions).await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.insert_db_transactions_batch(transactions).await,
     }
 }

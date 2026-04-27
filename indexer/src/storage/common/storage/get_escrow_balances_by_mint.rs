@@ -8,7 +8,7 @@ pub async fn get_escrow_balances_by_mint(
 ) -> Result<Vec<MintDbBalance>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.get_escrow_balances_by_mint_internal().await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.get_escrow_balances_by_mint().await,
     }
 }

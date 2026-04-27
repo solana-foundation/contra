@@ -2157,6 +2157,7 @@ name = "contra-integration"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.21.7",
  "bincode",
  "bs58",
@@ -2168,10 +2169,13 @@ dependencies = [
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
+ "jsonrpsee",
  "mockito",
+ "redis",
  "serde_json",
  "solana-account-decoder-client-types 2.3.10",
  "solana-client 2.3.10",
+ "solana-keychain",
  "solana-pubkey 2.4.0",
  "solana-sdk",
  "solana-sdk-ids 2.2.1",
@@ -2191,6 +2195,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
@@ -15529,6 +15534,12 @@ dependencies = [
  "contra-escrow-program-client",
  "contra-indexer",
  "contra-withdraw-program-client",
+ "futures 0.3.31",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "reqwest 0.11.27",
+ "rustls 0.23.31",
  "serde_json",
  "solana-address 1.0.0",
  "solana-client 3.0.6",
@@ -15540,7 +15551,12 @@ dependencies = [
  "solana-transaction-status 2.3.10",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tokio-util 0.7.16",
+ "tonic 0.14.2",
  "tracing",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]

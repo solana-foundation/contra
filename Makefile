@@ -64,22 +64,10 @@ integration-test:
 	@echo "Running integration tests for all projects..."
 	@$(MAKE) -C contra-escrow-program integration-test
 	@$(MAKE) -C contra-withdraw-program integration-test
-	@echo "Running contra integration test (with production build)..."
-	@cd integration && cargo nextest run --test contra_integration
-	@echo "Running reconciliation integration tests..."
-	@cd integration && cargo test --test reconciliation_integration -- --nocapture
-	@echo "Running mint idempotency integration tests..."
-	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
-	@echo "Running gap detection integration tests..."
-	@cd integration && cargo test --test gap_detection_integration -- --nocapture
-	@echo "Running truncate integration tests..."
-	@cd integration && cargo test --test truncate_integration -- --nocapture
-	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
-	@$(MAKE) -C contra-escrow-program build-test
-	@echo "Running indexer integration test (with test-tree build)..."
-	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@echo "Running operator lifecycle integration tests (with test-tree build)..."
-	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@# Delegate to integration/Makefile so escrow-feature grouping + the full
+	@# `[[test]]` set stay in one place. See integration/Makefile:integration-test
+	@# for the contra/test-tree/prod group ordering.
+	@$(MAKE) -C integration integration-test
 
 ci-unit-test:
 	@echo "Running CI unit tests for core + indexer..."
@@ -94,44 +82,107 @@ ci-integration-test:
 	@$(MAKE) ci-integration-test-build-test-tree
 
 ci-integration-test-build-test-tree:
+	@# Order matters: prod-feature first (escrow already prod from caller),
+	@# then rebuild test-tree, then run only test-tree-feature tests. Mixing
+	@# escrow features in a single run poisons the validator_helper Once.
 	@$(MAKE) ci-integration-test-prebuilt
 	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
 	@$(MAKE) -C contra-escrow-program build-test
-	@echo "Running indexer integration test (with test-tree build)..."
+	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@echo "Running operator lifecycle integration tests (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 
 ci-integration-test-prebuilt:
-	@echo "Running contra integration test (with production build)..."
+	@# Prod-feature suites that assume a prod escrow `.so` is already in
+	@# target/deploy/. Caller is responsible for the build. Keep in sync with
+	@# integration/Makefile's `integration-coverage-contra` (contra group) and
+	@# the prod-feature subset of `integration-coverage-indexer`.
+	@echo "=== contra group (prod escrow) ==="
 	@cd integration && cargo nextest run --test contra_integration
-	@echo "Running reconciliation integration tests..."
+	@cd integration && cargo test --test test_rpc_http_malformed -- --nocapture
+	@cd integration && cargo test --test test_simulate_transaction_guards -- --nocapture
+	@cd integration && cargo test --test test_health_endpoint_standalone -- --nocapture
+	@cd integration && cargo test --test test_sequencer_zero_deadline -- --nocapture
+	@cd integration && cargo test --test test_signatures_corruption_guard -- --nocapture
+	@cd integration && cargo test --test test_node_config_validation -- --nocapture
+	@cd integration && cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
+	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
-	@echo "Running mint idempotency integration tests..."
 	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
-	@echo "Running gap detection integration tests..."
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
-	@echo "Running truncate integration tests..."
 	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@cd integration && cargo test --test resync_integration -- --nocapture
+	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
+	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
+	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
+	@cd integration && cargo test --test remint_recovery -- --nocapture
+	@cd integration && cargo test --test bootstrap_validation -- --nocapture
+	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
+	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
+	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
+	@cd integration && cargo test --test yellowstone_inner_and_unknown -- --nocapture
+	@cd integration && cargo test --test harness_sanity -- --nocapture
+	@cd integration && cargo test --test sender_mint_idempotency -- --nocapture
+	@cd integration && cargo test --test sender_mint_validator_encodings -- --nocapture
+	@cd integration && cargo test --test sender_mint_signature_failures -- --nocapture
+	@cd integration && cargo test --test sender_poll_rpc_error -- --nocapture
+	@cd integration && cargo test --test sender_sign_and_send_error -- --nocapture
+	@cd integration && cargo test --test sender_max_retries -- --nocapture
+	@cd integration && cargo test --test sender_onchain_error_arms -- --nocapture
+	@cd integration && cargo test --test jit_mint_helper -- --nocapture
+	@cd integration && cargo test --test storage_update_failure -- --nocapture
+	@cd integration && cargo test --test processor_quarantine -- --nocapture
+	@cd integration && cargo test --test state_recovery_malformed -- --nocapture
+	@cd integration && cargo test --test remint_flow -- --nocapture
+	@cd integration && cargo test --test mint_builder_validation -- --nocapture
+	@cd integration && cargo test --test sender_channel_close -- --nocapture
+	@cd integration && cargo test --test sender_cancellation_drain -- --nocapture
 
 # CI-focused integration target that runs indexer integration tests only.
+# Same group-ordering invariant as integration/Makefile:integration-coverage-indexer:
+#   1. Build test-tree → run test-tree-feature tests.
+#   2. Rebuild escrow as prod → run prod-feature indexer tests.
 ci-integration-test-indexer:
-	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
+	@echo "Building escrow with test-tree for test-tree-feature group..."
 	@$(MAKE) -C contra-escrow-program build-test
-	@echo "Running indexer integration test (with test-tree build)..."
+	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@echo "Running reconciliation integration tests..."
-	@cd integration && cargo test --test reconciliation_integration -- --nocapture
-	@echo "Running mint idempotency integration tests..."
-	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
-	@echo "Running gap detection integration tests..."
-	@cd integration && cargo test --test gap_detection_integration -- --nocapture
-	@echo "Running truncate integration tests..."
-	@cd integration && cargo test --test truncate_integration -- --nocapture
-	@echo "Running operator lifecycle integration tests (with test-tree build)..."
 	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
-	@echo "Running reconciliation e2e tests..."
-	@cd indexer && cargo test --test reconciliation_e2e_test -- --nocapture
+	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
+	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
+	@$(MAKE) -C contra-escrow-program build-no-clients
+	@echo "=== prod-feature indexer group ==="
+	@cd integration && cargo test --test reconciliation_integration -- --nocapture
+	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
+	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@cd integration && cargo test --test resync_integration -- --nocapture
+	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
+	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
+	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
+	@cd integration && cargo test --test remint_recovery -- --nocapture
+	@cd integration && cargo test --test bootstrap_validation -- --nocapture
+	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
+	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
+	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
+	@cd integration && cargo test --test yellowstone_inner_and_unknown -- --nocapture
+	@cd integration && cargo test --test harness_sanity -- --nocapture
+	@cd integration && cargo test --test sender_mint_idempotency -- --nocapture
+	@cd integration && cargo test --test sender_mint_validator_encodings -- --nocapture
+	@cd integration && cargo test --test sender_mint_signature_failures -- --nocapture
+	@cd integration && cargo test --test sender_poll_rpc_error -- --nocapture
+	@cd integration && cargo test --test sender_sign_and_send_error -- --nocapture
+	@cd integration && cargo test --test sender_max_retries -- --nocapture
+	@cd integration && cargo test --test sender_onchain_error_arms -- --nocapture
+	@cd integration && cargo test --test jit_mint_helper -- --nocapture
+	@cd integration && cargo test --test storage_update_failure -- --nocapture
+	@cd integration && cargo test --test processor_quarantine -- --nocapture
+	@cd integration && cargo test --test state_recovery_malformed -- --nocapture
+	@cd integration && cargo test --test remint_flow -- --nocapture
+	@cd integration && cargo test --test mint_builder_validation -- --nocapture
+	@cd integration && cargo test --test sender_channel_close -- --nocapture
+	@cd integration && cargo test --test sender_cancellation_drain -- --nocapture
 
 # Backward-compatible aliases.
 unit-test-ci: ci-unit-test

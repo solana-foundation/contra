@@ -13,6 +13,9 @@
 //! 6. Idle operator: no phantom records created when the DB has no pending work.
 //! 7. Periodic reconciliation: mismatch between DB totals and on-chain ATA fires a webhook.
 //! 8. Sequential withdrawals: two consecutive withdrawal nonces both complete correctly.
+//! 9. SMT root mismatch on startup: a poisoned local SMT state (nonce 0 completed but
+//!    on-chain disagrees) must drive the next pending withdrawal out of `pending` via
+//!    the fatal-error path instead of silently completing.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -30,6 +33,7 @@ use contra_indexer::storage::common::models::{
 };
 use contra_indexer::storage::{PostgresDb, Storage, TransactionType};
 use contra_indexer::PostgresConfig;
+use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
@@ -436,7 +440,11 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig, 180).await?;
+    // Use the env-aware timeout so coverage-instrumented runs (which set
+    // CONTRA_TEST_WAIT_TIMEOUT_SECS=600) don't hit the 180 s ceiling that was
+    // tuned for uninstrumented nextest.
+    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig, *WAIT_TIMEOUT_SECS)
+        .await?;
 
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
@@ -449,14 +457,16 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     Ok(())
 }
 
-/// Triggers one failed mint (invalid mint account) and one failed withdrawal
-/// (mint not whitelisted on the instance) and asserts that the configured
-/// `alert_webhook_url` receives exactly two POST requests — one per failure.
+/// Triggers one failed mint (wrong-authority `mint_to`, rejected at preflight)
+/// and one bad withdrawal (mint not whitelisted on the instance, escalated to
+/// `ManualReview` because the burn never produced a verifiable signature) and
+/// asserts that the configured `alert_webhook_url` receives exactly two POST
+/// requests — `db_transaction_writer::send_webhook_alert` fires for both
+/// `Failed` and `ManualReview` dispositions.
 ///
 /// Uses a `mockito` HTTP server as the webhook endpoint so no external service
 /// is required.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "bad deposit never reaches failed status - under investigation"]
 async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Operator Lifecycle: Alerts on Failure ===");
 
@@ -592,7 +602,14 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     )
     .await?;
 
-    wait_for_transaction_status(&pool, &withdrawal_sig, "failed", 180).await?;
+    // The bad withdrawal preflights with `invalid account data for instruction`
+    // from the escrow program (the mint isn't whitelisted on the instance), so
+    // `sign_and_send` errors before any signature is broadcast. With no
+    // signatures to verify, the sender's "cannot safely remint" branch
+    // (`indexer/src/operator/sender/transaction.rs`) routes the row to
+    // `ManualReview`, NOT `Failed` — reverting that to `Failed` would risk
+    // double-reminting if the broadcast had succeeded silently.
+    wait_for_transaction_status(&pool, &withdrawal_sig, "manual_review", 180).await?;
 
     alert_mock.assert();
 
@@ -1009,6 +1026,150 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
         final_balance,
         initial_balance + (WITHDRAWAL_AMOUNT as u64) * 2,
         "User should have received both withdrawal amounts"
+    );
+
+    operator_handle.shutdown().await;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SMT root mismatch detected when processing a withdrawal
+//
+// The withdrawal-side operator's `initialize_smt_state` fetches the on-chain
+// SMT root from the escrow instance PDA, rebuilds the same root locally from
+// completed withdrawal nonces in the DB, and refuses to proceed if the two
+// don't match (see `initialize_smt_state` in `sender/state.rs`). The check
+// runs *lazily* — only when the first `ReleaseFunds` transaction is about
+// to be built (see `handle_transaction_builder` in `sender/transaction.rs`).
+//
+// Production behaviour on mismatch: the error propagates up to the
+// `handle_transaction_builder` caller, which logs it, increments an error
+// counter, and calls `send_fatal_error` to mark the specific withdrawal as
+// failed. The operator process itself keeps running so that other
+// (non-withdrawal) pipelines aren't taken down.
+//
+// We trigger the mismatch by pre-seeding:
+//   (a) a COMPLETED withdrawal at nonce 0 — poisons the SMT state
+//   (b) a PENDING withdrawal at nonce 1 — forces the SMT-init path to run
+// and assert the pending withdrawal transitions to a non-pending terminal
+// status (the fatal-error path inside `handle_transaction_builder`) within
+// a bounded wait.
+//
+// Target: the `SmtRootMismatch` branch in `sender/state.rs`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use test_utils::operator_helper::start_contra_to_solana_operator;
+
+    println!("=== Operator Lifecycle: SMT Root Mismatch Aborts Startup ===");
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("operator_smt_mismatch")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/operator_smt_mismatch",
+        pg_host, pg_port
+    );
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    // Fresh instance: on-chain SMT root is [0u8; 32] (empty tree).
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 0, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+
+    // Step 1: seed the DB with a COMPLETED withdrawal at nonce 0 — this
+    // poisons the SMT state: when the operator rebuilds the SMT locally
+    // it will insert nonce 0 and compute a non-zero root, while the fresh
+    // on-chain instance still has the default empty root.
+    let poison_sig = Signature::new_unique().to_string();
+    let fake_completed = make_withdrawal_transaction(
+        poison_sig.clone(),
+        env.mint.to_string(),
+        env.users[0].pubkey().to_string(),
+        10_000,
+        0, // nonce
+    );
+    storage.insert_db_transaction(&fake_completed).await?;
+    sqlx::query(
+        "UPDATE transactions SET status = 'completed'::transaction_status WHERE signature = $1",
+    )
+    .bind(&poison_sig)
+    .execute(&pool)
+    .await?;
+
+    // Step 2: add a PENDING withdrawal at nonce 1 so the operator has
+    // something to process. SMT init runs lazily on the first ReleaseFunds
+    // transaction (see `handle_transaction_builder` in
+    // `sender/transaction.rs`); without this trigger the mismatch branch
+    // is never reached.
+    let trigger_sig = Signature::new_unique().to_string();
+    let trigger_withdrawal = make_withdrawal_transaction(
+        trigger_sig.clone(),
+        env.mint.to_string(),
+        env.users[0].pubkey().to_string(),
+        5_000,
+        1, // nonce
+    );
+    storage.insert_db_transaction(&trigger_withdrawal).await?;
+
+    // Start the withdrawal-side operator. When it picks up the pending
+    // nonce-1 withdrawal, `initialize_smt_state` runs, detects the
+    // mismatch, and triggers the `send_fatal_error` path for that
+    // transaction.
+    let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let operator_handle = start_contra_to_solana_operator(
+        test_validator.rpc_url(),
+        db_url.clone(),
+        operator_keypair,
+        env.instance,
+    )
+    .await?;
+
+    // Wait for the pending nonce-1 withdrawal to transition out of
+    // Pending. A healthy operator would mark it `completed`; a
+    // mismatch-poisoned operator's fatal-error path must mark it
+    // `failed` (or some other terminal non-pending state).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut terminal_status = String::from("pending");
+    while std::time::Instant::now() < deadline {
+        if let Some(tx) = db::get_transaction(&pool, &trigger_sig).await? {
+            if tx.status != "pending" {
+                terminal_status = tx.status;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert_ne!(
+        terminal_status, "pending",
+        "operator must have moved the trigger tx out of 'pending'; SMT mismatch path never ran"
+    );
+    assert_ne!(
+        terminal_status, "completed",
+        "SMT-poisoned pending withdrawal must NOT reach 'completed'; the mismatch \
+         detection branch in `initialize_smt_state` was bypassed. Got: {terminal_status}"
     );
 
     operator_handle.shutdown().await;

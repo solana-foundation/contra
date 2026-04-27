@@ -6,7 +6,7 @@ PROGRAM_SO := ../target/deploy/contra_escrow_program.so
 PROGRAM_KEYPAIR := ../target/deploy/contra_escrow_program-keypair.json
 PROGRAM_ENV_KEY := ESCROW_PROGRAM_ID
 
-.PHONY: install build build-test fmt generate-idl generate-clients
+.PHONY: install build build-test build-no-clients fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
 .PHONY: unit-coverage coverage-html all-coverage
 .PHONY: build-localnet build-devnet deploy-devnet
@@ -18,11 +18,19 @@ install:
 # Build the program
 build:
 	$(MAKE) generate-clients
-	cargo-build-sbf
+	cd program && cargo-build-sbf
 
 # Build the program with test-tree feature for integration tests
 build-test:
 	cd program && cargo-build-sbf --features test-tree
+
+# Build the prod program WITHOUT regenerating IDL / clients. Use after
+# `make build` (or after restoring a CI artifact that already contains
+# `clients/` and `idl/`) when you only need to rebuild the BPF binary —
+# e.g. mid-test-suite when toggling between test-tree and prod features.
+# Avoids the pnpm dependency that `generate-clients` requires.
+build-no-clients:
+	cd program && cargo-build-sbf
 
 # Format / lint code
 fmt:

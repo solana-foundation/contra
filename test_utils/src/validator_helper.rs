@@ -7,7 +7,13 @@ use {
     solana_sdk::signature::Keypair,
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_test_validator::{TestValidator, TestValidatorGenesis, UpgradeableProgramInfo},
-    std::{io::Write, net::TcpListener, path::PathBuf},
+    std::{
+        fs,
+        io::Write,
+        net::TcpListener,
+        path::{Path, PathBuf},
+        sync::Once,
+    },
 };
 
 fn get_free_port() -> u16 {
@@ -42,6 +48,139 @@ const GEYSER_PLUGIN_PATH: &str = concat!(
     "/geyser/libyellowstone_grpc_geyser.so"
 );
 
+/// Preflight check: verify the escrow `.so` that solana-test-validator is
+/// about to load was built with the same `test-tree` feature flag as the
+/// `contra-indexer` crate this binary is linked against.
+///
+/// Why this exists:
+///   `target/deploy/contra_escrow_program.so` is a single artifact path
+///   that both prod (`make build`) and test-tree (`make build-test`) builds
+///   overwrite. Meanwhile the indexer's SMT empty-tree root is a compile-
+///   time constant derived from the `test-tree` feature on the
+///   `contra-indexer` crate. If the two disagree, the operator computes
+///   one empty root locally and sees a different one on-chain, refuses to
+///   build withdrawals, and the test times out 2+ minutes later with a
+///   cryptic balance assertion failure.
+///
+///   This preflight reads cargo's build fingerprint for the escrow
+///   program, matches it to the deployed `.so` by mtime, and panics with
+///   actionable instructions if the feature set doesn't match this crate.
+fn verify_escrow_program_features_match_indexer(program_path: &Path) {
+    static CHECKED: Once = Once::new();
+    CHECKED.call_once(|| {
+        // Detect the test-tree feature via the indexer's TREE_HEIGHT constant.
+        // Prod build: TREE_HEIGHT=16. test-tree build: TREE_HEIGHT=3.
+        let expected_test_tree = contra_indexer::operator::tree_constants::TREE_HEIGHT != 16;
+        let so_mtime = match fs::metadata(program_path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "Preflight: cannot stat {}: {e}. Skipping feature check.",
+                    program_path.display()
+                );
+                return;
+            }
+        };
+
+        // Cargo's sbpf fingerprint lives in target/sbpf-solana-solana/release/
+        // .fingerprint/contra-escrow-program-<hash>/lib-contra_escrow_program.json.
+        // The workspace target dir is two parents up from test_utils/programs/.
+        let workspace_root = match program_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!("Preflight: cannot locate workspace root. Skipping.");
+                return;
+            }
+        };
+        let fingerprint_dir = workspace_root.join("target/sbpf-solana-solana/release/.fingerprint");
+        if !fingerprint_dir.exists() {
+            tracing::warn!(
+                "Preflight: fingerprint dir {} missing. Skipping feature check.",
+                fingerprint_dir.display()
+            );
+            return;
+        }
+
+        // Find the fingerprint JSON whose mtime is closest-before the .so mtime.
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+        if let Ok(entries) = fs::read_dir(&fingerprint_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with("contra-escrow-program-") {
+                    continue;
+                }
+                let json_path = entry.path().join("lib-contra_escrow_program.json");
+                let Ok(meta) = fs::metadata(&json_path) else {
+                    continue;
+                };
+                let Ok(mtime) = meta.modified() else { continue };
+                if mtime > so_mtime {
+                    continue; // built after the .so we're loading
+                }
+                if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                    best = Some((mtime, json_path));
+                }
+            }
+        }
+
+        let Some((_, fp_path)) = best else {
+            tracing::warn!("Preflight: no matching fingerprint for deployed escrow .so. Skipping.");
+            return;
+        };
+
+        let Ok(contents) = fs::read_to_string(&fp_path) else {
+            return;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            return;
+        };
+        let features = json.get("features").and_then(|v| v.as_str()).unwrap_or("");
+        let deployed_test_tree = features.contains("test-tree");
+
+        if deployed_test_tree != expected_test_tree {
+            let (deployed_name, expected_name) = (
+                if deployed_test_tree {
+                    "test-tree"
+                } else {
+                    "production"
+                },
+                if expected_test_tree {
+                    "test-tree"
+                } else {
+                    "production"
+                },
+            );
+            let rebuild_cmd = if expected_test_tree {
+                "make -C contra-escrow-program build-test"
+            } else {
+                "make -C contra-escrow-program build"
+            };
+            panic!(
+                "\n\n\
+                ========================================================================\n\
+                SMT TREE FEATURE MISMATCH — test would fail with 'SMT root mismatch'\n\
+                ========================================================================\n\
+                Deployed escrow `.so` features: {deployed_name}\n\
+                Current test binary expects:    {expected_name}\n\
+                \n\
+                The indexer's `EMPTY_TREE_ROOT` is a compile-time constant that\n\
+                depends on the `test-tree` feature. It must match the escrow program\n\
+                loaded into solana-test-validator, or the operator will refuse to\n\
+                build withdrawal transactions (see indexer/src/operator/sender/state.rs).\n\
+                \n\
+                Rebuild the escrow program to match:\n\
+                    {rebuild_cmd}\n\
+                ========================================================================\n\n"
+            );
+        }
+    });
+}
+
 fn make_program_info(program_id_bytes: [u8; 32], program_path: &str) -> UpgradeableProgramInfo {
     UpgradeableProgramInfo {
         program_id: Address::new_from_array(program_id_bytes),
@@ -70,6 +209,8 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
         enable_rpc_transaction_history: true,
         ..Default::default()
     };
+
+    verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
     let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
         let escrow_program =
@@ -143,6 +284,8 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
         enable_rpc_transaction_history: true,
         ..Default::default()
     };
+
+    verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
     let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
         let escrow_program =

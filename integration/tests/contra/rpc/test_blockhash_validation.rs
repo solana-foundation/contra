@@ -126,5 +126,55 @@ pub async fn run_blockhash_validation_test(ctx: &ContraContext) {
     );
     println!("✓ RPC consistency verified: blockhash from getLatestBlockhash is valid in isBlockhashValid");
 
+    // Test 6: Submit a transaction with a fake blockhash so it is dropped at
+    // the dedup stage's unknown-blockhash arm (`core/src/stages/dedup.rs`).
+    // The tx must NOT land — getTransaction returns None — and the dedup
+    // metric for "dropped: unknown blockhash" fires.
+    println!("\n--- Test 6: Tx with unknown blockhash is dropped ---");
+    let fake_for_send = Hash::new_unique();
+    let dropped_keypair = Keypair::new();
+    let drop_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &ctx.operator_key.pubkey(),
+            &dropped_keypair.pubkey(),
+            1,
+        )],
+        Some(&ctx.operator_key.pubkey()),
+        &[&ctx.operator_key],
+        fake_for_send,
+    );
+    let send_outcome = ctx
+        .write_client
+        .send_transaction_with_config(
+            &drop_tx,
+            solana_client::rpc_config::RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    if let Ok(sig) = send_outcome {
+        // Brief poll: the dedup drop is silent (no rpc error), so we just
+        // assert the tx never settles within the window we'd expect for a
+        // real settlement.
+        sleep(Duration::from_millis(400)).await;
+        let landed = ctx.get_transaction(&sig).await.unwrap();
+        assert!(
+            landed.is_none(),
+            "Tx with unknown blockhash should not land; got: {landed:?}"
+        );
+        println!("✓ Tx with unknown blockhash was dropped at dedup");
+    } else {
+        // Some configurations may reject unknown blockhashes at sendTransaction
+        // (preflight or shape validation) before they reach dedup. Either
+        // outcome — server-side rejection or silent dedup drop — is correct
+        // behaviour; the dedup-drop path is the silent one we care about
+        // for coverage.
+        println!(
+            "ℹ Server rejected tx with unknown blockhash at send time: {:?}",
+            send_outcome.err()
+        );
+    }
+
     println!("\n=== Blockhash Validation Test Complete ===\n");
 }

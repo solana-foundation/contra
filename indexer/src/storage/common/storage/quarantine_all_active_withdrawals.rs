@@ -26,7 +26,7 @@ pub async fn quarantine_all_active_withdrawals(
             .quarantine_all_active_withdrawals_internal(exclude_id)
             .await
             .map_err(StorageError::from),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.quarantine_all_active_withdrawals(exclude_id).await,
     }
 }

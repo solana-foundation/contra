@@ -15,7 +15,7 @@ pub async fn get_pending_db_transactions(
         Storage::Postgres(db) => Ok(db
             .get_pending_withdrawals_internal(transaction_type, limit)
             .await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => {
             mock_db
                 .get_pending_db_transactions(transaction_type, limit)

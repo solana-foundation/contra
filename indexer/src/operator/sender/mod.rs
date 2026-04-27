@@ -8,6 +8,143 @@ pub mod types;
 pub use mint::{find_existing_mint_signature, find_existing_mint_signature_with_memo};
 pub use types::TransactionStatusUpdate;
 
+#[cfg(any(test, feature = "test-mock-storage"))]
+pub mod test_hooks {
+    //! Test-only re-exports of `pub(super)` constructors/recovery paths.
+    //! Gated behind `test-mock-storage` so production builds get the
+    //! same narrow API surface they always have.
+    use super::*;
+    use solana_sdk::commitment_config::CommitmentLevel;
+    use std::sync::Arc;
+
+    pub fn new_sender_state(
+        config: &ContraIndexerConfig,
+        operator_commitment: CommitmentLevel,
+        instance_pda: Option<solana_sdk::pubkey::Pubkey>,
+        storage: Arc<Storage>,
+        retry_max_attempts: u32,
+        confirmation_poll_interval_ms: u64,
+        source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+    ) -> Result<SenderState, OperatorError> {
+        SenderState::new(
+            config,
+            operator_commitment,
+            instance_pda,
+            storage,
+            retry_max_attempts,
+            confirmation_poll_interval_ms,
+            source_rpc_client,
+        )
+    }
+
+    pub async fn recover_pending_remints(
+        state: &mut SenderState,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) -> Result<(), OperatorError> {
+        state.recover_pending_remints(storage_tx).await
+    }
+
+    pub async fn jit_mint_init(
+        state: &mut SenderState,
+        transaction_id: i64,
+        instruction: super::types::InstructionWithSigners,
+    ) -> Option<super::types::InstructionWithSigners> {
+        super::mint::try_jit_mint_initialization(state, transaction_id, instruction).await
+    }
+
+    /// Drives `process_pending_remints` end-to-end. Each call walks
+    /// every matured `PendingRemint` in `state.pending_remints` and
+    /// either re-queues it (RPC error), promotes to `Completed`
+    /// (withdrawal finalized), or hands off to `execute_deferred_remint`.
+    pub async fn process_pending_remints(
+        state: &mut SenderState,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::remint::process_pending_remints(state, storage_tx).await
+    }
+
+    /// Drives `execute_deferred_remint` for a single matured entry.
+    /// Skips the queue-management layer of `process_pending_remints`,
+    /// allowing tests to pin the `attempt_remint → status update`
+    /// transition in isolation.
+    pub async fn execute_deferred_remint(
+        state: &SenderState,
+        entry: &super::types::PendingRemint,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::remint::execute_deferred_remint(state, entry, storage_tx).await
+    }
+
+    /// Drives a single `poll_in_flight` cycle. Drains
+    /// `state.in_flight`, calls `getSignatureStatuses`, and either
+    /// routes results via `route_poll_results` or — on RPC error —
+    /// puts the batch back unchanged for the next tick.
+    pub async fn poll_in_flight(
+        state: &mut SenderState,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::transaction::poll_in_flight(state, storage_tx).await
+    }
+
+    /// Drives `handle_confirmation_result` end-to-end. Used by tests
+    /// that synthesise a `Result<ConfirmationResult, TransactionError>`
+    /// to pin which on-chain error arm routes where without going
+    /// through the wire layer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_confirmation_result(
+        state: &mut SenderState,
+        result: Result<
+            crate::operator::utils::transaction_util::ConfirmationResult,
+            crate::error::TransactionError,
+        >,
+        signature: solana_sdk::signature::Signature,
+        compute_unit_price: Option<u64>,
+        ctx: &super::types::TransactionContext,
+        instruction: super::types::InstructionWithSigners,
+        retry_policy: crate::operator::utils::instruction_util::RetryPolicy,
+        extra_error_checks_policy: &crate::operator::utils::instruction_util::ExtraErrorCheckPolicy,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::transaction::handle_confirmation_result(
+            state,
+            result,
+            signature,
+            compute_unit_price,
+            ctx,
+            instruction,
+            retry_policy,
+            extra_error_checks_policy,
+            storage_tx,
+        )
+        .await
+    }
+
+    /// Drives `send_and_confirm` end-to-end against whatever RPC the
+    /// `state.rpc_client` is wired to. Fire-and-forget: results land on
+    /// `storage_tx` and `state.{retry_counts, in_flight, pending_remints}`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_send_and_confirm(
+        state: &mut SenderState,
+        instruction: super::types::InstructionWithSigners,
+        compute_unit_price: Option<u64>,
+        ctx: &super::types::TransactionContext,
+        retry_policy: crate::operator::utils::instruction_util::RetryPolicy,
+        extra_error_checks_policy: &crate::operator::utils::instruction_util::ExtraErrorCheckPolicy,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::transaction::send_and_confirm(
+            state,
+            instruction,
+            compute_unit_price,
+            ctx,
+            retry_policy,
+            extra_error_checks_policy,
+            storage_tx,
+        )
+        .await
+    }
+}
+
 use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::TransactionBuilder;
 use crate::operator::ReleaseFundsBuilderWithNonce;

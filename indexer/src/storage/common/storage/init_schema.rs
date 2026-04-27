@@ -6,7 +6,7 @@ pub async fn init_schema(storage: &Storage) -> Result<(), StorageError> {
             db.init_schema().await?;
             Ok(())
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.init_schema().await,
     }
 }

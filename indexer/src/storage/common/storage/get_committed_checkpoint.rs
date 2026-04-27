@@ -6,7 +6,7 @@ pub async fn get_committed_checkpoint(
 ) -> Result<Option<u64>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.get_committed_checkpoint_internal(program_type).await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.get_committed_checkpoint(program_type).await,
     }
 }

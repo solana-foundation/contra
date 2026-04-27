@@ -11,25 +11,64 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
-.PHONY: install build fmt generate-idl generate-clients
+.PHONY: install install-toolchain check-toolchain build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test all-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
 .PHONY: unit-coverage coverage-html all-coverage ci-unit-coverage ci-e2e-coverage
-.PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean
+.PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean ensure-geyser-plugin
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
 
 all: build
 
-install:
+# versions.env is the source of truth for SOLANA_VERSION; when absent (e.g.
+# inside the Docker build context, where the CLI is already installed by the
+# Dockerfile's ARG), we skip rather than fail.
+install-toolchain:
+	@if [ -f versions.env ]; then set -a; source versions.env; set +a; fi; \
+	if [ -z "$${SOLANA_VERSION:-}" ]; then \
+	    echo "SOLANA_VERSION not set (no versions.env, no env override) — skipping Solana CLI install"; \
+	elif ! command -v solana >/dev/null 2>&1 || \
+	     [ "$$(solana --version 2>/dev/null | awk '{print $$2}')" != "$$SOLANA_VERSION" ]; then \
+	    echo "Installing Solana CLI v$$SOLANA_VERSION..."; \
+	    sh -c "$$(curl -sSfL https://release.anza.xyz/v$$SOLANA_VERSION/install)"; \
+	else \
+	    echo "Solana CLI already at v$$SOLANA_VERSION — skipping"; \
+	fi
+	@# Warm the SBF platform tools cache so the first `make build`
+	@# doesn't interleave a large download with compilation output.
+	@cargo-build-sbf --version >/dev/null 2>&1 || true
+	@# rustup toolchain for the host side (core/indexer/gateway/auth).
+	@# rust-toolchain.toml drives the channel; this just pre-fetches it.
+	@if command -v rustup >/dev/null 2>&1; then \
+	    rustup show active-toolchain >/dev/null 2>&1 || rustup toolchain install; \
+	else \
+	    echo "rustup not found; install it manually (https://rustup.rs) then re-run"; \
+	fi
+
+check-toolchain:
+	@if [ -f versions.env ]; then set -a; source versions.env; set +a; fi; \
+	if [ -z "$${SOLANA_VERSION:-}" ]; then \
+	    echo "SOLANA_VERSION not set (no versions.env, no env override) — skipping check"; \
+	else \
+	    installed="$$(solana --version 2>/dev/null | awk '{print $$2}')"; \
+	    if [ "$$installed" != "$$SOLANA_VERSION" ]; then \
+	        echo "ERROR: solana CLI is '$$installed', versions.env pins '$$SOLANA_VERSION'."; \
+	        echo "Run: make install-toolchain"; \
+	        exit 1; \
+	    fi; \
+	fi
+	@command -v cargo-build-sbf >/dev/null || { echo "ERROR: cargo-build-sbf not on PATH"; exit 1; }
+
+install: install-toolchain ensure-geyser-plugin
 	@echo "Installing dependencies for all projects..."
 	@for dir in $(PROGRAM_DIRS); do \
 		$(MAKE) -C $$dir install; \
 	done
 
-build:
+build: check-toolchain
 	@echo "Building all projects..."
 	@for dir in $(PROGRAM_DIRS) $(RUST_DIRS); do \
 		$(MAKE) -C $$dir build; \
@@ -229,16 +268,17 @@ ci-e2e-coverage:
 # Integration Test Setup
 #############
 yellowstone-prepare:
-	@echo "Building Yellowstone Geyser plugin for Agave 3.0..."
-	@mkdir -p integration/.yellowstone-grpc
-	@if [ ! -d "integration/.yellowstone-grpc/.git" ]; then \
+	@set -a; source versions.env; set +a; \
+	echo "Building Yellowstone Geyser plugin at $$YELLOWSTONE_TAG..."; \
+	mkdir -p integration/.yellowstone-grpc; \
+	if [ ! -d "integration/.yellowstone-grpc/.git" ]; then \
 		echo "Cloning yellowstone-grpc repository..."; \
 		git clone https://github.com/rpcpool/yellowstone-grpc.git integration/.yellowstone-grpc; \
-	fi
-	@echo "Checking out Agave 3.0 compatible commit..."
-	@cd integration/.yellowstone-grpc && \
-		git fetch origin && \
-		git checkout f3d5e041c427f0f383b520c44b231c851d324ddc
+	fi; \
+	echo "Checking out $$YELLOWSTONE_TAG..."; \
+	cd integration/.yellowstone-grpc && \
+		git fetch origin --tags && \
+		git checkout "$$YELLOWSTONE_TAG"
 	@echo "Applying macOS compatibility fixes..."
 	@if [ "$$(uname)" = "Darwin" ]; then \
 		echo "Copying macOS-fixed files from test_utils/geyser/mac-files-fix/..."; \
@@ -275,7 +315,31 @@ yellowstone-clean:
 	@rm -rf integration/.yellowstone-grpc
 	@rm -f test_utils/geyser/libyellowstone_grpc_geyser.dylib
 	@rm -f test_utils/geyser/libyellowstone_grpc_geyser.so
+	@rm -f test_utils/geyser/.dylib-tag
 	@echo "Geyser artifacts cleaned"
+
+# Ensure the Yellowstone Geyser plugin is available for integration tests.
+#   Linux: the .so is checked into test_utils/geyser/ — just sanity-check it.
+#   macOS: build the .dylib from source on first run (~3-5 min) and cache it.
+#          Cross-compiling from Linux to macOS isn't practical (Apple SDK
+#          license + ABI fragility), so the .dylib is generated locally on
+#          each Mac. A stamp file tracks YELLOWSTONE_TAG so a versions.env
+#          bump triggers a rebuild but day-to-day `make install` is a no-op.
+ensure-geyser-plugin:
+	@set -a; source versions.env; set +a; \
+	if [ "$$(uname -s)" = "Darwin" ]; then \
+	    plugin=test_utils/geyser/libyellowstone_grpc_geyser.dylib; \
+	    stamp=test_utils/geyser/.dylib-tag; \
+	    if [ ! -f "$$plugin" ] || [ "$$(cat "$$stamp" 2>/dev/null)" != "$$YELLOWSTONE_TAG" ]; then \
+	        echo "macOS: building Yellowstone Geyser plugin $$YELLOWSTONE_TAG"; \
+	        echo "  one-time ~3-5 min build; the prebuilt .dylib was dropped"; \
+	        echo "  in the 3.1.13 bump (Linux->macOS cross-compile isn't viable)."; \
+	        $(MAKE) yellowstone-build-plugin && echo "$$YELLOWSTONE_TAG" > "$$stamp"; \
+	    fi; \
+	else \
+	    plugin=test_utils/geyser/libyellowstone_grpc_geyser.so; \
+	    [ -f "$$plugin" ] || { echo "ERROR: $$plugin missing (should be checked in)"; exit 1; }; \
+	fi
 
 # Backward-compatible aliases.
 download-yellowstone-grpc: yellowstone-prepare

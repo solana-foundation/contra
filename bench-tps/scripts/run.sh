@@ -327,8 +327,11 @@ fi
 #
 # The COMPOSE array is built as an array (not a string) to safely handle paths
 # that might contain spaces.
+#
+# versions.env is layered under BENCH_ENV so SOLANA_VERSION / YELLOWSTONE_TAG
+# reach the Dockerfile ARGs while bench-tps/.env values still win on conflict.
 # ---------------------------------------------------------------------------
-COMPOSE=(docker compose -f "${REPO_ROOT}/docker-compose.yml" --env-file "${BENCH_ENV}")
+COMPOSE=(docker compose -f "${REPO_ROOT}/docker-compose.yml" --env-file "${REPO_ROOT}/versions.env" --env-file "${BENCH_ENV}")
 
 BUILT_IMAGES=(contra-write-node contra-read-node contra-gateway contra-streamer contra-activity contra-validator contra-indexer-solana contra-indexer-contra contra-operator-solana contra-operator-contra contra-prometheus)
 BUILT_SERVICES=(write-node read-node gateway streamer activity validator indexer-solana indexer-contra operator-solana operator-contra prometheus)

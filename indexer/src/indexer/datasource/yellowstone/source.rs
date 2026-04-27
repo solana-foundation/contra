@@ -1,3 +1,4 @@
+use super::convert::create_message;
 use crate::metrics;
 use async_trait::async_trait;
 use contra_metrics::MetricLabel;
@@ -12,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{debug, error, info};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
-use yellowstone_grpc_proto::convert_from::create_message;
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions, SubscribeRequestPing,

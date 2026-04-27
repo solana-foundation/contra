@@ -31,7 +31,6 @@ http-body-util = { workspace = true }
 # Kept optional to avoid dragging proto/tonic-server codegen into downstream
 # consumers of `test_utils` that never touch the Yellowstone path.
 yellowstone-grpc-proto = { workspace = true, features = [
-    "plugin",
     "tonic",
 ], optional = true }
 tonic = { version = "0.14.2", features = ["server", "transport"], optional = true }

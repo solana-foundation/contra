@@ -16,6 +16,9 @@ install:
 	pnpm install
 
 # Build the program
+# cargo-build-sbf must run from program/ so it sees only the on-chain package.
+# From escrow-program root it also pulls the client crate (with host-only deps
+# like tokio/mio/socket2) and fails under solana CLI 3.1.13's stricter sbf target.
 build:
 	$(MAKE) generate-clients
 	cd program && cargo-build-sbf
@@ -87,7 +90,7 @@ all-coverage: unit-coverage coverage-html
 #############
 build-localnet:
 	$(MAKE) generate-clients
-	cargo-build-sbf
+	cd program && cargo-build-sbf
 	@echo "Updating .env.local with program IDs..."
 	@../scripts/update-program-env.sh ../.env.local $(PROGRAM_ENV_KEY) $(PROGRAM_KEYPAIR)
 
@@ -98,7 +101,7 @@ build-localnet:
 # Build the program with devnet feature
 build-devnet:
 	$(MAKE) generate-clients
-	cargo-build-sbf
+	cd program && cargo-build-sbf
 
 # Deploy to devnet
 deploy-devnet: build-devnet

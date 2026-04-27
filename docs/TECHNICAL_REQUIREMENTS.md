@@ -110,7 +110,7 @@ These components have minimal compute requirements relative to the write node. S
 | Software | Minimum Version | Purpose |
 |----------|----------------|---------|
 | [**Rust**](https://rust-lang.org/tools/install/) | 1.91+ | Building Contra programs and core components (pinned via `rust-toolchain.toml`) |
-| [**Solana CLI**](https://solana.com/docs/intro/installation) | 2.2.19+ (programs)<br/>2.3.9+ (Yellowstone) | Program deployment and interaction |
+| [**Solana CLI**](https://solana.com/docs/intro/installation) | See [`versions.env`](../versions.env) | Program deployment and interaction. Install via `make install-toolchain`. |
 | [**Docker**](https://docs.docker.com/get-docker/) | 26.0+ | Containerized deployment |
 | [**Docker Compose**](https://docs.docker.com/compose/install/) | 2.20+ | Multi-container orchestration |
 | [**PostgreSQL**](https://www.postgresql.org/download/) | 16+ | Database (if not using Docker) |

@@ -1,7 +1,13 @@
 # Multi-stage Dockerfile for Contra blockchain
+#
+# SOLANA_VERSION is the source of truth in versions.env.
+# Build via: `docker compose --env-file versions.env --env-file .env build <service>`
+
+ARG SOLANA_VERSION
 
 # Stage 1: Builder
 FROM --platform=linux/amd64 rust:bookworm AS builder
+ARG SOLANA_VERSION
 
 # Install build dependencies and update to nightly
 RUN apt-get update && apt-get install -y \
@@ -23,8 +29,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && npm install -g pnpm@latest \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Solana CLI (stable version)
-RUN sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.19/install)" \
+# Install Solana CLI — version driven by versions.env (SOLANA_VERSION).
+# Drifting this version from the validator image or from Cargo.toml's solana-* crates
+# reproduces the version-matrix bug that motivated consolidating into versions.env.
+RUN test -n "${SOLANA_VERSION}" || (echo "ERROR: SOLANA_VERSION build arg is required (use --env-file versions.env)" && exit 1) \
+    && sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)" \
     && echo 'export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"' >> ~/.bashrc
 ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
 

@@ -1,3 +1,9 @@
+# Build-arg anchor for Solana toolchain consumers.
+# Values come from versions.env 
+# Invoke compose with `--env-file versions.env --env-file .env.devnet`.
+x-solana-build-args: &solana-build-args
+  SOLANA_VERSION: ${SOLANA_VERSION}
+
 services:
   # PostgreSQL Primary (for write node)
   postgres-primary:
@@ -45,6 +51,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-write-node
     restart: unless-stopped
     ulimits:
@@ -132,6 +139,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-read-node
     restart: unless-stopped
     ulimits:
@@ -163,6 +171,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-gateway
     restart: unless-stopped
     ulimits:
@@ -193,6 +202,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-auth
     restart: unless-stopped
     depends_on:
@@ -244,6 +254,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-indexer-solana
     restart: unless-stopped
     deploy:
@@ -278,6 +289,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-indexer-contra
     restart: unless-stopped
     deploy:
@@ -311,6 +323,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-operator-solana
     restart: unless-stopped
     depends_on:
@@ -345,6 +358,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-operator-contra
     restart: unless-stopped
     depends_on:

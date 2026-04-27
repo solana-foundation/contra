@@ -420,8 +420,10 @@ mod tests {
         let mint = mint.unwrap();
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
-        // The indexer leaves the PausableConfig resolution to the operator.
+        // The indexer leaves Token-2022 extension resolution to the operator —
+        // both flags must stay None at AllowMint time.
         assert_eq!(mint.is_pausable, None);
+        assert_eq!(mint.has_permanent_delegate, None);
     }
 
     #[test]

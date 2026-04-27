@@ -1,6 +1,9 @@
 use crate::error::{AccountError, OperatorError};
 use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
+use solana_rpc_client_api::client_error;
+use solana_rpc_client_api::client_error::ErrorKind;
+use solana_rpc_client_api::request::RpcError;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
@@ -15,6 +18,21 @@ use std::sync::Arc;
 use tracing::warn;
 
 const DECIMALS_OFFSET: usize = 44;
+
+/// `getTokenAccountBalance` returns `RpcResponseError { code: -32602, ... }`
+/// when the ATA does not exist. The lowercased substring match is a fallback
+/// for non-standard RPC providers that may surface the same condition with a
+/// different code.
+fn is_account_not_found(e: &client_error::Error) -> bool {
+    let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) = &e.kind else {
+        return false;
+    };
+    if *code == -32602 {
+        return true;
+    }
+    let msg = message.to_lowercase();
+    msg.contains("could not find account") || msg.contains("account not found")
+}
 
 /// In-memory cache for basic mint metadata (`token_program`, `decimals`).
 /// Token-2022 extension flags (`is_pausable`, `has_permanent_delegate`) are
@@ -203,16 +221,22 @@ impl MintCache {
             OperatorError::RpcError("get_ata_balance requires an RPC client".to_string())
         })?;
 
-        let ui_amount = rpc.get_token_account_balance(ata).await.map_err(|e| {
-            OperatorError::RpcError(format!("get_token_account_balance({ata}): {e}"))
-        })?;
-
-        ui_amount.amount.parse::<u64>().map_err(|e| {
-            OperatorError::RpcError(format!(
-                "failed to parse token balance '{}' for {ata}: {e}",
-                ui_amount.amount
-            ))
-        })
+        // A non-existent ATA is semantically a zero balance — return Ok(0)
+        // so the caller can compare it against the expected amount. Mapping
+        // the not-found error to RpcError would classify it as Transient
+        // and restart the operator forever on a condition that won't heal.
+        match rpc.get_token_account_balance(ata).await {
+            Ok(ui_amount) => ui_amount.amount.parse::<u64>().map_err(|e| {
+                OperatorError::RpcError(format!(
+                    "failed to parse token balance '{}' for {ata}: {e}",
+                    ui_amount.amount
+                ))
+            }),
+            Err(e) if is_account_not_found(&e) => Ok(0),
+            Err(e) => Err(OperatorError::RpcError(format!(
+                "get_token_account_balance({ata}): {e}"
+            ))),
+        }
     }
 
     async fn fetch_mint_from_rpc(

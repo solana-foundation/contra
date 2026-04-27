@@ -531,6 +531,13 @@ pub async fn process_release_funds(
             // `halt_withdrawal_pipeline` (which is reserved for poison-pill
             // rows that would corrupt the SMT).
             //
+            // The pre-flight is best-effort, not a guarantee: a permanent
+            // delegate can drain the escrow ATA between this balance read and
+            // the on-chain `TransferChecked` CPI. In that race the CPI fails
+            // on-chain and the row is handled by the normal sender
+            // confirmation / retry path — the pre-flight just shrinks the
+            // window in the common case.
+            //
             // RPC errors during pre-flight bubble up via `?` and are
             // classified as Transient by `classify_processor_error`,
             // restarting the task. That's preferred over flooding the alert

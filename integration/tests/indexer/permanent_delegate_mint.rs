@@ -499,3 +499,147 @@ fn set_operator_env_vars() {
     std::env::set_var("OPERATOR_SIGNER", "memory");
     std::env::set_var("OPERATOR_PRIVATE_KEY", &private_key_base58);
 }
+
+/// Defensive coverage for the missing-ATA branch in the withdrawal pre-flight:
+/// when the escrow ATA does not exist on-chain, the operator must treat the
+/// query as on-chain balance = 0 and route the withdrawal to ManualReview.
+/// Mapping the not-found error to a transient RPC failure instead would
+/// restart the operator in a loop on a condition that won't heal.
+///
+/// We skip `AllowMint` to set up the missing-ATA state — it's the simplest
+/// way to leave the canonical escrow ATA address unfunded. The pre-flight
+/// reads on-chain state at query time and doesn't care how we got there.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Permanent Delegate: Withdrawal → ManualReview When Escrow ATA Missing ===");
+
+    set_operator_env_vars();
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("permanent_delegate_mint_missing_ata")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/permanent_delegate_mint_missing_ata",
+        pg_host, pg_port
+    );
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let recipient = Keypair::new();
+    let delegate = Keypair::new();
+
+    let (_, instance_pda) = TestEnvironment::setup_instance(&client, &faucet_keypair, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, instance_pda).await?;
+
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = generate_permanent_delegate_mint_2022(
+        &client,
+        &admin,
+        &admin,
+        &delegate.pubkey(),
+        &mint_keypair,
+    )
+    .await?;
+
+    // Skip AllowMint so the escrow ATA is never created on-chain.
+    let escrow_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint_pubkey,
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    assert!(
+        client.get_account(&escrow_ata).await.is_err(),
+        "pre-condition: escrow ATA must not exist on-chain",
+    );
+
+    // Seed DB: mints row with has_permanent_delegate=None, pending withdrawal.
+    let mint_meta = DbMint::new(
+        mint_pubkey.to_string(),
+        MINT_DECIMALS as i16,
+        TOKEN_2022_PROGRAM_ID.to_string(),
+    );
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+
+    let withdraw_amount: u64 = 50_000;
+    let withdrawal_sig = Signature::new_unique().to_string();
+    let withdrawal_tx = make_withdrawal_transaction(
+        withdrawal_sig.clone(),
+        mint_pubkey.to_string(),
+        recipient.pubkey().to_string(),
+        withdraw_amount as i64,
+        0,
+    );
+    storage.insert_db_transaction(&withdrawal_tx).await?;
+
+    let operator_handle = start_contra_to_solana_operator(
+        test_validator.rpc_url(),
+        db_url.clone(),
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
+        instance_pda,
+    )
+    .await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(tx) = db::get_transaction(&pool, &withdrawal_sig).await? {
+            if tx.status == "manual_review" {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "withdrawal {} did not reach manual_review within 60s",
+                withdrawal_sig
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let row = db::get_transaction(&pool, &withdrawal_sig)
+        .await?
+        .expect("withdrawal row should still exist");
+    assert_eq!(
+        row.status, "manual_review",
+        "missing escrow ATA should route the withdrawal to manual_review, not loop the operator",
+    );
+
+    let stored_mint = storage
+        .get_mint(&mint_pubkey.to_string())
+        .await?
+        .expect("mints row");
+    assert_eq!(
+        stored_mint.has_permanent_delegate,
+        Some(true),
+        "operator should have resolved has_permanent_delegate via RPC and written it back",
+    );
+
+    let recipient_balance =
+        get_token_2022_balance(&client, &recipient.pubkey(), &mint_pubkey).await?;
+    assert_eq!(
+        recipient_balance, 0,
+        "recipient ATA should be empty — no release_funds should have landed",
+    );
+
+    operator_handle.shutdown().await;
+    Ok(())
+}

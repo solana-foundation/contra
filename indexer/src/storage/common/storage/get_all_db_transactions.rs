@@ -12,7 +12,7 @@ pub async fn get_all_db_transactions(
         Storage::Postgres(db) => Ok(db
             .get_all_transactions_internal(transaction_type, limit)
             .await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock) => Ok(mock
             .get_all_db_transactions(transaction_type, limit)
             .await?),

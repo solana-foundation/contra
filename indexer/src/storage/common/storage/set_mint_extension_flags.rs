@@ -11,7 +11,7 @@ pub async fn set_mint_extension_flags(
             db.set_mint_extension_flags_internal(mint_address, is_pausable, has_permanent_delegate)
                 .await
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => {
             mock_db
                 .set_mint_extension_flags(mint_address, is_pausable, has_permanent_delegate)

@@ -185,7 +185,7 @@ pub fn mixed_transaction(
     mint: &Pubkey,
     destination: &Pubkey,
     mint_authority: &Pubkey,
-    _amount: u64,
+    amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
     let init_mint_ix =
@@ -200,7 +200,7 @@ pub fn mixed_transaction(
         &to_token_account,
         &non_admin.pubkey(),
         &[],
-        1000,
+        amount,
     )
     .unwrap();
 

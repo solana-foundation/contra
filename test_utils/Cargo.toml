@@ -20,7 +20,43 @@ solana-transaction-status.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# For mock_rpc::MockRpcServer — a local JSON-RPC server that returns
+# scripted responses. Already in the workspace so no new third-party deps.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+# `test-mock-yellowstone` pulls in tonic + yellowstone-grpc-proto only when
+# integration tests need a scripted gRPC stub (see `mock_yellowstone.rs`).
+# Kept optional to avoid dragging proto/tonic-server codegen into downstream
+# consumers of `test_utils` that never touch the Yellowstone path.
+yellowstone-grpc-proto = { workspace = true, features = [
+    "plugin",
+    "tonic",
+], optional = true }
+tonic = { version = "0.14.2", features = ["server", "transport"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+tokio-util = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[features]
+test-mock-yellowstone = [
+    "dep:yellowstone-grpc-proto",
+    "dep:tonic",
+    "dep:tokio-stream",
+    "dep:tokio-util",
+    "dep:futures",
+]
+# Exposes `OperatorMockHarness` (in `operator_helper`) — an in-process
+# operator runner wired to `MockRpcServer` + `Storage::Mock` for fault-
+# injection integration tests. Forwards to `contra-indexer/test-mock-storage`
+# to enable the `Storage::Mock` variant.
+test-mock-storage = ["contra-indexer/test-mock-storage"]
 
 [dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+yellowstone-grpc-client = { workspace = true }
+futures = { workspace = true }
+rustls = { workspace = true }
 
 [lib]

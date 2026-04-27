@@ -11,7 +11,7 @@ pub async fn count_pending_transactions(
         Storage::Postgres(db) => Ok(db
             .count_pending_transactions_internal(transaction_type)
             .await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => mock_db.count_pending_transactions(transaction_type).await,
     }
 }

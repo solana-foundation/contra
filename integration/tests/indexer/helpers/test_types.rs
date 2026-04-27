@@ -12,7 +12,16 @@ pub const BASE_AMOUNT: u64 = 10_000;
 // 240 s gives sufficient headroom for parallel cargo-test runs where multiple validators
 // and multiple Postgres containers compete for CPU. Under nextest (one process per test)
 // the timeout is never reached.
-pub const WAIT_TIMEOUT_SECS: u64 = 240;
+//
+// Coverage-instrumented builds are ~2-3x slower than release/debug. CI sets
+// CONTRA_TEST_WAIT_TIMEOUT_SECS=600 for the coverage target to give those runs
+// enough headroom; all other invocations fall back to 240 s.
+pub static WAIT_TIMEOUT_SECS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("CONTRA_TEST_WAIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(240)
+});
 
 pub const ESCROW_INSTANCE_SEEDS_PRIVATE_KEY: [u8; 64] = [
     253, 137, 127, 96, 208, 56, 227, 155, 179, 196, 123, 197, 226, 86, 137, 104, 38, 0, 15, 229,

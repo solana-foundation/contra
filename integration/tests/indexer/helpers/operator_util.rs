@@ -18,7 +18,7 @@ pub async fn wait_for_operator_completion(
     let mut last_logged = 0u64;
     let mut ready = false;
 
-    while start.elapsed().as_secs() < WAIT_TIMEOUT_SECS {
+    while start.elapsed().as_secs() < *WAIT_TIMEOUT_SECS {
         let completed = db::count_transactions_by_status(pool, "completed").await?;
         let failed = db::count_transactions_by_status(pool, "failed").await?;
 
@@ -65,7 +65,7 @@ pub async fn wait_for_operator_completion(
         let pending = db::count_transactions_by_status(pool, "pending").await?;
         println!(
             "✗ Timeout after {}s: completed={}, failed={}, pending={} (expected {} completed)",
-            WAIT_TIMEOUT_SECS, completed, failed, pending, expected_count
+            *WAIT_TIMEOUT_SECS, completed, failed, pending, expected_count
         );
     }
 

@@ -11,6 +11,13 @@
 //! 2. Dry-run mode – row counts and reported deletions match apply-mode values
 //!    but no rows are actually removed and metadata is not mutated.
 
+// Keep these in their own files for readability; `#[path]` wires them into
+// this same test binary so they share compile state.
+#[path = "test_truncate_backup_failure.rs"]
+mod backup_failure;
+#[path = "test_truncate_lock_contention.rs"]
+mod lock_contention;
+
 use {
     anyhow::{anyhow, Context, Result},
     contra_core::accounts::{

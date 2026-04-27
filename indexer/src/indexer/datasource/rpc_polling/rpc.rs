@@ -42,7 +42,8 @@ impl RpcPoller {
                         "encoding": self.encoding.to_string(),
                         "transactionDetails": "full",
                         "maxSupportedTransactionVersion": 0,
-                        "rewards": false
+                        "rewards": false,
+                        "commitment": self.commitment.to_string(),
                     }
                 ]
             }))
@@ -224,6 +225,39 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("RPC error"));
+    }
+
+    /// Regression: `get_block` must forward the configured commitment in the
+    /// request body. A previous version omitted the field, so the server
+    /// defaulted to `finalized` regardless of `RpcPoller::new`'s argument —
+    /// causing `solana-test-validator` to reply `-32009` for slots that were
+    /// only confirmed.
+    #[tokio::test]
+    async fn test_get_block_forwards_configured_commitment() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [
+                    101,
+                    { "commitment": "confirmed" }
+                ]
+            })))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":null,"id":1}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Confirmed,
+        );
+        let _ = poller.get_block(101).await;
+
+        m.assert_async().await;
     }
 
     // ============================================================================

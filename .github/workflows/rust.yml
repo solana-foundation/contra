@@ -289,10 +289,13 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.130
 
       - name: Run contra integration tests with coverage
         run: make -C integration integration-coverage-contra
+
+      - name: Run Redis-backend coverage tests
+        run: make -C integration integration-coverage-contra-redis
 
       - name: Build escrow with test-tree for indexer tests
         run: make -C contra-escrow-program build-test

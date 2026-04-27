@@ -24,13 +24,16 @@ pub mod upsert_mints_batch;
 
 use crate::{error::StorageError, storage::postgres::db::PostgresDb};
 
-#[cfg(test)]
+// `mock` is exposed when either this crate's own tests are compiling
+// (`#[cfg(test)]`) OR the explicit `test-mock-storage` feature is set by
+// a downstream integration-test crate.
+#[cfg(any(test, feature = "test-mock-storage"))]
 pub mod mock;
 
 #[derive(Clone)]
 pub enum Storage {
     Postgres(PostgresDb),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-mock-storage"))]
     Mock(mock::MockStorage),
 }
 

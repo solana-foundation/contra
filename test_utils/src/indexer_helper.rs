@@ -129,7 +129,12 @@ pub async fn start_solana_indexer_rpc_polling(
         batch_size: 10,
         from_slot: Some(1),
         encoding: UiTransactionEncoding::Json,
-        commitment: CommitmentLevel::Finalized,
+        // `Confirmed` matches the test client. `getBlock` rejects
+        // `Processed` outright (-32602 "Method does not support commitment
+        // below `confirmed`"). At `Finalized`, `solana-test-validator`
+        // without geyser / tower-bft leaves the deposit slots indefinitely
+        // unfinalized and `getBlock` returns -32009.
+        commitment: CommitmentLevel::Confirmed,
     };
 
     let backfill_config = BackfillConfig {

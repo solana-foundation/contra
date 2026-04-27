@@ -22,7 +22,7 @@ pub async fn update_transaction_status(
             .await?;
             Ok(())
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => {
             mock_db
                 .update_transaction_status(

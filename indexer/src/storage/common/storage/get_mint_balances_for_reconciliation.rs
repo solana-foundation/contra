@@ -8,7 +8,7 @@ pub async fn get_mint_balances_for_reconciliation(
 ) -> Result<Vec<MintDbBalance>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.get_mint_balances_for_reconciliation_internal().await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock) => mock.get_mint_balances_for_reconciliation().await,
     }
 }

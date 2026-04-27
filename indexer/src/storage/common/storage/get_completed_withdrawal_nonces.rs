@@ -13,7 +13,7 @@ pub async fn get_completed_withdrawal_nonces(
                 .await?;
             Ok(nonces.into_iter().map(|n| n as u64).collect())
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock) => mock.get_completed_withdrawal_nonces(min_nonce, max_nonce),
     }
 }

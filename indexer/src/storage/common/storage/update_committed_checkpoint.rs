@@ -9,7 +9,7 @@ pub async fn update_committed_checkpoint(
         Storage::Postgres(db) => Ok(db
             .update_committed_checkpoint_internal(program_type, slot)
             .await?),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => {
             mock_db
                 .update_committed_checkpoint(program_type, slot)

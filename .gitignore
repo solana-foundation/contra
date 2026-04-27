@@ -29,6 +29,9 @@ __pycache__/
 # Yellowstone gRPC plugin build
 indexer/.yellowstone-grpc/
 integration/.yellowstone-grpc/
+# Locally-built macOS Geyser plugin (not checked in — see Makefile:ensure-geyser-plugin)
+test_utils/geyser/libyellowstone_grpc_geyser.dylib
+test_utils/geyser/.dylib-tag
 
 # Local
 .local/

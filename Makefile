@@ -16,7 +16,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
 .PHONY: unit-coverage coverage-html all-coverage ci-unit-coverage ci-e2e-coverage
-.PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean
+.PHONY: yellowstone-prepare yellowstone-build-plugin yellowstone-clean ensure-geyser-plugin
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
@@ -62,7 +62,7 @@ check-toolchain:
 	fi
 	@command -v cargo-build-sbf >/dev/null || { echo "ERROR: cargo-build-sbf not on PATH"; exit 1; }
 
-install: install-toolchain
+install: install-toolchain ensure-geyser-plugin
 	@echo "Installing dependencies for all projects..."
 	@for dir in $(PROGRAM_DIRS); do \
 		$(MAKE) -C $$dir install; \
@@ -315,7 +315,31 @@ yellowstone-clean:
 	@rm -rf integration/.yellowstone-grpc
 	@rm -f test_utils/geyser/libyellowstone_grpc_geyser.dylib
 	@rm -f test_utils/geyser/libyellowstone_grpc_geyser.so
+	@rm -f test_utils/geyser/.dylib-tag
 	@echo "Geyser artifacts cleaned"
+
+# Ensure the Yellowstone Geyser plugin is available for integration tests.
+#   Linux: the .so is checked into test_utils/geyser/ — just sanity-check it.
+#   macOS: build the .dylib from source on first run (~3-5 min) and cache it.
+#          Cross-compiling from Linux to macOS isn't practical (Apple SDK
+#          license + ABI fragility), so the .dylib is generated locally on
+#          each Mac. A stamp file tracks YELLOWSTONE_TAG so a versions.env
+#          bump triggers a rebuild but day-to-day `make install` is a no-op.
+ensure-geyser-plugin:
+	@set -a; source versions.env; set +a; \
+	if [ "$$(uname -s)" = "Darwin" ]; then \
+	    plugin=test_utils/geyser/libyellowstone_grpc_geyser.dylib; \
+	    stamp=test_utils/geyser/.dylib-tag; \
+	    if [ ! -f "$$plugin" ] || [ "$$(cat "$$stamp" 2>/dev/null)" != "$$YELLOWSTONE_TAG" ]; then \
+	        echo "macOS: building Yellowstone Geyser plugin $$YELLOWSTONE_TAG"; \
+	        echo "  one-time ~3-5 min build; the prebuilt .dylib was dropped"; \
+	        echo "  in the 3.1.13 bump (Linux->macOS cross-compile isn't viable)."; \
+	        $(MAKE) yellowstone-build-plugin && echo "$$YELLOWSTONE_TAG" > "$$stamp"; \
+	    fi; \
+	else \
+	    plugin=test_utils/geyser/libyellowstone_grpc_geyser.so; \
+	    [ -f "$$plugin" ] || { echo "ERROR: $$plugin missing (should be checked in)"; exit 1; }; \
+	fi
 
 # Backward-compatible aliases.
 download-yellowstone-grpc: yellowstone-prepare

@@ -66,11 +66,12 @@ solana-rpc-client-api = { workspace = true }
 solana-transaction-status = { version = "2.3.10" }
 
 # Yellowstone gRPC (optional - enable with feature: datasource-yellowstone)
+# v12 removed the `convert`/`plugin` features from the proto crate
+# (helpers migrated to yellowstone-grpc-geyser); `tonic` is a direct dep now,
+# not a feature gate. The one conversion helper we used is vendored at
+# indexer/src/indexer/datasource/yellowstone/convert.rs.
 yellowstone-grpc-client = { workspace = true, optional = true }
-yellowstone-grpc-proto = { workspace = true, features = [
-    "plugin",
-    "tonic",
-], optional = true }
+yellowstone-grpc-proto = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
 solana-keychain = { version = "0.1.0", features = ["all"] }

@@ -1,3 +1,13 @@
+# Build-arg anchor for Solana toolchain consumers.
+# Values come from versions.env — invoke compose with
+# `--env-file versions.env --env-file .env` (later files win on conflict).
+x-solana-build-args: &solana-build-args
+  SOLANA_VERSION: ${SOLANA_VERSION}
+
+x-validator-build-args: &validator-build-args
+  SOLANA_VERSION: ${SOLANA_VERSION}
+  YELLOWSTONE_TAG: ${YELLOWSTONE_TAG}
+
 services:
   # PostgreSQL Primary (for write node)
   postgres-primary:
@@ -45,6 +55,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-write-node
     restart: unless-stopped
     ulimits:
@@ -132,6 +143,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-read-node
     restart: unless-stopped
     ulimits:
@@ -163,6 +175,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-gateway
     restart: unless-stopped
     ulimits:
@@ -194,6 +207,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-auth
     restart: unless-stopped
     depends_on:
@@ -217,6 +231,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-streamer
     restart: unless-stopped
     depends_on:
@@ -241,6 +256,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-activity
     restart: unless-stopped
     depends_on:
@@ -275,10 +291,15 @@ services:
     build:
       context: .
       dockerfile: validator.Dockerfile
+      args: *validator-build-args
     container_name: contra-validator
     restart: unless-stopped
     deploy:
       replicas: 1
+    # Agave 3.1 asserts io_uring_supported(); Docker's default seccomp profile
+    # blocks io_uring_setup, so the validator panics at startup without this.
+    security_opt:
+      - seccomp=unconfined
     ports:
       - "18899:8899"
       - "18900:8900"
@@ -347,6 +368,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-indexer-solana
     restart: unless-stopped
     deploy:
@@ -385,6 +407,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-indexer-contra
     restart: unless-stopped
     deploy:
@@ -419,6 +442,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-operator-solana
     restart: unless-stopped
     depends_on:
@@ -465,6 +489,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args: *solana-build-args
     container_name: contra-operator-contra
     restart: unless-stopped
     depends_on:

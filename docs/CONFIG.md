@@ -71,7 +71,7 @@ Set the corresponding environment variable in your `.env.devnet` file (or equiva
 CONTRA_SIGVERIFY_WORKERS=16
 
 # Restart the write node to pick up changes
-docker compose -f docker-compose.devnet.yml --env-file .env.devnet up -d write-node
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d write-node
 ```
 
 ## Restart & Recovery

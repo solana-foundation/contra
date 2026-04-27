@@ -32,7 +32,7 @@ Before starting, ensure you have:
 From the project root:
 
 ```shell
-docker compose -f docker-compose.devnet.yml build
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build
 ```
 
 This builds all Contra services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack (or go to the gym).
@@ -146,7 +146,7 @@ INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 Once your docker build (Step 1) is complete, run: 
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file .env.devnet up -d
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d
 ```
 
 You should see all services in a healthy/running state:
@@ -170,11 +170,11 @@ Check logs if needed:
 
 ```shell
 # All services
-docker compose -f docker-compose.devnet.yml --env-file .env.devnet logs -f
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs -f
 
 
 # Specific service
-docker compose -f docker-compose.devnet.yml --env-file .env.devnet logs -f indexer-solana
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs -f indexer-solana
 ```
 
 For reference, here are the ports and endpoints that are now running:
@@ -234,7 +234,7 @@ The indexer detects the burn on Contra, builds a Merkle proof, and the operator 
 ## Stopping Services
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file .env.devnet down
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down
 ```
 
 You should see something like this:
@@ -260,7 +260,7 @@ You should see something like this:
 To also remove volumes (reset all state):
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file .env.devnet down -v
+docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down -v
 ```
 
 ## Troubleshooting
@@ -276,8 +276,8 @@ docker compose -f docker-compose.devnet.yml --env-file .env.devnet down -v
 - Ensure operator has Devnet SOL for fees  
 - Verify the mint is whitelisted on the instance  
 - Try using CLI tools in `scripts/devnet/` instead of the Admin UI  
-- Check operator logs: `docker compose -f docker-compose.devnet.yml --env-file .env.devnet logs operator-solana`  
-  - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh `docker compose -f docker-compose.devnet.yml --env-file .env.devnet down -v`.
+- Check operator logs: `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs operator-solana`  
+  - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down -v`.
 - If using the Admin UI, ensure your wallet is on the correct cluster for the correct task (instructions relating to instance management and deposits should use Devnet, and transfers/withdrawals should use your Contra RPC URL (localhost:8899 in our example))
 
 ### Indexer not detecting events

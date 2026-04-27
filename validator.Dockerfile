@@ -1,8 +1,20 @@
 # Dockerfile for Solana Test Validator with Yellowstone gRPC Plugin
-FROM --platform=linux/amd64 rust:bookworm AS builder
+#
+# Both SOLANA_VERSION and YELLOWSTONE_TAG come from versions.env.
+# These two MUST move together — the Geyser plugin ABI is pinned to the
+# Solana version the plugin was built against. Drift between CLI and plugin
+# produces "validator starts then crashes on first subscribe".
+# Build via: `docker compose --env-file versions.env --env-file .env build validator`
+ARG SOLANA_VERSION
+ARG YELLOWSTONE_TAG
 
-# Install Solana CLI
-RUN sh -c "$(curl -sSfL https://release.anza.xyz/v2.3.9/install)"
+FROM --platform=linux/amd64 rust:bookworm AS builder
+ARG SOLANA_VERSION
+ARG YELLOWSTONE_TAG
+
+# Install Solana CLI at the pinned version.
+RUN test -n "${SOLANA_VERSION}" || (echo "ERROR: SOLANA_VERSION build arg is required (use --env-file versions.env)" && exit 1) \
+    && sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
 ENV PATH="/root/.local/share/solana/install/active_release/bin:$PATH"
 
 # Clone and build Yellowstone gRPC Geyser plugin
@@ -16,10 +28,13 @@ RUN apt-get update && apt-get install -y \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone https://github.com/rpcpool/yellowstone-grpc.git && \
-    cd yellowstone-grpc && \
-    git checkout v9.1.0+solana.2.3.11 && \
-    cargo build --release -p yellowstone-grpc-geyser
+# Checkout the tag that matches the installed Solana CLI.
+# The Geyser plugin is dlopen()'d by solana-test-validator; ABI must match exactly.
+RUN test -n "${YELLOWSTONE_TAG}" || (echo "ERROR: YELLOWSTONE_TAG build arg is required (use --env-file versions.env)" && exit 1) \
+    && git clone https://github.com/rpcpool/yellowstone-grpc.git \
+    && cd yellowstone-grpc \
+    && git checkout "${YELLOWSTONE_TAG}" \
+    && cargo build --release -p yellowstone-grpc-geyser
 
 # Runtime stage
 FROM --platform=linux/amd64 debian:bookworm-slim

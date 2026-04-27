@@ -47,8 +47,8 @@ use yellowstone_grpc_proto::geyser::{
     GetBlockHeightRequest, GetBlockHeightResponse, GetLatestBlockhashRequest,
     GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse, GetVersionRequest,
     GetVersionResponse, IsBlockhashValidRequest, IsBlockhashValidResponse, PingRequest,
-    PongResponse, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
-    SubscribeUpdate,
+    PongResponse, SubscribeDeshredRequest, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
+    SubscribeRequest, SubscribeUpdate, SubscribeUpdateDeshred,
 };
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -320,9 +320,25 @@ struct MockGeyserService {
 type SubscribeStream =
     Pin<Box<dyn Stream<Item = Result<SubscribeUpdate, Status>> + Send + 'static>>;
 
+// `subscribe_deshred` was added to the Geyser trait in yellowstone-grpc-proto
+// v12. The indexer does not consume this RPC, so the mock stubs it out with
+// `Unimplemented` and an empty stream type to satisfy the trait bound.
+type SubscribeDeshredStream =
+    Pin<Box<dyn Stream<Item = Result<SubscribeUpdateDeshred, Status>> + Send + 'static>>;
+
 #[tonic::async_trait]
 impl Geyser for MockGeyserService {
     type SubscribeStream = SubscribeStream;
+    type SubscribeDeshredStream = SubscribeDeshredStream;
+
+    async fn subscribe_deshred(
+        &self,
+        _request: Request<Streaming<SubscribeDeshredRequest>>,
+    ) -> Result<Response<Self::SubscribeDeshredStream>, Status> {
+        Err(Status::unimplemented(
+            "subscribe_deshred is not implemented by the mock",
+        ))
+    }
 
     async fn subscribe(
         &self,

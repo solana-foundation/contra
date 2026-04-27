@@ -1,33 +1,44 @@
 name: "Setup Solana CLI"
-description: "Install and cache Solana CLI"
+description: "Install and cache Solana CLI at the version pinned in versions.env"
 
 runs:
   using: "composite"
   steps:
+    - name: Load Solana version from versions.env
+      shell: bash
+      run: |
+        set -a
+        source versions.env
+        set +a
+        echo "SOLANA_VERSION=${SOLANA_VERSION}" >> "$GITHUB_ENV"
+        echo "YELLOWSTONE_TAG=${YELLOWSTONE_TAG}" >> "$GITHUB_ENV"
+
     - name: Cache Solana CLI installation
       uses: actions/cache@v4
       with:
         path: ~/.local/share/solana
-        key: solana-cli-stable-${{ runner.os }}-${{ runner.arch }}-v2.2.19
+        # Cache key includes the SOLANA_VERSION so a bump invalidates cleanly.
+        # The platform-tools cache under ~/.cache/solana/ uses its own hash and
+        # is orthogonal to this key — a stale platform-tools cache with a new
+        # CLI is caught by make check-toolchain in the build step.
+        key: solana-cli-stable-${{ runner.os }}-${{ runner.arch }}-v${{ env.SOLANA_VERSION }}
         restore-keys: |
           solana-cli-stable-${{ runner.os }}-${{ runner.arch }}-
 
-    - name: Install Solana CLI
+    - name: Install Solana CLI via make install-toolchain
       shell: bash
       run: |
-        # Check if already installed
-        if command -v solana &> /dev/null; then
-          echo "Solana CLI already installed"
-          solana --version
-          exit 0
+        # Delegates to the repo Makefile so the install logic lives in exactly
+        # one place (Makefile:install-toolchain reads versions.env).
+        if command -v solana >/dev/null 2>&1 && \
+           [ "$(solana --version | awk '{print $2}')" = "${SOLANA_VERSION}" ]; then
+          echo "Solana CLI already at v${SOLANA_VERSION} (cache hit)"
+        else
+          make install-toolchain
         fi
-
-        # Install Solana CLI (stable version)
-        sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.19/install)"
-        echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+        echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
         export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 
-        # Verify installation
         solana --version
         solana-test-validator --version
         cargo-build-sbf --version

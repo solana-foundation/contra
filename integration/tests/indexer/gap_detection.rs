@@ -329,7 +329,8 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
 /// otherwise unreachable in the integration suite (all other tests use geyser).
 /// A validator WITHOUT the geyser plugin is used — only the RPC port is needed.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "polling source races ahead of test-validator block availability \
+            (treats -32009 Ok(None) as terminal advance)"]
 async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Gap Detection: RPC-Polling Fallback Test ===\n");
 

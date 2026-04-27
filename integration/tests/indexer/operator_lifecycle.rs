@@ -457,14 +457,16 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     Ok(())
 }
 
-/// Triggers one failed mint (invalid mint account) and one failed withdrawal
-/// (mint not whitelisted on the instance) and asserts that the configured
-/// `alert_webhook_url` receives exactly two POST requests — one per failure.
+/// Triggers one failed mint (wrong-authority `mint_to`, rejected at preflight)
+/// and one bad withdrawal (mint not whitelisted on the instance, escalated to
+/// `ManualReview` because the burn never produced a verifiable signature) and
+/// asserts that the configured `alert_webhook_url` receives exactly two POST
+/// requests — `db_transaction_writer::send_webhook_alert` fires for both
+/// `Failed` and `ManualReview` dispositions.
 ///
 /// Uses a `mockito` HTTP server as the webhook endpoint so no external service
 /// is required.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "bad deposit never reaches failed status - under investigation"]
 async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Operator Lifecycle: Alerts on Failure ===");
 
@@ -600,7 +602,14 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     )
     .await?;
 
-    wait_for_transaction_status(&pool, &withdrawal_sig, "failed", 180).await?;
+    // The bad withdrawal preflights with `invalid account data for instruction`
+    // from the escrow program (the mint isn't whitelisted on the instance), so
+    // `sign_and_send` errors before any signature is broadcast. With no
+    // signatures to verify, the sender's "cannot safely remint" branch
+    // (`indexer/src/operator/sender/transaction.rs`) routes the row to
+    // `ManualReview`, NOT `Failed` — reverting that to `Failed` would risk
+    // double-reminting if the broadcast had succeeded silently.
+    wait_for_transaction_status(&pool, &withdrawal_sig, "manual_review", 180).await?;
 
     alert_mock.assert();
 

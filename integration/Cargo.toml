@@ -102,6 +102,14 @@ name = "sender_mint_idempotency"
 path = "tests/indexer/sender_mint_idempotency.rs"
 
 [[test]]
+name = "sender_mint_validator_encodings"
+path = "tests/indexer/sender_mint_validator_encodings.rs"
+
+[[test]]
+name = "sender_mint_signature_failures"
+path = "tests/indexer/sender_mint_signature_failures.rs"
+
+[[test]]
 name = "sender_poll_rpc_error"
 path = "tests/indexer/sender_poll_rpc_error.rs"
 

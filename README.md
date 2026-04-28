@@ -244,6 +244,18 @@ make install
 make build
 ```
 
+### Docker build cache
+
+Docker builds use BuildKit cache mounts for cargo and apt, so rebuilds after the first cold build are fast. Useful commands:
+
+```bash
+# Force a fresh build (ignore all caches)
+docker compose build --no-cache <service>
+
+# Reclaim disk by clearing the build cache
+docker builder prune -af
+```
+
 ### Run Tests
 
 ```bash
@@ -285,7 +297,7 @@ CI and local runs.
 | Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically |
 | cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
 | cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
-| Solana CLI       | `2.2.19`   | `sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.19/install)"` |
+| Solana CLI       | `3.1.13`   | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |
 | Node.js          | `22.x`     | See your distro's package manager                      |
 | pnpm             | `10.15.1`  | `npm install -g pnpm@10.15.1` (also pinned via `packageManager` in each `package.json`) |
 
@@ -298,10 +310,12 @@ Container images used by integration tests (pulled automatically by
 | `redis:7`            | Warmed in CI before each integration run.      |
 
 Source of truth for tool versions:
-- Rust + `cargo-llvm-cov` + pnpm: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
+- **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`
+- Rust toolchain: [`rust-toolchain.toml`](rust-toolchain.toml)
+- Rust + `cargo-llvm-cov`: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
 - `cargo-nextest`: [`.github/workflows/rust.yml`](.github/workflows/rust.yml) (`Install cargo-nextest` step)
-- Solana CLI: [`.github/actions/setup-solana/action.yml`](.github/actions/setup-solana/action.yml)
-- pnpm (also): `packageManager` field in `contra-escrow-program/package.json`
+- Solana CLI (CI mirror of `versions.env`): [`.github/actions/setup-solana/action.yml`](.github/actions/setup-solana/action.yml)
+- pnpm (also): `packageManager` field in each `package.json`
 
 When bumping any version, update the CI config **and** this section in the
 same PR so the two stay in sync.

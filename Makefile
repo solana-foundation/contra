@@ -11,7 +11,7 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
-.PHONY: install install-toolchain check-toolchain build fmt generate-idl generate-clients
+.PHONY: install install-toolchain check-toolchain check-docker build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test all-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
@@ -61,6 +61,26 @@ check-toolchain:
 	    fi; \
 	fi
 	@command -v cargo-build-sbf >/dev/null || { echo "ERROR: cargo-build-sbf not on PATH"; exit 1; }
+
+# Docker floor check. Separate from check-toolchain because `make build` is cargo-only
+# and must work for contributors who don't have Docker installed. Gate compose/docker
+# build targets on this instead. Floor is 26.0 to match the README; the Dockerfiles use
+# BuildKit `--mount=type=cache` and the `# syntax=docker/dockerfile:1.7` frontend.
+check-docker:
+	@if ! command -v docker >/dev/null 2>&1; then \
+	    echo "ERROR: docker not found on PATH — required for compose-based dev/test stacks (>= 26.0)"; \
+	    exit 1; \
+	fi
+	@ver="$$(docker version --format '{{.Server.Version}}' 2>/dev/null || docker version --format '{{.Client.Version}}' 2>/dev/null)"; \
+	if [ -z "$$ver" ]; then \
+	    echo "ERROR: docker present but version could not be read (daemon not running?)"; \
+	    exit 1; \
+	fi; \
+	major="$$(echo "$$ver" | cut -d. -f1)"; \
+	if [ "$$major" -lt 26 ] 2>/dev/null; then \
+	    echo "ERROR: docker is $$ver; this repo requires >= 26.0 (BuildKit cache mounts)."; \
+	    exit 1; \
+	fi
 
 install: install-toolchain ensure-geyser-plugin
 	@echo "Installing dependencies for all projects..."

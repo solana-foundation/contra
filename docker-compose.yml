@@ -3,6 +3,7 @@
 # `--env-file versions.env --env-file .env` (later files win on conflict).
 x-solana-build-args: &solana-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
+  PNPM_VERSION: ${PNPM_VERSION}
 
 x-validator-build-args: &validator-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}

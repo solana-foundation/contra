@@ -3,6 +3,7 @@
 # Invoke compose with `--env-file versions.env --env-file .env.devnet`.
 x-solana-build-args: &solana-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
+  PNPM_VERSION: ${PNPM_VERSION}
 
 services:
   # PostgreSQL Primary (for write node)

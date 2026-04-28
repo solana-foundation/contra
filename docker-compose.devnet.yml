@@ -282,6 +282,7 @@ services:
       args: *solana-build-args
     container_name: contra-indexer-solana
     restart: unless-stopped
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -310,7 +311,7 @@ services:
       - contra-network
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
@@ -320,6 +321,7 @@ services:
       args: *solana-build-args
     container_name: contra-indexer-contra
     restart: unless-stopped
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -347,7 +349,7 @@ services:
       - contra-network
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Operator Service - Solana
   operator-solana:
@@ -357,6 +359,7 @@ services:
       args: *solana-build-args
     container_name: contra-operator-solana
     restart: unless-stopped
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
@@ -385,7 +388,7 @@ services:
       - contra-network
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Operator Service - Contra
   operator-contra:
@@ -395,6 +398,7 @@ services:
       args: *solana-build-args
     container_name: contra-operator-contra
     restart: unless-stopped
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
@@ -425,7 +429,7 @@ services:
       - contra-network
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Base backup sidecar for postgres-primary
   pg-backup-primary:

@@ -77,7 +77,7 @@ pub async fn start_solana_to_contra_operator(
     set_operator_env_vars(&operator_keypair);
 
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = operator::run(storage, common_config, operator_config).await {
+        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
             tracing::error!("Operator error: {}", e);
         }
     });
@@ -199,7 +199,7 @@ pub async fn start_contra_to_solana_operator_with_mocks(
     let run_config = common_config.clone();
     let run_operator_config = operator_config.clone();
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = operator::run(run_storage, run_config, run_operator_config).await {
+        if let Err(e) = operator::run(run_storage, run_config, run_operator_config, None).await {
             tracing::error!("Operator (mock harness) error: {}", e);
         }
     });
@@ -247,7 +247,7 @@ pub async fn start_solana_to_contra_operator_with_mocks(
     let run_config = common_config.clone();
     let run_operator_config = operator_config.clone();
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = operator::run(run_storage, run_config, run_operator_config).await {
+        if let Err(e) = operator::run(run_storage, run_config, run_operator_config, None).await {
             tracing::error!("Operator (mock harness) error: {}", e);
         }
     });
@@ -289,7 +289,7 @@ pub async fn start_contra_to_solana_operator(
     set_operator_env_vars(&operator_keypair);
 
     let task_handle = tokio::spawn(async move {
-        if let Err(e) = operator::run(storage, common_config, operator_config).await {
+        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
             tracing::error!("Operator error: {}", e);
         }
     });

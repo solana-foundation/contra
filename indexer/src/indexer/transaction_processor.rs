@@ -15,7 +15,7 @@ use crate::{
         Storage,
     },
 };
-use contra_metrics::MetricLabel;
+use contra_metrics::{HealthState, MetricLabel};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -32,6 +32,10 @@ pub struct TransactionProcessor {
 
     // Buffer all instructions from current slot for batch processing
     current_slot_instructions: Vec<InstructionWithMetadata>,
+
+    // Optional health state — bumped on each SlotComplete so /health knows the
+    // indexer pipeline is making progress. None in tests / standalone uses.
+    health: Option<Arc<HealthState>>,
 }
 
 impl TransactionProcessor {
@@ -42,7 +46,13 @@ impl TransactionProcessor {
             current_slot: None,
             current_program_type: None,
             current_slot_instructions: Vec::new(),
+            health: None,
         }
+    }
+
+    pub fn with_health(mut self, health: Arc<HealthState>) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// Start processing messages from the channel
@@ -66,6 +76,9 @@ impl TransactionProcessor {
                     metrics::INDEXER_SLOT_PROCESSING_DURATION
                         .with_label_values(&[program_type.as_label()])
                         .observe(start.elapsed().as_secs_f64());
+                    if let Some(h) = &self.health {
+                        h.record_progress();
+                    }
                 }
             }
         }

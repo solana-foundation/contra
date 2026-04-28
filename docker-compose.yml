@@ -222,10 +222,11 @@ services:
     command: ["/usr/local/bin/gateway"]
     networks:
       - contra-network
-    # Liveness only — the gateway /health handler returns static 200. Gateway
-    # deliberately doesn't probe its upstreams; their own probes report their
-    # state, and restarting the gateway when an upstream is down doesn't fix
-    # anything. TODO: add a /ready endpoint for out-of-band upstream monitoring.
+    # Liveness only — /health returns static 200. Gateway deliberately
+    # doesn't probe its upstreams; their own probes report their state, and
+    # restarting the gateway when an upstream is down doesn't fix anything.
+    # /ready (separate endpoint, probes both backends, cached 2s) exists for
+    # out-of-band monitoring; compose stays on /health.
     healthcheck:
       <<: *default-healthcheck
       test: ["CMD-SHELL", "curl -fsS http://localhost:${GATEWAY_PORT}/health || exit 1"]
@@ -254,9 +255,10 @@ services:
     command: ["/usr/local/bin/auth"]
     networks:
       - contra-network
-    # Placebo /health — the auth handler returns static "ok". Catches process-up
-    # + axum alive, which is all compose needs for liveness.
-    # TODO: replace with a pool.is_healthy() flag updated by handlers.
+    # /health reads a pool-status flag updated by handlers after each DB call.
+    # Communication errors flip it unhealthy; logical errors (UNIQUE etc.)
+    # leave it healthy. The probe itself doesn't take a connection from the
+    # pool, so probe load can't contribute to pool exhaustion.
     healthcheck:
       <<: *default-healthcheck
       test: ["CMD-SHELL", "curl -fsS http://localhost:${AUTH_PORT}/health || exit 1"]
@@ -288,9 +290,9 @@ services:
     command: ["/usr/local/bin/streamer"]
     networks:
       - contra-network
-    # Placebo /health — the streamer handler returns static "ok". Catches
-    # process-up only. TODO: aggregate Yellowstone connection state +
-    # last-message-received timestamp into the response.
+    # /health checks each running poll loop's heartbeat — flips 503 if any
+    # has gone stale (>30s). Empty queries still bump the heartbeat, so a
+    # quiet DB stays healthy; only a truly stuck loop trips the probe.
     healthcheck:
       <<: *default-healthcheck
       test: ["CMD-SHELL", "curl -fsS http://localhost:${STREAMER_PORT:-8902}/health || exit 1"]
@@ -416,6 +418,8 @@ services:
       args: *solana-build-args
     container_name: contra-indexer-solana
     restart: unless-stopped
+    # tini as PID 1 so SIGTERM reaches the binary through the /bin/sh -c wrapper.
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -446,12 +450,13 @@ services:
           indexer
     networks:
       - contra-network
-    # No /health route on the metrics router yet — /metrics is a cheap idempotent
-    # probe of the same axum server (the contra-metrics crate).
-    # TODO: add /health to the metrics router with last_slot_processed_at + slot_lag.
+    # /health on the metrics port reads HealthState — backed by the indexer's
+    # slot-lag gauge and a heartbeat that bumps on each SlotComplete. With
+    # require_continuous_progress=true, a dead Yellowstone stream flips the
+    # probe even when slot-lag is 0.
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
@@ -461,6 +466,7 @@ services:
       args: *solana-build-args
     container_name: contra-indexer-contra
     restart: unless-stopped
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -487,10 +493,10 @@ services:
           indexer
     networks:
       - contra-network
-    # See indexer-solana note re: /metrics in lieu of /health.
+    # See indexer-solana — same heartbeat-backed /health.
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Operator Service - Solana
   operator-solana:
@@ -500,6 +506,7 @@ services:
       args: *solana-build-args
     container_name: contra-operator-solana
     restart: unless-stopped
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
@@ -538,10 +545,12 @@ services:
           operator
     networks:
       - contra-network
-    # /metrics in lieu of /health — the metrics router doesn't expose /health yet.
+    # /health on the metrics port reads HealthState — backlog comes from the
+    # operator's pending-tx count, progress bumps as txs are forwarded to the
+    # processor. Idle (pending=0) stays healthy.
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9102/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9102/health || exit 1"]
 
   # Operator Service - Contra
   operator-contra:
@@ -551,6 +560,7 @@ services:
       args: *solana-build-args
     container_name: contra-operator-contra
     restart: unless-stopped
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
@@ -586,10 +596,12 @@ services:
           operator
     networks:
       - contra-network
-    # /metrics in lieu of /health — the metrics router doesn't expose /health yet.
+    # /health on the metrics port reads HealthState — backlog comes from the
+    # operator's pending-tx count, progress bumps as txs are forwarded to the
+    # processor. Idle (pending=0) stays healthy.
     healthcheck:
       <<: *default-healthcheck
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9103/metrics > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9103/health || exit 1"]
 
   # Base backup sidecar for postgres-primary
   pg-backup-primary:

@@ -48,6 +48,7 @@ pub struct YellowstoneSource {
     max_gap_slots: u64,
     #[cfg(feature = "datasource-rpc")]
     batch_size: usize,
+    health: Option<Arc<contra_metrics::HealthState>>,
 }
 
 impl YellowstoneSource {
@@ -70,7 +71,13 @@ impl YellowstoneSource {
             max_gap_slots: 0,
             #[cfg(feature = "datasource-rpc")]
             batch_size: 0,
+            health: None,
         }
+    }
+
+    pub fn with_health(mut self, health: Arc<contra_metrics::HealthState>) -> Self {
+        self.health = Some(health);
+        self
     }
 
     #[cfg(feature = "datasource-rpc")]
@@ -162,6 +169,7 @@ impl DataSource for YellowstoneSource {
         let x_token = self.x_token.clone();
         let program_type = self.program_type;
         let escrow_instance_id = self.escrow_instance_id;
+        let health = self.health.clone();
 
         #[cfg(feature = "datasource-rpc")]
         let rpc_poller = self.rpc_poller.clone();
@@ -188,6 +196,7 @@ impl DataSource for YellowstoneSource {
                     tx.clone(),
                     cancellation_token.clone(),
                     &last_seen_slot,
+                    health.as_ref(),
                 )
                 .await
                 {
@@ -271,6 +280,7 @@ impl DataSource for YellowstoneSource {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_stream(
     endpoint: &str,
     x_token: Option<String>,
@@ -280,6 +290,7 @@ async fn connect_and_stream(
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     last_seen_slot: &AtomicU64,
+    health: Option<&Arc<contra_metrics::HealthState>>,
 ) -> Result<(), DataSourceError> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())
         .map_err(|e| DataSourceRpcError::Protocol {
@@ -385,6 +396,13 @@ async fn connect_and_stream(
                     metrics::INDEXER_CHAIN_TIP_SLOT
                         .with_label_values(&[program_type.as_label()])
                         .set(block_meta.slot as f64);
+                    if let Some(h) = health {
+                        // Yellowstone is push-based — a BlockMeta per slot means
+                        // we're caught up; pending stays 0. The continuous_progress
+                        // flag in HealthConfig::indexer() makes the staleness check
+                        // fire even at pending=0, so a dead stream is detected.
+                        h.set_pending(0);
+                    }
                     debug!("Yellowstone BlockMeta for slot {}", block_meta.slot);
 
                     let res = send_guaranteed(

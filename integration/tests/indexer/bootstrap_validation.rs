@@ -67,7 +67,7 @@ async fn run_rejects_escrow_without_instance_id() {
         reconciliation: ReconciliationConfig::default(),
     };
 
-    let result = run(common_config, indexer_config).await;
+    let result = run(common_config, indexer_config, None).await;
 
     let err = result.expect_err(
         "run() must reject Escrow program_type with no escrow_instance_id before touching the datasource",

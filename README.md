@@ -256,6 +256,22 @@ docker compose build --no-cache <service>
 docker builder prune -af
 ```
 
+### Building a single Dockerfile standalone
+
+Compose loads [`versions.env`](versions.env) automatically; standalone `docker build` doesn't. Source the file first so the build args are available, then pass only the args that the Dockerfile declares:
+
+```bash
+set -a; . versions.env; set +a
+
+docker build --build-arg SOLANA_VERSION --build-arg PNPM_VERSION -f Dockerfile .
+docker build --build-arg SOLANA_VERSION --build-arg YELLOWSTONE_TAG -f validator.Dockerfile .
+docker build --build-arg GRAFANA_VERSION    -f Dockerfile.grafana    .
+docker build --build-arg PROMETHEUS_VERSION -f Dockerfile.prometheus .
+docker build --build-arg NODE_VERSION --build-arg PNPM_VERSION -f admin-ui/Dockerfile .
+```
+
+`versions.env` is the single source of truth for every pinned version.
+
 ### Run Tests
 
 ```bash
@@ -298,8 +314,11 @@ CI and local runs.
 | cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
 | cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
 | Solana CLI       | `3.1.13`   | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |
-| Node.js          | `22.x`     | See your distro's package manager                      |
-| pnpm             | `10.15.1`  | `npm install -g pnpm@10.15.1` (also pinned via `packageManager` in each `package.json`) |
+| Node.js          | `24.7.0`   | Pinned in [`versions.env`](versions.env) (`NODE_VERSION`) for admin-ui Docker builds |
+| pnpm             | `10.15.1`  | Pinned in [`versions.env`](versions.env) (`PNPM_VERSION`); also via `packageManager` in each `package.json` |
+| Grafana          | `11.4.0`   | Pinned in [`versions.env`](versions.env) (`GRAFANA_VERSION`) |
+| Prometheus       | `v3.0.1`   | Pinned in [`versions.env`](versions.env) (`PROMETHEUS_VERSION`) |
+| Blackbox exporter| `v0.25.0`  | Pinned in [`versions.env`](versions.env) (`BLACKBOX_VERSION`) |
 
 Container images used by integration tests (pulled automatically by
 `testcontainers` at test time):
@@ -310,7 +329,7 @@ Container images used by integration tests (pulled automatically by
 | `redis:7`            | Warmed in CI before each integration run.      |
 
 Source of truth for tool versions:
-- **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`
+- **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`, `NODE_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `BLACKBOX_VERSION`
 - Rust toolchain: [`rust-toolchain.toml`](rust-toolchain.toml)
 - Rust + `cargo-llvm-cov`: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
 - `cargo-nextest`: [`.github/workflows/rust.yml`](.github/workflows/rust.yml) (`Install cargo-nextest` step)

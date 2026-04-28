@@ -6,6 +6,7 @@
 # Solana version the plugin was built against. Drift between CLI and plugin
 # produces "validator starts then crashes on first subscribe".
 # Build via: `docker compose --env-file versions.env --env-file .env build validator`
+# Standalone build (outside compose): see README "Building a single Dockerfile standalone".
 # Requires Docker >= 26.0 (BuildKit + the `--mount=type=cache` directives below).
 ARG SOLANA_VERSION
 ARG YELLOWSTONE_TAG

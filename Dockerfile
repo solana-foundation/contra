@@ -3,6 +3,7 @@
 #
 # SOLANA_VERSION is the source of truth in versions.env.
 # Build via: `docker compose --env-file versions.env --env-file .env build <service>`
+# Standalone build (outside compose): see README "Building a single Dockerfile standalone".
 # Requires Docker >= 26.0 (BuildKit + the `--mount=type=cache` directives below).
 
 ARG SOLANA_VERSION

@@ -1,4 +1,7 @@
-FROM prom/prometheus:latest
+# PROMETHEUS_VERSION comes from versions.env.
+# Standalone build (outside compose): see README "Building a single Dockerfile standalone".
+ARG PROMETHEUS_VERSION
+FROM prom/prometheus:${PROMETHEUS_VERSION}
 
 COPY prometheus.yml /etc/prometheus/prometheus.yml.tmpl
 

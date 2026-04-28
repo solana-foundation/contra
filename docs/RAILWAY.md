@@ -90,7 +90,10 @@ The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and mu
 - **Settings > Build > Dockerfile Path**: `admin-ui/Dockerfile`
 - **Settings > Build > Docker Build Context**: `/` (repo root, needed so the generated TypeScript clients can be copied)
 - **Settings > Build > Build Args** (mirror of `versions.env`, since Railway doesn't read it):
-  - `PNPM_VERSION` — must match `versions.env` (currently `10.15.1`). The Dockerfile has a fallback default, but set it explicitly here so a `versions.env` bump in CI/Docker doesn't silently drift from Railway.
+  - `PNPM_VERSION` — must match `versions.env` (currently `10.15.1`).
+  - `NODE_VERSION` — must match `versions.env` (currently `24.7.0`); selects the `node:${NODE_VERSION}-slim` base image.
+
+  Both have fallback defaults in the Dockerfile, but set them explicitly here so a `versions.env` bump in CI/Docker doesn't silently drift from Railway.
 - No custom start command needed -- the Dockerfile handles it.
 
 ## Environment Variables

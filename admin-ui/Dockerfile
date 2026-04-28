@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1.7
 # Requires Docker >= 26.0 (BuildKit + the `--mount=type=cache` directives below).
 #
-# PNPM_VERSION: versions.env is the source of truth (consumed by docker compose). Railway
-# builds don't read versions.env, so a default is set below as a fallback — Railway should
-# still set this explicitly via Build Args so a versions.env bump doesn't silently drift.
-# Bump this default in lockstep with versions.env when raising the pinned pnpm version.
-FROM node:24-slim AS builder
+# NODE_VERSION / PNPM_VERSION: versions.env is the source of truth (consumed by docker
+# compose). Railway builds don't read versions.env, so defaults are set below as fallbacks
+# — Railway should still set them explicitly via Build Args so a versions.env bump doesn't
+# silently drift. Bump these defaults in lockstep with versions.env when raising the pins.
+# Standalone build (outside compose): see README "Building a single Dockerfile standalone".
+ARG NODE_VERSION=24.7.0
+FROM node:${NODE_VERSION}-slim AS builder
 ARG PNPM_VERSION=10.15.1
 
 # Pin pnpm's content-addressed store to a known path so the cache mount below targets it.
@@ -40,7 +42,8 @@ ARG CONTRA_WS_URL
 RUN npx vite build
 
 # Runtime
-FROM node:24-slim
+ARG NODE_VERSION=24.7.0
+FROM node:${NODE_VERSION}-slim
 
 WORKDIR /app
 COPY --from=builder /workspace/admin-ui/dist ./dist

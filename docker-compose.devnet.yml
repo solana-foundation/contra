@@ -437,7 +437,7 @@ services:
 
   # Blackbox Exporter for HTTP health probing
   blackbox-exporter:
-    image: prom/blackbox-exporter:latest
+    image: prom/blackbox-exporter:${BLACKBOX_VERSION}
     container_name: contra-blackbox-exporter
     restart: unless-stopped
     networks:
@@ -465,6 +465,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.prometheus
+      args:
+        PROMETHEUS_VERSION: ${PROMETHEUS_VERSION}
     container_name: contra-prometheus
     restart: unless-stopped
     ports:
@@ -480,7 +482,7 @@ services:
 
   # Grafana for visualization
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:${GRAFANA_VERSION}
     container_name: contra-grafana
     restart: unless-stopped
     ports:

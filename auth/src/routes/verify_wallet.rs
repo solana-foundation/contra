@@ -17,9 +17,9 @@ pub async fn verify_wallet(
     Json(req): Json<VerifyWalletRequest>,
 ) -> AppResult<Json<WalletResponse>> {
     // Consume the challenge atomically — marks it used so it cannot be replayed.
-    let challenge = db::consume_challenge(&state.pool, claims.sub, req.nonce)
-        .await?
-        .ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
+    let r = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
+    state.pool_status.observe_app(&r);
+    let challenge = r?.ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
 
     // Reconstruct the exact message the client was asked to sign.
     // Must match the format returned by /auth/challenge-wallet.
@@ -41,17 +41,17 @@ pub async fn verify_wallet(
         return Err(AppError::Unauthorized);
     }
 
-    let wallet = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey)
-        .await
-        .map_err(|e| match e {
-            // Unique constraint on (user_id, pubkey) — wallet already verified.
-            AppError::Db(sqlx::Error::Database(ref db_err))
-                if db_err.constraint() == Some("verified_wallets_user_id_pubkey_key") =>
-            {
-                AppError::Conflict("wallet already verified".into())
-            }
-            other => other,
-        })?;
+    let raw = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey).await;
+    state.pool_status.observe_app(&raw);
+    let wallet = raw.map_err(|e| match e {
+        // Unique constraint on (user_id, pubkey) — wallet already verified.
+        AppError::Db(sqlx::Error::Database(ref db_err))
+            if db_err.constraint() == Some("verified_wallets_user_id_pubkey_key") =>
+        {
+            AppError::Conflict("wallet already verified".into())
+        }
+        other => other,
+    })?;
 
     info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
 

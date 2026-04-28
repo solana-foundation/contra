@@ -114,9 +114,8 @@ COPY contra-withdraw-program ./contra-withdraw-program
 RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    make install \
-    && make -C contra-escrow-program build \
-    && make -C contra-withdraw-program build \
+    make -C contra-escrow-program install build \
+    && make -C contra-withdraw-program install build \
     && mkdir -p /out/deploy \
     && cp target/deploy/contra_escrow_program.so /out/deploy/ \
     && cp target/deploy/contra_withdraw_program.so /out/deploy/

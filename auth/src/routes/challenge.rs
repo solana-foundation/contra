@@ -8,7 +8,9 @@ pub async fn challenge(
     claims: Claims,
 ) -> AppResult<Json<ChallengeResponse>> {
     let nonce = Uuid::new_v4();
-    let challenge = db::insert_challenge(&state.pool, claims.sub, nonce).await?;
+    let r = db::insert_challenge(&state.pool, claims.sub, nonce).await;
+    state.pool_status.observe_app(&r);
+    let challenge = r?;
 
     // The message includes user id and nonce so it is bound to this specific user and request.
     // The client must sign this exact string with their wallet's private key.

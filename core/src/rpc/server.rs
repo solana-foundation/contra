@@ -1,6 +1,7 @@
 use {
     super::handler::{create_rpc_module, handle_request},
     crate::{
+        health::HeartbeatRegistry,
         nodes::node::WorkerHandle,
         rpc::rpc_impl::{ReadDeps, WriteDeps},
     },
@@ -20,6 +21,7 @@ pub struct RpcServiceConfig {
     pub max_connections: usize,
     pub read_deps: Option<ReadDeps>,
     pub write_deps: Option<WriteDeps>,
+    pub heartbeats: HeartbeatRegistry,
     pub shutdown_token: CancellationToken,
 }
 
@@ -31,6 +33,7 @@ pub async fn start_rpc_service(
         max_connections,
         read_deps,
         write_deps,
+        heartbeats,
         shutdown_token,
     } = config;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -44,6 +47,7 @@ pub async fn start_rpc_service(
 
     // Create the RPC module once, to be shared across all connections
     let rpc_module = Arc::new(create_rpc_module(read_deps, write_deps).await);
+    let heartbeats = Arc::new(heartbeats);
 
     // Limit concurrent connections
     let max_connections = Arc::new(Semaphore::new(max_connections));
@@ -72,6 +76,7 @@ pub async fn start_rpc_service(
 
                             let io = TokioIo::new(tcp_stream);
                             let rpc_module_clone = rpc_module.clone();
+                            let heartbeats_clone = heartbeats.clone();
 
                             tokio::spawn(async move {
                                 // Hold permit for connection lifetime
@@ -79,7 +84,7 @@ pub async fn start_rpc_service(
                                 debug!("Accepted connection from {}", peer_addr);
 
                                 let service = hyper::service::service_fn(move |req| {
-                                    handle_request(req, rpc_module_clone.clone())
+                                    handle_request(req, rpc_module_clone.clone(), heartbeats_clone.clone())
                                 });
 
                                 // Configure connection with timeouts

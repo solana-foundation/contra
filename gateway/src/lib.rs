@@ -21,8 +21,8 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -108,7 +108,18 @@ pub struct Gateway {
     /// Used for wallet ownership checks on gated methods.
     /// `None` when auth enforcement is disabled.
     auth_db: Option<PgPool>,
+    /// Cached result of the last upstream readiness probe, refreshed on demand.
+    ready_cache: Arc<StdMutex<Option<ReadyCache>>>,
 }
+
+#[derive(Clone, Copy)]
+struct ReadyCache {
+    checked_at: Instant,
+    healthy: bool,
+}
+
+const READY_CACHE_TTL: Duration = Duration::from_secs(2);
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 impl Gateway {
     pub fn new(
@@ -138,7 +149,45 @@ impl Gateway {
             client,
             jwt_secret,
             auth_db,
+            ready_cache: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Probes a single upstream's /health with a short timeout.
+    async fn probe_upstream(&self, url: &str) -> bool {
+        let probe_url = format!("{}/health", url.trim_end_matches('/'));
+        let Ok(uri) = probe_url.parse::<hyper::Uri>() else {
+            return false;
+        };
+        let Ok(req) = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .body(Full::new(Bytes::new()))
+        else {
+            return false;
+        };
+        match tokio::time::timeout(READY_PROBE_TIMEOUT, self.client.request(req)).await {
+            Ok(Ok(resp)) => resp.status().is_success(),
+            _ => false,
+        }
+    }
+
+    /// Returns true if both upstreams pass /health within the cache TTL. Probes are
+    /// cached for 2s so probe storms don't cascade into upstream load.
+    async fn check_ready(&self) -> bool {
+        if let Some(c) = *self.ready_cache.lock().unwrap() {
+            if c.checked_at.elapsed() < READY_CACHE_TTL {
+                return c.healthy;
+            }
+        }
+        let (write_ok, read_ok) =
+            tokio::join!(self.probe_upstream(&self.write_url), self.probe_upstream(&self.read_url));
+        let healthy = write_ok && read_ok;
+        *self.ready_cache.lock().unwrap() = Some(ReadyCache {
+            checked_at: Instant::now(),
+            healthy,
+        });
+        healthy
     }
 
     fn record_metrics(
@@ -336,6 +385,34 @@ impl Gateway {
                 )
                 .body(
                     Full::new(Bytes::from(r#"{"status":"ok"}"#))
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                )
+                .unwrap());
+        }
+
+        // Readiness check — probes both upstreams. For external monitoring only;
+        // compose's healthcheck stays on /health so a backend outage doesn't
+        // cause the gateway to be restarted (which wouldn't help).
+        if req.method() == hyper::Method::GET && req.uri().path() == "/ready" {
+            let healthy = self.check_ready().await;
+            let (status, body) = if healthy {
+                (StatusCode::OK, r#"{"status":"ready"}"#)
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"status":"degraded"}"#,
+                )
+            };
+            return Ok(Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .header(
+                    "Access-Control-Allow-Origin",
+                    self.cors_allowed_origin.as_str(),
+                )
+                .body(
+                    Full::new(Bytes::from(body))
                         .map_err(|never| match never {})
                         .boxed_unsync(),
                 )

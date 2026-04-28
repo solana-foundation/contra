@@ -1,6 +1,7 @@
 use {
     crate::{
-        accounts::traits::AccountsDB, nodes::node::WorkerHandle, stage_metrics::SharedMetrics,
+        accounts::traits::AccountsDB, health::StageHeartbeat, nodes::node::WorkerHandle,
+        stage_metrics::SharedMetrics,
     },
     anyhow::{ensure, Result},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
@@ -24,6 +25,7 @@ pub struct DedupArgs {
     /// Pre-populated from DB on startup; empty on a fresh node.
     pub initial_dedup_cache: HashMap<Hash, HashSet<Signature>>,
     pub metrics: SharedMetrics,
+    pub heartbeat: Arc<StageHeartbeat>,
 }
 
 /// Create the dedup channel pair (unbounded)
@@ -161,6 +163,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
         initial_live_blockhashes,
         initial_dedup_cache,
         metrics,
+        heartbeat,
     } = args;
 
     let live_blockhashes = Arc::new(RwLock::new(initial_live_blockhashes));
@@ -232,6 +235,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                     match result {
                         Some(transaction) => {
                             metrics.dedup_received();
+                            heartbeat.record_input();
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
 
@@ -304,6 +308,8 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                     send_result = output_tx.send(transaction.clone()) => {
                                         if let Err(e) = send_result {
                                             warn!("Failed to forward transaction to sigverify: {}", e);
+                                        } else {
+                                            heartbeat.record_progress();
                                         }
                                         break;
                                     }
@@ -388,6 +394,7 @@ mod tests {
             initial_live_blockhashes: LinkedList::new(),
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         };
         tokio::spawn(async move {
             start_dedup(args).await;

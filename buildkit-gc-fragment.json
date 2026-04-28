@@ -1,0 +1,25 @@
+{
+  "builder": {
+    "gc": {
+      "enabled": true,
+      "defaultKeepStorage": "50GB",
+      "policy": [
+        {
+          "keepStorage": "20GB",
+          "filter": [
+            "type==source.local",
+            "type==exec.cachemount",
+            "type==source.git.checkout"
+          ]
+        },
+        {
+          "keepStorage": "10GB"
+        },
+        {
+          "keepStorage": "50GB",
+          "all": true
+        }
+      ]
+    }
+  }
+}

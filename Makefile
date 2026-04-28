@@ -20,6 +20,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
+.PHONY: install-buildkit-cache check-buildkit-cache
 
 all: build
 
@@ -350,7 +351,7 @@ yellowstone-clean:
 #          each Mac. A stamp file tracks YELLOWSTONE_TAG so a versions.env
 #          bump triggers a rebuild but day-to-day `make install` is a no-op.
 ensure-geyser-plugin:
-	@set -a; source versions.env; set +a; \
+	@if [ -f versions.env ]; then set -a; source versions.env; set +a; fi; \
 	if [ "$$(uname -s)" = "Darwin" ]; then \
 	    plugin=test_utils/geyser/libyellowstone_grpc_geyser.dylib; \
 	    stamp=test_utils/geyser/.dylib-tag; \
@@ -409,7 +410,7 @@ profile:
 #############
 # Observability
 #############
-obs-up:
+obs-up: check-buildkit-cache
 	@echo "Starting observability stack (docker-compose.yml)..."
 	@docker compose -f docker-compose.yml up -d $(OBS_SERVICES)
 
@@ -420,7 +421,7 @@ obs-down:
 obs-logs:
 	@docker compose -f docker-compose.yml logs -f --tail=200 $(OBS_SERVICES)
 
-obs-devnet-up:
+obs-devnet-up: check-buildkit-cache
 	@echo "Starting observability stack (docker-compose.devnet.yml)..."
 	@docker compose -f docker-compose.devnet.yml up -d $(OBS_SERVICES)
 
@@ -430,6 +431,59 @@ obs-devnet-down:
 
 obs-devnet-logs:
 	@docker compose -f docker-compose.devnet.yml logs -f --tail=200 $(OBS_SERVICES)
+
+#############
+# BuildKit cache GC
+#############
+# Merges buildkit-gc-fragment.json into /etc/docker/daemon.json and reloads
+# dockerd so the embedded BuildKit applies the cache caps. Idempotent: jq's
+# `.[0] * .[1]` deep-merge means re-running produces the same result. Safe:
+# always backs up daemon.json with a timestamp and validates the merged
+# output before installing. live-restore=true (already in daemon.json)
+# means reload does not interrupt running containers.
+DAEMON_JSON := /etc/docker/daemon.json
+BUILDKIT_GC_FRAGMENT := $(CURDIR)/buildkit-gc-fragment.json
+
+install-buildkit-cache: check-docker
+	@command -v jq >/dev/null 2>&1 || { echo "ERROR: jq required (apt install jq)"; exit 1; }
+	@test -r $(BUILDKIT_GC_FRAGMENT) || { echo "ERROR: $(BUILDKIT_GC_FRAGMENT) not found"; exit 1; }
+	@if [ "$$(id -u)" -ne 0 ]; then \
+	    echo "ERROR: must run as root (writes $(DAEMON_JSON))"; \
+	    echo "Re-run with: sudo make install-buildkit-cache"; \
+	    exit 1; \
+	fi
+	@set -e; \
+	ts="$$(date +%Y%m%d-%H%M%S)"; \
+	if [ -f $(DAEMON_JSON) ]; then \
+	    cp -a $(DAEMON_JSON) $(DAEMON_JSON).bak.$$ts; \
+	    echo "Backup: $(DAEMON_JSON).bak.$$ts"; \
+	    base=$(DAEMON_JSON); \
+	else \
+	    base="$$(mktemp)"; printf '{}\n' > "$$base"; \
+	fi; \
+	merged="$$(mktemp)"; \
+	jq -s '.[0] * .[1]' "$$base" $(BUILDKIT_GC_FRAGMENT) > "$$merged"; \
+	jq empty "$$merged" >/dev/null; \
+	mv "$$merged" $(DAEMON_JSON); \
+	chmod 0644 $(DAEMON_JSON); \
+	echo "Merged builder.gc into $(DAEMON_JSON)"; \
+	echo "Reloading dockerd (live-restore=true preserves running containers)..."; \
+	systemctl reload docker; \
+	sleep 1; \
+	docker info >/dev/null 2>&1 || { echo "ERROR: docker info failed after reload — restore from backup"; exit 1; }; \
+	echo "Done. Inspect cache usage: docker buildx du"
+
+# Lightweight check used as a prerequisite of compose-driven build targets.
+# Greps daemon.json for the marker keys; cheap and avoids spawning docker.
+# Fails with an actionable message if the cache caps were never installed.
+check-buildkit-cache:
+	@if [ ! -f $(DAEMON_JSON) ] || \
+	   ! grep -q '"defaultKeepStorage"' $(DAEMON_JSON) 2>/dev/null; then \
+	    echo "ERROR: BuildKit GC config not installed in $(DAEMON_JSON)"; \
+	    echo "       Run: sudo make install-buildkit-cache"; \
+	    echo "       (one-time setup; caps build cache at 50 GB so it doesn't fill the disk)"; \
+	    exit 1; \
+	fi
 
 help:
 	@echo "Contra Programs - Available targets:"
@@ -481,3 +535,7 @@ help:
 	@echo "  obs-devnet-up        - Start cadvisor/prometheus/grafana (docker-compose.devnet.yml)"
 	@echo "  obs-devnet-down      - Stop cadvisor/prometheus/grafana (docker-compose.devnet.yml)"
 	@echo "  obs-devnet-logs      - Tail observability logs (docker-compose.devnet.yml)"
+	@echo ""
+	@echo "Build host setup:"
+	@echo "  install-buildkit-cache - Merge BuildKit GC config into /etc/docker/daemon.json (sudo, one-time)"
+	@echo "  check-buildkit-cache   - Verify BuildKit GC config is installed (used as prereq of obs-up)"

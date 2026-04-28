@@ -1,10 +1,10 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    contra_auth::db,
+    contra_auth::{db, error::AppError},
     solana_sdk::pubkey::Pubkey,
     sqlx::postgres::PgPoolOptions,
-    std::str::FromStr,
+    std::{env, str::FromStr},
     tracing::{error, info},
 };
 
@@ -14,10 +14,6 @@ use {
     about = "Manual administrative commands for the contra-auth database"
 )]
 struct Args {
-    /// Auth database connection URL (PostgreSQL)
-    #[arg(long, env = "AUTH_DATABASE_URL")]
-    database_url: String,
-
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info", env = "CONTRA_LOG_LEVEL")]
     log_level: String,
@@ -73,15 +69,18 @@ fn init_logging(log_level: &str, json_logs: bool) {
 }
 
 async fn run(args: Args) -> Result<()> {
-    if !args.database_url.starts_with("postgres://")
-        && !args.database_url.starts_with("postgresql://")
-    {
+    // Read AUTH_DATABASE_URL from the environment rather than a CLI flag so the
+    // password never lands in argv (visible via `ps` and shell history).
+    let database_url =
+        env::var("AUTH_DATABASE_URL").map_err(|_| anyhow!("AUTH_DATABASE_URL is not set"))?;
+
+    if !database_url.starts_with("postgres://") && !database_url.starts_with("postgresql://") {
         return Err(anyhow!("AUTH_DATABASE_URL must be a PostgreSQL URL"));
     }
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&args.database_url)
+        .connect(&database_url)
         .await
         .map_err(|e| anyhow!("Failed to connect to auth DB: {}", e))?;
 
@@ -93,13 +92,29 @@ async fn run(args: Args) -> Result<()> {
 }
 
 async fn attach_wallet(pool: &sqlx::PgPool, args: AttachWalletArgs) -> Result<()> {
-    Pubkey::from_str(&args.pubkey).map_err(|_| anyhow!("invalid pubkey: {}", args.pubkey))?;
+    let pubkey = Pubkey::from_str(&args.pubkey)
+        .map_err(|_| anyhow!("invalid pubkey: {}", args.pubkey))?
+        .to_string();
 
     let user = db::find_user_by_username(pool, &args.username)
         .await?
         .ok_or_else(|| anyhow!("user not found: {}", args.username))?;
 
-    let wallet = db::insert_verified_wallet(pool, user.id, &args.pubkey).await?;
+    let wallet = db::insert_verified_wallet(pool, user.id, &pubkey)
+        .await
+        .map_err(|e| match e {
+            // Unique constraint on (user_id, pubkey) — wallet already attached.
+            AppError::Db(sqlx::Error::Database(ref db_err))
+                if db_err.constraint() == Some("verified_wallets_user_id_pubkey_key") =>
+            {
+                anyhow!(
+                    "wallet {} is already attached to user {}",
+                    pubkey,
+                    args.username
+                )
+            }
+            other => anyhow::Error::new(other),
+        })?;
 
     info!(
         user_id = %user.id,

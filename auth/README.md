@@ -101,6 +101,18 @@ There are two roles: `user` (default) and `operator`.
 UPDATE contra_auth.users SET role = 'operator' WHERE username = 'alice';
 ```
 
+## Admin CLI
+
+Operator-only commands for managing users directly against the auth database. Requires `AUTH_DATABASE_URL` (same DB the auth service uses).
+
+### Attach a wallet to a user
+
+Inserts a row into `contra_auth.verified_wallets` without running the challenge/signature flow — the operator is asserting trust, the user does not prove ownership. Use this for provisioning or recovery, not as a substitute for the normal verification flow.
+
+```bash
+AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin admin -- attach-wallet --username alice --pubkey <base58>
+```
+
 ## Wallet verification flow
 
 Wallets are not trusted on assertion — the user must cryptographically prove they control the private key.

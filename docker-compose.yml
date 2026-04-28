@@ -9,6 +9,15 @@ x-validator-build-args: &validator-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
   YELLOWSTONE_TAG: ${YELLOWSTONE_TAG}
 
+# Default healthcheck timings — 10s interval keeps probe load light, 3s timeout
+# fails fast on a wedged service, 5 retries gives ~50s of hysteresis to absorb
+# transients. start_period overrides per service below where boot is slow.
+x-default-healthcheck: &default-healthcheck
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 30s
+
 services:
   # PostgreSQL Primary (for write node)
   postgres-primary:
@@ -64,7 +73,8 @@ services:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-primary
+      postgres-primary:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_WRITE_PORT}
@@ -89,6 +99,11 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    # Real probe — /health dispatches getEpochSchedule through the in-process RPC
+    # module and returns 503 if the call fails. Fails when the RPC pipeline is dead.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_WRITE_PORT}/health || exit 1"]
 
   # PostgreSQL Replica (for read node)
   postgres-replica:
@@ -152,8 +167,10 @@ services:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-replica
-      - write-node
+      postgres-replica:
+        condition: service_healthy
+      write-node:
+        condition: service_started
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_READ_PORT}
@@ -170,6 +187,10 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    # Real probe — same /health implementation as write-node, against the replica pool.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_READ_PORT}/health || exit 1"]
 
   # Gateway (Routes requests between write and read nodes)
   gateway:
@@ -201,6 +222,13 @@ services:
     command: ["/usr/local/bin/gateway"]
     networks:
       - contra-network
+    # Liveness only — the gateway /health handler returns static 200. Gateway
+    # deliberately doesn't probe its upstreams; their own probes report their
+    # state, and restarting the gateway when an upstream is down doesn't fix
+    # anything. TODO: add a /ready endpoint for out-of-band upstream monitoring.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${GATEWAY_PORT}/health || exit 1"]
 
   # Auth Service (optional — run with: docker compose --profile auth up)
   auth:
@@ -226,6 +254,12 @@ services:
     command: ["/usr/local/bin/auth"]
     networks:
       - contra-network
+    # Placebo /health — the auth handler returns static "ok". Catches process-up
+    # + axum alive, which is all compose needs for liveness.
+    # TODO: replace with a pool.is_healthy() flag updated by handlers.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${AUTH_PORT}/health || exit 1"]
 
   # WebSocket Transaction Streamer
   streamer:
@@ -236,9 +270,12 @@ services:
     container_name: contra-streamer
     restart: unless-stopped
     depends_on:
-      - postgres-replica
-      - write-node
-      - postgres-indexer
+      postgres-replica:
+        condition: service_healthy
+      write-node:
+        condition: service_healthy
+      postgres-indexer:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - STREAMER_PORT=${STREAMER_PORT:-8902}
@@ -251,6 +288,12 @@ services:
     command: ["/usr/local/bin/streamer"]
     networks:
       - contra-network
+    # Placebo /health — the streamer handler returns static "ok". Catches
+    # process-up only. TODO: aggregate Yellowstone connection state +
+    # last-message-received timestamp into the response.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${STREAMER_PORT:-8902}/health || exit 1"]
 
   # Activity Generator
   activity:
@@ -331,6 +374,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   # PostgreSQL for Indexer
   postgres-indexer:
@@ -402,6 +446,12 @@ services:
           indexer
     networks:
       - contra-network
+    # No /health route on the metrics router yet — /metrics is a cheap idempotent
+    # probe of the same axum server (the contra-metrics crate).
+    # TODO: add /health to the metrics router with last_slot_processed_at + slot_lag.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
@@ -437,6 +487,10 @@ services:
           indexer
     networks:
       - contra-network
+    # See indexer-solana note re: /metrics in lieu of /health.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
 
   # Operator Service - Solana
   operator-solana:
@@ -450,7 +504,7 @@ services:
       postgres-indexer:
         condition: service_healthy
       write-node:
-        condition: service_started
+        condition: service_healthy
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
@@ -484,6 +538,10 @@ services:
           operator
     networks:
       - contra-network
+    # /metrics in lieu of /health — the metrics router doesn't expose /health yet.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9102/metrics > /dev/null || exit 1"]
 
   # Operator Service - Contra
   operator-contra:
@@ -528,6 +586,10 @@ services:
           operator
     networks:
       - contra-network
+    # /metrics in lieu of /health — the metrics router doesn't expose /health yet.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9103/metrics > /dev/null || exit 1"]
 
   # Base backup sidecar for postgres-primary
   pg-backup-primary:
@@ -580,6 +642,12 @@ services:
     restart: unless-stopped
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9115/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   # cAdvisor for container metrics
   cadvisor:
@@ -597,6 +665,10 @@ services:
     privileged: true
     networks:
       - contra-network
+    # No healthcheck — the cadvisor image is distroless (no shell, no wget/curl).
+    # Restart-on-crash via `restart: unless-stopped` is the only liveness signal.
+    # An out-of-process probe (Prometheus scrape failure on the cadvisor target)
+    # is the right monitoring path here.
 
   # Prometheus for metrics collection
   prometheus:
@@ -619,6 +691,12 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
   # Grafana for visualization
   grafana:
@@ -642,6 +720,12 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres-primary-data:

@@ -5,6 +5,15 @@ x-solana-build-args: &solana-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
   PNPM_VERSION: ${PNPM_VERSION}
 
+# Default healthcheck timings — 10s interval keeps probe load light, 3s timeout
+# fails fast on a wedged service, 5 retries gives ~50s of hysteresis to absorb
+# transients. start_period overrides per service below where boot is slow.
+x-default-healthcheck: &default-healthcheck
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 30s
+
 services:
   # PostgreSQL Primary (for write node)
   postgres-primary:
@@ -60,7 +69,8 @@ services:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-primary
+      postgres-primary:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_WRITE_PORT}
@@ -85,6 +95,9 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_WRITE_PORT}/health || exit 1"]
 
   # PostgreSQL Replica (for read node)
   postgres-replica:
@@ -148,8 +161,10 @@ services:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-replica
-      - write-node
+      postgres-replica:
+        condition: service_healthy
+      write-node:
+        condition: service_started
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_READ_PORT}
@@ -166,6 +181,9 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_READ_PORT}/health || exit 1"]
 
   # Gateway (Routes requests between write and read nodes)
   gateway:
@@ -196,6 +214,9 @@ services:
     command: ["/usr/local/bin/gateway"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${GATEWAY_PORT}/health || exit 1"]
 
   # Auth Service (optional — run with: docker compose --profile auth up)
   auth:
@@ -221,6 +242,9 @@ services:
     command: ["/usr/local/bin/auth"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${AUTH_PORT}/health || exit 1"]
 
   # PostgreSQL for Indexer
   postgres-indexer:
@@ -284,6 +308,9 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
@@ -318,6 +345,9 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
 
   # Operator Service - Solana
   operator-solana:
@@ -353,6 +383,9 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
 
   # Operator Service - Contra
   operator-contra:
@@ -366,7 +399,7 @@ services:
       postgres-indexer:
         condition: service_healthy
       write-node:
-        condition: service_started
+        condition: service_healthy
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
@@ -390,6 +423,9 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/metrics > /dev/null || exit 1"]
 
   # Base backup sidecar for postgres-primary
   pg-backup-primary:
@@ -442,6 +478,12 @@ services:
     restart: unless-stopped
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9115/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   # cAdvisor for container metrics
   cadvisor:
@@ -459,6 +501,7 @@ services:
     privileged: true
     networks:
       - contra-network
+    # No healthcheck — cadvisor image is distroless. See docker-compose.yml note.
 
   # Prometheus for metrics collection
   prometheus:
@@ -479,6 +522,12 @@ services:
       - CONTRA_METRICS_PORT=${CONTRA_METRICS_PORT:-9090}
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
   # Grafana for visualization
   grafana:
@@ -497,6 +546,12 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres-primary-data:

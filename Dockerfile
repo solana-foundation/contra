@@ -160,11 +160,13 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 RUN rm -f /etc/apt/apt.conf.d/docker-clean \
     && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
-# Install runtime dependencies
+# Install runtime dependencies. curl is used by compose healthcheck probes
+# against the service's /health and /metrics endpoints.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     libssl3
 
 # Create a non-root user to run the application

@@ -198,8 +198,8 @@ pub fn parse_program_error(
             InstructionError::Custom(code),
         ) => {
             match *code {
-                12 => Some(ContraEscrowProgramError::InvalidSmtProof),
-                13 => Some(ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex),
+                11 => Some(ContraEscrowProgramError::InvalidSmtProof),
+                12 => Some(ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex),
                 _ => None, // Ignore other program errors
             }
         }
@@ -289,8 +289,8 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn parse_custom_12_invalid_smt_proof() {
-        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
+    fn parse_custom_11_invalid_smt_proof() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(11));
         let result = parse_program_error(&err);
         assert!(matches!(
             result,
@@ -299,8 +299,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_custom_13_invalid_nonce() {
-        let err = TransactionError::InstructionError(0, InstructionError::Custom(13));
+    fn parse_custom_12_invalid_nonce() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
         let result = parse_program_error(&err);
         assert!(matches!(
             result,
@@ -389,7 +389,7 @@ mod tests {
         assert!(matches!(result, Ok(ConfirmationResult::Confirmed)));
     }
 
-    /// A confirmed status carrying Custom(12) must decode to Failed(InvalidSmtProof) so
+    /// A confirmed status carrying Custom(11) must decode to Failed(InvalidSmtProof) so
     /// the sender receives the exact escrow-program error rather than a generic failure.
     #[tokio::test]
     async fn check_transaction_status_returns_failed_on_program_error() {
@@ -409,9 +409,9 @@ mod tests {
                         "value": [{
                             "confirmationStatus": "confirmed",
                             "confirmations": 1,
-                            "err": {"InstructionError": [0, {"Custom": 12}]},
+                            "err": {"InstructionError": [0, {"Custom": 11}]},
                             "slot": 100,
-                            "status": {"Err": {"InstructionError": [0, {"Custom": 12}]}}
+                            "status": {"Err": {"InstructionError": [0, {"Custom": 11}]}}
                         }]
                     }
                 })

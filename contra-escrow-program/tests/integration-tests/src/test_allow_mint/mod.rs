@@ -3,10 +3,10 @@ use crate::{
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance},
     utils::{
         assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_pausable,
-        set_mint_2022_with_permanent_delegate, TestContext, CONTRA_ESCROW_PROGRAM_ID,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR, PAUSABLE_MINT_NOT_ALLOWED_ERROR,
-        PERMANENT_DELEGATE_NOT_ALLOWED_ERROR, TOKEN_2022_PROGRAM_ID,
+        set_mint_2022_with_permanent_delegate, set_mint_2022_with_transfer_hook, TestContext,
+        CONTRA_ESCROW_PROGRAM_ID, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
+        INVALID_ALLOWED_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR, TOKEN_2022_PROGRAM_ID,
+        TRANSFER_HOOK_NOT_ALLOWED_ERROR,
     },
 };
 use contra_escrow_program_client::instructions::AllowMintBuilder;
@@ -321,7 +321,7 @@ fn test_allow_mint_token_2022_basic_success() {
 }
 
 #[test]
-fn test_allow_mint_token_2022_permanent_delegate_blocked() {
+fn test_allow_mint_token_2022_permanent_delegate_accepted() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let mint = Keypair::new();
@@ -334,40 +334,19 @@ fn test_allow_mint_token_2022_permanent_delegate_blocked() {
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
             .expect("CreateInstance should succeed");
 
-    context
-        .airdrop_if_required(&admin.pubkey(), 1_000_000_000)
-        .unwrap();
-
-    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
-    let (event_authority_pda, _) = find_event_authority_pda();
-    let instance_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
         &instance_pda,
         &mint.pubkey(),
-        &TOKEN_2022_PROGRAM_ID,
-    );
-
-    let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.pubkey())
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_2022_PROGRAM_ID)
-        .associated_token_program(spl_associated_token_account::ID)
-        .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
-        .bump(bump)
-        .instruction();
-
-    let result = context.send_transaction_with_signers(instruction, &[&admin]);
-
-    assert_program_error(result, PERMANENT_DELEGATE_NOT_ALLOWED_ERROR);
+        false,
+        true,
+    )
+    .expect("AllowMint should succeed for a Token-2022 mint with a permanent delegate");
 }
 
 #[test]
-fn test_allow_mint_token_2022_pausable_blocked() {
+fn test_allow_mint_token_2022_pausable_accepted() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let mint = Keypair::new();
@@ -381,6 +360,34 @@ fn test_allow_mint_token_2022_pausable_blocked() {
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
             .expect("CreateInstance should succeed");
 
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        true,
+    )
+    .expect("AllowMint should succeed for a pausable Token-2022 mint");
+}
+
+#[test]
+fn test_allow_mint_token_2022_transfer_hook_blocked() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new();
+    // Hook program id is arbitrary — the check fires on the extension's
+    // presence, not on whether the hook program exists on-chain.
+    let hook_program_id = Pubkey::new_unique();
+
+    let instance_seed = Keypair::new();
+
+    set_mint_2022_with_transfer_hook(&mut context, &mint.pubkey(), &hook_program_id);
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
     context
         .airdrop_if_required(&admin.pubkey(), 1_000_000_000)
         .unwrap();
@@ -410,5 +417,5 @@ fn test_allow_mint_token_2022_pausable_blocked() {
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
-    assert_program_error(result, PAUSABLE_MINT_NOT_ALLOWED_ERROR);
+    assert_program_error(result, TRANSFER_HOOK_NOT_ALLOWED_ERROR);
 }

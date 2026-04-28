@@ -178,6 +178,20 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get token account balance with retry (read-only, safe to retry)
+    pub async fn get_token_account_balance(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Result<solana_account_decoder_client_types::token::UiTokenAmount, Box<client_error::Error>>
+    {
+        self.with_retry(
+            "get_token_account_balance",
+            RetryPolicy::Idempotent,
+            || async { self.rpc_client.get_token_account_balance(pubkey).await },
+        )
+        .await
+    }
+
     /// Get signature statuses with retry (read-only, always safe to retry)
     pub async fn get_signature_statuses(
         &self,

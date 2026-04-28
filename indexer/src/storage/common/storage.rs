@@ -16,6 +16,7 @@ pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod quarantine_all_active_withdrawals;
+pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
@@ -141,6 +142,24 @@ impl Storage {
     /// Get mint metadata by address
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
         get_mint::get_mint(self, mint_address).await
+    }
+
+    /// Write-back the on-chain extension presence (PausableConfig,
+    /// PermanentDelegate) for a mint. Called by the operator's MintCache
+    /// after a single RPC fetch that resolves both flags together.
+    pub async fn set_mint_extension_flags(
+        &self,
+        mint_address: &str,
+        is_pausable: bool,
+        has_permanent_delegate: bool,
+    ) -> Result<(), StorageError> {
+        set_mint_extension_flags::set_mint_extension_flags(
+            self,
+            mint_address,
+            is_pausable,
+            has_permanent_delegate,
+        )
+        .await
     }
 
     /// Return per-mint aggregate balances (completed deposits minus withdrawals) for startup reconciliation.

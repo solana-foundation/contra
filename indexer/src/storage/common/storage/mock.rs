@@ -199,13 +199,50 @@ impl MockStorage {
         self.check_should_fail("upsert_mints_batch")?;
         let mut store = self.mints.lock().unwrap();
         for mint in mints {
-            store.insert(mint.mint_address.clone(), mint.clone());
+            // Must mirror the Postgres `ON CONFLICT DO UPDATE SET decimals,
+            // token_program` semantics: the indexer upserts a `DbMint::new`
+            // (flags = None) every time it sees AllowMint, but the operator
+            // lazily fills `is_pausable` / `has_permanent_delegate` via
+            // `set_mint_extension_flags`. A re-upsert (reorg, indexer
+            // restart, retry) must preserve those flags, otherwise the next
+            // withdrawal wastes an RPC round-trip re-resolving them. A
+            // blanket `insert` here would silently disagree with prod and
+            // let tests lock in the wrong behavior.
+            match store.get_mut(&mint.mint_address) {
+                Some(existing) => {
+                    existing.decimals = mint.decimals;
+                    existing.token_program = mint.token_program.clone();
+                }
+                None => {
+                    store.insert(mint.mint_address.clone(), mint.clone());
+                }
+            }
         }
         Ok(())
     }
 
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
         Ok(self.mints.lock().unwrap().get(mint_address).cloned())
+    }
+
+    pub async fn set_mint_extension_flags(
+        &self,
+        mint_address: &str,
+        is_pausable: bool,
+        has_permanent_delegate: bool,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("set_mint_extension_flags")?;
+        let mut mints = self.mints.lock().unwrap();
+        match mints.get_mut(mint_address) {
+            Some(mint) => {
+                mint.is_pausable = Some(is_pausable);
+                mint.has_permanent_delegate = Some(has_permanent_delegate);
+                Ok(())
+            }
+            None => Err(StorageError::DatabaseError {
+                message: format!("set_mint_extension_flags: no mints row for {mint_address}"),
+            }),
+        }
     }
 
     pub fn set_mint_balances(&self, balances: Vec<MintDbBalance>) {

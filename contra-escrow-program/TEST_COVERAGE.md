@@ -38,8 +38,9 @@
 - `test_allow_mint_invalid_admin` — wrong admin rejected
 - `test_allow_mint_invalid_instance_account_owner` — wrong owner rejected
 - `test_allow_mint_token_2022_basic_success` — Token2022 mint allowed
-- `test_allow_mint_token_2022_permanent_delegate_blocked` — PermanentDelegateNotAllowed
-- `test_allow_mint_token_2022_pausable_blocked` — PausableMintNotAllowed
+- `test_allow_mint_token_2022_permanent_delegate_accepted` — permanent-delegate Token-2022 mint allowed; drain detection is enforced by the operator at withdrawal time
+- `test_allow_mint_token_2022_pausable_accepted` — pausable Token-2022 mint allowed; pause state is enforced by the operator at withdrawal time
+- `test_allow_mint_token_2022_transfer_hook_blocked` — TransferHookNotAllowed; the program's `TransferChecked` CPI does not resolve extra-account metas, so hook mints are rejected at validation
 
 ### BlockMint (9 integration tests)
 
@@ -90,7 +91,7 @@
 - `test_deposit_invalid_instruction_data_too_short` — malformed data
 - `test_deposit_not_enough_accounts` — missing accounts
 - `test_deposit_token_2022_basic_success` — Token2022 deposit
-- `test_deposit_token_2022_permanent_delegate_rejected` — Token2022 extension blocked
+- `test_deposit_token_2022_transfer_hook_rejected` — TransferHookNotAllowed on deposit path (live swap of mint data post-AllowMint proves the check runs at deposit, not only at AllowMint)
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
 - `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData

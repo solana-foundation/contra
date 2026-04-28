@@ -514,47 +514,41 @@
       {
         "code": 6,
         "kind": "errorNode",
-        "message": "Permanent delegate extension not allowed",
-        "name": "permanentDelegateNotAllowed"
+        "message": "Transfer hook extension not allowed",
+        "name": "transferHookNotAllowed"
       },
       {
         "code": 7,
-        "kind": "errorNode",
-        "message": "Pausable mint extension not allowed",
-        "name": "pausableMintNotAllowed"
-      },
-      {
-        "code": 8,
         "kind": "errorNode",
         "message": "Invalid operator PDA provided",
         "name": "invalidOperatorPda"
       },
       {
-        "code": 9,
+        "code": 8,
         "kind": "errorNode",
         "message": "Invalid token account provided",
         "name": "invalidTokenAccount"
       },
       {
-        "code": 10,
+        "code": 9,
         "kind": "errorNode",
         "message": "Invalid escrow balance",
         "name": "invalidEscrowBalance"
       },
       {
-        "code": 11,
+        "code": 10,
         "kind": "errorNode",
         "message": "Invalid allowed mint",
         "name": "invalidAllowedMint"
       },
       {
-        "code": 12,
+        "code": 11,
         "kind": "errorNode",
         "message": "Invalid SMT proof provided",
         "name": "invalidSmtProof"
       },
       {
-        "code": 13,
+        "code": 12,
         "kind": "errorNode",
         "message": "Invalid transaction nonce for current tree index",
         "name": "invalidTransactionNonceForCurrentTreeIndex"

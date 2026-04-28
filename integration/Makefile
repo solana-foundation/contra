@@ -45,6 +45,8 @@ integration-test:
 	@cargo test --test mint_idempotency_integration -- --nocapture
 	@cargo test --test gap_detection_integration -- --nocapture
 	@cargo test --test truncate_integration -- --nocapture
+	@cargo test --test pausable_mint_integration -- --nocapture
+	@cargo test --test permanent_delegate_mint_integration -- --nocapture
 	@cargo test --test resync_integration -- --nocapture
 	@cargo test --test reconciliation_e2e_test -- --nocapture
 	@cargo test --test mock_rpc_retry -- --nocapture
@@ -234,6 +236,10 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
 	@echo "Running truncate integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test truncate_integration -- --nocapture
+	@echo "Running pausable mint integration tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test pausable_mint_integration -- --nocapture
+	@echo "Running permanent delegate mint integration tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Running resync integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture
 	@echo "Running reconciliation e2e tests with coverage instrumentation..."

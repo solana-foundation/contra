@@ -327,6 +327,20 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Idempotent migration: add is_pausable to existing databases.
+        // Nullable = "unknown"; populated lazily by the operator after an RPC
+        // check against the on-chain mint's Token-2022 PausableConfig extension.
+        sqlx::query("ALTER TABLE mints ADD COLUMN IF NOT EXISTS is_pausable BOOLEAN")
+            .execute(&self.pool)
+            .await?;
+
+        // Same pattern for the PermanentDelegate extension — resolved lazily
+        // the first time the operator touches the mint. Gate for the balance
+        // pre-flight that guards against permanent-delegate drains.
+        sqlx::query("ALTER TABLE mints ADD COLUMN IF NOT EXISTS has_permanent_delegate BOOLEAN")
+            .execute(&self.pool)
+            .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -916,6 +930,37 @@ impl PostgresDb {
         }
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Write-back from the operator's MintCache after it resolves whether
+    /// the on-chain mint carries the Token-2022 PausableConfig and
+    /// PermanentDelegate extensions. Both flags are always resolved in the
+    /// same RPC fetch, so they're persisted together in a single update.
+    /// Errors if the row doesn't exist — the indexer always lands the
+    /// `mints` row before any withdrawal for that mint can reach the
+    /// operator, so a missing row indicates an ordering bug.
+    pub async fn set_mint_extension_flags_internal(
+        &self,
+        mint_address: &str,
+        is_pausable: bool,
+        has_permanent_delegate: bool,
+    ) -> Result<(), StorageError> {
+        let result = sqlx::query(
+            "UPDATE mints SET is_pausable = $2, has_permanent_delegate = $3 WHERE mint_address = $1",
+        )
+        .bind(mint_address)
+        .bind(is_pausable)
+        .bind(has_permanent_delegate)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::DatabaseError {
+                message: format!("set_mint_extension_flags: no mints row for {mint_address}"),
+            });
+        }
+
         Ok(())
     }
 

@@ -562,3 +562,44 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
     assert!(result.is_err(), "should fail when status is not processing");
     Ok(())
 }
+
+// ── set_mint_extension_flags row-exists guard ────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_mint_extension_flags_updates_existing_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    let m = DbMint::new("mint_ext".to_string(), 6, "TokenkegQ".to_string());
+    storage.upsert_mints_batch(&[m]).await?;
+    let row = storage.get_mint("mint_ext").await?.unwrap();
+    assert_eq!(row.is_pausable, None, "upsert should not set is_pausable");
+    assert_eq!(
+        row.has_permanent_delegate, None,
+        "upsert should not set has_permanent_delegate",
+    );
+
+    storage
+        .set_mint_extension_flags("mint_ext", true, false)
+        .await?;
+    let row = storage.get_mint("mint_ext").await?.unwrap();
+    assert_eq!(row.is_pausable, Some(true));
+    assert_eq!(row.has_permanent_delegate, Some(false));
+
+    // Idempotent — writing the same values again is fine.
+    storage
+        .set_mint_extension_flags("mint_ext", true, false)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_mint_extension_flags_fails_when_no_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    let result = storage
+        .set_mint_extension_flags("mint_never_upserted", true, false)
+        .await;
+
+    assert!(result.is_err(), "should fail when mints row doesn't exist");
+    Ok(())
+}

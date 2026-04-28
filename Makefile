@@ -151,6 +151,8 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
 	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
+	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
 	@cd integration && cargo test --test resync_integration -- --nocapture
 	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
@@ -196,6 +198,8 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
 	@cd integration && cargo test --test truncate_integration -- --nocapture
+	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
+	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
 	@cd integration && cargo test --test resync_integration -- --nocapture
 	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture

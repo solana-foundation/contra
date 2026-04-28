@@ -29,35 +29,31 @@ pub enum ContraEscrowProgramError {
     #[error("Invalid admin provided")]
     InvalidAdmin,
 
-    /// (6) Permanent delegate extension not allowed
-    #[error("Permanent delegate extension not allowed")]
-    PermanentDelegateNotAllowed,
+    /// (6) Transfer hook extension not allowed
+    #[error("Transfer hook extension not allowed")]
+    TransferHookNotAllowed,
 
-    /// (7) Pausable mint extension not allowed
-    #[error("Pausable mint extension not allowed")]
-    PausableMintNotAllowed,
-
-    /// (8) Invalid operator PDA provided
+    /// (7) Invalid operator PDA provided
     #[error("Invalid operator PDA provided")]
     InvalidOperatorPda,
 
-    /// (9) Invalid token account provided
+    /// (8) Invalid token account provided
     #[error("Invalid token account provided")]
     InvalidTokenAccount,
 
-    /// (10) Invalid escrow balance
+    /// (9) Invalid escrow balance
     #[error("Invalid escrow balance")]
     InvalidEscrowBalance,
 
-    /// (11) Invalid allowed mint
+    /// (10) Invalid allowed mint
     #[error("Invalid allowed mint")]
     InvalidAllowedMint,
 
-    /// (12) Invalid SMT proof provided
+    /// (11) Invalid SMT proof provided
     #[error("Invalid SMT proof provided")]
     InvalidSmtProof,
 
-    /// (13) Invalid transaction nonce for current tree index
+    /// (12) Invalid transaction nonce for current tree index
     #[error("Invalid transaction nonce for current tree index")]
     InvalidTransactionNonceForCurrentTreeIndex,
 }
@@ -87,14 +83,13 @@ mod tests {
             (InvalidInstanceId, 3),
             (InvalidInstance, 4),
             (InvalidAdmin, 5),
-            (PermanentDelegateNotAllowed, 6),
-            (PausableMintNotAllowed, 7),
-            (InvalidOperatorPda, 8),
-            (InvalidTokenAccount, 9),
-            (InvalidEscrowBalance, 10),
-            (InvalidAllowedMint, 11),
-            (InvalidSmtProof, 12),
-            (InvalidTransactionNonceForCurrentTreeIndex, 13),
+            (TransferHookNotAllowed, 6),
+            (InvalidOperatorPda, 7),
+            (InvalidTokenAccount, 8),
+            (InvalidEscrowBalance, 9),
+            (InvalidAllowedMint, 10),
+            (InvalidSmtProof, 11),
+            (InvalidTransactionNonceForCurrentTreeIndex, 12),
         ];
 
         for (error, expected_code) in cases {

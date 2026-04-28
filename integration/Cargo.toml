@@ -40,6 +40,14 @@ name = "reconciliation_e2e_test"
 path = "tests/indexer/reconciliation_e2e.rs"
 
 [[test]]
+name = "pausable_mint_integration"
+path = "tests/indexer/pausable_mint.rs"
+
+[[test]]
+name = "permanent_delegate_mint_integration"
+path = "tests/indexer/permanent_delegate_mint.rs"
+
+[[test]]
 name = "mock_rpc_retry"
 path = "tests/indexer/mock_rpc_retry.rs"
 

@@ -65,9 +65,15 @@ pub struct HealthState {
 pub enum HealthOutcome {
     Healthy,
     /// Backlog has exceeded the configured ceiling.
-    BacklogExceeded { pending: u64, ceiling: u64 },
+    BacklogExceeded {
+        pending: u64,
+        ceiling: u64,
+    },
     /// Backlog non-zero and no progress within the staleness window.
-    Stalled { pending: u64, age_secs: i64 },
+    Stalled {
+        pending: u64,
+        age_secs: i64,
+    },
 }
 
 impl HealthState {
@@ -80,8 +86,7 @@ impl HealthState {
     }
 
     pub fn record_progress(&self) {
-        self.last_progress_at
-            .store(now_unix(), Ordering::Relaxed);
+        self.last_progress_at.store(now_unix(), Ordering::Relaxed);
     }
 
     pub fn set_pending(&self, value: u64) {

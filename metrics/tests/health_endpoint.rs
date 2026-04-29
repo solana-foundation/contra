@@ -9,21 +9,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Bind to port 0 to find a free port, drop the listener, return the port.
-/// There's a tiny race where another process could grab the port between
-/// our drop and the metrics server's bind, but for an integration test on
-/// a single host this is acceptable.
-fn ephemeral_port() -> u16 {
+async fn boot(health: Arc<HealthState>) -> u16 {
+    // Bind here, hand the listener to the server — no drop-and-rebind window for
+    // another process or parallel test to steal the port.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-async fn boot(health: Arc<HealthState>) -> u16 {
-    let port = ephemeral_port();
-    contra_metrics::start_metrics_server_with_health(port, health);
-    // Give axum a moment to bind. The server spawns on a tokio task so this
+    contra_metrics::start_metrics_server_with_health_from_listener(listener, health);
+    // Give axum a moment to start serving. The server spawns on a tokio task so this
     // is the simplest way to await readiness without polling.
     tokio::time::sleep(Duration::from_millis(100)).await;
     port
@@ -80,8 +72,7 @@ async fn health_returns_503_when_stalled() {
         .unwrap()
         .as_secs() as i64
         - 7200;
-    h.last_progress_at()
-        .store(two_hours_ago, Ordering::Relaxed);
+    h.last_progress_at().store(two_hours_ago, Ordering::Relaxed);
 
     let port = boot(h).await;
 

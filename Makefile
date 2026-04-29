@@ -519,6 +519,14 @@ docker-up: check-docker check-buildkit-cache
 	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
 
+# Like docker-up but preserves the local validator ledger across restarts so
+# on-chain state stays consistent with Postgres rows. Caveat: after changing
+# escrow/withdraw program code, run `make docker-clean` first or the validator
+# will keep running stale bytecode.
+docker-up-persist: check-docker check-buildkit-cache
+	@echo "Starting full stack with validator persistence ($(COMPOSE_LOCAL))..."
+	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
+
 docker-rebuild: check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --build
@@ -631,6 +639,7 @@ help:
 	@echo "Docker stack (full local — docker-compose.yml, uses .env.local):"
 	@echo "  docker-build         - Build all images"
 	@echo "  docker-up            - Start full stack in detached mode"
+	@echo "  docker-up-persist    - Start full stack and preserve the local validator ledger across restarts"
 	@echo "  docker-rebuild       - Rebuild images and (re)start (= build + up in one shot)"
 	@echo "  docker-restart       - Restart all services without rebuilding"
 	@echo "  docker-down          - Stop services (volumes preserved)"

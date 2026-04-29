@@ -373,9 +373,18 @@ services:
       - RUST_LOG=info
       - ESCROW_PROGRAM_ID=${ESCROW_PROGRAM_ID}
       - WITHDRAW_PROGRAM_ID=${WITHDRAW_PROGRAM_ID}
+    # VALIDATOR_RESET_FLAG defaults to --reset (today's behavior: wipe ledger
+    # at every container start). Set it blank to preserve /validator-data
+    # across restarts so on-chain state stays consistent with Postgres rows.
+    # --limit-ledger-size caps the rocksdb blockstore at ~1M shreds (~1 GB);
+    # without this the test-validator default of 10000 shreds wraps too fast
+    # for the indexer to keep up. AccountsDB has no explicit cap but is
+    # naturally bounded by Contra's PDA/ATA count; `make docker-clean` is
+    # the floor if /validator-data ever needs reclaiming.
     command: >
       solana-test-validator
-      --reset
+      ${VALIDATOR_RESET_FLAG---reset}
+      --limit-ledger-size 1000000
       --bpf-program ${ESCROW_PROGRAM_ID} /programs/contra_escrow_program.so
       --bpf-program ${WITHDRAW_PROGRAM_ID} /programs/contra_withdraw_program.so
       --clone TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA

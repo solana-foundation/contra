@@ -21,9 +21,10 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 /// Maximum allowed request body size (64 KB).
@@ -109,7 +110,7 @@ pub struct Gateway {
     /// `None` when auth enforcement is disabled.
     auth_db: Option<PgPool>,
     /// Cached result of the last upstream readiness probe, refreshed on demand.
-    ready_cache: Arc<StdMutex<Option<ReadyCache>>>,
+    ready_cache: Arc<AsyncMutex<Option<ReadyCache>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,7 +150,7 @@ impl Gateway {
             client,
             jwt_secret,
             auth_db,
-            ready_cache: Arc::new(StdMutex::new(None)),
+            ready_cache: Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -175,7 +176,10 @@ impl Gateway {
     /// Returns true if both upstreams pass /health within the cache TTL. Probes are
     /// cached for 2s so probe storms don't cascade into upstream load.
     async fn check_ready(&self) -> bool {
-        if let Some(c) = *self.ready_cache.lock().unwrap() {
+        // Lock held across the probe so concurrent /ready callers single-flight: the first
+        // refreshes the cache, the rest wait and read the just-cached result.
+        let mut cache = self.ready_cache.lock().await;
+        if let Some(c) = *cache {
             if c.checked_at.elapsed() < READY_CACHE_TTL {
                 return c.healthy;
             }
@@ -185,7 +189,7 @@ impl Gateway {
             self.probe_upstream(&self.read_url)
         );
         let healthy = write_ok && read_ok;
-        *self.ready_cache.lock().unwrap() = Some(ReadyCache {
+        *cache = Some(ReadyCache {
             checked_at: Instant::now(),
             healthy,
         });

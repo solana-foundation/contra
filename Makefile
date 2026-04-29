@@ -11,7 +11,7 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
-.PHONY: install install-toolchain check-toolchain build fmt generate-idl generate-clients
+.PHONY: install install-toolchain check-toolchain check-docker build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test all-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
@@ -20,6 +20,9 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: download-yellowstone-grpc build-geyser-plugin clean-geyser
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
+.PHONY: install-buildkit-cache check-buildkit-cache
+.PHONY: docker-build docker-up docker-rebuild docker-restart docker-down docker-clean docker-logs docker-ps
+.PHONY: docker-devnet-build docker-devnet-up docker-devnet-rebuild docker-devnet-restart docker-devnet-down docker-devnet-clean docker-devnet-logs docker-devnet-ps
 
 all: build
 
@@ -61,6 +64,26 @@ check-toolchain:
 	    fi; \
 	fi
 	@command -v cargo-build-sbf >/dev/null || { echo "ERROR: cargo-build-sbf not on PATH"; exit 1; }
+
+# Docker floor check. Separate from check-toolchain because `make build` is cargo-only
+# and must work for contributors who don't have Docker installed. Gate compose/docker
+# build targets on this instead. Floor is 26.0 to match the README; the Dockerfiles use
+# BuildKit `--mount=type=cache` and the `# syntax=docker/dockerfile:1.7` frontend.
+check-docker:
+	@if ! command -v docker >/dev/null 2>&1; then \
+	    echo "ERROR: docker not found on PATH — required for compose-based dev/test stacks (>= 26.0)"; \
+	    exit 1; \
+	fi
+	@ver="$$(docker version --format '{{.Server.Version}}' 2>/dev/null || docker version --format '{{.Client.Version}}' 2>/dev/null)"; \
+	if [ -z "$$ver" ]; then \
+	    echo "ERROR: docker present but version could not be read (daemon not running?)"; \
+	    exit 1; \
+	fi; \
+	major="$$(echo "$$ver" | cut -d. -f1)"; \
+	if [ "$$major" -lt 26 ] 2>/dev/null; then \
+	    echo "ERROR: docker is $$ver; this repo requires >= 26.0 (BuildKit cache mounts)."; \
+	    exit 1; \
+	fi
 
 install: install-toolchain ensure-geyser-plugin
 	@echo "Installing dependencies for all projects..."
@@ -330,7 +353,7 @@ yellowstone-clean:
 #          each Mac. A stamp file tracks YELLOWSTONE_TAG so a versions.env
 #          bump triggers a rebuild but day-to-day `make install` is a no-op.
 ensure-geyser-plugin:
-	@set -a; source versions.env; set +a; \
+	@if [ -f versions.env ]; then set -a; source versions.env; set +a; fi; \
 	if [ "$$(uname -s)" = "Darwin" ]; then \
 	    plugin=test_utils/geyser/libyellowstone_grpc_geyser.dylib; \
 	    stamp=test_utils/geyser/.dylib-tag; \
@@ -389,7 +412,7 @@ profile:
 #############
 # Observability
 #############
-obs-up:
+obs-up: check-buildkit-cache
 	@echo "Starting observability stack (docker-compose.yml)..."
 	@docker compose -f docker-compose.yml up -d $(OBS_SERVICES)
 
@@ -400,7 +423,7 @@ obs-down:
 obs-logs:
 	@docker compose -f docker-compose.yml logs -f --tail=200 $(OBS_SERVICES)
 
-obs-devnet-up:
+obs-devnet-up: check-buildkit-cache
 	@echo "Starting observability stack (docker-compose.devnet.yml)..."
 	@docker compose -f docker-compose.devnet.yml up -d $(OBS_SERVICES)
 
@@ -410,6 +433,153 @@ obs-devnet-down:
 
 obs-devnet-logs:
 	@docker compose -f docker-compose.devnet.yml logs -f --tail=200 $(OBS_SERVICES)
+
+#############
+# BuildKit cache GC
+#############
+# Merges buildkit-gc-fragment.json into /etc/docker/daemon.json and reloads
+# dockerd so the embedded BuildKit applies the cache caps. Idempotent: jq's
+# `.[0] * .[1]` deep-merge means re-running produces the same result. Safe:
+# always backs up daemon.json with a timestamp and validates the merged
+# output before installing. live-restore=true (already in daemon.json)
+# means reload does not interrupt running containers.
+DAEMON_JSON := /etc/docker/daemon.json
+BUILDKIT_GC_FRAGMENT := $(CURDIR)/buildkit-gc-fragment.json
+
+install-buildkit-cache: check-docker
+	@command -v jq >/dev/null 2>&1 || { echo "ERROR: jq required (apt install jq)"; exit 1; }
+	@test -r $(BUILDKIT_GC_FRAGMENT) || { echo "ERROR: $(BUILDKIT_GC_FRAGMENT) not found"; exit 1; }
+	@if [ "$$(id -u)" -ne 0 ]; then \
+	    echo "ERROR: must run as root (writes $(DAEMON_JSON))"; \
+	    echo "Re-run with: sudo make install-buildkit-cache"; \
+	    exit 1; \
+	fi
+	@set -e; \
+	ts="$$(date +%Y%m%d-%H%M%S)"; \
+	if [ -f $(DAEMON_JSON) ]; then \
+	    cp -a $(DAEMON_JSON) $(DAEMON_JSON).bak.$$ts; \
+	    echo "Backup: $(DAEMON_JSON).bak.$$ts"; \
+	    base=$(DAEMON_JSON); \
+	else \
+	    base="$$(mktemp)"; printf '{}\n' > "$$base"; \
+	fi; \
+	merged="$$(mktemp)"; \
+	jq -s '.[0] * .[1]' "$$base" $(BUILDKIT_GC_FRAGMENT) > "$$merged"; \
+	jq empty "$$merged" >/dev/null; \
+	mv "$$merged" $(DAEMON_JSON); \
+	chmod 0644 $(DAEMON_JSON); \
+	echo "Merged builder.gc into $(DAEMON_JSON)"; \
+	echo "Reloading dockerd (live-restore=true preserves running containers)..."; \
+	systemctl reload docker; \
+	sleep 1; \
+	docker info >/dev/null 2>&1 || { echo "ERROR: docker info failed after reload — restore from backup"; exit 1; }; \
+	echo "Done. Inspect cache usage: docker buildx du"
+
+# Lightweight check used as a prerequisite of compose-driven build targets.
+# Greps daemon.json for the marker keys; cheap and avoids spawning docker.
+# Fails with an actionable message if the cache caps were never installed.
+check-buildkit-cache:
+	@if [ ! -f $(DAEMON_JSON) ] || \
+	   ! grep -q '"defaultKeepStorage"' $(DAEMON_JSON) 2>/dev/null; then \
+	    echo "ERROR: BuildKit GC config not installed in $(DAEMON_JSON)"; \
+	    echo "       Run: sudo make install-buildkit-cache"; \
+	    echo "       (one-time setup; caps build cache at 50 GB so it doesn't fill the disk)"; \
+	    exit 1; \
+	fi
+
+#############
+# Docker stack — full local + devnet compose orchestration
+#############
+# These targets save users from remembering the env-file chain on every invocation.
+# Load order: versions.env first (toolchain pins), then the env-specific overrides.
+# `.env.local` is the developer's machine config (gitignored — copy from .env.example
+# and fill in secrets); `.env.devnet` is the tracked devnet preset.
+#
+# Override the env file chain by passing ENV_FILES_LOCAL / ENV_FILES_DEVNET on the
+# command line, e.g. `make docker-up ENV_FILES_LOCAL="--env-file versions.env --env-file .env.staging"`.
+#
+# Prereq policy:
+#   - Daemon-touching targets (build/up/restart/logs/ps) depend on `check-docker`.
+#   - Targets that can trigger a build depend on `check-buildkit-cache` so the
+#     cache GC config is in place before BuildKit populates it.
+#   - `docker-down` and `docker-clean` are recovery paths — no prereqs, so they
+#     still run if Docker / BuildKit configuration is in a degraded state.
+COMPOSE_LOCAL    := docker-compose.yml
+COMPOSE_DEVNET   := docker-compose.devnet.yml
+ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local
+ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet
+
+# --- Local stack (local validator) ---
+
+docker-build: check-docker check-buildkit-cache
+	@echo "Building all images ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) build
+
+docker-up: check-docker check-buildkit-cache
+	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
+
+# Like docker-up but preserves the local validator ledger across restarts so
+# on-chain state stays consistent with Postgres rows. Caveat: after changing
+# escrow/withdraw program code, run `make docker-clean` first or the validator
+# will keep running stale bytecode.
+docker-up-persist: check-docker check-buildkit-cache
+	@echo "Starting full stack with validator persistence ($(COMPOSE_LOCAL))..."
+	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
+
+docker-rebuild: check-docker check-buildkit-cache
+	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --build
+
+docker-restart: check-docker
+	@echo "Restarting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) restart
+
+docker-down:
+	@echo "Stopping full stack ($(COMPOSE_LOCAL); volumes preserved)..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) down
+
+docker-clean:
+	@echo "Stopping full stack and removing volumes ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) down -v --remove-orphans
+
+docker-logs: check-docker
+	@docker compose -f $(COMPOSE_LOCAL) logs -f --tail=200
+
+docker-ps: check-docker
+	@docker compose -f $(COMPOSE_LOCAL) ps
+
+# --- Devnet stack (against Solana devnet) ---
+
+docker-devnet-build: check-docker check-buildkit-cache
+	@echo "Building all images ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) build
+
+docker-devnet-up: check-docker check-buildkit-cache
+	@echo "Starting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d
+
+docker-devnet-rebuild: check-docker check-buildkit-cache
+	@echo "Rebuilding and (re)starting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --build
+
+docker-devnet-restart: check-docker
+	@echo "Restarting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) restart
+
+docker-devnet-down:
+	@echo "Stopping devnet stack ($(COMPOSE_DEVNET); volumes preserved)..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) down
+
+docker-devnet-clean:
+	@echo "Stopping devnet stack and removing volumes ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) down -v --remove-orphans
+
+docker-devnet-logs: check-docker
+	@docker compose -f $(COMPOSE_DEVNET) logs -f --tail=200
+
+docker-devnet-ps: check-docker
+	@docker compose -f $(COMPOSE_DEVNET) ps
 
 help:
 	@echo "Contra Programs - Available targets:"
@@ -461,3 +631,28 @@ help:
 	@echo "  obs-devnet-up        - Start cadvisor/prometheus/grafana (docker-compose.devnet.yml)"
 	@echo "  obs-devnet-down      - Stop cadvisor/prometheus/grafana (docker-compose.devnet.yml)"
 	@echo "  obs-devnet-logs      - Tail observability logs (docker-compose.devnet.yml)"
+	@echo ""
+	@echo "Build host setup:"
+	@echo "  install-buildkit-cache - Merge BuildKit GC config into /etc/docker/daemon.json (sudo, one-time)"
+	@echo "  check-buildkit-cache   - Verify BuildKit GC config is installed (prereq of obs-up + docker-build/up/rebuild)"
+	@echo ""
+	@echo "Docker stack (full local — docker-compose.yml, uses .env.local):"
+	@echo "  docker-build         - Build all images"
+	@echo "  docker-up            - Start full stack in detached mode"
+	@echo "  docker-up-persist    - Start full stack and preserve the local validator ledger across restarts"
+	@echo "  docker-rebuild       - Rebuild images and (re)start (= build + up in one shot)"
+	@echo "  docker-restart       - Restart all services without rebuilding"
+	@echo "  docker-down          - Stop services (volumes preserved)"
+	@echo "  docker-clean         - Stop and remove volumes / orphans (recovery)"
+	@echo "  docker-logs          - Tail logs from all services"
+	@echo "  docker-ps            - Show service status"
+	@echo ""
+	@echo "Docker stack (devnet — docker-compose.devnet.yml, uses .env.devnet):"
+	@echo "  docker-devnet-build  - Build all devnet images"
+	@echo "  docker-devnet-up     - Start devnet stack in detached mode"
+	@echo "  docker-devnet-rebuild - Rebuild and (re)start devnet stack"
+	@echo "  docker-devnet-restart - Restart devnet services without rebuilding"
+	@echo "  docker-devnet-down   - Stop devnet services (volumes preserved)"
+	@echo "  docker-devnet-clean  - Stop and remove devnet volumes / orphans"
+	@echo "  docker-devnet-logs   - Tail devnet logs"
+	@echo "  docker-devnet-ps     - Show devnet service status"

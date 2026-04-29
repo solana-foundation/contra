@@ -1,5 +1,5 @@
 use {
-    axum::http::HeaderValue,
+    axum::http::{HeaderValue, StatusCode},
     axum::{
         extract::{
             ws::{Message, WebSocket, WebSocketUpgrade},
@@ -18,11 +18,28 @@ use {
     solana_sdk::{message::VersionedMessage, pubkey::Pubkey, signature::Signature},
     solana_transaction_status_client_types::option_serializer::OptionSerializer,
     sqlx::{postgres::PgPoolOptions, FromRow, PgPool},
-    std::{net::SocketAddr, sync::Arc, time::Duration},
+    std::{
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicI64, Ordering},
+            Arc,
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    },
     tokio::{signal, sync::broadcast},
     tower_http::cors::{AllowOrigin, Any, CorsLayer},
     tracing::{debug, error, info, warn},
 };
+
+/// /health is healthy if every running poller has updated its heartbeat within this window.
+const HEALTH_STALE_THRESHOLD: i64 = 30;
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Escrow program discriminators (matches admin-ui/src/hooks/useActivityFeed.ts)
@@ -102,6 +119,10 @@ struct Args {
 // ---------------------------------------------------------------------------
 struct AppState {
     tx_sender: broadcast::Sender<String>,
+    /// Per-poller liveness heartbeats — Unix seconds of the last successful poll iteration.
+    accounts_poll_at: Arc<AtomicI64>,
+    /// `None` when STREAMER_DATABASE_URL is unset and the indexer poller is disabled.
+    indexer_poll_at: Option<Arc<AtomicI64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +429,12 @@ struct IndexerTxRow {
 // Poller — indexer DB for escrow deposits / withdrawals
 // ---------------------------------------------------------------------------
 
-async fn poll_indexer(pool: PgPool, tx_sender: broadcast::Sender<String>, poll_interval: Duration) {
+async fn poll_indexer(
+    pool: PgPool,
+    tx_sender: broadcast::Sender<String>,
+    poll_interval: Duration,
+    heartbeat: Arc<AtomicI64>,
+) {
     let mut last_seen_id: i64 =
         sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(id) FROM transactions")
             .fetch_one(&pool)
@@ -446,6 +472,9 @@ async fn poll_indexer(pool: PgPool, tx_sender: broadcast::Sender<String>, poll_i
                 continue;
             }
         };
+        // Record the loop iteration as a successful heartbeat regardless of row count —
+        // a quiet DB is healthy idle, not a wedge.
+        heartbeat.store(now_unix(), Ordering::Relaxed);
 
         if rows.is_empty() {
             continue;
@@ -496,6 +525,7 @@ async fn poll_loop(
     accounts_db: AccountsDB,
     tx_sender: broadcast::Sender<String>,
     poll_interval: Duration,
+    heartbeat: Arc<AtomicI64>,
 ) {
     // Initialise to the latest slot so we only stream new activity.
     let mut last_seen_slot: u64 = match accounts_db.get_latest_slot().await {
@@ -520,6 +550,8 @@ async fn poll_loop(
             Ok(b) => b,
             Err(_) => continue,
         };
+        // Record the loop iteration as a successful heartbeat — empty result is healthy idle.
+        heartbeat.store(now_unix(), Ordering::Relaxed);
 
         if blocks.is_empty() {
             continue;
@@ -616,8 +648,18 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket client disconnected");
 }
 
-async fn health_handler() -> &'static str {
-    "ok"
+async fn health_handler(State(state): State<Arc<AppState>>) -> StatusCode {
+    let now = now_unix();
+    let accounts_fresh =
+        now - state.accounts_poll_at.load(Ordering::Relaxed) < HEALTH_STALE_THRESHOLD;
+    let indexer_fresh = state.indexer_poll_at.as_ref().map_or(true, |a| {
+        now - a.load(Ordering::Relaxed) < HEALTH_STALE_THRESHOLD
+    });
+    if accounts_fresh && indexer_fresh {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,23 +755,35 @@ async fn main() {
 
     let poll_interval = Duration::from_millis(args.poll_interval_ms);
 
+    // Initialize heartbeats to "now" so /health doesn't 503 during the start_period
+    // grace window before the first poll iteration completes.
+    let accounts_poll_at = Arc::new(AtomicI64::new(now_unix()));
+    let indexer_poll_at_opt = indexer_pool
+        .as_ref()
+        .map(|_| Arc::new(AtomicI64::new(now_unix())));
+
     // Spawn indexer poller (deposits / withdrawals)
-    if let Some(pool) = indexer_pool {
+    if let (Some(pool), Some(heartbeat)) = (indexer_pool, indexer_poll_at_opt.clone()) {
         let indexer_tx = tx_sender.clone();
         tokio::spawn(async move {
-            poll_indexer(pool, indexer_tx, poll_interval).await;
+            poll_indexer(pool, indexer_tx, poll_interval, heartbeat).await;
         });
     }
 
     // Spawn AccountsDB poller (mint / burn / transfer on Contra)
     let poller_db = accounts_db.clone();
     let poller_tx = tx_sender.clone();
+    let poller_heartbeat = accounts_poll_at.clone();
     tokio::spawn(async move {
-        poll_loop(poller_db, poller_tx, poll_interval).await;
+        poll_loop(poller_db, poller_tx, poll_interval, poller_heartbeat).await;
     });
 
     // Build the axum app
-    let state = Arc::new(AppState { tx_sender });
+    let state = Arc::new(AppState {
+        tx_sender,
+        accounts_poll_at,
+        indexer_poll_at: indexer_poll_at_opt,
+    });
 
     let cors_origin = if args.cors_allowed_origin == "*" {
         AllowOrigin::any()

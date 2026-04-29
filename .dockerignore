@@ -1,3 +1,7 @@
+# All Docker builds in this repo use the repo root as build context (see
+# compose `build.context: .` and the standalone commands in README.md).
+# BuildKit only consults the .dockerignore next to the active context
+
 # Git
 .git
 .gitignore

@@ -3,10 +3,43 @@
 # `--env-file versions.env --env-file .env` (later files win on conflict).
 x-solana-build-args: &solana-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
+  PNPM_VERSION: ${PNPM_VERSION}
 
 x-validator-build-args: &validator-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
   YELLOWSTONE_TAG: ${YELLOWSTONE_TAG}
+
+# Default healthcheck timings — 10s interval keeps probe load light, 3s timeout
+# fails fast on a wedged service, 5 retries gives ~50s of hysteresis to absorb
+# transients. start_period overrides per service below where boot is slow.
+x-default-healthcheck: &default-healthcheck
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 30s
+
+# Default logging policy — rotates each service's stdout/stderr at 100MB per file
+# with 5 files retained (=~500MB ceiling per container). Lives in compose so the
+# policy travels with the repo to any deploy target, instead of relying on the
+# host's daemon.json.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "5"
+
+# Shared image+build for every Rust service that compiles from the main Dockerfile.
+# All such services share one byte-identical image; per-service tags would be
+# 10 copies of the same artifact differing only in compose metadata. Each service
+# overrides only `command:` (and per-service env). Pin in CI/Railway via
+# CONTRA_VERSION; defaults to `latest` for local dev. Validator, prometheus,
+# grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
+x-contra-app: &contra-app
+  image: contra-app:${CONTRA_VERSION:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args: *solana-build-args
 
 services:
   # PostgreSQL Primary (for write node)
@@ -14,6 +47,7 @@ services:
     image: postgres:16-alpine
     container_name: contra-postgres-primary
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -52,18 +86,17 @@ services:
 
   # Write Node (formerly sequencer)
   write-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-write-node
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-primary
+      postgres-primary:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_WRITE_PORT}
@@ -88,12 +121,18 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    # Real probe — /health dispatches getEpochSchedule through the in-process RPC
+    # module and returns 503 if the call fails. Fails when the RPC pipeline is dead.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_WRITE_PORT}/health || exit 1"]
 
   # PostgreSQL Replica (for read node)
   postgres-replica:
     image: postgres:16-alpine
     container_name: contra-postgres-replica
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -140,19 +179,19 @@ services:
 
   # Read Node
   read-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-read-node
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-replica
-      - write-node
+      postgres-replica:
+        condition: service_healthy
+      write-node:
+        condition: service_started
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_READ_PORT}
@@ -169,15 +208,17 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    # Real probe — same /health implementation as write-node, against the replica pool.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_READ_PORT}/health || exit 1"]
 
   # Gateway (Routes requests between write and read nodes)
   gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-gateway
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
@@ -200,16 +241,22 @@ services:
     command: ["/usr/local/bin/gateway"]
     networks:
       - contra-network
+    # Liveness only — /health returns static 200. Gateway deliberately
+    # doesn't probe its upstreams; their own probes report their state, and
+    # restarting the gateway when an upstream is down doesn't fix anything.
+    # /ready (separate endpoint, probes both backends, cached 2s) exists for
+    # out-of-band monitoring; compose stays on /health.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${GATEWAY_PORT}/health || exit 1"]
 
   # Auth Service (optional — run with: docker compose --profile auth up)
   auth:
     profiles: [auth]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-auth
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -225,19 +272,27 @@ services:
     command: ["/usr/local/bin/auth"]
     networks:
       - contra-network
+    # /health reads a pool-status flag updated by handlers after each DB call.
+    # Communication errors flip it unhealthy; logical errors (UNIQUE etc.)
+    # leave it healthy. The probe itself doesn't take a connection from the
+    # pool, so probe load can't contribute to pool exhaustion.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${AUTH_PORT}/health || exit 1"]
 
   # WebSocket Transaction Streamer
   streamer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-streamer
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
-      - postgres-replica
-      - write-node
-      - postgres-indexer
+      postgres-replica:
+        condition: service_healthy
+      write-node:
+        condition: service_healthy
+      postgres-indexer:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - STREAMER_PORT=${STREAMER_PORT:-8902}
@@ -250,15 +305,19 @@ services:
     command: ["/usr/local/bin/streamer"]
     networks:
       - contra-network
+    # /health checks each running poll loop's heartbeat — flips 503 if any
+    # has gone stale (>30s). Empty queries still bump the heartbeat, so a
+    # quiet DB stays healthy; only a truly stuck loop trips the probe.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${STREAMER_PORT:-8902}/health || exit 1"]
 
   # Activity Generator
   activity:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-activity
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - write-node
       - read-node
@@ -294,6 +353,7 @@ services:
       args: *validator-build-args
     container_name: contra-validator
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       replicas: 1
     # Agave 3.1 asserts io_uring_supported(); Docker's default seccomp profile
@@ -313,9 +373,18 @@ services:
       - RUST_LOG=info
       - ESCROW_PROGRAM_ID=${ESCROW_PROGRAM_ID}
       - WITHDRAW_PROGRAM_ID=${WITHDRAW_PROGRAM_ID}
+    # VALIDATOR_RESET_FLAG defaults to --reset (today's behavior: wipe ledger
+    # at every container start). Set it blank to preserve /validator-data
+    # across restarts so on-chain state stays consistent with Postgres rows.
+    # --limit-ledger-size caps the rocksdb blockstore at ~1M shreds (~1 GB);
+    # without this the test-validator default of 10000 shreds wraps too fast
+    # for the indexer to keep up. AccountsDB has no explicit cap but is
+    # naturally bounded by Contra's PDA/ATA count; `make docker-clean` is
+    # the floor if /validator-data ever needs reclaiming.
     command: >
       solana-test-validator
-      --reset
+      ${VALIDATOR_RESET_FLAG---reset}
+      --limit-ledger-size 1000000
       --bpf-program ${ESCROW_PROGRAM_ID} /programs/contra_escrow_program.so
       --bpf-program ${WITHDRAW_PROGRAM_ID} /programs/contra_withdraw_program.so
       --clone TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
@@ -330,12 +399,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   # PostgreSQL for Indexer
   postgres-indexer:
     image: postgres:16-alpine
     container_name: contra-postgres-indexer
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_INDEXER_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -365,12 +436,12 @@ services:
 
   # Indexer Service - Solana (Yellowstone)
   indexer-solana:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-indexer-solana
     restart: unless-stopped
+    logging: *default-logging
+    # tini as PID 1 so SIGTERM reaches the binary through the /bin/sh -c wrapper.
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -401,15 +472,21 @@ services:
           indexer
     networks:
       - contra-network
+    # /health on the metrics port reads HealthState — backed by the indexer's
+    # slot-lag gauge and a heartbeat that bumps on each SlotComplete. With
+    # require_continuous_progress=true, a dead Yellowstone stream flips the
+    # probe even when slot-lag is 0.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-indexer-contra
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -436,20 +513,23 @@ services:
           indexer
     networks:
       - contra-network
+    # See indexer-solana — same heartbeat-backed /health.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Operator Service - Solana
   operator-solana:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-operator-solana
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
       write-node:
-        condition: service_started
+        condition: service_healthy
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
@@ -483,15 +563,20 @@ services:
           operator
     networks:
       - contra-network
+    # /health on the metrics port reads HealthState — backlog comes from the
+    # operator's pending-tx count, progress bumps as txs are forwarded to the
+    # processor. Idle (pending=0) stays healthy.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9102/health || exit 1"]
 
   # Operator Service - Contra
   operator-contra:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-operator-contra
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
@@ -527,15 +612,26 @@ services:
           operator
     networks:
       - contra-network
+    # /health on the metrics port reads HealthState — backlog comes from the
+    # operator's pending-tx count, progress bumps as txs are forwarded to the
+    # processor. Idle (pending=0) stays healthy.
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9103/health || exit 1"]
 
   # Base backup sidecar for postgres-primary
   pg-backup-primary:
     image: postgres:16-alpine
     container_name: contra-pg-backup-primary
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
+    # TODO: pg_basebackup fails because POSTGRES_USER ("contra") lacks the
+    # REPLICATION attribute and isn't in pg_hba.conf for replication. Switch
+    # to POSTGRES_REPLICATION_USER/_PASSWORD (already used by the streaming
+    # replica). Pre-existing gap; backups currently never complete.
     environment:
       - PGHOST=postgres-primary
       - PGUSER=${POSTGRES_USER}
@@ -555,9 +651,11 @@ services:
     image: postgres:16-alpine
     container_name: contra-pg-backup-indexer
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-indexer:
         condition: service_healthy
+    # TODO: same pg_hba/role mismatch as pg-backup-primary above.
     environment:
       - PGHOST=postgres-indexer
       - PGUSER=${POSTGRES_USER}
@@ -574,17 +672,25 @@ services:
 
   # Blackbox Exporter for HTTP health probing
   blackbox-exporter:
-    image: prom/blackbox-exporter:latest
+    image: prom/blackbox-exporter:${BLACKBOX_VERSION}
     container_name: contra-blackbox-exporter
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9115/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   # cAdvisor for container metrics
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: contra-cadvisor
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8080:8080"
     volumes:
@@ -596,14 +702,21 @@ services:
     privileged: true
     networks:
       - contra-network
+    # No healthcheck — the cadvisor image is distroless (no shell, no wget/curl).
+    # Restart-on-crash via `restart: unless-stopped` is the only liveness signal.
+    # An out-of-process probe (Prometheus scrape failure on the cadvisor target)
+    # is the right monitoring path here.
 
   # Prometheus for metrics collection
   prometheus:
     build:
       context: .
       dockerfile: Dockerfile.prometheus
+      args:
+        PROMETHEUS_VERSION: ${PROMETHEUS_VERSION}
     container_name: contra-prometheus
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "9090:9090"
     volumes:
@@ -616,12 +729,26 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
-  # Grafana for visualization
+  # Grafana for visualization. Uses Dockerfile.grafana so the image bakes in
+  # provisioning + dashboards (matters for Railway/standalone where bind mounts
+  # aren't available). Locally the bind mounts below shadow the baked content
+  # so edits hot-reload without rebuilding.
   grafana:
-    image: grafana/grafana:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.grafana
+      args:
+        GRAFANA_VERSION: ${GRAFANA_VERSION}
     container_name: contra-grafana
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "37429:3000"
     volumes:
@@ -639,6 +766,12 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres-primary-data:

@@ -22,7 +22,9 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<LoginResponse>> {
-    let user = db::find_user_by_username(&state.pool, &req.username).await?;
+    let user = db::find_user_by_username(&state.pool, &req.username).await;
+    state.pool_status.observe_app(&user);
+    let user = user?;
 
     let Some(user) = user else {
         // User not found — run Argon2 against the dummy hash to match the cost

@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use contra_auth::config::Config;
-use contra_auth::{build_app, db, jwt::JwtConfig, AppState};
+use contra_auth::{build_app, db, jwt::JwtConfig, pool_status::PoolStatus, AppState};
 
 /// How often the background task purges expired and used challenge rows.
 /// Challenge TTL is 10 minutes, so hourly is more than sufficient.
@@ -34,17 +34,22 @@ async fn main() {
 
     info!("Schema initialized");
 
+    let pool_status = PoolStatus::new_healthy();
     let state = AppState {
         pool,
         jwt: Arc::new(JwtConfig::new(&config.jwt_secret)),
+        pool_status: pool_status.clone(),
     };
 
     // Periodically remove expired and used challenges so the table doesn't grow unboundedly.
     let cleanup_pool = state.pool.clone();
+    let cleanup_status = pool_status.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(CHALLENGE_CLEANUP_INTERVAL).await;
-            match db::cleanup_stale_challenges(&cleanup_pool).await {
+            let r = db::cleanup_stale_challenges(&cleanup_pool).await;
+            cleanup_status.observe_sqlx(&r);
+            match r {
                 Ok(n) => info!(deleted = n, "cleaned up stale challenges"),
                 Err(e) => error!("challenge cleanup failed: {e}"),
             }

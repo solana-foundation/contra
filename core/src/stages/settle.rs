@@ -22,6 +22,7 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     std::{
         collections::HashMap,
+        sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{sync::mpsc, time::Instant},
@@ -123,6 +124,7 @@ pub struct SettleArgs {
     pub perf_sample_period_secs: u64,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
+    pub heartbeat: Arc<crate::health::StageHeartbeat>,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -135,6 +137,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         perf_sample_period_secs,
         shutdown_token,
         metrics,
+        heartbeat,
     } = args;
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
@@ -150,6 +153,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             perf_sample_period_secs: u64,
             shutdown_token: CancellationToken,
             metrics: SharedMetrics,
+            heartbeat: Arc<crate::health::StageHeartbeat>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -269,6 +273,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         .await
                         {
                             Ok(settle_result) => {
+                                heartbeat.record_progress();
                                 perf_num_transactions += num_results as u64;
                                 if num_results > 0 {
                                     metrics.settler_txs_settled(num_results);
@@ -337,6 +342,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     result = execution_results_rx.recv() => {
                         match result {
                             Some((svm_output, transactions)) => {
+                                heartbeat.record_input();
                                 debug!("Settle worker received output with {} transactions", transactions.len());
                                 if svm_output.processing_results.len() != transactions.len() {
                                     error!("Processing results and transactions length mismatch");
@@ -399,6 +405,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             perf_sample_period_secs,
             shutdown_token,
             metrics,
+            heartbeat,
         )
         .await
         {
@@ -1054,6 +1061,7 @@ mod tests {
             perf_sample_period_secs: 60,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -1082,6 +1090,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -1134,6 +1143,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -1494,6 +1504,7 @@ mod tests {
             perf_sample_period_secs: 1, // fires after 1s
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 

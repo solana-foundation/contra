@@ -5,7 +5,7 @@ use crate::metrics;
 use crate::storage::common::models::{DbTransaction, TransactionType};
 use crate::storage::Storage;
 use crate::ProgramType;
-use contra_metrics::MetricLabel;
+use contra_metrics::{HealthState, MetricLabel};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,7 @@ pub async fn run_fetcher(
     config: OperatorConfig,
     program_type: ProgramType,
     cancellation_token: CancellationToken,
+    health: Option<Arc<HealthState>>,
 ) -> Result<(), OperatorError> {
     info!("Starting fetcher");
 
@@ -40,6 +41,9 @@ pub async fn run_fetcher(
                 metrics::OPERATOR_BACKLOG_DEPTH
                     .with_label_values(&[program_type.as_label()])
                     .set(count as f64);
+                if let Some(h) = &health {
+                    h.set_pending(count as u64);
+                }
             }
             Err(e) => {
                 warn!(
@@ -78,6 +82,11 @@ pub async fn run_fetcher(
                             return Err(OperatorError::ChannelClosed {
                                 component: "fetcher".to_string(),
                             });
+                        }
+                        if let Some(h) = &health {
+                            // Forwarding a tx to the processor counts as progress —
+                            // the operator pipeline is moving items along.
+                            h.record_progress();
                         }
                     }
                 }
@@ -152,7 +161,8 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel(); // cancel immediately
 
-        let result = run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token).await;
+        let result =
+            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
         assert!(result.is_ok());
     }
 
@@ -168,7 +178,15 @@ mod tests {
 
         let token_clone = token.clone();
         let handle = tokio::spawn(async move {
-            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token_clone).await
+            run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                ProgramType::Escrow,
+                token_clone,
+                None,
+            )
+            .await
         });
 
         // Wait for the transaction to come through
@@ -195,7 +213,8 @@ mod tests {
 
         drop(rx); // close receiver
 
-        let result = run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token).await;
+        let result =
+            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
 
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();

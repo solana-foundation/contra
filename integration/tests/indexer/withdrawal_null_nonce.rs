@@ -97,7 +97,7 @@ async fn start_withdraw_operator(
     let operator_config = default_operator_config();
     set_operator_env_vars(&operator_keypair);
     let task_handle: JoinHandle<()> = tokio::spawn(async move {
-        if let Err(e) = operator::run(storage, common_config, operator_config).await {
+        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
             tracing::error!("Operator error: {}", e);
         }
     });

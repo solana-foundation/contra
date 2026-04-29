@@ -52,6 +52,7 @@ async fn start_app(db_url: &str) -> SocketAddr {
     let state = AppState {
         pool,
         jwt: Arc::new(JwtConfig::new("test-secret")),
+        pool_status: contra_auth::pool_status::PoolStatus::new_healthy(),
     };
 
     let app = build_app(state, "*");

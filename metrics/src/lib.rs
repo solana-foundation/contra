@@ -3,6 +3,9 @@ pub use std::sync::LazyLock as Lazy;
 pub use prometheus;
 pub use prometheus::{CounterVec, GaugeVec, HistogramVec};
 
+pub mod health;
+pub use health::{HealthConfig, HealthOutcome, HealthState};
+
 #[macro_export]
 macro_rules! counter_vec {
     ($name:ident, $metric_name:expr, $help:expr, $labels:expr) => {
@@ -56,6 +59,62 @@ async fn metrics_handler() -> ([(axum::http::header::HeaderName, &'static str); 
 
 pub fn start_metrics_server(port: u16) {
     let app = axum::Router::new().route("/metrics", axum::routing::get(metrics_handler));
+    spawn_server(port, app);
+}
+
+/// Same as `start_metrics_server` but also exposes `/health` backed by the
+/// supplied state. Use this from services that want compose to gate on
+/// `/health` instead of `/metrics`.
+pub fn start_metrics_server_with_health(port: u16, health: std::sync::Arc<HealthState>) {
+    spawn_server(port, build_health_app(health));
+}
+
+/// Test-only entry point that takes a pre-bound listener so callers can avoid
+/// the bind/drop/rebind port-reclaim race when they need to know the port up front.
+pub fn start_metrics_server_with_health_from_listener(
+    listener: std::net::TcpListener,
+    health: std::sync::Arc<HealthState>,
+) {
+    let app = build_health_app(health);
+    listener.set_nonblocking(true).expect("set_nonblocking");
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("from_std");
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("Metrics server error: {}", e);
+        }
+    });
+}
+
+fn build_health_app(health: std::sync::Arc<HealthState>) -> axum::Router {
+    axum::Router::new()
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .route("/health", axum::routing::get(health_handler))
+        .with_state(health)
+}
+
+async fn health_handler(
+    axum::extract::State(health): axum::extract::State<std::sync::Arc<HealthState>>,
+) -> (axum::http::StatusCode, String) {
+    match health.check() {
+        HealthOutcome::Healthy => (axum::http::StatusCode::OK, r#"{"status":"ok"}"#.to_string()),
+        HealthOutcome::BacklogExceeded { pending, ceiling } => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                r#"{{"status":"degraded","reason":"backlog","pending":{},"ceiling":{}}}"#,
+                pending, ceiling
+            ),
+        ),
+        HealthOutcome::Stalled { pending, age_secs } => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                r#"{{"status":"degraded","reason":"stalled","pending":{},"age_secs":{}}}"#,
+                pending, age_secs
+            ),
+        ),
+    }
+}
+
+fn spawn_server(port: u16, app: axum::Router) {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!("Metrics server listening on {}", addr);

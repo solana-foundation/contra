@@ -1,11 +1,12 @@
 use {
     crate::{
+        health::StageHeartbeat,
         nodes::node::WorkerHandle,
         scheduler::{ConflictFreeBatch, Scheduler, SchedulerTrait},
         stage_metrics::SharedMetrics,
     },
     solana_sdk::transaction::SanitizedTransaction,
-    std::time::Duration,
+    std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
     tracing::{debug, info, warn},
@@ -18,6 +19,7 @@ pub struct SequencerArgs {
     pub batch_tx: mpsc::Sender<ConflictFreeBatch>,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
+    pub heartbeat: Arc<StageHeartbeat>,
 }
 
 pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
@@ -28,6 +30,7 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
         batch_tx,
         shutdown_token,
         metrics,
+        heartbeat,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -48,6 +51,7 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
                 result = rx.recv() => {
                     match result {
                         Some(transaction) => {
+                            heartbeat.record_input();
                             debug!("Sequencer received transaction: {}", transaction.signature());
                             pending_transactions.push(transaction);
                             collected += 1;
@@ -149,6 +153,9 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
                     &metrics,
                 )
                 .await;
+                if sent > 0 {
+                    heartbeat.record_progress();
+                }
                 total_batches_sent += sent;
                 pending_transactions.clear();
 
@@ -413,6 +420,7 @@ mod tests {
             batch_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -439,6 +447,7 @@ mod tests {
             batch_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -484,6 +493,7 @@ mod tests {
             batch_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 

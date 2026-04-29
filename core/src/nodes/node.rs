@@ -120,6 +120,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
 
+    // Heartbeat registry — populated for stages that actually run, consumed by /health.
+    let mut heartbeats = crate::health::HeartbeatRegistry::new();
+
     // Only create write pipeline for Write and Aio modes
     let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
@@ -159,6 +162,17 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             let (initial_live_blockhashes, initial_dedup_cache) =
                 load_dedup_state(&db, config.max_blockhashes()).await?;
 
+            let dedup_hb = crate::health::StageHeartbeat::new();
+            let sigverify_hb = crate::health::StageHeartbeat::new();
+            let sequencer_hb = crate::health::StageHeartbeat::new();
+            let executor_hb = crate::health::StageHeartbeat::new();
+            let settler_hb = crate::health::StageHeartbeat::new();
+            heartbeats.dedup = Some(Arc::clone(&dedup_hb));
+            heartbeats.sigverify = Some(Arc::clone(&sigverify_hb));
+            heartbeats.sequencer = Some(Arc::clone(&sequencer_hb));
+            heartbeats.executor = Some(Arc::clone(&executor_hb));
+            heartbeats.settler = Some(Arc::clone(&settler_hb));
+
             // Start dedup stage (filters duplicate transactions before sigverify)
             let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
                 max_blockhashes: config.max_blockhashes(),
@@ -169,6 +183,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 initial_live_blockhashes,
                 initial_dedup_cache,
                 metrics: Arc::clone(&config.metrics),
+                heartbeat: dedup_hb,
             })
             .await;
             write_workers.push(dedup);
@@ -181,6 +196,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 sequencer_tx,
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
+                heartbeat: sigverify_hb,
             })
             .await;
             write_workers.extend(sigverify_workers);
@@ -193,6 +209,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 batch_tx,
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
+                heartbeat: sequencer_hb,
             })
             .await;
             write_workers.push(sequence);
@@ -206,6 +223,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 max_svm_workers: config.max_svm_workers,
+                heartbeat: executor_hb,
             })
             .await;
             write_workers.push(execution);
@@ -219,6 +237,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 perf_sample_period_secs: config.perf_sample_period_secs,
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
+                heartbeat: settler_hb,
             })
             .await;
             write_workers.push(settle);
@@ -251,6 +270,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             NodeMode::Write => None,
         },
         write_deps,
+        heartbeats,
         shutdown_token: shutdown_token.clone(),
     };
     let rpc_handle = start_rpc_service(rpc_config).await?;

@@ -70,6 +70,7 @@ async fn sequencer_zero_deadline_drains_nonblocking() {
         batch_tx,
         shutdown_token: shutdown.clone(),
         metrics,
+        heartbeat: contra_core::health::StageHeartbeat::new(),
     })
     .await;
 

@@ -1,9 +1,12 @@
 use {
     super::{api::ContraRpcServer, rpc_impl::ContraRpcImpl},
-    crate::rpc::{
-        constants::{MAX_BODY_SIZE, MAX_RESPONSE_SIZE},
-        error::{INTERNAL_ERROR_CODE, PARSE_ERROR_CODE},
-        rpc_impl::{ReadDeps, WriteDeps},
+    crate::{
+        health::HeartbeatRegistry,
+        rpc::{
+            constants::{MAX_BODY_SIZE, MAX_RESPONSE_SIZE},
+            error::{INTERNAL_ERROR_CODE, PARSE_ERROR_CODE},
+            rpc_impl::{ReadDeps, WriteDeps},
+        },
     },
     http_body_util::{BodyExt, Full, LengthLimitError, Limited},
     hyper::{body::Bytes, Method, Request, Response, StatusCode},
@@ -15,6 +18,7 @@ use {
 pub async fn handle_request(
     req: Request<hyper::body::Incoming>,
     rpc_module: Arc<RpcModule<()>>,
+    heartbeats: Arc<HeartbeatRegistry>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let payload_too_large = || {
         let body = format!(
@@ -30,43 +34,42 @@ pub async fn handle_request(
 
     let response = match (req.method(), req.uri().path()) {
         (&Method::GET, "/health") => {
-            let health_request = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule"}"#;
-            match rpc_module.raw_json_request(health_request, 1024).await {
-                Ok((resp, _)) => {
-                    if serde_json::from_str::<serde_json::Value>(&resp)
-                        .ok()
-                        .and_then(|v| v.get("result").cloned())
-                        .is_some()
-                    {
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "application/json")
-                            .body(Full::new(Bytes::from(r#"{"status":"ok"}"#)))
-                            .unwrap()
-                    } else {
-                        tracing::warn!(
-                            "Health check: getEpochSchedule returned unexpected response: {}",
-                            resp
-                        );
-                        Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .header("Content-Type", "application/json")
-                            .body(Full::new(Bytes::from(
-                                r#"{"status":"degraded","error":"unexpected getEpochSchedule response"}"#,
-                            )))
-                            .unwrap()
-                    }
-                }
+            // Two-stage check: RPC pipeline first (cheap, in-process), then any
+            // running pipeline-stage heartbeat. A wedged stage shows up here as
+            // a stale heartbeat even when getEpochSchedule still answers.
+            let rpc_health_request = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule"}"#;
+            let rpc_ok = match rpc_module.raw_json_request(rpc_health_request, 1024).await {
+                Ok((resp, _)) => serde_json::from_str::<serde_json::Value>(&resp)
+                    .ok()
+                    .and_then(|v| v.get("result").cloned())
+                    .is_some(),
                 Err(e) => {
                     tracing::error!("Health check: getEpochSchedule RPC call failed: {}", e);
-                    Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .header("Content-Type", "application/json")
-                        .body(Full::new(Bytes::from(
-                            r#"{"status":"error","error":"RPC unavailable"}"#,
-                        )))
-                        .unwrap()
+                    false
                 }
+            };
+            let stage_unhealthy = heartbeats.first_unhealthy();
+            if rpc_ok && stage_unhealthy.is_none() {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(r#"{"status":"ok"}"#)))
+                    .unwrap()
+            } else {
+                let body = if !rpc_ok {
+                    r#"{"status":"degraded","error":"rpc"}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"status":"degraded","error":"stage:{}"}}"#,
+                        stage_unhealthy.unwrap_or("unknown")
+                    )
+                };
+                tracing::warn!(rpc_ok, stage_unhealthy = ?stage_unhealthy, "health check failed");
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap()
             }
         }
         (&Method::POST, "/") => {
@@ -193,6 +196,7 @@ mod tests {
     async fn start_test_rpc_server() -> std::net::SocketAddr {
         // Empty RPC module — sufficient for testing body validation layer
         let rpc_module = Arc::new(RpcModule::new(()));
+        let heartbeats = Arc::new(HeartbeatRegistry::new());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -202,11 +206,13 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let io = TokioIo::new(stream);
                 let rpc_module = Arc::clone(&rpc_module);
+                let heartbeats = Arc::clone(&heartbeats);
 
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let rpc_module = Arc::clone(&rpc_module);
-                        async move { handle_request(req, rpc_module).await }
+                        let heartbeats = Arc::clone(&heartbeats);
+                        async move { handle_request(req, rpc_module, heartbeats).await }
                     });
                     let _ = http1::Builder::new().serve_connection(io, service).await;
                 });

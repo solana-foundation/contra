@@ -58,6 +58,7 @@ pub struct ExecutionArgs {
     /// 1 disables parallelism; >=2 enables it once the batch is large enough
     /// to give each worker ≥ MIN_PARALLEL_BATCH_FACTOR transactions.
     pub max_svm_workers: usize,
+    pub heartbeat: Arc<crate::health::StageHeartbeat>,
 }
 
 pub struct ExecutionDeps {
@@ -88,6 +89,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         shutdown_token,
         metrics,
         max_svm_workers,
+        heartbeat,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -110,6 +112,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                 result = batch_rx.recv() => {
                     match result {
                         Some(batch) => {
+                            heartbeat.record_input();
                             let batch_size = batch.transactions.len();
                             debug!("Executor received batch with {} transactions", batch_size);
 
@@ -120,6 +123,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             ).await;
 
                             let num_transactions_executed = execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
+                            heartbeat.record_progress();
                             if !execution_result.admin_transactions.is_empty() {
                                 if let Some(admin_results) = execution_result.admin_results {
                                     let len = execution_result.admin_transactions.len();
@@ -828,6 +832,7 @@ mod tests {
             accountsdb_connection_url: url,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
         })
         .await;
@@ -1152,6 +1157,7 @@ mod tests {
             accountsdb_connection_url: url,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
         })
         .await;

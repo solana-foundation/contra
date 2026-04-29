@@ -82,16 +82,16 @@ pub async fn register(
     // The constraint name `users_username_key` is generated deterministically by Postgres
     // from the table and column name (inline UNIQUE), so it is stable as long as the
     // schema definition in db.rs does not change.
-    let user = db::insert_user(&state.pool, &req.username, &hash)
-        .await
-        .map_err(|e| match e {
-            AppError::Db(sqlx::Error::Database(ref db_err))
-                if db_err.constraint() == Some("users_username_key") =>
-            {
-                AppError::Conflict("username already taken".into())
-            }
-            other => other,
-        })?;
+    let raw = db::insert_user(&state.pool, &req.username, &hash).await;
+    state.pool_status.observe_app(&raw);
+    let user = raw.map_err(|e| match e {
+        AppError::Db(sqlx::Error::Database(ref db_err))
+            if db_err.constraint() == Some("users_username_key") =>
+        {
+            AppError::Conflict("username already taken".into())
+        }
+        other => other,
+    })?;
 
     info!(username = %user.username, "new user registered");
 

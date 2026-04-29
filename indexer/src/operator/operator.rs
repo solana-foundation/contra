@@ -8,7 +8,7 @@ use crate::operator::{
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
 use crate::ContraIndexerConfig;
-use contra_metrics::MetricLabel;
+use contra_metrics::{HealthState, MetricLabel};
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -19,6 +19,7 @@ pub async fn run(
     storage: Arc<Storage>,
     common_config: ContraIndexerConfig,
     config: OperatorConfig,
+    health: Option<Arc<HealthState>>,
 ) -> Result<(), OperatorError> {
     info!("Starting Contra Operator");
     info!("Program: {:?}", common_config.program_type);
@@ -61,6 +62,7 @@ pub async fn run(
     let fetcher_storage = storage.clone();
     let fetcher_config = config.clone();
     let fetcher_token = cancellation_token.clone();
+    let fetcher_health = health.clone();
     let fetcher_handle = tokio::spawn(async move {
         if let Err(e) = fetcher::run_fetcher(
             fetcher_storage,
@@ -68,6 +70,7 @@ pub async fn run(
             fetcher_config,
             common_config.program_type,
             fetcher_token,
+            fetcher_health,
         )
         .await
         {

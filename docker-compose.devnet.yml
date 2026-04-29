@@ -3,6 +3,39 @@
 # Invoke compose with `--env-file versions.env --env-file .env.devnet`.
 x-solana-build-args: &solana-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}
+  PNPM_VERSION: ${PNPM_VERSION}
+
+# Default healthcheck timings — 10s interval keeps probe load light, 3s timeout
+# fails fast on a wedged service, 5 retries gives ~50s of hysteresis to absorb
+# transients. start_period overrides per service below where boot is slow.
+x-default-healthcheck: &default-healthcheck
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 30s
+
+# Default logging policy — rotates each service's stdout/stderr at 100MB per file
+# with 5 files retained (=~500MB ceiling per container). Lives in compose so the
+# policy travels with the repo to any deploy target, instead of relying on the
+# host's daemon.json.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "5"
+
+# Shared image+build for every Rust service that compiles from the main Dockerfile.
+# All such services share one byte-identical image; per-service tags would be 8
+# copies of the same artifact differing only in compose metadata. Each service
+# overrides only `command:` (and per-service env). Pin in CI/Railway via
+# CONTRA_VERSION; defaults to `latest` for local dev. Validator, prometheus,
+# grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
+x-contra-app: &contra-app
+  image: contra-app:${CONTRA_VERSION:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args: *solana-build-args
 
 services:
   # PostgreSQL Primary (for write node)
@@ -10,6 +43,7 @@ services:
     image: postgres:16-alpine
     container_name: contra-postgres-primary
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -48,18 +82,17 @@ services:
 
   # Write Node (formerly sequencer)
   write-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-write-node
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-primary
+      postgres-primary:
+        condition: service_healthy
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_WRITE_PORT}
@@ -84,12 +117,16 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_WRITE_PORT}/health || exit 1"]
 
   # PostgreSQL Replica (for read node)
   postgres-replica:
     image: postgres:16-alpine
     container_name: contra-postgres-replica
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -136,19 +173,19 @@ services:
 
   # Read Node
   read-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-read-node
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
     depends_on:
-      - postgres-replica
-      - write-node
+      postgres-replica:
+        condition: service_healthy
+      write-node:
+        condition: service_started
     environment:
       - RUST_LOG=info
       - CONTRA_PORT=${CONTRA_READ_PORT}
@@ -165,15 +202,16 @@ services:
     command: ["/usr/local/bin/contra-node"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${CONTRA_READ_PORT}/health || exit 1"]
 
   # Gateway (Routes requests between write and read nodes)
   gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-gateway
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
@@ -195,16 +233,17 @@ services:
     command: ["/usr/local/bin/gateway"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${GATEWAY_PORT}/health || exit 1"]
 
   # Auth Service (optional — run with: docker compose --profile auth up)
   auth:
     profiles: [auth]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-auth
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -213,19 +252,23 @@ services:
       - AUTH_PORT=${AUTH_PORT}
       - AUTH_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - JWT_SECRET=${JWT_SECRET}
-      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
     ports:
       - "${AUTH_PORT}:${AUTH_PORT}"
     command: ["/usr/local/bin/auth"]
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${AUTH_PORT}/health || exit 1"]
 
   # PostgreSQL for Indexer
   postgres-indexer:
     image: postgres:16-alpine
     container_name: contra-postgres-indexer
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_INDEXER_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -251,12 +294,11 @@ services:
 
   # Indexer Service - Solana (Yellowstone)
   indexer-solana:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-indexer-solana
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -283,15 +325,17 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-indexer-contra
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     deploy:
       replicas: 1
     depends_on:
@@ -317,15 +361,17 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9100/health || exit 1"]
 
   # Operator Service - Solana
   operator-solana:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-operator-solana
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
@@ -339,7 +385,11 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - METRICS_PORT=9100
+      - METRICS_PORT=9102
+    ports:
+      # Exposed to host so bench-tps can scrape contra_operator_mints_sent_total
+      # from outside Docker (matches the local stack).
+      - "9102:9102"
     command:
       - /bin/sh
       - -c
@@ -352,20 +402,22 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9102/health || exit 1"]
 
   # Operator Service - Contra
   operator-contra:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-operator-contra
     restart: unless-stopped
+    logging: *default-logging
+    init: true
     depends_on:
       postgres-indexer:
         condition: service_healthy
       write-node:
-        condition: service_started
+        condition: service_healthy
     environment:
       - RUST_LOG=info,contra_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
@@ -376,7 +428,11 @@ services:
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - METRICS_PORT=9100
+      - METRICS_PORT=9103
+    ports:
+      # Exposed to host so bench-tps can scrape contra_operator_mints_sent_total
+      # from outside Docker (matches the local stack).
+      - "9103:9103"
     command:
       - /bin/sh
       - -c
@@ -389,15 +445,23 @@ services:
       - ./scripts/devnet/config:/config/devnet:ro
     networks:
       - contra-network
+    healthcheck:
+      <<: *default-healthcheck
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9103/health || exit 1"]
 
   # Base backup sidecar for postgres-primary
   pg-backup-primary:
     image: postgres:16-alpine
     container_name: contra-pg-backup-primary
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
+    # TODO: pg_basebackup fails because POSTGRES_USER ("contra") lacks the
+    # REPLICATION attribute and isn't in pg_hba.conf for replication. Switch
+    # to POSTGRES_REPLICATION_USER/_PASSWORD (already used by the streaming
+    # replica). Pre-existing gap; backups currently never complete.
     environment:
       - PGHOST=postgres-primary
       - PGUSER=${POSTGRES_USER}
@@ -417,9 +481,11 @@ services:
     image: postgres:16-alpine
     container_name: contra-pg-backup-indexer
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-indexer:
         condition: service_healthy
+    # TODO: same pg_hba/role mismatch as pg-backup-primary above.
     environment:
       - PGHOST=postgres-indexer
       - PGUSER=${POSTGRES_USER}
@@ -436,17 +502,25 @@ services:
 
   # Blackbox Exporter for HTTP health probing
   blackbox-exporter:
-    image: prom/blackbox-exporter:latest
+    image: prom/blackbox-exporter:${BLACKBOX_VERSION}
     container_name: contra-blackbox-exporter
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9115/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   # cAdvisor for container metrics
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: contra-cadvisor
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8080:8080"
     volumes:
@@ -458,14 +532,18 @@ services:
     privileged: true
     networks:
       - contra-network
+    # No healthcheck — cadvisor image is distroless. See docker-compose.yml note.
 
   # Prometheus for metrics collection
   prometheus:
     build:
       context: .
       dockerfile: Dockerfile.prometheus
+      args:
+        PROMETHEUS_VERSION: ${PROMETHEUS_VERSION}
     container_name: contra-prometheus
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "9090:9090"
     volumes:
@@ -476,12 +554,26 @@ services:
       - CONTRA_METRICS_PORT=${CONTRA_METRICS_PORT:-9090}
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
 
-  # Grafana for visualization
+  # Grafana for visualization. Uses Dockerfile.grafana so the image bakes in
+  # provisioning + dashboards (matters for Railway/standalone where bind mounts
+  # aren't available). Locally the bind mounts below shadow the baked content
+  # so edits hot-reload without rebuilding.
   grafana:
-    image: grafana/grafana:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.grafana
+      args:
+        GRAFANA_VERSION: ${GRAFANA_VERSION}
     container_name: contra-grafana
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "37429:3000"
     volumes:
@@ -491,9 +583,20 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - POSTGRES_INDEXER_DB=${POSTGRES_INDEXER_DB}
+      - POSTGRES_INDEXER_HOST=${POSTGRES_INDEXER_HOST:-postgres-indexer}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     networks:
       - contra-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
 
 volumes:
   postgres-primary-data:

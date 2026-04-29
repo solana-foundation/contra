@@ -1,16 +1,27 @@
+# syntax=docker/dockerfile:1.7
 # Multi-stage Dockerfile for Contra blockchain
 #
 # SOLANA_VERSION is the source of truth in versions.env.
 # Build via: `docker compose --env-file versions.env --env-file .env build <service>`
+# Standalone build (outside compose): see README "Building a single Dockerfile standalone".
+# Requires Docker >= 26.0 (BuildKit + the `--mount=type=cache` directives below).
 
 ARG SOLANA_VERSION
+ARG PNPM_VERSION
 
 # Stage 1: Builder
 FROM --platform=linux/amd64 rust:bookworm AS builder
 ARG SOLANA_VERSION
+ARG PNPM_VERSION
+
+# Disable the base image's apt auto-clean so the cache mount below persists downloaded .debs.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
 # Install build dependencies and update to nightly
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
     clang \
     cmake \
     libhidapi-dev \
@@ -18,16 +29,17 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     libudev-dev \
     pkg-config \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/* \
-    && rustup default nightly-2025-09-01 \
-    && rustup component add rustfmt clippy
+    protobuf-compiler
+# rustup pulls the channel pinned in rust-toolchain.toml the first time cargo
+# runs in the workspace below — no `rustup default` needed.
 
 # Install Node.js and pnpm
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
-    && npm install -g pnpm@latest \
-    && rm -rf /var/lib/apt/lists/*
+    && test -n "${PNPM_VERSION}" || (echo "ERROR: PNPM_VERSION build arg is required (use --env-file versions.env)" && exit 1) \
+    && npm install -g pnpm@${PNPM_VERSION}
 
 # Install Solana CLI — version driven by versions.env (SOLANA_VERSION).
 # Drifting this version from the validator image or from Cargo.toml's solana-* crates
@@ -37,10 +49,23 @@ RUN test -n "${SOLANA_VERSION}" || (echo "ERROR: SOLANA_VERSION build arg is req
     && echo 'export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"' >> ~/.bashrc
 ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
 
+# Convention used throughout this builder stage: build artifacts are copied into /out/
+# before the next stage references them.
+#
+# Why: the cargo build steps below mount /usr/src/contra/target as a BuildKit cache
+# (`--mount=type=cache`), which is *not* visible to later stages' `COPY --from=builder`
+# and is also not visible to subsequent RUN steps that don't re-mount it. /out/ is a
+# normal image layer, so artifacts placed there persist across RUN steps and are
+# reachable from the runtime stage.
+
 # Set working directory
 WORKDIR /usr/src/contra
 
-# Copy workspace cargo files first for better caching
+# Copy workspace cargo files first for better caching.
+# rust-toolchain.toml MUST be present alongside Cargo.toml so rustup picks
+# the pinned channel (1.91.0) for cargo invocations inside the workspace,
+# matching the host's `make build` behaviour. 
+COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY core/Cargo.toml ./core/
 COPY gateway/Cargo.toml ./gateway/
@@ -78,15 +103,26 @@ RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/i
     printf 'fn main() {}\n' > auth/src/main.rs
 
 # Build the project with the dummy files. We can cache this layer.
-RUN cargo build --release
+# Cache mounts: target/ holds compiled artifacts; cargo registry/git hold downloaded crate sources.
+# All three are reused across rebuilds, turning a cold ~30 min build into <2 min when only
+# source changes.
+RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release
 
 # First, do the real build for the programs
 COPY Makefile ./Makefile
 COPY contra-escrow-program ./contra-escrow-program
 COPY contra-withdraw-program ./contra-withdraw-program
-RUN make install
-RUN make -C contra-escrow-program build
-RUN make -C contra-withdraw-program build
+RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    make -C contra-escrow-program install build \
+    && make -C contra-withdraw-program install build \
+    && mkdir -p /out/deploy \
+    && cp target/deploy/contra_escrow_program.so /out/deploy/ \
+    && cp target/deploy/contra_withdraw_program.so /out/deploy/
 
 # Next, do the real build for the other components
 COPY core ./core
@@ -95,36 +131,59 @@ COPY indexer ./indexer
 COPY metrics ./metrics
 COPY auth ./auth
 
-# Resolve the symlink: copy the built .so into core/precompiles/
-# (the source symlink points to target/deploy/ which exists in the builder)
-RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
+# core/precompiles/contra_withdraw_program.so is a symlink into target/deploy/ (used by
+# include_bytes! in core). The cache-mounted target/ isn't reliably available to the next
+# build, so swap the symlink for the real .so. rm first — otherwise cp follows the symlink
+# and writes to the wrong place.
+RUN rm -f core/precompiles/contra_withdraw_program.so \
+    && cp /out/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
 
-RUN cargo build --release \
-    -p contra-core \
-    -p contra-gateway \
-    -p contra-indexer \
-    -p auth
+# Final build — binaries are copied to /out/ per the convention noted above.
+RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release \
+        -p contra-core \
+        -p contra-gateway \
+        -p contra-indexer \
+        -p auth \
+    && mkdir -p /out \
+    && cp target/release/node /out/node \
+    && cp target/release/activity /out/activity \
+    && cp target/release/admin /out/admin \
+    && cp target/release/gateway /out/gateway \
+    && cp target/release/indexer /out/indexer \
+    && cp target/release/streamer /out/streamer \
+    && cp target/release/auth /out/auth
 
 # Stage 2: Runtime
 FROM --platform=linux/amd64 debian:bookworm-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+# Disable the base image's apt auto-clean so the cache mount below persists downloaded .debs.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+# Install runtime dependencies. curl is used by compose healthcheck probes
+# against the service's /health and /metrics endpoints.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    libssl3
 
 # Create a non-root user to run the application
 RUN useradd -m -u 1000 -s /bin/bash contra
 
-# Copy the binaries from builder
-COPY --from=builder /usr/src/contra/target/release/node /usr/local/bin/contra-node
-COPY --from=builder /usr/src/contra/target/release/activity /usr/local/bin/activity
-COPY --from=builder /usr/src/contra/target/release/admin /usr/local/bin/admin
-COPY --from=builder /usr/src/contra/target/release/gateway /usr/local/bin/gateway
-COPY --from=builder /usr/src/contra/target/release/indexer /usr/local/bin/indexer
-COPY --from=builder /usr/src/contra/target/release/streamer /usr/local/bin/streamer
-COPY --from=builder /usr/src/contra/target/release/auth /usr/local/bin/auth
+# Copy the binaries from builder. Source paths are /out/ (a normal layer in the builder
+# stage), not target/release/ (a cache mount which is not visible across stages).
+COPY --from=builder /out/node /usr/local/bin/contra-node
+COPY --from=builder /out/activity /usr/local/bin/activity
+COPY --from=builder /out/admin /usr/local/bin/admin
+COPY --from=builder /out/gateway /usr/local/bin/gateway
+COPY --from=builder /out/indexer /usr/local/bin/indexer
+COPY --from=builder /out/streamer /usr/local/bin/streamer
+COPY --from=builder /out/auth /usr/local/bin/auth
 
 # Copy indexer/operator config files
 COPY indexer/config /etc/contra/config

@@ -107,6 +107,7 @@ pub struct SigverifyArgs {
     pub sequencer_tx: mpsc::UnboundedSender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
+    pub heartbeat: Arc<crate::health::StageHeartbeat>,
 }
 
 pub async fn sigverify_transaction(
@@ -145,6 +146,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
         sequencer_tx,
         shutdown_token,
         metrics,
+        heartbeat,
     } = args;
     let mut handles = Vec::with_capacity(num_workers);
     let admin_keys = Arc::new(admin_keys);
@@ -155,6 +157,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
         let shutdown = shutdown_token.clone();
         let admin_keys = admin_keys.clone();
         let metrics = Arc::clone(&metrics);
+        let heartbeat = Arc::clone(&heartbeat);
 
         let handle = tokio::spawn(async move {
             info!("Sigverify worker {} started", worker_id);
@@ -165,7 +168,10 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                     result = rx.recv() => {
                         match result {
                             Ok(transaction) => {
+                                heartbeat.record_input();
                                 let result = sigverify_transaction(&transaction, &admin_keys).await;
+                                // Each verify (forward or reject) counts as progress — the stage isn't wedged.
+                                heartbeat.record_progress();
                                 match result {
                                     SigverifyResult::Valid(_) => {
                                         metrics.sigverify_forwarded();
@@ -419,6 +425,7 @@ mod tests {
             sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -454,6 +461,7 @@ mod tests {
             sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -515,6 +523,7 @@ mod tests {
             sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
         assert_eq!(handles.len(), 2);
@@ -640,6 +649,7 @@ mod tests {
             sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
@@ -675,6 +685,7 @@ mod tests {
             sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 

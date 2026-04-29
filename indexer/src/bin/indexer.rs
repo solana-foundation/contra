@@ -222,7 +222,8 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
     contra_indexer::metrics::init();
-    contra_metrics::start_metrics_server(metrics_port);
+    let health = contra_metrics::HealthState::new(contra_metrics::HealthConfig::indexer());
+    contra_metrics::start_metrics_server_with_health(metrics_port, health.clone());
 
     let common: CommonSection = figment.extract_inner("common")?;
     contra_indexer::metrics::init_labels(contra_metrics::MetricLabel::as_label(
@@ -330,7 +331,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
     common_config.validate()?;
     indexer_config.validate()?;
 
-    contra_indexer::run(common_config, indexer_config).await?;
+    contra_indexer::run(common_config, indexer_config, Some(health)).await?;
 
     Ok(())
 }
@@ -349,7 +350,8 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
     contra_indexer::metrics::init();
-    contra_metrics::start_metrics_server(metrics_port);
+    let health = contra_metrics::HealthState::new(contra_metrics::HealthConfig::operator());
+    contra_metrics::start_metrics_server_with_health(metrics_port, health.clone());
 
     let common: CommonSection = figment.extract_inner("common")?;
     contra_indexer::metrics::init_labels(contra_metrics::MetricLabel::as_label(
@@ -414,7 +416,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     // Validate signer configuration early (from environment variables)
     OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
 
-    contra_indexer::operator::run(storage, common_config, operator_config).await?;
+    contra_indexer::operator::run(storage, common_config, operator_config, Some(health)).await?;
 
     Ok(())
 }

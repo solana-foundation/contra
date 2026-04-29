@@ -18,6 +18,7 @@ use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
 
 #[cfg(feature = "datasource-yellowstone")]
 use crate::indexer::datasource::yellowstone::YellowstoneSource;
+use contra_metrics::HealthState;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -27,6 +28,7 @@ use tracing::{error, info};
 pub async fn run(
     common_config: ContraIndexerConfig,
     indexer_config: IndexerConfig,
+    health: Option<Arc<HealthState>>,
 ) -> Result<(), IndexerError> {
     info!("Starting Contra Indexer");
     info!("Program: {:?}", common_config.program_type);
@@ -159,7 +161,7 @@ pub async fn run(
                 }
             })?;
 
-            Box::new(RpcPollingSource::new(
+            let mut source = RpcPollingSource::new(
                 common_config.rpc_url.clone(),
                 rpc_config.from_slot,
                 rpc_config.poll_interval_ms,
@@ -169,7 +171,11 @@ pub async fn run(
                 rpc_config.commitment,
                 common_config.program_type,
                 common_config.escrow_instance_id,
-            ))
+            );
+            if let Some(h) = health.clone() {
+                source = source.with_health(h);
+            }
+            Box::new(source)
         }
 
         #[cfg(feature = "datasource-yellowstone")]
@@ -228,6 +234,12 @@ pub async fn run(
                 )
             };
 
+            let source = if let Some(h) = health.clone() {
+                source.with_health(h)
+            } else {
+                source
+            };
+
             Box::new(source)
         }
 
@@ -253,7 +265,11 @@ pub async fn run(
         .await?;
 
     // 8. Start transaction processor
-    let transaction_processor = TransactionProcessor::new(storage.clone(), checkpoint_tx.clone());
+    let mut transaction_processor =
+        TransactionProcessor::new(storage.clone(), checkpoint_tx.clone());
+    if let Some(h) = health.clone() {
+        transaction_processor = transaction_processor.with_health(h);
+    }
     let processor_handle = tokio::spawn(async move {
         if let Err(e) = transaction_processor.start(instruction_rx).await {
             error!("TransactionProcessor error: {}", e);

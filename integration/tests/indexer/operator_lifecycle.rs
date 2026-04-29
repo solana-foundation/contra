@@ -106,7 +106,7 @@ async fn start_operator_with_alert(
     set_operator_env_vars(&operator_keypair);
 
     let task_handle: JoinHandle<()> = tokio::spawn(async move {
-        if let Err(e) = operator::run(storage, common_config, operator_config).await {
+        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
             tracing::error!("Operator error: {}", e);
         }
     });
@@ -149,7 +149,7 @@ async fn start_operator_with_config(
     set_operator_env_vars(&operator_keypair);
 
     let task_handle: JoinHandle<()> = tokio::spawn(async move {
-        if let Err(e) = operator::run(storage, common_config, operator_config).await {
+        if let Err(e) = operator::run(storage, common_config, operator_config, None).await {
             tracing::error!("Operator error: {}", e);
         }
     });

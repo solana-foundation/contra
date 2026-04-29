@@ -16,7 +16,9 @@ pub async fn wallets(
     State(state): State<AppState>,
     claims: Claims,
 ) -> AppResult<Json<Vec<WalletResponse>>> {
-    let wallets = db::list_verified_wallets(&state.pool, claims.sub).await?;
+    let r = db::list_verified_wallets(&state.pool, claims.sub).await;
+    state.pool_status.observe_app(&r);
+    let wallets = r?;
 
     Ok(Json(
         wallets
@@ -34,9 +36,9 @@ pub async fn delete_wallet(
     claims: Claims,
     Path(pubkey): Path<String>,
 ) -> AppResult<StatusCode> {
-    let deleted = db::delete_verified_wallet(&state.pool, claims.sub, &pubkey)
-        .await
-        .map_err(AppError::Db)?;
+    let raw = db::delete_verified_wallet(&state.pool, claims.sub, &pubkey).await;
+    state.pool_status.observe_sqlx(&raw);
+    let deleted = raw.map_err(AppError::Db)?;
 
     if deleted {
         Ok(StatusCode::NO_CONTENT)

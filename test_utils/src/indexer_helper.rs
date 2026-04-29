@@ -93,7 +93,7 @@ pub async fn start_contra_indexer(
     common_config.validate()?;
 
     let indexer_handle = tokio::spawn(async move {
-        if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
+        if let Err(e) = contra_indexer::run(common_config, indexer_config, None).await {
             eprintln!("Indexer error: {}", e);
         }
     });
@@ -171,7 +171,7 @@ pub async fn start_solana_indexer_rpc_polling(
     indexer_config.validate()?;
 
     let indexer_handle = tokio::spawn(async move {
-        if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
+        if let Err(e) = contra_indexer::run(common_config, indexer_config, None).await {
             eprintln!("Solana RPC-polling Indexer error: {}", e);
         }
     });
@@ -250,7 +250,7 @@ pub async fn start_solana_indexer(
     indexer_config.validate()?;
 
     let indexer_handle = tokio::spawn(async move {
-        if let Err(e) = contra_indexer::run(common_config, indexer_config).await {
+        if let Err(e) = contra_indexer::run(common_config, indexer_config, None).await {
             eprintln!("Solana Indexer error: {}", e);
         }
     });

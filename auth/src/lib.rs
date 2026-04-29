@@ -3,10 +3,11 @@ pub mod db;
 pub mod error;
 pub mod jwt;
 pub mod models;
+pub mod pool_status;
 pub mod routes;
 
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRequestParts, State},
     http::{request::Parts, HeaderValue, Method, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -16,11 +17,13 @@ use std::sync::Arc;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use jwt::{Claims, JwtConfig};
+use pool_status::PoolStatus;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub jwt: Arc<JwtConfig>,
+    pub pool_status: Arc<PoolStatus>,
 }
 
 // Extract and validate JWT from the Authorization header for any route that declares `claims: Claims`.
@@ -100,7 +103,16 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
             "/auth/wallets/{pubkey}",
             delete(routes::wallets::delete_wallet),
         )
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         .layer(cors)
         .with_state(state)
+}
+
+/// Reads the cached pool-status flag updated by handlers; doesn't itself touch the pool.
+async fn health(State(state): State<AppState>) -> StatusCode {
+    if state.pool_status.is_healthy() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }

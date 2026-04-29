@@ -244,6 +244,36 @@ make install
 make build
 ```
 
+### Docker build cache
+
+Docker builds use BuildKit cache mounts for cargo and apt, so rebuilds after the first cold build are fast. One-time setup on a fresh host: `sudo make install-buildkit-cache` merges a BuildKit GC fragment into `/etc/docker/daemon.json` so the cache stays capped (~50 GB) instead of growing unbounded. The `make docker-build`, `make docker-up`, and `make docker-rebuild` targets (and devnet variants) check for this and fail with an actionable message if it's missing.
+
+Useful commands:
+
+```bash
+# Force a fresh build (ignore all caches)
+docker compose build --no-cache <service>
+
+# Reclaim disk by clearing the build cache
+docker builder prune -af
+```
+
+### Building a single Dockerfile standalone
+
+Compose loads [`versions.env`](versions.env) automatically; standalone `docker build` doesn't. Source the file first so the build args are available, then pass only the args that the Dockerfile declares:
+
+```bash
+set -a; . versions.env; set +a
+
+docker build --build-arg SOLANA_VERSION --build-arg PNPM_VERSION -f Dockerfile .
+docker build --build-arg SOLANA_VERSION --build-arg YELLOWSTONE_TAG -f validator.Dockerfile .
+docker build --build-arg GRAFANA_VERSION    -f Dockerfile.grafana    .
+docker build --build-arg PROMETHEUS_VERSION -f Dockerfile.prometheus .
+docker build --build-arg NODE_VERSION --build-arg PNPM_VERSION -f admin-ui/Dockerfile .
+```
+
+`versions.env` is the single source of truth for every pinned version.
+
 ### Run Tests
 
 ```bash
@@ -257,19 +287,41 @@ make unit-test
 make integration-test
 ```
 
+### Docker stack
+
+The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in any secrets.
+
+```bash
+# Build all images
+make docker-build
+
+# Start the full stack in the background
+make docker-up
+
+# Rebuild changed services and restart
+make docker-rebuild
+
+# Tail logs / inspect / stop
+make docker-logs
+make docker-ps
+make docker-down
+```
+
+Devnet variants exist for every target (`make docker-devnet-up`, `make docker-devnet-down`, etc.) and read `.env.devnet` instead. Run `make help` for the full list.
+
 ### Running with Auth (RBAC)
 
 Auth is opt-in. The gateway runs without it by default — all RPC methods are accessible without a token.
 
-To enable auth, set `JWT_SECRET` in your `.env` and start with the `auth` profile:
+To enable auth, set `JWT_SECRET` in your `.env.local` and start with the `auth` profile:
 
 ```bash
 # Copy and configure env
-cp .env.example .env
-# Set JWT_SECRET=<your-secret> in .env
+cp .env.example .env.local
+# Set JWT_SECRET=<your-secret> in .env.local
 
 # Start full stack including auth service
-docker compose --profile auth up
+docker compose --env-file versions.env --env-file .env.local --profile auth up
 ```
 
 Once running, the auth service is available at `http://localhost:${AUTH_PORT}` (default `8903`). See [auth/README.md](auth/README.md) for the full API reference, role definitions, and wallet verification flow.
@@ -282,12 +334,15 @@ CI and local runs.
 
 | Tool             | Version    | Install command                                        |
 |------------------|------------|--------------------------------------------------------|
-| Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically |
+| Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically (host *and* Docker builder) |
 | cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
 | cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
-| Solana CLI       | `2.2.19`   | `sh -c "$(curl -sSfL https://release.anza.xyz/v2.2.19/install)"` |
-| Node.js          | `22.x`     | See your distro's package manager                      |
-| pnpm             | `10.15.1`  | `npm install -g pnpm@10.15.1` (also pinned via `packageManager` in each `package.json`) |
+| Solana CLI       | `3.1.13`   | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |
+| Node.js          | `24.7.0`   | Pinned in [`versions.env`](versions.env) (`NODE_VERSION`) for admin-ui Docker builds |
+| pnpm             | `10.15.1`  | Pinned in [`versions.env`](versions.env) (`PNPM_VERSION`); also via `packageManager` in each `package.json` |
+| Grafana          | `11.4.0`   | Pinned in [`versions.env`](versions.env) (`GRAFANA_VERSION`) |
+| Prometheus       | `v3.0.1`   | Pinned in [`versions.env`](versions.env) (`PROMETHEUS_VERSION`) |
+| Blackbox exporter| `v0.25.0`  | Pinned in [`versions.env`](versions.env) (`BLACKBOX_VERSION`) |
 
 Container images used by integration tests (pulled automatically by
 `testcontainers` at test time):
@@ -298,10 +353,12 @@ Container images used by integration tests (pulled automatically by
 | `redis:7`            | Warmed in CI before each integration run.      |
 
 Source of truth for tool versions:
-- Rust + `cargo-llvm-cov` + pnpm: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
+- **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`, `NODE_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `BLACKBOX_VERSION`
+- Rust toolchain: [`rust-toolchain.toml`](rust-toolchain.toml)
+- Rust + `cargo-llvm-cov`: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
 - `cargo-nextest`: [`.github/workflows/rust.yml`](.github/workflows/rust.yml) (`Install cargo-nextest` step)
-- Solana CLI: [`.github/actions/setup-solana/action.yml`](.github/actions/setup-solana/action.yml)
-- pnpm (also): `packageManager` field in `contra-escrow-program/package.json`
+- Solana CLI (CI mirror of `versions.env`): [`.github/actions/setup-solana/action.yml`](.github/actions/setup-solana/action.yml)
+- pnpm (also): `packageManager` field in each `package.json`
 
 When bumping any version, update the CI config **and** this section in the
 same PR so the two stay in sync.

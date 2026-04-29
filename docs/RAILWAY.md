@@ -4,7 +4,9 @@ This guide covers deploying Contra to [Railway](https://railway.com) as a multi-
 
 ## Architecture
 
-All services are built from a single Dockerfile that produces five binaries: `contra-node`, `gateway`, `indexer`, `activity`, and `streamer`. Each Railway service runs the same Docker image with a different start command and environment variables.
+All services are built from a single Dockerfile that produces seven binaries: `contra-node`, `gateway`, `indexer`, `activity`, `streamer`, `admin`, and `auth`. Each Railway service runs the same Docker image with a different start command and environment variables. (`admin` is a CLI for one-off ops, not deployed as a long-running service.)
+
+> **Note on `CONTRA_VERSION`:** The local compose stack consolidates all Rust services onto a single shared image tag (`contra-app:${CONTRA_VERSION:-latest}`) — see `docker-compose.yml`. **This sharing does not apply on Railway today.** Each Railway service has its own build pipeline and produces its own image, even though they all reference the same `Dockerfile`. `CONTRA_VERSION` is a local-only knob. To replicate the consolidated single-image pattern on Railway (build once, deploy to N services), see [`RAILWAY_SHARED_IMAGE.md`](RAILWAY_SHARED_IMAGE.md).
 
 | Railway Service | Binary | Role |
 |---|---|---|
@@ -16,6 +18,7 @@ All services are built from a single Dockerfile that produces five binaries: `co
 | `indexer-contra` | `indexer` | Indexes Contra transactions via RPC polling |
 | `operator-solana` | `indexer` | Processes escrow program operations |
 | `operator-contra` | `indexer` | Processes withdrawal program operations |
+| `auth` | `auth` | Optional RBAC service issuing JWTs to gateway clients (only when the `auth` profile is enabled) |
 | `admin-ui` | Vite/React | Web UI for managing escrow instances, operators, mints, balances, and withdrawals |
 
 Services **not** deployed to Railway:
@@ -67,7 +70,7 @@ railway add --service admin-ui
 railway add --service blackbox-exporter
 ```
 
-The `blackbox-exporter` service uses the Docker image `prom/blackbox-exporter:latest` directly (not the repo Dockerfile). In Railway, set **Settings > Build > Docker Image** to `prom/blackbox-exporter:latest`. No env vars, start command, or volumes needed -- it listens on port 9115.
+The `blackbox-exporter` service uses the Docker image `prom/blackbox-exporter:v0.25.0` directly (not the repo Dockerfile). In Railway, set **Settings > Build > Docker Image** to `prom/blackbox-exporter:v0.25.0`. No env vars, start command, or volumes needed -- it listens on port 9115. Keep this tag in lockstep with `BLACKBOX_VERSION` in [`versions.env`](../versions.env).
 
 ## Start Commands
 
@@ -89,6 +92,11 @@ Config files are baked into the Docker image at `/etc/contra/config/` during bui
 The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and must be configured in the Railway dashboard:
 - **Settings > Build > Dockerfile Path**: `admin-ui/Dockerfile`
 - **Settings > Build > Docker Build Context**: `/` (repo root, needed so the generated TypeScript clients can be copied)
+- **Settings > Build > Build Args** (mirror of `versions.env`, since Railway doesn't read it):
+  - `PNPM_VERSION` — must match `versions.env` (currently `10.15.1`).
+  - `NODE_VERSION` — must match `versions.env` (currently `24.7.0`); selects the `node:${NODE_VERSION}-slim` base image.
+
+  Both have fallback defaults in the Dockerfile, but set them explicitly here so a `versions.env` bump in CI/Docker doesn't silently drift from Railway.
 - No custom start command needed -- the Dockerfile handles it.
 
 ## Environment Variables
@@ -426,7 +434,7 @@ railway up --service prometheus
 railway up --service grafana
 ```
 
-The `blackbox-exporter` service uses a stock Docker image -- no code deploy needed. Create it in the Railway dashboard with image `prom/blackbox-exporter:latest`.
+The `blackbox-exporter` service uses a stock Docker image -- no code deploy needed. Create it in the Railway dashboard with image `prom/blackbox-exporter:v0.25.0`.
 
 Prometheus uses `Dockerfile.prometheus` which runs `envsubst` at startup to interpolate `${HOST_SUFFIX}` into the config. Set `HOST_SUFFIX=.railway.internal` on the Railway prometheus service. No custom start command is needed — the Dockerfile handles it.
 

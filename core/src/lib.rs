@@ -1,6 +1,7 @@
 // Library modules that other binaries and tests can use
 pub mod accounts;
 pub mod client;
+pub mod health;
 pub mod nodes;
 pub mod processor;
 pub mod rpc;

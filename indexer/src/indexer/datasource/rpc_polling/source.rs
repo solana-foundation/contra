@@ -6,7 +6,7 @@ use crate::indexer::datasource::common::{datasource::DataSource, types::*};
 use crate::indexer::datasource::rpc_polling::decoder;
 use crate::metrics;
 use async_trait::async_trait;
-use contra_metrics::MetricLabel;
+use contra_metrics::{HealthState, MetricLabel};
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
@@ -24,6 +24,7 @@ pub struct RpcPollingSource {
     commitment: CommitmentLevel,
     program_type: ProgramType,
     escrow_instance_id: Option<solana_sdk::pubkey::Pubkey>,
+    health: Option<Arc<HealthState>>,
 }
 
 impl RpcPollingSource {
@@ -49,7 +50,13 @@ impl RpcPollingSource {
             commitment,
             program_type,
             escrow_instance_id,
+            health: None,
         }
+    }
+
+    pub fn with_health(mut self, health: Arc<HealthState>) -> Self {
+        self.health = Some(health);
+        self
     }
 }
 
@@ -81,6 +88,7 @@ impl DataSource for RpcPollingSource {
         let error_retry_interval_ms = self.error_retry_interval_ms;
         let program_type = self.program_type;
         let escrow_instance_id = self.escrow_instance_id;
+        let health = self.health.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -113,6 +121,9 @@ impl DataSource for RpcPollingSource {
                 metrics::INDEXER_CHAIN_TIP_SLOT
                     .with_label_values(&[program_type.as_label()])
                     .set(chain_tip as f64);
+                if let Some(h) = &health {
+                    h.set_pending(chain_tip.saturating_sub(current_slot));
+                }
 
                 // If no slots available, wait and retry
                 if slots.is_empty() {

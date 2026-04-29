@@ -49,4 +49,6 @@ WORKDIR /app
 COPY --from=builder /workspace/admin-ui/dist ./dist
 COPY admin-ui/server.mjs .
 
+USER node
+
 CMD ["node", "server.mjs"]

@@ -29,9 +29,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libssl-dev \
     libudev-dev \
     pkg-config \
-    protobuf-compiler \
-    && rustup default nightly-2025-09-01 \
-    && rustup component add rustfmt clippy
+    protobuf-compiler
+# rustup pulls the channel pinned in rust-toolchain.toml the first time cargo
+# runs in the workspace below — no `rustup default` needed.
 
 # Install Node.js and pnpm
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -61,7 +61,11 @@ ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
 # Set working directory
 WORKDIR /usr/src/contra
 
-# Copy workspace cargo files first for better caching
+# Copy workspace cargo files first for better caching.
+# rust-toolchain.toml MUST be present alongside Cargo.toml so rustup picks
+# the pinned channel (1.91.0) for cargo invocations inside the workspace,
+# matching the host's `make build` behaviour. 
+COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY core/Cargo.toml ./core/
 COPY gateway/Cargo.toml ./gateway/

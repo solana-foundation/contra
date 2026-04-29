@@ -246,7 +246,9 @@ make build
 
 ### Docker build cache
 
-Docker builds use BuildKit cache mounts for cargo and apt, so rebuilds after the first cold build are fast. Useful commands:
+Docker builds use BuildKit cache mounts for cargo and apt, so rebuilds after the first cold build are fast. One-time setup on a fresh host: `sudo make install-buildkit-cache` merges a BuildKit GC fragment into `/etc/docker/daemon.json` so the cache stays capped (~50 GB) instead of growing unbounded. The `make docker-build`, `make docker-up`, and `make docker-rebuild` targets (and devnet variants) check for this and fail with an actionable message if it's missing.
+
+Useful commands:
 
 ```bash
 # Force a fresh build (ignore all caches)
@@ -285,19 +287,41 @@ make unit-test
 make integration-test
 ```
 
+### Docker stack
+
+The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in any secrets.
+
+```bash
+# Build all images
+make docker-build
+
+# Start the full stack in the background
+make docker-up
+
+# Rebuild changed services and restart
+make docker-rebuild
+
+# Tail logs / inspect / stop
+make docker-logs
+make docker-ps
+make docker-down
+```
+
+Devnet variants exist for every target (`make docker-devnet-up`, `make docker-devnet-down`, etc.) and read `.env.devnet` instead. Run `make help` for the full list.
+
 ### Running with Auth (RBAC)
 
 Auth is opt-in. The gateway runs without it by default — all RPC methods are accessible without a token.
 
-To enable auth, set `JWT_SECRET` in your `.env` and start with the `auth` profile:
+To enable auth, set `JWT_SECRET` in your `.env.local` and start with the `auth` profile:
 
 ```bash
 # Copy and configure env
-cp .env.example .env
-# Set JWT_SECRET=<your-secret> in .env
+cp .env.example .env.local
+# Set JWT_SECRET=<your-secret> in .env.local
 
 # Start full stack including auth service
-docker compose --profile auth up
+docker compose --env-file versions.env --env-file .env.local --profile auth up
 ```
 
 Once running, the auth service is available at `http://localhost:${AUTH_PORT}` (default `8903`). See [auth/README.md](auth/README.md) for the full API reference, role definitions, and wallet verification flow.
@@ -310,7 +334,7 @@ CI and local runs.
 
 | Tool             | Version    | Install command                                        |
 |------------------|------------|--------------------------------------------------------|
-| Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically |
+| Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically (host *and* Docker builder) |
 | cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
 | cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
 | Solana CLI       | `3.1.13`   | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |

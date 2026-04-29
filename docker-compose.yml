@@ -18,12 +18,36 @@ x-default-healthcheck: &default-healthcheck
   retries: 5
   start_period: 30s
 
+# Default logging policy — rotates each service's stdout/stderr at 100MB per file
+# with 5 files retained (=~500MB ceiling per container). Lives in compose so the
+# policy travels with the repo to any deploy target, instead of relying on the
+# host's daemon.json.
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "5"
+
+# Shared image+build for every Rust service that compiles from the main Dockerfile.
+# All such services share one byte-identical image; per-service tags would be
+# 10 copies of the same artifact differing only in compose metadata. Each service
+# overrides only `command:` (and per-service env). Pin in CI/Railway via
+# CONTRA_VERSION; defaults to `latest` for local dev. Validator, prometheus,
+# grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
+x-contra-app: &contra-app
+  image: contra-app:${CONTRA_VERSION:-latest}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args: *solana-build-args
+
 services:
   # PostgreSQL Primary (for write node)
   postgres-primary:
     image: postgres:16-alpine
     container_name: contra-postgres-primary
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -62,12 +86,10 @@ services:
 
   # Write Node (formerly sequencer)
   write-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-write-node
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
@@ -110,6 +132,7 @@ services:
     image: postgres:16-alpine
     container_name: contra-postgres-replica
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -156,12 +179,10 @@ services:
 
   # Read Node
   read-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-read-node
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
@@ -194,12 +215,10 @@ services:
 
   # Gateway (Routes requests between write and read nodes)
   gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-gateway
     restart: unless-stopped
+    logging: *default-logging
     ulimits:
       nofile:
         soft: 65536
@@ -234,12 +253,10 @@ services:
   # Auth Service (optional — run with: docker compose --profile auth up)
   auth:
     profiles: [auth]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-auth
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -265,12 +282,10 @@ services:
 
   # WebSocket Transaction Streamer
   streamer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-streamer
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-replica:
         condition: service_healthy
@@ -299,12 +314,10 @@ services:
 
   # Activity Generator
   activity:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-activity
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - write-node
       - read-node
@@ -340,6 +353,7 @@ services:
       args: *validator-build-args
     container_name: contra-validator
     restart: unless-stopped
+    logging: *default-logging
     deploy:
       replicas: 1
     # Agave 3.1 asserts io_uring_supported(); Docker's default seccomp profile
@@ -383,6 +397,7 @@ services:
     image: postgres:16-alpine
     container_name: contra-postgres-indexer
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_INDEXER_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -412,12 +427,10 @@ services:
 
   # Indexer Service - Solana (Yellowstone)
   indexer-solana:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-indexer-solana
     restart: unless-stopped
+    logging: *default-logging
     # tini as PID 1 so SIGTERM reaches the binary through the /bin/sh -c wrapper.
     init: true
     deploy:
@@ -460,12 +473,10 @@ services:
 
   # Indexer Service - Contra (RPC Polling)
   indexer-contra:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-indexer-contra
     restart: unless-stopped
+    logging: *default-logging
     init: true
     deploy:
       replicas: 1
@@ -500,12 +511,10 @@ services:
 
   # Operator Service - Solana
   operator-solana:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-operator-solana
     restart: unless-stopped
+    logging: *default-logging
     init: true
     depends_on:
       postgres-indexer:
@@ -554,12 +563,10 @@ services:
 
   # Operator Service - Contra
   operator-contra:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args: *solana-build-args
+    <<: *contra-app
     container_name: contra-operator-contra
     restart: unless-stopped
+    logging: *default-logging
     init: true
     depends_on:
       postgres-indexer:
@@ -608,9 +615,14 @@ services:
     image: postgres:16-alpine
     container_name: contra-pg-backup-primary
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-primary:
         condition: service_healthy
+    # TODO: pg_basebackup fails because POSTGRES_USER ("contra") lacks the
+    # REPLICATION attribute and isn't in pg_hba.conf for replication. Switch
+    # to POSTGRES_REPLICATION_USER/_PASSWORD (already used by the streaming
+    # replica). Pre-existing gap; backups currently never complete.
     environment:
       - PGHOST=postgres-primary
       - PGUSER=${POSTGRES_USER}
@@ -630,9 +642,11 @@ services:
     image: postgres:16-alpine
     container_name: contra-pg-backup-indexer
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres-indexer:
         condition: service_healthy
+    # TODO: same pg_hba/role mismatch as pg-backup-primary above.
     environment:
       - PGHOST=postgres-indexer
       - PGUSER=${POSTGRES_USER}
@@ -652,6 +666,7 @@ services:
     image: prom/blackbox-exporter:${BLACKBOX_VERSION}
     container_name: contra-blackbox-exporter
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - contra-network
     healthcheck:
@@ -666,6 +681,7 @@ services:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: contra-cadvisor
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8080:8080"
     volumes:
@@ -691,6 +707,7 @@ services:
         PROMETHEUS_VERSION: ${PROMETHEUS_VERSION}
     container_name: contra-prometheus
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "9090:9090"
     volumes:
@@ -710,11 +727,19 @@ services:
       retries: 5
       start_period: 15s
 
-  # Grafana for visualization
+  # Grafana for visualization. Uses Dockerfile.grafana so the image bakes in
+  # provisioning + dashboards (matters for Railway/standalone where bind mounts
+  # aren't available). Locally the bind mounts below shadow the baked content
+  # so edits hot-reload without rebuilding.
   grafana:
-    image: grafana/grafana:${GRAFANA_VERSION}
+    build:
+      context: .
+      dockerfile: Dockerfile.grafana
+      args:
+        GRAFANA_VERSION: ${GRAFANA_VERSION}
     container_name: contra-grafana
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "37429:3000"
     volumes:

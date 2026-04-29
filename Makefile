@@ -21,6 +21,8 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
 .PHONY: install-buildkit-cache check-buildkit-cache
+.PHONY: docker-build docker-up docker-rebuild docker-restart docker-down docker-clean docker-logs docker-ps
+.PHONY: docker-devnet-build docker-devnet-up docker-devnet-rebuild docker-devnet-restart docker-devnet-down docker-devnet-clean docker-devnet-logs docker-devnet-ps
 
 all: build
 
@@ -485,6 +487,92 @@ check-buildkit-cache:
 	    exit 1; \
 	fi
 
+#############
+# Docker stack — full local + devnet compose orchestration
+#############
+# These targets save users from remembering the env-file chain on every invocation.
+# Load order: versions.env first (toolchain pins), then the env-specific overrides.
+# `.env.local` is the developer's machine config (gitignored — copy from .env.example
+# and fill in secrets); `.env.devnet` is the tracked devnet preset.
+#
+# Override the env file chain by passing ENV_FILES_LOCAL / ENV_FILES_DEVNET on the
+# command line, e.g. `make docker-up ENV_FILES_LOCAL="--env-file versions.env --env-file .env.staging"`.
+#
+# Prereq policy:
+#   - Daemon-touching targets (build/up/restart/logs/ps) depend on `check-docker`.
+#   - Targets that can trigger a build depend on `check-buildkit-cache` so the
+#     cache GC config is in place before BuildKit populates it.
+#   - `docker-down` and `docker-clean` are recovery paths — no prereqs, so they
+#     still run if Docker / BuildKit configuration is in a degraded state.
+COMPOSE_LOCAL    := docker-compose.yml
+COMPOSE_DEVNET   := docker-compose.devnet.yml
+ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local
+ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet
+
+# --- Local stack (local validator) ---
+
+docker-build: check-docker check-buildkit-cache
+	@echo "Building all images ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) build
+
+docker-up: check-docker check-buildkit-cache
+	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
+
+docker-rebuild: check-docker check-buildkit-cache
+	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --build
+
+docker-restart: check-docker
+	@echo "Restarting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) restart
+
+docker-down:
+	@echo "Stopping full stack ($(COMPOSE_LOCAL); volumes preserved)..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) down
+
+docker-clean:
+	@echo "Stopping full stack and removing volumes ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) down -v --remove-orphans
+
+docker-logs: check-docker
+	@docker compose -f $(COMPOSE_LOCAL) logs -f --tail=200
+
+docker-ps: check-docker
+	@docker compose -f $(COMPOSE_LOCAL) ps
+
+# --- Devnet stack (against Solana devnet) ---
+
+docker-devnet-build: check-docker check-buildkit-cache
+	@echo "Building all images ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) build
+
+docker-devnet-up: check-docker check-buildkit-cache
+	@echo "Starting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d
+
+docker-devnet-rebuild: check-docker check-buildkit-cache
+	@echo "Rebuilding and (re)starting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --build
+
+docker-devnet-restart: check-docker
+	@echo "Restarting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) restart
+
+docker-devnet-down:
+	@echo "Stopping devnet stack ($(COMPOSE_DEVNET); volumes preserved)..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) down
+
+docker-devnet-clean:
+	@echo "Stopping devnet stack and removing volumes ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) down -v --remove-orphans
+
+docker-devnet-logs: check-docker
+	@docker compose -f $(COMPOSE_DEVNET) logs -f --tail=200
+
+docker-devnet-ps: check-docker
+	@docker compose -f $(COMPOSE_DEVNET) ps
+
 help:
 	@echo "Contra Programs - Available targets:"
 	@echo ""
@@ -538,4 +626,24 @@ help:
 	@echo ""
 	@echo "Build host setup:"
 	@echo "  install-buildkit-cache - Merge BuildKit GC config into /etc/docker/daemon.json (sudo, one-time)"
-	@echo "  check-buildkit-cache   - Verify BuildKit GC config is installed (used as prereq of obs-up)"
+	@echo "  check-buildkit-cache   - Verify BuildKit GC config is installed (prereq of obs-up + docker-build/up/rebuild)"
+	@echo ""
+	@echo "Docker stack (full local — docker-compose.yml, uses .env.local):"
+	@echo "  docker-build         - Build all images"
+	@echo "  docker-up            - Start full stack in detached mode"
+	@echo "  docker-rebuild       - Rebuild images and (re)start (= build + up in one shot)"
+	@echo "  docker-restart       - Restart all services without rebuilding"
+	@echo "  docker-down          - Stop services (volumes preserved)"
+	@echo "  docker-clean         - Stop and remove volumes / orphans (recovery)"
+	@echo "  docker-logs          - Tail logs from all services"
+	@echo "  docker-ps            - Show service status"
+	@echo ""
+	@echo "Docker stack (devnet — docker-compose.devnet.yml, uses .env.devnet):"
+	@echo "  docker-devnet-build  - Build all devnet images"
+	@echo "  docker-devnet-up     - Start devnet stack in detached mode"
+	@echo "  docker-devnet-rebuild - Rebuild and (re)start devnet stack"
+	@echo "  docker-devnet-restart - Restart devnet services without rebuilding"
+	@echo "  docker-devnet-down   - Stop devnet services (volumes preserved)"
+	@echo "  docker-devnet-clean  - Stop and remove devnet volumes / orphans"
+	@echo "  docker-devnet-logs   - Tail devnet logs"
+	@echo "  docker-devnet-ps     - Show devnet service status"

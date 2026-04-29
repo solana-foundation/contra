@@ -125,6 +125,10 @@ contra-admin truncate --keep-slots 100000 --dry-run
 | `make generate-clients` | Generate IDL and TypeScript/Rust clients |
 | `make obs-up` / `make obs-down` | Start/stop observability stack (Prometheus, Grafana, cAdvisor) |
 | `make obs-devnet-up` / `make obs-devnet-down` | Start/stop devnet observability stack |
+| `make docker-up` / `make docker-down` | Start/stop the full local stack (wraps the `--env-file versions.env --env-file .env.local` chain) |
+| `make docker-build` / `make docker-rebuild` | Build images / rebuild and restart the full local stack |
+| `make docker-devnet-up` / `make docker-devnet-down` | Start/stop the full devnet stack (reads `.env.devnet`) |
+| `make install-buildkit-cache` | One-time setup: install BuildKit GC config into `/etc/docker/daemon.json` (required before first `docker-build`) |
 
 ### Operational Scripts
 

@@ -180,8 +180,10 @@ impl Gateway {
                 return c.healthy;
             }
         }
-        let (write_ok, read_ok) =
-            tokio::join!(self.probe_upstream(&self.write_url), self.probe_upstream(&self.read_url));
+        let (write_ok, read_ok) = tokio::join!(
+            self.probe_upstream(&self.write_url),
+            self.probe_upstream(&self.read_url)
+        );
         let healthy = write_ok && read_ok;
         *self.ready_cache.lock().unwrap() = Some(ReadyCache {
             checked_at: Instant::now(),
@@ -399,10 +401,7 @@ impl Gateway {
             let (status, body) = if healthy {
                 (StatusCode::OK, r#"{"status":"ready"}"#)
             } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    r#"{"status":"degraded"}"#,
-                )
+                (StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"degraded"}"#)
             };
             return Ok(Response::builder()
                 .status(status)

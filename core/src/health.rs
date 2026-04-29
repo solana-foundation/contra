@@ -170,8 +170,8 @@ mod tests {
         r.dedup = Some(StageHeartbeat::new());
         r.sigverify = Some(hb_with(1000, 900)); // unhealthy
         r.executor = Some(hb_with(1000, 900)); // also unhealthy, but reported second
-        // First unhealthy in ordered iteration (dedup, sigverify, sequencer, executor, settler):
-        //   dedup is healthy (no input recorded), sigverify is unhealthy
+                                               // First unhealthy in ordered iteration (dedup, sigverify, sequencer, executor, settler):
+                                               //   dedup is healthy (no input recorded), sigverify is unhealthy
         assert_eq!(r.first_unhealthy(), Some("sigverify"));
     }
 

@@ -161,7 +161,8 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel(); // cancel immediately
 
-        let result = run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
+        let result =
+            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
         assert!(result.is_ok());
     }
 
@@ -212,7 +213,8 @@ mod tests {
 
         drop(rx); // close receiver
 
-        let result = run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
+        let result =
+            run_fetcher(storage, tx, test_config(), ProgramType::Escrow, token, None).await;
 
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();

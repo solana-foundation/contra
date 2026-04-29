@@ -46,7 +46,14 @@ async fn start_empty_server() -> std::net::SocketAddr {
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let rpc_module = Arc::clone(&rpc_module);
-                    async move { handle_request(req, rpc_module, std::sync::Arc::new(contra_core::health::HeartbeatRegistry::new())).await }
+                    async move {
+                        handle_request(
+                            req,
+                            rpc_module,
+                            std::sync::Arc::new(contra_core::health::HeartbeatRegistry::new()),
+                        )
+                        .await
+                    }
                 });
                 let _ = http1::Builder::new().serve_connection(io, service).await;
             });

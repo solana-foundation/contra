@@ -37,8 +37,7 @@ pub async fn handle_request(
             // Two-stage check: RPC pipeline first (cheap, in-process), then any
             // running pipeline-stage heartbeat. A wedged stage shows up here as
             // a stale heartbeat even when getEpochSchedule still answers.
-            let rpc_health_request =
-                r#"{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule"}"#;
+            let rpc_health_request = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule"}"#;
             let rpc_ok = match rpc_module.raw_json_request(rpc_health_request, 1024).await {
                 Ok((resp, _)) => serde_json::from_str::<serde_json::Value>(&resp)
                     .ok()

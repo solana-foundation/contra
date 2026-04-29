@@ -280,7 +280,6 @@ impl DataSource for YellowstoneSource {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn connect_and_stream(
     endpoint: &str,
     x_token: Option<String>,

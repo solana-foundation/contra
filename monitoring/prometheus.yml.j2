@@ -1,0 +1,111 @@
+# Rendered by Ansible. Source: contra-deploy/templates/prometheus.yml.j2
+#
+# Scrape targets:
+#   - blackbox HTTP probes for every Contra service /health endpoint
+#   - cAdvisor (containers), node_exporter (host), postgres_exporter (DBs)
+#   - Contra services that expose /metrics directly (write/read/gateway use
+#     the metrics_port env vars in docker-compose.yml; we scrape the same
+#     ports here when CONTRA_METRICS=true). Off by default; the rules
+#     below tolerate missing targets gracefully.
+
+global:
+  scrape_interval: 10s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+
+  # ── self ────────────────────────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ── blackbox HTTP probes — the spec-recommended /health monitoring path.
+  # Each target's `__param_target` is rewritten into the URL the blackbox
+  # exporter actually probes; the exported metric series carry `instance`
+  # = the friendly service name, which is what dashboards group by.
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://gateway:{{ gateway_port }}/health
+          - http://write-node:{{ write_port }}/health
+          - http://read-node:{{ read_port }}/health
+          - http://indexer-solana:9100/health
+          - http://indexer-contra:9100/health
+          - http://operator-solana:9102/health
+          - http://operator-contra:9103/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ── infra exporters ────────────────────────────────────────────────────
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: postgres-primary
+    static_configs:
+      - targets: ['postgres-exporter-primary:9187']
+        labels:
+          db: primary
+
+  - job_name: postgres-indexer
+    static_configs:
+      - targets: ['postgres-exporter-indexer:9187']
+        labels:
+          db: indexer
+
+  # ── Contra indexer + operator /metrics — always-on. Each service binds
+  # its Prometheus exporter to METRICS_PORT (see docker-compose.yml: indexers
+  # default to 9100; operator-solana is 9102, operator-contra is 9103 so
+  # bench-tps can scrape them on distinct host ports). The metrics already
+  # carry a `program_type` label (escrow|withdraw) baked in by the app, so
+  # dashboards group across solana/contra pairs naturally — no extra
+  # relabeling needed here.
+  - job_name: contra-indexer-solana
+    static_configs:
+      - targets: ['indexer-solana:9100']
+        labels:
+          stack: contra
+
+  - job_name: contra-indexer-contra
+    static_configs:
+      - targets: ['indexer-contra:9100']
+        labels:
+          stack: contra
+
+  - job_name: contra-operator-solana
+    static_configs:
+      - targets: ['operator-solana:9102']
+        labels:
+          stack: contra
+
+  - job_name: contra-operator-contra
+    static_configs:
+      - targets: ['operator-contra:9103']
+        labels:
+          stack: contra
+
+  # ── Contra write/read/gateway /metrics (only when CONTRA_METRICS=true is
+  # set on the service; otherwise these targets show as down which is
+  # correct). Listed here so flipping CONTRA_METRICS=true requires no
+  # Prometheus config change.
+  - job_name: contra-services
+    static_configs:
+      - targets:
+          - 'write-node:9090'
+          - 'read-node:9090'
+          - 'gateway:9090'
+        labels:
+          stack: contra

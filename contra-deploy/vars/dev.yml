@@ -1,0 +1,89 @@
+# Dev environment overrides. The file most users edit.
+# Loaded by deploy.yml when invoked with `-l dev`.
+# Each option below: what it does, then how to choose.
+
+# === What to deploy =========================================================
+
+# image_registry — registry prefix for pulled images. Format: <registry>/<owner>,
+# where <owner> is your GitHub username or org, lowercased (GHCR namespaces are
+# case-sensitive and lowercase-only). Example: ghcr.io/huzaifa696.
+# See README → "Using GHCR" for the full setup (PAT, build, push).
+image_registry: ghcr.io/<owner>
+
+# image_tag — the docker tag to pull. Bump per deploy.
+image_tag: v0.1.0
+
+# === Network the deployed stack talks to ===================================
+
+# network — which Solana cluster the indexer + operator point at.
+#   localnet : the validator container baked into docker-compose.yml (default for self-tests).
+#   devnet   : Solana's public devnet (set rpc_url accordingly).
+#   mainnet  : Solana mainnet (production only).
+network: localnet
+
+# rpc_url — full HTTP RPC endpoint matching `network`.
+#   localnet : http://127.0.0.1:18899 (validator container, host-side port).
+#   devnet   : https://api.devnet.solana.com (rate-limited; use a paid RPC for real work).
+#   mainnet  : your dedicated RPC (Helius, Triton, QuickNode, etc.).
+rpc_url: http://127.0.0.1:18899
+
+# === On-host layout ========================================================
+
+# host_data_dir — where Compose volumes, rendered config, and logs live on the host.
+#   /tmp/contra-test : self-tests; doesn't need root, gets wiped on host reboot.
+#   /opt/contra      : real deploys (default in common.yml). Survives reboots.
+host_data_dir: /tmp/contra-test
+
+# === Gateway auth & port ===================================================
+
+# gateway_enforce_jwt — whether the gateway requires a signed JWT on every RPC call.
+#   false : operator services can call getSignaturesForAddress without auth (required for the dev self-test).
+#   true  : production setting. When enabling, also set `jwt_secret` in secrets.yml
+#           (already required there; the gateway will refuse to start without it).
+gateway_enforce_jwt: false
+
+# gateway_port — host-side port the gateway listens on. Default 8899 in vars/common.yml.
+# Override here if 8899 collides on this host (e.g. local Solana test-validator).
+# gateway_port: 8899
+
+# === Compose subset =========================================================
+
+# compose_services is derived in vars/common.yml (base list + `validator` on
+# localnet only). Uncomment and set explicitly here to override.
+# compose_services: "postgres-primary postgres-replica write-node read-node gateway ..."
+
+# === On-host program IDs ====================================================
+# program IDs deployed to the validator container.
+# Only relevant when network=localnet. Pinned to match the keypairs in the repo.
+escrow_program_id: GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
+
+# === Admin keypair ==========================================================
+# Path on the control node to a funded Solana keypair (JSON byte array).
+# Used to derive the operator services' ADMIN_PRIVATE_KEY at runtime, and by
+# any post-deploy admin tooling that signs on-chain transactions.
+admin_keypair_path: "{{ repo_root }}/keypairs/admin.json"
+
+# === Public surface ========================================================
+
+# domain — hostname the gateway is reachable at. Used by the report phase + any
+# reverse-proxy template. `localhost` for self-tests; real DNS for prod.
+domain: localhost
+
+# === Reset-state binding ===================================================
+
+# reset_state — when true, every deploy wipes the validator ledger AND the indexer
+# Postgres volume in lockstep. Required for dev because the validator boots with
+# `--reset` (fresh ATAs); leaving the indexer DB intact would trigger
+# `MismatchExceedsThreshold` in startup reconciliation. Set to false in prod.
+# Override at the CLI with `-e reset_state=false`.
+reset_state: true
+
+# === Monitoring ports (host-side) ==========================================
+monitoring_dir: "{{ host_data_dir }}/monitoring"
+monitoring_grafana_port: 3001
+monitoring_prometheus_port: 9090
+monitoring_blackbox_port: 9115
+monitoring_cadvisor_port: 8081
+monitoring_node_exporter_port: 9101
+monitoring_postgres_exporter_port: 9187

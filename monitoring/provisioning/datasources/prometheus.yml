@@ -1,0 +1,16 @@
+apiVersion: 1
+
+# url uses $PROMETHEUS_URL so the same provisioning works in both deploy
+# paths: Dockerfile.grafana exposes ENV PROMETHEUS_URL, and the Ansible-
+# rendered monitoring.compose.yml passes it as a service env var. Default
+# (set in both paths) is http://prometheus:9090 — the in-network DNS name
+# of the prometheus service in the same compose stack.
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: $PROMETHEUS_URL
+    isDefault: true
+    editable: false

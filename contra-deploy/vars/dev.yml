@@ -87,3 +87,7 @@ monitoring_blackbox_port: 9115
 monitoring_cadvisor_port: 8081
 monitoring_node_exporter_port: 9101
 monitoring_postgres_exporter_port: 9187
+# Indexer postgres-exporter sits on a distinct host port so both exporters
+# (primary + indexer) can be reached without colliding. Defaults to one
+# above the primary; override only if 9188 is already taken.
+monitoring_postgres_exporter_indexer_port: 9188

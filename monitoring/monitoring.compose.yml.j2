@@ -152,5 +152,7 @@ services:
     environment:
       - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
     ports:
-      - "9188:9187"
+      # Distinct from monitoring_postgres_exporter_port so primary + indexer
+      # exporters don't collide on the host. Defined in vars/<env>.yml.
+      - "{{ monitoring_postgres_exporter_indexer_port }}:9187"
     networks: [contra]

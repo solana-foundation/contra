@@ -99,19 +99,38 @@ fn main() -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            // Even if confirmation timed out, the signature is deterministic
-            // from the signed transaction; emit it so external pollers can
-            // verify the burn by polling getSignatureStatuses or the indexer DB.
-            println!("Transaction signature: {}", prelim_sig);
-            eprintln!(
-                "Warning: send_and_confirm reported error ({}); the transaction \
-                 may still have landed. Verify with `getSignatureStatuses` on \
-                 sig {}.",
-                e, prelim_sig
-            );
-            // Exit success because the channel-side flow has been exercised;
-            // the smoke test will verify finalization out-of-band.
-            Ok(())
+            // The gasless channel sometimes returns a confirmation-timeout
+            // error on a transaction that actually finalized — the signature
+            // is deterministic from the signed transaction body, so external
+            // pollers (smoke harness, indexer DB, getSignatureStatuses) can
+            // resolve the truth out-of-band. We only swallow this *specific*
+            // class of error; other failures (network, account-not-found,
+            // insufficient funds, malformed instruction) propagate so any
+            // CI / orchestration script reading the exit code gets honest
+            // signal instead of a false success.
+            let msg = e.to_string().to_lowercase();
+            let is_confirmation_timeout = msg.contains("unable to confirm")
+                || msg.contains("not been confirmed")
+                || msg.contains("transaction was not confirmed")
+                || msg.contains("blockhash not found")
+                || msg.contains("expired");
+            if is_confirmation_timeout {
+                println!("Transaction signature: {}", prelim_sig);
+                eprintln!(
+                    "Warning: send_and_confirm reported a confirmation timeout ({}); \
+                     the transaction may still have landed. Verify with \
+                     `getSignatureStatuses` on sig {}.",
+                    e, prelim_sig
+                );
+                Ok(())
+            } else {
+                eprintln!(
+                    "Error: send_and_confirm failed for sig {} — not a confirmation \
+                     timeout. Propagating so callers see a non-zero exit code.\n  cause: {}",
+                    prelim_sig, e
+                );
+                Err(e.into())
+            }
         }
     }
 }

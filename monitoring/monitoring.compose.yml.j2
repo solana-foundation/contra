@@ -1,0 +1,158 @@
+# Rendered by Ansible — do not edit by hand.
+# Source: monitoring/monitoring.compose.yml.j2
+#
+# Sibling stack to docker-compose.yml. Joins the upstream `contra_contra-network`
+# (created by the Contra compose) so blackbox can resolve service hostnames
+# and cAdvisor sees every running container. Prometheus + Grafana run on
+# host-port-forwarded volumes for persistence across re-runs.
+
+networks:
+  contra:
+    name: contra_contra-network
+    external: true
+
+volumes:
+  prom-data:
+  grafana-data:
+
+services:
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: contra-mon-prometheus
+    restart: unless-stopped
+    # --web.enable-lifecycle exposes /-/reload, so the deploy phase can
+    # pick up scrape-config edits via `curl -X POST .../-/reload` without
+    # a restart (which would lose the in-memory scrape state). See the
+    # "Reload prometheus config" task in deploy.yml.
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - {{ monitoring_dir }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "{{ monitoring_prometheus_port }}:9090"
+    networks: [contra]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: contra-mon-grafana
+    restart: unless-stopped
+    environment:
+      # Skip the forced first-login password change so the rest of the
+      # playbook can hit /api/* with the password from secrets.sops.yml.
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password }}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # Provisioning files under monitoring/provisioning/ reference these
+      # env vars at Grafana startup. Same set + defaults as docker-compose.yml's
+      # grafana service so both deploy paths see identical config.
+      - PROMETHEUS_URL=http://prometheus:9090
+      # alerting/contact-points.yml uses this; the no-op default keeps Grafana
+      # from failing provisioning when no real webhook is configured.
+      - ALERT_WEBHOOK_URL={{ alert_webhook_url | default('http://localhost:9/no-op') }}
+      # Postgres datasource (for the Postgres dashboard's direct-DB queries).
+      - POSTGRES_INDEXER_HOST=postgres-indexer
+      - POSTGRES_INDEXER_DB={{ postgres_indexer_db }}
+      - POSTGRES_USER={{ postgres_user }}
+      - POSTGRES_PASSWORD={{ postgres_password }}
+    volumes:
+      # Single mount per side mirrors the bind-mount layout in
+      # docker-compose.yml so both deploy paths see identical provisioning.
+      # Provisioning ships datasources/, dashboards/, alerting/ in one tree.
+      - {{ monitoring_dir }}/grafana/provisioning:/etc/grafana/provisioning:ro
+      - {{ monitoring_dir }}/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "{{ monitoring_grafana_port }}:3000"
+    networks: [contra]
+    depends_on: [prometheus]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # blackbox_exporter probes external endpoints (HTTP /health on each Contra service).
+  # Spec §7 calls this out as the recommended mechanism for ongoing healthz monitoring.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: contra-mon-blackbox
+    restart: unless-stopped
+    volumes:
+      - {{ monitoring_dir }}/blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    command: ["--config.file=/etc/blackbox_exporter/config.yml"]
+    ports:
+      - "{{ monitoring_blackbox_port }}:9115"
+    networks: [contra]
+
+  # cAdvisor — per-container CPU/mem/IO. Mounts the Docker socket and host cgroup paths.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: contra-mon-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "{{ monitoring_cadvisor_port }}:8080"
+    networks: [contra]
+
+  # node_exporter — host CPU/mem/disk/net.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: contra-mon-node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    ports:
+      - "{{ monitoring_node_exporter_port }}:9100"
+    networks: [contra]
+
+  # postgres_exporter for both primary and replica. Two instances differ only
+  # in DATA_SOURCE_NAME; Prometheus scrapes them as separate targets.
+  postgres-exporter-primary:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: contra-mon-pgexp-primary
+    restart: unless-stopped
+    environment:
+      - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
+    ports:
+      - "{{ monitoring_postgres_exporter_port }}:9187"
+    networks: [contra]
+
+  postgres-exporter-indexer:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: contra-mon-pgexp-indexer
+    restart: unless-stopped
+    environment:
+      - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
+    ports:
+      # Distinct from monitoring_postgres_exporter_port so primary + indexer
+      # exporters don't collide on the host. Defined in vars/<env>.yml.
+      - "{{ monitoring_postgres_exporter_indexer_port }}:9187"
+    networks: [contra]

@@ -1,0 +1,25 @@
+# Rendered by Ansible — do not edit by hand. Source: contra-deploy/templates/compose.yml.j2
+#
+# This is a Compose *override* file. The real stack lives in the repo's
+# docker-compose.yml (or docker-compose.devnet.yml when -l devnet); this file
+# is layered on top via `-f <repo>/docker-compose.yml -f <host>/compose.yml`.
+#
+# Why an override instead of a full copy: the upstream compose is the source
+# of truth for service shapes, healthchecks, and volume layout. Re-templating
+# all 20+ services here would silently drift. Override only what differs per
+# deploy: image tag pin, host data dir, network mode if applicable.
+
+# Prepend image_registry so `compose pull` resolves to GHCR (or whatever registry).
+{% set img_prefix = image_registry ~ '/' %}
+
+services:
+{% for svc in ['write-node', 'read-node', 'gateway', 'streamer', 'auth', 'activity',
+               'indexer-solana', 'indexer-contra', 'operator-solana', 'operator-contra'] %}
+  {{ svc }}:
+    # Pin every Contra-app service to the deployed image tag.
+    image: {{ img_prefix }}contra-app:{{ image_tag }}
+{% endfor %}
+
+  # Stamp the deployed tag onto the validator image too (built from validator.Dockerfile).
+  validator:
+    image: {{ img_prefix }}contra-validator:{{ image_tag }}

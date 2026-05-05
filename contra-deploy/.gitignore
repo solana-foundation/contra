@@ -1,0 +1,19 @@
+# Ansible run logs (configured via ansible.cfg log_path).
+ansible.log
+*.log
+
+# Ansible scratch + retry files.
+*.retry
+.ansible/
+
+# Plain-text secrets file — must never be committed. See README "Future
+# improvements" for the SOPS upgrade path that lets this go in git encrypted.
+secrets.yml
+
+# Reserved for the SOPS upgrade. Keys must never live in the repo.
+age.key
+keys.txt
+
+# Editor / OS noise.
+.DS_Store
+*.swp

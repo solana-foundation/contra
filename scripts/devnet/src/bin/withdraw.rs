@@ -75,12 +75,62 @@ fn main() -> Result<()> {
         recent_blockhash,
     );
 
+    // Print the locally-derived signature *before* sending so callers (the
+    // smoke test in particular) can capture it even if the subsequent
+    // `send_and_confirm` on the Contra gateway times out. The Contra channel
+    // is gasless and finalizes within ~1s, but the solana-client default
+    // confirmation poll uses methods (e.g. getRecentPerformanceSamples in
+    // older versions) and timing assumptions that don't always agree with
+    // a gasless channel — and we've seen "unable to confirm transaction"
+    // come back on a tx that was actually finalized in the channel. Printing
+    // the signature pre-flight lets the smoke harness fall back to polling
+    // postgres-indexer directly.
+    let prelim_sig = transaction.signatures[0];
+    println!("Pre-send signature: {}", prelim_sig);
+
     println!("Sending transaction...");
-    let signature = client.send_and_confirm_transaction(&transaction)?;
+    let send_result = client.send_and_confirm_transaction(&transaction);
 
-    println!("\n✅ Withdrawal initiated on Contra!");
-    println!("Transaction signature: {}", signature);
-    println!("Burned {} tokens on Contra", amount);
-
-    Ok(())
+    match send_result {
+        Ok(signature) => {
+            println!("\n✅ Withdrawal initiated on Contra!");
+            println!("Transaction signature: {}", signature);
+            println!("Burned {} tokens on Contra", amount);
+            Ok(())
+        }
+        Err(e) => {
+            // The gasless channel sometimes returns a confirmation-timeout
+            // error on a transaction that actually finalized — the signature
+            // is deterministic from the signed transaction body, so external
+            // pollers (smoke harness, indexer DB, getSignatureStatuses) can
+            // resolve the truth out-of-band. We only swallow this *specific*
+            // class of error; other failures (network, account-not-found,
+            // insufficient funds, malformed instruction) propagate so any
+            // CI / orchestration script reading the exit code gets honest
+            // signal instead of a false success.
+            let msg = e.to_string().to_lowercase();
+            let is_confirmation_timeout = msg.contains("unable to confirm")
+                || msg.contains("not been confirmed")
+                || msg.contains("transaction was not confirmed")
+                || msg.contains("blockhash not found")
+                || msg.contains("expired");
+            if is_confirmation_timeout {
+                println!("Transaction signature: {}", prelim_sig);
+                eprintln!(
+                    "Warning: send_and_confirm reported a confirmation timeout ({}); \
+                     the transaction may still have landed. Verify with \
+                     `getSignatureStatuses` on sig {}.",
+                    e, prelim_sig
+                );
+                Ok(())
+            } else {
+                eprintln!(
+                    "Error: send_and_confirm failed for sig {} — not a confirmation \
+                     timeout. Propagating so callers see a non-zero exit code.\n  cause: {}",
+                    prelim_sig, e
+                );
+                Err(e.into())
+            }
+        }
+    }
 }

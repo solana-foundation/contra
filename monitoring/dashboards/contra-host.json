@@ -1,0 +1,71 @@
+{
+  "uid": "contra-host",
+  "title": "Host (node_exporter)",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["host", "node_exporter"],
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "CPU usage (1 - idle)",
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m]))" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Memory used",
+      "gridPos": { "h": 5, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Disk used (root)",
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/rootfs\"} / node_filesystem_size_bytes{mountpoint=\"/rootfs\"})" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "CPU per mode",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (mode)(rate(node_cpu_seconds_total[1m]))", "legendFormat": "{{mode}}" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Network bytes/s",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "rate(node_network_receive_bytes_total{device!~\"lo|docker.*\"}[1m])", "legendFormat": "rx {{device}}" },
+        { "refId": "B", "expr": "rate(node_network_transmit_bytes_total{device!~\"lo|docker.*\"}[1m])", "legendFormat": "tx {{device}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Load average",
+      "description": "node_load1/5/15. Rule of thumb: load > N(cores) sustained = CPU saturation. The three lines spreading apart = transient burst; staying together = steady saturation.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "node_load1",  "legendFormat": "1m" },
+        { "refId": "B", "expr": "node_load5",  "legendFormat": "5m" },
+        { "refId": "C", "expr": "node_load15", "legendFormat": "15m" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Disk I/O bytes/s",
+      "description": "rate(node_disk_{read,written}_bytes_total[1m]) per device. Sustained heavy writes on the postgres-backed device = WAL pressure; sustained reads on validator-data = ledger replay.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "rate(node_disk_read_bytes_total[1m])",    "legendFormat": "read {{device}}" },
+        { "refId": "B", "expr": "rate(node_disk_written_bytes_total[1m])", "legendFormat": "write {{device}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    }
+  ]
+}

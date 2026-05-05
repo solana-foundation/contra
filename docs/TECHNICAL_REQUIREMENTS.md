@@ -42,7 +42,7 @@ Only the three Postgres containers need disk; size them per
 *Streamer, Solana indexer, and Solana/Contra operators each take <0.1 core
 and ~30 MB RAM, and are not material to sizing.*
 
-*Measured 2026-05-05 on a 16-core / 62 GB host. 
+*Measured 2026-05-05 on a 16-core / 62 GB host.*
 
 ### Storage sizing
 
@@ -75,7 +75,7 @@ streams WAL to archive volumes, wire those volumes to S3 lifecycle policies.
 | Software | Minimum | Purpose |
 |---|---|---|
 | [Rust](https://rust-lang.org/tools/install/) | 1.91+ | Build (`rust-toolchain.toml` is authoritative) |
-| [Solana CLI](https://solana.com/docs/intro/installation) | 3.1.13 | Program deployment; `make install-toolchain` |
+| [Solana CLI](https://solana.com/docs/intro/installation) | 3.1.13 (see [`versions.env`](../versions.env)) | Program deployment; `make install-toolchain` |
 | [Docker](https://docs.docker.com/get-docker/) | 26.0+ | Container runtime |
 | [Docker Compose](https://docs.docker.com/compose/install/) | 2.20+ | Stack orchestration |
 | [PostgreSQL](https://www.postgresql.org/download/) | 16+ | Database (skip if using bundled containers) |

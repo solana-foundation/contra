@@ -333,8 +333,13 @@ fi
 # ---------------------------------------------------------------------------
 COMPOSE=(docker compose -f "${REPO_ROOT}/docker-compose.yml" --env-file "${REPO_ROOT}/versions.env" --env-file "${BENCH_ENV}")
 
-BUILT_IMAGES=(contra-write-node contra-read-node contra-gateway contra-streamer contra-activity contra-validator contra-indexer-solana contra-indexer-contra contra-operator-solana contra-operator-contra contra-prometheus)
-BUILT_SERVICES=(write-node read-node gateway streamer activity validator indexer-solana indexer-contra operator-solana operator-contra prometheus)
+# All Rust services (write-node, read-node, gateway, streamer, activity,
+# indexer-*, operator-*) share a single `contra-app` image via the
+# x-contra-app YAML anchor in docker-compose.yml. Validator, prometheus,
+# and grafana each build their own image (no `image:` field in compose →
+# tagged as `<project>-<service>:latest`).
+BUILT_IMAGES=(contra-app contra-validator contra-prometheus contra-grafana)
+BUILT_SERVICES=(write-node read-node gateway streamer activity validator indexer-solana indexer-contra operator-solana operator-contra prometheus grafana)
 
 images_exist() {
     # docker image inspect exits non-zero if any image in the list is missing.

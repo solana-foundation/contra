@@ -153,7 +153,7 @@ See [`PITR.md`](PITR.md) for the WAL archive setup.
 
 For questions about technical requirements or deployment assistance:
 
-- **GitHub Issues**: TBD/issues
+- **GitHub Issues**: https://github.com/solana-foundation/contra/issues
 - **Stack Exchange**: Ask on https://solana.stackexchange.com/ (use the `private_channel` tag)
 - **Documentation**: See [ARCHITECTURE.md](ARCHITECTURE.md) and [DEVNET_QUICKSTART.md](DEVNET_QUICKSTART.md)
 

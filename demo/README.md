@@ -37,8 +37,8 @@ cp .env.example .env
 ```
 
 2. Configure the environment variables in `.env`:
-- `VITE_WRITE_URL`: URL for write operations (default: https://write.TBD)
-- `VITE_READ_URL`: URL for read operations (default: https://read.TBD)
+- `VITE_WRITE_URL`: URL for write operations (default: https://write.example.com)
+- `VITE_READ_URL`: URL for read operations (default: https://read.example.com)
 - `VITE_ADMIN_KEYPAIR`: Admin keypair array for funding test wallets
 
 ## Development

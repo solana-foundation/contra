@@ -19,7 +19,7 @@ See [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) for detailed system r
 
 ```bash
 # Clone the repository
-git clone TBD.git
+git clone https://github.com/solana-foundation/contra.git
 cd private_channel
 
 # Install dependencies for all projects
@@ -196,7 +196,7 @@ async fn my_test_function() {
 
 For questions about contributing to Solana Private Channels:
 
-- **GitHub Issues**: TBD/issues
+- **GitHub Issues**: https://github.com/solana-foundation/contra/issues
 - **Stack Exchange**: Ask on https://solana.stackexchange.com/ (use the `private_channel` tag)
 
 ## License

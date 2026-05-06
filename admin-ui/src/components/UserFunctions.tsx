@@ -20,7 +20,7 @@ import {
   assertIsTransactionMessageWithSingleSendingSigner,
 } from '@solana/kit';
 
-const rawUrl = import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL || 'https://api.TBD';
+const rawUrl = import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL || 'https://api.example.com';
 const PRIVATE_CHANNEL_RPC_URL = rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : `https://${rawUrl}`;
 
 interface UserFunctionsProps {

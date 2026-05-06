@@ -212,7 +212,7 @@ The admin UI is a static React/Vite app. It connects to Solana RPC directly (via
 
 `PRIVATE_CHANNEL_WS_URL` is baked into the JS bundle at Docker build time via a `Dockerfile ARG`. Railway passes service variables as build args automatically. The browser connects directly to the streamer over WebSocket, so this URL cannot be proxied through `server.mjs` like the RPC URLs are.
 
-If you change the streamer URL later, redeploy the admin-ui so the new URL is embedded in the bundle. If `PRIVATE_CHANNEL_WS_URL` is not set, the fallback is `wss://streamer.TBD/ws`.
+If you change the streamer URL later, redeploy the admin-ui so the new URL is embedded in the bundle. If `PRIVATE_CHANNEL_WS_URL` is not set, the fallback is `wss://streamer.example.com/ws`.
 
 The admin-ui also needs a public domain (**Settings > Networking > Generate Domain**).
 

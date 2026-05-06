@@ -18,7 +18,7 @@ export default defineConfig(({ mode }) => {
       global: 'globalThis',
       'process.env': {},
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
-      'import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL': JSON.stringify(env.PRIVATE_CHANNEL_RPC_URL || 'https://api.TBD'),
+      'import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL': JSON.stringify(env.PRIVATE_CHANNEL_RPC_URL || 'https://api.example.com'),
     },
   }
 })

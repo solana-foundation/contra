@@ -196,7 +196,7 @@ Get Solana Private Channels running locally in under 5 minutes:
 
 ```bash
 # Clone repository
-git clone TBD.git
+git clone https://github.com/solana-foundation/contra.git
 cd private_channel
 
 # Install dependencies

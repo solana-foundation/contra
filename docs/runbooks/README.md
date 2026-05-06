@@ -97,8 +97,17 @@ pins the relevant contract.
 | `drill_9_path_b_signature_uniqueness_fence` | withdrawal | Mark-completed-with-sig is idempotent; unique index rejects cross-row collision. |
 | `drill_10_deposit_failed_recovery_flows` | deposit | `LANDED` → completed-with-sig; `NOT_LANDED` → re-arm; bad data → failed. |
 | `drill_11_program_type_labels_match_runbooks` | both | Pins `ProgramType::as_label` to `withdraw` / `escrow`. |
+| `drill_12_withdrawal_failed_recovery_flows` | withdrawal | `withdrawal_failed.md` LANDED → completed-with-sig; cross-row signature fence still applies on `failed`; NOT_LANDED is terminal (markdown + operator code grep); AMBIGUOUS escalates without SQL. |
+| `drill_13_withdrawal_failed_reminted_reconcile` | withdrawal | `failed_reminted` transition writes `remint_signatures`; runbook contains zero mutating SQL; LANDED verdict cannot be silently absorbed via `SET status='completed'`; webhook `remint_signature` (singular) ↔ DB `remint_signatures` (plural) asymmetry pinned. |
 
-Trigger:
+Trigger (`make` shorthand, runs from repo root):
+
+```bash
+make drills                  # all drills
+make drill NAME=drill_2      # single drill (substring match)
+```
+
+Or directly via cargo:
 
 ```bash
 cargo test -p contra-indexer --test runbook_drills -- --ignored --nocapture
@@ -111,5 +120,9 @@ RUST_LOG=trace cargo test -p contra-indexer --test runbook_drills -- \
 ### When to run drills
 
 - Before merging a runbook edit.
-- After changes to: `processor.rs`, `sender/transaction.rs`,
-  `sender/remint.rs`, `db_transaction_writer.rs`, or the indexer schema.
+- After changes to: `processor.rs`, `sender/transaction.rs` (and in
+  particular `send_fatal_error`, the source of the rare withdrawal
+  `failed` transition that drill_12 protects), `sender/remint.rs`,
+  `db_transaction_writer.rs` (including its webhook-payload serializer
+  — drill_13 anchors on the `"remint_signature"` JSON key string
+  literal), or the indexer schema.

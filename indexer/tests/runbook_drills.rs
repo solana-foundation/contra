@@ -125,6 +125,49 @@ async fn seed_deposit(pool: &PgPool, status: &str) -> Result<i64, sqlx::Error> {
     Ok(row)
 }
 
+/// Seed a `failed_reminted` withdrawal row with the supplied remint
+/// signatures bound to the `remint_signatures TEXT[]` column. The runbook
+/// `withdrawal_failed_reminted.md` Step 1 hard-requires this column to be
+/// non-empty for the reconciliation flow to mean anything; the upstream
+/// production path enforces that via `set_pending_remint(…)` running
+/// before the `FailedReminted` status transition (see
+/// `sender/remint.rs::attempt_remint`). Drills bypass that path and seed
+/// directly, so they need a helper that mirrors the post-transition
+/// shape.
+async fn seed_failed_reminted(
+    pool: &PgPool,
+    nonce: i64,
+    remint_sigs: &[&str],
+) -> Result<i64, sqlx::Error> {
+    let sigs: Vec<String> = remint_sigs.iter().map(|s| s.to_string()).collect();
+    let row = sqlx::query(
+        r#"
+        INSERT INTO transactions
+            (signature, slot, initiator, recipient, mint, amount,
+             transaction_type, status, withdrawal_nonce,
+             remint_signatures, trace_id, processed_at, created_at, updated_at)
+        VALUES
+            ($1, 100, $2, $3, $4, 1000,
+             'withdrawal'::transaction_type,
+             'failed_reminted'::transaction_status, $5,
+             $6, $7, $8, NOW(), NOW())
+        RETURNING id
+        "#,
+    )
+    .bind(Signature::new_unique().to_string())
+    .bind(Pubkey::new_unique().to_string())
+    .bind(Pubkey::new_unique().to_string())
+    .bind(Pubkey::new_unique().to_string())
+    .bind(nonce)
+    .bind(&sigs)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(Utc::now())
+    .fetch_one(pool)
+    .await?
+    .get::<i64, _>(0);
+    Ok(row)
+}
+
 /// Convenience: read the status of a row.
 async fn status_of(pool: &PgPool, id: i64) -> Result<String, sqlx::Error> {
     let s: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
@@ -921,4 +964,367 @@ fn drill_11_program_type_labels_match_runbooks() {
     );
 
     eprintln!("program_type label contract verified.");
+}
+
+// ── Drill 12: withdrawal_failed.md recovery flows ───────────────────────────
+//
+// `withdrawal_failed.md` covers the rare case of a withdrawal row reaching
+// the terminal `failed` status (per `_glossary.md:14-22`, this normally
+// only happens for deposits, withdrawals go through `pending_remint`).
+// The runbook routes by the on-chain release verdict from
+// `_verify_onchain_release.md`. This drill walks each branch:
+//
+//   - LANDED  → mark Completed with the observed signature (code-defect
+//                path: the row should never have been `failed`).
+//   - NOT_LANDED → `failed` is terminal; the runbook says "Do not re-arm".
+//   - AMBIGUOUS  → no SQL; escalate Tier 2.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_12_withdrawal_failed_recovery_flows() -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "withdrawal_failed.md",
+        "Step 2 — branch on verdict (LANDED / NOT_LANDED / AMBIGUOUS)",
+    );
+
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    // ── (1) LANDED branch — mark Completed with observed sig ──────────────
+    // The runbook's recovery query at `withdrawal_failed.md:30-35`. Verifies
+    // the SQL still parses against the schema and produces the documented
+    // end-state on a `failed` starting state.
+    let nonce_a: i64 = 200;
+    let id_a = seed_withdrawal(
+        &pool,
+        "failed",
+        nonce_a,
+        Some("misrouted to send_fatal_error"),
+    )
+    .await?;
+    let observed_sig = Signature::new_unique().to_string();
+    eprintln!("(1) LANDED branch: simulated verdict {observed_sig}");
+
+    let updated = sqlx::query(
+        "UPDATE transactions SET status='completed', counterpart_signature=$2, updated_at=NOW()
+          WHERE id=$1",
+    )
+    .bind(id_a)
+    .bind(&observed_sig)
+    .execute(&pool)
+    .await?;
+    assert_eq!(updated.rows_affected(), 1);
+
+    let row = sqlx::query(
+        "SELECT status::text AS s, counterpart_signature, withdrawal_nonce
+           FROM transactions WHERE id=$1",
+    )
+    .bind(id_a)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(row.get::<String, _>("s"), "completed");
+    assert_eq!(
+        row.get::<Option<String>, _>("counterpart_signature")
+            .as_deref(),
+        Some(observed_sig.as_str())
+    );
+    assert_eq!(
+        row.get::<Option<i64>, _>("withdrawal_nonce"),
+        Some(nonce_a),
+        "nonce must be preserved — SMT leaf identity per _glossary.md:62-68"
+    );
+
+    // ── (2) Cross-row signature uniqueness fence ──────────────────────────
+    // Mirrors drill_9 sub-(b), starting state `failed` instead of
+    // `manual_review`. Pins that the same double-credit fence active on
+    // manual_review recovery also fires for `failed` recovery — a future
+    // schema change that scoped the unique partial index to specific
+    // statuses would fail this assertion.
+    let id_b = seed_withdrawal(&pool, "failed", 201, Some("second incident")).await?;
+    let bad = sqlx::query(
+        "UPDATE transactions SET status='completed', counterpart_signature=$2, updated_at=NOW()
+          WHERE id=$1",
+    )
+    .bind(id_b)
+    .bind(&observed_sig) // collision with row A
+    .execute(&pool)
+    .await;
+    assert!(
+        bad.is_err(),
+        "cross-row counterpart_signature collision must be rejected by unique index"
+    );
+    assert_eq!(
+        status_of(&pool, id_b).await?,
+        "failed",
+        "row B must remain `failed` after rejected UPDATE"
+    );
+    eprintln!("(2) cross-row sig fence active on `failed` recovery: ok");
+
+    // ── (3) NOT_LANDED branch — `failed` is terminal ──────────────────────
+    // The runbook says: "Do not re-arm a `failed` row - the status is
+    // terminal by contract." Pin via two complementary checks.
+    //
+    // (3a) Markdown scan: `withdrawal_failed.md` does not contain a
+    //      `failed → pending` UPDATE. Direct test of the runbook itself.
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let runbook = workspace_root.join("docs/runbooks/withdrawal_failed.md");
+    let runbook_text = std::fs::read_to_string(&runbook).expect("read withdrawal_failed.md");
+    assert!(
+        !runbook_text.contains("status = 'pending'") && !runbook_text.contains("status='pending'"),
+        "withdrawal_failed.md must not contain a `failed → pending` UPDATE — \
+         the runbook's terminal-status contract would be silently violated"
+    );
+
+    // (3b) Code grep: no operator code path re-arms a `failed` row to
+    //      `pending` via *literal* SQL. Note: the operator uses sqlx
+    //      parameterised queries, so this tripwire only catches literal-
+    //      SQL violations (rare in this codebase). The primary defense is
+    //      sub-3a (markdown scan); 3b is defense-in-depth for the case
+    //      where someone bypasses the storage abstraction with raw SQL.
+    let operator_dir = workspace_root.join("indexer/src/operator");
+    let mut violations: Vec<String> = Vec::new();
+    for entry in walkdir(&operator_dir) {
+        if entry.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = match std::fs::read_to_string(&entry) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Look for any UPDATE that mentions both status='failed' as a
+        // selector and status='pending' as a setter in close proximity.
+        // The substring search is conservative — it matches the SQL
+        // shape the operator code would have to use to violate the
+        // contract.
+        let mentions_failed = src.contains("status='failed'") || src.contains("status = 'failed'");
+        let flips_to_pending =
+            src.contains("SET status='pending'") || src.contains("SET status = 'pending'");
+        if mentions_failed && flips_to_pending {
+            violations.push(entry.display().to_string());
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "operator code must not re-arm `failed` rows to `pending`; found in: {violations:?}"
+    );
+    eprintln!("(3) NOT_LANDED branch terminal contract verified (markdown + code grep)");
+
+    // ── (4) AMBIGUOUS branch — no SQL, escalate Tier 2 ────────────────────
+    // Pin via markdown scan: the AMBIGUOUS paragraph contains no SQL and
+    // contains the word "Escalate".
+    let ambiguous_idx = runbook_text
+        .find("`AMBIGUOUS`")
+        .expect("withdrawal_failed.md must mention AMBIGUOUS verdict");
+    let ambiguous_para =
+        &runbook_text[ambiguous_idx..ambiguous_idx + 200.min(runbook_text.len() - ambiguous_idx)];
+    assert!(
+        ambiguous_para.contains("Escalate") || ambiguous_para.contains("escalate"),
+        "AMBIGUOUS branch must escalate; got:\n{ambiguous_para}"
+    );
+    assert!(
+        !ambiguous_para.contains("UPDATE"),
+        "AMBIGUOUS branch must contain no SQL; got:\n{ambiguous_para}"
+    );
+    eprintln!("(4) AMBIGUOUS branch: escalate, no SQL — verified");
+
+    eprintln!("withdrawal_failed.md recovery flows verified end-to-end.");
+    Ok(())
+}
+
+// ── Drill 13: withdrawal_failed_reminted.md reconciliation contract ─────────
+//
+// `withdrawal_failed_reminted.md` is a SUCCESS-OUTCOME runbook — the
+// original withdrawal failed on Solana, then the channel-side remint
+// succeeded, and no funds are stranded. The reconciliation is read-only:
+// confirm the remint signature on-chain, confirm the original release did
+// NOT land, close the alert. The runbook contains zero recovery SQL.
+//
+// This drill pins:
+//   (1) the upstream production path that writes `remint_signatures`
+//       before the FailedReminted transition,
+//   (2) the Step 1 query shape,
+//   (3) the read-only contract — no mutating SQL in the runbook,
+//   (4) the double-credit fence — if release LANDED, escalate, do not
+//       silently mark Completed,
+//   (5) the webhook ↔ DB naming asymmetry: webhook payload uses
+//       `remint_signature` (singular), DB column is `remint_signatures`
+//       (plural array). Per `_glossary.md:35`.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_13_withdrawal_failed_reminted_reconcile() -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "withdrawal_failed_reminted.md",
+        "Reconciliation contract (read-only) + double-credit fence",
+    );
+
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+
+    // ── (1) Production code path: FailedReminted preceded by remint_signatures ─
+    // The runbook's Step 1 hard-requires non-empty `remint_signatures`. The
+    // schema does NOT enforce this (no CHECK constraint); the upstream
+    // operator code does, and it does so across two files (deliberately
+    // decoupled — signatures are stashed during the original send so a
+    // restart between send and confirmation can recover). Pin both legs:
+    //
+    //   (1a) sender/transaction.rs calls `set_pending_remint(tx_id, sigs, …)`
+    //        — this is the persistence call site; runs BEFORE any
+    //        FailedReminted transition.
+    //   (1b) sender/remint.rs is the only file that writes the
+    //        FailedReminted status — confirms the transition has a single
+    //        source we can reason about.
+    //   (1c) the storage layer's set_pending_remint binds the
+    //        `remint_signatures` column — runbook Step 1's column lookup
+    //        will find what was written.
+    let tx_src = workspace_root.join("indexer/src/operator/sender/transaction.rs");
+    let tx_text = std::fs::read_to_string(&tx_src).expect("read sender/transaction.rs");
+    assert!(
+        tx_text.contains(".set_pending_remint(") || tx_text.contains("set_pending_remint("),
+        "(1a) sender/transaction.rs must call set_pending_remint(…) to stash \
+         remint signatures before any FailedReminted transition"
+    );
+
+    let remint_src = workspace_root.join("indexer/src/operator/sender/remint.rs");
+    let remint_text = std::fs::read_to_string(&remint_src).expect("read sender/remint.rs");
+    assert!(
+        remint_text.contains("TransactionStatus::FailedReminted"),
+        "(1b) sender/remint.rs must contain the FailedReminted status transition"
+    );
+
+    let storage_src = workspace_root.join("indexer/src/storage/postgres/db.rs");
+    let storage_text = std::fs::read_to_string(&storage_src).expect("read db.rs");
+    let spr_idx = storage_text
+        .find("fn set_pending_remint")
+        .expect("(1c) db.rs must define set_pending_remint");
+    let spr_window = &storage_text[spr_idx..(spr_idx + 1500).min(storage_text.len())];
+    assert!(
+        spr_window.contains("remint_signatures"),
+        "(1c) db.rs::set_pending_remint must bind the `remint_signatures` column"
+    );
+    eprintln!("(1) FailedReminted ↔ remint_signatures persistence pinned across both files: ok");
+
+    // ── (2) Step 1 query shape works on a well-formed seeded row ──────────
+    // Seeds with two signatures (mirrors retry-attempt array shape). Runs
+    // the implicit query backing Step 1: read the column, expect an array
+    // of length ≥ 1.
+    let sig1 = Signature::new_unique().to_string();
+    let sig2 = Signature::new_unique().to_string();
+    let id = seed_failed_reminted(&pool, 300, &[&sig1, &sig2]).await?;
+
+    let stored_sigs: Vec<String> =
+        sqlx::query_scalar("SELECT remint_signatures FROM transactions WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        !stored_sigs.is_empty(),
+        "seeded failed_reminted row must have non-empty remint_signatures"
+    );
+    assert_eq!(stored_sigs.len(), 2);
+    eprintln!(
+        "(2) Step 1 query returned {} remint signatures: {:?}",
+        stored_sigs.len(),
+        stored_sigs
+    );
+
+    // ── (3) Read-only contract — no mutating SQL in the runbook ───────────
+    // The whole runbook is "verify and close". A future edit that sneaks in
+    // an UPDATE/INSERT/DELETE on the row's status would silently shift the
+    // contract. Markdown scan: zero mutating SQL keywords.
+    let runbook = workspace_root.join("docs/runbooks/withdrawal_failed_reminted.md");
+    let runbook_text =
+        std::fs::read_to_string(&runbook).expect("read withdrawal_failed_reminted.md");
+    for keyword in &["UPDATE transactions", "INSERT INTO", "DELETE FROM"] {
+        assert!(
+            !runbook_text.contains(keyword),
+            "withdrawal_failed_reminted.md must not contain `{keyword}` — \
+             the runbook is read-only by design (success-outcome reconciliation)"
+        );
+    }
+    eprintln!("(3) read-only contract verified — no mutating SQL in runbook");
+
+    // ── (4) Double-credit fence on LANDED verdict ─────────────────────────
+    // If `_verify_onchain_release.md` returns LANDED, the user has been
+    // double-credited. Runbook prescribes Tier 1 escalation, NOT a status
+    // flip. Pin via two checks:
+    //
+    // (4a) No `SET status='completed'` in the file. Already implied by (3),
+    //      but called out separately because the contract semantics differ.
+    assert!(
+        !runbook_text.contains("status = 'completed'")
+            && !runbook_text.contains("status='completed'"),
+        "withdrawal_failed_reminted.md must not contain a `SET status='completed'` — \
+         that would silently absorb a double-credit on LANDED verdict"
+    );
+
+    // (4b) The LANDED paragraph (lines 26-28 of the runbook at time of
+    //      writing) escalates to Tier 1.
+    let landed_idx = runbook_text
+        .find("If `LANDED`")
+        .expect("runbook must discuss LANDED branch");
+    let landed_para_end = (landed_idx + 400).min(runbook_text.len());
+    let landed_para = &runbook_text[landed_idx..landed_para_end];
+    assert!(
+        landed_para.contains("escalate") || landed_para.contains("Escalate"),
+        "LANDED branch must escalate; got:\n{landed_para}"
+    );
+    assert!(
+        landed_para.contains("Tier 1"),
+        "LANDED branch must escalate Tier 1 (double-credit is funds-at-risk); got:\n{landed_para}"
+    );
+    eprintln!("(4) double-credit fence pinned: no completed-flip; LANDED → Tier 1");
+
+    // ── (5) Webhook ↔ DB naming asymmetry ─────────────────────────────────
+    // Glossary at `_glossary.md:35` declares the webhook payload uses
+    // `remint_signature` (singular). The DB column is `remint_signatures`
+    // (plural array). Both must be present; if either is renamed without
+    // the other, the runbook reader's mental model breaks.
+    let writer_src = workspace_root.join("indexer/src/operator/db_transaction_writer.rs");
+    let writer_text = std::fs::read_to_string(&writer_src).expect("read db_transaction_writer.rs");
+    assert!(
+        writer_text.contains("\"remint_signature\""),
+        "webhook serializer in db_transaction_writer.rs must emit JSON key \
+         `remint_signature` (singular) — matches _glossary.md:35"
+    );
+
+    let db_src = workspace_root.join("indexer/src/storage/postgres/db.rs");
+    let db_text = std::fs::read_to_string(&db_src).expect("read db.rs");
+    assert!(
+        db_text.contains("remint_signatures TEXT[]"),
+        "DB column must be `remint_signatures TEXT[]` (plural array) — \
+         matches the migration at db.rs ALTER TABLE"
+    );
+    eprintln!("(5) webhook/DB asymmetry pinned: `remint_signature` ↔ `remint_signatures TEXT[]`");
+
+    eprintln!("withdrawal_failed_reminted.md reconciliation contract verified.");
+    Ok(())
+}
+
+// Minimal recursive-walk helper used by drill_12's code grep. Avoids
+// pulling in `walkdir` as a new dev-dep just for two drills.
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
 }

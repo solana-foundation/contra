@@ -40,7 +40,6 @@ SELECT id,
        status,
        counterpart_signature,
        remint_signatures,
-       error_message,
        updated_at
   FROM transactions
  WHERE id = :transaction_id;

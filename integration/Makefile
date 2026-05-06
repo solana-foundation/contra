@@ -1,5 +1,5 @@
 .PHONY: install integration-test fmt check-coverage-floor
-.PHONY: integration-coverage integration-coverage-contra integration-coverage-contra-redis integration-coverage-indexer integration-coverage-report
+.PHONY: integration-coverage integration-coverage-private_channel integration-coverage-private-channel-redis integration-coverage-indexer integration-coverage-report
 
 COVERAGE_DIR ?= ../coverage
 
@@ -13,18 +13,18 @@ install:
 # fingerprint-poisoning issue (see `integration-coverage-indexer` for the
 # detailed write-up). Order:
 #
-#   1. contra group        (prod escrow)
+#   1. private_channel group        (prod escrow)
 #   2. test-tree group     (rebuild escrow with `--features test-tree`)
 #   3. prod-indexer group  (rebuild escrow back to prod)
 #
 # Keep this list in sync with the corresponding `integration-coverage-*`
 # targets — same set of `[[test]]` entries, same group assignment.
-integration-test: export CONTRA_TEST_WAIT_TIMEOUT_SECS=600
+integration-test: export PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600
 integration-test:
-	@echo "=== Building escrow with prod settings for contra group ==="
-	@$(MAKE) -C ../contra-escrow-program build
-	@echo "=== contra group (prod escrow) ==="
-	@cargo nextest run --test contra_integration
+	@echo "=== Building escrow with prod settings for private_channel group ==="
+	@$(MAKE) -C ../private-channel-escrow-program build
+	@echo "=== private_channel group (prod escrow) ==="
+	@cargo nextest run --test private_channel_integration
 	@cargo test --test test_rpc_http_malformed -- --nocapture
 	@cargo test --test test_simulate_transaction_guards -- --nocapture
 	@cargo test --test test_health_endpoint_standalone -- --nocapture
@@ -33,13 +33,13 @@ integration-test:
 	@cargo test --test test_node_config_validation -- --nocapture
 	@cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== Building escrow with test-tree for test-tree-feature group ==="
-	@$(MAKE) -C ../contra-escrow-program build-test
+	@$(MAKE) -C ../private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cargo test --features test-tree --test indexer_integration -- --nocapture
 	@cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
-	@$(MAKE) -C ../contra-escrow-program build-no-clients
+	@$(MAKE) -C ../private-channel-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cargo test --test reconciliation_integration -- --nocapture
 	@cargo test --test mint_idempotency_integration -- --nocapture
@@ -166,10 +166,10 @@ COV_IGNORE_PATTERNS := \
 # e.g. "a b c" → "(a|b|c)"
 COV_IGNORE_REGEX := ($(shell echo '$(COV_IGNORE_PATTERNS)' | tr -s ' \t\n' '|' | sed 's/^|//;s/|$$//'))
 
-integration-coverage-contra:
-	@echo "Running contra integration tests with coverage instrumentation..."
+integration-coverage-private_channel:
+	@echo "Running private_channel integration tests with coverage instrumentation..."
 	@cargo llvm-cov clean --workspace
-	@cargo llvm-cov nextest --no-report --workspace --test contra_integration
+	@cargo llvm-cov nextest --no-report --workspace --test private_channel_integration
 	@echo "Running HTTP malformed-body tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test test_rpc_http_malformed -- --nocapture
 	@echo "Running simulate-transaction guards tests with coverage instrumentation..."
@@ -187,11 +187,11 @@ integration-coverage-contra:
 # Runs a Postgres+Redis node and a Redis-only node to exercise settle.rs's
 # `REDIS_URL`/best-effort-write branches and the
 # `get_signatures_for_address_redis` dispatch arm. Runs independently of the
-# main contra_integration suite — its profraw aggregates into the same
+# main private_channel_integration suite — its profraw aggregates into the same
 # `cargo llvm-cov report` output, so coverage accumulates naturally.
 # CI should invoke this target in parallel with (or immediately after)
-# `integration-coverage-contra`.
-integration-coverage-contra-redis:
+# `integration-coverage-private_channel`.
+integration-coverage-private-channel-redis:
 	@echo "Running Redis-cache-path tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test test_redis_cache_path -- --nocapture --test-threads=1
 
@@ -212,10 +212,10 @@ integration-coverage-contra-redis:
 # feature — cascading every subsequent test in the binary to fail with
 # "Once instance has previously been poisoned". Grouping by feature and
 # rebuilding between groups prevents this.
-integration-coverage-indexer: export CONTRA_TEST_WAIT_TIMEOUT_SECS=600
+integration-coverage-indexer: export PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600
 integration-coverage-indexer:
 	@echo "=== test-tree feature group ==="
-	@echo "CONTRA_TEST_WAIT_TIMEOUT_SECS=$$CONTRA_TEST_WAIT_TIMEOUT_SECS (coverage headroom)"
+	@echo "PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=$$PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS (coverage headroom)"
 	@echo "Running indexer integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --features test-tree --test indexer_integration -- --nocapture
 	@echo "Running operator lifecycle integration tests with coverage instrumentation..."
@@ -226,7 +226,7 @@ integration-coverage-indexer:
 	@# Use `build-no-clients` to skip pnpm-driven IDL / client regeneration —
 	@# clients are already present from the initial `make build` (or, in CI,
 	@# from the restored `ci-build-artifacts` tarball).
-	@$(MAKE) -C ../contra-escrow-program build-no-clients
+	@$(MAKE) -C ../private-channel-escrow-program build-no-clients
 	@echo "=== prod feature group ==="
 	@echo "Running reconciliation integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture
@@ -297,7 +297,7 @@ integration-coverage-report:
 	@echo "Generating combined integration E2E coverage report..."
 	@mkdir -p $(COVERAGE_DIR)
 	@cargo llvm-cov report --lcov \
-		-p contra-core -p contra-indexer \
+		-p private-channel-core -p private-channel-indexer \
 		--ignore-filename-regex '$(COV_IGNORE_REGEX)' \
 		--output-path $(COVERAGE_DIR)/coverage-integration-e2e.lcov
 	@echo "Coverage report: $(COVERAGE_DIR)/coverage-integration-e2e.lcov"
@@ -322,14 +322,14 @@ check-coverage-floor:
 	|| { echo 'ERROR: coverage regressed below the floor. Either raise coverage or justify lowering COVERAGE_FLOOR.' ; exit 1 ; }
 
 # Local convenience target: builds the required .so artifacts before running coverage.
-# CI calls integration-coverage-contra and integration-coverage-indexer directly,
+# CI calls integration-coverage-private_channel and integration-coverage-indexer directly,
 # with .so files pre-built in a separate job (do NOT add build steps to those targets).
 integration-coverage:
-	@echo "Building escrow with production settings for contra integration tests..."
-	@$(MAKE) -C ../contra-escrow-program build
-	@$(MAKE) integration-coverage-contra
-	@$(MAKE) integration-coverage-contra-redis
+	@echo "Building escrow with production settings for private_channel integration tests..."
+	@$(MAKE) -C ../private-channel-escrow-program build
+	@$(MAKE) integration-coverage-private_channel
+	@$(MAKE) integration-coverage-private-channel-redis
 	@echo "Building escrow with test-tree for indexer/operator-lifecycle tests..."
-	@$(MAKE) -C ../contra-escrow-program build-test
+	@$(MAKE) -C ../private-channel-escrow-program build-test
 	@$(MAKE) integration-coverage-indexer
 	@$(MAKE) integration-coverage-report

@@ -1,17 +1,17 @@
 <div align="center">
   <br />
-  <img src="./contra.svg" alt="Contra" width="140" />
+  <img src="./solana-private-channels.svg" alt="Solana Private Channels" width="140" />
   <br />
   <br />
 
-  <h3>Contra: Enterprise Infrastructure for Internet Capital Markets</h3>
+  <h3>Solana Private Channels: Enterprise Infrastructure for Internet Capital Markets</h3>
 
   <br />
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 </div>
 
-Contra is a payment channel with direct access to Solana Mainnet liquidity. Contra provides a complete infrastructure solution to execute thousands of transactions instantly with privacy, control and permissioning, while assets are readily accessible to and from Solana Mainnet.
+Solana Private Channels is a payment channel with direct access to Solana Mainnet liquidity. Solana Private Channels provides a complete infrastructure solution to execute thousands of transactions instantly with privacy, control and permissioning, while assets are readily accessible to and from Solana Mainnet.
 
 > ## ⚠️ SECURITY NOTICE
 >
@@ -25,27 +25,27 @@ Contra is a payment channel with direct access to Solana Mainnet liquidity. Cont
 
 - **[All Documentation](docs/README.md)** — Architecture, program references, guides, and operational requirements
 
-## How Contra Works
+## How Solana Private Channels Works
 
-Contra operates as a payment channel with direct access to Solana Mainnet liquidity:
+Solana Private Channels operates as a payment channel with direct access to Solana Mainnet liquidity:
 
-- **Contra Channel**: Your private transaction batching system with direct Solana Mainnet access. Execute transactions with instant finality and full control over who participates and what rules apply.
-- **Contra Escrow Program**: Makes assets readily accessible to the payment channel. Users deposit SPL tokens. The program locks funds in escrow for use within the channel.
-- **Contra Withdrawal Program**: Withdrawals are initiated by sending tokens to the withdraw program inside the payment channel. The withdraw program burns the tokens and SPL tokens are released from the escrow program.
-- **Contra Indexer/Operator**: Monitors deposits and withdrawals, orchestrates state synchronization, and maintains an auditable record of all activity.
-- **Contra Auth**: Optional authentication service. Issues signed JWTs for registered users and verified Solana wallets. When enabled, the gateway enforces RBAC — restricting account queries to wallets the caller owns and reserving operator-only methods (block/transaction fetching, transaction simulation) for elevated accounts.
+- **Solana Private Channels Channel**: Your private transaction batching system with direct Solana Mainnet access. Execute transactions with instant finality and full control over who participates and what rules apply.
+- **Solana Private Channels Escrow Program**: Makes assets readily accessible to the payment channel. Users deposit SPL tokens. The program locks funds in escrow for use within the channel.
+- **Solana Private Channels Withdrawal Program**: Withdrawals are initiated by sending tokens to the withdraw program inside the payment channel. The withdraw program burns the tokens and SPL tokens are released from the escrow program.
+- **Solana Private Channels Indexer/Operator**: Monitors deposits and withdrawals, orchestrates state synchronization, and maintains an auditable record of all activity.
+- **Solana Private Channels Auth**: Optional authentication service. Issues signed JWTs for registered users and verified Solana wallets. When enabled, the gateway enforces RBAC — restricting account queries to wallets the caller owns and reserving operator-only methods (block/transaction fetching, transaction simulation) for elevated accounts.
 
 ### Case Study - Payments
 
 #### 1. Tokenized Deposit Issuance Flow
 
-This flow shows how a bank creates a token mint and issues tokenized deposits on Solana mainnet, initializes a Contra payment channel for transactions between bank customers [Alice and Bob].
+This flow shows how a bank creates a token mint and issues tokenized deposits on Solana mainnet, initializes a Solana Private Channels payment channel for transactions between bank customers [Alice and Bob].
 
 ```mermaid
 sequenceDiagram
     participant Bank
     participant Mainnet as Solana Mainnet
-    participant Channel as Contra Payment Channel
+    participant Channel as Solana Private Channels Payment Channel
     
     %% Setup Phase
     Note over Bank,Mainnet: SETUP
@@ -55,7 +55,7 @@ sequenceDiagram
     Bank->>Mainnet: Initialize Escrow for Payment Channel
     Mainnet-->>Bank: Escrow Instance Active
     
-    Bank->>Channel: Initialize Contra Payment Channel
+    Bank->>Channel: Initialize Solana Private Channels Payment Channel
     Channel-->>Bank: Channel Ready
     
     Bank->>Mainnet: Link Payment Channel to Escrow
@@ -89,7 +89,7 @@ This flow demonstrates a simple $1,000 transfer between bank customers Alice and
 sequenceDiagram
     participant Alice
     participant Bob
-    participant Channel as Contra Payment Channel
+    participant Channel as Solana Private Channels Payment Channel
     participant Bank
     
     %% Initial State
@@ -127,7 +127,7 @@ The flow shows two withdrawal methods that allow Bob to withdraw while preservin
 ```mermaid
 sequenceDiagram
     participant Bob
-    participant Channel as Contra Payment Channel
+    participant Channel as Solana Private Channels Payment Channel
     participant Bank
     participant Mainnet as Solana Mainnet
     participant BobWallet as Bob's Wallet
@@ -176,10 +176,10 @@ Within the payment channel, transactions are processed through a **five-stage pi
    - **GaslessCallback**: Synthesizes fee payer accounts on-demand (zero operational overhead)
 5. **Settler**: Batches results every 100ms and commits to PostgreSQL/Redis with atomic writes
 
-### Contra Escrow/Withdrawal Programs
+### Solana Private Channels Escrow/Withdrawal Programs
 
-- **Contra Escrow Program**: Mainnet token custody with SMT security (Program ID: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83`)
-- **Contra Withdrawal Program**: Channel withdrawal processing (token burning) (Program ID: `J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi`)
+- **Solana Private Channels Escrow Program**: Mainnet token custody with SMT security (Program ID: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83`)
+- **Solana Private Channels Withdrawal Program**: Channel withdrawal processing (token burning) (Program ID: `J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi`)
 
 ### Indexer
 
@@ -192,12 +192,12 @@ Both strategies parse Escrow/Withdraw Program instructions and write to PostgreS
 
 ## Quick Start
 
-Get Contra running locally in under 5 minutes:
+Get Solana Private Channels running locally in under 5 minutes:
 
 ```bash
 # Clone repository
-git clone https://github.com/solana-foundation/contra.git
-cd contra
+git clone TBD.git
+cd private_channel
 
 # Install dependencies
 make install
@@ -222,12 +222,12 @@ make all-test
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| **Contra Core** | [core/](core/) | Payment channel transaction pipeline |
-| **Contra DB** | [core/src/accounts/](core/src/accounts/) | Accounts database with multi-backend support |
+| **Solana Private Channels Core** | [core/](core/) | Payment channel transaction pipeline |
+| **Solana Private Channels DB** | [core/src/accounts/](core/src/accounts/) | Accounts database with multi-backend support |
 | **Gateway** | [gateway/](gateway/) | Read/write node routing service with optional RBAC enforcement |
 | **Auth** | [auth/](auth/) | Authentication service — user registration, login, wallet verification, JWT issuance |
-| **Escrow Program** | [contra-escrow-program/](contra-escrow-program/) | Mainnet token deposit via escrow |
-| **Withdrawal Program** | [contra-withdraw-program/](contra-withdraw-program/) | Channel token withdrawal via burning |
+| **Escrow Program** | [private-channel-escrow-program/](private-channel-escrow-program/) | Mainnet token deposit via escrow |
+| **Withdrawal Program** | [private-channel-withdraw-program/](private-channel-withdraw-program/) | Channel token withdrawal via burning |
 | **Indexer + Operator** | [indexer/](indexer/) | Mainnet & channel transaction monitoring & automation |
 | **Integration Tests** | [integration/](integration/) | Cross-workspace integration tests |
 | **Deployment** | [docker-compose.yml](docker-compose.yml) | Full stack deployment configuration |

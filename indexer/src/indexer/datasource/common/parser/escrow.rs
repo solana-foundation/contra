@@ -8,8 +8,8 @@ use borsh::BorshDeserialize;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
-// Contra Escrow Program ID
-pub const CONTRA_ESCROW_PROGRAM_ID: &str = "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83";
+// PrivateChannel Escrow Program ID
+pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83";
 
 // Instruction discriminators (from IDL)
 const CREATE_INSTANCE: u8 = 0;
@@ -61,7 +61,7 @@ pub struct CreateInstanceAccounts {
     pub instance: Pubkey,
     pub system_program: Pubkey,
     pub event_authority: Pubkey,
-    pub contra_escrow_program: Pubkey,
+    pub private_channel_escrow_program: Pubkey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ pub struct AllowMintAccounts {
     pub token_program: Pubkey,
     pub associated_token_program: Pubkey,
     pub event_authority: Pubkey,
-    pub contra_escrow_program: Pubkey,
+    pub private_channel_escrow_program: Pubkey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +92,7 @@ pub struct DepositAccounts {
     pub token_program: Pubkey,
     pub associated_token_program: Pubkey,
     pub event_authority: Pubkey,
-    pub contra_escrow_program: Pubkey,
+    pub private_channel_escrow_program: Pubkey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ pub struct ReleaseFundsAccounts {
     pub token_program: Pubkey,
     pub associated_token_program: Pubkey,
     pub event_authority: Pubkey,
-    pub contra_escrow_program: Pubkey,
+    pub private_channel_escrow_program: Pubkey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +118,7 @@ pub struct ResetSmtRootAccounts {
     pub instance: Pubkey,
     pub operator_pda: Pubkey,
     pub event_authority: Pubkey,
-    pub contra_escrow_program: Pubkey,
+    pub private_channel_escrow_program: Pubkey,
 }
 
 // ******************************************************************************************
@@ -198,7 +198,7 @@ pub struct AllowMintEvent {
 // ******************************************************************************************
 // Parse instructions
 // ******************************************************************************************
-/// Parse a single Contra Escrow instruction
+/// Parse a single PrivateChannel Escrow instruction
 pub fn parse_escrow_instruction(
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
@@ -248,7 +248,7 @@ fn parse_create_instance(
         instance: account_keys[instruction.accounts[3] as usize],
         system_program: account_keys[instruction.accounts[4] as usize],
         event_authority: account_keys[instruction.accounts[5] as usize],
-        contra_escrow_program: account_keys[instruction.accounts[6] as usize],
+        private_channel_escrow_program: account_keys[instruction.accounts[6] as usize],
     };
 
     Ok(Some(EscrowInstruction::CreateInstance {
@@ -286,7 +286,7 @@ fn parse_allow_mint(
         token_program: account_keys[instruction.accounts[7] as usize],
         associated_token_program: account_keys[instruction.accounts[8] as usize],
         event_authority: account_keys[instruction.accounts[9] as usize],
-        contra_escrow_program: account_keys[instruction.accounts[10] as usize],
+        private_channel_escrow_program: account_keys[instruction.accounts[10] as usize],
     };
 
     for inner_instruction_set in inner_instructions {
@@ -344,7 +344,7 @@ fn parse_deposit(
         token_program: account_keys[instruction.accounts[8] as usize],
         associated_token_program: account_keys[instruction.accounts[9] as usize],
         event_authority: account_keys[instruction.accounts[10] as usize],
-        contra_escrow_program: account_keys[instruction.accounts[11] as usize],
+        private_channel_escrow_program: account_keys[instruction.accounts[11] as usize],
     };
 
     Ok(Some(EscrowInstruction::Deposit {
@@ -382,7 +382,7 @@ fn parse_release_funds(
         token_program: account_keys[instruction.accounts[8] as usize],
         associated_token_program: account_keys[instruction.accounts[9] as usize],
         event_authority: account_keys[instruction.accounts[10] as usize],
-        contra_escrow_program: account_keys[instruction.accounts[11] as usize],
+        private_channel_escrow_program: account_keys[instruction.accounts[11] as usize],
     };
 
     Ok(Some(EscrowInstruction::ReleaseFunds {
@@ -411,7 +411,7 @@ fn parse_reset_smt_root(
         instance: account_keys[instruction.accounts[2] as usize],
         operator_pda: account_keys[instruction.accounts[3] as usize],
         event_authority: account_keys[instruction.accounts[4] as usize],
-        contra_escrow_program: account_keys[instruction.accounts[5] as usize],
+        private_channel_escrow_program: account_keys[instruction.accounts[5] as usize],
     };
 
     Ok(Some(EscrowInstruction::ResetSmtRoot { accounts }))

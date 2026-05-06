@@ -1,6 +1,6 @@
 use {
-    contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID,
-    contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+    private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     solana_address::Address,
     solana_client::rpc_client::RpcClient,
     solana_rpc::rpc::JsonRpcConfig,
@@ -28,12 +28,12 @@ fn get_free_port() -> u16 {
 
 const ESCROW_PROGRAM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/programs/contra_escrow_program.so"
+    "/programs/private_channel_escrow_program.so"
 );
 
 const WITHDRAW_PROGRAM_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/programs/contra_withdraw_program.so"
+    "/programs/private_channel_withdraw_program.so"
 );
 
 #[cfg(target_os = "macos")]
@@ -50,14 +50,14 @@ const GEYSER_PLUGIN_PATH: &str = concat!(
 
 /// Preflight check: verify the escrow `.so` that solana-test-validator is
 /// about to load was built with the same `test-tree` feature flag as the
-/// `contra-indexer` crate this binary is linked against.
+/// `private-channel-indexer` crate this binary is linked against.
 ///
 /// Why this exists:
-///   `target/deploy/contra_escrow_program.so` is a single artifact path
+///   `target/deploy/private_channel_escrow_program.so` is a single artifact path
 ///   that both prod (`make build`) and test-tree (`make build-test`) builds
 ///   overwrite. Meanwhile the indexer's SMT empty-tree root is a compile-
 ///   time constant derived from the `test-tree` feature on the
-///   `contra-indexer` crate. If the two disagree, the operator computes
+///   `private-channel-indexer` crate. If the two disagree, the operator computes
 ///   one empty root locally and sees a different one on-chain, refuses to
 ///   build withdrawals, and the test times out 2+ minutes later with a
 ///   cryptic balance assertion failure.
@@ -70,7 +70,7 @@ fn verify_escrow_program_features_match_indexer(program_path: &Path) {
     CHECKED.call_once(|| {
         // Detect the test-tree feature via the indexer's TREE_HEIGHT constant.
         // Prod build: TREE_HEIGHT=16. test-tree build: TREE_HEIGHT=3.
-        let expected_test_tree = contra_indexer::operator::tree_constants::TREE_HEIGHT != 16;
+        let expected_test_tree = private_channel_indexer::operator::tree_constants::TREE_HEIGHT != 16;
         let so_mtime = match fs::metadata(program_path).and_then(|m| m.modified()) {
             Ok(t) => t,
             Err(e) => {
@@ -83,7 +83,7 @@ fn verify_escrow_program_features_match_indexer(program_path: &Path) {
         };
 
         // Cargo's sbpf fingerprint lives in target/sbpf-solana-solana/release/
-        // .fingerprint/contra-escrow-program-<hash>/lib-contra_escrow_program.json.
+        // .fingerprint/private-channel-escrow-program-<hash>/lib-private_channel_escrow_program.json.
         // The workspace target dir is two parents up from test_utils/programs/.
         let workspace_root = match program_path
             .parent()
@@ -111,10 +111,10 @@ fn verify_escrow_program_features_match_indexer(program_path: &Path) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if !name_str.starts_with("contra-escrow-program-") {
+                if !name_str.starts_with("private-channel-escrow-program-") {
                     continue;
                 }
-                let json_path = entry.path().join("lib-contra_escrow_program.json");
+                let json_path = entry.path().join("lib-private_channel_escrow_program.json");
                 let Ok(meta) = fs::metadata(&json_path) else {
                     continue;
                 };
@@ -156,9 +156,9 @@ fn verify_escrow_program_features_match_indexer(program_path: &Path) {
                 },
             );
             let rebuild_cmd = if expected_test_tree {
-                "make -C contra-escrow-program build-test"
+                "make -C private-channel-escrow-program build-test"
             } else {
-                "make -C contra-escrow-program build"
+                "make -C private-channel-escrow-program build"
             };
             panic!(
                 "\n\n\
@@ -214,9 +214,9 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
 
     let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
         let escrow_program =
-            make_program_info(CONTRA_ESCROW_PROGRAM_ID.to_bytes(), ESCROW_PROGRAM_PATH);
+            make_program_info(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(), ESCROW_PROGRAM_PATH);
         let withdraw_program =
-            make_program_info(CONTRA_WITHDRAW_PROGRAM_ID.to_bytes(), WITHDRAW_PROGRAM_PATH);
+            make_program_info(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(), WITHDRAW_PROGRAM_PATH);
 
         let geyser_config = serde_json::json!({
             "libpath": GEYSER_PLUGIN_PATH,
@@ -289,9 +289,9 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
 
     let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
         let escrow_program =
-            make_program_info(CONTRA_ESCROW_PROGRAM_ID.to_bytes(), ESCROW_PROGRAM_PATH);
+            make_program_info(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(), ESCROW_PROGRAM_PATH);
         let withdraw_program =
-            make_program_info(CONTRA_WITHDRAW_PROGRAM_ID.to_bytes(), WITHDRAW_PROGRAM_PATH);
+            make_program_info(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(), WITHDRAW_PROGRAM_PATH);
 
         let mut genesis = TestValidatorGenesis::default();
 

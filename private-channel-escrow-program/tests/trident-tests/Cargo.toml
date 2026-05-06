@@ -1,0 +1,30 @@
+[workspace]
+
+[package]
+name = "fuzz_tests"
+version = "0.1.0"
+description = "Created with Trident"
+edition = "2021"
+
+[dependencies]
+solana-sdk = "2.3.1"
+spl-associated-token-account = { version = "4.0.0", features = ["no-entrypoint"] }
+private-channel-escrow-program-client = { path = "../../clients/rust" }
+tests-private-channel-escrow-program = { path = "../integration-tests" }
+
+[dependencies.trident-fuzz]
+version = "0.12.0"
+features = ["token"]
+
+# Patch Trident to work with the syscalls necessary for Pinocchio
+[patch.crates-io]
+trident-syscall-stubs-v2 = { git = "https://github.com/exo-tech-xyz/trident-syscall-stubs.git", package = "trident-syscall-stubs-v2", branch = "fix-rent-pinocchio" }
+trident-svm = { git = "https://github.com/exo-tech-xyz/trident-svm", branch = "fix-syscalls" }
+
+[[bin]]
+name = "fuzz_escrow"
+path = "fuzz_escrow.rs"
+
+[[bin]]
+name = "fuzz_reset_smt"
+path = "fuzz_reset_smt.rs"

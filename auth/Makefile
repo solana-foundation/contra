@@ -1,36 +1,36 @@
 .PHONY: build fmt unit-test integration-test
 .PHONY: unit-coverage coverage-html all-coverage
 
-# Build the contra-auth binary
+# Build the private-channel-auth binary
 build:
-	@echo "Building contra-auth..."
+	@echo "Building private-channel-auth..."
 	@cargo build --release
 
 # Format and lint code
 fmt:
-	@echo "Formatting contra-auth..."
+	@echo "Formatting private-channel-auth..."
 	@cargo fmt --all
 	@cargo clippy --all-targets -- -D warnings
 
 # Run unit tests
 unit-test:
-	@echo "Running unit tests for contra-auth..."
+	@echo "Running unit tests for private-channel-auth..."
 	@cargo test --lib
 
 # Run integration tests (requires Docker for testcontainers)
 integration-test:
-	@echo "Running integration tests for contra-auth..."
+	@echo "Running integration tests for private-channel-auth..."
 	@cargo test --test integration -- --test-threads=1
 
 # Run unit tests with coverage
 unit-coverage:
-	@echo "Running unit tests with coverage for contra-auth..."
+	@echo "Running unit tests with coverage for private-channel-auth..."
 	@mkdir -p ../coverage
 	@cargo llvm-cov --lib --tests --lcov --output-path ../coverage/coverage-auth-unit.lcov
 
 # Generate HTML coverage report
 coverage-html:
-	@echo "Generating HTML coverage report for contra-auth..."
+	@echo "Generating HTML coverage report for private-channel-auth..."
 	@mkdir -p ../coverage
 	@cargo llvm-cov --lib --tests --html --output-dir ../coverage/coverage-auth-html
 

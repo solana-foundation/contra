@@ -8,7 +8,7 @@
 //!   `db_expected = all_indexed_deposits − completed_withdrawals`
 //!
 //! Deposits increase the ATA balance on-chain the moment they are observed, regardless of
-//! the operator's contra minting status (`pending`/`processing`/`completed`/`failed`).
+//! the operator's private_channel minting status (`pending`/`processing`/`completed`/`failed`).
 //! Only completed withdrawals (`release_funds`) reduce the ATA balance.
 //!
 //! Flow:
@@ -25,7 +25,7 @@ use crate::{
     operator::{rpc_util::RpcClientWithRetry, RetryConfig, RetryPolicy},
     storage::Storage,
 };
-use contra_core::rpc::error::INVALID_PARAMS_CODE;
+use private_channel_core::rpc::error::INVALID_PARAMS_CODE;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::str::FromStr;

@@ -1,5 +1,5 @@
 name: "Setup Environment"
-description: "Common setup steps for Contra CI/CD workflows"
+description: "Common setup steps for Solana Private Channels CI/CD workflows"
 
 inputs:
   rust-components:

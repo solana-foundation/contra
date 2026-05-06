@@ -30,7 +30,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub const MAX_CONCURRENT_SENDS: usize = 64;
 
 /// How often the background blockhash poller calls `getLatestBlockhash`.
-/// The contra node rejects transactions whose blockhash is older than ~15 s,
+/// The private_channel node rejects transactions whose blockhash is older than ~15 s,
 /// so refreshing at 80 ms gives a comfortable margin.
 pub const BLOCKHASH_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
@@ -133,12 +133,12 @@ pub struct DepositConfig {
 
 /// Configuration for the withdraw load phase.
 ///
-/// Holds the on-chain state set up by the Contra `setup::run_setup_phase`.
+/// Holds the on-chain state set up by the PrivateChannel `setup::run_setup_phase`.
 pub struct WithdrawConfig {
-    /// The Contra SPL mint whose tokens will be burned on withdraw.
+    /// The PrivateChannel SPL mint whose tokens will be burned on withdraw.
     pub mint: Pubkey,
-    /// Withdrawer keypairs, one per account.  Each has a Contra ATA funded with tokens.
+    /// Withdrawer keypairs, one per account.  Each has a PrivateChannel ATA funded with tokens.
     pub keypairs: Vec<Arc<Keypair>>,
-    /// Shared mutable state seeded with the current Contra blockhash.
+    /// Shared mutable state seeded with the current PrivateChannel blockhash.
     pub state: Arc<BenchState>,
 }

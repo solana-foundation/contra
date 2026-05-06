@@ -13,8 +13,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 operator_pubkey="$(solana-keygen pubkey "$operator_keypair")"
 operator_private_key="$(tr -d '\n' < "$operator_keypair")"
 
-"$script_dir/upsert-env.sh" "$env_file" "CONTRA_ADMIN_KEYS" "$operator_pubkey"
+"$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_ADMIN_KEYS" "$operator_pubkey"
 "$script_dir/upsert-env.sh" "$env_file" "ADMIN_PRIVATE_KEY" "$operator_private_key"
 
-echo "Updated $env_file with CONTRA_ADMIN_KEYS=$operator_pubkey"
+echo "Updated $env_file with PRIVATE_CHANNEL_ADMIN_KEYS=$operator_pubkey"
 echo "Updated $env_file with ADMIN_PRIVATE_KEY"

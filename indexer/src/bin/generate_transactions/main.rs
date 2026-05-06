@@ -1,9 +1,9 @@
 /// Binary tool that generates transactions to test the indexer
 ///
 /// Run with: cargo run --bin generate_transactions
-use contra_escrow_program_client::{
+use private_channel_escrow_program_client::{
     instructions::{AllowMintBuilder, CreateInstanceBuilder, DepositBuilder},
-    CONTRA_ESCROW_PROGRAM_ID,
+    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -27,18 +27,18 @@ const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED, instance_seed.as_ref()],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
 fn find_event_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
 }
 
 fn find_allowed_mint_pda(instance: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[ALLOWED_MINT_SEED, instance.as_ref(), mint.as_ref()],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
@@ -58,7 +58,7 @@ async fn send_create_instance(
         .instance(instance_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .instruction();
 
@@ -97,7 +97,7 @@ async fn send_allow_mint(
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .instruction();
 
@@ -137,7 +137,7 @@ async fn send_deposit(
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .amount(amount);
 
     let instruction = if let Some(recipient) = recipient {

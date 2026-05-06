@@ -17,15 +17,15 @@
 //!
 //! Deposits (Escrow program type) don't halt the pipeline — they
 //! quarantine the single row and keep flowing (614-635 path). This
-//! keeps the test focused on the observable contract without needing
+//! keeps the test focused on the observable private_channelct without needing
 //! the full withdrawal SMT harness.
 
 use {
     chrono::Utc,
-    contra_indexer::storage::common::models::{DbTransaction, TransactionStatus, TransactionType},
+    private_channel_indexer::storage::common::models::{DbTransaction, TransactionStatus, TransactionType},
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::time::Duration,
-    test_utils::operator_helper::start_solana_to_contra_operator_with_mocks,
+    test_utils::operator_helper::start_solana_to_private_channel_operator_with_mocks,
 };
 
 fn make_bad_deposit(id: i64) -> DbTransaction {
@@ -61,7 +61,7 @@ async fn processor_quarantines_deposit_with_malformed_mint_string() {
     let escrow_instance = Pubkey::new_unique();
     let keypair = Keypair::new();
 
-    let harness = start_solana_to_contra_operator_with_mocks(escrow_instance, keypair)
+    let harness = start_solana_to_private_channel_operator_with_mocks(escrow_instance, keypair)
         .await
         .expect("harness start");
 

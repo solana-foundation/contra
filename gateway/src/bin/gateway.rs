@@ -1,5 +1,5 @@
 use clap::Parser;
-use contra_gateway::{run, Args};
+use private_channel_gateway::{run, Args};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,8 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9101);
-    contra_gateway::metrics::init();
-    contra_metrics::start_metrics_server(metrics_port);
+    private_channel_gateway::metrics::init();
+    private_channel_metrics::start_metrics_server(metrics_port);
 
     rustls::crypto::ring::default_provider()
         .install_default()

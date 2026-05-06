@@ -1,0 +1,6 @@
+[fuzz.metrics]
+enabled = true
+
+[[fuzz.programs]]
+address = "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83"
+program = "../../../target/deploy/private_channel_escrow_program.so"

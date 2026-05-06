@@ -1,11 +1,11 @@
-# Rendered by Ansible. Source: contra-deploy/templates/prometheus.yml.j2
+# Rendered by Ansible. Source: private-channel-deploy/templates/prometheus.yml.j2
 #
 # Scrape targets:
-#   - blackbox HTTP probes for every Contra service /health endpoint
+#   - blackbox HTTP probes for every Solana Private Channels service /health endpoint
 #   - cAdvisor (containers), node_exporter (host), postgres_exporter (DBs)
-#   - Contra services that expose /metrics directly (write/read/gateway use
+#   - Solana Private Channels services that expose /metrics directly (write/read/gateway use
 #     the metrics_port env vars in docker-compose.yml; we scrape the same
-#     ports here when CONTRA_METRICS=true). Off by default; the rules
+#     ports here when PRIVATE_CHANNEL_METRICS=true). Off by default; the rules
 #     below tolerate missing targets gracefully.
 
 global:
@@ -34,9 +34,9 @@ scrape_configs:
           - http://write-node:{{ write_port }}/health
           - http://read-node:{{ read_port }}/health
           - http://indexer-solana:9100/health
-          - http://indexer-contra:9100/health
+          - http://indexer-private-channel:9100/health
           - http://operator-solana:9102/health
-          - http://operator-contra:9103/health
+          - http://operator-private-channel:9103/health
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -66,46 +66,46 @@ scrape_configs:
         labels:
           db: indexer
 
-  # ── Contra indexer + operator /metrics — always-on. Each service binds
+  # ── Solana Private Channels indexer + operator /metrics — always-on. Each service binds
   # its Prometheus exporter to METRICS_PORT (see docker-compose.yml: indexers
-  # default to 9100; operator-solana is 9102, operator-contra is 9103 so
+  # default to 9100; operator-solana is 9102, operator-private-channel is 9103 so
   # bench-tps can scrape them on distinct host ports). The metrics already
   # carry a `program_type` label (escrow|withdraw) baked in by the app, so
-  # dashboards group across solana/contra pairs naturally — no extra
+  # dashboards group across solana/private-channel pairs naturally — no extra
   # relabeling needed here.
-  - job_name: contra-indexer-solana
+  - job_name: private-channel-indexer-solana
     static_configs:
       - targets: ['indexer-solana:9100']
         labels:
-          stack: contra
+          stack: private-channel
 
-  - job_name: contra-indexer-contra
+  - job_name: private-channel-indexer-private-channel
     static_configs:
-      - targets: ['indexer-contra:9100']
+      - targets: ['indexer-private-channel:9100']
         labels:
-          stack: contra
+          stack: private-channel
 
-  - job_name: contra-operator-solana
+  - job_name: private-channel-operator-solana
     static_configs:
       - targets: ['operator-solana:9102']
         labels:
-          stack: contra
+          stack: private-channel
 
-  - job_name: contra-operator-contra
+  - job_name: private-channel-operator-private-channel
     static_configs:
-      - targets: ['operator-contra:9103']
+      - targets: ['operator-private-channel:9103']
         labels:
-          stack: contra
+          stack: private-channel
 
-  # ── Contra write/read/gateway /metrics (only when CONTRA_METRICS=true is
+  # ── Solana Private Channels write/read/gateway /metrics (only when PRIVATE_CHANNEL_METRICS=true is
   # set on the service; otherwise these targets show as down which is
-  # correct). Listed here so flipping CONTRA_METRICS=true requires no
+  # correct). Listed here so flipping PRIVATE_CHANNEL_METRICS=true requires no
   # Prometheus config change.
-  - job_name: contra-services
+  - job_name: private-channel-services
     static_configs:
       - targets:
           - 'write-node:9090'
           - 'read-node:9090'
           - 'gateway:9090'
         labels:
-          stack: contra
+          stack: private-channel

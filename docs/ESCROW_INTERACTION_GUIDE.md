@@ -1,16 +1,16 @@
-# Interacting with the Contra Escrow Program
+# Interacting with the Solana Private Channels Escrow Program
 
-This guide provides a reference for all client-side actions for calling Contra Escrow Program instructions.
+This guide provides a reference for all client-side actions for calling Solana Private Channels Escrow Program instructions.
 
 ## Overview
 
-The Contra Escrow Program manages token deposits to and withdrawals from the Contra payment channel. The program supports:
+The Solana Private Channels Escrow Program manages token deposits to and withdrawals from the Solana Private Channels payment channel. The program supports:
 
 - **Instance Management**: Create and configure escrow instances
 - **Access Control**: Manage admins and operators
 - **Token Whitelisting**: Control which tokens can be deposited
-- **Deposits**: Lock tokens on Mainnet for minting on the Contra payment channel
-- **Withdrawals**: Release funds from escrow to user (note: this is handled by the Contra Indexer/Operator and is not covered in this guide)
+- **Deposits**: Lock tokens on Mainnet for minting on the Solana Private Channels payment channel
+- **Withdrawals**: Release funds from escrow to user (note: this is handled by the Solana Private Channels Indexer/Operator and is not covered in this guide)
 
 
 ### Program Address
@@ -20,7 +20,7 @@ GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
 
 ### Installation
 ```bash
-pnpm add contra-escrow-program @solana/kit
+pnpm add private-channel-escrow-program @solana/kit
 ```
 
 ## Table of Contents
@@ -31,12 +31,12 @@ pnpm add contra-escrow-program @solana/kit
 4. [AddOperator](#addoperator) - Authorize a withdrawal operator
 5. [RemoveOperator](#removeoperator) - Remove an operator
 6. [SetNewAdmin](#setnewadmin) - Transfer admin control
-7. [Deposit](#deposit) - Deposit tokens to Contra
+7. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
 8. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
 
 ## CreateInstance
 
-Creates a new escrow instance with a dedicated admin. Each Contra deployment requires its own instance. Instance PDA's are seeded with the string literal "instance" and a unique pubkey (the instance seed).
+Creates a new escrow instance with a dedicated admin. Each Solana Private Channels deployment requires its own instance. Instance PDA's are seeded with the string literal "instance" and a unique pubkey (the instance seed).
 
 Anyone can create an instance--the `admin` signer will have authority for managing subsequent instructions.
 
@@ -46,7 +46,7 @@ Anyone can create an instance--the `admin` signer will have authority for managi
 import {
   getCreateInstanceInstructionAsync,
   findInstancePda,
-} from 'contra-escrow-program';
+} from 'private-channel-escrow-program';
 import { generateKeyPairSigner } from '@solana/kit';
 
 // Generate unique instance seed (save securely for future Instance retrieval)
@@ -79,7 +79,7 @@ Whitelists an SPL token mint for deposits. At least one allowed mint is required
 import {
   getAllowMintInstructionAsync,
   findInstancePda,
-} from 'contra-escrow-program';
+} from 'private-channel-escrow-program';
 import { address } from '@solana/kit';
 
 const USDC_MINT = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
@@ -118,7 +118,7 @@ Revokes deposit permissions for a previously whitelisted mint. Closes the Allowe
 ```typescript
 import {
   getBlockMintInstructionAsync,
-} from 'contra-escrow-program';
+} from 'private-channel-escrow-program';
 
 const blockMintIx = await getBlockMintInstructionAsync({
   payer,
@@ -132,7 +132,7 @@ const blockMintIx = await getBlockMintInstructionAsync({
 
 **Notes:**
 - New deposits for this mint fail immediately with `InvalidAllowedMint` error
-- Existing Contra balances are NOT affected
+- Existing Solana Private Channels balances are NOT affected
 - Withdraws still work for existing balances
 - Reversible: Admin can call AllowMint again to re-enable
 
@@ -145,7 +145,7 @@ Authorizes an operator to sign withdrawal transactions. At least one operator is
 ```typescript
 import {
   getAddOperatorInstructionAsync,
-} from 'contra-escrow-program';
+} from 'private-channel-escrow-program';
 
 const operatorKeypair = await generateKeyPairSigner();
 
@@ -172,7 +172,7 @@ Removes an operator's authorization. Closes the Operator PDA and reclaims rent t
 ### TypeScript Example
 
 ```typescript
-import { getRemoveOperatorInstructionAsync } from 'contra-escrow-program';
+import { getRemoveOperatorInstructionAsync } from 'private-channel-escrow-program';
 
 const removeOperatorIx = await getRemoveOperatorInstructionAsync({
   payer,
@@ -193,7 +193,7 @@ Transfers admin control to a new address. Useful for key rotation, organizationa
 ### TypeScript Example
 
 ```typescript
-import { getSetNewAdminInstruction } from 'contra-escrow-program';
+import { getSetNewAdminInstruction } from 'private-channel-escrow-program';
 
 const newAdmin = await generateKeyPairSigner();
 
@@ -217,7 +217,7 @@ const setAdminIx = getSetNewAdminInstruction({
 
 ## Deposit
 
-Locks tokens in the Mainnet escrow for minting on the Contra payment channel. Permissionless instruction — any user can deposit to any instance with allowed mints.
+Locks tokens in the Mainnet escrow for minting on the Solana Private Channels payment channel. Permissionless instruction — any user can deposit to any instance with allowed mints.
 
 ### TypeScript Example
 
@@ -225,7 +225,7 @@ Locks tokens in the Mainnet escrow for minting on the Contra payment channel. Pe
 import {
   getDepositInstructionAsync,
   findAllowedMintPda,
-} from 'contra-escrow-program';
+} from 'private-channel-escrow-program';
 import { findAssociatedTokenPda } from '@solana-program/token';
 import { address, none } from '@solana/kit';
 
@@ -239,7 +239,7 @@ const depositIx = await getDepositInstructionAsync({
   instance: process.env.INSTANCE_ADDRESS,
   mint: process.env.ALLOWED_MINT_ADDRESS,
   amount: depositAmount,
-  recipient: none(), // or address('RecipientAddressOnContra...') if you want to credit to a different address
+  recipient: none(), // or address('RecipientAddressOnSolana Private Channels...') if you want to credit to a different address
 });
 
 // Send and sign transaction with payer and user as signers
@@ -249,18 +249,18 @@ const depositIx = await getDepositInstructionAsync({
 
 | Recipient Value | Tokens Credited To |
 |----------------|-------------------|
-| `null` or `none()` | User's address on Contra |
-| Specified address | Recipient address on Contra |
+| `null` or `none()` | User's address on Solana Private Channels |
+| Specified address | Recipient address on Solana Private Channels |
 
 **Use Case**: Third-party deposits (e.g., CEX depositing on behalf of end users OR user's depositing to CEX managed-wallet)
 
-Check out the [Architecture Overview](./ARCHITECTURE.md) for more details on how deposits are processed on Contra.
+Check out the [Architecture Overview](./ARCHITECTURE.md) for more details on how deposits are processed on Solana Private Channels.
 
 ## PDA Reference
 
 ### Instance PDA
 
-The Instance PDA is your unique instance of the Contra Escrow Program. It isolates your governance (allowed mints, operators, etc.) and escrowed deposits from other instances.
+The Instance PDA is your unique instance of the Solana Private Channels Escrow Program. It isolates your governance (allowed mints, operators, etc.) and escrowed deposits from other instances.
 
 Seeds: `["instance", instance_seed]`
 
@@ -318,5 +318,5 @@ const [eventAuthorityPda] = await findEventAuthorityPda();
 ## Related Documentation
 
 - [Withdraw Program](WITHDRAW_PROGRAM.md) - Technical reference
-- [Withdraw Guide](WITHDRAWING_GUIDE.md) - Processing Contra → Mainnet withdrawals
+- [Withdraw Guide](WITHDRAWING_GUIDE.md) - Processing Solana Private Channels → Mainnet withdrawals
 - [Architecture Overview](ARCHITECTURE.md) - System design

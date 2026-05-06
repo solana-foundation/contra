@@ -3,8 +3,8 @@
 use super::send_and_confirm_instructions;
 use super::test_types::{TransactionType, UserTransaction, BASE_AMOUNT, DEPOSITS_PER_USER};
 
-use contra_escrow_program_client::instructions::DepositBuilder;
-use contra_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
+use private_channel_escrow_program_client::instructions::DepositBuilder;
+use private_channel_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer};
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
@@ -44,7 +44,7 @@ pub async fn execute_user_deposits(
             .token_program(TOKEN_PROGRAM_ID)
             .associated_token_program(spl_associated_token_account::ID)
             .event_authority(event_authority_pda)
-            .contra_escrow_program(contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID)
+            .private_channel_escrow_program(private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
             .amount(amount)
             .instruction();
 

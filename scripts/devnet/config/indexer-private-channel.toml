@@ -1,0 +1,26 @@
+# Devnet configuration for Solana Private Channels indexer (RPC Polling)
+# Monitors Solana Private Channels for withdrawals via gateway
+
+[common]
+program_type = "withdraw"
+# Solana Private Channels gateway based on docker compose
+rpc_url = "http://gateway:8899"
+
+[storage]
+type = "postgres"
+max_connections = 10
+
+[indexer]
+datasource_type = "rpc_polling"
+
+[indexer.rpc_polling]
+start_slot = 0
+poll_interval_ms = 1000
+error_retry_interval_ms = 5000
+batch_size = 50
+
+[indexer.backfill]
+enabled = false
+backfill_only = false
+batch_size = 100
+max_gap_slots = 10000000

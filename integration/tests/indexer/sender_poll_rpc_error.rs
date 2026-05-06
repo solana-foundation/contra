@@ -27,7 +27,7 @@
 mod sender_fixtures;
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         operator::{
             sender::{
                 test_hooks,

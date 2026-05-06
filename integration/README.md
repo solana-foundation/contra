@@ -1,6 +1,6 @@
-# Contra Integration Tests
+# Solana Private Channels Integration Tests
 
-This package contains integration tests for the Contra stack.
+This package contains integration tests for the Solana Private Channels stack.
 
 ## Structure
 
@@ -12,18 +12,18 @@ This package contains integration tests for the Contra stack.
 
 Run all integration tests:
 ```bash
-cargo test -p contra-integration
+cargo test -p private-channel-integration
 ```
 
 Run a specific test:
 ```bash
-cargo test -p contra-integration test_with_redis
-cargo test -p contra-integration test_with_postgres
+cargo test -p private-channel-integration test_with_redis
+cargo test -p private-channel-integration test_with_postgres
 ```
 
 Run with output:
 ```bash
-cargo test -p contra-integration -- --nocapture
+cargo test -p private-channel-integration -- --nocapture
 ```
 
 ## Test Coverage
@@ -50,4 +50,4 @@ The integration tests cover:
 
 ## Future Enhancements
 
-The next goal is to extend these tests to include the indexer and other components of the Contra stack for full end-to-end testing.
+The next goal is to extend these tests to include the indexer and other components of the Solana Private Channels stack for full end-to-end testing.

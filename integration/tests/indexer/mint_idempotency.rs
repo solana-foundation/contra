@@ -12,7 +12,7 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-use contra_indexer::operator::{
+use private_channel_indexer::operator::{
     find_existing_mint_signature, mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId,
     RetryConfig, RpcClientWithRetry,
 };

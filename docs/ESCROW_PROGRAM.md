@@ -1,4 +1,4 @@
-# Contra Escrow Program Overview
+# Solana Private Channels Escrow Program Overview
 
 ## Program ID
 
@@ -47,7 +47,7 @@ Discriminator: `0`
 | 3 | `instance` | | ✓ | Instance PDA to be created |
 | 4 | `system_program` | | | System program |
 | 5 | `event_authority` | | | Event authority PDA for emitting events |
-| 6 | `contra_escrow_program` | | | Current program for CPI |
+| 6 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### AllowMint
 Allows new token mints for the instance (admin-only).
@@ -72,7 +72,7 @@ Discriminator: `1`
 | 7 | `token_program` | | | Token program |
 | 8 | `associated_token_program` | | | Associated Token program |
 | 9 | `event_authority` | | | Event authority PDA for emitting events |
-| 10 | `contra_escrow_program` | | | Current program for CPI |
+| 10 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### BlockMint
 Blocks previously allowed mints for the instance (admin-only).
@@ -91,7 +91,7 @@ Discriminator: `2`
 | 4 | `allowed_mint` | | ✓ | Existing Allowed Mint PDA |
 | 5 | `system_program` | | | System program for account creation |
 | 6 | `event_authority` | | | Event authority PDA for emitting events |
-| 7 | `contra_escrow_program` | | | Current program for CPI |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### AddOperator
 Adds an operator to the instance (admin-only).
@@ -113,7 +113,7 @@ Discriminator: `3`
 | 4 | `operator_pda` | | ✓ | Operator PDA to be created |
 | 5 | `system_program` | | | System program |
 | 6 | `event_authority` | | | Event authority PDA for emitting events |
-| 7 | `contra_escrow_program` | | | Current program for CPI |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### RemoveOperator
 Removes an operator from the instance (admin-only).
@@ -132,7 +132,7 @@ Discriminator: `4`
 | 4 | `operator_pda` | | ✓ | Existing Operator PDA |
 | 5 | `system_program` | | | System program |
 | 6 | `event_authority` | | | Event authority PDA for emitting events |
-| 7 | `contra_escrow_program` | | | Current program for CPI |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### SetNewAdmin
 Sets a new admin for the instance (current admin only).
@@ -149,7 +149,7 @@ Discriminator: `5`
 | 2 | `instance` | | ✓ | Instance PDA to update admin |
 | 3 | `new_admin` | ✓ | | New admin public key |
 | 4 | `event_authority` | | | Event authority PDA for emitting events |
-| 5 | `contra_escrow_program` | | | Current program for CPI |
+| 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### Deposit
 Deposits tokens from user ATA to instance escrow ATA (permissionless).
@@ -160,7 +160,7 @@ Discriminator: `6`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `amount` | u64 | Amount of tokens to deposit |
-| `recipient` | Option&lt;Pubkey&gt; | Optional recipient for Contra tracking (wallet address, not the ATA; if None, defaults to user) |
+| `recipient` | Option&lt;Pubkey&gt; | Optional recipient for Solana Private Channels tracking (wallet address, not the ATA; if None, defaults to user) |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -176,7 +176,7 @@ Discriminator: `6`
 | 8 | `token_program` | | | Token program for the mint |
 | 9 | `associated_token_program` | | | Associated Token program |
 | 10 | `event_authority` | | | Event authority PDA for emitting events |
-| 11 | `contra_escrow_program` | | | Current program for CPI |
+| 11 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### ReleaseFunds
 Releases funds from escrow to user (operator-only).
@@ -206,7 +206,7 @@ Discriminator: `7`
 | 8 | `token_program` | | | Token program for the mint |
 | 9 | `associated_token_program` | | | Associated Token program |
 | 10 | `event_authority` | | | Event authority PDA for emitting events |
-| 11 | `contra_escrow_program` | | | Current program for CPI |
+| 11 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### ResetSmtRoot
 Resets the SMT root for the instance (operator-only).
@@ -223,7 +223,7 @@ Discriminator: `8`
 | 2 | `instance` | | ✓ | Instance PDA to reset |
 | 3 | `operator_pda` | | | Operator PDA to validate operator permissions |
 | 4 | `event_authority` | | | Event authority PDA for emitting events |
-| 5 | `contra_escrow_program` | | | Current program for CPI |
+| 5 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### EmitEvent
 Invoked via CPI from another program to log event via instruction data.

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
-use contra_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
-use contra_indexer::{
-    BackfillConfig, ContraIndexerConfig, DatasourceType, IndexerConfig, OperatorConfig,
+use private_channel_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
+use private_channel_indexer::{
+    BackfillConfig, PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, OperatorConfig,
     PostgresConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
     YellowstoneConfig,
 };
@@ -118,14 +118,14 @@ fn default_confirmation_poll_interval_ms() -> u64 {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "contra-indexer", about = "Index data from Contra programs")]
+#[command(name = "private-channel-indexer", about = "Index data from PrivateChannel programs")]
 struct Args {
     /// Path to configuration file
-    #[arg(short = 'c', long = "config", env = "CONTRA_INDEXER_CONFIG")]
+    #[arg(short = 'c', long = "config", env = "PRIVATE_CHANNEL_INDEXER_CONFIG")]
     config: PathBuf,
 
     /// Enable verbose logging
-    #[arg(short = 'v', long, env = "CONTRA_INDEXER_VERBOSE")]
+    #[arg(short = 'v', long, env = "PRIVATE_CHANNEL_INDEXER_VERBOSE")]
     verbose: bool,
 
     #[command(subcommand)]
@@ -211,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
-            "info,contra_indexer=debug"
+            "info,private_channel_indexer=debug"
         } else {
             "info"
         })
@@ -221,12 +221,12 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
-    contra_indexer::metrics::init();
-    let health = contra_metrics::HealthState::new(contra_metrics::HealthConfig::indexer());
-    contra_metrics::start_metrics_server_with_health(metrics_port, health.clone());
+    private_channel_indexer::metrics::init();
+    let health = private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig::indexer());
+    private_channel_metrics::start_metrics_server_with_health(metrics_port, health.clone());
 
     let common: CommonSection = figment.extract_inner("common")?;
-    contra_indexer::metrics::init_labels(contra_metrics::MetricLabel::as_label(
+    private_channel_indexer::metrics::init_labels(private_channel_metrics::MetricLabel::as_label(
         &common.program_type,
     ));
     let storage: StorageSection = figment.extract_inner("storage")?;
@@ -307,7 +307,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         })
         .transpose()?;
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: common.program_type,
         storage_type: storage.storage_type,
         postgres: postgres_config,
@@ -331,7 +331,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
     common_config.validate()?;
     indexer_config.validate()?;
 
-    contra_indexer::run(common_config, indexer_config, Some(health)).await?;
+    private_channel_indexer::run(common_config, indexer_config, Some(health)).await?;
 
     Ok(())
 }
@@ -339,7 +339,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
 async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
-            "info,contra_indexer=debug"
+            "info,private_channel_indexer=debug"
         } else {
             "info"
         })
@@ -349,12 +349,12 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
-    contra_indexer::metrics::init();
-    let health = contra_metrics::HealthState::new(contra_metrics::HealthConfig::operator());
-    contra_metrics::start_metrics_server_with_health(metrics_port, health.clone());
+    private_channel_indexer::metrics::init();
+    let health = private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig::operator());
+    private_channel_metrics::start_metrics_server_with_health(metrics_port, health.clone());
 
     let common: CommonSection = figment.extract_inner("common")?;
-    contra_indexer::metrics::init_labels(contra_metrics::MetricLabel::as_label(
+    private_channel_indexer::metrics::init_labels(private_channel_metrics::MetricLabel::as_label(
         &common.program_type,
     ));
     let storage_section: StorageSection = figment.extract_inner("storage")?;
@@ -370,9 +370,9 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     };
 
     // Initialize storage
-    let storage: Arc<contra_indexer::storage::Storage> = match storage_section.storage_type {
-        StorageType::Postgres => Arc::new(contra_indexer::storage::Storage::Postgres(
-            contra_indexer::storage::PostgresDb::new(&postgres_config).await?,
+    let storage: Arc<private_channel_indexer::storage::Storage> = match storage_section.storage_type {
+        StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
+            private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
         )),
     };
     storage
@@ -387,7 +387,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         })
         .transpose()?;
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: common.program_type,
         storage_type: storage_section.storage_type,
         postgres: postgres_config,
@@ -416,7 +416,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     // Validate signer configuration early (from environment variables)
     OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
 
-    contra_indexer::operator::run(storage, common_config, operator_config, Some(health)).await?;
+    private_channel_indexer::operator::run(storage, common_config, operator_config, Some(health)).await?;
 
     Ok(())
 }
@@ -428,7 +428,7 @@ async fn run_resync(
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
-            "info,contra_indexer=debug"
+            "info,private_channel_indexer=debug"
         } else {
             "info"
         })
@@ -448,9 +448,9 @@ async fn run_resync(
     };
 
     // Initialize storage
-    let storage_instance: Arc<contra_indexer::storage::Storage> = match storage.storage_type {
-        StorageType::Postgres => Arc::new(contra_indexer::storage::Storage::Postgres(
-            contra_indexer::storage::PostgresDb::new(&postgres_config).await?,
+    let storage_instance: Arc<private_channel_indexer::storage::Storage> = match storage.storage_type {
+        StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
+            private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
         )),
     };
 
@@ -472,7 +472,7 @@ async fn run_resync(
         .unwrap_or(CommitmentLevel::Finalized);
 
     let rpc_poller = Arc::new(
-        contra_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(
+        private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(
             rpc_url,
             rpc_encoding,
             rpc_commitment,
@@ -498,7 +498,7 @@ async fn run_resync(
     };
 
     // Create ResyncService
-    let resync_service = contra_indexer::indexer::resync::ResyncService::new(
+    let resync_service = private_channel_indexer::indexer::resync::ResyncService::new(
         storage_instance,
         rpc_poller,
         common.program_type,

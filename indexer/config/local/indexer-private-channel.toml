@@ -1,0 +1,28 @@
+# Local docker-compose configuration for Solana Private Channels indexer (RPC Polling)
+
+[common]
+program_type = "withdraw"
+
+# Solana Private Channels gateway — polls for WithdrawFunds instructions. Overridden at runtime by
+# COMMON_RPC_URL in docker-compose; update both if the gateway address changes.
+rpc_url = "http://gateway:8898"
+
+[storage]
+type = "postgres"
+max_connections = 10
+
+[indexer]
+datasource_type = "rpc_polling"
+
+[indexer.rpc_polling]
+start_slot = 0
+poll_interval_ms = 1000
+error_retry_interval_ms = 5000
+batch_size = 50
+
+[indexer.backfill]
+enabled = true
+backfill_only = false
+batch_size = 100
+max_gap_slots = 10000000
+# start_slot = 100  # Optional: First slot to process (inclusive, e.g., 100 means start from slot 100)

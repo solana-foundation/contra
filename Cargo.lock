@@ -2301,312 +2301,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
-name = "contra-bench-tps"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "clap 4.5.48",
- "contra-core",
- "contra-escrow-program-client",
- "contra-metrics",
- "contra-withdraw-program-client",
- "futures 0.3.31",
- "hex",
- "rayon",
- "reqwest 0.11.27",
- "serde_json",
- "solana-client 2.3.10",
- "solana-sdk",
- "solana-system-interface 1.0.0",
- "spl-associated-token-account 7.0.0",
- "spl-token 8.0.0",
- "tokio",
- "tokio-util 0.7.16",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "contra-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "axum 0.8.4",
- "base64 0.21.7",
- "bincode",
- "bs58",
- "clap 4.5.48",
- "contra-metrics",
- "contra-withdraw-program-client",
- "enum_dispatch",
- "futures 0.3.31",
- "hex",
- "http-body-util",
- "hyper 1.7.0",
- "hyper-util",
- "jsonrpsee",
- "rand 0.7.3",
- "redis",
- "reqwest 0.11.27",
- "rocksdb",
- "serde",
- "serde_json",
- "serial_test",
- "solana-account-decoder 2.3.10",
- "solana-account-decoder-client-types 2.3.10",
- "solana-bpf-loader-program 2.3.10",
- "solana-client 2.3.10",
- "solana-compute-budget 2.3.10",
- "solana-epoch-info 2.2.1",
- "solana-epoch-schedule 2.2.1",
- "solana-fee-calculator 2.2.1",
- "solana-hash 2.3.0",
- "solana-loader-v3-interface 5.0.0",
- "solana-logger",
- "solana-program-runtime 2.3.10",
- "solana-rent-collector",
- "solana-rpc-client-api 2.3.10",
- "solana-rpc-client-types 2.3.10",
- "solana-runtime-transaction 2.3.10",
- "solana-sdk",
- "solana-sdk-ids 2.2.1",
- "solana-svm 2.3.10",
- "solana-svm-callback 2.3.10",
- "solana-svm-feature-set 2.3.10",
- "solana-svm-rent-collector",
- "solana-svm-transaction 2.3.10",
- "solana-system-interface 1.0.0",
- "solana-system-program 2.3.10",
- "solana-timings",
- "solana-transaction-error 2.2.1",
- "solana-transaction-status 2.3.10",
- "solana-transaction-status-client-types 2.3.10",
- "spl-associated-token-account 7.0.0",
- "spl-memo 6.0.0",
- "spl-token 8.0.0",
- "sqlx",
- "tempfile",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-util 0.7.16",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url 2.5.7",
- "wiremock",
-]
-
-[[package]]
-name = "contra-escrow-program"
-version = "0.1.0"
-dependencies = [
- "codama",
- "const-crypto",
- "pinocchio",
- "pinocchio-associated-token-account",
- "pinocchio-log",
- "pinocchio-system",
- "pinocchio-token",
- "pinocchio-token-2022",
- "serde_json",
- "sha2 0.10.9",
- "solana-address 2.1.0",
- "sparse-merkle-tree",
- "spl-token-2022 9.0.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "contra-escrow-program-client"
-version = "0.0.1"
-dependencies = [
- "borsh 1.5.7",
- "num-derive",
- "num-traits",
- "solana-account 2.2.1",
- "solana-account-info 2.3.0",
- "solana-client 2.3.10",
- "solana-cpi 2.2.1",
- "solana-instruction 2.3.0",
- "solana-program-error 2.2.2",
- "solana-pubkey 2.4.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "contra-gateway"
-version = "0.1.0"
-dependencies = [
- "auth",
- "base64 0.21.7",
- "bs58",
- "chrono",
- "clap 4.5.48",
- "contra-metrics",
- "http-body-util",
- "hyper 1.7.0",
- "hyper-rustls",
- "hyper-util",
- "jsonrpsee",
- "jsonwebtoken",
- "reqwest 0.11.27",
- "rustls 0.23.39",
- "serde",
- "serde_json",
- "sqlx",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "contra-indexer"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.21.7",
- "borsh 1.5.7",
- "bs58",
- "chrono",
- "clap 4.5.48",
- "const-crypto",
- "contra-core",
- "contra-escrow-program-client",
- "contra-metrics",
- "contra-withdraw-program-client",
- "figment",
- "futures 0.3.31",
- "mockito",
- "once_cell",
- "reqwest 0.11.27",
- "rustls 0.23.39",
- "serde",
- "serde_json",
- "serial_test",
- "solana-account-decoder-client-types 2.3.10",
- "solana-address 1.1.0",
- "solana-client 2.3.10",
- "solana-keychain",
- "solana-rpc",
- "solana-rpc-client-api 2.3.10",
- "solana-sdk",
- "solana-sdk-ids 3.0.0",
- "solana-system-interface 1.0.0",
- "solana-test-validator",
- "solana-transaction-status 2.3.10",
- "spl-associated-token-account 7.0.0",
- "spl-memo 6.0.0",
- "spl-token 8.0.0",
- "spl-token-2022 9.0.0",
- "sqlx",
- "tempfile",
- "testcontainers",
- "testcontainers-modules",
- "thiserror 2.0.17",
- "tokio",
- "tokio-util 0.7.16",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "yellowstone-grpc-client",
- "yellowstone-grpc-proto",
-]
-
-[[package]]
-name = "contra-integration"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.21.7",
- "bincode",
- "bs58",
- "chrono",
- "contra-core",
- "contra-escrow-program-client",
- "contra-indexer",
- "contra-withdraw-program-client",
- "http-body-util",
- "hyper 1.7.0",
- "hyper-util",
- "jsonrpsee",
- "mockito",
- "redis",
- "serde_json",
- "solana-account-decoder-client-types 2.3.10",
- "solana-client 2.3.10",
- "solana-keychain",
- "solana-pubkey 2.4.0",
- "solana-sdk",
- "solana-sdk-ids 2.2.1",
- "solana-system-interface 1.0.0",
- "solana-test-validator",
- "solana-transaction-status 2.3.10",
- "spl-associated-token-account 7.0.0",
- "spl-memo 6.0.0",
- "spl-token 8.0.0",
- "spl-token-2022 9.0.0",
- "sqlx",
- "test_utils",
- "testcontainers",
- "testcontainers-modules",
- "tokio",
- "tokio-util 0.7.16",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "yellowstone-grpc-proto",
-]
-
-[[package]]
-name = "contra-metrics"
-version = "0.1.0"
-dependencies = [
- "axum 0.8.4",
- "prometheus",
- "reqwest 0.11.27",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "contra-withdraw-program"
-version = "0.1.0"
-dependencies = [
- "codama",
- "pinocchio",
- "pinocchio-associated-token-account",
- "pinocchio-log",
- "pinocchio-token",
- "serde_json",
- "solana-address 2.1.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "contra-withdraw-program-client"
-version = "0.0.1"
-dependencies = [
- "borsh 1.5.7",
- "num-derive",
- "num-traits",
- "solana-account 2.2.1",
- "solana-account-info 2.3.0",
- "solana-client 2.3.10",
- "solana-cpi 2.2.1",
- "solana-instruction 2.3.0",
- "solana-program-error 2.2.2",
- "solana-pubkey 2.4.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3071,8 +2765,8 @@ dependencies = [
 name = "devnet-scripts"
 version = "0.1.0"
 dependencies = [
- "contra-escrow-program-client",
- "contra-withdraw-program-client",
+ "private-channel-escrow-program-client",
+ "private-channel-withdraw-program-client",
  "solana-client 2.3.10",
  "solana-sdk",
  "solana-system-interface 1.0.0",
@@ -6602,6 +6296,312 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f28921629370a46cf564f6ba1828bd8d1c97f7fad4ee9d1c6438f92feed6b8d"
 dependencies = [
  "ahash 0.8.12",
+]
+
+[[package]]
+name = "private-channel-bench-tps"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "clap 4.5.48",
+ "futures 0.3.31",
+ "hex",
+ "private-channel-core",
+ "private-channel-escrow-program-client",
+ "private-channel-metrics",
+ "private-channel-withdraw-program-client",
+ "rayon",
+ "reqwest 0.11.27",
+ "serde_json",
+ "solana-client 2.3.10",
+ "solana-sdk",
+ "solana-system-interface 1.0.0",
+ "spl-associated-token-account 7.0.0",
+ "spl-token 8.0.0",
+ "tokio",
+ "tokio-util 0.7.16",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "private-channel-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "axum 0.8.4",
+ "base64 0.21.7",
+ "bincode",
+ "bs58",
+ "clap 4.5.48",
+ "enum_dispatch",
+ "futures 0.3.31",
+ "hex",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "jsonrpsee",
+ "private-channel-metrics",
+ "private-channel-withdraw-program-client",
+ "rand 0.7.3",
+ "redis",
+ "reqwest 0.11.27",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "solana-account-decoder 2.3.10",
+ "solana-account-decoder-client-types 2.3.10",
+ "solana-bpf-loader-program 2.3.10",
+ "solana-client 2.3.10",
+ "solana-compute-budget 2.3.10",
+ "solana-epoch-info 2.2.1",
+ "solana-epoch-schedule 2.2.1",
+ "solana-fee-calculator 2.2.1",
+ "solana-hash 2.3.0",
+ "solana-loader-v3-interface 5.0.0",
+ "solana-logger",
+ "solana-program-runtime 2.3.10",
+ "solana-rent-collector",
+ "solana-rpc-client-api 2.3.10",
+ "solana-rpc-client-types 2.3.10",
+ "solana-runtime-transaction 2.3.10",
+ "solana-sdk",
+ "solana-sdk-ids 2.2.1",
+ "solana-svm 2.3.10",
+ "solana-svm-callback 2.3.10",
+ "solana-svm-feature-set 2.3.10",
+ "solana-svm-rent-collector",
+ "solana-svm-transaction 2.3.10",
+ "solana-system-interface 1.0.0",
+ "solana-system-program 2.3.10",
+ "solana-timings",
+ "solana-transaction-error 2.2.1",
+ "solana-transaction-status 2.3.10",
+ "solana-transaction-status-client-types 2.3.10",
+ "spl-associated-token-account 7.0.0",
+ "spl-memo 6.0.0",
+ "spl-token 8.0.0",
+ "sqlx",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util 0.7.16",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url 2.5.7",
+ "wiremock",
+]
+
+[[package]]
+name = "private-channel-escrow-program"
+version = "0.1.0"
+dependencies = [
+ "codama",
+ "const-crypto",
+ "pinocchio",
+ "pinocchio-associated-token-account",
+ "pinocchio-log",
+ "pinocchio-system",
+ "pinocchio-token",
+ "pinocchio-token-2022",
+ "serde_json",
+ "sha2 0.10.9",
+ "solana-address 2.1.0",
+ "sparse-merkle-tree",
+ "spl-token-2022 9.0.0",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "private-channel-escrow-program-client"
+version = "0.0.1"
+dependencies = [
+ "borsh 1.5.7",
+ "num-derive",
+ "num-traits",
+ "solana-account 2.2.1",
+ "solana-account-info 2.3.0",
+ "solana-client 2.3.10",
+ "solana-cpi 2.2.1",
+ "solana-instruction 2.3.0",
+ "solana-program-error 2.2.2",
+ "solana-pubkey 2.4.0",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "private-channel-gateway"
+version = "0.1.0"
+dependencies = [
+ "auth",
+ "base64 0.21.7",
+ "bs58",
+ "chrono",
+ "clap 4.5.48",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-rustls",
+ "hyper-util",
+ "jsonrpsee",
+ "jsonwebtoken",
+ "private-channel-metrics",
+ "reqwest 0.11.27",
+ "rustls 0.23.39",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "private-channel-indexer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "borsh 1.5.7",
+ "bs58",
+ "chrono",
+ "clap 4.5.48",
+ "const-crypto",
+ "figment",
+ "futures 0.3.31",
+ "mockito",
+ "once_cell",
+ "private-channel-core",
+ "private-channel-escrow-program-client",
+ "private-channel-metrics",
+ "private-channel-withdraw-program-client",
+ "reqwest 0.11.27",
+ "rustls 0.23.39",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "solana-account-decoder-client-types 2.3.10",
+ "solana-address 1.1.0",
+ "solana-client 2.3.10",
+ "solana-keychain",
+ "solana-rpc",
+ "solana-rpc-client-api 2.3.10",
+ "solana-sdk",
+ "solana-sdk-ids 3.0.0",
+ "solana-system-interface 1.0.0",
+ "solana-test-validator",
+ "solana-transaction-status 2.3.10",
+ "spl-associated-token-account 7.0.0",
+ "spl-memo 6.0.0",
+ "spl-token 8.0.0",
+ "spl-token-2022 9.0.0",
+ "sqlx",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-util 0.7.16",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
+]
+
+[[package]]
+name = "private-channel-integration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.21.7",
+ "bincode",
+ "bs58",
+ "chrono",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "jsonrpsee",
+ "mockito",
+ "private-channel-core",
+ "private-channel-escrow-program-client",
+ "private-channel-indexer",
+ "private-channel-withdraw-program-client",
+ "redis",
+ "serde_json",
+ "solana-account-decoder-client-types 2.3.10",
+ "solana-client 2.3.10",
+ "solana-keychain",
+ "solana-pubkey 2.4.0",
+ "solana-sdk",
+ "solana-sdk-ids 2.2.1",
+ "solana-system-interface 1.0.0",
+ "solana-test-validator",
+ "solana-transaction-status 2.3.10",
+ "spl-associated-token-account 7.0.0",
+ "spl-memo 6.0.0",
+ "spl-token 8.0.0",
+ "spl-token-2022 9.0.0",
+ "sqlx",
+ "test_utils",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util 0.7.16",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "yellowstone-grpc-proto",
+]
+
+[[package]]
+name = "private-channel-metrics"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.4",
+ "prometheus",
+ "reqwest 0.11.27",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "private-channel-withdraw-program"
+version = "0.1.0"
+dependencies = [
+ "codama",
+ "pinocchio",
+ "pinocchio-associated-token-account",
+ "pinocchio-log",
+ "pinocchio-token",
+ "serde_json",
+ "solana-address 2.1.0",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "private-channel-withdraw-program-client"
+version = "0.0.1"
+dependencies = [
+ "borsh 1.5.7",
+ "num-derive",
+ "num-traits",
+ "solana-account 2.2.1",
+ "solana-account-info 2.3.0",
+ "solana-client 2.3.10",
+ "solana-cpi 2.2.1",
+ "solana-instruction 2.3.0",
+ "solana-program-error 2.2.2",
+ "solana-pubkey 2.4.0",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -16192,13 +16192,13 @@ name = "test_utils"
 version = "0.1.0"
 dependencies = [
  "bs58",
- "contra-escrow-program-client",
- "contra-indexer",
- "contra-withdraw-program-client",
  "futures 0.3.31",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
+ "private-channel-escrow-program-client",
+ "private-channel-indexer",
+ "private-channel-withdraw-program-client",
  "reqwest 0.11.27",
  "rustls 0.23.39",
  "serde_json",
@@ -16260,12 +16260,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "tests-contra-escrow-program"
+name = "tests-private-channel-escrow-program"
 version = "0.1.0"
 dependencies = [
  "const-crypto",
- "contra-escrow-program-client",
  "litesvm",
+ "private-channel-escrow-program-client",
  "solana-program",
  "solana-program-pack 2.2.1",
  "solana-sdk",
@@ -16276,11 +16276,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "tests-contra-withdraw-program"
+name = "tests-private-channel-withdraw-program"
 version = "0.1.0"
 dependencies = [
- "contra-withdraw-program-client",
  "litesvm",
+ "private-channel-withdraw-program-client",
  "solana-program",
  "solana-program-pack 2.2.1",
  "solana-sdk",

@@ -8,7 +8,7 @@ use crate::operator::{parse_instance, RetryConfig, RpcClientWithRetry};
 use crate::operator::{MintCache, TransactionStatusUpdate, WithdrawalRemintInfo};
 use crate::storage::common::storage::Storage;
 use crate::storage::TransactionStatus;
-use crate::ContraIndexerConfig;
+use crate::PrivateChannelIndexerConfig;
 use chrono::Utc;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
@@ -24,7 +24,7 @@ use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
     pub(super) fn new(
-        config: &ContraIndexerConfig,
+        config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
         instance_pda: Option<Pubkey>,
         storage: Arc<Storage>,
@@ -213,8 +213,8 @@ impl SenderState {
             transactions.len()
         );
 
-        // Contra only supports SPL Token for now.
-        let contra_token_program = self.mint_cache.get_contra_token_program();
+        // PrivateChannel only supports SPL Token for now.
+        let private_channel_token_program = self.mint_cache.get_private_channel_token_program();
 
         for tx in transactions {
             // Parse pubkeys stored as strings. On any failure we cannot remint safely,
@@ -243,7 +243,7 @@ impl SenderState {
             };
 
             let user_ata =
-                get_associated_token_address_with_program_id(&user, &mint, &contra_token_program);
+                get_associated_token_address_with_program_id(&user, &mint, &private_channel_token_program);
 
             // u64::try_from catches negative amounts. The write path already guards
             // against this (ba77249) but a corrupt DB row could still produce one —
@@ -297,7 +297,7 @@ impl SenderState {
                 mint,
                 user,
                 user_ata,
-                token_program: contra_token_program,
+                token_program: private_channel_token_program,
                 amount,
             };
 
@@ -820,8 +820,8 @@ mod tests {
         }
     }
 
-    fn make_config() -> ContraIndexerConfig {
-        ContraIndexerConfig {
+    fn make_config() -> PrivateChannelIndexerConfig {
+        PrivateChannelIndexerConfig {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),

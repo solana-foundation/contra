@@ -1,11 +1,11 @@
-# Master Makefile for Contra Programs
+# Master Makefile for Solana Private Channels Programs
 # Delegates to subdirectory Makefiles
 
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := build
 
-PROGRAM_DIRS := contra-escrow-program contra-withdraw-program
+PROGRAM_DIRS := private-channel-escrow-program private-channel-withdraw-program
 RUST_DIRS := core indexer gateway auth
 FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
@@ -124,11 +124,11 @@ unit-test:
 
 integration-test:
 	@echo "Running integration tests for all projects..."
-	@$(MAKE) -C contra-escrow-program integration-test
-	@$(MAKE) -C contra-withdraw-program integration-test
+	@$(MAKE) -C private-channel-escrow-program integration-test
+	@$(MAKE) -C private-channel-withdraw-program integration-test
 	@# Delegate to integration/Makefile so escrow-feature grouping + the full
 	@# `[[test]]` set stay in one place. See integration/Makefile:integration-test
-	@# for the contra/test-tree/prod group ordering.
+	@# for the private-channel/test-tree/prod group ordering.
 	@$(MAKE) -C integration integration-test
 
 ci-unit-test:
@@ -139,8 +139,8 @@ ci-unit-test:
 ci-integration-test:
 	@echo "Running CI integration tests (non-program suites)..."
 	@echo "Building program artifacts once for integration crate tests..."
-	@$(MAKE) -C contra-escrow-program build
-	@$(MAKE) -C contra-withdraw-program build
+	@$(MAKE) -C private-channel-escrow-program build
+	@$(MAKE) -C private-channel-withdraw-program build
 	@$(MAKE) ci-integration-test-build-test-tree
 
 ci-integration-test-build-test-tree:
@@ -149,7 +149,7 @@ ci-integration-test-build-test-tree:
 	@# escrow features in a single run poisons the validator_helper Once.
 	@$(MAKE) ci-integration-test-prebuilt
 	@echo "Building escrow with test-tree for indexer and operator lifecycle tests..."
-	@$(MAKE) -C contra-escrow-program build-test
+	@$(MAKE) -C private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
 	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
@@ -158,10 +158,10 @@ ci-integration-test-build-test-tree:
 ci-integration-test-prebuilt:
 	@# Prod-feature suites that assume a prod escrow `.so` is already in
 	@# target/deploy/. Caller is responsible for the build. Keep in sync with
-	@# integration/Makefile's `integration-coverage-contra` (contra group) and
+	@# integration/Makefile's `integration-coverage-private-channel` (private-channel group) and
 	@# the prod-feature subset of `integration-coverage-indexer`.
-	@echo "=== contra group (prod escrow) ==="
-	@cd integration && cargo nextest run --test contra_integration
+	@echo "=== private-channel group (prod escrow) ==="
+	@cd integration && cargo nextest run --test private_channel_integration
 	@cd integration && cargo test --test test_rpc_http_malformed -- --nocapture
 	@cd integration && cargo test --test test_simulate_transaction_guards -- --nocapture
 	@cd integration && cargo test --test test_health_endpoint_standalone -- --nocapture
@@ -209,13 +209,13 @@ ci-integration-test-prebuilt:
 #   2. Rebuild escrow as prod → run prod-feature indexer tests.
 ci-integration-test-indexer:
 	@echo "Building escrow with test-tree for test-tree-feature group..."
-	@$(MAKE) -C contra-escrow-program build-test
+	@$(MAKE) -C private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
 	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
-	@$(MAKE) -C contra-escrow-program build-no-clients
+	@$(MAKE) -C private-channel-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
 	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
@@ -402,8 +402,8 @@ generate-operator-keypair:
 #############
 build-localnet:
 	@echo "Building all programs for localnet..."
-	@$(MAKE) -C contra-escrow-program build-localnet
-	@$(MAKE) -C contra-withdraw-program build-localnet
+	@$(MAKE) -C private-channel-escrow-program build-localnet
+	@$(MAKE) -C private-channel-withdraw-program build-localnet
 	@$(MAKE) generate-operator-keypair
 	@./scripts/update-admin-env.sh .env.local keypairs/operator-keypair.json
 
@@ -412,15 +412,15 @@ build-localnet:
 #############
 build-devnet:
 	@echo "Building all programs for devnet..."
-	@$(MAKE) -C contra-escrow-program build-devnet
-	@$(MAKE) -C contra-withdraw-program build-devnet
+	@$(MAKE) -C private-channel-escrow-program build-devnet
+	@$(MAKE) -C private-channel-withdraw-program build-devnet
 	@$(MAKE) generate-operator-keypair
 	@./scripts/update-admin-env.sh .env.devnet keypairs/operator-keypair.json
 
 deploy-devnet:
 	@echo "Deploying all programs to devnet..."
-	@$(MAKE) -C contra-escrow-program deploy-devnet DEPLOYER_KEY=$(DEPLOYER_KEY)
-	@$(MAKE) -C contra-withdraw-program deploy-devnet DEPLOYER_KEY=$(DEPLOYER_KEY)
+	@$(MAKE) -C private-channel-escrow-program deploy-devnet DEPLOYER_KEY=$(DEPLOYER_KEY)
+	@$(MAKE) -C private-channel-withdraw-program deploy-devnet DEPLOYER_KEY=$(DEPLOYER_KEY)
 
 profile:
 	@echo "Generating CU profiling report..."
@@ -600,7 +600,7 @@ docker-devnet-ps: check-docker
 	@docker compose -f $(COMPOSE_DEVNET) ps
 
 help:
-	@echo "Contra Programs - Available targets:"
+	@echo "Solana Private Channels Programs - Available targets:"
 	@echo ""
 	@echo "Dependencies:"
 	@echo "  install              - Install dependencies for all projects"
@@ -620,7 +620,7 @@ help:
 	@echo "  integration-test     - Run integration tests for all projects"
 	@echo "  ci-integration-test  - Build prod artifacts, build test-tree, run CI integration suites"
 	@echo "  ci-integration-test-build-test-tree - Run prebuilt test, then test-tree indexer integration"
-	@echo "  ci-integration-test-prebuilt - Run contra integration using prebuilt production artifacts"
+	@echo "  ci-integration-test-prebuilt - Run Solana Private Channels integration using prebuilt production artifacts"
 	@echo "  ci-integration-test-indexer - Build test-tree artifact and run indexer integration only"
 	@echo "  all-test             - Run all tests for all projects"
 	@echo ""

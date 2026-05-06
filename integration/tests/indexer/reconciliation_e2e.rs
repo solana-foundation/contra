@@ -8,8 +8,8 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
-use contra_indexer::{
+use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::IndexerError,
     indexer::reconciliation::run_startup_reconciliation,
@@ -32,7 +32,7 @@ use testcontainers_modules::postgres::Postgres;
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn instance_pda(seed: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"instance", seed.as_ref()], &CONTRA_ESCROW_PROGRAM_ID).0
+    Pubkey::find_program_address(&[b"instance", seed.as_ref()], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).0
 }
 
 async fn seed_mint_and_deposit(

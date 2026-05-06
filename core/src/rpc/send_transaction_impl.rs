@@ -78,7 +78,7 @@ pub async fn send_transaction_impl(
                     || *program_id == spl_associated_token_account::id()
                     || *program_id == spl_memo::id()
                     || *program_id == solana_sdk::system_program::id()
-                    || *program_id == contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID
+                    || *program_id == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
             });
 
     if !is_allowed_transaction {
@@ -200,7 +200,7 @@ mod tests {
         let memo_ix = Instruction {
             program_id: spl_memo::id(),
             accounts: vec![],
-            data: b"contra:mint-idempotency:42".to_vec(),
+            data: b"private_channel:mint-idempotency:42".to_vec(),
         };
         let tx = Transaction::new_signed_with_payer(
             &[memo_ix],

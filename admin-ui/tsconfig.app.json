@@ -24,9 +24,9 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
     "paths": {
-      "@contra-escrow": ["../contra-escrow-program/clients/typescript/src/generated"],
-      "@contra-withdraw": ["../contra-withdraw-program/clients/typescript/src/generated"]
+      "@private-channel-escrow": ["../private-channel-escrow-program/clients/typescript/src/generated"],
+      "@private-channel-withdraw": ["../private-channel-withdraw-program/clients/typescript/src/generated"]
     }
   },
-  "include": ["src", "../contra-escrow-program/clients/typescript/src/generated", "../contra-withdraw-program/clients/typescript/src/generated"]
+  "include": ["src", "../private-channel-escrow-program/clients/typescript/src/generated", "../private-channel-withdraw-program/clients/typescript/src/generated"]
 }

@@ -1,4 +1,4 @@
-//! CLI argument definitions for contra-bench-tps.
+//! CLI argument definitions for private-channel-bench-tps.
 //!
 //! Every argument can also be set via an environment variable (useful when
 //! running inside Docker or calling from `run.sh`).  Environment variables
@@ -9,8 +9,8 @@ use {clap::Parser, std::path::PathBuf};
 /// Top-level CLI with subcommands.
 #[derive(Parser, Debug)]
 #[command(
-    name = "contra-bench-tps",
-    about = "Load testing binary for the Contra pipeline"
+    name = "private-channel-bench-tps",
+    about = "Load testing binary for the PrivateChannel pipeline"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,11 +20,11 @@ pub struct Cli {
 /// Available bench subcommands.
 #[derive(clap::Subcommand, Debug)]
 pub enum SubCommand {
-    /// SPL token transfer load test (Contra pipeline, default flow).
+    /// SPL token transfer load test (PrivateChannel pipeline, default flow).
     Transfer(TransferArgs),
     /// Escrow deposit load test (Solana → escrow program).
     Deposit(DepositArgs),
-    /// Withdraw-burn load test (Contra withdraw program).
+    /// Withdraw-burn load test (PrivateChannel withdraw program).
     Withdraw(WithdrawArgs),
     /// Derive and print the escrow instance PDA for a given instance-seed keypair.
     ///
@@ -59,7 +59,7 @@ pub struct TransferArgs {
     #[arg(long, env = "BENCH_ADMIN_KEYPAIR")]
     pub admin_keypair: PathBuf,
 
-    /// JSON-RPC endpoint of the contra write-node (or gateway).
+    /// JSON-RPC endpoint of the private_channel write-node (or gateway).
     ///
     /// `run.sh` points this at the gateway (`http://localhost:GATEWAY_PORT`)
     /// so that read requests are automatically routed to the read-node.
@@ -179,7 +179,7 @@ pub struct DepositArgs {
 
     /// Prometheus /metrics URL of the operator-solana container.
     ///
-    /// When set, samples `contra_operator_mints_sent_total` every second and
+    /// When set, samples `private_channel_operator_mints_sent_total` every second and
     /// includes e2e minted count and drop rate in the final CLI summary.
     #[arg(long, env = "BENCH_OPERATOR_METRICS_URL")]
     pub operator_metrics_url: Option<String>,
@@ -195,28 +195,28 @@ pub struct DepositArgs {
     #[arg(long, env = "BENCH_INSTANCE_SEED_KEYPAIR")]
     pub instance_seed_keypair: Option<PathBuf>,
 
-    /// JSON-RPC endpoint of the Contra write-node (or gateway).
+    /// JSON-RPC endpoint of the PrivateChannel write-node (or gateway).
     ///
-    /// Used during setup to initialise the SPL mint on Contra so the operator
+    /// Used during setup to initialise the SPL mint on PrivateChannel so the operator
     /// can mint immediately without JIT initialisation.
     #[arg(
         long,
         default_value = "http://localhost:8898",
-        env = "BENCH_CONTRA_RPC_URL"
+        env = "BENCH_PRIVATE_CHANNEL_RPC_URL"
     )]
-    pub contra_rpc_url: String,
+    pub private_channel_rpc_url: String,
 
     /// Tracing log level.
     #[arg(long, default_value = "info", env = "BENCH_LOG_LEVEL")]
     pub log_level: String,
 }
 
-/// Arguments for the withdraw subcommand (Contra withdraw-burn load test).
+/// Arguments for the withdraw subcommand (PrivateChannel withdraw-burn load test).
 #[derive(Parser, Debug)]
 pub struct WithdrawArgs {
     /// Path to the admin keypair JSON file.
     ///
-    /// Used to initialise the Solana escrow infrastructure and fund Contra
+    /// Used to initialise the Solana escrow infrastructure and fund PrivateChannel
     /// withdrawer accounts.  The same keypair is registered as the ReleaseFunds operator.
     #[arg(long, env = "BENCH_ADMIN_KEYPAIR")]
     pub admin_keypair: PathBuf,
@@ -231,16 +231,16 @@ pub struct WithdrawArgs {
     )]
     pub solana_rpc_url: String,
 
-    /// JSON-RPC endpoint of the Contra write-node (or gateway).
+    /// JSON-RPC endpoint of the PrivateChannel write-node (or gateway).
     #[arg(long, default_value = "http://localhost:8899", env = "BENCH_RPC_URL")]
     pub rpc_url: String,
 
     /// Path to the instance-seed keypair JSON file.
     ///
     /// Reuse the same file as the deposit bench (deposit-instance-seed.json) so
-    /// that operator-contra (pre-configured with COMMON_ESCROW_INSTANCE_ID) can
+    /// that operator-private_channel (pre-configured with COMMON_ESCROW_INSTANCE_ID) can
     /// observe the ReleaseFunds calls from this run.  If absent a fresh ephemeral
-    /// keypair is used (e2e tracking via operator-contra will not work).
+    /// keypair is used (e2e tracking via operator-private_channel will not work).
     #[arg(long, env = "BENCH_INSTANCE_SEED_KEYPAIR")]
     pub instance_seed_keypair: Option<PathBuf>,
 
@@ -260,7 +260,7 @@ pub struct WithdrawArgs {
     #[arg(long, default_value_t = 5, env = "BENCH_SENDER_SLEEP_MS")]
     pub sender_sleep_ms: u64,
 
-    /// Initial token balance (raw units) minted to each withdrawer's Contra ATA.
+    /// Initial token balance (raw units) minted to each withdrawer's PrivateChannel ATA.
     #[arg(long, default_value_t = 1_000_000, env = "BENCH_INITIAL_BALANCE")]
     pub initial_balance: u64,
 
@@ -268,9 +268,9 @@ pub struct WithdrawArgs {
     #[arg(long, env = "BENCH_METRICS_PORT")]
     pub metrics_port: Option<u16>,
 
-    /// Prometheus /metrics URL of the operator-contra container.
+    /// Prometheus /metrics URL of the operator-private_channel container.
     ///
-    /// When set, samples `contra_operator_mints_sent_total` every second and
+    /// When set, samples `private_channel_operator_mints_sent_total` every second and
     /// includes e2e solana_released count and drop rate in the final CLI summary.
     #[arg(long, env = "BENCH_WITHDRAW_OPERATOR_METRICS_URL")]
     pub operator_metrics_url: Option<String>,

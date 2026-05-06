@@ -1,17 +1,17 @@
-//! contra-bench-tps — Contra pipeline load testing binary
+//! private-channel-bench-tps — PrivateChannel pipeline load testing binary
 //!
 //! # Overview
 //!
-//! The binary supports three subcommands for testing different parts of the Contra pipeline:
+//! The binary supports three subcommands for testing different parts of the PrivateChannel pipeline:
 //!
 //! **`transfer`** (default flow)
-//! Tests the Contra SPL transfer pipeline.
+//! Tests the PrivateChannel SPL transfer pipeline.
 //!
 //! **`deposit`**
 //! Tests the Solana escrow deposit flow.
 //!
 //! **`withdraw`**
-//! Tests the Contra withdraw-burn flow.
+//! Tests the PrivateChannel withdraw-burn flow.
 //!
 //! Each flow follows the same three-phase structure:
 //!
@@ -44,7 +44,7 @@ use {
         bench_metrics_init, {FLOW_DEPOSIT, FLOW_TRANSFER, FLOW_WITHDRAW},
     },
     clap::Parser,
-    contra_core::client::load_keypair,
+    private_channel_core::client::load_keypair,
     load::{build_destinations, run_generator, run_sender_task},
     load_deposit::{run_deposit_generator, run_deposit_sender_thread},
     load_withdraw::{run_withdraw_generator, run_withdraw_sender_thread},
@@ -84,7 +84,7 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
     init_logging(&args.log_level);
     bench_metrics_init();
     if let Some(port) = args.metrics_port {
-        contra_metrics::start_metrics_server(port);
+        private_channel_metrics::start_metrics_server(port);
     }
 
     info!(
@@ -93,7 +93,7 @@ async fn run_transfer(args: args::TransferArgs) -> Result<()> {
         threads = args.threads,
         batch_size = args.batch_size,
         duration = args.duration,
-        "Starting contra-bench-tps (transfer)",
+        "Starting private-channel-bench-tps (transfer)",
     );
 
     // -------------------------------------------------------------------------
@@ -243,7 +243,7 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
     init_logging(&args.log_level);
     bench_metrics_init();
     if let Some(port) = args.metrics_port {
-        contra_metrics::start_metrics_server(port);
+        private_channel_metrics::start_metrics_server(port);
     }
 
     info!(
@@ -251,12 +251,12 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
         accounts = args.accounts,
         threads = args.threads,
         duration = args.duration,
-        "Starting contra-bench-tps (deposit)",
+        "Starting private-channel-bench-tps (deposit)",
     );
 
     let deposit_config = setup_deposit::run_setup_deposit_phase(
         &args.solana_rpc_url,
-        &args.contra_rpc_url,
+        &args.private_channel_rpc_url,
         &args.admin_keypair,
         args.instance_seed_keypair.as_deref(),
         args.accounts,
@@ -340,12 +340,12 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
 
     let sent = sent_count.load(Ordering::Relaxed);
     let solana_landed = end_tx_count.saturating_sub(start_tx_count);
-    let contra_minted = end_mints.saturating_sub(start_mints);
+    let private_channel_minted = end_mints.saturating_sub(start_mints);
     let solana_tps = solana_landed as f64 / args.duration as f64;
 
     if args.operator_metrics_url.is_some() {
-        let contra_tps = contra_minted as f64 / args.duration as f64;
-        let drop = solana_landed.saturating_sub(contra_minted);
+        let private_channel_tps = private_channel_minted as f64 / args.duration as f64;
+        let drop = solana_landed.saturating_sub(private_channel_minted);
         let drop_rate = if solana_landed > 0 {
             drop as f64 / solana_landed as f64 * 100.0
         } else {
@@ -355,11 +355,11 @@ async fn run_deposit(args: args::DepositArgs) -> Result<()> {
             duration_secs = args.duration,
             sent,
             solana_landed,
-            contra_minted,
+            private_channel_minted,
             drop,
             drop_rate = format!("{drop_rate:.1}%"),
             solana_tps = format!("{solana_tps:.1}"),
-            contra_tps = format!("{contra_tps:.1}"),
+            private_channel_tps = format!("{private_channel_tps:.1}"),
             "Final summary (deposit)",
         );
     } else {
@@ -383,7 +383,7 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     init_logging(&args.log_level);
     bench_metrics_init();
     if let Some(port) = args.metrics_port {
-        contra_metrics::start_metrics_server(port);
+        private_channel_metrics::start_metrics_server(port);
     }
 
     info!(
@@ -392,10 +392,10 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
         accounts = args.accounts,
         threads = args.threads,
         duration = args.duration,
-        "Starting contra-bench-tps (withdraw)",
+        "Starting private-channel-bench-tps (withdraw)",
     );
 
-    // Full e2e setup: initialise Solana escrow infrastructure + Contra mint and accounts.
+    // Full e2e setup: initialise Solana escrow infrastructure + PrivateChannel mint and accounts.
     let withdraw_config = Arc::new(
         setup_withdraw::run_setup_withdraw_phase(
             &args.solana_rpc_url,
@@ -419,14 +419,14 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     ));
 
     let load_end = tokio::time::Instant::now() + Duration::from_secs(args.duration);
-    // Measures burn transactions confirmed on the Contra write-node
-    let contra_metrics_handle = tokio::spawn(run_metrics_sampler(
+    // Measures burn transactions confirmed on the PrivateChannel write-node
+    let private_channel_metrics_handle = tokio::spawn(run_metrics_sampler(
         args.rpc_url.clone(),
         load_end,
         cancel.clone(),
         FLOW_WITHDRAW,
     ));
-    // Samples contra_operator_mints_sent_total from operator-contra for e2e solana_released count
+    // Samples private_channel_operator_mints_sent_total from operator-private_channel for e2e solana_released count
     let operator_handle = args.operator_metrics_url.clone().map(|url| {
         tokio::spawn(run_operator_mints_sampler(
             url,
@@ -471,7 +471,7 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
 
     let _ = gen_handle.await;
     let _ = bh_handle.await;
-    let (start_contra_count, end_contra_count) = contra_metrics_handle.await.unwrap_or((0, 0));
+    let (start_private_channel_count, end_private_channel_count) = private_channel_metrics_handle.await.unwrap_or((0, 0));
     let (start_mints, end_mints) = if let Some(h) = operator_handle {
         h.await.unwrap_or((0, 0))
     } else {
@@ -482,26 +482,26 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     }
 
     let sent = sent_count.load(Ordering::Relaxed);
-    let contra_burned = end_contra_count.saturating_sub(start_contra_count);
-    let contra_tps = contra_burned as f64 / args.duration as f64;
+    let private_channel_burned = end_private_channel_count.saturating_sub(start_private_channel_count);
+    let private_channel_tps = private_channel_burned as f64 / args.duration as f64;
 
     if args.operator_metrics_url.is_some() {
         let solana_released = end_mints.saturating_sub(start_mints);
         let solana_tps = solana_released as f64 / args.duration as f64;
-        let drop = contra_burned.saturating_sub(solana_released);
-        let drop_rate = if contra_burned > 0 {
-            drop as f64 / contra_burned as f64 * 100.0
+        let drop = private_channel_burned.saturating_sub(solana_released);
+        let drop_rate = if private_channel_burned > 0 {
+            drop as f64 / private_channel_burned as f64 * 100.0
         } else {
             0.0
         };
         info!(
             duration_secs = args.duration,
             sent,
-            contra_burned,
+            private_channel_burned,
             solana_released,
             drop,
             drop_rate = format!("{drop_rate:.1}%"),
-            contra_tps = format!("{contra_tps:.1}"),
+            private_channel_tps = format!("{private_channel_tps:.1}"),
             solana_tps = format!("{solana_tps:.1}"),
             "Final summary (withdraw)",
         );
@@ -509,8 +509,8 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
         info!(
             duration_secs = args.duration,
             sent,
-            contra_burned,
-            contra_tps = format!("{contra_tps:.1}"),
+            private_channel_burned,
+            private_channel_tps = format!("{private_channel_tps:.1}"),
             "Final summary (withdraw)",
         );
     }

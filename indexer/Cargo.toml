@@ -1,5 +1,5 @@
 [package]
-name = "contra-indexer"
+name = "private-channel-indexer"
 version = "0.1.0"
 edition = "2021"
 
@@ -54,9 +54,9 @@ futures = { workspace = true }
 async-trait = "0.1"
 borsh = { workspace = true }
 const-crypto = { workspace = true }
-contra-core = { workspace = true }
-contra-escrow-program-client = { workspace = true }
-contra-metrics = { workspace = true }
+private-channel-core = { workspace = true }
+private-channel-escrow-program-client = { workspace = true }
+private-channel-metrics = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
@@ -81,7 +81,7 @@ tokio = { workspace = true, features = ["test-util"] }
 spl-associated-token-account = { workspace = true }
 
 solana-system-interface = { workspace = true }
-contra-withdraw-program-client = { workspace = true }
+private-channel-withdraw-program-client = { workspace = true }
 mockito = "1.7"
 serial_test = "3"
 solana-address = { workspace = true }

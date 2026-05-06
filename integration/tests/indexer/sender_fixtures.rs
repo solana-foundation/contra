@@ -21,8 +21,8 @@
 
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
-    contra_indexer::{
-        config::{ContraIndexerConfig, PostgresConfig, ProgramType, StorageType},
+    private_channel_indexer::{
+        config::{PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType},
         operator::{
             sender::{
                 test_hooks,
@@ -61,12 +61,12 @@ pub fn ensure_admin_signer_env() {
     });
 }
 
-/// Minimal `ContraIndexerConfig` pointing at the supplied mock RPC URL.
+/// Minimal `PrivateChannelIndexerConfig` pointing at the supplied mock RPC URL.
 /// `program_type` differs across tests (Escrow vs Withdraw) so it's a
 /// parameter; the rest of the fields are placeholders that the in-memory
 /// `Storage::Mock` path never inspects.
-pub fn make_config(rpc_url: String, program_type: ProgramType) -> ContraIndexerConfig {
-    ContraIndexerConfig {
+pub fn make_config(rpc_url: String, program_type: ProgramType) -> PrivateChannelIndexerConfig {
+    PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
         rpc_url,

@@ -1,0 +1,29 @@
+# Local docker-compose configuration for Solana Private Channels Operator (withdraw program)
+
+[common]
+program_type = "withdraw"
+# Solana Solana validator — where ReleaseFunds transactions are sent
+rpc_url = "http://localhost:18899"
+
+# Solana Private Channels gateway — source of withdrawal/burn state and mint account data
+source_rpc_url = "http://localhost:8898"
+
+# Placeholder — overridden at runtime by COMMON_ESCROW_INSTANCE_ID, which
+# bench-tps/scripts/run.sh derives from the persistent deposit-instance-seed.json
+# keypair and injects via .env before starting Docker services.
+# Only used as a fallback for manual `docker compose up` without run.sh;
+# update this value to match your actual escrow instance PDA in that case.
+escrow_instance_id = "7HgtQ4VcSZJDtzUBQbjqMWcSr5dauigbqRFqpQMK8pwz"
+
+[storage]
+type = "postgres"
+max_connections = 10
+
+[operator]
+poll_interval_secs = 1
+batch_size = 10
+retry_max_attempts = 3
+retry_base_delay_secs = 1
+channel_buffer_size = 100
+# Solana block time is ~400 ms
+confirmation_poll_interval_ms = 400

@@ -4,7 +4,7 @@ use crate::error::TransactionError;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::ExtraErrorCheckPolicy;
 use crate::operator::{sender::types::InstructionWithSigners, RpcClientWithRetry};
-use contra_escrow_program_client::errors::ContraEscrowProgramError;
+use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use solana_keychain::SolanaSigner;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::InstructionError;
@@ -21,8 +21,8 @@ pub const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
 pub enum ConfirmationResult {
     /// Transaction confirmed on-chain
     Confirmed,
-    /// Transaction failed with optional program error from ContraEscrowProgram
-    Failed(Option<ContraEscrowProgramError>),
+    /// Transaction failed with optional program error from PrivateChannelEscrowProgram
+    Failed(Option<PrivateChannelEscrowProgramError>),
     /// Mint account not initialized (triggers initialization)
     MintNotInitialized,
     /// Transaction couldn't be confirmed after polling max attempts
@@ -187,19 +187,19 @@ pub fn is_mint_already_initialized_error(
 
 /// Parse program error code from transaction error
 ///
-/// Extracts ContraEscrowProgramError from Solana transaction errors.
+/// Extracts PrivateChannelEscrowProgramError from Solana transaction errors.
 /// Returns None if error is not a custom program error.
 pub fn parse_program_error(
     err: &solana_sdk::transaction::TransactionError,
-) -> Option<ContraEscrowProgramError> {
+) -> Option<PrivateChannelEscrowProgramError> {
     match err {
         solana_sdk::transaction::TransactionError::InstructionError(
             _,
             InstructionError::Custom(code),
         ) => {
             match *code {
-                11 => Some(ContraEscrowProgramError::InvalidSmtProof),
-                12 => Some(ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex),
+                11 => Some(PrivateChannelEscrowProgramError::InvalidSmtProof),
+                12 => Some(PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex),
                 _ => None, // Ignore other program errors
             }
         }
@@ -294,7 +294,7 @@ mod tests {
         let result = parse_program_error(&err);
         assert!(matches!(
             result,
-            Some(ContraEscrowProgramError::InvalidSmtProof)
+            Some(PrivateChannelEscrowProgramError::InvalidSmtProof)
         ));
     }
 
@@ -304,7 +304,7 @@ mod tests {
         let result = parse_program_error(&err);
         assert!(matches!(
             result,
-            Some(ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex)
+            Some(PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex)
         ));
     }
 
@@ -434,7 +434,7 @@ mod tests {
         assert!(matches!(
             result,
             Ok(ConfirmationResult::Failed(Some(
-                ContraEscrowProgramError::InvalidSmtProof
+                PrivateChannelEscrowProgramError::InvalidSmtProof
             )))
         ));
     }

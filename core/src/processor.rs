@@ -26,17 +26,17 @@ use {
 /// Program Runtime's `ForkGraph` - must be implemented, to tell the batch
 /// processor how to work across forks.
 ///
-/// Since Contra doesn't use slots or forks, this implementation is mocked.
-pub struct ContraForkGraph {}
+/// Since PrivateChannel doesn't use slots or forks, this implementation is mocked.
+pub struct PrivateChannelForkGraph {}
 
-impl ForkGraph for ContraForkGraph {
+impl ForkGraph for PrivateChannelForkGraph {
     fn relationship(&self, _a: Slot, _b: Slot) -> BlockRelation {
         BlockRelation::Unknown
     }
 }
 
 /// This function encapsulates some initial setup required to tweak the
-/// `TransactionBatchProcessor` for use within Contra.
+/// `TransactionBatchProcessor` for use within PrivateChannel.
 ///
 /// We're simply configuring the mocked fork graph on the SVM API's program
 /// cache, then adding the System program to the processor's builtins.
@@ -45,13 +45,13 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
     feature_set: &SVMFeatureSet,
     compute_budget: &SVMTransactionExecutionBudget,
 ) -> Result<(
-    TransactionBatchProcessor<ContraForkGraph>,
-    Arc<RwLock<ContraForkGraph>>,
+    TransactionBatchProcessor<PrivateChannelForkGraph>,
+    Arc<RwLock<PrivateChannelForkGraph>>,
 )> {
-    let processor = TransactionBatchProcessor::<ContraForkGraph>::default();
+    let processor = TransactionBatchProcessor::<PrivateChannelForkGraph>::default();
 
     // Create and keep the fork graph alive
-    let fork_graph = Arc::new(RwLock::new(ContraForkGraph {}));
+    let fork_graph = Arc::new(RwLock::new(PrivateChannelForkGraph {}));
 
     {
         let mut cache = processor.program_cache.write().unwrap();
@@ -72,7 +72,7 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
             spl_token::id(),
             spl_associated_token_account::id(),
             spl_memo::id(),
-            contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         ];
 
         // Loop over all BPF programs and add them to the cache
@@ -133,7 +133,7 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
 
 /// This functions is also a mock. In the Agave validator, the bank pre-checks
 /// transactions before providing them to the SVM API. We mock this step in
-/// Contra, since we don't need to perform such pre-checks.
+/// PrivateChannel, since we don't need to perform such pre-checks.
 pub fn get_transaction_check_results(
     len: usize,
 ) -> Vec<transaction::Result<CheckedTransactionDetails>> {

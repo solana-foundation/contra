@@ -1,22 +1,22 @@
-//! Bootstrap-time validation for `contra_indexer::indexer::run`.
+//! Bootstrap-time validation for `private_channel_indexer::indexer::run`.
 //!
 //! Covers the misconfiguration branch in
-//! `contra_indexer::indexer::run`: when `program_type = Escrow` but no
+//! `private_channel_indexer::indexer::run`: when `program_type = Escrow` but no
 //! `escrow_instance_id` is set, startup reconciliation has nothing to
 //! anchor against, so `run` must bail with an `InvalidPubkey` error
 //! (wrapped in `IndexerError::Reconciliation`).
 //!
-//! The existing `ContraIndexerConfig::validate()` method would also catch
+//! The existing `PrivateChannelIndexerConfig::validate()` method would also catch
 //! this mismatch, but the `run` fast-path guard matters on its own because
 //! production TOML load skips `validate()` if the user bypasses it in
 //! custom bootstrapping. This test exercises the in-line guard specifically.
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         config::{BackfillConfig, ReconciliationConfig},
         error::{IndexerError, ReconciliationError},
         indexer::run,
-        ContraIndexerConfig, DatasourceType, IndexerConfig, PostgresConfig, ProgramType,
+        PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, PostgresConfig, ProgramType,
         StorageType,
     },
     testcontainers::runners::AsyncRunner,
@@ -39,7 +39,7 @@ async fn run_rejects_escrow_without_instance_id() {
         pg_host, pg_port
     );
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         rpc_url: "http://127.0.0.1:1".to_string(),

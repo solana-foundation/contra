@@ -26,8 +26,8 @@ mod db_migration_race;
 #[path = "pending_remint_storage.rs"]
 mod pending_remint_storage;
 
-use contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID;
-use contra_indexer::{
+use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
     indexer::reconciliation::run_startup_reconciliation,
@@ -51,7 +51,7 @@ use testcontainers_modules::postgres::Postgres;
 
 /// Derive the escrow instance PDA from a seed pubkey.
 fn instance_pda(seed: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"instance", seed.as_ref()], &CONTRA_ESCROW_PROGRAM_ID).0
+    Pubkey::find_program_address(&[b"instance", seed.as_ref()], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).0
 }
 
 /// Register a mint in the `mints` table and insert a single `pending` deposit of
@@ -206,7 +206,7 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
 /// matching pending deposit. With strict threshold (0) reconciliation must pass.
 ///
 /// This also exercises the all-statuses deposit fix: the DB row has
-/// `status = 'pending'` (operator has not yet acted on contra) but the tokens are
+/// `status = 'pending'` (operator has not yet acted on private_channel) but the tokens are
 /// already reflected in the ATA, so the DB-expected balance should include it.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_reconciliation_passes_with_matching_on_chain_balance(

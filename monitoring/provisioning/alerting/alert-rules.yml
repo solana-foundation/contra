@@ -2,7 +2,7 @@ apiVersion: 1
 groups:
   - orgId: 1
     name: indexer-lag-alerts
-    folder: Contra Alerts
+    folder: Solana Private Channels Alerts
     interval: 10s
     rules:
       - uid: indexer-lag-10s
@@ -22,7 +22,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: (contra_indexer_chain_tip_slot - contra_indexer_current_slot) * 0.4
+              expr: (private_channel_indexer_chain_tip_slot - private_channel_indexer_current_slot) * 0.4
               instant: true
               refId: A
           - refId: C
@@ -41,11 +41,11 @@ groups:
 
   - orgId: 1
     name: service-down-alerts
-    folder: Contra Alerts
+    folder: Solana Private Channels Alerts
     interval: 10s
     rules:
       - uid: service-down-scrape
-        title: "Contra service down (scrape target unreachable)"
+        title: "Solana Private Channels service down (scrape target unreachable)"
         condition: C
         for: 30s
         noDataState: Alerting
@@ -61,7 +61,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job=~"gateway|indexer-solana|indexer-contra|operator-solana|operator-contra"}
+              expr: up{job=~"gateway|indexer-solana|indexer-private-channel|operator-solana|operator-private-channel"}
               instant: true
               refId: A
           - refId: C
@@ -79,7 +79,7 @@ groups:
               refId: C
 
       - uid: service-down-probe
-        title: "Contra service down (health probe failed)"
+        title: "Solana Private Channels service down (health probe failed)"
         condition: C
         for: 30s
         noDataState: Alerting
@@ -114,7 +114,7 @@ groups:
 
   - orgId: 1
     name: feepayer-alerts
-    folder: Contra Alerts
+    folder: Solana Private Channels Alerts
     interval: 1m
     rules:
       - uid: feepayer-low-balance
@@ -134,7 +134,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: contra_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
               instant: true
               refId: A
           - refId: C

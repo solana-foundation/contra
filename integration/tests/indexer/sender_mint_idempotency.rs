@@ -35,7 +35,7 @@
 
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
-    contra_indexer::operator::{
+    private_channel_indexer::operator::{
         find_existing_mint_signature,
         utils::{
             instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},

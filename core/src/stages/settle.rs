@@ -321,7 +321,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 num_transactions: perf_num_transactions,
                                 num_slots,
                                 sample_period_secs: perf_sample_period_secs as u16,
-                                // In Contra, all transactions are non-vote transactions
+                                // In PrivateChannel, all transactions are non-vote transactions
                                 num_non_vote_transactions: Some(perf_num_transactions),
                             };
 
@@ -929,7 +929,7 @@ mod tests {
 
         // Setup: Get test database URLs from environment
         let postgres_url = env::var("TEST_POSTGRES_URL").unwrap_or_else(|_| {
-            "postgresql://contra:contra@localhost:5432/contra_test".to_string()
+            "postgresql://private_channel:private_channel@localhost:5432/private_channel_test".to_string()
         });
         let redis_url =
             env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

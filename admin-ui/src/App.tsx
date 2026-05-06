@@ -7,7 +7,7 @@ import { OperatorFunctions } from "./components/OperatorFunctions";
 import { UserFunctions } from "./components/UserFunctions";
 import { StatusChecker } from "./components/StatusChecker";
 import { MintManager } from "./components/MintManager";
-import { ContraManagement } from "./components/ContraManagement";
+import { PrivateChannelManagement } from "./components/PrivateChannelManagement";
 import { useWallet } from "./hooks/useWallet";
 import { useCluster } from "./hooks/useCluster";
 import type { NetworkType } from "./context/ClusterContext";
@@ -15,7 +15,7 @@ import { createSolanaRpc } from "@solana/rpc";
 import { createSolanaRpcSubscriptions } from "@solana/rpc-subscriptions";
 import { SolanaContext } from "./context/SolanaContext";
 
-type TabType = "escrow" | "mint" | "contra";
+type TabType = "escrow" | "mint" | "private-channel";
 
 function AppContent() {
   const { connected, publicKey } = useWallet();
@@ -26,7 +26,7 @@ function AppContent() {
   return (
     <div className="app-container">
       <header className="app-header">
-        <h1>Contra Admin UI</h1>
+        <h1>Solana Private Channels Admin UI</h1>
         <div
           className="header-actions"
           style={{ display: "flex", gap: "1rem", alignItems: "center" }}
@@ -51,7 +51,7 @@ function AppContent() {
       <main className="app-main">
         {!connected ? (
           <div className="connect-prompt">
-            <h2>Connect your wallet to manage your Contra instance</h2>
+            <h2>Connect your wallet to manage your Solana Private Channels instance</h2>
             <p>Use the button above to connect your Solana wallet</p>
             <p className="info-text">Powered by Anza Wallet Adapter</p>
           </div>
@@ -76,10 +76,10 @@ function AppContent() {
                 Mint Management
               </button>
               <button
-                className={`tab ${activeTab === "contra" ? "active" : ""}`}
-                onClick={() => setActiveTab("contra")}
+                className={`tab ${activeTab === "private-channel" ? "active" : ""}`}
+                onClick={() => setActiveTab("private-channel")}
               >
-                Contra Management
+                Solana Private Channels Management
               </button>
             </div>
 
@@ -104,9 +104,9 @@ function AppContent() {
               </div>
 
               <div
-                style={{ display: activeTab === "contra" ? "block" : "none" }}
+                style={{ display: activeTab === "private-channel" ? "block" : "none" }}
               >
-                <ContraManagement />
+                <PrivateChannelManagement />
               </div>
             </div>
           </div>
@@ -114,7 +114,7 @@ function AppContent() {
       </main>
 
       <footer className="app-footer">
-        <p>Contra Escrow & Withdraw Management Interface</p>
+        <p>Solana Private Channels Escrow & Withdraw Management Interface</p>
         <p className="footer-note">
           Built with Anza Wallet Adapter & @solana/kit - Modern Solana tooling!
         </p>

@@ -12,7 +12,7 @@
 //!   - clear failure, retry: row 1 lands without re-submitting row 0
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         config::ProgramType,
         indexer::checkpoint::{CheckpointUpdate, CheckpointWriter},
         storage::{common::storage::mock::MockStorage, Storage},

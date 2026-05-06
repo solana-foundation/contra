@@ -5,10 +5,10 @@
 //!
 //! Production callers use the typed fluent API which always sets every
 //! field, but the defensive checks still exist — this test pins the
-//! error contract for each missing field.
+//! error private_channelct for each missing field.
 
 use {
-    contra_indexer::operator::utils::instruction_util::MintToBuilder, solana_sdk::pubkey::Pubkey,
+    private_channel_indexer::operator::utils::instruction_util::MintToBuilder, solana_sdk::pubkey::Pubkey,
 };
 
 fn pk(seed: u8) -> Pubkey {

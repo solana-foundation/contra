@@ -12,7 +12,7 @@ mod sender_fixtures;
 
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
-    contra_indexer::{
+    private_channel_indexer::{
         config::ProgramType,
         operator::{
             sender::{test_hooks, types::InstructionWithSigners},
@@ -86,7 +86,7 @@ fn make_mint_builder(mint: Pubkey) -> MintToBuilder {
         .mint_authority(admin)
         .token_program(spl_token::id())
         .amount(1_000)
-        .idempotency_memo("contra:mint-idempotency:1".to_string());
+        .idempotency_memo("private_channel:mint-idempotency:1".to_string());
     builder
 }
 
@@ -95,7 +95,7 @@ fn make_mint_builder(mint: Pubkey) -> MintToBuilder {
 /// `txn_id` so the JIT helper can read it; when false, the helper hits
 /// its "no cached builder" early-return branch on first lookup.
 struct Fixture {
-    state: contra_indexer::operator::sender::types::SenderState,
+    state: private_channel_indexer::operator::sender::types::SenderState,
     mock: MockRpcServer,
     txn_id: i64,
     instruction: InstructionWithSigners,

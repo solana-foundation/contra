@@ -1,4 +1,4 @@
-# Example configuration for Contra Indexer
+# Example configuration for Solana Private Channels Indexer
 # Copy this file and customize for your deployment
 # Secrets (DATABASE_URL, tokens) should be set via environment variables
 

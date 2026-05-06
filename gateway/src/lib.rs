@@ -56,7 +56,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
 ];
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "contra-gateway")]
+#[command(name = "private-channel-gateway")]
 #[command(about = "JSON RPC gateway that routes requests to write or read nodes")]
 pub struct Args {
     /// Port to run the gateway on
@@ -665,7 +665,7 @@ pub async fn serve(
 }
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting Contra Gateway");
+    info!("Starting PrivateChannel Gateway");
     info!("  Port: {}", args.port);
     info!("  Write URL: {}", args.write_url);
     info!("  Read URL: {}", args.read_url);

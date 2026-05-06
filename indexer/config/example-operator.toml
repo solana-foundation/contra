@@ -1,4 +1,4 @@
-# Example configuration for Contra Operator
+# Example configuration for Solana Private Channels Operator
 # Copy this file and customize for your deployment
 # Secrets (DATABASE_URL, private keys) must be set via environment variables
 

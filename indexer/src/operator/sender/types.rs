@@ -7,7 +7,7 @@ use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
 use crate::{operator::utils::smt_util::SmtState, operator::MintCache};
 use chrono::{DateTime, Utc};
-use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
+use private_channel_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;

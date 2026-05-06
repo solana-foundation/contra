@@ -21,9 +21,9 @@
 //! closed-sender state.
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         config::{
-            ContraIndexerConfig, PostgresConfig, ProgramType, StorageType,
+            PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         operator::run_sender,
@@ -35,8 +35,8 @@ use {
     tokio_util::sync::CancellationToken,
 };
 
-fn mock_config() -> ContraIndexerConfig {
-    ContraIndexerConfig {
+fn mock_config() -> PrivateChannelIndexerConfig {
+    PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         rpc_url: "http://127.0.0.1:1".to_string(),
@@ -57,7 +57,7 @@ fn mock_config() -> ContraIndexerConfig {
 ///      the loop stalling waiting for a cancellation token that will
 ///      never arrive.
 ///   b. The return value is `Ok(())` — proves the shutdown path is
-///      treated as a normal termination (contrast: the `?` on
+///      treated as a normal termination (private_channelst: the `?` on
 ///      `recover_pending_remints` would have propagated an Err if that
 ///      recovery had failed, so reaching Ok proves the select loop was
 ///      actually entered before exiting).

@@ -3,19 +3,19 @@ use crate::operator::{
     is_mint_already_initialized_error, is_mint_not_initialized_error, ConfirmationResult,
     SignerUtil, DEFAULT_CU_MINT, DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
-use contra_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
+use private_channel_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
 use solana_keychain::Signer;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
 use std::fmt::Display;
 
-pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "contra:remint:";
+pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:remint:";
 
 /*
 Mint initialization is going to be done outside of the operator. There's a command that will add to the allowed mints on Solana mainnet
-and will also initialize that mint on Contra. This simplifies our operator's code and reduces the checks it needs to do if we'd want to
-validate mint existence on Contra.
+and will also initialize that mint on PrivateChannel. This simplifies our operator's code and reduces the checks it needs to do if we'd want to
+validate mint existence on PrivateChannel.
 */
 
 pub fn mint_idempotency_memo(transaction_id: impl Display) -> String {
@@ -26,7 +26,7 @@ pub fn remint_idempotency_memo(transaction_id: impl Display) -> String {
     format!("{REMINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
 }
 
-/// Info needed to remint Contra tokens back to user on permanent withdrawal failure.
+/// Info needed to remint PrivateChannel tokens back to user on permanent withdrawal failure.
 /// Captured in the processor where locals are available, since ReleaseFundsBuilder
 /// has private fields (codama-generated).
 #[derive(Clone, Debug)]
@@ -69,11 +69,11 @@ pub enum ExtraErrorCheckPolicy {
 /// Allows processor to send multiple builder types through a single channel to sender
 #[derive(Clone, Debug)]
 pub enum TransactionBuilder {
-    /// Release funds transaction (Contra → Solana) - requires SMT proof
+    /// Release funds transaction (PrivateChannel → Solana) - requires SMT proof
     ReleaseFunds(Box<ReleaseFundsBuilderWithNonce>),
-    /// Initialize mint transaction (Solana → Contra) - simple initialize_mint instruction
+    /// Initialize mint transaction (Solana → PrivateChannel) - simple initialize_mint instruction
     InitializeMint(Box<InitializeMintBuilder>),
-    /// Mint transaction (Solana → Contra) - simple SPL mint, no proof needed
+    /// Mint transaction (Solana → PrivateChannel) - simple SPL mint, no proof needed
     Mint(Box<MintToBuilderWithTxnId>),
     /// Reset SMT root transaction - rotates to new tree
     ResetSmtRoot(Box<ResetSmtRootBuilder>),
@@ -396,7 +396,7 @@ impl InitializeMintBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use contra_escrow_program_client::instructions::ResetSmtRootBuilder;
+    use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
     use solana_sdk::pubkey::Pubkey;
 
     fn pk(i: u8) -> Pubkey {
@@ -518,7 +518,7 @@ mod tests {
             .token_program(spl_token::id())
             .associated_token_program(spl_associated_token_account::id())
             .event_authority(pk(10))
-            .contra_escrow_program(pk(11))
+            .private_channel_escrow_program(pk(11))
             .amount(100)
             .user(pk(12))
             .new_withdrawal_root([0u8; 32])
@@ -559,7 +559,7 @@ mod tests {
             .instance(pk(3))
             .operator_pda(pk(4))
             .event_authority(pk(5))
-            .contra_escrow_program(pk(6));
+            .private_channel_escrow_program(pk(6));
         TransactionBuilder::ResetSmtRoot(Box::new(inner.clone()))
     }
 
@@ -656,7 +656,7 @@ mod tests {
     fn remint_idempotency_memo_format() {
         assert_eq!(
             remint_idempotency_memo(99_i64),
-            "contra:remint:99".to_string()
+            "private_channel:remint:99".to_string()
         );
     }
 }

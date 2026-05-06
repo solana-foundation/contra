@@ -57,7 +57,7 @@ pub async fn get_signature_statuses_impl(
         match stored_tx {
             Some(tx) => {
                 // Transaction found - return its status
-                // In Contra, all found transactions are confirmed (finalized)
+                // In PrivateChannel, all found transactions are confirmed (finalized)
                 debug!(
                     signature = %signature,
                     status = ?tx.meta.status,

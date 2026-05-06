@@ -1,22 +1,22 @@
-# Withdrawing Tokens from Contra
+# Withdrawing Tokens from Solana Private Channels
 
-This guide explains how to withdraw tokens from the Contra payment channel back to Solana Mainnet using Sparse Merkle Tree (SMT) proofs.
+This guide explains how to withdraw tokens from the Solana Private Channels payment channel back to Solana Mainnet using Sparse Merkle Tree (SMT) proofs.
 
-Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-withdrawal-on-contra)
+Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-withdrawal-on-private_channel)
 
 ## Overview
 
-Withdrawals move tokens from the Contra payment channel to Solana Mainnet through a three-step process:
+Withdrawals move tokens from the Solana Private Channels payment channel to Solana Mainnet through a three-step process:
 
-1. **Burn on Contra**: User calls `WithdrawFunds` instruction to burn tokens on the Contra payment channel
+1. **Burn on Solana Private Channels**: User calls `WithdrawFunds` instruction to burn tokens on the Solana Private Channels payment channel
 2. **Backend Processing**: Indexer detects burn event, builds SMT proof, and submits to Mainnet
 3. **Release on Mainnet**: Operator calls `ReleaseFunds` instruction with cryptographic proof to unlock escrowed tokens
 
-The [Indexer/Operator](../indexer/src/operator/) handles steps 2 and 3 automatically. This guide explains how the withdraw process works and how to manually initiate a withdrawal on Contra.
+The [Indexer/Operator](../indexer/src/operator/) handles steps 2 and 3 automatically. This guide explains how the withdraw process works and how to manually initiate a withdrawal on Solana Private Channels.
 
 ## Understanding the Sparse Merkle Tree (SMT)
 
-Contra uses a **Sparse Merkle Tree** to prevent double-spending of withdrawals. Each withdrawal is assigned a unique `transaction_nonce` that gets recorded in the tree. The mainnet escrow program validates each withdrawal's nonce and tree index to prevent double processing of the same withdrawal.
+Solana Private Channels uses a **Sparse Merkle Tree** to prevent double-spending of withdrawals. Each withdrawal is assigned a unique `transaction_nonce` that gets recorded in the tree. The mainnet escrow program validates each withdrawal's nonce and tree index to prevent double processing of the same withdrawal.
 
 ### Tree Structure
 - **Height**: 16 levels
@@ -49,9 +49,9 @@ Traditional Merkle trees require storing all intermediate nodes. SMTs are "spars
 
 ### The Rotating Tree Index System
 
-Contra uses a **rotating tree index** mechanism to handle unlimited withdrawals while keeping the SMT bounded and limited in size. This helps minimize account size, transaction size, and processing costs/compute.
+Solana Private Channels uses a **rotating tree index** mechanism to handle unlimited withdrawals while keeping the SMT bounded and limited in size. This helps minimize account size, transaction size, and processing costs/compute.
 
-Each Contra instance has its own tree with two important fields stored in the `Instance` state:
+Each Solana Private Channels instance has its own tree with two important fields stored in the `Instance` state:
 - `withdrawal_transactions_root`: The root hash of the tree
 - `current_tree_index`: The index of the current tree
 
@@ -129,17 +129,17 @@ Tree Index 0 (nonces 0-65,535)              Tree Index 1 (nonces 65,536-131,071)
 ```
 
 
-## Initiate a Withdrawal on Contra
+## Initiate a Withdrawal on Solana Private Channels
 
-Users initiate withdrawals by burning tokens on the Contra payment channel using the Withdrawal Program. This will burn tokens from Contra. The Contra Indexer/Operator will monitor for these transactions and then process the `ReleaseFunds` instruction on Mainnet.
+Users initiate withdrawals by burning tokens on the Solana Private Channels payment channel using the Withdrawal Program. This will burn tokens from Solana Private Channels. The Solana Private Channels Indexer/Operator will monitor for these transactions and then process the `ReleaseFunds` instruction on Mainnet.
 
 ### TypeScript Example
 
 ```typescript
 import {
   getWithdrawFundsInstructionAsync,
-  CONTRA_WITHDRAW_PROGRAM_PROGRAM_ADDRESS
-} from 'contra-withdraw-program';
+  PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS
+} from 'private-channel-withdraw-program';
 import { address, generateKeyPairSigner, none } from '@solana/kit';
 
 const user = await generateKeyPairSigner();
@@ -157,17 +157,17 @@ const withdrawIx = await getWithdrawFundsInstructionAsync({
   destination: none(), // Optionally pass a destination address on Mainnet
 });
 
-// Send to Contra RPC
-const contraRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'https://contra-rpc.example.com' }));
+// Send to Solana Private Channels RPC
+const private_channelRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'https://private-channel-rpc.example.com' }));
 // ... sign and send transaction
 ```
 
 **Key Points:**
-- **Permissionless**: Any user can burn their tokens on Contra
+- **Permissionless**: Any user can burn their tokens on Solana Private Channels
 - **Destination Field**:
   - If `null`: Tokens released to `user` address on Mainnet
   - If specified: Tokens released to `destination` address on Mainnet (associated token account must already exist for this user's address on Mainnet)
-- Executing the `WithdrawFunds` instruction will burn tokens from the Contra payment channel immediately.
+- Executing the `WithdrawFunds` instruction will burn tokens from the Solana Private Channels payment channel immediately.
 
 ### Related Documentation
 - [Escrow Interaction Guide](ESCROW_INTERACTION_GUIDE.md)

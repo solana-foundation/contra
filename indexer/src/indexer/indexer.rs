@@ -7,7 +7,7 @@ use crate::{
     },
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer},
     storage::{PostgresDb, Storage},
-    ContraIndexerConfig, DatasourceType, IndexerConfig, StorageType,
+    PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, StorageType,
 };
 
 #[cfg(feature = "datasource-rpc")]
@@ -18,7 +18,7 @@ use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
 
 #[cfg(feature = "datasource-yellowstone")]
 use crate::indexer::datasource::yellowstone::YellowstoneSource;
-use contra_metrics::HealthState;
+use private_channel_metrics::HealthState;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -26,11 +26,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 pub async fn run(
-    common_config: ContraIndexerConfig,
+    common_config: PrivateChannelIndexerConfig,
     indexer_config: IndexerConfig,
     health: Option<Arc<HealthState>>,
 ) -> Result<(), IndexerError> {
-    info!("Starting Contra Indexer");
+    info!("Starting PrivateChannel Indexer");
     info!("Program: {:?}", common_config.program_type);
     info!("Datasource: {:?}", indexer_config.datasource_type);
     info!("Storage: {:?}", common_config.storage_type);

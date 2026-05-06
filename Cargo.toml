@@ -2,12 +2,12 @@
 
 members = [
     "auth",
-    "contra-escrow-program/program",
-    "contra-escrow-program/tests/integration-tests",
-    "contra-escrow-program/clients/rust",
-    "contra-withdraw-program/program",
-    "contra-withdraw-program/tests/integration-tests",
-    "contra-withdraw-program/clients/rust",
+    "private-channel-escrow-program/program",
+    "private-channel-escrow-program/tests/integration-tests",
+    "private-channel-escrow-program/clients/rust",
+    "private-channel-withdraw-program/program",
+    "private-channel-withdraw-program/tests/integration-tests",
+    "private-channel-withdraw-program/clients/rust",
     "core",
     "gateway",
     "indexer",
@@ -137,11 +137,11 @@ uuid = { version = "1", features = ["v4"] }
 # unchanged between the two.
 yellowstone-grpc-client = "~12.2"
 yellowstone-grpc-proto = "~12.2"
-contra-core = { path = "core" }
-contra-metrics = { path = "metrics" }
-contra-escrow-program-client = { path = "contra-escrow-program/clients/rust", features = [
+private-channel-core = { path = "core" }
+private-channel-metrics = { path = "metrics" }
+private-channel-escrow-program-client = { path = "private-channel-escrow-program/clients/rust", features = [
     "fetch",
 ] }
-contra-withdraw-program-client = { path = "contra-withdraw-program/clients/rust", features = [
+private-channel-withdraw-program-client = { path = "private-channel-withdraw-program/clients/rust", features = [
     "fetch",
 ] }

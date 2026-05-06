@@ -4,7 +4,7 @@ use solana_rpc_client_types::{config::RpcGetVoteAccountsConfig, response::RpcVot
 pub async fn get_vote_accounts_impl(
     _config: Option<RpcGetVoteAccountsConfig>,
 ) -> RpcResult<RpcVoteAccountStatus> {
-    // Contra has no voting/staking mechanism, so both arrays are empty
+    // PrivateChannel has no voting/staking mechanism, so both arrays are empty
     Ok(RpcVoteAccountStatus {
         current: vec![],
         delinquent: vec![],

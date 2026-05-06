@@ -24,7 +24,7 @@ pub async fn verify_wallet(
     // Reconstruct the exact message the client was asked to sign.
     // Must match the format returned by /auth/challenge-wallet.
     let message = format!(
-        "Contra wallet verification\nuser: {}\nnonce: {}\nexpires: {}",
+        "PrivateChannel wallet verification\nuser: {}\nnonce: {}\nexpires: {}",
         claims.sub,
         challenge.nonce,
         challenge.expires_at.timestamp()

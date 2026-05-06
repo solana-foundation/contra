@@ -17,7 +17,7 @@ use testcontainers_modules::postgres::Postgres;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use contra_auth::{build_app, db, jwt::JwtConfig, AppState};
+use private_channel_auth::{build_app, db, jwt::JwtConfig, AppState};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -52,7 +52,7 @@ async fn start_app(db_url: &str) -> SocketAddr {
     let state = AppState {
         pool,
         jwt: Arc::new(JwtConfig::new("test-secret")),
-        pool_status: contra_auth::pool_status::PoolStatus::new_healthy(),
+        pool_status: private_channel_auth::pool_status::PoolStatus::new_healthy(),
     };
 
     let app = build_app(state, "*");
@@ -891,7 +891,7 @@ async fn test_cleanup_stale_challenges() {
     // Insert an expired challenge (expires_at in the past, not used).
     sqlx::query(
         r#"
-        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at)
+        INSERT INTO private_channel_auth.challenges (id, user_id, nonce, expires_at)
         VALUES ($1, $2, $3, NOW() - INTERVAL '1 hour')
         "#,
     )
@@ -905,7 +905,7 @@ async fn test_cleanup_stale_challenges() {
     // Insert a used challenge (used_at is set, not yet expired).
     sqlx::query(
         r#"
-        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at, used_at)
+        INSERT INTO private_channel_auth.challenges (id, user_id, nonce, expires_at, used_at)
         VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes', NOW())
         "#,
     )
@@ -920,7 +920,7 @@ async fn test_cleanup_stale_challenges() {
     let valid_nonce = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at)
+        INSERT INTO private_channel_auth.challenges (id, user_id, nonce, expires_at)
         VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')
         "#,
     )
@@ -938,7 +938,7 @@ async fn test_cleanup_stale_challenges() {
     assert_eq!(deleted, 2, "expired and used challenges should be removed");
 
     let remaining: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM contra_auth.challenges WHERE nonce = $1")
+        sqlx::query_as("SELECT COUNT(*) FROM private_channel_auth.challenges WHERE nonce = $1")
             .bind(valid_nonce)
             .fetch_one(&pool)
             .await

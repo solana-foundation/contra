@@ -18,7 +18,7 @@ pub mod test_hooks {
     use std::sync::Arc;
 
     pub fn new_sender_state(
-        config: &ContraIndexerConfig,
+        config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
         instance_pda: Option<solana_sdk::pubkey::Pubkey>,
         storage: Arc<Storage>,
@@ -150,7 +150,7 @@ use crate::operator::utils::instruction_util::TransactionBuilder;
 use crate::operator::ReleaseFundsBuilderWithNonce;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::storage::Storage;
-use crate::ContraIndexerConfig;
+use crate::PrivateChannelIndexerConfig;
 use crate::ProgramType;
 use solana_sdk::commitment_config::CommitmentLevel;
 use std::sync::Arc;
@@ -170,7 +170,7 @@ use types::{PollTaskResult, SenderState};
 /// completes with SMT proofs if needed, submits to blockchain, and handles failures
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sender(
-    config: &ContraIndexerConfig,
+    config: &PrivateChannelIndexerConfig,
     operator_commitment: CommitmentLevel,
     mut processor_rx: mpsc::Receiver<TransactionBuilder>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
@@ -402,7 +402,7 @@ mod tests {
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
-    use crate::ContraIndexerConfig;
+    use crate::PrivateChannelIndexerConfig;
     use solana_keychain::Signer;
     use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
     use solana_sdk::pubkey::Pubkey;
@@ -470,8 +470,8 @@ mod tests {
         }
     }
 
-    fn minimal_config() -> ContraIndexerConfig {
-        ContraIndexerConfig {
+    fn minimal_config() -> PrivateChannelIndexerConfig {
+        PrivateChannelIndexerConfig {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),

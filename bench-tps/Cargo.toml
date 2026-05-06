@@ -1,20 +1,20 @@
 [package]
-name = "contra-bench-tps"
+name = "private-channel-bench-tps"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "contra-bench-tps"
+name = "private-channel-bench-tps"
 path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
 async-channel = { workspace = true }
 clap = { workspace = true }
-contra-core = { workspace = true }
-contra-metrics = { workspace = true }
-contra-escrow-program-client = { workspace = true }
-contra-withdraw-program-client = { workspace = true }
+private-channel-core = { workspace = true }
+private-channel-metrics = { workspace = true }
+private-channel-escrow-program-client = { workspace = true }
+private-channel-withdraw-program-client = { workspace = true }
 futures = { workspace = true }
 hex = "0.4"
 rayon = "1.10"

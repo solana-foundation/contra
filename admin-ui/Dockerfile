@@ -19,15 +19,15 @@ RUN npm install -g pnpm@${PNPM_VERSION} \
 WORKDIR /workspace
 
 # Copy program dirs (IDL + codama scripts + package configs)
-COPY contra-escrow-program ./contra-escrow-program
-COPY contra-withdraw-program ./contra-withdraw-program
+COPY private-channel-escrow-program ./private-channel-escrow-program
+COPY private-channel-withdraw-program ./private-channel-withdraw-program
 
 # Generate TypeScript clients from IDL. The pnpm store is a content-addressed cache;
 # node_modules under each project still get materialized as a normal layer.
 RUN --mount=type=cache,target=/pnpm-store,sharing=locked \
-    cd contra-escrow-program && pnpm install && pnpm run generate-clients
+    cd private-channel-escrow-program && pnpm install && pnpm run generate-clients
 RUN --mount=type=cache,target=/pnpm-store,sharing=locked \
-    cd contra-withdraw-program && pnpm install && pnpm run generate-clients
+    cd private-channel-withdraw-program && pnpm install && pnpm run generate-clients
 
 # Copy and build admin-ui
 COPY admin-ui ./admin-ui
@@ -36,8 +36,8 @@ WORKDIR /workspace/admin-ui
 RUN --mount=type=cache,target=/pnpm-store,sharing=locked \
     pnpm install --frozen-lockfile
 
-ARG CONTRA_RPC_URL
-ARG CONTRA_WS_URL
+ARG PRIVATE_CHANNEL_RPC_URL
+ARG PRIVATE_CHANNEL_WS_URL
 
 RUN npx vite build
 

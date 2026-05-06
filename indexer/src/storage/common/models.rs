@@ -29,7 +29,7 @@ pub enum TransactionStatus {
     Processing,
     Completed,
     Failed,
-    // Withdrawal failed permanently but burned Contra tokens were reminted back to user
+    // Withdrawal failed permanently but burned PrivateChannel tokens were reminted back to user
     #[sqlx(rename = "failed_reminted")]
     FailedReminted,
     // Remint attempted but could not confirm — requires manual investigation
@@ -61,8 +61,8 @@ pub struct DbTransaction {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
-    // If this is a deposit from Solana to Contra, this will represent the Contra signature and
-    // if this is a withdrawal from Contra to Solana, this will represent the Solana signature
+    // If this is a deposit from Solana to PrivateChannel, this will represent the PrivateChannel signature and
+    // if this is a withdrawal from PrivateChannel to Solana, this will represent the Solana signature
     pub counterpart_signature: Option<String>,
     /// Withdrawal signatures sent to Solana, stored when status transitions to
     /// PendingRemint. Used on restart to verify whether the original withdrawal
@@ -81,7 +81,7 @@ pub struct MintDbBalance {
     pub token_program: String,
     /// Sum of amounts for all indexed deposits (any status).
     /// Deposits increase the on-chain ATA balance the moment they are observed,
-    /// regardless of whether the operator has completed the corresponding contra mint.
+    /// regardless of whether the operator has completed the corresponding private_channel mint.
     pub total_deposits: i64,
     /// Sum of amounts for completed withdrawals only.
     /// Only a completed `release_funds` call actually reduces the on-chain ATA balance.

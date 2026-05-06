@@ -1,6 +1,6 @@
 //! Pending-remint recovery across operator restart.
 //!
-//! Verifies the integration-level contract of
+//! Verifies the integration-level private_channelct of
 //! `SenderState::recover_pending_remints`: on startup, every PendingRemint
 //! row in the database must be fully reconstructed into the in-memory
 //! `pending_remints` queue so the finality-check tick can pick up where
@@ -18,14 +18,14 @@
 //!
 //! Unlike the in-crate unit tests (`indexer/src/operator/sender/state.rs`
 //! `recover_pending_remints_*`), this test exercises the recovery path
-//! through the exported test hook (`contra_indexer::operator::sender::test_hooks`)
+//! through the exported test hook (`private_channel_indexer::operator::sender::test_hooks`)
 //! so the integration crate boundary stays honest — the same public API
 //! a future external tool would use to drive recovery.
 
 use {
     chrono::{DateTime, Utc},
-    contra_indexer::{
-        config::{ContraIndexerConfig, PostgresConfig, ProgramType, StorageType},
+    private_channel_indexer::{
+        config::{PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType},
         operator::sender::{test_hooks, TransactionStatusUpdate},
         storage::{
             common::{
@@ -71,8 +71,8 @@ fn make_row(
     }
 }
 
-fn make_config() -> ContraIndexerConfig {
-    ContraIndexerConfig {
+fn make_config() -> PrivateChannelIndexerConfig {
+    PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         // RpcClientWithRetry is only constructed here — we never make an

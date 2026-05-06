@@ -21,10 +21,10 @@
 //!      fires when two writers race past the initial existence check).
 
 use {
-    contra_indexer::storage::{
+    private_channel_indexer::storage::{
         common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType,
     },
-    contra_indexer::PostgresConfig,
+    private_channel_indexer::PostgresConfig,
     solana_sdk::signature::Signature,
     testcontainers::runners::AsyncRunner,
     testcontainers_modules::postgres::Postgres,

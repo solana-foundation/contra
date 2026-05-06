@@ -3,9 +3,9 @@
 //! Exercises the error paths in
 //! `indexer/src/indexer/datasource/yellowstone/source.rs` that only fire on a
 //! malformed upstream `SubscribeUpdate`. All assertions pin the CURRENT
-//! production contract; behaviour changes should fail these tests.
+//! production private_channelct; behaviour changes should fail these tests.
 //!
-//! ## Pinned contract (per source.rs, 2026-04)
+//! ## Pinned private_channelct (per source.rs, 2026-04)
 //!
 //! 1. Stream-level error (`tonic::Status`) ⇒ `connect_and_stream` returns
 //!    `Err(DataSourceRpcError::Protocol)`, the outer loop logs via `error!`,
@@ -17,17 +17,17 @@
 //!    Source treats this as a stream-level protocol error and reconnects.
 //!    (Per source.rs comments this is the "category b" defensive branch —
 //!    a single malformed transaction kills the live subscription. This
-//!    behaviour is under-cautious but IS the current contract; flagging
+//!    behaviour is under-cautious but IS the current private_channelct; flagging
 //!    for follow-up in the commit message rather than fixing here.)
 //! 3. Transaction whose compiled instructions reference a different program
 //!    ID ⇒ inner-loop `continue`, no stream-level impact, no error, no
 //!    reconnect; subsequent updates on the same stream keep flowing.
 
-use contra_indexer::config::ProgramType;
-use contra_indexer::indexer::datasource::common::datasource::DataSource;
-use contra_indexer::indexer::datasource::common::parser::escrow::CONTRA_ESCROW_PROGRAM_ID;
-use contra_indexer::indexer::datasource::common::types::ProcessorMessage;
-use contra_indexer::indexer::datasource::yellowstone::YellowstoneSource;
+use private_channel_indexer::config::ProgramType;
+use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
+use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_indexer::indexer::datasource::common::types::ProcessorMessage;
+use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource;
 use std::str::FromStr;
 use std::time::Duration;
 use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher};
@@ -95,7 +95,7 @@ fn tx_update_with_program(slot: u64, program_id: solana_sdk::pubkey::Pubkey) -> 
     };
 
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(SubscribeUpdateTransactionInfo {
                 signature: vec![7u8; 64],
@@ -146,7 +146,7 @@ fn tx_update_bad_program_index(slot: u64) -> SubscribeUpdate {
         message: Some(message),
     };
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(SubscribeUpdateTransactionInfo {
                 signature: vec![0x77u8; 64],
@@ -170,7 +170,7 @@ fn tx_update_missing_message(slot: u64) -> SubscribeUpdate {
     };
 
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(SubscribeUpdateTransactionInfo {
                 signature: vec![0x55; 64],
@@ -194,7 +194,7 @@ struct TestHarness {
 
 async fn spin_up() -> TestHarness {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,contra_indexer=debug")
+        .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
         .try_init();
 
@@ -319,7 +319,7 @@ async fn stream_error_triggers_reconnect_and_resumes() {
 /// stream terminates and the source reconnects. Subsequent scripted updates
 /// are delivered on the new stream.
 ///
-/// Note: a more resilient contract would skip the individual bad tx. Current
+/// Note: a more resilient private_channelct would skip the individual bad tx. Current
 /// behaviour surfaces this as a stream-kill — documented above, flagging
 /// only — the test pins what the code does today.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -439,7 +439,7 @@ async fn wrong_program_id_is_silently_filtered() {
     // for — the filtered tx legitimately did not match.
     assert_ne!(
         wrong_program,
-        solana_sdk::pubkey::Pubkey::from_str(CONTRA_ESCROW_PROGRAM_ID).unwrap()
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap()
     );
 
     tear_down(h).await;

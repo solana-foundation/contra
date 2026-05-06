@@ -5,7 +5,7 @@ use crate::metrics;
 use crate::storage::common::models::{DbTransaction, TransactionType};
 use crate::storage::Storage;
 use crate::ProgramType;
-use contra_metrics::{HealthState, MetricLabel};
+use private_channel_metrics::{HealthState, MetricLabel};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

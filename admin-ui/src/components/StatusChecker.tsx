@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useSolana } from '../hooks/useSolana';
 import { address } from '@solana/addresses';
-import { findAllowedMintPda, findOperatorPda } from '@contra-escrow';
+import { findAllowedMintPda, findOperatorPda } from '@private-channel-escrow';
 
 interface StatusCheckerProps {
   instancePubkey: string;

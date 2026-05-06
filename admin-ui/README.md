@@ -1,6 +1,6 @@
-# Contra Admin UI
+# Solana Private Channels Admin UI
 
-A modern web-based admin interface for managing Contra instances on Solana. **Fully migrated to @solana/kit v2** with zero deprecated dependencies!
+A modern web-based admin interface for managing Solana Private Channels instances on Solana. **Fully migrated to @solana/kit v2** with zero deprecated dependencies!
 
 ## ✅ Full Migration Complete
 

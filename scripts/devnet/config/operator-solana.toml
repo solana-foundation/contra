@@ -1,5 +1,5 @@
 # Devnet configuration for Solana Operator (escrow program)
-# Processes deposits FROM Solana → Mints TO Contra
+# Processes deposits FROM Solana → Mints TO Solana Private Channels
 
 [common]
 program_type = "escrow"
@@ -19,5 +19,5 @@ batch_size = 1000
 retry_max_attempts = 3
 retry_base_delay_secs = 1
 channel_buffer_size = 1000
-# Contra block time is ~100 ms; poll quickly to reduce per-mint latency
+# Solana Private Channels block time is ~100 ms; poll quickly to reduce per-mint latency
 confirmation_poll_interval_ms = 100

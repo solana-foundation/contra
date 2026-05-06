@@ -1,4 +1,4 @@
-use contra_metrics::{counter_vec, gauge_vec, histogram_vec};
+use private_channel_metrics::{counter_vec, gauge_vec, histogram_vec};
 
 // ---------------------------------------------------------------------------
 // Indexer metrics
@@ -6,70 +6,70 @@ use contra_metrics::{counter_vec, gauge_vec, histogram_vec};
 
 counter_vec!(
     INDEXER_SLOTS_PROCESSED,
-    "contra_indexer_slots_processed_total",
+    "private_channel_indexer_slots_processed_total",
     "Total slots checkpointed by the indexer",
     &["program_type"]
 );
 
 counter_vec!(
     INDEXER_TRANSACTIONS_SAVED,
-    "contra_indexer_transactions_saved_total",
+    "private_channel_indexer_transactions_saved_total",
     "Total transactions saved to the database",
     &["program_type"]
 );
 
 counter_vec!(
     INDEXER_MINTS_SAVED,
-    "contra_indexer_mints_saved_total",
+    "private_channel_indexer_mints_saved_total",
     "Total mints upserted to the database",
     &["program_type"]
 );
 
 counter_vec!(
     INDEXER_SLOT_SAVE_ERRORS,
-    "contra_indexer_slot_save_errors_total",
+    "private_channel_indexer_slot_save_errors_total",
     "Total slot save errors (mints or transactions)",
     &["program_type"]
 );
 
 gauge_vec!(
     INDEXER_CURRENT_SLOT,
-    "contra_indexer_current_slot",
+    "private_channel_indexer_current_slot",
     "Latest slot successfully checkpointed",
     &["program_type"]
 );
 
 counter_vec!(
     INDEXER_RPC_ERRORS,
-    "contra_indexer_rpc_errors_total",
+    "private_channel_indexer_rpc_errors_total",
     "Total RPC errors in datasource layer",
     &["program_type", "error_type"]
 );
 
 gauge_vec!(
     INDEXER_CHAIN_TIP_SLOT,
-    "contra_indexer_chain_tip_slot",
+    "private_channel_indexer_chain_tip_slot",
     "Latest slot on the Solana chain as seen by the datasource",
     &["program_type"]
 );
 
 gauge_vec!(
     INDEXER_BACKFILL_SLOTS_REMAINING,
-    "contra_indexer_backfill_slots_remaining",
+    "private_channel_indexer_backfill_slots_remaining",
     "Remaining slots to backfill (0 when not backfilling)",
     &["program_type"]
 );
 
 counter_vec!(
     INDEXER_DATASOURCE_RECONNECTS,
-    "contra_indexer_datasource_reconnects_total",
+    "private_channel_indexer_datasource_reconnects_total",
     "Total Yellowstone gRPC reconnections",
     &["program_type"]
 );
 
 histogram_vec!(
     INDEXER_SLOT_PROCESSING_DURATION,
-    "contra_indexer_slot_processing_duration_seconds",
+    "private_channel_indexer_slot_processing_duration_seconds",
     "Time to process and checkpoint a slot",
     &["program_type"]
 );
@@ -80,56 +80,56 @@ histogram_vec!(
 
 counter_vec!(
     OPERATOR_TRANSACTIONS_FETCHED,
-    "contra_operator_transactions_fetched_total",
+    "private_channel_operator_transactions_fetched_total",
     "Total transactions fetched from the database",
     &["program_type"]
 );
 
 counter_vec!(
     OPERATOR_DB_UPDATES,
-    "contra_operator_db_updates_total",
+    "private_channel_operator_db_updates_total",
     "Total transaction status DB updates",
     &["program_type", "status"]
 );
 
 counter_vec!(
     OPERATOR_DB_UPDATE_ERRORS,
-    "contra_operator_db_update_errors_total",
+    "private_channel_operator_db_update_errors_total",
     "Total transaction status DB update errors",
     &["program_type"]
 );
 
 histogram_vec!(
     OPERATOR_RPC_SEND_DURATION,
-    "contra_operator_rpc_send_duration_seconds",
+    "private_channel_operator_rpc_send_duration_seconds",
     "Duration of RPC send_and_confirm calls",
     &["program_type", "result"]
 );
 
 counter_vec!(
     OPERATOR_TRANSACTION_ERRORS,
-    "contra_operator_transaction_errors_total",
+    "private_channel_operator_transaction_errors_total",
     "Total transaction errors by reason (includes retried errors)",
     &["program_type", "error_reason"]
 );
 
 counter_vec!(
     OPERATOR_MINTS_SENT,
-    "contra_operator_mints_sent_total",
+    "private_channel_operator_mints_sent_total",
     "Total mint transactions successfully confirmed",
     &["program_type"]
 );
 
 gauge_vec!(
     OPERATOR_BACKLOG_DEPTH,
-    "contra_operator_backlog_depth",
+    "private_channel_operator_backlog_depth",
     "Number of pending transactions in the database",
     &["program_type"]
 );
 
 gauge_vec!(
     FEEPAYER_BALANCE_LAMPORTS,
-    "contra_feepayer_balance_lamports",
+    "private_channel_feepayer_balance_lamports",
     "Current SOL balance of the escrow operator feepayer wallet in lamports",
     &["program_type"]
 );
@@ -141,7 +141,7 @@ gauge_vec!(
 // bad rows.  Keep `init_labels` in sync when adding a new variant.
 counter_vec!(
     OPERATOR_TRANSACTION_QUARANTINED,
-    "contra_operator_transaction_quarantined_total",
+    "private_channel_operator_transaction_quarantined_total",
     "Transactions quarantined to ManualReview by the processor",
     &["program_type", "reason"]
 );
@@ -151,7 +151,7 @@ counter_vec!(
 // so dashboards can alert even if the restart is fast.
 counter_vec!(
     OPERATOR_TASK_EXIT,
-    "contra_operator_task_exit_total",
+    "private_channel_operator_task_exit_total",
     "Critical operator task exits observed by the supervisor",
     &["program_type", "task"]
 );
@@ -222,7 +222,7 @@ pub fn init_labels(program_type: &str) {
 }
 
 pub fn init() {
-    contra_metrics::init_metrics!(
+    private_channel_metrics::init_metrics!(
         INDEXER_SLOTS_PROCESSED,
         INDEXER_TRANSACTIONS_SAVED,
         INDEXER_MINTS_SAVED,
@@ -249,7 +249,7 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use contra_metrics::prometheus;
+    use private_channel_metrics::prometheus;
     use prometheus::proto::MetricFamily;
 
     fn find_family(name: &str) -> MetricFamily {
@@ -277,20 +277,20 @@ mod tests {
         init_labels(program_type);
 
         let single_label_metrics = [
-            "contra_indexer_mints_saved_total",
-            "contra_indexer_transactions_saved_total",
-            "contra_indexer_slot_save_errors_total",
-            "contra_indexer_slots_processed_total",
-            "contra_indexer_datasource_reconnects_total",
-            "contra_indexer_current_slot",
-            "contra_indexer_chain_tip_slot",
-            "contra_indexer_backfill_slots_remaining",
-            "contra_indexer_slot_processing_duration_seconds",
-            "contra_operator_transactions_fetched_total",
-            "contra_operator_db_update_errors_total",
-            "contra_operator_mints_sent_total",
-            "contra_operator_backlog_depth",
-            "contra_feepayer_balance_lamports",
+            "private_channel_indexer_mints_saved_total",
+            "private_channel_indexer_transactions_saved_total",
+            "private_channel_indexer_slot_save_errors_total",
+            "private_channel_indexer_slots_processed_total",
+            "private_channel_indexer_datasource_reconnects_total",
+            "private_channel_indexer_current_slot",
+            "private_channel_indexer_chain_tip_slot",
+            "private_channel_indexer_backfill_slots_remaining",
+            "private_channel_indexer_slot_processing_duration_seconds",
+            "private_channel_operator_transactions_fetched_total",
+            "private_channel_operator_db_update_errors_total",
+            "private_channel_operator_mints_sent_total",
+            "private_channel_operator_backlog_depth",
+            "private_channel_feepayer_balance_lamports",
         ];
 
         for name in single_label_metrics {
@@ -309,26 +309,26 @@ mod tests {
         init_labels("default");
 
         let names = [
-            "contra_indexer_slots_processed_total",
-            "contra_indexer_transactions_saved_total",
-            "contra_indexer_mints_saved_total",
-            "contra_indexer_slot_save_errors_total",
-            "contra_indexer_current_slot",
-            "contra_indexer_rpc_errors_total",
-            "contra_indexer_chain_tip_slot",
-            "contra_indexer_backfill_slots_remaining",
-            "contra_indexer_datasource_reconnects_total",
-            "contra_indexer_slot_processing_duration_seconds",
-            "contra_operator_transactions_fetched_total",
-            "contra_operator_db_updates_total",
-            "contra_operator_db_update_errors_total",
-            "contra_operator_rpc_send_duration_seconds",
-            "contra_operator_transaction_errors_total",
-            "contra_operator_mints_sent_total",
-            "contra_operator_backlog_depth",
-            "contra_feepayer_balance_lamports",
-            "contra_operator_transaction_quarantined_total",
-            "contra_operator_task_exit_total",
+            "private_channel_indexer_slots_processed_total",
+            "private_channel_indexer_transactions_saved_total",
+            "private_channel_indexer_mints_saved_total",
+            "private_channel_indexer_slot_save_errors_total",
+            "private_channel_indexer_current_slot",
+            "private_channel_indexer_rpc_errors_total",
+            "private_channel_indexer_chain_tip_slot",
+            "private_channel_indexer_backfill_slots_remaining",
+            "private_channel_indexer_datasource_reconnects_total",
+            "private_channel_indexer_slot_processing_duration_seconds",
+            "private_channel_operator_transactions_fetched_total",
+            "private_channel_operator_db_updates_total",
+            "private_channel_operator_db_update_errors_total",
+            "private_channel_operator_rpc_send_duration_seconds",
+            "private_channel_operator_transaction_errors_total",
+            "private_channel_operator_mints_sent_total",
+            "private_channel_operator_backlog_depth",
+            "private_channel_feepayer_balance_lamports",
+            "private_channel_operator_transaction_quarantined_total",
+            "private_channel_operator_task_exit_total",
         ];
 
         let families = prometheus::gather();

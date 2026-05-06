@@ -2,7 +2,7 @@ use crate::config::{OperatorConfig, ProgramType};
 use crate::error::OperatorError;
 use crate::metrics::FEEPAYER_BALANCE_LAMPORTS;
 use crate::operator::{RpcClientWithRetry, SignerUtil};
-use contra_metrics::MetricLabel;
+use private_channel_metrics::MetricLabel;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};

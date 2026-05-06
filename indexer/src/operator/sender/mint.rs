@@ -47,7 +47,7 @@ pub(super) async fn try_jit_mint_initialization(
     // 2. Extract mint pubkey
     let mint = builder.get_mint()?;
 
-    // 3. Check if mint is initialized on Contra. An account may exist at the
+    // 3. Check if mint is initialized on PrivateChannel. An account may exist at the
     // mint address (allocated via `create_account`) with non-empty zeroed data
     // and `is_initialized = false`; treating that as "present" skips JIT and
     // the subsequent `mint_to` fails with `UninitializedAccount`. Gate on
@@ -56,7 +56,7 @@ pub(super) async fn try_jit_mint_initialization(
         Ok(data) if is_initialized_mint_data(&data) => return Some(instruction),
         Ok(_) => {
             info!(
-                "Mint {} not initialized on Contra - attempting JIT initialization",
+                "Mint {} not initialized on PrivateChannel - attempting JIT initialization",
                 mint
             );
         }
@@ -86,7 +86,7 @@ pub(super) async fn try_jit_mint_initialization(
         mint,
         mint_metadata.decimals,
         admin_pubkey,
-        state.mint_cache.get_contra_token_program(),
+        state.mint_cache.get_private_channel_token_program(),
         admin_pubkey,
     );
 
@@ -173,7 +173,7 @@ fn is_initialized_mint_data(data: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns whether the mint is initialized on Contra, retrying with backoff
+/// Returns whether the mint is initialized on PrivateChannel, retrying with backoff
 /// to absorb read-RPC lag after a racing InitializeMint. Any error or
 /// uninitialized result on the final attempt is reported as `false`.
 async fn mint_is_initialized_on_chain(rpc_client: &RpcClientWithRetry, mint: &Pubkey) -> bool {
@@ -747,23 +747,23 @@ mod tests {
     #[test]
     fn strip_memo_length_prefix_handles_formatted_values() {
         assert_eq!(
-            strip_memo_length_prefix("[12] contra:mint-idempotency:42"),
-            "contra:mint-idempotency:42"
+            strip_memo_length_prefix("[12] private_channel:mint-idempotency:42"),
+            "private_channel:mint-idempotency:42"
         );
         assert_eq!(
-            strip_memo_length_prefix("contra:mint-idempotency:42"),
-            "contra:mint-idempotency:42"
+            strip_memo_length_prefix("private_channel:mint-idempotency:42"),
+            "private_channel:mint-idempotency:42"
         );
     }
 
     #[test]
     fn memo_matches_handles_plain_and_formatted_values() {
-        let expected = "contra:mint-idempotency:99";
+        let expected = "private_channel:mint-idempotency:99";
 
         assert!(memo_matches(expected, expected));
-        assert!(memo_matches("[27] contra:mint-idempotency:99", expected));
+        assert!(memo_matches("[27] private_channel:mint-idempotency:99", expected));
         assert!(memo_matches(
-            "[5] hello; [27] contra:mint-idempotency:99",
+            "[5] hello; [27] private_channel:mint-idempotency:99",
             expected
         ));
         assert!(!memo_matches("[5] hello", expected));
@@ -1131,7 +1131,7 @@ mod tests {
     #[test]
     fn transaction_matches_expected_mint_parsed_happy_path() {
         let (mint, recipient_ata, mint_authority, expected) = make_expected();
-        let memo_text = "contra:mint-idempotency:42";
+        let memo_text = "private_channel:mint-idempotency:42";
 
         let memo_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
             program: "spl-memo".to_string(),
@@ -1162,7 +1162,7 @@ mod tests {
     #[test]
     fn transaction_matches_expected_mint_rejects_failed_tx() {
         let (mint, recipient_ata, mint_authority, expected) = make_expected();
-        let memo_text = "contra:mint-idempotency:42";
+        let memo_text = "private_channel:mint-idempotency:42";
 
         let memo_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
             program: "spl-memo".to_string(),
@@ -1199,12 +1199,12 @@ mod tests {
     #[test]
     fn transaction_matches_expected_mint_rejects_wrong_memo() {
         let (mint, recipient_ata, mint_authority, expected) = make_expected();
-        let expected_memo = "contra:mint-idempotency:42";
+        let expected_memo = "private_channel:mint-idempotency:42";
 
         let wrong_memo_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
             program: "spl-memo".to_string(),
             program_id: spl_memo::id().to_string(),
-            parsed: serde_json::Value::String("contra:mint-idempotency:999".to_string()),
+            parsed: serde_json::Value::String("private_channel:mint-idempotency:999".to_string()),
             stack_height: None,
         }));
         let mint_ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
@@ -1253,7 +1253,7 @@ mod tests {
     /// matching memo text must be recognized as containing the expected memo.
     #[test]
     fn instruction_has_memo_parsed_correct_memo() {
-        let memo_text = "contra:mint-idempotency:7";
+        let memo_text = "private_channel:mint-idempotency:7";
         let ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
             program: "spl-memo".to_string(),
             program_id: spl_memo::id().to_string(),
@@ -1267,7 +1267,7 @@ mod tests {
     /// so an instruction from a different program is rejected.
     #[test]
     fn instruction_has_memo_parsed_wrong_program() {
-        let memo_text = "contra:mint-idempotency:7";
+        let memo_text = "private_channel:mint-idempotency:7";
         let wrong_program = Pubkey::new_unique();
         let ix = UiInstruction::Parsed(UiParsedInstruction::Parsed(ParsedInstruction {
             program: "not-memo".to_string(),
@@ -1295,7 +1295,7 @@ mod tests {
     /// path correctly recognises the expected memo text.
     #[test]
     fn instruction_has_memo_partially_decoded_correct_memo() {
-        let memo_text = "contra:mint-idempotency:99";
+        let memo_text = "private_channel:mint-idempotency:99";
         let encoded_memo = bs58::encode(memo_text.as_bytes()).into_string();
         let ix = UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(
             UiPartiallyDecodedInstruction {
@@ -1312,7 +1312,7 @@ mod tests {
     /// even in the PartiallyDecoded encoding.
     #[test]
     fn instruction_has_memo_partially_decoded_wrong_program() {
-        let memo_text = "contra:mint-idempotency:99";
+        let memo_text = "private_channel:mint-idempotency:99";
         let encoded_memo = bs58::encode(memo_text.as_bytes()).into_string();
         let wrong_program = Pubkey::new_unique();
         let ix = UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(
@@ -1414,7 +1414,7 @@ mod tests {
     #[test]
     fn transaction_matches_expected_mint_raw_message_happy_path() {
         let (mint, recipient_ata, mint_authority, expected) = make_expected();
-        let memo_text = "contra:mint-idempotency:42";
+        let memo_text = "private_channel:mint-idempotency:42";
 
         let mint_data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
 
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn transaction_matches_expected_mint_raw_message_rejects_wrong_signer() {
         let (mint, recipient_ata, mint_authority, expected) = make_expected();
-        let memo_text = "contra:mint-idempotency:42";
+        let memo_text = "private_channel:mint-idempotency:42";
 
         let mint_data = spl_token::instruction::TokenInstruction::MintTo { amount: 1000 }.pack();
         let wrong_authority = Pubkey::new_unique();

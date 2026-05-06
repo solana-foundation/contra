@@ -8,8 +8,8 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-contra-escrow-program-client.workspace = true
-contra-withdraw-program-client.workspace = true
+private-channel-escrow-program-client.workspace = true
+private-channel-withdraw-program-client.workspace = true
 solana-client = "2.3.10"
 solana-sdk.workspace = true
 solana-system-interface.workspace = true

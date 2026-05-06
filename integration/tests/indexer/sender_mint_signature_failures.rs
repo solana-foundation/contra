@@ -19,7 +19,7 @@
 //!     short-circuits `Ok(None)` without any RPC traffic.
 
 use {
-    contra_indexer::operator::{
+    private_channel_indexer::operator::{
         sender::find_existing_mint_signature_with_memo,
         utils::{
             instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},
@@ -111,7 +111,7 @@ async fn method_not_found_returns_none_without_hard_failure() {
 
     assert!(
         result.is_none(),
-        "graceful-degradation contract: -32601 yields Ok(None)"
+        "graceful-degradation private_channelct: -32601 yields Ok(None)"
     );
     mock.shutdown().await;
 }

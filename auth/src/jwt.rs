@@ -6,19 +6,19 @@ use uuid::Uuid;
 use crate::models::Role;
 
 /// Issuer claim embedded in every JWT. Must match `JWT_ISSUER` in the gateway.
-pub const JWT_ISSUER: &str = "contra-auth";
+pub const JWT_ISSUER: &str = "private-channel-auth";
 
 /// Audience claim embedded in every JWT. Must match `JWT_AUDIENCE` in the gateway.
-pub const JWT_AUDIENCE: &str = "contra-gateway";
+pub const JWT_AUDIENCE: &str = "private-channel-gateway";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid,
     pub role: Role,
     pub exp: usize,
-    /// Issuer — always `"contra-auth"`.
+    /// Issuer — always `"private-channel-auth"`.
     pub iss: String,
-    /// Audience — always `"contra-gateway"`.
+    /// Audience — always `"private-channel-gateway"`.
     pub aud: String,
 }
 

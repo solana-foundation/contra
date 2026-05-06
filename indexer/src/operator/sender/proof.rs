@@ -2,7 +2,7 @@ use crate::error::{OperatorError, ProgramError};
 use crate::operator::sender::mint;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::{ReleaseFundsBuilderWithNonce, SIBLING_PROOF_SIZE};
-use contra_escrow_program_client::instructions::ResetSmtRootBuilder;
+use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{error, info, warn};
@@ -207,7 +207,7 @@ mod tests {
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
-    use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
     use std::collections::HashMap;
     use std::sync::Arc;
 

@@ -10,7 +10,7 @@
 //! Upstream source:
 //!   https://github.com/rpcpool/yellowstone-grpc/blob/
 //!   v12.3.0+solana.3.1.13/yellowstone-grpc-geyser/src/plugin/convert_from.rs
-//! License: Apache-2.0 (upstream). Contra repo is MIT; Apache-2.0 is compatible.
+//! License: Apache-2.0 (upstream). PrivateChannel repo is MIT; Apache-2.0 is compatible.
 
 use {
     solana_sdk::{

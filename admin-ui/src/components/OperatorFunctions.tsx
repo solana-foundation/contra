@@ -6,7 +6,7 @@ import { useCluster } from '../hooks/useCluster';
 import { address } from '@solana/addresses';
 import { useWalletAccountTransactionSendingSigner } from '@solana/react';
 import { getBase58Decoder } from '@solana/codecs-strings';
-import { getReleaseFundsInstructionAsync, getResetSmtRootInstructionAsync } from '@contra-escrow';
+import { getReleaseFundsInstructionAsync, getResetSmtRootInstructionAsync } from '@private-channel-escrow';
 import { findAssociatedTokenPda } from '@solana-program/token';
 import {
   pipe,

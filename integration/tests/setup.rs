@@ -35,7 +35,7 @@ pub fn create_mint_account_transaction(
     decimals: u8,
     recent_blockhash: Hash,
 ) -> Transaction {
-    // Contra's admin VM creates the account automatically, so only initialize_mint
+    // PrivateChannel's admin VM creates the account automatically, so only initialize_mint
     // is needed and the mint keypair does NOT sign.
     let init_mint_ix = spl_token::instruction::initialize_mint(
         &spl_token::id(),
@@ -153,7 +153,7 @@ pub fn withdraw_funds_transaction(
     amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
-    use contra_withdraw_program_client::instructions::WithdrawFundsBuilder;
+    use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
 
     let token_account =
         get_associated_token_address_with_program_id(&from.pubkey(), mint, &spl_token::ID);

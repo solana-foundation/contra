@@ -1,6 +1,6 @@
-# Contra Load Test Demo App
+# Solana Private Channels Load Test Demo App
 
-A visual web interface for load testing the Contra Solana deployment. This app replicates the functionality of the core `load_test.rs` with an intuitive UI for monitoring transactions and wallet balances in real-time.
+A visual web interface for load testing the Solana Private Channels Solana deployment. This app replicates the functionality of the core `load_test.rs` with an intuitive UI for monitoring transactions and wallet balances in real-time.
 
 ## Features
 
@@ -37,8 +37,8 @@ cp .env.example .env
 ```
 
 2. Configure the environment variables in `.env`:
-- `VITE_WRITE_URL`: URL for write operations (default: https://write.onlyoncontra.xyz)
-- `VITE_READ_URL`: URL for read operations (default: https://read.onlyoncontra.xyz)
+- `VITE_WRITE_URL`: URL for write operations (default: https://write.TBD)
+- `VITE_READ_URL`: URL for read operations (default: https://read.TBD)
 - `VITE_ADMIN_KEYPAIR`: Admin keypair array for funding test wallets
 
 ## Development

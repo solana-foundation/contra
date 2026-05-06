@@ -17,11 +17,11 @@
 //!   4. Base58-undecodable data                     → `Err` from decode step
 //!   5. Discriminator valid but account index OOB   → panic? / Err?
 //!      (the current parser trusts the account_keys slice; asserting the
-//!      OOB case documents the trust contract — see NOTE below)
+//!      OOB case documents the trust private_channelct — see NOTE below)
 //!   6. Truncated borsh payload for CreateInstance  → `Err` from borsh
 
-use contra_indexer::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
-use contra_indexer::indexer::datasource::common::types::CompiledInstruction;
+use private_channel_indexer::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
+use private_channel_indexer::indexer::datasource::common::types::CompiledInstruction;
 use solana_sdk::pubkey::Pubkey;
 
 fn account_keys(n: usize) -> Vec<Pubkey> {

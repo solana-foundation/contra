@@ -1,5 +1,5 @@
 [package]
-name = "contra-metrics"
+name = "private-channel-metrics"
 version.workspace = true
 edition.workspace = true
 

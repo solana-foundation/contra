@@ -107,78 +107,78 @@ impl StageMetrics for NoopMetrics {
 // PrometheusMetrics — enabled via --metrics; writes to global registry.
 // ---------------------------------------------------------------------------
 
-use contra_metrics::{counter_vec, init_metrics};
+use private_channel_metrics::{counter_vec, init_metrics};
 
 // Counters
 counter_vec!(
     DEDUP_RECEIVED,
-    "contra_dedup_received_total",
+    "private_channel_dedup_received_total",
     "Transactions received by dedup",
     &[]
 );
 counter_vec!(
     DEDUP_FORWARDED,
-    "contra_dedup_forwarded_total",
+    "private_channel_dedup_forwarded_total",
     "Transactions forwarded by dedup",
     &[]
 );
 counter_vec!(
     DEDUP_DROPPED_DUP,
-    "contra_dedup_dropped_duplicate_total",
+    "private_channel_dedup_dropped_duplicate_total",
     "Transactions dropped as duplicates",
     &[]
 );
 counter_vec!(
     DEDUP_DROPPED_UNK_BH,
-    "contra_dedup_dropped_unknown_bh_total",
+    "private_channel_dedup_dropped_unknown_bh_total",
     "Transactions dropped for unknown blockhash",
     &[]
 );
 counter_vec!(
     SIGVERIFY_FORWARDED,
-    "contra_sigverify_forwarded_total",
+    "private_channel_sigverify_forwarded_total",
     "Transactions forwarded by sigverify",
     &[]
 );
 counter_vec!(
     SIGVERIFY_REJECTED,
-    "contra_sigverify_rejected_total",
+    "private_channel_sigverify_rejected_total",
     "Transactions rejected by sigverify",
     &["reason"]
 );
 counter_vec!(
     SEQUENCER_COLLECTED,
-    "contra_sequencer_collected_total",
+    "private_channel_sequencer_collected_total",
     "Transactions collected by sequencer",
     &[]
 );
 counter_vec!(
     SEQUENCER_TXS_EMITTED,
-    "contra_sequencer_transactions_emitted_total",
+    "private_channel_sequencer_transactions_emitted_total",
     "Transactions emitted by sequencer",
     &[]
 );
 counter_vec!(
     EXECUTOR_RESULTS_SENT,
-    "contra_executor_results_sent_total",
+    "private_channel_executor_results_sent_total",
     "Execution results sent to settler",
     &[]
 );
 counter_vec!(
     EXECUTOR_RESULTS_SEND_FAILED,
-    "contra_executor_results_send_failed_total",
+    "private_channel_executor_results_send_failed_total",
     "Failed to send execution results",
     &["kind"]
 );
 counter_vec!(
     EXECUTOR_MISSING_RESULTS,
-    "contra_executor_missing_results_total",
+    "private_channel_executor_missing_results_total",
     "Missing execution results",
     &["kind"]
 );
 counter_vec!(
     SETTLER_TXS_SETTLED,
-    "contra_settler_txs_settled_total",
+    "private_channel_settler_txs_settled_total",
     "Transactions settled to DB",
     &[]
 );
@@ -186,29 +186,29 @@ counter_vec!(
 // Gauges
 
 // Executor latency histograms — buckets cover sub-millisecond to ~500 ms range.
-use contra_metrics::histogram_vec;
+use private_channel_metrics::histogram_vec;
 
 histogram_vec!(
     EXECUTOR_BATCH_DURATION,
-    "contra_executor_batch_duration_ms",
+    "private_channel_executor_batch_duration_ms",
     "Total execute_batch wall time in milliseconds",
     &[]
 );
 histogram_vec!(
     EXECUTOR_PRELOAD_DURATION,
-    "contra_executor_preload_duration_ms",
+    "private_channel_executor_preload_duration_ms",
     "Account preload DB round-trip time in milliseconds",
     &[]
 );
 histogram_vec!(
     EXECUTOR_SVM_DURATION,
-    "contra_executor_svm_duration_ms",
+    "private_channel_executor_svm_duration_ms",
     "SVM load_and_execute time in milliseconds",
     &["kind"]
 );
 histogram_vec!(
     EXECUTOR_BOB_UPDATE_DURATION,
-    "contra_executor_bob_update_duration_ms",
+    "private_channel_executor_bob_update_duration_ms",
     "BOB update_accounts time in milliseconds",
     &["kind"]
 );
@@ -216,19 +216,19 @@ histogram_vec!(
 // Settler latency histograms
 histogram_vec!(
     SETTLER_SETTLE_DURATION,
-    "contra_settler_settle_duration_ms",
+    "private_channel_settler_settle_duration_ms",
     "Total settle_transactions wall time in milliseconds",
     &[]
 );
 histogram_vec!(
     SETTLER_DB_WRITE_DURATION,
-    "contra_settler_db_write_duration_ms",
+    "private_channel_settler_db_write_duration_ms",
     "Postgres write_batch time in milliseconds",
     &[]
 );
 histogram_vec!(
     SETTLER_PROCESSING_DURATION,
-    "contra_settler_processing_duration_ms",
+    "private_channel_settler_processing_duration_ms",
     "Pre-DB account map building time in milliseconds",
     &[]
 );

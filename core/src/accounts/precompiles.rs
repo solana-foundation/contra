@@ -83,15 +83,15 @@ fn build_precompiles() -> HashMap<Pubkey, AccountSharedData> {
         bpf_loader_program_account(&spl_memo::id(), memo_v3_elf, &rent);
     precompiles.insert(memo_v3_id, AccountSharedData::from(memo_v3_account));
 
-    // Contra Withdraw program.
-    let withdraw_elf = include_bytes!("../../precompiles/contra_withdraw_program.so");
+    // PrivateChannel Withdraw program.
+    let withdraw_elf = include_bytes!("../../precompiles/private_channel_withdraw_program.so");
     let (_, withdraw_account) = bpf_loader_program_account(
-        &contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+        &private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         withdraw_elf,
         &rent,
     );
     precompiles.insert(
-        contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+        private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         AccountSharedData::from(withdraw_account),
     );
 
@@ -111,7 +111,7 @@ mod tests {
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::sysvar::rent::ID));
         assert!(PRECOMPILES.contains_key(&spl_memo::id()));
         assert!(
-            PRECOMPILES.contains_key(&contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID)
+            PRECOMPILES.contains_key(&private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID)
         );
         assert_eq!(PRECOMPILES.len(), 6);
     }
@@ -122,7 +122,7 @@ mod tests {
             spl_token::ID,
             spl_associated_token_account::ID,
             spl_memo::id(),
-            contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         ] {
             let account = PRECOMPILES.get(&program_id).expect("missing precompile");
             assert!(account.executable(), "{} should be executable", program_id);

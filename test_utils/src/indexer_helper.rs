@@ -1,7 +1,7 @@
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         storage::{PostgresDb, Storage},
-        BackfillConfig, ContraIndexerConfig, DatasourceType, IndexerConfig, PostgresConfig,
+        BackfillConfig, PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, PostgresConfig,
         ProgramType, RpcPollingConfig, StorageType, YellowstoneConfig,
     },
     solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey},
@@ -22,9 +22,9 @@ impl IndexerHandle {
     }
 }
 
-/// Start the Contra indexer.
+/// Start the PrivateChannel indexer.
 /// If geyser_endpoint is Some, uses Yellowstone datasource; otherwise uses RPC polling.
-pub async fn start_contra_indexer(
+pub async fn start_private_channel_indexer(
     geyser_endpoint: Option<String>,
     rpc_url: String,
     database_url: String,
@@ -68,7 +68,7 @@ pub async fn start_contra_indexer(
         start_slot: None,
     };
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
@@ -84,7 +84,7 @@ pub async fn start_contra_indexer(
         backfill: backfill_config,
         // Disable the mismatch guard: gap-recovery restarts (indexer stopped
         // while deposits arrived) must not be blocked by startup reconciliation.
-        reconciliation: contra_indexer::ReconciliationConfig {
+        reconciliation: private_channel_indexer::ReconciliationConfig {
             mismatch_threshold_raw: u64::MAX,
         },
     };
@@ -93,7 +93,7 @@ pub async fn start_contra_indexer(
     common_config.validate()?;
 
     let indexer_handle = tokio::spawn(async move {
-        if let Err(e) = contra_indexer::run(common_config, indexer_config, None).await {
+        if let Err(e) = private_channel_indexer::run(common_config, indexer_config, None).await {
             eprintln!("Indexer error: {}", e);
         }
     });
@@ -146,7 +146,7 @@ pub async fn start_solana_indexer_rpc_polling(
         start_slot: None,
     };
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
@@ -162,7 +162,7 @@ pub async fn start_solana_indexer_rpc_polling(
         backfill: backfill_config,
         // Disable the mismatch guard: gap-recovery restarts (indexer stopped
         // while deposits arrived) must not be blocked by startup reconciliation.
-        reconciliation: contra_indexer::ReconciliationConfig {
+        reconciliation: private_channel_indexer::ReconciliationConfig {
             mismatch_threshold_raw: u64::MAX,
         },
     };
@@ -171,7 +171,7 @@ pub async fn start_solana_indexer_rpc_polling(
     indexer_config.validate()?;
 
     let indexer_handle = tokio::spawn(async move {
-        if let Err(e) = contra_indexer::run(common_config, indexer_config, None).await {
+        if let Err(e) = private_channel_indexer::run(common_config, indexer_config, None).await {
             eprintln!("Solana RPC-polling Indexer error: {}", e);
         }
     });
@@ -225,7 +225,7 @@ pub async fn start_solana_indexer(
         start_slot: None,
     };
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
@@ -241,7 +241,7 @@ pub async fn start_solana_indexer(
         backfill: backfill_config,
         // Disable the mismatch guard: gap-recovery restarts (indexer stopped
         // while deposits arrived) must not be blocked by startup reconciliation.
-        reconciliation: contra_indexer::ReconciliationConfig {
+        reconciliation: private_channel_indexer::ReconciliationConfig {
             mismatch_threshold_raw: u64::MAX,
         },
     };
@@ -250,7 +250,7 @@ pub async fn start_solana_indexer(
     indexer_config.validate()?;
 
     let indexer_handle = tokio::spawn(async move {
-        if let Err(e) = contra_indexer::run(common_config, indexer_config, None).await {
+        if let Err(e) = private_channel_indexer::run(common_config, indexer_config, None).await {
             eprintln!("Solana Indexer error: {}", e);
         }
     });

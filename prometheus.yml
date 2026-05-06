@@ -10,7 +10,7 @@ scrape_configs:
     metric_relabel_configs:
       # Keep only metrics for specific containers
       - source_labels: [container_label_com_docker_compose_service]
-        regex: '(write-node|read-node|gateway|streamer|postgres-primary|postgres-replica|postgres-indexer|activity|validator|indexer-solana|indexer-contra|operator-solana|operator-contra)'
+        regex: '(write-node|read-node|gateway|streamer|postgres-primary|postgres-replica|postgres-indexer|activity|validator|indexer-solana|indexer-private_channel|operator-solana|operator-private_channel)'
         action: keep
 
   # Indexer & Operator app-level metrics
@@ -19,20 +19,20 @@ scrape_configs:
     static_configs:
       - targets: ['indexer-solana${HOST_SUFFIX}:9100']
 
-  - job_name: 'indexer-contra'
+  - job_name: 'indexer-private_channel'
     scrape_interval: 2s
     static_configs:
-      - targets: ['indexer-contra${HOST_SUFFIX}:9100']
+      - targets: ['indexer-private_channel${HOST_SUFFIX}:9100']
 
   - job_name: 'operator-solana'
     scrape_interval: 2s
     static_configs:
       - targets: ['operator-solana${HOST_SUFFIX}:9102']
 
-  - job_name: 'operator-contra'
+  - job_name: 'operator-private_channel'
     scrape_interval: 2s
     static_configs:
-      - targets: ['operator-contra${HOST_SUFFIX}:9103']
+      - targets: ['operator-private_channel${HOST_SUFFIX}:9103']
 
   - job_name: 'gateway'
     static_configs:
@@ -46,7 +46,7 @@ scrape_configs:
   - job_name: 'write-node-stages'
     scrape_interval: 2s
     static_configs:
-      - targets: ['write-node:${CONTRA_METRICS_PORT}']
+      - targets: ['write-node:${PRIVATE_CHANNEL_METRICS_PORT}']
 
   - job_name: 'blackbox-http'
     metrics_path: /probe

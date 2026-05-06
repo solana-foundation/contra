@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Multi-stage Dockerfile for Contra blockchain
+# Multi-stage Dockerfile for Solana Private Channels blockchain
 #
 # SOLANA_VERSION is the source of truth in versions.env.
 # Build via: `docker compose --env-file versions.env --env-file .env build <service>`
@@ -52,14 +52,14 @@ ENV PATH="/root/.local/share/solana/install/active_release/bin:${PATH}"
 # Convention used throughout this builder stage: build artifacts are copied into /out/
 # before the next stage references them.
 #
-# Why: the cargo build steps below mount /usr/src/contra/target as a BuildKit cache
+# Why: the cargo build steps below mount /usr/src/private_channel/target as a BuildKit cache
 # (`--mount=type=cache`), which is *not* visible to later stages' `COPY --from=builder`
 # and is also not visible to subsequent RUN steps that don't re-mount it. /out/ is a
 # normal image layer, so artifacts placed there persist across RUN steps and are
 # reachable from the runtime stage.
 
 # Set working directory
-WORKDIR /usr/src/contra
+WORKDIR /usr/src/private_channel
 
 # Copy workspace cargo files first for better caching.
 # rust-toolchain.toml MUST be present alongside Cargo.toml so rustup picks
@@ -73,12 +73,12 @@ COPY indexer/Cargo.toml ./indexer/
 COPY auth/Cargo.toml ./auth/
 
 # Copy Cargo.toml files for other workspace members (to satisfy workspace references)
-COPY contra-escrow-program/program/Cargo.toml ./contra-escrow-program/program/
-COPY contra-escrow-program/tests/integration-tests/Cargo.toml ./contra-escrow-program/tests/integration-tests/
-COPY contra-escrow-program/clients/rust/Cargo.toml ./contra-escrow-program/clients/rust/
-COPY contra-withdraw-program/program/Cargo.toml ./contra-withdraw-program/program/
-COPY contra-withdraw-program/tests/integration-tests/Cargo.toml ./contra-withdraw-program/tests/integration-tests/
-COPY contra-withdraw-program/clients/rust/Cargo.toml ./contra-withdraw-program/clients/rust/
+COPY private-channel-escrow-program/program/Cargo.toml ./private-channel-escrow-program/program/
+COPY private-channel-escrow-program/tests/integration-tests/Cargo.toml ./private-channel-escrow-program/tests/integration-tests/
+COPY private-channel-escrow-program/clients/rust/Cargo.toml ./private-channel-escrow-program/clients/rust/
+COPY private-channel-withdraw-program/program/Cargo.toml ./private-channel-withdraw-program/program/
+COPY private-channel-withdraw-program/tests/integration-tests/Cargo.toml ./private-channel-withdraw-program/tests/integration-tests/
+COPY private-channel-withdraw-program/clients/rust/Cargo.toml ./private-channel-withdraw-program/clients/rust/
 COPY integration/Cargo.toml ./integration/
 COPY test_utils/Cargo.toml ./test_utils/
 COPY scripts/devnet/Cargo.toml ./scripts/devnet/
@@ -86,18 +86,18 @@ COPY metrics/Cargo.toml ./metrics/
 COPY bench-tps/Cargo.toml ./bench-tps/
 
 # Create dummy lib.rs files for workspace members we're not building
-RUN mkdir -p contra-escrow-program/program/src contra-escrow-program/tests/integration-tests/src \
-    contra-escrow-program/clients/rust/src contra-withdraw-program/program/src \
-    contra-withdraw-program/tests/integration-tests/src \
+RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-program/tests/integration-tests/src \
+    private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/program/src \
+    private-channel-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
-    contra-escrow-program/clients/rust/src contra-withdraw-program/clients/rust/src \
+    private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/clients/rust/src \
     core/src metrics/src auth/src bench-tps/src
-RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/integration-tests/src/lib.rs \
-    contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/program/src/lib.rs \
-    contra-withdraw-program/tests/integration-tests/src/lib.rs \
+RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escrow-program/tests/integration-tests/src/lib.rs \
+    private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/program/src/lib.rs \
+    private-channel-withdraw-program/tests/integration-tests/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
-    contra-escrow-program/clients/rust/src/lib.rs contra-withdraw-program/clients/rust/src/lib.rs \
+    private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/clients/rust/src/lib.rs \
     core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs && \
     printf 'fn main() {}\n' > bench-tps/src/main.rs && \
     printf 'fn main() {}\n' > auth/src/main.rs
@@ -106,23 +106,23 @@ RUN touch contra-escrow-program/program/src/lib.rs contra-escrow-program/tests/i
 # Cache mounts: target/ holds compiled artifacts; cargo registry/git hold downloaded crate sources.
 # All three are reused across rebuilds, turning a cold ~30 min build into <2 min when only
 # source changes.
-RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
+RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release
 
 # First, do the real build for the programs
 COPY Makefile ./Makefile
-COPY contra-escrow-program ./contra-escrow-program
-COPY contra-withdraw-program ./contra-withdraw-program
-RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
+COPY private-channel-escrow-program ./private-channel-escrow-program
+COPY private-channel-withdraw-program ./private-channel-withdraw-program
+RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    make -C contra-escrow-program install build \
-    && make -C contra-withdraw-program install build \
+    make -C private-channel-escrow-program install build \
+    && make -C private-channel-withdraw-program install build \
     && mkdir -p /out/deploy \
-    && cp target/deploy/contra_escrow_program.so /out/deploy/ \
-    && cp target/deploy/contra_withdraw_program.so /out/deploy/
+    && cp target/deploy/private_channel_escrow_program.so /out/deploy/ \
+    && cp target/deploy/private_channel_withdraw_program.so /out/deploy/
 
 # Next, do the real build for the other components
 COPY core ./core
@@ -131,21 +131,21 @@ COPY indexer ./indexer
 COPY metrics ./metrics
 COPY auth ./auth
 
-# core/precompiles/contra_withdraw_program.so is a symlink into target/deploy/ (used by
+# core/precompiles/private_channel_withdraw_program.so is a symlink into target/deploy/ (used by
 # include_bytes! in core). The cache-mounted target/ isn't reliably available to the next
 # build, so swap the symlink for the real .so. rm first — otherwise cp follows the symlink
 # and writes to the wrong place.
-RUN rm -f core/precompiles/contra_withdraw_program.so \
-    && cp /out/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so
+RUN rm -f core/precompiles/private_channel_withdraw_program.so \
+    && cp /out/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so
 
 # Final build — binaries are copied to /out/ per the convention noted above.
-RUN --mount=type=cache,target=/usr/src/contra/target,sharing=locked \
+RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release \
-        -p contra-core \
-        -p contra-gateway \
-        -p contra-indexer \
+        -p private-channel-core \
+        -p private-channel-gateway \
+        -p private-channel-indexer \
         -p auth \
     && mkdir -p /out \
     && cp target/release/node /out/node \
@@ -173,11 +173,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libssl3
 
 # Create a non-root user to run the application
-RUN useradd -m -u 1000 -s /bin/bash contra
+RUN useradd -m -u 1000 -s /bin/bash private_channel
 
 # Copy the binaries from builder. Source paths are /out/ (a normal layer in the builder
 # stage), not target/release/ (a cache mount which is not visible across stages).
-COPY --from=builder /out/node /usr/local/bin/contra-node
+COPY --from=builder /out/node /usr/local/bin/private-channel-node
 COPY --from=builder /out/activity /usr/local/bin/activity
 COPY --from=builder /out/admin /usr/local/bin/admin
 COPY --from=builder /out/gateway /usr/local/bin/gateway
@@ -186,13 +186,13 @@ COPY --from=builder /out/streamer /usr/local/bin/streamer
 COPY --from=builder /out/auth /usr/local/bin/auth
 
 # Copy indexer/operator config files
-COPY indexer/config /etc/contra/config
+COPY indexer/config /etc/private_channel/config
 
 # Create data directory for RocksDB
-RUN mkdir -p /data && chown contra:contra /data
+RUN mkdir -p /data && chown private_channel:private_channel /data
 
 # Switch to non-root user
-USER contra
+USER private_channel
 
 # No default entrypoint - let docker-compose specify the command
 # This ensures proper signal handling for graceful shutdown

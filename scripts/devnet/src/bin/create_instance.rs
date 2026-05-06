@@ -1,4 +1,4 @@
-use contra_escrow_program_client::{instructions::CreateInstanceBuilder, CONTRA_ESCROW_PROGRAM_ID};
+use private_channel_escrow_program_client::{instructions::CreateInstanceBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -16,12 +16,12 @@ const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED, instance_seed.as_ref()],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
 fn find_event_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
 }
 
 fn main() -> Result<()> {
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
         .instance(instance_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .instruction();
 

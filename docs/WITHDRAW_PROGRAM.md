@@ -1,4 +1,4 @@
-# Contra Withdraw Program Overview
+# Solana Private Channels Withdraw Program Overview
 
 ## Program ID
 

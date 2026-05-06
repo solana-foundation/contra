@@ -1,4 +1,4 @@
-use contra_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
+use private_channel_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -14,12 +14,12 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 5 {
-        eprintln!("Usage: {} <contra-gateway-rpc> <user-keypair-path> <mint-address> <amount> [destination]", args[0]);
+        eprintln!("Usage: {} <private-channel-gateway-rpc> <user-keypair-path> <mint-address> <amount> [destination]", args[0]);
         eprintln!("Example: {} http://localhost:8898 ./keypairs/user.json PANskKbAxqUQuqVfwzMtkyxii5GLaG1VFmB9xWb5tTP 500000", args[0]);
-        eprintln!("\n⚠️  IMPORTANT: RPC URL must be Contra gateway (NOT Solana devnet)");
+        eprintln!("\n⚠️  IMPORTANT: RPC URL must be PrivateChannel gateway (NOT Solana devnet)");
         eprintln!("  - Local:  http://localhost:8898");
         eprintln!("  - Docker: gateway:8899");
-        eprintln!("\nThis burns tokens on Contra. The operator will then release funds on Solana.");
+        eprintln!("\nThis burns tokens on PrivateChannel. The operator will then release funds on Solana.");
         std::process::exit(1);
     }
 
@@ -33,8 +33,8 @@ fn main() -> Result<()> {
         None
     };
 
-    println!("🔥 Withdrawing from Contra (burning tokens)");
-    println!("Connecting to Contra gateway: {}", rpc_url);
+    println!("🔥 Withdrawing from PrivateChannel (burning tokens)");
+    println!("Connecting to PrivateChannel gateway: {}", rpc_url);
     println!("Using user keypair: {}", keypair_path);
     println!("Mint: {}", mint);
     println!("Amount: {}", amount);
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     let user_ata = get_associated_token_address(&user_keypair.pubkey(), &mint);
 
     println!("\n📍 Transaction details:");
-    println!("User ATA (on Contra): {}", user_ata);
+    println!("User ATA (on PrivateChannel): {}", user_ata);
 
     let instruction = WithdrawFunds {
         user: user_keypair.pubkey(),
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 
     // Print the locally-derived signature *before* sending so callers (the
     // smoke test in particular) can capture it even if the subsequent
-    // `send_and_confirm` on the Contra gateway times out. The Contra channel
+    // `send_and_confirm` on the PrivateChannel gateway times out. The PrivateChannel channel
     // is gasless and finalizes within ~1s, but the solana-client default
     // confirmation poll uses methods (e.g. getRecentPerformanceSamples in
     // older versions) and timing assumptions that don't always agree with
@@ -93,9 +93,9 @@ fn main() -> Result<()> {
 
     match send_result {
         Ok(signature) => {
-            println!("\n✅ Withdrawal initiated on Contra!");
+            println!("\n✅ Withdrawal initiated on PrivateChannel!");
             println!("Transaction signature: {}", signature);
-            println!("Burned {} tokens on Contra", amount);
+            println!("Burned {} tokens on PrivateChannel", amount);
             Ok(())
         }
         Err(e) => {

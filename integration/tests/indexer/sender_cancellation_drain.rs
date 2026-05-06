@@ -23,9 +23,9 @@
 //! tests which exit via handle drop rather than cooperative cancellation.
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         config::{
-            ContraIndexerConfig, PostgresConfig, ProgramType, StorageType,
+            PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         operator::run_sender,
@@ -37,8 +37,8 @@ use {
     tokio_util::sync::CancellationToken,
 };
 
-fn mock_config() -> ContraIndexerConfig {
-    ContraIndexerConfig {
+fn mock_config() -> PrivateChannelIndexerConfig {
+    PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         rpc_url: "http://127.0.0.1:1".to_string(),

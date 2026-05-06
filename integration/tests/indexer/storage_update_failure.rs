@@ -13,11 +13,11 @@
 //! and no panic occurred. Clear the flag, push a second update, and
 //! assert it succeeds — the status update is recorded in
 //! `MockStorage::status_updates`. This proves the loop "keeps
-//! looping" contract.
+//! looping" private_channelct.
 
 use {
     chrono::Utc,
-    contra_indexer::{
+    private_channel_indexer::{
         config::ProgramType,
         operator::{sender::TransactionStatusUpdate, DbTransactionWriter},
         storage::{common::models::TransactionStatus, common::storage::mock::MockStorage, Storage},

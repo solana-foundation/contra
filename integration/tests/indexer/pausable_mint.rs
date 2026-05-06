@@ -9,7 +9,7 @@
 //! 3. Seed a `DbMint` row with `is_pausable = None` (the state the indexer
 //!    leaves behind at AllowMint time) and a pending `DbTransaction`
 //!    withdrawal at nonce 0.
-//! 4. Start the Contra→Solana withdrawal operator.
+//! 4. Start the PrivateChannel→Solana withdrawal operator.
 //! 5. Assert the operator routes the withdrawal to `manual_review`: the row
 //!    status flips from `pending` to `manual_review`, and `mints.is_pausable`
 //!    flips from `None` to `Some(true)` (lazy RPC resolution + write-back).
@@ -25,12 +25,12 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use contra_escrow_program_client::{instructions::AllowMintBuilder, CONTRA_ESCROW_PROGRAM_ID};
-use contra_indexer::storage::common::models::{
+use private_channel_escrow_program_client::{instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
+use private_channel_indexer::storage::common::models::{
     DbMint, DbTransaction, TransactionStatus, TransactionType,
 };
-use contra_indexer::storage::{PostgresDb, Storage};
-use contra_indexer::PostgresConfig;
+use private_channel_indexer::storage::{PostgresDb, Storage};
+use private_channel_indexer::PostgresConfig;
 use helpers::db;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -47,7 +47,7 @@ use spl_token_2022::extension::{pausable, ExtensionType};
 use spl_token_2022::state::Mint as Token2022Mint;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::time::Duration;
-use test_utils::operator_helper::start_contra_to_solana_operator;
+use test_utils::operator_helper::start_private_channel_to_solana_operator;
 use test_utils::validator_helper::start_test_validator_no_geyser;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -195,7 +195,7 @@ async fn allow_mint_for_program(
         .token_program(token_program)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .instruction();
 
@@ -365,7 +365,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
     // Start the withdraw operator.
-    let operator_handle = start_contra_to_solana_operator(
+    let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,

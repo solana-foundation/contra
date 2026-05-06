@@ -26,7 +26,7 @@
 //! re-exported `find_existing_mint_signature_with_memo` helper directly.
 
 use {
-    contra_indexer::operator::{
+    private_channel_indexer::operator::{
         sender::find_existing_mint_signature_with_memo,
         utils::{
             instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},
@@ -633,7 +633,7 @@ async fn memo_mismatch_skips_entry_and_returns_none() {
 
     mock.enqueue(
         "getSignaturesForAddress",
-        signature_reply("contra:mint-idempotency:wrong-id"),
+        signature_reply("private_channel:mint-idempotency:wrong-id"),
     );
 
     let bwt = builder_with_txn(

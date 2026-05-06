@@ -75,7 +75,7 @@ pub fn create_withdraw_funds(
     amount: u64,
     blockhash: Hash,
 ) -> Transaction {
-    use contra_withdraw_program_client::instructions::WithdrawFundsBuilder;
+    use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
 
     let from_pubkey = from.pubkey();
     let token_account = get_associated_token_address(&from_pubkey, mint);
@@ -387,10 +387,10 @@ mod tests {
         assert_eq!(tx.message.instructions.len(), 1);
         assert_eq!(tx.message.account_keys[0], from.pubkey());
 
-        // Program must be the Contra withdraw program
+        // Program must be the PrivateChannel withdraw program
         assert_eq!(
             resolve_program_id(&tx, 0),
-            contra_withdraw_program_client::programs::CONTRA_WITHDRAW_PROGRAM_ID,
+            private_channel_withdraw_program_client::programs::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         );
 
         // Account keys must include the derived ATA, mint, and token programs

@@ -17,7 +17,7 @@
 //! the validator fixtures those tests use).
 
 use {
-    contra_indexer::operator::reconciliation::compare_balances, solana_sdk::pubkey::Pubkey,
+    private_channel_indexer::operator::reconciliation::compare_balances, solana_sdk::pubkey::Pubkey,
     std::collections::HashMap,
 };
 

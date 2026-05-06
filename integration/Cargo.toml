@@ -205,6 +205,7 @@ contra-indexer = { path = "../indexer", features = [
     "datasource-yellowstone",
     "test-mock-storage",
 ] }
+contra-swap-program-client = { path = "../contra-swap-program/clients/rust" }
 contra-withdraw-program-client = { path = "../contra-withdraw-program/clients/rust" }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

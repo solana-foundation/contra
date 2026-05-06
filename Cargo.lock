@@ -2339,6 +2339,7 @@ dependencies = [
  "bs58",
  "clap 4.5.48",
  "contra-metrics",
+ "contra-swap-program-client",
  "contra-withdraw-program-client",
  "enum_dispatch",
  "futures 0.3.31",
@@ -2531,6 +2532,7 @@ dependencies = [
  "contra-core",
  "contra-escrow-program-client",
  "contra-indexer",
+ "contra-swap-program-client",
  "contra-withdraw-program-client",
  "http-body-util",
  "hyper 1.7.0",
@@ -2572,6 +2574,38 @@ dependencies = [
  "prometheus",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "contra-swap-program"
+version = "0.1.0"
+dependencies = [
+ "codama",
+ "pinocchio",
+ "pinocchio-associated-token-account",
+ "pinocchio-log",
+ "pinocchio-system",
+ "pinocchio-token",
+ "serde_json",
+ "solana-address 2.1.0",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "contra-swap-program-client"
+version = "0.0.1"
+dependencies = [
+ "borsh 1.5.7",
+ "num-derive",
+ "num-traits",
+ "solana-account 2.2.1",
+ "solana-account-info 2.3.0",
+ "solana-client 2.3.10",
+ "solana-cpi 2.2.1",
+ "solana-instruction 2.3.0",
+ "solana-program-error 2.2.2",
+ "solana-pubkey 2.4.0",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -16272,6 +16306,19 @@ dependencies = [
  "spl-pod 0.5.1",
  "spl-token 6.0.0",
  "spl-token-2022 9.0.0",
+]
+
+[[package]]
+name = "tests-contra-swap-program"
+version = "0.1.0"
+dependencies = [
+ "contra-swap-program-client",
+ "litesvm",
+ "solana-program",
+ "solana-program-pack 2.2.1",
+ "solana-sdk",
+ "spl-associated-token-account 4.0.0",
+ "spl-token 6.0.0",
 ]
 
 [[package]]

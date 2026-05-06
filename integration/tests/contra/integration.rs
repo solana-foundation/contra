@@ -343,6 +343,7 @@ async fn test_suite(contra_ctx: &ContraContext, solana_ctx: &SolanaContext) {
     run_precompile_accounts_test(contra_ctx).await;
     run_spl_token_test(contra_ctx, solana_ctx, spl_token::ID).await;
     run_spl_token_test(contra_ctx, solana_ctx, spl_token_2022::ID).await;
+    run_swap_clock_tests(contra_ctx, solana_ctx).await;
     run_tx_replay_test(contra_ctx).await;
     run_transaction_count_test(contra_ctx).await;
     run_get_transaction_test(contra_ctx).await;

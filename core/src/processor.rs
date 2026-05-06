@@ -73,6 +73,7 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
             spl_associated_token_account::id(),
             spl_memo::id(),
             contra_withdraw_program_client::CONTRA_WITHDRAW_PROGRAM_ID,
+            contra_swap_program_client::CONTRA_SWAP_PROGRAM_ID,
         ];
 
         // Loop over all BPF programs and add them to the cache

@@ -16,6 +16,9 @@ members = [
     "test_utils",
     "scripts/devnet",
     "bench-tps",
+    "contra-swap-program/program",
+    "contra-swap-program/tests/integration-tests",
+    "contra-swap-program/clients/rust",
 ]
 
 resolver = "2"
@@ -143,5 +146,8 @@ contra-escrow-program-client = { path = "contra-escrow-program/clients/rust", fe
     "fetch",
 ] }
 contra-withdraw-program-client = { path = "contra-withdraw-program/clients/rust", features = [
+    "fetch",
+] }
+contra-swap-program-client = { path = "contra-swap-program/clients/rust", features = [
     "fetch",
 ] }

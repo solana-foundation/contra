@@ -1,7 +1,7 @@
 # Technical Requirements
 
 This document specifies the hardware, software, and network requirements for
-running the Contra stack.
+running the Solana Private Channels stack.
 
 ## Reference machine specs
 
@@ -30,7 +30,7 @@ mostly I/O-bound.
 | Postgres primary | 0.9 | 0.5–1.0 GB † |
 | Gateway  | 1.3 | 110–125 MB |
 | Read node | 0.4–0.5 | 180–665 MB |
-| Indexer (Contra) | 0.2 | 0.3–1.4 GB † |
+| Indexer (private channel) | 0.2 | 0.3–1.4 GB † |
 | Postgres indexer | 0.1 | 230 MB |
 
 † Postgres primary RAM scales with its in-memory cache size; the indexer's
@@ -39,7 +39,7 @@ RAM grows with the size of the indexed dataset.
 Only the three Postgres containers need disk; size them per
 [Storage sizing](#storage-sizing) and use NVMe for the primary.
 
-*Streamer, Solana indexer, and Solana/Contra operators each take <0.1 core
+*Streamer, Solana indexer, and Solana/private channel operators each take <0.1 core
 and ~30 MB RAM, and are not material to sizing.*
 
 *Measured 2026-05-05 on a 16-core / 62 GB host.*
@@ -101,7 +101,7 @@ need to be exposed at the host firewall; see `docker-compose.yml` for defaults.
 
 - **Public ingress:** 8899 (gateway), 8902 (streamer).
 - **Outbound:** 443 to Solana mainnet RPC, 10000 to Yellowstone gRPC (if used).
-- **Internal:** allow all between Contra services on the private network.
+- **Internal:** allow all between stack services on the private network.
 
 ---
 
@@ -116,12 +116,12 @@ Tune the write node's 5-stage pipeline via environment variables:
 
 | Knob | Default | Effect |
 |---|---|---|
-| `CONTRA_SIGVERIFY_WORKERS` | 4 | Parallel Ed25519 verification workers. Primary CPU lever. |
-| `CONTRA_SIGVERIFY_QUEUE_SIZE` | 1000 | Bounded backlog before sigverify. Trade burst tolerance for memory. |
-| `CONTRA_MAX_TX_PER_BATCH` | 256 | Sequencer batch size; larger amortises executor overhead. |
-| `CONTRA_BATCH_DEADLINE_MS` | 10 | Force-flush timer for partial batches. |
-| `CONTRA_MAX_SVM_WORKERS` | 8 | Executor's parallel SVM threads per batch. |
-| `CONTRA_BLOCKTIME_MS` | 100 | Settlement interval. |
+| `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | 4 | Parallel Ed25519 verification workers. Primary CPU lever. |
+| `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | 1000 | Bounded backlog before sigverify. Trade burst tolerance for memory. |
+| `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | 256 | Sequencer batch size; larger amortises executor overhead. |
+| `PRIVATE_CHANNEL_BATCH_DEADLINE_MS` | 10 | Force-flush timer for partial batches. |
+| `PRIVATE_CHANNEL_MAX_SVM_WORKERS` | 8 | Executor's parallel SVM threads per batch. |
+| `PRIVATE_CHANNEL_BLOCKTIME_MS` | 100 | Settlement interval. |
 
 See [`CONFIG.md`](CONFIG.md) for the full reference and restart procedure.
 

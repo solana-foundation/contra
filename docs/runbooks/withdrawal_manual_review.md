@@ -227,5 +227,5 @@ Capture in the incident record:
 - Recovery action taken (SQL run, sig used, escalation path).
 - RPC endpoint used for verification.
 
-These feeds the audit trail for any user-facing reconciliation.
+These feed the audit trail for any user-facing reconciliation.
 

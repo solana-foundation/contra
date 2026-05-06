@@ -3,7 +3,7 @@
 //! `cargo test` skips them; trigger explicitly:
 //!
 //!     cargo test --test runbook_drills -- --ignored --nocapture
-//!     cargo test --test runbook_drills -- --ignored drill_path_a -- --nocapture
+//!     cargo test --test runbook_drills -- --ignored --nocapture drill_2
 //!
 //! Drills are NOT in CI. They exist so a human running through a runbook can
 //! verify the diagnostic and recovery commands in it actually work against
@@ -56,16 +56,18 @@ async fn start_postgres(
 }
 
 /// Insert a withdrawal row directly into the desired state. Bypasses the
-/// operator code path — drills verify the runbook against the post-trigger
+/// operator code path: drills verify the runbook against the post-trigger
 /// DB shape, so seeding the shape directly is correct.
 ///
-/// Returns the generated row id. The trigger auto-assigns
-/// `withdrawal_nonce` if not provided, but here we want explicit control.
+/// `error_message` is descriptive only. The `transactions` table has no
+/// such column - the operator surfaces it on the alert webhook payload,
+/// not in DB state. The argument exists so caller-side test code reads
+/// like the runbook's dispatch table.
 async fn seed_withdrawal(
     pool: &PgPool,
     status: &str,
     nonce: i64,
-    error_message: Option<&str>,
+    _error_message: Option<&str>,
 ) -> Result<i64, sqlx::Error> {
     let row = sqlx::query(
         r#"
@@ -88,29 +90,16 @@ async fn seed_withdrawal(
     .bind(status)
     .bind(nonce)
     .bind(uuid::Uuid::new_v4().to_string())
-    .bind(error_message.map(|_| Utc::now()))
+    .bind(Utc::now())
     .fetch_one(pool)
     .await?
     .get::<i64, _>(0);
-
-    // error_message is not a column — runbook surfaces it via the alert
-    // payload (TransactionStatusUpdate). For drill purposes we attach it via
-    // a side table so the dispatch SQL can read it. Schema doesn't actually
-    // store error_message; drills that need it stage it separately.
-    if let Some(_msg) = error_message {
-        // No column to write to. The runbook reads error_message from the
-        // webhook payload, not from the DB. Drills that exercise dispatch
-        // pass the message in-process (see drill bodies).
-    }
     Ok(row)
 }
 
 /// Insert a deposit row directly. Deposits have no `withdrawal_nonce` (the
 /// schema's auto-assign trigger only fires on withdrawals).
-async fn seed_deposit(
-    pool: &PgPool,
-    status: &str,
-) -> Result<i64, sqlx::Error> {
+async fn seed_deposit(pool: &PgPool, status: &str) -> Result<i64, sqlx::Error> {
     let row = sqlx::query(
         r#"
         INSERT INTO transactions
@@ -147,11 +136,10 @@ async fn status_of(pool: &PgPool, id: i64) -> Result<String, sqlx::Error> {
 
 /// Convenience: count rows by status.
 async fn count_status(pool: &PgPool, status: &str) -> Result<i64, sqlx::Error> {
-    let n: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE status::text = $1")
-            .bind(status)
-            .fetch_one(pool)
-            .await?;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE status::text = $1")
+        .bind(status)
+        .fetch_one(pool)
+        .await?;
     Ok(n)
 }
 
@@ -200,10 +188,7 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         // Withdrawal — sender side.
-        (
-            "remint failed:",
-            "indexer/src/operator/sender/remint.rs",
-        ),
+        ("remint failed:", "indexer/src/operator/sender/remint.rs"),
         (
             "finality check failed after",
             "indexer/src/operator/sender/remint.rs",
@@ -252,8 +237,8 @@ fn drill_1_error_message_contracts_present_in_source() {
     let mut missing: Vec<String> = Vec::new();
     for (substr, path) in contracts {
         let full = workspace_root.join(path);
-        let content = std::fs::read_to_string(&full)
-            .unwrap_or_else(|e| panic!("read {full:?}: {e}"));
+        let content =
+            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}"));
         if content.contains(substr) {
             eprintln!("OK   {path}: {substr:?}");
         } else {
@@ -459,19 +444,19 @@ async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
     eprintln!("simulated on-chain verification: NOT_LANDED");
 
     // ── Recovery (Path C, NOT_LANDED branch — re-arm to pending) ──────
-    let updated = sqlx::query(
-        "UPDATE transactions SET status = 'pending', updated_at = NOW() WHERE id = $1",
-    )
-    .bind(id)
-    .execute(&pool)
-    .await?;
+    let updated =
+        sqlx::query("UPDATE transactions SET status = 'pending', updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
     assert_eq!(updated.rows_affected(), 1);
 
     // ── Post-state: status flipped, nonce preserved ───────────────────
-    let row = sqlx::query("SELECT status::text AS s, withdrawal_nonce FROM transactions WHERE id = $1")
-        .bind(id)
-        .fetch_one(&pool)
-        .await?;
+    let row =
+        sqlx::query("SELECT status::text AS s, withdrawal_nonce FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
     let status: String = row.get("s");
     let nonce: Option<i64> = row.get("withdrawal_nonce");
     assert_eq!(status, "pending");
@@ -526,8 +511,7 @@ async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_5_halt_sweep_excludes_poison_only(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn drill_5_halt_sweep_excludes_poison_only() -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "withdrawal_manual_review.md",
         "Path A.halting - quarantine_all_active_withdrawals semantics",
@@ -592,8 +576,8 @@ async fn drill_5_halt_sweep_excludes_poison_only(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_6_recovery_query_skips_terminal_statuses(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn std::error::Error>>
+{
     drill_header("_glossary.md", "PendingRemint recovery contract");
 
     let (pool, storage, _pg) = start_postgres().await?;
@@ -659,8 +643,7 @@ async fn drill_6_recovery_query_skips_terminal_statuses(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_7_halt_sweep_does_not_touch_terminals(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn drill_7_halt_sweep_does_not_touch_terminals() -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "_glossary.md",
         "Terminal statuses (Completed / Failed / FailedReminted / ManualReview)",
@@ -729,7 +712,11 @@ fn drill_8_alertable_set_matches_runbook_dispatch() {
     eprintln!("is_alertable block:\n{block}");
 
     // Each runbook-claimed alertable status must appear in the match block.
-    for variant in ["TransactionStatus::Failed", "TransactionStatus::FailedReminted", "TransactionStatus::ManualReview"] {
+    for variant in [
+        "TransactionStatus::Failed",
+        "TransactionStatus::FailedReminted",
+        "TransactionStatus::ManualReview",
+    ] {
         assert!(
             block.contains(variant),
             "runbook claims {variant} fires webhook but is_alertable does not list it"
@@ -765,8 +752,7 @@ fn drill_8_alertable_set_matches_runbook_dispatch() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_9_path_b_signature_uniqueness_fence(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn drill_9_path_b_signature_uniqueness_fence() -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "withdrawal_manual_review.md",
         "Path B — counterpart_signature uniqueness fence (safety)",
@@ -844,7 +830,10 @@ async fn drill_9_path_b_signature_uniqueness_fence(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn drill_10_deposit_failed_recovery_flows() -> Result<(), Box<dyn std::error::Error>> {
-    drill_header("deposit_failed.md", "Step 2 — branch on verdict (LANDED / NOT_LANDED)");
+    drill_header(
+        "deposit_failed.md",
+        "Step 2 — branch on verdict (LANDED / NOT_LANDED)",
+    );
 
     let (pool, _storage, _pg) = start_postgres().await?;
 
@@ -862,12 +851,11 @@ async fn drill_10_deposit_failed_recovery_flows() -> Result<(), Box<dyn std::err
     .execute(&pool)
     .await?;
     assert_eq!(status_of(&pool, landed_id).await?, "completed");
-    let cs: Option<String> = sqlx::query_scalar(
-        "SELECT counterpart_signature FROM transactions WHERE id=$1",
-    )
-    .bind(landed_id)
-    .fetch_one(&pool)
-    .await?;
+    let cs: Option<String> =
+        sqlx::query_scalar("SELECT counterpart_signature FROM transactions WHERE id=$1")
+            .bind(landed_id)
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(cs.as_deref(), Some(observed_sig.as_str()));
 
     // ── NOT_LANDED branch — re-arm to pending ─────────────────────────
@@ -915,7 +903,10 @@ fn drill_11_program_type_labels_match_runbooks() {
 
     // Locate `as_label` and confirm the two arms emit the expected strings.
     let start = src.find("fn as_label(").expect("as_label not found");
-    let end = src[start..].find('}').map(|i| start + i + 1).expect("malformed");
+    let end = src[start..]
+        .find('}')
+        .map(|i| start + i + 1)
+        .expect("malformed");
     let block = &src[start..end];
     eprintln!("as_label block:\n{block}");
 

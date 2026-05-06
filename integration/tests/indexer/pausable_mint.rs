@@ -25,13 +25,15 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use private_channel_escrow_program_client::{instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
+use helpers::db;
+use private_channel_escrow_program_client::{
+    instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+};
 use private_channel_indexer::storage::common::models::{
     DbMint, DbTransaction, TransactionStatus, TransactionType,
 };
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
-use helpers::db;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;

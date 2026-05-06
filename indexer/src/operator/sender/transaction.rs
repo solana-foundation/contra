@@ -377,7 +377,9 @@ pub(super) fn handle_confirmation_result<'a>(
             Ok(ConfirmationResult::Confirmed) => {
                 handle_success(state, ctx, signature, storage_tx).await;
             }
-            Ok(ConfirmationResult::Failed(Some(PrivateChannelEscrowProgramError::InvalidSmtProof))) => {
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::InvalidSmtProof,
+            ))) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "invalid_smt_proof"])
                     .inc();

@@ -1,5 +1,5 @@
-use private_channel_withdraw_program_client::PrivateChannelWithdrawProgramError;
 use litesvm::{types::TransactionMetadata, LiteSVM};
+use private_channel_withdraw_program_client::PrivateChannelWithdrawProgramError;
 use solana_program::pubkey;
 use solana_program_pack::Pack;
 use solana_sdk::{
@@ -67,7 +67,8 @@ impl TestContext {
             unix_timestamp: current_time,
         });
 
-        let program_data = include_bytes!("../../../../target/deploy/private_channel_withdraw_program.so");
+        let program_data =
+            include_bytes!("../../../../target/deploy/private_channel_withdraw_program.so");
         let _ = svm.add_program(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, program_data);
 
         let payer = Keypair::new();

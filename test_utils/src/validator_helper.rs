@@ -70,7 +70,8 @@ fn verify_escrow_program_features_match_indexer(program_path: &Path) {
     CHECKED.call_once(|| {
         // Detect the test-tree feature via the indexer's TREE_HEIGHT constant.
         // Prod build: TREE_HEIGHT=16. test-tree build: TREE_HEIGHT=3.
-        let expected_test_tree = private_channel_indexer::operator::tree_constants::TREE_HEIGHT != 16;
+        let expected_test_tree =
+            private_channel_indexer::operator::tree_constants::TREE_HEIGHT != 16;
         let so_mtime = match fs::metadata(program_path).and_then(|m| m.modified()) {
             Ok(t) => t,
             Err(e) => {
@@ -213,10 +214,14 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
     verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
     let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
-        let escrow_program =
-            make_program_info(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(), ESCROW_PROGRAM_PATH);
-        let withdraw_program =
-            make_program_info(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(), WITHDRAW_PROGRAM_PATH);
+        let escrow_program = make_program_info(
+            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(),
+            ESCROW_PROGRAM_PATH,
+        );
+        let withdraw_program = make_program_info(
+            PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
+            WITHDRAW_PROGRAM_PATH,
+        );
 
         let geyser_config = serde_json::json!({
             "libpath": GEYSER_PLUGIN_PATH,
@@ -288,10 +293,14 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
     verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
     let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
-        let escrow_program =
-            make_program_info(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(), ESCROW_PROGRAM_PATH);
-        let withdraw_program =
-            make_program_info(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(), WITHDRAW_PROGRAM_PATH);
+        let escrow_program = make_program_info(
+            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(),
+            ESCROW_PROGRAM_PATH,
+        );
+        let withdraw_program = make_program_info(
+            PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
+            WITHDRAW_PROGRAM_PATH,
+        );
 
         let mut genesis = TestValidatorGenesis::default();
 

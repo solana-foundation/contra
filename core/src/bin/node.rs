@@ -27,7 +27,11 @@ struct Args {
     port: u16,
 
     /// Size of the signature verification queue
-    #[arg(long, default_value_t = 1000, env = "PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE")]
+    #[arg(
+        long,
+        default_value_t = 1000,
+        env = "PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE"
+    )]
     sigverify_queue_size: usize,
 
     /// Number of signature verification workers
@@ -47,7 +51,11 @@ struct Args {
     batch_deadline_ms: u64,
 
     /// Sequencer→executor batch channel capacity (bounded for back-pressure).
-    #[arg(long, default_value_t = 16, env = "PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY")]
+    #[arg(
+        long,
+        default_value_t = 16,
+        env = "PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY"
+    )]
     batch_channel_capacity: usize,
 
     /// Maximum parallel SVM worker threads per batch (including the calling thread).
@@ -86,7 +94,11 @@ struct Args {
     blocktime_ms: u64,
 
     /// Performance sample collection period in seconds
-    #[arg(long, default_value_t = 60, env = "PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS")]
+    #[arg(
+        long,
+        default_value_t = 60,
+        env = "PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS"
+    )]
     perf_sample_period_secs: u64,
 
     /// Enable Prometheus stage metrics server (load testing / profiling only).
@@ -200,7 +212,10 @@ async fn main() {
     // Initialize logging
     init_logging(&args.log_level, args.json_logs);
 
-    info!("Starting PrivateChannel node v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting PrivateChannel node v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("Mode: {:?}", args.mode);
 
     if let Err(e) = run_node_with_args(args).await {

@@ -17,8 +17,8 @@
 //! the validator fixtures those tests use).
 
 use {
-    private_channel_indexer::operator::reconciliation::compare_balances, solana_sdk::pubkey::Pubkey,
-    std::collections::HashMap,
+    private_channel_indexer::operator::reconciliation::compare_balances,
+    solana_sdk::pubkey::Pubkey, std::collections::HashMap,
 };
 
 fn mints(pairs: &[(Pubkey, u64)]) -> HashMap<Pubkey, u64> {

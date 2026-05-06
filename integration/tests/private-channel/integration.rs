@@ -13,15 +13,18 @@ mod helpers;
 #[path = "../setup.rs"]
 mod setup;
 
-use test_utils::indexer_helper::{start_private_channel_indexer, start_solana_indexer, IndexerHandle};
+use test_utils::indexer_helper::{
+    start_private_channel_indexer, start_solana_indexer, IndexerHandle,
+};
 use test_utils::operator_helper::{
-    start_private_channel_to_solana_operator, start_solana_to_private_channel_operator, OperatorHandle,
+    start_private_channel_to_solana_operator, start_solana_to_private_channel_operator,
+    OperatorHandle,
 };
 use test_utils::validator_helper::start_test_validator;
 
 use {
-    private_channel_core::nodes::node::{NodeConfig, NodeHandles, NodeMode},
     helpers::get_free_port,
+    private_channel_core::nodes::node::{NodeConfig, NodeHandles, NodeMode},
     rpc::*,
     solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer},
     std::time::Duration,
@@ -194,8 +197,8 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
             .with_password("password")
             .start(),
     );
-    let private_channel_indexer_postgres_container =
-        private_channel_indexer_postgres_container.expect("Failed to start PrivateChannel PostgreSQL container");
+    let private_channel_indexer_postgres_container = private_channel_indexer_postgres_container
+        .expect("Failed to start PrivateChannel PostgreSQL container");
     let solana_indexer_postgres_container =
         solana_indexer_postgres_container.expect("Failed to start Solana PostgreSQL container");
 
@@ -256,7 +259,8 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
         metrics: Arc::new(NoopMetrics),
     };
-    let (private_channel_handles, private_channel_rpc_url) = start_private_channel(node_config).await.unwrap();
+    let (private_channel_handles, private_channel_rpc_url) =
+        start_private_channel(node_config).await.unwrap();
 
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
@@ -268,7 +272,11 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
     println!("\n=== Starting PrivateChannel Indexer and Solana Indexer in parallel ===");
     let geyser_endpoint = format!("http://127.0.0.1:{}", geyser_port);
     let (private_channel_indexer_result, solana_indexer_result) = tokio::join!(
-        start_private_channel_indexer(None, private_channel_rpc_url.clone(), private_channel_indexer_db_url.clone()),
+        start_private_channel_indexer(
+            None,
+            private_channel_rpc_url.clone(),
+            private_channel_indexer_db_url.clone()
+        ),
         start_solana_indexer(
             geyser_endpoint,
             test_validator.rpc_url(),
@@ -284,8 +292,10 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
 
     // Start both operators in parallel — they are independent of each other
     println!("\n=== Starting Operators in parallel ===");
-    let operator_key_solana_to_private_channel = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let operator_key_private_channel_to_solana = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    let operator_key_solana_to_private_channel =
+        Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
+    let operator_key_private_channel_to_solana =
+        Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     let (solana_to_private_channel_result, private_channel_to_solana_result) = tokio::join!(
         start_solana_to_private_channel_operator(
             private_channel_rpc_url.clone(),
@@ -300,11 +310,13 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
             instance_pda,
         ),
     );
-    let solana_to_private_channel_operator_handle =
-        solana_to_private_channel_result.expect("Failed to start Solana -> PrivateChannel operator");
-    let private_channel_to_solana_operator_handle =
-        private_channel_to_solana_result.expect("Failed to start PrivateChannel -> Solana operator");
-    println!("Solana -> PrivateChannel and PrivateChannel -> Solana Operators started successfully");
+    let solana_to_private_channel_operator_handle = solana_to_private_channel_result
+        .expect("Failed to start Solana -> PrivateChannel operator");
+    let private_channel_to_solana_operator_handle = private_channel_to_solana_result
+        .expect("Failed to start PrivateChannel -> Solana operator");
+    println!(
+        "Solana -> PrivateChannel and PrivateChannel -> Solana Operators started successfully"
+    );
 
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     let solana_ctx = SolanaContext::new(

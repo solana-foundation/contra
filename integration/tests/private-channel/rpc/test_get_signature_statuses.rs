@@ -18,7 +18,9 @@ pub async fn run_get_signature_statuses_test(ctx: &PrivateChannelContext) {
     println!("\n✓ getSignatureStatuses tests passed!");
 }
 
-async fn test_signature_statuses_with_malformed_and_unknown_signatures(ctx: &PrivateChannelContext) {
+async fn test_signature_statuses_with_malformed_and_unknown_signatures(
+    ctx: &PrivateChannelContext,
+) {
     println!("\n  Test 1: malformed and unknown signatures return null");
 
     let from_keypair = Keypair::new();

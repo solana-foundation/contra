@@ -1,7 +1,8 @@
 use crate::assertions::{assert_deposit_balances, assert_release_funds_balances};
 use crate::pda_utils::{find_allowed_mint_pda, find_event_authority_pda};
 use crate::utils::{
-    assert_event_discriminator_present, get_token_balance, ATA_PROGRAM_ID, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    assert_event_discriminator_present, get_token_balance, ATA_PROGRAM_ID,
+    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use crate::{
     assertions::{

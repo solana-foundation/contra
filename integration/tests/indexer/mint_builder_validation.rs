@@ -8,7 +8,8 @@
 //! error private_channelct for each missing field.
 
 use {
-    private_channel_indexer::operator::utils::instruction_util::MintToBuilder, solana_sdk::pubkey::Pubkey,
+    private_channel_indexer::operator::utils::instruction_util::MintToBuilder,
+    solana_sdk::pubkey::Pubkey,
 };
 
 fn pk(seed: u8) -> Pubkey {

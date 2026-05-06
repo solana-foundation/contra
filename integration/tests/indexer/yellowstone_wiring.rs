@@ -17,7 +17,9 @@
 use private_channel_indexer::config::ProgramType;
 use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
 use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
-use private_channel_indexer::indexer::datasource::common::types::{ProcessorMessage, ProgramInstruction};
+use private_channel_indexer::indexer::datasource::common::types::{
+    ProcessorMessage, ProgramInstruction,
+};
 use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource;
 use std::str::FromStr;
 use std::time::Duration;
@@ -39,7 +41,8 @@ use yellowstone_grpc_proto::solana::storage::confirmed_block::{
 /// The account list is padded with deterministic junk pubkeys so parsing the
 /// Deposit accounts (12 required) succeeds.
 fn deposit_tx_update(slot: u64) -> SubscribeUpdate {
-    let program_id = solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
+    let program_id =
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
 
     // 12 account keys + program id at index 12 (the instruction references
     // indices 0..12 and program_id_index = 12).

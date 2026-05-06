@@ -11,7 +11,10 @@ export class PrivateChannelEscrowCodamaBuilder {
     private codama: Codama;
 
     constructor(privateChannelEscrowIdl: any) {
-        const idlJson = typeof privateChannelEscrowIdl === 'string' ? privateChannelEscrowIdl : JSON.stringify(privateChannelEscrowIdl);
+        const idlJson =
+            typeof privateChannelEscrowIdl === 'string'
+                ? privateChannelEscrowIdl
+                : JSON.stringify(privateChannelEscrowIdl);
         this.codama = createFromJson(idlJson);
     }
 
@@ -45,6 +48,8 @@ export class PrivateChannelEscrowCodamaBuilder {
     }
 }
 
-export function createPrivateChannelEscrowCodamaBuilder(privateChannelEscrowIdl: any): PrivateChannelEscrowCodamaBuilder {
+export function createPrivateChannelEscrowCodamaBuilder(
+    privateChannelEscrowIdl: any,
+): PrivateChannelEscrowCodamaBuilder {
     return new PrivateChannelEscrowCodamaBuilder(privateChannelEscrowIdl);
 }

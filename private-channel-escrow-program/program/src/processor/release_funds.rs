@@ -284,7 +284,11 @@ mod tests {
         let instruction_data = vec![0; INSTRUCTION_DATA_LENGTH];
         let accounts = [];
 
-        let result = process_release_funds(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &accounts, &instruction_data);
+        let result = process_release_funds(
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
     }

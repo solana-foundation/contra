@@ -12,11 +12,11 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
+use helpers::{generate_mint, send_and_confirm_instructions, setup_wallets};
 use private_channel_indexer::operator::{
     find_existing_mint_signature, mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId,
     RetryConfig, RpcClientWithRetry,
 };
-use helpers::{generate_mint, send_and_confirm_instructions, setup_wallets};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_config::RpcTransactionConfig;

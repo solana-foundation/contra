@@ -7,7 +7,7 @@ use crate::{
     },
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer},
     storage::{PostgresDb, Storage},
-    PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, StorageType,
+    DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
 
 #[cfg(feature = "datasource-rpc")]

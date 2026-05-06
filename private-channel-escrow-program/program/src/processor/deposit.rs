@@ -222,7 +222,11 @@ mod tests {
         let instruction_data = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let accounts = [];
 
-        let result = process_deposit(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &accounts, &instruction_data);
+        let result = process_deposit(
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
     }

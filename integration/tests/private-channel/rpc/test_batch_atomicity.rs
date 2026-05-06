@@ -102,7 +102,11 @@ async fn shared_postgres() -> &'static SharedPostgres {
 async fn create_isolated_db_url(test_name: &str) -> String {
     let shared = shared_postgres().await;
     let suffix = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let db_name = format!("private_channel_{}_{}", sanitize_db_component(test_name), suffix);
+    let db_name = format!(
+        "private_channel_{}_{}",
+        sanitize_db_component(test_name),
+        suffix
+    );
 
     let admin_url = format!(
         "postgres://postgres:password@{}:{}/postgres",

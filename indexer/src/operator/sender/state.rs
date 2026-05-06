@@ -242,8 +242,11 @@ impl SenderState {
                 continue;
             };
 
-            let user_ata =
-                get_associated_token_address_with_program_id(&user, &mint, &private_channel_token_program);
+            let user_ata = get_associated_token_address_with_program_id(
+                &user,
+                &mint,
+                &private_channel_token_program,
+            );
 
             // u64::try_from catches negative amounts. The write path already guards
             // against this (ba77249) but a corrupt DB row could still produce one —

@@ -57,7 +57,12 @@ async fn start_postgres(
 
 fn make_backup_dir(tag: &str) -> Result<PathBuf> {
     let u = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!("private_channel_t19_{}_{}_{}", tag, std::process::id(), u));
+    let dir = std::env::temp_dir().join(format!(
+        "private_channel_t19_{}_{}_{}",
+        tag,
+        std::process::id(),
+        u
+    ));
     fs::create_dir_all(&dir)?;
     let file = dir.join("backup.dump");
     fs::write(&file, b"fixture-backup")?;

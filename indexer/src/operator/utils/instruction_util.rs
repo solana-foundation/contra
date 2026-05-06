@@ -3,7 +3,9 @@ use crate::operator::{
     is_mint_already_initialized_error, is_mint_not_initialized_error, ConfirmationResult,
     SignerUtil, DEFAULT_CU_MINT, DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
-use private_channel_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
+use private_channel_escrow_program_client::instructions::{
+    ReleaseFundsBuilder, ResetSmtRootBuilder,
+};
 use solana_keychain::Signer;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;

@@ -1,5 +1,5 @@
 .PHONY: install integration-test fmt check-coverage-floor
-.PHONY: integration-coverage integration-coverage-private_channel integration-coverage-private-channel-redis integration-coverage-indexer integration-coverage-report
+.PHONY: integration-coverage integration-coverage-private-channel integration-coverage-private-channel-redis integration-coverage-indexer integration-coverage-report
 
 COVERAGE_DIR ?= ../coverage
 
@@ -166,7 +166,7 @@ COV_IGNORE_PATTERNS := \
 # e.g. "a b c" → "(a|b|c)"
 COV_IGNORE_REGEX := ($(shell echo '$(COV_IGNORE_PATTERNS)' | tr -s ' \t\n' '|' | sed 's/^|//;s/|$$//'))
 
-integration-coverage-private_channel:
+integration-coverage-private-channel:
 	@echo "Running private_channel integration tests with coverage instrumentation..."
 	@cargo llvm-cov clean --workspace
 	@cargo llvm-cov nextest --no-report --workspace --test private_channel_integration
@@ -190,7 +190,7 @@ integration-coverage-private_channel:
 # main private_channel_integration suite — its profraw aggregates into the same
 # `cargo llvm-cov report` output, so coverage accumulates naturally.
 # CI should invoke this target in parallel with (or immediately after)
-# `integration-coverage-private_channel`.
+# `integration-coverage-private-channel`.
 integration-coverage-private-channel-redis:
 	@echo "Running Redis-cache-path tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test test_redis_cache_path -- --nocapture --test-threads=1
@@ -322,12 +322,12 @@ check-coverage-floor:
 	|| { echo 'ERROR: coverage regressed below the floor. Either raise coverage or justify lowering COVERAGE_FLOOR.' ; exit 1 ; }
 
 # Local convenience target: builds the required .so artifacts before running coverage.
-# CI calls integration-coverage-private_channel and integration-coverage-indexer directly,
+# CI calls integration-coverage-private-channel and integration-coverage-indexer directly,
 # with .so files pre-built in a separate job (do NOT add build steps to those targets).
 integration-coverage:
 	@echo "Building escrow with production settings for private_channel integration tests..."
 	@$(MAKE) -C ../private-channel-escrow-program build
-	@$(MAKE) integration-coverage-private_channel
+	@$(MAKE) integration-coverage-private-channel
 	@$(MAKE) integration-coverage-private-channel-redis
 	@echo "Building escrow with test-tree for indexer/operator-lifecycle tests..."
 	@$(MAKE) -C ../private-channel-escrow-program build-test

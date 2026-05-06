@@ -11,7 +11,9 @@ use {
     tokio::time::sleep,
 };
 
-use super::utils::{restart_private_channel, send_and_confirm, start_private_channel, token_balance};
+use super::utils::{
+    restart_private_channel, send_and_confirm, start_private_channel, token_balance,
+};
 use crate::helpers::get_free_port;
 use crate::setup;
 

@@ -95,8 +95,11 @@ mod tests {
         let instruction_data = vec![];
         let accounts = [];
 
-        let result =
-            process_reset_smt_root(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &accounts, &instruction_data);
+        let result = process_reset_smt_root(
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
     }

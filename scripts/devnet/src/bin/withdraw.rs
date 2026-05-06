@@ -1,4 +1,6 @@
-use private_channel_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs};
+use private_channel_withdraw_program_client::instructions::{
+    WithdrawFunds, WithdrawFundsInstructionArgs,
+};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,

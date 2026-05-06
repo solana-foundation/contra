@@ -11,8 +11,8 @@ use crate::{
     state_utils::assert_get_or_withdraw_funds,
     utils::{
         assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR, TOKEN_INSUFFICIENT_FUNDS_ERROR,
-        ZERO_AMOUNT_ERROR,
+        INVALID_INSTRUCTION_DATA_ERROR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        TOKEN_INSUFFICIENT_FUNDS_ERROR, ZERO_AMOUNT_ERROR,
     },
 };
 

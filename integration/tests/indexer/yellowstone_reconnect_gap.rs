@@ -15,12 +15,12 @@
 //! simulates a mid-subscription disconnect; an in-process `mockito` RPC
 //! server stands in for the backfill RPC endpoint.
 
+use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::config::ProgramType;
 use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
 use private_channel_indexer::indexer::datasource::common::types::ProcessorMessage;
 use private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller;
 use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource;
-use mockito::{Matcher, Server as MockitoServer};
 use serde_json::json;
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;

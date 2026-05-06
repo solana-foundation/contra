@@ -1,4 +1,6 @@
-use private_channel_escrow_program_client::{instructions::CreateInstanceBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
+use private_channel_escrow_program_client::{
+    instructions::CreateInstanceBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,

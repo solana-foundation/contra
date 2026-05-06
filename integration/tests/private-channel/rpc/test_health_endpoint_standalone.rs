@@ -19,13 +19,13 @@
 //! HTTP-level reproducer so coverage attributes correctly.
 
 use {
-    private_channel_core::rpc::handle_request,
     http_body_util::{BodyExt, Full},
     hyper::server::conn::http1,
     hyper::service::service_fn,
     hyper::{body::Bytes, Method, Request, StatusCode},
     hyper_util::{client::legacy::Client, rt::TokioExecutor, rt::TokioIo},
     jsonrpsee::server::RpcModule,
+    private_channel_core::rpc::handle_request,
     std::sync::Arc,
     tokio::net::TcpListener,
 };
@@ -50,7 +50,9 @@ async fn start_empty_server() -> std::net::SocketAddr {
                         handle_request(
                             req,
                             rpc_module,
-                            std::sync::Arc::new(private_channel_core::health::HeartbeatRegistry::new()),
+                            std::sync::Arc::new(
+                                private_channel_core::health::HeartbeatRegistry::new(),
+                            ),
                         )
                         .await
                     }

@@ -725,7 +725,10 @@ async fn main() {
             .unwrap_or(8902)
     });
 
-    info!("Starting PrivateChannel streamer v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting PrivateChannel streamer v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Connect to the read replica
     let accounts_db = AccountsDB::new(&args.accountsdb_connection_url, true)

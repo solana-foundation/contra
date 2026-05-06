@@ -110,9 +110,9 @@ mod tests {
         assert!(PRECOMPILES.contains_key(&spl_associated_token_account::ID));
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::sysvar::rent::ID));
         assert!(PRECOMPILES.contains_key(&spl_memo::id()));
-        assert!(
-            PRECOMPILES.contains_key(&private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID)
-        );
+        assert!(PRECOMPILES.contains_key(
+            &private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+        ));
         assert_eq!(PRECOMPILES.len(), 6);
     }
 

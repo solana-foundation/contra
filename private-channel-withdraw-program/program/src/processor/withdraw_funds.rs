@@ -189,8 +189,11 @@ mod tests {
         let instruction_data = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let accounts = [];
 
-        let result =
-            process_withdraw_funds(&PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, &accounts, &instruction_data);
+        let result = process_withdraw_funds(
+            &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
 
         assert_eq!(result.err(), Some(ProgramError::NotEnoughAccountKeys));
     }

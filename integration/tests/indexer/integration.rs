@@ -11,13 +11,13 @@ mod setup;
 #[path = "parser_malformation.rs"]
 mod parser_malformation;
 
-use private_channel_indexer::operator::tree_constants::MAX_TREE_LEAVES;
-use private_channel_indexer::storage::{PostgresDb, Storage};
-use private_channel_indexer::PostgresConfig;
 use helpers::{
     calculate_user_total_deposited, db, execute_user_deposits, execute_user_withdrawal,
     get_token_balance, operator_util, test_types::*, verify_database,
 };
+use private_channel_indexer::operator::tree_constants::MAX_TREE_LEAVES;
+use private_channel_indexer::storage::{PostgresDb, Storage};
+use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
@@ -141,7 +141,9 @@ async fn setup_test_environments(
             .token_program(spl_token::ID)
             .associated_token_program(spl_associated_token_account::ID)
             .event_authority(event_authority_pda)
-            .private_channel_escrow_program(private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .private_channel_escrow_program(
+                private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            )
             .amount(amount)
             .instruction();
 
@@ -869,13 +871,14 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     println!("{}{}", CYAN, "=".repeat(40));
     // Start PrivateChannel indexer (Yellowstone) in background
     println!("\n=== Starting PrivateChannel Indexer (Yellowstone) ===");
-    let (_private_channel_indexer_handle, _private_channel_indexer_storage) = start_private_channel_indexer(
-        Some(geyser_endpoint.clone()),
-        test_validator.rpc_url(),
-        indexer_db_url.clone(),
-    )
-    .await
-    .expect("Failed to start PrivateChannel indexer");
+    let (_private_channel_indexer_handle, _private_channel_indexer_storage) =
+        start_private_channel_indexer(
+            Some(geyser_endpoint.clone()),
+            test_validator.rpc_url(),
+            indexer_db_url.clone(),
+        )
+        .await
+        .expect("Failed to start PrivateChannel indexer");
 
     println!("PrivateChannel Indexer started successfully");
 

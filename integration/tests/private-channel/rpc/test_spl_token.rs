@@ -623,7 +623,10 @@ async fn setup_private_channel_accounts(
     );
 
     // Send the transaction
-    let sig = private_channel_ctx.send_transaction(&transfer_tx).await.unwrap();
+    let sig = private_channel_ctx
+        .send_transaction(&transfer_tx)
+        .await
+        .unwrap();
     private_channel_ctx.check_transaction_exists(sig).await;
     println!("Transfer transaction sent: {}", sig);
 
@@ -707,7 +710,10 @@ async fn private_channel_burn(
     let blockhash = private_channel_ctx.get_blockhash().await.unwrap();
     let withdraw_tx =
         setup::withdraw_funds_transaction(alice, mint_pubkey, withdrawal_amount, blockhash);
-    let sig = private_channel_ctx.send_transaction(&withdraw_tx).await.unwrap();
+    let sig = private_channel_ctx
+        .send_transaction(&withdraw_tx)
+        .await
+        .unwrap();
     private_channel_ctx.check_transaction_exists(sig).await;
     println!(
         "Withdrew {} tokens from Alice: {}",
@@ -884,7 +890,14 @@ pub async fn run_spl_token_test(
     .await;
 
     // Step 3: Setup accounts in PrivateChannel and perform token operations
-    setup_private_channel_accounts(private_channel_ctx, &mint_keypair.pubkey(), &alice, &bob, &charlie).await;
+    setup_private_channel_accounts(
+        private_channel_ctx,
+        &mint_keypair.pubkey(),
+        &alice,
+        &bob,
+        &charlie,
+    )
+    .await;
 
     // Step 4: Withdraw from PrivateChannel
     private_channel_burn(
@@ -917,8 +930,14 @@ async fn test_simulate_transaction(
         get_associated_token_address_with_program_id(&from.pubkey(), mint_pubkey, &spl_token::id());
     let to_ata =
         get_associated_token_address_with_program_id(&to.pubkey(), mint_pubkey, &spl_token::id());
-    let from_balance_before = private_channel_ctx.get_token_balance(&from_ata).await.unwrap();
-    let to_balance_before = private_channel_ctx.get_token_balance(&to_ata).await.unwrap();
+    let from_balance_before = private_channel_ctx
+        .get_token_balance(&from_ata)
+        .await
+        .unwrap();
+    let to_balance_before = private_channel_ctx
+        .get_token_balance(&to_ata)
+        .await
+        .unwrap();
     let blockhash = private_channel_ctx.get_blockhash().await.unwrap();
     let transfer_tx = setup::transfer_tokens_versioned_transaction(
         from,

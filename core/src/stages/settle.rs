@@ -929,7 +929,8 @@ mod tests {
 
         // Setup: Get test database URLs from environment
         let postgres_url = env::var("TEST_POSTGRES_URL").unwrap_or_else(|_| {
-            "postgresql://private_channel:private_channel@localhost:5432/private_channel_test".to_string()
+            "postgresql://private_channel:private_channel@localhost:5432/private_channel_test"
+                .to_string()
         });
         let redis_url =
             env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

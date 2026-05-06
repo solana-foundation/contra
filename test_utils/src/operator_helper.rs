@@ -1,6 +1,8 @@
 use {
     private_channel_indexer::{
-        config::{PrivateChannelIndexerConfig, OperatorConfig, PostgresConfig, ProgramType, StorageType},
+        config::{
+            OperatorConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
+        },
         operator,
         storage::{PostgresDb, Storage},
     },

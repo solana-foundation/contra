@@ -1,5 +1,7 @@
 extern crate alloc;
-use super::discriminator::{AccountSerialize, PrivateChannelEscrowAccountDiscriminators, Discriminator};
+use super::discriminator::{
+    AccountSerialize, Discriminator, PrivateChannelEscrowAccountDiscriminators,
+};
 use crate::constants::{
     tree_constants::{EMPTY_TREE_ROOT, MAX_TREE_LEAVES},
     INSTANCE_SEED, INSTANCE_VERSION,
@@ -28,7 +30,8 @@ pub struct Instance {
 }
 
 impl Discriminator for Instance {
-    const DISCRIMINATOR: u8 = PrivateChannelEscrowAccountDiscriminators::InstanceDiscriminator as u8;
+    const DISCRIMINATOR: u8 =
+        PrivateChannelEscrowAccountDiscriminators::InstanceDiscriminator as u8;
 }
 
 impl AccountSerialize for Instance {

@@ -1,5 +1,5 @@
-use private_channel_escrow_program_client::PrivateChannelEscrowProgramError;
 use litesvm::{types::TransactionMetadata, LiteSVM};
+use private_channel_escrow_program_client::PrivateChannelEscrowProgramError;
 use solana_program::pubkey;
 use solana_program_pack::Pack;
 use solana_sdk::{
@@ -47,7 +47,8 @@ pub const INVALID_ATA_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidAta 
 pub const INVALID_MINT_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidMint as u32;
 pub const INVALID_INSTANCE_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidInstance as u32;
 pub const INVALID_ADMIN_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidAdmin as u32;
-pub const INVALID_ALLOWED_MINT_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidAllowedMint as u32;
+pub const INVALID_ALLOWED_MINT_ERROR: u32 =
+    PrivateChannelEscrowProgramError::InvalidAllowedMint as u32;
 pub const INVALID_OPERATOR_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidOperatorPda as u32;
 pub const INVALID_SMT_PROOF_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidSmtProof as u32;
 pub const TRANSFER_HOOK_NOT_ALLOWED_ERROR: u32 =
@@ -93,7 +94,8 @@ impl TestContext {
             unix_timestamp: current_time,
         });
 
-        let program_data = include_bytes!("../../../../target/deploy/private_channel_escrow_program.so");
+        let program_data =
+            include_bytes!("../../../../target/deploy/private_channel_escrow_program.so");
         let _ = svm.add_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, program_data);
 
         let payer = Keypair::new();

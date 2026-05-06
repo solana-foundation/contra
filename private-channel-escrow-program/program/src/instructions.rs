@@ -24,7 +24,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     CreateInstance {
         /// Bump for the instance PDA
         bump: u8,
@@ -48,7 +51,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     AllowMint {
         /// Bump for the allowed mint PDA
         bump: u8,
@@ -65,7 +71,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     BlockMint {} = 2,
 
     /// Add an operator to the instance (admin-only).
@@ -79,7 +88,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     AddOperator {
         /// Bump for the operator PDA
         bump: u8,
@@ -96,7 +108,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     RemoveOperator {} = 4,
 
     /// Set a new admin for the instance (current admin only).
@@ -108,7 +123,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     SetNewAdmin {} = 5,
 
     /// Deposit tokens from user ATA to instance escrow ATA (permissionless).
@@ -137,7 +155,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     Deposit {
         /// Amount of tokens to deposit
         amount: u64,
@@ -178,7 +199,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     ReleaseFunds {
         /// Amount of tokens to release
         amount: u64,
@@ -204,7 +228,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
     ))]
-    #[codama(account(name = "private_channel_escrow_program", docs = "Current program for CPI"))]
+    #[codama(account(
+        name = "private_channel_escrow_program",
+        docs = "Current program for CPI"
+    ))]
     ResetSmtRoot {} = 8,
 
     /// Invoked via CPI from another program to log event via instruction data.

@@ -21,11 +21,11 @@
 //! broken.
 
 use {
-    private_channel_core::rpc::{constants::MAX_BODY_SIZE, handle_request},
     hyper::server::conn::http1,
     hyper::service::service_fn,
     hyper_util::rt::TokioIo,
     jsonrpsee::server::RpcModule,
+    private_channel_core::rpc::{constants::MAX_BODY_SIZE, handle_request},
     std::sync::Arc,
     tokio::io::{AsyncReadExt, AsyncWriteExt},
     tokio::net::{TcpListener, TcpStream},
@@ -55,7 +55,9 @@ async fn start_test_server() -> std::net::SocketAddr {
                         handle_request(
                             req,
                             rpc_module,
-                            std::sync::Arc::new(private_channel_core::health::HeartbeatRegistry::new()),
+                            std::sync::Arc::new(
+                                private_channel_core::health::HeartbeatRegistry::new(),
+                            ),
                         )
                         .await
                     }

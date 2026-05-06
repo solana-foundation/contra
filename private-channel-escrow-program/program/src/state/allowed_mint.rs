@@ -1,5 +1,7 @@
 extern crate alloc;
-use super::discriminator::{AccountSerialize, PrivateChannelEscrowAccountDiscriminators, Discriminator};
+use super::discriminator::{
+    AccountSerialize, Discriminator, PrivateChannelEscrowAccountDiscriminators,
+};
 use crate::constants::ALLOWED_MINT_SEED;
 use crate::processor::validate_pda_account;
 use crate::require_len;
@@ -19,7 +21,8 @@ pub struct AllowedMint {
 }
 
 impl Discriminator for AllowedMint {
-    const DISCRIMINATOR: u8 = PrivateChannelEscrowAccountDiscriminators::AllowedMintDiscriminator as u8;
+    const DISCRIMINATOR: u8 =
+        PrivateChannelEscrowAccountDiscriminators::AllowedMintDiscriminator as u8;
 }
 
 impl AccountSerialize for AllowedMint {

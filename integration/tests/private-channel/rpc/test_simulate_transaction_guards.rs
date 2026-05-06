@@ -13,11 +13,11 @@
 
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
+    jsonrpsee::server::RpcModule,
     private_channel_core::{
         accounts::AccountsDB,
         rpc::{create_rpc_module, ReadDeps},
     },
-    jsonrpsee::server::RpcModule,
     serde_json::{json, Value},
     solana_sdk::{
         hash::Hash,

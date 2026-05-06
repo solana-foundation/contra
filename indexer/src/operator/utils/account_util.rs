@@ -1,4 +1,6 @@
-use private_channel_escrow_program_client::{programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, Instance};
+use private_channel_escrow_program_client::{
+    programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, Instance,
+};
 use solana_sdk::pubkey::Pubkey;
 
 const INSTANCE_SEED: &[u8] = b"instance";

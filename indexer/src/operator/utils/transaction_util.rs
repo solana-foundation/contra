@@ -199,7 +199,9 @@ pub fn parse_program_error(
         ) => {
             match *code {
                 11 => Some(PrivateChannelEscrowProgramError::InvalidSmtProof),
-                12 => Some(PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex),
+                12 => Some(
+                    PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
+                ),
                 _ => None, // Ignore other program errors
             }
         }

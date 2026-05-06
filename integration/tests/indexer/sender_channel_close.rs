@@ -23,7 +23,7 @@
 use {
     private_channel_indexer::{
         config::{
-            PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType,
+            PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         operator::run_sender,

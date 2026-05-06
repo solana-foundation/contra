@@ -27,14 +27,14 @@ mod setup;
 
 use {
     chrono::Utc,
+    helpers::{db, mint_to_owner},
     private_channel_indexer::{
-        config::{PrivateChannelIndexerConfig, OperatorConfig, ProgramType, StorageType},
+        config::{OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator,
         storage::common::models::{DbMint, DbTransaction, TransactionStatus},
         storage::{PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
-    helpers::{db, mint_to_owner},
     setup::{TestEnvironment, TEST_ADMIN_KEYPAIR},
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{

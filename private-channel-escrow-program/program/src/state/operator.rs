@@ -1,5 +1,7 @@
 extern crate alloc;
-use super::discriminator::{AccountSerialize, PrivateChannelEscrowAccountDiscriminators, Discriminator};
+use super::discriminator::{
+    AccountSerialize, Discriminator, PrivateChannelEscrowAccountDiscriminators,
+};
 use crate::constants::OPERATOR_SEED;
 use crate::processor::validate_pda_account;
 use crate::require_len;
@@ -19,7 +21,8 @@ pub struct Operator {
 }
 
 impl Discriminator for Operator {
-    const DISCRIMINATOR: u8 = PrivateChannelEscrowAccountDiscriminators::OperatorDiscriminator as u8;
+    const DISCRIMINATOR: u8 =
+        PrivateChannelEscrowAccountDiscriminators::OperatorDiscriminator as u8;
 }
 
 impl AccountSerialize for Operator {

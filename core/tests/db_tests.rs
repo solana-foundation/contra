@@ -5,7 +5,9 @@
 
 use private_channel_core::accounts::AccountsDB;
 use private_channel_core::stages::AccountSettlement;
-use private_channel_core::test_helpers::{create_test_block_info, create_test_sanitized_transaction};
+use private_channel_core::test_helpers::{
+    create_test_block_info, create_test_sanitized_transaction,
+};
 use solana_rpc_client_types::response::RpcPerfSample;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount},

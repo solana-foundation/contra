@@ -1,7 +1,7 @@
 use {
     private_channel_indexer::{
         storage::{PostgresDb, Storage},
-        BackfillConfig, PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, PostgresConfig,
+        BackfillConfig, DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig,
         ProgramType, RpcPollingConfig, StorageType, YellowstoneConfig,
     },
     solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey},

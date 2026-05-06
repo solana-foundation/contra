@@ -761,7 +761,10 @@ mod tests {
         let expected = "private_channel:mint-idempotency:99";
 
         assert!(memo_matches(expected, expected));
-        assert!(memo_matches("[27] private_channel:mint-idempotency:99", expected));
+        assert!(memo_matches(
+            "[27] private_channel:mint-idempotency:99",
+            expected
+        ));
         assert!(memo_matches(
             "[5] hello; [27] private_channel:mint-idempotency:99",
             expected

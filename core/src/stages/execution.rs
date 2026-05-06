@@ -3,7 +3,8 @@ use {
         accounts::{bob::BOB, AccountsDB},
         nodes::node::WorkerHandle,
         processor::{
-            create_transaction_batch_processor, get_transaction_check_results, PrivateChannelForkGraph,
+            create_transaction_batch_processor, get_transaction_check_results,
+            PrivateChannelForkGraph,
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,

@@ -4,8 +4,8 @@ use crate::{
     utils::{
         assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_pausable,
         set_mint_2022_with_permanent_delegate, set_mint_2022_with_transfer_hook, TestContext,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
-        INVALID_ALLOWED_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR, TOKEN_2022_PROGRAM_ID,
+        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
+        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
         TRANSFER_HOOK_NOT_ALLOWED_ERROR,
     },
 };

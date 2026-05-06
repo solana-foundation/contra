@@ -16,7 +16,7 @@ use {
         config::{BackfillConfig, ReconciliationConfig},
         error::{IndexerError, ReconciliationError},
         indexer::run,
-        PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, PostgresConfig, ProgramType,
+        DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
         StorageType,
     },
     testcontainers::runners::AsyncRunner,

@@ -4,8 +4,8 @@ use crate::{
         assert_get_or_add_operator, assert_get_or_create_instance, assert_get_or_reset_smt_root,
     },
     utils::{
-        assert_program_error, TestContext, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, INVALID_OPERATOR_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR,
+        assert_program_error, TestContext, INVALID_OPERATOR_ERROR,
+        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
 };
 

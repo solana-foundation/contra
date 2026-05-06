@@ -22,7 +22,9 @@
 
 use {
     chrono::Utc,
-    private_channel_indexer::storage::common::models::{DbTransaction, TransactionStatus, TransactionType},
+    private_channel_indexer::storage::common::models::{
+        DbTransaction, TransactionStatus, TransactionType,
+    },
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::time::Duration,
     test_utils::operator_helper::start_solana_to_private_channel_operator_with_mocks,

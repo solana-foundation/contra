@@ -15,7 +15,9 @@ use crate::storage::common::models::{DbTransaction, TransactionStatus};
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
-use private_channel_escrow_program_client::instructions::{ReleaseFundsBuilder, ResetSmtRootBuilder};
+use private_channel_escrow_program_client::instructions::{
+    ReleaseFundsBuilder, ResetSmtRootBuilder,
+};
 use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -383,9 +385,14 @@ async fn build_release_funds(
 
     // Remint info for recovery-on-permanent-failure.  PrivateChannel token program, not
     // mainnet — remint happens on PrivateChannel.
-    let private_channel_token_program = processor_state.mint_cache.get_private_channel_token_program();
-    let remint_user_ata =
-        get_associated_token_address_with_program_id(&recipient, &mint, &private_channel_token_program);
+    let private_channel_token_program = processor_state
+        .mint_cache
+        .get_private_channel_token_program();
+    let remint_user_ata = get_associated_token_address_with_program_id(
+        &recipient,
+        &mint,
+        &private_channel_token_program,
+    );
     let remint_info = WithdrawalRemintInfo {
         transaction_id: transaction.id,
         trace_id: transaction.trace_id.clone(),
@@ -652,7 +659,9 @@ pub async fn process_deposit_funds(
                 }
             })?;
 
-            let token_program = processor_state.mint_cache.get_private_channel_token_program();
+            let token_program = processor_state
+                .mint_cache
+                .get_private_channel_token_program();
 
             let recipient_ata =
                 get_associated_token_address_with_program_id(&recipient, &mint, &token_program);

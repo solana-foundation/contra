@@ -1,13 +1,13 @@
 use clap::{Parser, Subcommand};
-use private_channel_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
-use private_channel_indexer::{
-    BackfillConfig, PrivateChannelIndexerConfig, DatasourceType, IndexerConfig, OperatorConfig,
-    PostgresConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
-    YellowstoneConfig,
-};
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
+};
+use private_channel_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
+use private_channel_indexer::{
+    BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
+    PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
+    YellowstoneConfig,
 };
 use serde::Deserialize;
 use solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey};
@@ -118,7 +118,10 @@ fn default_confirmation_poll_interval_ms() -> u64 {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "private-channel-indexer", about = "Index data from PrivateChannel programs")]
+#[command(
+    name = "private-channel-indexer",
+    about = "Index data from PrivateChannel programs"
+)]
 struct Args {
     /// Path to configuration file
     #[arg(short = 'c', long = "config", env = "PRIVATE_CHANNEL_INDEXER_CONFIG")]
@@ -222,7 +225,8 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
     private_channel_indexer::metrics::init();
-    let health = private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig::indexer());
+    let health =
+        private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig::indexer());
     private_channel_metrics::start_metrics_server_with_health(metrics_port, health.clone());
 
     let common: CommonSection = figment.extract_inner("common")?;
@@ -350,7 +354,9 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9100);
     private_channel_indexer::metrics::init();
-    let health = private_channel_metrics::HealthState::new(private_channel_metrics::HealthConfig::operator());
+    let health = private_channel_metrics::HealthState::new(
+        private_channel_metrics::HealthConfig::operator(),
+    );
     private_channel_metrics::start_metrics_server_with_health(metrics_port, health.clone());
 
     let common: CommonSection = figment.extract_inner("common")?;
@@ -370,7 +376,8 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     };
 
     // Initialize storage
-    let storage: Arc<private_channel_indexer::storage::Storage> = match storage_section.storage_type {
+    let storage: Arc<private_channel_indexer::storage::Storage> = match storage_section.storage_type
+    {
         StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
             private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
         )),
@@ -416,7 +423,8 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     // Validate signer configuration early (from environment variables)
     OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
 
-    private_channel_indexer::operator::run(storage, common_config, operator_config, Some(health)).await?;
+    private_channel_indexer::operator::run(storage, common_config, operator_config, Some(health))
+        .await?;
 
     Ok(())
 }
@@ -448,11 +456,12 @@ async fn run_resync(
     };
 
     // Initialize storage
-    let storage_instance: Arc<private_channel_indexer::storage::Storage> = match storage.storage_type {
-        StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
-            private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
-        )),
-    };
+    let storage_instance: Arc<private_channel_indexer::storage::Storage> =
+        match storage.storage_type {
+            StorageType::Postgres => Arc::new(private_channel_indexer::storage::Storage::Postgres(
+                private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
+            )),
+        };
 
     // Initialize RPC poller
     let rpc_url = indexer

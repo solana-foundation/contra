@@ -59,7 +59,12 @@ fn tmpdir(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("private_channel_t20_{}_{}_{}", tag, std::process::id(), u));
+    let dir = std::env::temp_dir().join(format!(
+        "private_channel_t20_{}_{}_{}",
+        tag,
+        std::process::id(),
+        u
+    ));
     fs::create_dir_all(&dir).unwrap();
     dir
 }

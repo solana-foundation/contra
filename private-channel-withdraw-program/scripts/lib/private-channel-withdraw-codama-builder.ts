@@ -5,7 +5,10 @@ export class PrivateChannelWithdrawCodamaBuilder {
     private codama: Codama;
 
     constructor(privateChannelWithdrawIdl: any) {
-        const idlJson = typeof privateChannelWithdrawIdl === 'string' ? privateChannelWithdrawIdl : JSON.stringify(privateChannelWithdrawIdl);
+        const idlJson =
+            typeof privateChannelWithdrawIdl === 'string'
+                ? privateChannelWithdrawIdl
+                : JSON.stringify(privateChannelWithdrawIdl);
         this.codama = createFromJson(idlJson);
     }
 
@@ -19,6 +22,8 @@ export class PrivateChannelWithdrawCodamaBuilder {
     }
 }
 
-export function createPrivateChannelWithdrawCodamaBuilder(privateChannelWithdrawIdl: any): PrivateChannelWithdrawCodamaBuilder {
+export function createPrivateChannelWithdrawCodamaBuilder(
+    privateChannelWithdrawIdl: any,
+): PrivateChannelWithdrawCodamaBuilder {
     return new PrivateChannelWithdrawCodamaBuilder(privateChannelWithdrawIdl);
 }

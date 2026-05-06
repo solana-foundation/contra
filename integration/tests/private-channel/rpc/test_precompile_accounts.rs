@@ -53,7 +53,10 @@ pub async fn run_precompile_accounts_test(private_channel_ctx: &PrivateChannelCo
         println!("  Testing {}: {}", precompile.name, precompile.pubkey);
 
         // Get account info
-        let account = private_channel_ctx.read_client.get_account(&precompile.pubkey).await;
+        let account = private_channel_ctx
+            .read_client
+            .get_account(&precompile.pubkey)
+            .await;
         println!("Account info: {:?}", account);
 
         let account = match account {

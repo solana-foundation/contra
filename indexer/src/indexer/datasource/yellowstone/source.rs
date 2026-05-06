@@ -1,9 +1,9 @@
 use super::convert::create_message;
 use crate::metrics;
 use async_trait::async_trait;
-use private_channel_metrics::MetricLabel;
 use futures::stream::StreamExt;
 use futures::SinkExt;
+use private_channel_metrics::MetricLabel;
 use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;

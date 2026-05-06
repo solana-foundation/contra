@@ -1,5 +1,6 @@
 use crate::utils::{
-    assert_program_error, TestContext, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, INVALID_EVENT_AUTHORITY_ERROR,
+    assert_program_error, TestContext, INVALID_EVENT_AUTHORITY_ERROR,
+    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},

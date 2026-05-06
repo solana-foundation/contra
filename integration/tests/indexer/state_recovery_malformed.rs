@@ -20,7 +20,7 @@
 use {
     chrono::{DateTime, Utc},
     private_channel_indexer::{
-        config::{PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType},
+        config::{PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator::sender::{test_hooks, TransactionStatusUpdate},
         storage::{
             common::{

@@ -1,7 +1,8 @@
 use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, ProgramResult};
 
 use crate::{
-    discriminator::PrivateChannelWithdrawInstructionDiscriminators, processor::process_withdraw_funds,
+    discriminator::PrivateChannelWithdrawInstructionDiscriminators,
+    processor::process_withdraw_funds,
 };
 
 entrypoint!(process_instruction);

@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
 // PrivateChannel Withdraw Program ID
-pub const PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID: &str = "J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi";
+pub const PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID: &str =
+    "J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi";
 
 // Instruction discriminators
 const WITHDRAW_FUNDS: u8 = 0;

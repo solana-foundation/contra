@@ -22,7 +22,7 @@
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
     private_channel_indexer::{
-        config::{PrivateChannelIndexerConfig, PostgresConfig, ProgramType, StorageType},
+        config::{PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator::{
             sender::{
                 test_hooks,

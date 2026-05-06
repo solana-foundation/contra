@@ -1,7 +1,8 @@
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
 use crate::{
-    constants::event_authority_pda, error::PrivateChannelEscrowProgramError, processor::verify_signer,
+    constants::event_authority_pda, error::PrivateChannelEscrowProgramError,
+    processor::verify_signer,
 };
 
 #[inline(always)]

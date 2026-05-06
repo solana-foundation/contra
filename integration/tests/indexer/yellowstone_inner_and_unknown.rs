@@ -66,7 +66,8 @@ fn block_meta(slot: u64) -> SubscribeUpdate {
 /// entry. The inner frame only needs to parse shape-wise — its contents are
 /// not validated by the outer branch we're covering.
 fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
-    let program_id = solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
+    let program_id =
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
     let mut account_keys: Vec<Vec<u8>> = (0..12)
         .map(|i| {
             let mut bytes = [0u8; 32];
@@ -142,7 +143,8 @@ fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
 /// an unrecognised discriminator (0xFE). The escrow parser returns
 /// `Ok(None)` for unknown discriminators, firing the `:736-773` branch.
 fn unknown_discriminator_tx(slot: u64) -> SubscribeUpdate {
-    let program_id = solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
+    let program_id =
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
     let mut account_keys: Vec<Vec<u8>> = (0..12)
         .map(|i| {
             let mut bytes = [0u8; 32];

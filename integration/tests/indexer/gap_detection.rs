@@ -17,9 +17,9 @@ mod helpers;
 #[allow(dead_code)]
 mod setup;
 
+use helpers::{db, send_and_confirm_instructions, test_types::*};
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
-use helpers::{db, send_and_confirm_instructions, test_types::*};
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
@@ -66,7 +66,9 @@ async fn execute_deposit(
         .token_program(spl_token::ID)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .private_channel_escrow_program(private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(
+            private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        )
         .amount(amount)
         .instruction();
 

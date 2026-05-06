@@ -164,7 +164,11 @@ mod tests {
         let instruction_data = [];
         let accounts = [];
 
-        let result = process_allow_mint(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &accounts, &instruction_data);
+        let result = process_allow_mint(
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &accounts,
+            &instruction_data,
+        );
 
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
     }

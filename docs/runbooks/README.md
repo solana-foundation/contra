@@ -120,5 +120,9 @@ RUST_LOG=trace cargo test -p contra-indexer --test runbook_drills -- \
 ### When to run drills
 
 - Before merging a runbook edit.
-- After changes to: `processor.rs`, `sender/transaction.rs`,
-  `sender/remint.rs`, `db_transaction_writer.rs`, or the indexer schema.
+- After changes to: `processor.rs`, `sender/transaction.rs` (and in
+  particular `send_fatal_error`, the source of the rare withdrawal
+  `failed` transition that drill_12 protects), `sender/remint.rs`,
+  `db_transaction_writer.rs` (including its webhook-payload serializer
+  — drill_13 anchors on the `"remint_signature"` JSON key string
+  literal), or the indexer schema.

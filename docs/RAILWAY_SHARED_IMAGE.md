@@ -1,7 +1,7 @@
-# Railway: shared `contra-app` image migration
+# Railway: shared `private-channel-app` image migration
 
 This doc is a draft plan for replicating the local §1.6 pattern (one shared
-`contra-app:${CONTRA_VERSION}` image, N Railway services that all reference it
+`private-channel-app:${PRIVATE_CHANNEL_VERSION}` image, N Railway services that all reference it
 with different start commands) on Railway. It is **not implemented**. Today
 each Railway service builds its own copy of the same `Dockerfile` — wasteful
 but functional.
@@ -17,7 +17,7 @@ Read [`RAILWAY.md`](RAILWAY.md) first for the current per-service-build flow.
 | 9 Rust services × full Cargo build per deploy | 1 build, 9 image pulls |
 | Services can drift if a deploy partially fails | All services byte-identical, guaranteed |
 | Rollback = re-deploy from old commit (rebuild) | Rollback = re-pin to previous tag (seconds) |
-| `CONTRA_VERSION` ignored | `CONTRA_VERSION` becomes the deploy primitive |
+| `PRIVATE_CHANNEL_VERSION` ignored | `PRIVATE_CHANNEL_VERSION` becomes the deploy primitive |
 | `git push` triggers Railway rebuild | CI builds & pushes; Railway redeploys on tag change |
 
 **Skip this if:** Railway is dev/staging where per-push auto-rebuild is more
@@ -39,17 +39,17 @@ are starting to hurt.
                                            ┌─────────────────────┐
                                            │  GHCR registry      │
                                            │  ghcr.io/<org>/     │
-                                           │  contra-app:vX.Y.Z  │
+                                           │  private-channel-app:vX.Y.Z  │
                                            └──────────┬──────────┘
                                                       │ pull
                             ┌─────────────────────────┼─────────────────────────┐
                             ▼                         ▼                         ▼
                   ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
                   │ write-node   │          │ gateway      │   ...    │ operator-    │
-                  │ Railway svc  │          │ Railway svc  │          │ contra svc   │
+                  │ Railway svc  │          │ Railway svc  │          │ private_channel svc   │
                   │              │          │              │          │              │
                   │ start cmd:   │          │ start cmd:   │          │ start cmd:   │
-                  │ contra-node  │          │ gateway      │          │ indexer      │
+                  │ private-channel-node  │          │ gateway      │          │ indexer      │
                   └──────────────┘          └──────────────┘          └──────────────┘
 ```
 
@@ -64,7 +64,7 @@ Add `.github/workflows/release-image.yml`. Triggers on git tag push (e.g.
 `v1.2.3`) and on manual dispatch.
 
 ```yaml
-name: Build & push contra-app image
+name: Build & push private-channel-app image
 
 on:
   push:
@@ -81,11 +81,11 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/contra-app
+  IMAGE_NAME: ${{ github.repository_owner }}/private-channel-app
 
 jobs:
   build-and-push:
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -145,7 +145,7 @@ jobs:
 - The Dockerfile already accepts `SOLANA_VERSION` / `PNPM_VERSION` as build
   args; no Dockerfile change needed.
 - Image visibility: GHCR packages default to private. After the first push,
-  go to GitHub → Packages → contra-app → Settings → set to private and add
+  go to GitHub → Packages → private-channel-app → Settings → set to private and add
   Railway as a collaborator (see Phase 2 secrets).
 
 ---
@@ -153,11 +153,11 @@ jobs:
 ## Phase 2 — Railway service reconfiguration
 
 For each of the 8 Rust services (`write-node`, `read-node`, `gateway`,
-`streamer`, `indexer-solana`, `indexer-contra`, `operator-solana`,
-`operator-contra`):
+`streamer`, `indexer-solana`, `indexer-private_channel`, `operator-solana`,
+`operator-private_channel`):
 
 1. **Settings → Source** → switch from "GitHub repo" to "Docker Image".
-2. **Image:** `ghcr.io/<org>/contra-app:v1.2.3` (start with the first tag CI
+2. **Image:** `ghcr.io/<org>/private-channel-app:v1.2.3` (start with the first tag CI
    produces). Bump this to redeploy.
 3. **Registry credentials:** Settings → Variables → add as service-scoped:
    - `RAILWAY_DOCKERFILE_PATH` — remove if previously set.
@@ -165,7 +165,7 @@ For each of the 8 Rust services (`write-node`, `read-node`, `gateway`,
      a GitHub PAT with `read:packages`. Reference it as the registry auth
      for any private image.
 4. **Start command:** unchanged from current RAILWAY.md (e.g.
-   `/usr/local/bin/contra-node` for `write-node`).
+   `/usr/local/bin/private-channel-node` for `write-node`).
 5. **Environment variables:** unchanged.
 6. **Health check / port / domain:** unchanged.
 
@@ -187,22 +187,22 @@ git push origin v1.2.4
 # Then in Railway, for each Rust service:
 #   Settings → Source → Image → bump to v1.2.4
 # Or scripted via Railway CLI:
-railway service update --image ghcr.io/<org>/contra-app:v1.2.4 \
+railway service update --image ghcr.io/<org>/private-channel-app:v1.2.4 \
   --service write-node \
   --service read-node \
   --service gateway \
   --service streamer \
   --service indexer-solana \
-  --service indexer-contra \
+  --service indexer-private_channel \
   --service operator-solana \
-  --service operator-contra
+  --service operator-private_channel
 ```
 
 **Rollback:**
 
 ```bash
 # Pin all services back to the previous tag — no rebuild needed.
-railway service update --image ghcr.io/<org>/contra-app:v1.2.3 \
+railway service update --image ghcr.io/<org>/private-channel-app:v1.2.3 \
   --service write-node ...
 ```
 
@@ -225,8 +225,8 @@ this up:
      if: success() && github.ref == 'refs/heads/main'
      run: |
        docker buildx imagetools create \
-         -t ghcr.io/<org>/contra-app:staging \
-         ghcr.io/<org>/contra-app:${{ steps.tag.outputs.tag }}
+         -t ghcr.io/<org>/private-channel-app:staging \
+         ghcr.io/<org>/private-channel-app:${{ steps.tag.outputs.tag }}
    ```
 3. In Railway, point each service at `:staging` and enable
    **Settings → Source → Watch image** (polls every ~5 min).
@@ -244,7 +244,7 @@ haven't.
 - [ ] Land `release-image.yml` workflow.
 - [ ] Push a test tag (`v0.0.0-rc1`) and verify the image lands in GHCR.
 - [ ] Pull the image locally and smoke-test one binary
-      (`docker run --rm ghcr.io/<org>/contra-app:v0.0.0-rc1 gateway --help`).
+      (`docker run --rm ghcr.io/<org>/private-channel-app:v0.0.0-rc1 gateway --help`).
 - [ ] Reconfigure **one** non-critical Railway service (e.g. `streamer`)
       to pull from the registry; verify deploy works end-to-end.
 - [ ] Reconfigure remaining 7 Rust services.

@@ -4,7 +4,7 @@ import { useWalletStandardAccount } from '../hooks/useWalletStandardAccount';
 import { useCluster } from '../hooks/useCluster';
 import { address } from '@solana/addresses';
 import type { Address } from '@solana/addresses';
-import { decodeInstance, getCreateInstanceInstructionAsync } from '@contra-escrow';
+import { decodeInstance, getCreateInstanceInstructionAsync } from '@private-channel-escrow';
 import { generateKeyPairSigner } from '@solana/signers';
 import { useWalletAccountTransactionSendingSigner } from '@solana/react';
 import type { UiWalletAccount } from '@wallet-standard/react';

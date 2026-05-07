@@ -21,12 +21,12 @@
 //! instructions; the `Ok(None)` arm is defined as "silently filtered".
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         config::ProgramType,
         indexer::datasource::{
             common::{
                 datasource::DataSource,
-                parser::escrow::CONTRA_ESCROW_PROGRAM_ID,
+                parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                 types::{ProcessorMessage, ProgramInstruction},
             },
             yellowstone::YellowstoneSource,
@@ -66,7 +66,8 @@ fn block_meta(slot: u64) -> SubscribeUpdate {
 /// entry. The inner frame only needs to parse shape-wise — its contents are
 /// not validated by the outer branch we're covering.
 fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
-    let program_id = solana_sdk::pubkey::Pubkey::from_str(CONTRA_ESCROW_PROGRAM_ID).unwrap();
+    let program_id =
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
     let mut account_keys: Vec<Vec<u8>> = (0..12)
         .map(|i| {
             let mut bytes = [0u8; 32];
@@ -129,7 +130,7 @@ fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
         index: 0,
     };
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(tx_info),
             slot,
@@ -142,7 +143,8 @@ fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
 /// an unrecognised discriminator (0xFE). The escrow parser returns
 /// `Ok(None)` for unknown discriminators, firing the `:736-773` branch.
 fn unknown_discriminator_tx(slot: u64) -> SubscribeUpdate {
-    let program_id = solana_sdk::pubkey::Pubkey::from_str(CONTRA_ESCROW_PROGRAM_ID).unwrap();
+    let program_id =
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
     let mut account_keys: Vec<Vec<u8>> = (0..12)
         .map(|i| {
             let mut bytes = [0u8; 32];
@@ -185,7 +187,7 @@ fn unknown_discriminator_tx(slot: u64) -> SubscribeUpdate {
         index: 0,
     };
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(tx_info),
             slot,
@@ -211,7 +213,7 @@ fn unknown_discriminator_tx(slot: u64) -> SubscribeUpdate {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn yellowstone_handles_inner_instructions_and_unknown_discriminator() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,contra_indexer=debug")
+        .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
         .try_init();
 
@@ -253,7 +255,7 @@ async fn yellowstone_handles_inner_instructions_and_unknown_discriminator() {
                 ProgramInstruction::Escrow(ref b)
                     if matches!(
                         **b,
-                        contra_indexer::indexer::datasource::common::parser::EscrowInstruction::Deposit { .. }
+                        private_channel_indexer::indexer::datasource::common::parser::EscrowInstruction::Deposit { .. }
                     ) =>
                 {
                     deposits += 1;

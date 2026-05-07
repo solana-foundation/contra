@@ -3,10 +3,10 @@ use std::str::FromStr;
 use crate::config::ProgramType;
 use crate::error::ParserError;
 use crate::indexer::datasource::common::parser::escrow::{
-    parse_escrow_instruction, CONTRA_ESCROW_PROGRAM_ID,
+    parse_escrow_instruction, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use crate::indexer::datasource::common::parser::withdraw::{
-    parse_withdraw_instruction, CONTRA_WITHDRAW_PROGRAM_ID,
+    parse_withdraw_instruction, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
 use crate::indexer::datasource::common::parser::{EscrowInstruction, WithdrawInstruction};
 use crate::indexer::datasource::common::types::CompiledInstruction;
@@ -31,7 +31,7 @@ pub fn parse_block(
     match program_type {
         ProgramType::Escrow => parse_block_for_program::<EscrowInstruction>(
             block,
-            CONTRA_ESCROW_PROGRAM_ID,
+            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
             parse_escrow_instruction,
             escrow_instance_id,
         )
@@ -45,7 +45,7 @@ pub fn parse_block(
         .collect(),
         ProgramType::Withdraw => parse_block_for_program::<WithdrawInstruction>(
             block,
-            CONTRA_WITHDRAW_PROGRAM_ID,
+            PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
             parse_withdraw_instruction,
             None,
         )

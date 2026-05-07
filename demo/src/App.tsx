@@ -27,8 +27,8 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Contra Load Test Visualizer</h1>
-        <p>Interactive load testing for Contra deployment</p>
+        <h1>Solana Private Channels Load Test Visualizer</h1>
+        <p>Interactive load testing for Solana Private Channels deployment</p>
       </header>
 
       <div className="main-content">

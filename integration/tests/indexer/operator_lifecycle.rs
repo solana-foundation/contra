@@ -24,18 +24,20 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use contra_indexer::config::{ContraIndexerConfig, OperatorConfig, ProgramType, StorageType};
-use contra_indexer::operator;
-use contra_indexer::operator::reconciliation::run_reconciliation;
-use contra_indexer::operator::{RetryConfig, RpcClientWithRetry};
-use contra_indexer::storage::common::models::{
-    DbMint, DbTransaction, DbTransactionBuilder, TransactionStatus,
-};
-use contra_indexer::storage::{PostgresDb, Storage, TransactionType};
-use contra_indexer::PostgresConfig;
 use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
+use private_channel_indexer::config::{
+    OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
+};
+use private_channel_indexer::operator;
+use private_channel_indexer::operator::reconciliation::run_reconciliation;
+use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
+use private_channel_indexer::storage::common::models::{
+    DbMint, DbTransaction, DbTransactionBuilder, TransactionStatus,
+};
+use private_channel_indexer::storage::{PostgresDb, Storage, TransactionType};
+use private_channel_indexer::PostgresConfig;
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -43,7 +45,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::sync::Arc;
 use std::time::Duration;
-use test_utils::operator_helper::start_solana_to_contra_operator;
+use test_utils::operator_helper::start_solana_to_private_channel_operator;
 use test_utils::operator_helper::OperatorHandle;
 use test_utils::validator_helper::start_test_validator_no_geyser;
 use testcontainers::runners::AsyncRunner;
@@ -92,7 +94,7 @@ async fn start_operator_with_alert(
 
     let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
         rpc_url,
@@ -137,7 +139,7 @@ async fn start_operator_with_config(
 
     let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
         rpc_url,
@@ -211,7 +213,7 @@ fn make_withdrawal_transaction(
     }
 }
 
-/// Happy path: a single pending deposit is picked up by the Solana→Contra operator,
+/// Happy path: a single pending deposit is picked up by the Solana→PrivateChannel operator,
 /// minted on the channel, and the DB row transitions to `completed` with a
 /// non-null `counterpart_signature`.
 ///
@@ -264,9 +266,9 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 
     storage.insert_db_transaction(&deposit_txn).await?;
 
-    // 3. Start start_solana_to_contra_operator()
+    // 3. Start start_solana_to_private_channel_operator()
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_solana_to_contra_operator(
+    let operator_handle = start_solana_to_private_channel_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -346,7 +348,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     let balance_before = get_token_balance(&client, &user_pubkey, &env.mint).await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_solana_to_contra_operator(
+    let operator_handle = start_solana_to_private_channel_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -368,7 +370,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 }
 
 /// Inserts a withdrawal row twice (same signature / nonce 0), starts the
-/// Contra→Solana operator, and asserts the user receives `50_000` tokens — not
+/// PrivateChannel→Solana operator, and asserts the user receives `50_000` tokens — not
 /// `100_000`.  Confirms that the duplicate DB row does not result in two
 /// `ReleaseFunds` instructions being sent to the escrow program.
 #[tokio::test(flavor = "multi_thread")]
@@ -441,7 +443,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     .await?;
 
     // Use the env-aware timeout so coverage-instrumented runs (which set
-    // CONTRA_TEST_WAIT_TIMEOUT_SECS=600) don't hit the 180 s ceiling that was
+    // PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600) don't hit the 180 s ceiling that was
     // tuned for uninstrumented nextest.
     operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig, *WAIT_TIMEOUT_SECS)
         .await?;
@@ -509,14 +511,14 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
         .create_async()
         .await;
 
-    // Start Solana -> Contra operator with alert URL and low retry count so bad
+    // Start Solana -> PrivateChannel operator with alert URL and low retry count so bad
     // transactions fail quickly without exhausting a long wait window.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let fast_fail_config = OperatorConfig {
         retry_max_attempts: 3,
         ..default_operator_config(Some(server.url()))
     };
-    let solana_to_contra = start_operator_with_config(
+    let solana_to_private_channel = start_operator_with_config(
         ProgramType::Escrow,
         test_validator.rpc_url(),
         db_url.clone(),
@@ -586,13 +588,13 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     );
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
-    // Start Contra -> Solana operator with same alert URL and low retry count.
+    // Start PrivateChannel -> Solana operator with same alert URL and low retry count.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let fast_fail_config = OperatorConfig {
         retry_max_attempts: 3,
         ..default_operator_config(Some(server.url()))
     };
-    let contra_to_solana = start_operator_with_config(
+    let private_channel_to_solana = start_operator_with_config(
         ProgramType::Withdraw,
         test_validator.rpc_url(),
         db_url.clone(),
@@ -613,8 +615,8 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
 
     alert_mock.assert();
 
-    solana_to_contra.shutdown().await;
-    contra_to_solana.shutdown().await;
+    solana_to_private_channel.shutdown().await;
+    private_channel_to_solana.shutdown().await;
     Ok(())
 }
 
@@ -675,9 +677,9 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         signatures.push(sig);
     }
 
-    // Start the Solana → Contra operator and wait for all deposits to be processed.
+    // Start the Solana → PrivateChannel operator and wait for all deposits to be processed.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_solana_to_contra_operator(
+    let operator_handle = start_solana_to_private_channel_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -750,7 +752,7 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
     let env = TestEnvironment::setup(&client, &faucet_keypair, 0, 0, None).await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_solana_to_contra_operator(
+    let operator_handle = start_solana_to_private_channel_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
@@ -1061,7 +1063,7 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
 #[tokio::test(flavor = "multi_thread")]
 async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use test_utils::operator_helper::start_contra_to_solana_operator;
+    use test_utils::operator_helper::start_private_channel_to_solana_operator;
 
     println!("=== Operator Lifecycle: SMT Root Mismatch Aborts Startup ===");
 
@@ -1138,7 +1140,7 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     // mismatch, and triggers the `send_fatal_error` path for that
     // transaction.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_contra_to_solana_operator(
+    let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,

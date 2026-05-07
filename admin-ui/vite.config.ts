@@ -10,15 +10,16 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     resolve: {
       alias: {
-        '@contra-escrow': path.resolve(__dirname, '../contra-escrow-program/clients/typescript/src/generated'),
-        '@contra-withdraw': path.resolve(__dirname, '../contra-withdraw-program/clients/typescript/src/generated'),
+        '@private-channel-escrow': path.resolve(__dirname, '../private-channel-escrow-program/clients/typescript/src/generated'),
+        '@private-channel-withdraw': path.resolve(__dirname, '../private-channel-withdraw-program/clients/typescript/src/generated'),
       },
     },
     define: {
       global: 'globalThis',
       'process.env': {},
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
-      'import.meta.env.VITE_CONTRA_RPC_URL': JSON.stringify(env.CONTRA_RPC_URL || 'https://api.onlyoncontra.xyz'),
+      // Fallback host is a placeholder — set PRIVATE_CHANNEL_RPC_URL before building.
+      'import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL': JSON.stringify(env.PRIVATE_CHANNEL_RPC_URL || 'https://api.example.com'),
     },
   }
 })

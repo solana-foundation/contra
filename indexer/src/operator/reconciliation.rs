@@ -14,7 +14,7 @@ use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::Storage;
-use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
+use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
 use solana_account_decoder_client_types::UiAccountData;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;

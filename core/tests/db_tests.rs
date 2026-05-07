@@ -3,9 +3,11 @@
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 //! Requires Docker to be running.
 
-use contra_core::accounts::AccountsDB;
-use contra_core::stages::AccountSettlement;
-use contra_core::test_helpers::{create_test_block_info, create_test_sanitized_transaction};
+use private_channel_core::accounts::AccountsDB;
+use private_channel_core::stages::AccountSettlement;
+use private_channel_core::test_helpers::{
+    create_test_block_info, create_test_sanitized_transaction,
+};
 use solana_rpc_client_types::response::RpcPerfSample;
 use solana_sdk::{
     account::{AccountSharedData, ReadableAccount},
@@ -527,7 +529,7 @@ async fn test_latest_blockhash_empty_db() {
 async fn test_truncate_rejects_zero_keep_slots() {
     let (db, _pg) = start_postgres().await;
 
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 0,
         max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
@@ -536,7 +538,7 @@ async fn test_truncate_rejects_zero_keep_slots() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let result = contra_core::accounts::truncate::truncate_slots(pg, &opts).await;
+        let result = private_channel_core::accounts::truncate::truncate_slots(pg, &opts).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("keep_slots"));
     }
@@ -546,7 +548,7 @@ async fn test_truncate_rejects_zero_keep_slots() {
 async fn test_truncate_rejects_zero_batch_size() {
     let (db, _pg) = start_postgres().await;
 
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 10,
         max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
@@ -555,7 +557,7 @@ async fn test_truncate_rejects_zero_batch_size() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let result = contra_core::accounts::truncate::truncate_slots(pg, &opts).await;
+        let result = private_channel_core::accounts::truncate::truncate_slots(pg, &opts).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("batch_size"));
     }
@@ -565,7 +567,7 @@ async fn test_truncate_rejects_zero_batch_size() {
 async fn test_truncate_empty_db_returns_none() {
     let (db, _pg) = start_postgres().await;
 
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 10,
         max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
@@ -574,7 +576,7 @@ async fn test_truncate_empty_db_returns_none() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
             .await
             .unwrap();
         assert_eq!(report.latest_slot, None);
@@ -595,7 +597,7 @@ async fn test_truncate_nothing_to_delete() {
     }
 
     // Keep all 5 slots — nothing should be truncated
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 10,
         max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
@@ -604,7 +606,7 @@ async fn test_truncate_nothing_to_delete() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
             .await
             .unwrap();
         assert_eq!(report.latest_slot, Some(5));
@@ -629,7 +631,7 @@ async fn test_truncate_dry_run_with_pg_dump() {
     let tmp_dump = tempfile::NamedTempFile::new().unwrap();
 
     // Keep 5 slots → truncate before slot 6 → blocks 1-5 should be counted
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 5,
         max_backup_age: std::time::Duration::from_secs(3600),
         pg_dump_path: Some(tmp_dump.path().to_path_buf()),
@@ -638,7 +640,7 @@ async fn test_truncate_dry_run_with_pg_dump() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
             .await
             .unwrap();
         assert_eq!(report.latest_slot, Some(10));
@@ -667,7 +669,7 @@ async fn test_truncate_actually_deletes_blocks() {
     let tmp_dump = tempfile::NamedTempFile::new().unwrap();
 
     // Keep 5 → truncate before slot 6 → delete blocks 1-5
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 5,
         max_backup_age: std::time::Duration::from_secs(3600),
         pg_dump_path: Some(tmp_dump.path().to_path_buf()),
@@ -676,7 +678,7 @@ async fn test_truncate_actually_deletes_blocks() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
             .await
             .unwrap();
         assert_eq!(report.blocks_deleted, 5);
@@ -723,7 +725,7 @@ async fn test_truncate_deletes_associated_transactions() {
     let tmp_dump = tempfile::NamedTempFile::new().unwrap();
 
     // Keep 2 → truncate before slot 3 → delete blocks 1,2 and their transactions
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 2,
         max_backup_age: std::time::Duration::from_secs(3600),
         pg_dump_path: Some(tmp_dump.path().to_path_buf()),
@@ -732,7 +734,7 @@ async fn test_truncate_deletes_associated_transactions() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let report = contra_core::accounts::truncate::truncate_slots(pg, &opts)
+        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
             .await
             .unwrap();
         assert_eq!(report.blocks_deleted, 2);
@@ -752,7 +754,7 @@ async fn test_truncate_fails_without_backup() {
     }
 
     // No pg_dump_path, and testcontainers Postgres has no WAL archiving
-    let opts = contra_core::accounts::truncate::TruncateOptions {
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 5,
         max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
@@ -761,7 +763,7 @@ async fn test_truncate_fails_without_backup() {
     };
 
     if let AccountsDB::Postgres(ref pg) = db {
-        let result = contra_core::accounts::truncate::truncate_slots(pg, &opts).await;
+        let result = private_channel_core::accounts::truncate::truncate_slots(pg, &opts).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

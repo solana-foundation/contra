@@ -15,7 +15,7 @@ use crate::{
         Storage,
     },
 };
-use contra_metrics::{HealthState, MetricLabel};
+use private_channel_metrics::{HealthState, MetricLabel};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -318,7 +318,7 @@ mod tests {
                     token_program: make_pubkey(16),
                     associated_token_program: make_pubkey(17),
                     event_authority: make_pubkey(18),
-                    contra_escrow_program: make_pubkey(19),
+                    private_channel_escrow_program: make_pubkey(19),
                 },
                 data: DepositData {
                     amount: 1000,
@@ -345,7 +345,7 @@ mod tests {
                     token_program: make_pubkey(16),
                     associated_token_program: make_pubkey(17),
                     event_authority: make_pubkey(18),
-                    contra_escrow_program: make_pubkey(19),
+                    private_channel_escrow_program: make_pubkey(19),
                 },
                 data: AllowMintData { bump: 255 },
                 event: AllowMintEvent { decimals: 6 },
@@ -388,7 +388,7 @@ mod tests {
                     instance: make_pubkey(12),
                     operator_pda: make_pubkey(13),
                     event_authority: make_pubkey(14),
-                    contra_escrow_program: make_pubkey(15),
+                    private_channel_escrow_program: make_pubkey(15),
                 },
             })),
             slot,

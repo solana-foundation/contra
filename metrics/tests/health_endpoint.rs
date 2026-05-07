@@ -3,7 +3,7 @@
 //! Spins up the real axum server on an ephemeral port and verifies the HTTP
 //! response codes and bodies for each HealthOutcome variant.
 
-use contra_metrics::{HealthConfig, HealthState};
+use private_channel_metrics::{HealthConfig, HealthState};
 use std::net::TcpListener;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ async fn boot(health: Arc<HealthState>) -> u16 {
     // another process or parallel test to steal the port.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    contra_metrics::start_metrics_server_with_health_from_listener(listener, health);
+    private_channel_metrics::start_metrics_server_with_health_from_listener(listener, health);
     // Give axum a moment to start serving. The server spawns on a tokio task so this
     // is the simplest way to await readiness without polling.
     tokio::time::sleep(Duration::from_millis(100)).await;

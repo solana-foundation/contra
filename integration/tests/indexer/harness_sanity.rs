@@ -3,7 +3,7 @@
 //! can be built on top of it.
 //!
 //! What this test validates:
-//!   - `start_solana_to_contra_operator_with_mocks` spawns the operator
+//!   - `start_solana_to_private_channel_operator_with_mocks` spawns the operator
 //!     task, wires its RPC client at `mock.url()`, and backs its storage
 //!     with `Storage::Mock`.
 //!   - Seeding one pending `Deposit` row into
@@ -30,11 +30,15 @@
 //! infrastructure and the operator did reach the HTTP boundary.
 
 use {
-    contra_indexer::storage::common::models::{DbTransaction, TransactionStatus, TransactionType},
+    private_channel_indexer::storage::common::models::{
+        DbTransaction, TransactionStatus, TransactionType,
+    },
     serde_json::json,
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::time::{Duration, Instant},
-    test_utils::{mock_rpc::Reply, operator_helper::start_solana_to_contra_operator_with_mocks},
+    test_utils::{
+        mock_rpc::Reply, operator_helper::start_solana_to_private_channel_operator_with_mocks,
+    },
 };
 
 /// Construct a pending Deposit row with all fields that the processor needs
@@ -71,9 +75,10 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     let escrow_instance_id = Pubkey::new_unique();
     let operator_keypair = Keypair::new();
 
-    let harness = start_solana_to_contra_operator_with_mocks(escrow_instance_id, operator_keypair)
-        .await
-        .expect("harness start");
+    let harness =
+        start_solana_to_private_channel_operator_with_mocks(escrow_instance_id, operator_keypair)
+            .await
+            .expect("harness start");
 
     // Script the wire responses the operator will consume on the happy path
     // for one deposit. Methods the mock never expects are returned as

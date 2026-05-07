@@ -12,7 +12,7 @@ use crate::{
     },
     storage::Storage,
 };
-use contra_metrics::MetricLabel;
+use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use std::time::Duration;

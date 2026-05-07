@@ -6,7 +6,7 @@
 //!    delegate is a keypair we control. AllowMint it on the escrow instance.
 //! 2. Fund the escrow ATA with 2x the withdrawal amount via `mint_to`. This
 //!    is the only way the escrow balance gets bumped in this test — sidesteps
-//!    the deposit path so the operator has no Contra-side event for the
+//!    the deposit path so the operator has no PrivateChannel-side event for the
 //!    drain that follows.
 //! 3. Use the permanent delegate to drain the escrow ATA below the withdrawal
 //!    amount. The escrow program is never invoked, so the indexer sees
@@ -14,7 +14,7 @@
 //! 4. Seed the DB: `mints` row with `has_permanent_delegate = None` (what the
 //!    indexer writes at AllowMint time) and a pending withdrawal for the full
 //!    amount at nonce 0.
-//! 5. Start the Contra→Solana withdrawal operator.
+//! 5. Start the PrivateChannel→Solana withdrawal operator.
 //! 6. Assert the operator routes the withdrawal to `manual_review`: the row
 //!    status flips from `pending` to `manual_review`, `has_permanent_delegate`
 //!    flips from `None` to `Some(true)` (lazy RPC resolution + write-back),
@@ -29,13 +29,15 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use contra_escrow_program_client::{instructions::AllowMintBuilder, CONTRA_ESCROW_PROGRAM_ID};
-use contra_indexer::storage::common::models::{
+use helpers::db;
+use private_channel_escrow_program_client::{
+    instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+};
+use private_channel_indexer::storage::common::models::{
     DbMint, DbTransaction, TransactionStatus, TransactionType,
 };
-use contra_indexer::storage::{PostgresDb, Storage};
-use contra_indexer::PostgresConfig;
-use helpers::db;
+use private_channel_indexer::storage::{PostgresDb, Storage};
+use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -51,7 +53,7 @@ use spl_token_2022::extension::ExtensionType;
 use spl_token_2022::state::Mint as Token2022Mint;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::time::Duration;
-use test_utils::operator_helper::start_contra_to_solana_operator;
+use test_utils::operator_helper::start_private_channel_to_solana_operator;
 use test_utils::validator_helper::start_test_validator_no_geyser;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -157,7 +159,7 @@ async fn mint_2022_to_owner(
 /// Use the permanent delegate to move tokens out of `source_ata` into a
 /// fresh ATA owned by `drain_owner`. Simulates the attack the pre-flight
 /// is designed to catch: the escrow program is never invoked, so no
-/// Contra-side event ever reaches the indexer.
+/// PrivateChannel-side event ever reaches the indexer.
 async fn drain_via_permanent_delegate(
     client: &RpcClient,
     payer: &Keypair,
@@ -226,7 +228,7 @@ async fn allow_mint_for_program(
         .token_program(token_program)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .instruction();
 
@@ -371,7 +373,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
     println!("AllowMint succeeded for permanent-delegate mint");
 
     // Fund the escrow ATA with 2x the withdrawal amount. Sidesteps the
-    // deposit path so no Contra-side deposit event is ever produced.
+    // deposit path so no PrivateChannel-side deposit event is ever produced.
     let withdraw_amount: u64 = 50_000;
     let escrow_ata = mint_2022_to_owner(
         &client,
@@ -435,7 +437,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
     // Start the withdraw operator.
-    let operator_handle = start_contra_to_solana_operator(
+    let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
@@ -590,7 +592,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
     );
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
-    let operator_handle = start_contra_to_solana_operator(
+    let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,

@@ -38,7 +38,7 @@ fn is_account_not_found(e: &client_error::Error) -> bool {
 /// Token-2022 extension flags (`is_pausable`, `has_permanent_delegate`) are
 /// resolved separately via [`MintCache::get_extension_flags`], because the
 /// deposit-side sender JIT-init path has a `MintCache` pointed at the
-/// **Contra** RPC where the mint doesn't yet exist — forcing extension
+/// **PrivateChannel** RPC where the mint doesn't yet exist — forcing extension
 /// resolution from `get_mint_metadata` made that path fail with
 /// `AccountNotFound` and broke every fresh deposit.
 pub struct MintCache {
@@ -214,7 +214,7 @@ impl MintCache {
     ///
     /// Intended for the permanent-delegate pre-flight: we can't trust our
     /// indexed balance because a permanent delegate may have moved tokens
-    /// out of the escrow ATA without emitting a Contra program event. Only
+    /// out of the escrow ATA without emitting a PrivateChannel program event. Only
     /// call this after `MintMetadata.has_permanent_delegate` came back true.
     pub async fn get_ata_balance(&self, ata: &Pubkey) -> Result<u64, OperatorError> {
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
@@ -308,9 +308,9 @@ impl MintCache {
         Ok(())
     }
 
-    // For now contra only supports SPL, when we want to make the move to token 2022, we
+    // For now private_channel only supports SPL, when we want to make the move to token 2022, we
     // can call get mint_metadata above instead of this function.
-    pub fn get_contra_token_program(&self) -> Pubkey {
+    pub fn get_private_channel_token_program(&self) -> Pubkey {
         TOKEN_PROGRAM_ID
     }
 }

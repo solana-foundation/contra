@@ -15,7 +15,7 @@ pub async fn challenge(
     // The message includes user id and nonce so it is bound to this specific user and request.
     // The client must sign this exact string with their wallet's private key.
     let message = format!(
-        "Contra wallet verification\nuser: {}\nnonce: {}\nexpires: {}",
+        "PrivateChannel wallet verification\nuser: {}\nnonce: {}\nexpires: {}",
         claims.sub,
         challenge.nonce,
         challenge.expires_at.timestamp()

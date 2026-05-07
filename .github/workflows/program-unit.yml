@@ -4,15 +4,15 @@ on:
   push:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - "contra-escrow-program/**"
-      - "contra-withdraw-program/**"
+      - "private-channel-escrow-program/**"
+      - "private-channel-withdraw-program/**"
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
   pull_request:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - "contra-escrow-program/**"
-      - "contra-withdraw-program/**"
+      - "private-channel-escrow-program/**"
+      - "private-channel-withdraw-program/**"
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
 

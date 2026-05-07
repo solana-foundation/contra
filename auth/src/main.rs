@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
-use contra_auth::config::Config;
-use contra_auth::{build_app, db, jwt::JwtConfig, pool_status::PoolStatus, AppState};
+use private_channel_auth::config::Config;
+use private_channel_auth::{build_app, db, jwt::JwtConfig, pool_status::PoolStatus, AppState};
 
 /// How often the background task purges expired and used challenge rows.
 /// Challenge TTL is 10 minutes, so hourly is more than sufficient.
@@ -17,7 +17,7 @@ async fn main() {
 
     let config = Config::parse();
 
-    info!("Starting contra-auth on port {}", config.port);
+    info!("Starting private-channel-auth on port {}", config.port);
 
     let pool = PgPoolOptions::new()
         .max_connections(config.database_max_connections)

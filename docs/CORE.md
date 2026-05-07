@@ -1,7 +1,7 @@
 
-# Contra Core
+# Solana Private Channels Core
 
-Contra processes transactions through five sequential stages, each optimized for a specific concern.
+Solana Private Channels processes transactions through five sequential stages, each optimized for a specific concern.
 
 ```
 Transaction → [1:Dedup] → [2:SigVerify] → [3:Sequencer] → [4:Executor] → [5:Settler] → Database
@@ -75,10 +75,10 @@ Execute transaction batches through the SVM with custom execution modes.
 
 #### AdminVM
 
-Privileged execution for token mint operations (bypasses BPF execution). This enables consistent mint addresses across Mainnet and the Contra payment channel. This is achieved by intercepting `InitializeMint` instructions and synthesizing mint accounts without executing BPF code.
+Privileged execution for token mint operations (bypasses BPF execution). This enables consistent mint addresses across Mainnet and the Solana Private Channels payment channel. This is achieved by intercepting `InitializeMint` instructions and synthesizing mint accounts without executing BPF code.
 
 **Location**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
-**Security**: Transactions are gated by admin key validation in the SigVerify stage (`CONTRA_ADMIN_KEYS`). Only transactions signed by an admin key are routed to AdminVM for execution.
+**Security**: Transactions are gated by admin key validation in the SigVerify stage (`PRIVATE_CHANNEL_ADMIN_KEYS`). Only transactions signed by an admin key are routed to AdminVM for execution.
 
 #### GaslessCallback
 
@@ -125,7 +125,7 @@ Finally, the settler notifies the executor's in-memory cache (BOB) of settled ac
 
 ## Supported Programs
 
-Contra restricts which programs can execute in the payment channel. Transactions referencing unsupported programs are rejected at the RPC layer.
+Solana Private Channels restricts which programs can execute in the payment channel. Transactions referencing unsupported programs are rejected at the RPC layer.
 
 | Program | Status | Notes |
 |---------|--------|-------|
@@ -133,7 +133,7 @@ Contra restricts which programs can execute in the payment channel. Transactions
 | **SPL Associated Token Account** | Supported | ATA creation and lookup |
 | **SPL Memo** | Supported | Memo attachments |
 | **System Program** | Supported | Native transfers and account creation |
-| **Contra Withdraw Program** | Supported | Token burns for withdrawal flow |
+| **Solana Private Channels Withdraw Program** | Supported | Token burns for withdrawal flow |
 
 **Source**: [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs)
 
@@ -147,7 +147,7 @@ The AdminVM (used for operator mint operations) only supports SPL Token `Initial
 
 ### No Custom Program Deployment
 
-Contra does not support deploying arbitrary BPF programs. The supported program set is fixed at compile time. The instruction allowlist is currently hardcoded to SPL Token instructions.
+Solana Private Channels does not support deploying arbitrary BPF programs. The supported program set is fixed at compile time. The instruction allowlist is currently hardcoded to SPL Token instructions.
 
 ### No Precompiles
 
@@ -158,7 +158,7 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Constraint | Value | Source |
 |------------|-------|--------|
 | Max transaction size | 1,232 bytes | Solana's `PACKET_DATA_SIZE` |
-| Max transactions per batch | 64 (configurable) | `CONTRA_MAX_TX_PER_BATCH` |
+| Max transactions per batch | 64 (configurable) | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` |
 | Max loaded accounts data | 64 MB | [`core/src/processor.rs`](../core/src/processor.rs) |
 | Max signatures per `getSignatureStatuses` | 256 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max slot range for `getBlocks` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
@@ -167,4 +167,4 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 
 ### No Fork Choice
 
-Contra does not implement slots or forks. The fork graph is stubbed — all blocks are final on write. There is no rollback mechanism.
+Solana Private Channels does not implement slots or forks. The fork graph is stubbed — all blocks are final on write. There is no rollback mechanism.

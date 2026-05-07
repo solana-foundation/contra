@@ -3,7 +3,7 @@
 ## Architecture
 
 - **[Architecture Overview](ARCHITECTURE.md)** — Core components, transaction pipeline, and design decisions
-- **[Contra Core](CORE.md)** — Transaction pipeline, supported programs, and limitations
+- **[Solana Private Channels Core](CORE.md)** — Transaction pipeline, supported programs, and limitations
 - **[Indexer & Operator](INDEXER.md)** — Datasource strategies, backfill, reconciliation, and operator pipeline
 
 ## Programs

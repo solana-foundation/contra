@@ -1,15 +1,15 @@
 apiVersion: 1
 
 # Single dashboard provider, used by both the Dockerfile.grafana build
-# (`make docker-up`) and the Ansible-deployed Grafana (contra-deploy/).
+# (`make docker-up`) and the Ansible-deployed Grafana (private-channel-deploy/).
 # allowUiUpdates lets users tweak in the UI; changes revert on the next
 # provisioning sync (interval: 30s), so the JSON files in monitoring/
 # dashboards/ remain the source of truth.
 
 providers:
-  - name: contra
+  - name: private-channel
     orgId: 1
-    folder: Contra
+    folder: Solana Private Channels
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30

@@ -75,7 +75,7 @@ impl Default for NodeConfig {
             batch_deadline_ms: 10,
             batch_channel_capacity: 16,
             max_svm_workers: 8,
-            accountsdb_connection_url: "postgresql://user:password@localhost:5432/contra"
+            accountsdb_connection_url: "postgresql://user:password@localhost:5432/private_channel"
                 .to_string(),
             admin_keys: vec![],               // No admin keys by default
             transaction_expiration_ms: 15000, // 15 seconds default
@@ -275,7 +275,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     };
     let rpc_handle = start_rpc_service(rpc_config).await?;
 
-    info!("Contra node started:");
+    info!("PrivateChannel node started:");
     info!("  Mode: {:?}", config.mode);
     info!("  RPC port: {}", config.port);
     if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {

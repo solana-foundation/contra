@@ -980,7 +980,7 @@ impl PostgresDb {
     ///
     /// For each mint known to the DB, sums:
     /// - `total_deposits`  : ALL indexed deposits (any status), because a deposit increases
-    ///   the escrow ATA balance on-chain the moment it is observed — the operator's contra minting
+    ///   the escrow ATA balance on-chain the moment it is observed — the operator's private_channel minting
     ///   status (`pending`/`processing`/`completed`/`failed`) does not change what is on-chain.
     /// - `total_withdrawals`: only `completed` withdrawals, because only a completed
     ///   `release_funds` call actually moves tokens out of the ATA.

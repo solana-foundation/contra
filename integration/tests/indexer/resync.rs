@@ -11,7 +11,7 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-use contra_indexer::{
+use private_channel_indexer::{
     config::{BackfillConfig, ProgramType},
     indexer::{datasource::rpc_polling::rpc::RpcPoller, resync::ResyncService},
     storage::{PostgresDb, Storage},

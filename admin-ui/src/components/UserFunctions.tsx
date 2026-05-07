@@ -7,8 +7,8 @@ import { address } from '@solana/addresses';
 import { useWalletAccountTransactionSendingSigner } from '@solana/react';
 import type { UiWalletAccount } from '@wallet-standard/react';
 import { getBase58Decoder } from '@solana/codecs-strings';
-import { getDepositInstructionAsync } from '@contra-escrow';
-import { getWithdrawFundsInstructionAsync } from '@contra-withdraw';
+import { getDepositInstructionAsync } from '@private-channel-escrow';
+import { getWithdrawFundsInstructionAsync } from '@private-channel-withdraw';
 import { createSolanaRpc } from '@solana/rpc';
 import {
   pipe,
@@ -20,8 +20,9 @@ import {
   assertIsTransactionMessageWithSingleSendingSigner,
 } from '@solana/kit';
 
-const rawUrl = import.meta.env.VITE_CONTRA_RPC_URL || 'https://api.onlyoncontra.xyz';
-const CONTRA_RPC_URL = rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : `https://${rawUrl}`;
+// Fallback host is a placeholder — set VITE_PRIVATE_CHANNEL_RPC_URL before building.
+const rawUrl = import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL || 'https://api.example.com';
+const PRIVATE_CHANNEL_RPC_URL = rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : `https://${rawUrl}`;
 
 interface UserFunctionsProps {
   instancePubkey: string;
@@ -182,8 +183,8 @@ function WithdrawSection({
       const amount = BigInt(withdrawAmount);
       const destination = withdrawDestination ? address(withdrawDestination) : null;
 
-      // Create RPC connection to Contra for the withdrawal transaction
-      const contraRpc = createSolanaRpc(CONTRA_RPC_URL);
+      // Create RPC connection to Solana Private Channels for the withdrawal transaction
+      const privateChannelRpc = createSolanaRpc(PRIVATE_CHANNEL_RPC_URL);
 
       // Get the withdraw instruction
       const instruction = await getWithdrawFundsInstructionAsync({
@@ -195,8 +196,8 @@ function WithdrawSection({
 
       console.log('Created withdraw instruction:', instruction);
 
-      // Get recent blockhash from Contra
-      const { value: latestBlockhash } = await contraRpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
+      // Get recent blockhash from Solana Private Channels
+      const { value: latestBlockhash } = await privateChannelRpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
 
       // Build transaction message
       const transactionMessage = pipe(
@@ -236,7 +237,7 @@ function WithdrawSection({
     <div className="function-section">
       <h3>Withdraw Tokens</h3>
       <p className="info-text">
-        Withdraw tokens from your token account (uses Contra Withdraw Program)
+        Withdraw tokens from your token account (uses Solana Private Channels Withdraw Program)
       </p>
       <div className="form-group">
         <label>Mint Address</label>

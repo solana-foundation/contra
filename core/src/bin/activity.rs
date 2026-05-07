@@ -1,7 +1,7 @@
 use {
     anyhow::Result,
     clap::Parser,
-    contra_core::client::{
+    private_channel_core::client::{
         create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction,
         create_spl_transfer, create_withdraw_funds, load_keypair,
     },
@@ -16,8 +16,8 @@ use {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "contra-activity",
-    about = "Generate continuous activity on Contra with token operations"
+    name = "private-channel-activity",
+    about = "Generate continuous activity on PrivateChannel with token operations"
 )]
 struct Args {
     /// Write URL for the deployment (e.g., http://localhost:8899)

@@ -6,7 +6,7 @@ FROM prom/prometheus:${PROMETHEUS_VERSION}
 COPY prometheus.yml /etc/prometheus/prometheus.yml.tmpl
 
 ENTRYPOINT ["/bin/sh", "-c", \
-  "sed \"s/\\${HOST_SUFFIX}/${HOST_SUFFIX}/g; s/\\${BENCH_METRICS_TARGET}/${BENCH_METRICS_TARGET}/g; s/\\${CONTRA_METRICS_PORT}/${CONTRA_METRICS_PORT}/g\" /etc/prometheus/prometheus.yml.tmpl > /tmp/prometheus.yml && \
+  "sed \"s/\\${HOST_SUFFIX}/${HOST_SUFFIX}/g; s/\\${BENCH_METRICS_TARGET}/${BENCH_METRICS_TARGET}/g; s/\\${PRIVATE_CHANNEL_METRICS_PORT}/${PRIVATE_CHANNEL_METRICS_PORT}/g\" /etc/prometheus/prometheus.yml.tmpl > /tmp/prometheus.yml && \
    exec /bin/prometheus \
      --config.file=/tmp/prometheus.yml \
      --storage.tsdb.path=/prometheus \

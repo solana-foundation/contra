@@ -1,0 +1,457 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 110,
+      "title": "Indexer Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 1 },
+      "id": 11,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "private_channel_indexer_current_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Current Slot",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 1 },
+      "id": 12,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "private_channel_indexer_mints_saved_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mints Saved (total)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "none" },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 1 },
+      "id": 17,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "private_channel_indexer_chain_tip_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Chain Tip Slot",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "id": 13,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(private_channel_indexer_slots_processed_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Slots Processed/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "id": 14,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(private_channel_indexer_transactions_saved_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transactions Saved/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "id": 15,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(private_channel_indexer_slot_save_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Slot Save Errors/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "id": 16,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(private_channel_indexer_rpc_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}} / {{error_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "RPC Errors/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
+      "id": 18,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "private_channel_indexer_chain_tip_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"} - private_channel_indexer_current_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Slot Lag (chain tip - current slot)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "id": 19,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, program_type) (rate(private_channel_indexer_slot_processing_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{program_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, program_type) (rate(private_channel_indexer_slot_processing_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{program_type}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Slot Processing Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "orange" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "id": 20,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "rate(private_channel_indexer_datasource_reconnects_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Datasource Reconnects/sec",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0 },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 39 },
+      "id": 21,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "private_channel_indexer_backfill_slots_remaining{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Backfill Slots Remaining",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
+      "id": 130,
+      "title": "Lag & Health",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "red", "value": 75 }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 48 },
+      "id": 30,
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "expr": "private_channel_indexer_chain_tip_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"} - private_channel_indexer_current_slot{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "legendFormat": "{{program_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Slot Lag",
+      "type": "gauge"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
+      "id": 100,
+      "title": "Infrastructure",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "id": 1,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-private-channel\"}[1m])) * 100",
+          "legendFormat": "{{container_label_com_docker_compose_service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "CPU Usage (%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "decimals": 2, "unit": "decmbytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "id": 2,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "container_memory_usage_bytes{container_label_com_docker_compose_service=~\"indexer-solana|indexer-private-channel\"} / 1024 / 1024",
+          "legendFormat": "{{container_label_com_docker_compose_service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Usage (MB)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 65 },
+      "id": 3,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_network_receive_bytes_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-private-channel\"}[1m]))",
+          "legendFormat": "{{container_label_com_docker_compose_service}} rx",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (rate(container_network_transmit_bytes_total{container_label_com_docker_compose_service=~\"indexer-solana|indexer-private-channel\"}[1m]))",
+          "legendFormat": "{{container_label_com_docker_compose_service}} tx",
+          "refId": "B"
+        }
+      ],
+      "title": "Network I/O (Bytes/sec)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "min": 0, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 65 },
+      "id": 4,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (container_label_com_docker_compose_service) (changes(container_start_time_seconds{container_label_com_docker_compose_service=~\"indexer-solana|indexer-private-channel\"}[24h]))",
+          "legendFormat": "{{container_label_com_docker_compose_service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Container Restarts (24h)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": ["private-channel", "indexer"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": ["escrow", "withdraw"], "value": ["escrow", "withdraw"] },
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(private_channel_indexer_slots_processed_total, program_type)",
+        "includeAll": false,
+        "multi": true,
+        "name": "program_type",
+        "query": { "qryType": 1, "query": "label_values(private_channel_indexer_slots_processed_total, program_type)" },
+        "refresh": 2,
+        "regex": "/^(escrow|withdraw)$/",
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Solana Private Channels Indexer",
+  "uid": "private-channel-indexer",
+  "version": 1
+}

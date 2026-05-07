@@ -1,14 +1,14 @@
 # Rendered by Ansible — do not edit by hand.
 # Source: monitoring/monitoring.compose.yml.j2
 #
-# Sibling stack to docker-compose.yml. Joins the upstream `contra_contra-network`
-# (created by the Contra compose) so blackbox can resolve service hostnames
+# Sibling stack to docker-compose.yml. Joins the upstream `private-channel_private-channel-network`
+# (created by the Solana Private Channels compose) so blackbox can resolve service hostnames
 # and cAdvisor sees every running container. Prometheus + Grafana run on
 # host-port-forwarded volumes for persistence across re-runs.
 
 networks:
-  contra:
-    name: contra_contra-network
+  private-channel:
+    name: private-channel_private-channel-network
     external: true
 
 volumes:
@@ -19,7 +19,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.55.1
-    container_name: contra-mon-prometheus
+    container_name: private-channel-mon-prometheus
     restart: unless-stopped
     # --web.enable-lifecycle exposes /-/reload, so the deploy phase can
     # pick up scrape-config edits via `curl -X POST .../-/reload` without
@@ -36,7 +36,7 @@ services:
       - prom-data:/prometheus
     ports:
       - "{{ monitoring_prometheus_port }}:9090"
-    networks: [contra]
+    networks: [private-channel]
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
       interval: 5s
@@ -45,7 +45,7 @@ services:
 
   grafana:
     image: grafana/grafana:11.3.0
-    container_name: contra-mon-grafana
+    container_name: private-channel-mon-grafana
     restart: unless-stopped
     environment:
       # Skip the forced first-login password change so the rest of the
@@ -75,7 +75,7 @@ services:
       - grafana-data:/var/lib/grafana
     ports:
       - "{{ monitoring_grafana_port }}:3000"
-    networks: [contra]
+    networks: [private-channel]
     depends_on: [prometheus]
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
@@ -83,23 +83,23 @@ services:
       timeout: 3s
       retries: 30
 
-  # blackbox_exporter probes external endpoints (HTTP /health on each Contra service).
+  # blackbox_exporter probes external endpoints (HTTP /health on each Solana Private Channels service).
   # Spec §7 calls this out as the recommended mechanism for ongoing healthz monitoring.
   blackbox-exporter:
     image: prom/blackbox-exporter:v0.25.0
-    container_name: contra-mon-blackbox
+    container_name: private-channel-mon-blackbox
     restart: unless-stopped
     volumes:
       - {{ monitoring_dir }}/blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
     command: ["--config.file=/etc/blackbox_exporter/config.yml"]
     ports:
       - "{{ monitoring_blackbox_port }}:9115"
-    networks: [contra]
+    networks: [private-channel]
 
   # cAdvisor — per-container CPU/mem/IO. Mounts the Docker socket and host cgroup paths.
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
-    container_name: contra-mon-cadvisor
+    container_name: private-channel-mon-cadvisor
     restart: unless-stopped
     privileged: true
     devices:
@@ -112,12 +112,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
       - "{{ monitoring_cadvisor_port }}:8080"
-    networks: [contra]
+    networks: [private-channel]
 
   # node_exporter — host CPU/mem/disk/net.
   node-exporter:
     image: prom/node-exporter:v1.8.2
-    container_name: contra-mon-node-exporter
+    container_name: private-channel-mon-node-exporter
     restart: unless-stopped
     pid: host
     volumes:
@@ -131,23 +131,23 @@ services:
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
     ports:
       - "{{ monitoring_node_exporter_port }}:9100"
-    networks: [contra]
+    networks: [private-channel]
 
   # postgres_exporter for both primary and replica. Two instances differ only
   # in DATA_SOURCE_NAME; Prometheus scrapes them as separate targets.
   postgres-exporter-primary:
     image: prometheuscommunity/postgres-exporter:v0.16.0
-    container_name: contra-mon-pgexp-primary
+    container_name: private-channel-mon-pgexp-primary
     restart: unless-stopped
     environment:
       - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
     ports:
       - "{{ monitoring_postgres_exporter_port }}:9187"
-    networks: [contra]
+    networks: [private-channel]
 
   postgres-exporter-indexer:
     image: prometheuscommunity/postgres-exporter:v0.16.0
-    container_name: contra-mon-pgexp-indexer
+    container_name: private-channel-mon-pgexp-indexer
     restart: unless-stopped
     environment:
       - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
@@ -155,4 +155,4 @@ services:
       # Distinct from monitoring_postgres_exporter_port so primary + indexer
       # exporters don't collide on the host. Defined in vars/<env>.yml.
       - "{{ monitoring_postgres_exporter_indexer_port }}:9187"
-    networks: [contra]
+    networks: [private-channel]

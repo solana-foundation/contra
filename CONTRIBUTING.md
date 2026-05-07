@@ -1,6 +1,6 @@
-# Contributing to Contra
+# Contributing to Solana Private Channels
 
-Thank you for your interest in contributing to Contra! This document provides guidelines and instructions for contributing to the project. 
+Thank you for your interest in contributing to Solana Private Channels! This document provides guidelines and instructions for contributing to the project. 
 
 See [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) for detailed system requirements.
 
@@ -20,7 +20,7 @@ See [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) for detailed system r
 ```bash
 # Clone the repository
 git clone https://github.com/solana-foundation/contra.git
-cd contra
+cd private_channel
 
 # Install dependencies for all projects
 make install
@@ -78,7 +78,7 @@ All contributions must pass CI/CD checks before requesting a review. The project
 
 ### Security Vulnerabilities
 
-For security vulnerabilities, please do NOT report them publicly on GitHub Issues. Instead, contact the Contra team offline.
+For security vulnerabilities, please do NOT report them publicly on GitHub Issues. Instead, contact the Solana Private Channels team offline.
 
 ### Non-Security Issues/Bugs
 
@@ -87,7 +87,7 @@ When reporting bugs, include:
 1. **Description**: Clear description of the issue
 2. **Steps to reproduce**:
    ```
-   1. Start Contra node
+   1. Start Solana Private Channels node
    2. Submit transfer transaction
    3. Observe error XYZ
    ```
@@ -176,8 +176,8 @@ mod tests {
 
 **Integration tests**: Place in `integration/tests/` directory:
 ```rust
-// integration/tests/contra/test_transaction_flow.rs
-use contra_test_utils::*;
+// integration/tests/private_channel/test_transaction_flow.rs
+use private_channel_test_utils::*;
 
 #[tokio::test]
 async fn my_test_function() {
@@ -194,11 +194,11 @@ async fn my_test_function() {
 
 ## Getting Help
 
-For questions about contributing to Contra:
+For questions about contributing to Solana Private Channels:
 
 - **GitHub Issues**: https://github.com/solana-foundation/contra/issues
-- **Stack Exchange**: Ask on https://solana.stackexchange.com/ (use the `contra` tag)
+- **Stack Exchange**: Ask on https://solana.stackexchange.com/ (use the `private_channel` tag)
 
 ## License
 
-By contributing to Contra, you agree that your contributions will be licensed under the MIT License. See [LICENSE](./LICENSE) for the full license text.
+By contributing to Solana Private Channels, you agree that your contributions will be licensed under the MIT License. See [LICENSE](./LICENSE) for the full license text.

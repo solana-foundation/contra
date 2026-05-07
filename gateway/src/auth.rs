@@ -27,10 +27,10 @@ pub enum Role {
 }
 
 /// Expected `iss` claim. Must match `JWT_ISSUER` in the auth service's jwt.rs.
-const JWT_ISSUER: &str = "contra-auth";
+const JWT_ISSUER: &str = "private-channel-auth";
 
 /// Expected `aud` claim. Must match `JWT_AUDIENCE` in the auth service's jwt.rs.
-const JWT_AUDIENCE: &str = "contra-gateway";
+const JWT_AUDIENCE: &str = "private-channel-gateway";
 
 /// The claims the auth service embeds in every JWT.
 /// `jsonwebtoken` automatically validates `exp` (expiry) during decode.
@@ -240,7 +240,7 @@ pub async fn check_account_data_ownership(
     }
 
     // Extract the `owner` field (bytes 32-63) and encode as base58 to match
-    // the format stored in contra_auth.verified_wallets.
+    // the format stored in private_channel_auth.verified_wallets.
     let owner = bs58::encode(&data[OWNER_OFFSET..OWNER_END]).into_string();
 
     match is_wallet_owned_by_user(auth_db, user_id, &owner).await {

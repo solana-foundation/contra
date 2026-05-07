@@ -3,7 +3,8 @@ use {
         accounts::{bob::BOB, AccountsDB},
         nodes::node::WorkerHandle,
         processor::{
-            create_transaction_batch_processor, get_transaction_check_results, ContraForkGraph,
+            create_transaction_batch_processor, get_transaction_check_results,
+            PrivateChannelForkGraph,
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
@@ -63,14 +64,14 @@ pub struct ExecutionArgs {
 
 pub struct ExecutionDeps {
     pub bob: BOB,
-    pub vm: TransactionBatchProcessor<ContraForkGraph>,
+    pub vm: TransactionBatchProcessor<PrivateChannelForkGraph>,
     pub admin_vm: AdminVm,
     /// Effective parallel-worker cap used by `execute_parallel`. Captured at
     /// worker startup so hot-path batch execution never touches shared config.
     pub max_svm_workers: usize,
 
     // Must prevent this from being dropped
-    _fork_graph: Arc<RwLock<ContraForkGraph>>,
+    _fork_graph: Arc<RwLock<PrivateChannelForkGraph>>,
 }
 
 pub struct ExecutionResult {
@@ -213,7 +214,7 @@ pub async fn get_execution_deps(
 /// environment is trivially cheap to construct, so per-thread construction has
 /// negligible cost compared to the SVM call it frames.
 fn execute_chunk(
-    vm: &TransactionBatchProcessor<ContraForkGraph>,
+    vm: &TransactionBatchProcessor<PrivateChannelForkGraph>,
     callback: &SnapshotCallback,
     transactions: &[SanitizedTransaction],
 ) -> LoadAndExecuteSanitizedTransactionsOutput {
@@ -292,7 +293,7 @@ fn merge_svm_outputs(
 /// Caller must ensure `max_svm_workers >= 2` — this function assumes the
 /// parallel path is wanted and will always split into at least 2 chunks.
 fn execute_parallel(
-    vm: &TransactionBatchProcessor<ContraForkGraph>,
+    vm: &TransactionBatchProcessor<PrivateChannelForkGraph>,
     snapshot: &SnapshotCallback,
     transactions: &[SanitizedTransaction],
     max_svm_workers: usize,

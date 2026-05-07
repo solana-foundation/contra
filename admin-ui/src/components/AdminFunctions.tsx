@@ -12,7 +12,7 @@ import {
   getBlockMintInstructionAsync,
   getAddOperatorInstructionAsync,
   getRemoveOperatorInstructionAsync,
-} from '@contra-escrow';
+} from '@private-channel-escrow';
 import {
   getInitializeMintInstruction,
   getMintSize,

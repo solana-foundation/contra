@@ -1,0 +1,100 @@
+---
+# Tear down both stacks AND remove all state: containers, volumes, host_data_dir,
+# bootstrap marker. The next `ansible-playbook deploy.yml` will re-bootstrap and
+# start from a clean slate.
+#
+# This is irreversible — postgres data, indexer state, validator ledger, and
+# Grafana dashboards-data are all destroyed. For a non-destructive stop use
+# `down.yml`.
+#
+# Usage: ansible-playbook teardown.yml -l dev
+- name: Tear down Solana Private Channels (destroy volumes)
+  hosts: all
+  gather_facts: false
+  vars_files:
+  - vars/common.yml
+  # Selects vars/<env>.yml from the host's inventory group (e.g. dev → vars/dev.yml). Override via -e env=<name>.
+  - "vars/{{ env | default(group_names | difference(['all']) | first | default('dev')) }}.yml"
+
+  tasks:
+  - name: "==== TEARDOWN: destroy volumes + host_data_dir ===="
+    ansible.builtin.debug:
+      msg: "Removing both stacks with -v, named volumes, and {{ host_data_dir }}."
+
+  # Same order as reset_state in deploy.yml: monitoring first, then private-channel.
+  - name: Tear down monitoring stack (down -v)
+    ansible.builtin.shell: |
+      if [ -f "{{ monitoring_dir }}/monitoring.compose.yml" ]; then
+        docker compose \
+          --env-file {{ host_data_dir }}/config/.env \
+          -f {{ monitoring_dir }}/monitoring.compose.yml \
+          down -v --remove-orphans || true
+      fi
+    changed_when: true
+
+  - name: Tear down private-channel stack (down -v)
+    ansible.builtin.shell: |
+      if [ -f "{{ target_override_file }}" ]; then
+        docker compose -p private-channel \
+          --env-file {{ target_versions_env_file }} \
+          --env-file {{ target_config_dir }}/.env \
+          -f {{ target_compose_file }} \
+          -f {{ target_override_file }} \
+          down -v --remove-orphans || true
+      fi
+    changed_when: true
+
+  # Belt-and-braces #1: the private-channel services hardcode `container_name:
+  # private-channel-*`. If anything ran `docker compose up` from {{ target_config_dir }}
+  # without `-p private-channel` (project name then defaults to the dir basename,
+  # `config`), the down -p private-channel above won't touch it. Discover any project
+  # owning a private-channel-* container and tear it down with -v --remove-orphans,
+  # then force-remove anything that survives. Mirrors the reset_state
+  # hardening in deploy.yml so a teardown is always a true clean slate.
+  - name: Tear down any orphan compose projects owning private-channel-* containers
+    ansible.builtin.shell: |
+      set +e
+      seen=""
+      for cid in $(docker ps -aq --filter 'name=^private-channel-'); do
+        p=$(docker inspect --format '{% raw %}{{ index .Config.Labels "com.docker.compose.project" }}{% endraw %}' "$cid" 2>/dev/null)
+        if [ -n "$p" ] && [ "$p" != "private-channel" ] && ! echo "$seen" | tr ' ' '\n' | grep -qx "$p"; then
+          echo "Cleaning orphan compose project: $p"
+          docker compose -p "$p" down -v --remove-orphans 2>/dev/null || true
+          seen="$seen $p"
+        fi
+      done
+      ids=$(docker ps -aq --filter 'name=^private-channel-')
+      if [ -n "$ids" ]; then docker rm -f $ids; fi
+    changed_when: true
+
+  # Belt-and-braces #2: remove named volumes by exact name in case the compose
+  # project name changed since they were created. `volume rm` returns 1 if
+  # the volume is missing — that's fine.
+  - name: Remove named volumes by exact name
+    ansible.builtin.shell: |
+      docker volume rm \
+        private-channel_postgres-indexer-data \
+        private-channel_postgres-indexer-wal-archive \
+        private-channel_postgres-primary-data \
+        private-channel_postgres-primary-wal-archive \
+        private-channel_postgres-replica-data \
+        private-channel_validator-data \
+        monitoring_grafana-data \
+        monitoring_prom-data \
+        postgres-indexer-wal-archive \
+        postgres-primary-wal-archive 2>/dev/null || true
+    changed_when: true
+
+  # Wipe everything under host_data_dir, including the bootstrap marker so
+  # the next `deploy.yml` re-runs PHASE 2 (bootstrap) cleanly.
+  - name: Wipe host_data_dir
+    ansible.builtin.file:
+      path: "{{ host_data_dir }}"
+      state: absent
+
+  - name: Report
+    ansible.builtin.debug:
+      msg: |
+        Teardown complete. Containers, volumes, and {{ host_data_dir }} removed.
+        Next deploy will re-bootstrap from scratch:
+          ansible-playbook deploy.yml -l {{ group_names | difference(['all']) | first | default('dev') }}

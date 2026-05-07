@@ -98,8 +98,8 @@ jobs:
               - 'indexer/**'
               - 'integration/**'
               - 'test_utils/**'
-              - 'contra-escrow-program/**'
-              - 'contra-withdraw-program/**'
+              - 'private-channel-escrow-program/**'
+              - 'private-channel-withdraw-program/**'
               - 'auth/**'
             integration:
               - 'Cargo.toml'
@@ -112,8 +112,8 @@ jobs:
               - 'indexer/**'
               - 'integration/**'
               - 'test_utils/**'
-              - 'contra-escrow-program/**'
-              - 'contra-withdraw-program/**'
+              - 'private-channel-escrow-program/**'
+              - 'private-channel-withdraw-program/**'
             core_indexer:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -140,18 +140,18 @@ jobs:
 
       - name: Build programs and generate clients
         run: |
-          make -C contra-escrow-program build
-          make -C contra-withdraw-program build
+          make -C private-channel-escrow-program build
+          make -C private-channel-withdraw-program build
 
       - name: Package shared artifacts
         run: |
           tar -czf ci-build-artifacts.tgz \
-            target/deploy/contra_escrow_program.so \
-            target/deploy/contra_withdraw_program.so \
-            contra-escrow-program/idl \
-            contra-escrow-program/clients \
-            contra-withdraw-program/idl \
-            contra-withdraw-program/clients
+            target/deploy/private_channel_escrow_program.so \
+            target/deploy/private_channel_withdraw_program.so \
+            private-channel-escrow-program/idl \
+            private-channel-escrow-program/clients \
+            private-channel-withdraw-program/idl \
+            private-channel-withdraw-program/clients
 
       - name: Upload shared artifacts
         uses: actions/upload-artifact@v4
@@ -178,7 +178,7 @@ jobs:
       - name: Create program placeholder for type checking
         run: |
           mkdir -p target/deploy
-          touch target/deploy/contra_withdraw_program.so
+          touch target/deploy/private_channel_withdraw_program.so
 
       - name: Generate clients
         run: make generate-clients
@@ -186,10 +186,10 @@ jobs:
       - name: Run cargo check
         run: |
           cargo check --workspace --all-features \
-            --exclude contra-core \
-            --exclude contra-integration \
-            --exclude tests-contra-escrow-program \
-            --exclude tests-contra-withdraw-program
+            --exclude private-channel-core \
+            --exclude private-channel-integration \
+            --exclude tests-private-channel-escrow-program \
+            --exclude tests-private-channel-withdraw-program
 
   fmt:
     name: Format
@@ -211,14 +211,14 @@ jobs:
       - name: Check formatting
         run: |
           cargo fmt \
-            -p contra-escrow-program \
-            -p tests-contra-escrow-program \
-            -p contra-withdraw-program \
-            -p tests-contra-withdraw-program \
-            -p contra-core \
-            -p contra-gateway \
-            -p contra-indexer \
-            -p contra-integration \
+            -p private-channel-escrow-program \
+            -p tests-private-channel-escrow-program \
+            -p private-channel-withdraw-program \
+            -p tests-private-channel-withdraw-program \
+            -p private-channel-core \
+            -p private-channel-gateway \
+            -p private-channel-indexer \
+            -p private-channel-integration \
             -p test_utils \
             -p devnet-scripts \
             -p auth \
@@ -242,7 +242,7 @@ jobs:
       - name: Create program placeholder for type checking
         run: |
           mkdir -p target/deploy
-          touch target/deploy/contra_withdraw_program.so
+          touch target/deploy/private_channel_withdraw_program.so
 
       - name: Generate clients
         run: make generate-clients
@@ -250,10 +250,10 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --workspace --all-features \
-            --exclude contra-core \
-            --exclude contra-integration \
-            --exclude tests-contra-escrow-program \
-            --exclude tests-contra-withdraw-program \
+            --exclude private-channel-core \
+            --exclude private-channel-integration \
+            --exclude tests-private-channel-escrow-program \
+            --exclude tests-private-channel-withdraw-program \
             -- -D warnings
 
   integration-tests:
@@ -291,14 +291,14 @@ jobs:
         with:
           tool: cargo-nextest@0.9.130
 
-      - name: Run contra integration tests with coverage
-        run: make -C integration integration-coverage-contra
+      - name: Run Solana Private Channels integration tests with coverage
+        run: make -C integration integration-coverage-private-channel
 
       - name: Run Redis-backend coverage tests
-        run: make -C integration integration-coverage-contra-redis
+        run: make -C integration integration-coverage-private-channel-redis
 
       - name: Build escrow with test-tree for indexer tests
-        run: make -C contra-escrow-program build-test
+        run: make -C private-channel-escrow-program build-test
 
       - name: Run indexer integration tests with coverage
         run: make -C integration integration-coverage-indexer

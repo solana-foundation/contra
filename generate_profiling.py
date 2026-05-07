@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Contra Escrow Program - CU Analysis Report Generator
+Solana Private Channels Escrow Program - CU Analysis Report Generator
 
 Analyzes compute unit usage from litesvm integration tests to create
 CU usage reports for Solana programs.
@@ -22,7 +22,7 @@ from typing import Dict, List
 
 DEFAULT_OUTPUT_FILE = "profiling_report.md"
 INTEGRATION_TESTS_DIR = "."
-INSTRUCTIONS_FILE = "contra-escrow-program/program/src/instructions.rs"
+INSTRUCTIONS_FILE = "private-channel-escrow-program/program/src/instructions.rs"
 
 # Solana Transaction Structure (Max 1232 bytes total)
 # Based on Solana documentation and IPv6 MTU minus headers
@@ -429,7 +429,7 @@ class ProfilingCollector:
                     "cargo",
                     "test",
                     "-p",
-                    "tests-contra-escrow-program",
+                    "tests-private-channel-escrow-program",
                     "--",
                     "--nocapture",
                 ],
@@ -559,7 +559,7 @@ class ReportGenerator:
 
     def _write_header(self, f, operation_stats: Dict[str, OperationStats]) -> None:
         """Write report header."""
-        f.write("# Contra Escrow Program - CU Analysis Report\n\n")
+        f.write("# Solana Private Channels Escrow Program - CU Analysis Report\n\n")
         f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
         total_operations = len(operation_stats)
@@ -653,7 +653,7 @@ def main():
     )
     args = parser.parse_args()
 
-    print("🔥 Contra Escrow CU Analysis Report Generator")
+    print("🔥 Solana Private Channels Escrow CU Analysis Report Generator")
     print("=" * 50)
 
     # Collect profiling data from integration tests

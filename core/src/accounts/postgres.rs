@@ -15,10 +15,10 @@ pub(crate) const DEFAULT_PG_MAX_CONNECTIONS: u32 = 32;
 /// default `max_connections = 100` across co-located services.
 pub(crate) const MAX_PG_MAX_CONNECTIONS: u32 = 256;
 
-/// Reads `CONTRA_PG_MAX_CONNECTIONS`; falls back to the default on unset/empty/
+/// Reads `PRIVATE_CHANNEL_PG_MAX_CONNECTIONS`; falls back to the default on unset/empty/
 /// unparseable/zero; clamps above the ceiling.
 pub(crate) fn resolve_pool_size() -> u32 {
-    std::env::var("CONTRA_PG_MAX_CONNECTIONS")
+    std::env::var("PRIVATE_CHANNEL_PG_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n > 0)
@@ -197,7 +197,7 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
     use solana_svm_callback::TransactionProcessingCallback;
 
-    const ENV_VAR: &str = "CONTRA_PG_MAX_CONNECTIONS";
+    const ENV_VAR: &str = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS";
 
     /// Snapshot the env var, run `body`, restore. `serial_test` prevents
     /// concurrent tests from racing on the shared process env.

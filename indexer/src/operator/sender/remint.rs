@@ -26,7 +26,7 @@ use tracing::{error, info, warn};
 /// Maximum number of finality-check retries before giving up and sending to ManualReview.
 const MAX_FINALITY_CHECK_ATTEMPTS: u32 = 3;
 
-/// Attempt to remint burned Contra tokens back to user after permanent withdrawal failure.
+/// Attempt to remint burned PrivateChannel tokens back to user after permanent withdrawal failure.
 /// Builds a MintTo instruction with an idempotency memo (same pattern as deposits).
 /// No sender-level retry — RPC-level retries may still occur via RpcClientWithRetry.
 async fn attempt_remint(

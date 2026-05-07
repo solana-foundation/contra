@@ -12,8 +12,8 @@ use crate::operator::{
 };
 use crate::storage::common::models::TransactionStatus;
 use chrono::Utc;
-use contra_escrow_program_client::errors::ContraEscrowProgramError;
-use contra_metrics::MetricLabel;
+use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
+use private_channel_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
@@ -377,7 +377,9 @@ pub(super) fn handle_confirmation_result<'a>(
             Ok(ConfirmationResult::Confirmed) => {
                 handle_success(state, ctx, signature, storage_tx).await;
             }
-            Ok(ConfirmationResult::Failed(Some(ContraEscrowProgramError::InvalidSmtProof))) => {
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::InvalidSmtProof,
+            ))) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "invalid_smt_proof"])
                     .inc();
@@ -406,7 +408,7 @@ pub(super) fn handle_confirmation_result<'a>(
                 }
             }
             Ok(ConfirmationResult::Failed(Some(
-                ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
+                PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
             ))) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "invalid_nonce_for_tree_index"])
@@ -1206,8 +1208,8 @@ mod tests {
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::common::storage::Storage;
-    use contra_escrow_program_client::errors::ContraEscrowProgramError;
-    use contra_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
+    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
     use solana_keychain::Signer;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
@@ -1747,7 +1749,7 @@ mod tests {
         handle_confirmation_result(
             &mut state,
             Ok(ConfirmationResult::Failed(Some(
-                ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
+                PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
             ))),
             Signature::new_unique(),
             None,
@@ -2035,7 +2037,7 @@ mod tests {
         handle_confirmation_result(
             &mut state,
             Ok(ConfirmationResult::Failed(Some(
-                ContraEscrowProgramError::InvalidSmtProof,
+                PrivateChannelEscrowProgramError::InvalidSmtProof,
             ))),
             Signature::new_unique(),
             None,

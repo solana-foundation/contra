@@ -6,7 +6,7 @@ use crate::indexer::datasource::common::{datasource::DataSource, types::*};
 use crate::indexer::datasource::rpc_polling::decoder;
 use crate::metrics;
 use async_trait::async_trait;
-use contra_metrics::{HealthState, MetricLabel};
+use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;

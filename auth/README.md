@@ -1,6 +1,6 @@
-# contra-auth
+# private-channel-auth
 
-Authentication service for the Contra platform. Handles user registration, login, and Solana wallet verification. Issues JWTs consumed by the gateway for RBAC enforcement.
+Authentication service for the Solana Private Channels platform. Handles user registration, login, and Solana wallet verification. Issues JWTs consumed by the gateway for RBAC enforcement.
 
 ## Configuration
 
@@ -9,7 +9,7 @@ Authentication service for the Contra platform. Handles user registration, login
 | `AUTH_PORT` | `8903` | Port to listen on |
 | `AUTH_DATABASE_URL` | — | Postgres connection URL |
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
-| `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.contra.xyz`). Defaults to `*` for local dev. |
+| `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
 
 ## API
@@ -52,7 +52,7 @@ Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minu
 
 ```json
 {
-  "message": "Contra wallet verification\nuser: <uuid>\nnonce: <uuid>\nexpires: <unix>",
+  "message": "Solana Private Channels wallet verification\nuser: <uuid>\nnonce: <uuid>\nexpires: <unix>",
   "nonce": "<uuid>",
   "expires_at": "<iso8601>"
 }
@@ -98,7 +98,7 @@ There are two roles: `user` (default) and `operator`.
 **Operators must be provisioned directly in the database** — there is no API to assign or escalate to the operator role. This is intentional: operator access is an infrastructure-level concern, not a self-service one.
 
 ```sql
-UPDATE contra_auth.users SET role = 'operator' WHERE username = 'alice';
+UPDATE private_channel_auth.users SET role = 'operator' WHERE username = 'alice';
 ```
 
 ## Admin CLI
@@ -107,7 +107,7 @@ Operator-only commands for managing users directly against the auth database. Re
 
 ### Attach a wallet to a user
 
-Inserts a row into `contra_auth.verified_wallets` without running the challenge/signature flow — the operator is asserting trust, the user does not prove ownership. Use this for provisioning or recovery, not as a substitute for the normal verification flow.
+Inserts a row into `private_channel_auth.verified_wallets` without running the challenge/signature flow — the operator is asserting trust, the user does not prove ownership. Use this for provisioning or recovery, not as a substitute for the normal verification flow.
 
 ```bash
 AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin admin -- attach-wallet --username alice --pubkey <base58>
@@ -137,8 +137,8 @@ Tokens are signed with HS256. The payload contains:
 {
   "sub": "<user uuid>",
   "role": "user | operator",
-  "iss": "contra-auth",
-  "aud": "contra-gateway",
+  "iss": "private-channel-auth",
+  "aud": "private-channel-gateway",
   "exp": <unix timestamp>
 }
 ```

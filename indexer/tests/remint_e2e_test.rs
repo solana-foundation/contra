@@ -9,7 +9,7 @@
 //! Uses testcontainers for isolated Postgres instances.
 
 use chrono::Utc;
-use contra_indexer::{
+use private_channel_indexer::{
     storage::{PostgresDb, Storage, TransactionStatus},
     PostgresConfig,
 };
@@ -367,7 +367,7 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
     // Step 5b: balance query must remain unchanged after the remint.
     // The failed withdrawal is still NOT in total_withdrawals — FailedReminted
     // means the withdrawal never succeeded on-chain. The escrow still holds the
-    // deposit. The user received their tokens back on Contra via remint.
+    // deposit. The user received their tokens back on PrivateChannel via remint.
     let after_balances = storage.get_mint_balances_for_reconciliation().await?;
     let after_balance = after_balances
         .iter()

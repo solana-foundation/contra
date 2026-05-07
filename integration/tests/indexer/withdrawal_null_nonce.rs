@@ -27,14 +27,14 @@ mod setup;
 
 use {
     chrono::Utc,
-    contra_indexer::{
-        config::{ContraIndexerConfig, OperatorConfig, ProgramType, StorageType},
+    helpers::{db, mint_to_owner},
+    private_channel_indexer::{
+        config::{OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator,
         storage::common::models::{DbMint, DbTransaction, TransactionStatus},
         storage::{PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
-    helpers::{db, mint_to_owner},
     setup::{TestEnvironment, TEST_ADMIN_KEYPAIR},
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
@@ -86,7 +86,7 @@ async fn start_withdraw_operator(
         max_connections: 10,
     };
     let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         rpc_url,

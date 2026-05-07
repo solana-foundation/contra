@@ -1,7 +1,7 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    contra_auth::{db, error::AppError},
+    private_channel_auth::{db, error::AppError},
     solana_sdk::pubkey::Pubkey,
     sqlx::postgres::PgPoolOptions,
     std::{env, str::FromStr},
@@ -10,16 +10,16 @@ use {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "contra-auth-admin",
-    about = "Manual administrative commands for the contra-auth database"
+    name = "private-channel-auth-admin",
+    about = "Manual administrative commands for the private-channel-auth database"
 )]
 struct Args {
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info", env = "CONTRA_LOG_LEVEL")]
+    #[arg(long, default_value = "info", env = "PRIVATE_CHANNEL_LOG_LEVEL")]
     log_level: String,
 
     /// Enable JSON logging format
-    #[arg(long, env = "CONTRA_JSON_LOGS")]
+    #[arg(long, env = "PRIVATE_CHANNEL_JSON_LOGS")]
     json_logs: bool,
 
     #[command(subcommand)]

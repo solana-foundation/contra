@@ -1,0 +1,46 @@
+{
+  "uid": "private-channel-containers",
+  "title": "Containers (cAdvisor)",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["containers", "cadvisor"],
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "CPU per container",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name!=\"\"}[1m]))", "legendFormat": "{{name}}" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } }
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Memory RSS per container",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "container_memory_rss{name!=\"\"}", "legendFormat": "{{name}}" }],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Container net I/O bytes/s",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (name) (rate(container_network_receive_bytes_total{name!=\"\"}[1m]))", "legendFormat": "rx {{name}}" },
+        { "refId": "B", "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name!=\"\"}[1m]))", "legendFormat": "tx {{name}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Container disk I/O bytes/s",
+      "description": "rate(container_fs_{reads,writes}_bytes_total[1m]) grouped by cgroup id. Note: cAdvisor on cgroups-v2 hosts reports filesystem metrics by cgroup path (id) only — the `name` label populated for CPU/memory does NOT appear here. Docker container cgroups show as `/docker/<full-id>` on cgroups-v1; on cgroups-v2 with systemd, you'll see a single `/` series (host-aggregate) plus per-service slices. For per-container disk attribution on this host, use the host-dashboard's node_disk panel.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (id) (rate(container_fs_reads_bytes_total[1m]))",  "legendFormat": "read {{id}}" },
+        { "refId": "B", "expr": "sum by (id) (rate(container_fs_writes_bytes_total[1m]))", "legendFormat": "write {{id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    }
+  ]
+}

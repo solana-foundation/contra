@@ -1,4 +1,4 @@
-//! Deposit setup phase — Solana escrow + Contra mint preparation.
+//! Deposit setup phase — Solana escrow + PrivateChannel mint preparation.
 //!
 //! Prepares all on-chain state the deposit load phase needs:
 //!   1. Loads the admin keypair from disk.
@@ -7,7 +7,7 @@
 //!   4. Generates N fresh depositor keypairs.
 //!   5. Funds each depositor with SOL (via transfer from admin).
 //!   6. Creates a fresh Solana SPL mint (admin is mint authority) and
-//!      initialises it on **Contra** so the operator can mint immediately
+//!      initialises it on **PrivateChannel** so the operator can mint immediately
 //!      without JIT initialisation.
 //!   7. Calls AllowMint — registers the mint with the instance, creating both
 //!      the allowed_mint PDA and the instance ATA on Solana.
@@ -24,14 +24,14 @@ use {
         types::{BenchState, DepositConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
-    contra_core::client::{
+    private_channel_core::client::{
         create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction,
     },
-    contra_escrow_program_client::{
+    private_channel_escrow_program_client::{
         instructions::{
             AllowMint, AllowMintInstructionArgs, CreateInstance, CreateInstanceInstructionArgs,
         },
-        CONTRA_ESCROW_PROGRAM_ID,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
     rayon::prelude::*,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
@@ -61,7 +61,7 @@ const AIRDROP_LAMPORTS: u64 = 100_000_000_000;
 pub fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED_PREFIX, instance_seed.as_ref()],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
@@ -73,20 +73,20 @@ fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
             instance_pda.as_ref(),
             mint.as_ref(),
         ],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
 /// Derive the Anchor event-authority PDA for the escrow program.
 fn find_event_authority() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
 }
 
 /// Run all deposit setup tasks and return the `DepositConfig` needed by the
 /// deposit load phase.
 ///
 /// `solana_rpc_url`  — Solana validator RPC endpoint
-/// `contra_rpc_url`  — Contra gateway / write-node RPC endpoint
+/// `private_channel_rpc_url`  — PrivateChannel gateway / write-node RPC endpoint
 /// `admin_path`      — path to the admin keypair JSON file
 /// `instance_seed_path` — optional path to save/load the instance-seed keypair;
 ///                        when `Some`, the keypair (and thus instance PDA) is
@@ -95,7 +95,7 @@ fn find_event_authority() -> (Pubkey, u8) {
 /// `initial_balance` — raw token units minted to each depositor ATA
 pub async fn run_setup_deposit_phase(
     solana_rpc_url: &str,
-    contra_rpc_url: &str,
+    private_channel_rpc_url: &str,
     admin_path: &Path,
     instance_seed_path: Option<&Path>,
     num_accounts: usize,
@@ -105,7 +105,7 @@ pub async fn run_setup_deposit_phase(
     // Task 1: Load admin keypair
     // ------------------------------------------------------------------
     let admin_keypair = Arc::new(
-        contra_core::client::load_keypair(admin_path)
+        private_channel_core::client::load_keypair(admin_path)
             .map_err(|e| anyhow::anyhow!("failed to load admin keypair: {e}"))?,
     );
     info!(pubkey = %admin_keypair.pubkey(), "Loaded admin keypair (deposit setup)");
@@ -120,7 +120,7 @@ pub async fn run_setup_deposit_phase(
     // is generated (useful for isolated tests).
     // ------------------------------------------------------------------
     let instance_seed_keypair: Keypair = match instance_seed_path {
-        Some(path) if path.exists() => contra_core::client::load_keypair(path)
+        Some(path) if path.exists() => private_channel_core::client::load_keypair(path)
             .map_err(|e| anyhow::anyhow!("failed to load instance-seed keypair: {e}"))?,
         Some(path) => {
             let kp = Keypair::new();
@@ -210,7 +210,7 @@ pub async fn run_setup_deposit_phase(
                         instance: instance_pda,
                         system_program: program::id(),
                         event_authority,
-                        contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
+                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(CreateInstanceInstructionArgs {
                         bump: instance_bump,
@@ -413,9 +413,9 @@ pub async fn run_setup_deposit_phase(
     info!(%mint, elapsed_ms = t6.elapsed().as_millis(), "Solana mint initialized");
 
     // ------------------------------------------------------------------
-    // Task 6b: Initialise the same mint on Contra
+    // Task 6b: Initialise the same mint on PrivateChannel
     //
-    // The Contra write-node creates accounts implicitly (gasless), so
+    // The PrivateChannel write-node creates accounts implicitly (gasless), so
     // create_admin_initialize_mint only sends the initialize_mint
     // instruction — no preceding create_account is needed.
     //
@@ -423,15 +423,15 @@ pub async fn run_setup_deposit_phase(
     // every first deposit, blocking the sender loop ~200 ms each time.
     // ------------------------------------------------------------------
     let t6b = Instant::now();
-    let contra_rpc =
-        RpcClient::new_with_commitment(contra_rpc_url.to_string(), CommitmentConfig::confirmed());
-    let contra_mint_sig = 'send: {
+    let private_channel_rpc =
+        RpcClient::new_with_commitment(private_channel_rpc_url.to_string(), CommitmentConfig::confirmed());
+    let private_channel_mint_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match contra_rpc.get_latest_blockhash().await {
+            match private_channel_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
-                        "get_latest_blockhash failed (Contra mint init), retrying in {delay_secs}s");
+                        "get_latest_blockhash failed (PrivateChannel mint init), retrying in {delay_secs}s");
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
@@ -441,11 +441,11 @@ pub async fn run_setup_deposit_phase(
                         MINT_DECIMALS,
                         blockhash,
                     );
-                    match contra_rpc.send_transaction(&init_tx).await {
+                    match private_channel_rpc.send_transaction(&init_tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
                             warn!(attempt, err = %e,
-                                "Contra initialize_mint send failed, retrying in {delay_secs}s");
+                                "PrivateChannel initialize_mint send failed, retrying in {delay_secs}s");
                             last_err = e.to_string();
                         }
                     }
@@ -454,24 +454,24 @@ pub async fn run_setup_deposit_phase(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
         return Err(anyhow::anyhow!(
-            "Contra initialize_mint: all retries exhausted: {last_err}"
+            "PrivateChannel initialize_mint: all retries exhausted: {last_err}"
         ));
     };
     let retry = poll_confirmations(
-        &contra_rpc,
-        &[Some(contra_mint_sig)],
-        "initialize_mint(contra)",
+        &private_channel_rpc,
+        &[Some(private_channel_mint_sig)],
+        "initialize_mint(private_channel)",
         0,
         1,
     )
     .await?;
     if !retry.is_empty() {
-        return Err(anyhow::anyhow!("Contra initialize_mint failed to confirm"));
+        return Err(anyhow::anyhow!("PrivateChannel initialize_mint failed to confirm"));
     }
     info!(
         %mint,
         elapsed_ms = t6b.elapsed().as_millis(),
-        "Contra mint initialized",
+        "PrivateChannel mint initialized",
     );
 
     // ------------------------------------------------------------------
@@ -506,7 +506,7 @@ pub async fn run_setup_deposit_phase(
                         token_program: spl_token::id(),
                         associated_token_program: spl_associated_token_account::id(),
                         event_authority,
-                        contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
+                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(AllowMintInstructionArgs { bump: allow_bump });
                     let tx = Transaction::new_signed_with_payer(

@@ -1,23 +1,23 @@
 # Railway Deployment
 
-This guide covers deploying Contra to [Railway](https://railway.com) as a multi-service project.
+This guide covers deploying Solana Private Channels to [Railway](https://railway.com) as a multi-service project.
 
 ## Architecture
 
-All services are built from a single Dockerfile that produces seven binaries: `contra-node`, `gateway`, `indexer`, `activity`, `streamer`, `admin`, and `auth`. Each Railway service runs the same Docker image with a different start command and environment variables. (`admin` is a CLI for one-off ops, not deployed as a long-running service.)
+All services are built from a single Dockerfile that produces seven binaries: `private-channel-node`, `gateway`, `indexer`, `activity`, `streamer`, `admin`, and `auth`. Each Railway service runs the same Docker image with a different start command and environment variables. (`admin` is a CLI for one-off ops, not deployed as a long-running service.)
 
-> **Note on `CONTRA_VERSION`:** The local compose stack consolidates all Rust services onto a single shared image tag (`contra-app:${CONTRA_VERSION:-latest}`) — see `docker-compose.yml`. **This sharing does not apply on Railway today.** Each Railway service has its own build pipeline and produces its own image, even though they all reference the same `Dockerfile`. `CONTRA_VERSION` is a local-only knob. To replicate the consolidated single-image pattern on Railway (build once, deploy to N services), see [`RAILWAY_SHARED_IMAGE.md`](RAILWAY_SHARED_IMAGE.md).
+> **Note on `PRIVATE_CHANNEL_VERSION`:** The local compose stack consolidates all Rust services onto a single shared image tag (`private-channel-app:${PRIVATE_CHANNEL_VERSION:-latest}`) — see `docker-compose.yml`. **This sharing does not apply on Railway today.** Each Railway service has its own build pipeline and produces its own image, even though they all reference the same `Dockerfile`. `PRIVATE_CHANNEL_VERSION` is a local-only knob. To replicate the consolidated single-image pattern on Railway (build once, deploy to N services), see [`RAILWAY_SHARED_IMAGE.md`](RAILWAY_SHARED_IMAGE.md).
 
 | Railway Service | Binary | Role |
 |---|---|---|
-| `write-node` | `contra-node` | Core write node (processes transactions) |
-| `read-node` | `contra-node` | Core read node (serves queries) |
+| `write-node` | `private-channel-node` | Core write node (processes transactions) |
+| `read-node` | `private-channel-node` | Core read node (serves queries) |
 | `gateway` | `gateway` | Routes requests between write and read nodes |
-| `streamer` | `streamer` | WebSocket server streaming real-time Contra transactions to frontends |
+| `streamer` | `streamer` | WebSocket server streaming real-time Solana Private Channels transactions to frontends |
 | `indexer-solana` | `indexer` | Indexes Solana transactions via Yellowstone gRPC |
-| `indexer-contra` | `indexer` | Indexes Contra transactions via RPC polling |
+| `indexer-private_channel` | `indexer` | Indexes Solana Private Channels transactions via RPC polling |
 | `operator-solana` | `indexer` | Processes escrow program operations |
-| `operator-contra` | `indexer` | Processes withdrawal program operations |
+| `operator-private_channel` | `indexer` | Processes withdrawal program operations |
 | `auth` | `auth` | Optional RBAC service issuing JWTs to gateway clients (only when the `auth` profile is enabled) |
 | `admin-ui` | Vite/React | Web UI for managing escrow instances, operators, mints, balances, and withdrawals |
 
@@ -36,10 +36,10 @@ Services **not** deployed to Railway:
   ```bash
   make install              # Install pnpm dependencies for both programs
   make generate-clients     # Generate IDL + Rust/JS clients from Codama annotations
-  make -C contra-escrow-program build
-  make -C contra-withdraw-program build
+  make -C private-channel-escrow-program build
+  make -C private-channel-withdraw-program build
   ```
-  The repo contains symlinks (`core/precompiles/contra_withdraw_program.so`, `test_utils/programs/*.so`) that point to `target/deploy/`. These must resolve or `railway up` will fail during upload.
+  The repo contains symlinks (`core/precompiles/private_channel_withdraw_program.so`, `test_utils/programs/*.so`) that point to `target/deploy/`. These must resolve or `railway up` will fail during upload.
 - An admin keypair (e.g., `keypairs/admin.json`)
 
 ## Database Setup
@@ -47,7 +47,7 @@ Services **not** deployed to Railway:
 The system uses two PostgreSQL databases. Connect to your Railway Postgres and create them:
 
 ```sql
-CREATE DATABASE contra;
+CREATE DATABASE private_channel;
 CREATE DATABASE indexer;
 ```
 
@@ -62,9 +62,9 @@ railway add --service write-node
 railway add --service read-node
 railway add --service gateway
 railway add --service indexer-solana
-railway add --service indexer-contra
+railway add --service indexer-private_channel
 railway add --service operator-solana
-railway add --service operator-contra
+railway add --service operator-private_channel
 railway add --service streamer
 railway add --service admin-ui
 railway add --service blackbox-exporter
@@ -78,16 +78,16 @@ Set the start command for each service in the Railway dashboard under **Settings
 
 | Service | Start Command |
 |---|---|
-| `write-node` | `/usr/local/bin/contra-node` |
-| `read-node` | `/usr/local/bin/contra-node` |
+| `write-node` | `/usr/local/bin/private-channel-node` |
+| `read-node` | `/usr/local/bin/private-channel-node` |
 | `gateway` | `/usr/local/bin/gateway` |
-| `indexer-solana` | `/usr/local/bin/indexer --config /etc/contra/config/railway/indexer-solana.toml -v indexer` |
-| `indexer-contra` | `/usr/local/bin/indexer --config /etc/contra/config/railway/indexer-contra.toml -v indexer` |
-| `operator-solana` | `/usr/local/bin/indexer --config /etc/contra/config/railway/operator-solana.toml -v operator` |
-| `operator-contra` | `/usr/local/bin/indexer --config /etc/contra/config/railway/operator-contra.toml -v operator` |
+| `indexer-solana` | `/usr/local/bin/indexer --config /etc/private_channel/config/railway/indexer-solana.toml -v indexer` |
+| `indexer-private_channel` | `/usr/local/bin/indexer --config /etc/private_channel/config/railway/indexer-private_channel.toml -v indexer` |
+| `operator-solana` | `/usr/local/bin/indexer --config /etc/private_channel/config/railway/operator-solana.toml -v operator` |
+| `operator-private_channel` | `/usr/local/bin/indexer --config /etc/private_channel/config/railway/operator-private_channel.toml -v operator` |
 | `streamer` | `/usr/local/bin/streamer` |
 
-Config files are baked into the Docker image at `/etc/contra/config/` during build.
+Config files are baked into the Docker image at `/etc/private_channel/config/` during build.
 
 The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and must be configured in the Railway dashboard:
 - **Settings > Build > Dockerfile Path**: `admin-ui/Dockerfile`
@@ -105,31 +105,31 @@ The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and mu
 
 | Variable | Value |
 |---|---|
-| `CONTRA_PORT` | `8900` |
-| `CONTRA_ACCOUNTSDB_CONNECTION_URL` | `postgres://user:pass@host:port/contra` |
-| `CONTRA_ENABLE_READ` | `false` |
-| `CONTRA_MODE` | `write` |
-| `CONTRA_SIGVERIFY_QUEUE_SIZE` | `10000000` |
-| `CONTRA_SIGVERIFY_WORKERS` | `32` |
-| `CONTRA_MAX_CONNECTIONS` | `1000000` |
-| `CONTRA_MAX_TX_PER_BATCH` | `64` |
-| `CONTRA_ADMIN_KEYS` | Admin pubkey(s), comma-separated |
-| `CONTRA_LOG_LEVEL` | `info` |
-| `CONTRA_JSON_LOGS` | `true` |
+| `PRIVATE_CHANNEL_PORT` | `8900` |
+| `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | `postgres://user:pass@host:port/private_channel` |
+| `PRIVATE_CHANNEL_ENABLE_READ` | `false` |
+| `PRIVATE_CHANNEL_MODE` | `write` |
+| `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `10000000` |
+| `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | `32` |
+| `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `1000000` |
+| `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` |
+| `PRIVATE_CHANNEL_ADMIN_KEYS` | Admin pubkey(s), comma-separated |
+| `PRIVATE_CHANNEL_LOG_LEVEL` | `info` |
+| `PRIVATE_CHANNEL_JSON_LOGS` | `true` |
 | `RUST_LOG` | `info` |
 
 ### read-node
 
 | Variable | Value |
 |---|---|
-| `CONTRA_PORT` | `8901` |
-| `CONTRA_ACCOUNTSDB_CONNECTION_URL` | `postgres://user:pass@host:port/contra` |
-| `CONTRA_ENABLE_WRITE` | `false` |
-| `CONTRA_ENABLE_READ` | `true` |
-| `CONTRA_MODE` | `read` |
-| `CONTRA_MAX_CONNECTIONS` | `100000` |
-| `CONTRA_LOG_LEVEL` | `info` |
-| `CONTRA_JSON_LOGS` | `true` |
+| `PRIVATE_CHANNEL_PORT` | `8901` |
+| `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | `postgres://user:pass@host:port/private_channel` |
+| `PRIVATE_CHANNEL_ENABLE_WRITE` | `false` |
+| `PRIVATE_CHANNEL_ENABLE_READ` | `true` |
+| `PRIVATE_CHANNEL_MODE` | `read` |
+| `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100000` |
+| `PRIVATE_CHANNEL_LOG_LEVEL` | `info` |
+| `PRIVATE_CHANNEL_JSON_LOGS` | `true` |
 | `RUST_LOG` | `info` |
 
 > Both nodes share the same Postgres database. Without streaming replication (which a single Railway PG instance doesn't provide), the read node doesn't have replication-level isolation. This is fine for initial deployment.
@@ -152,29 +152,29 @@ The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and mu
 | `COMMON_ESCROW_INSTANCE_ID` | Escrow instance pubkey |
 | `INDEXER_YELLOWSTONE_ENDPOINT` | Yellowstone gRPC endpoint |
 | `INDEXER_YELLOWSTONE_TOKEN` | Yellowstone auth token |
-| `RUST_LOG` | `info,contra_indexer=debug` |
+| `RUST_LOG` | `info,private_channel_indexer=debug` |
 
-### indexer-contra
+### indexer-private_channel
 
 | Variable | Value |
 |---|---|
 | `DATABASE_URL` | `postgres://user:pass@host:port/indexer` |
 | `COMMON_RPC_URL` | `http://${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8899` |
-| `RUST_LOG` | `info,contra_indexer=debug` |
+| `RUST_LOG` | `info,private_channel_indexer=debug` |
 
 ### operator-solana
 
 | Variable | Value |
 |---|---|
 | `DATABASE_URL` | `postgres://user:pass@host:port/indexer` |
-| `COMMON_RPC_URL` | `http://${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8899` (Contra — where mint txs are sent) |
+| `COMMON_RPC_URL` | `http://${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8899` (Solana Private Channels — where mint txs are sent) |
 | `COMMON_SOURCE_RPC_URL` | Solana RPC endpoint (devnet — where escrow state is read) |
 | `COMMON_ESCROW_INSTANCE_ID` | Escrow instance pubkey |
 | `ADMIN_SIGNER` | `memory` (or `vault` / `turnkey` / `privy`) |
 | `ADMIN_PRIVATE_KEY` | Admin private key (base58) |
-| `RUST_LOG` | `info,contra_indexer=debug` |
+| `RUST_LOG` | `info,private_channel_indexer=debug` |
 
-### operator-contra
+### operator-private_channel
 
 | Variable | Value |
 |---|---|
@@ -182,16 +182,16 @@ The `admin-ui` service uses a separate Dockerfile (`admin-ui/Dockerfile`) and mu
 | `COMMON_RPC_URL` | `http://${{gateway.RAILWAY_PRIVATE_DOMAIN}}:8899` |
 | `ADMIN_SIGNER` | `memory` (or `vault` / `turnkey` / `privy`) |
 | `ADMIN_PRIVATE_KEY` | Admin private key (base58) |
-| `RUST_LOG` | `info,contra_indexer=debug` |
+| `RUST_LOG` | `info,private_channel_indexer=debug` |
 
 ### streamer
 
-The streamer polls the Contra PostgreSQL database for new blocks/transactions and broadcasts them over WebSocket to connected frontends. It replaces the 4-second RPC polling the admin-ui previously used for the activity feed.
+The streamer polls the Solana Private Channels PostgreSQL database for new blocks/transactions and broadcasts them over WebSocket to connected frontends. It replaces the 4-second RPC polling the admin-ui previously used for the activity feed.
 
 | Variable | Value |
 |---|---|
 | `STREAMER_PORT` | `8902` |
-| `STREAMER_ACCOUNTSDB_CONNECTION_URL` | `postgres://user:pass@host:port/contra` (same DB as read-node) |
+| `STREAMER_ACCOUNTSDB_CONNECTION_URL` | `postgres://user:pass@host:port/private_channel` (same DB as read-node) |
 | `STREAMER_POLL_INTERVAL_MS` | `200` (how often to check for new blocks, in ms) |
 | `STREAMER_CORS_ALLOWED_ORIGIN` | `*` |
 | `STREAMER_LOG_LEVEL` | `info` |
@@ -202,17 +202,17 @@ The streamer needs a **public domain** for the admin-ui (and any other frontend)
 
 ### admin-ui
 
-The admin UI is a static React/Vite app. It connects to Solana RPC directly (via wallet) and to the Contra gateway for payment channel operations.
+The admin UI is a static React/Vite app. It connects to Solana RPC directly (via wallet) and to the Solana Private Channels gateway for payment channel operations.
 
 | Variable | Kind | Value |
 |---|---|---|
-| `CONTRA_RPC_URL` | Runtime | Gateway public URL (e.g., `https://gateway-production-xxxx.up.railway.app`) |
-| `CONTRA_WS_URL` | **Build arg** | Streamer WebSocket URL (e.g., `wss://streamer-production-xxxx.up.railway.app/ws`) |
+| `PRIVATE_CHANNEL_RPC_URL` | Runtime | Gateway public URL (e.g., `https://gateway-production-xxxx.up.railway.app`) |
+| `PRIVATE_CHANNEL_WS_URL` | **Build arg** | Streamer WebSocket URL (e.g., `wss://streamer-production-xxxx.up.railway.app/ws`) |
 | `PORT` | Runtime | `3000` |
 
-`CONTRA_WS_URL` is baked into the JS bundle at Docker build time via a `Dockerfile ARG`. Railway passes service variables as build args automatically. The browser connects directly to the streamer over WebSocket, so this URL cannot be proxied through `server.mjs` like the RPC URLs are.
+`PRIVATE_CHANNEL_WS_URL` is baked into the JS bundle at Docker build time via a `Dockerfile ARG`. Railway passes service variables as build args automatically. The browser connects directly to the streamer over WebSocket, so this URL cannot be proxied through `server.mjs` like the RPC URLs are.
 
-If you change the streamer URL later, redeploy the admin-ui so the new URL is embedded in the bundle. If `CONTRA_WS_URL` is not set, the fallback is `wss://streamer.onlyoncontra.xyz/ws`.
+If you change the streamer URL later, redeploy the admin-ui so the new URL is embedded in the bundle. If `PRIVATE_CHANNEL_WS_URL` is not set, the fallback is `wss://streamer.example.com/ws` (placeholder — set `PRIVATE_CHANNEL_WS_URL` to your real streamer URL before deploying).
 
 The admin-ui also needs a public domain (**Settings > Networking > Generate Domain**).
 
@@ -239,9 +239,9 @@ railway service write-node && railway up
 railway service read-node && railway up
 railway service gateway && railway up
 railway service indexer-solana && railway up
-railway service indexer-contra && railway up
+railway service indexer-private_channel && railway up
 railway service operator-solana && railway up
-railway service operator-contra && railway up
+railway service operator-private_channel && railway up
 railway service streamer && railway up
 railway service admin-ui && railway up
 ```
@@ -309,11 +309,11 @@ railway variable set COMMON_ESCROW_INSTANCE_ID=<INSTANCE_ID> --service indexer-s
 railway variable set COMMON_ESCROW_INSTANCE_ID=<INSTANCE_ID> --service operator-solana
 ```
 
-Also set `CONTRA_ADMIN_KEYS` on the core nodes to the operator pubkey:
+Also set `PRIVATE_CHANNEL_ADMIN_KEYS` on the core nodes to the operator pubkey:
 
 ```bash
-railway variable set CONTRA_ADMIN_KEYS=<OPERATOR_PUBKEY> --service write-node
-railway variable set CONTRA_ADMIN_KEYS=<OPERATOR_PUBKEY> --service read-node
+railway variable set PRIVATE_CHANNEL_ADMIN_KEYS=<OPERATOR_PUBKEY> --service write-node
+railway variable set PRIVATE_CHANNEL_ADMIN_KEYS=<OPERATOR_PUBKEY> --service read-node
 ```
 
 Setting variables triggers a redeploy automatically (unless `--skip-deploys` is used).
@@ -322,7 +322,7 @@ Setting variables triggers a redeploy automatically (unless `--skip-deploys` is 
 
 In the Railway dashboard, go to the **gateway** service > **Settings > Networking > Generate Domain**. This gives you a public URL like `gateway-production-xxxx.up.railway.app`.
 
-This is your Contra RPC endpoint. Use it in place of `http://localhost:8899` for withdrawals and any client interactions.
+This is your Solana Private Channels RPC endpoint. Use it in place of `http://localhost:8899` for withdrawals and any client interactions.
 
 ### Step 6: Verify
 
@@ -337,7 +337,7 @@ cargo run --manifest-path scripts/devnet/Cargo.toml --bin deposit -- \
   <AMOUNT>
 ```
 
-Test a withdrawal (runs against your Railway gateway, withdrawing from Contra back to Solana):
+Test a withdrawal (runs against your Railway gateway, withdrawing from Solana Private Channels back to Solana):
 
 ```bash
 cargo run --manifest-path scripts/devnet/Cargo.toml --bin withdraw -- \
@@ -351,7 +351,7 @@ Monitor processing via Railway logs:
 
 ```bash
 railway logs --service operator-solana
-railway logs --service operator-contra
+railway logs --service operator-private_channel
 ```
 
 ### Setup Summary
@@ -362,7 +362,7 @@ railway logs --service operator-contra
 | 2. Add operator | `add_operator` binary | Local, against Solana devnet |
 | 3. Allow mint | `allow_mint` binary | Local, against Solana devnet |
 | 4. Set instance ID | `COMMON_ESCROW_INSTANCE_ID` env var | Railway dashboard/CLI |
-| 5. Set admin keys | `CONTRA_ADMIN_KEYS` env var | Railway dashboard/CLI |
+| 5. Set admin keys | `PRIVATE_CHANNEL_ADMIN_KEYS` env var | Railway dashboard/CLI |
 | 6. Generate domain | Gateway public URL | Railway dashboard |
 | 7. Test deposit | `deposit` binary | Local, against Solana devnet |
 | 8. Test withdrawal | `withdraw` binary | Local, against Railway gateway |
@@ -414,15 +414,15 @@ The grafana service needs these env vars to resolve datasource provisioning:
 
 | Dashboard | Panels | Datasources |
 |---|---|---|
-| Contra Indexer | Infrastructure (CPU, memory, network, restarts), indexer metrics (slots, transactions, errors, lag), lag gauge | Prometheus |
-| Contra Operator | Infrastructure, operator metrics (fetched, backlog, sent, errors, DB updates), Solana RPC, withdrawal status breakdown, pending withdrawals over time | Prometheus, Postgres |
-| Contra RPC | Gateway request rates, latency, errors | Prometheus |
+| Solana Private Channels Indexer | Infrastructure (CPU, memory, network, restarts), indexer metrics (slots, transactions, errors, lag), lag gauge | Prometheus |
+| Solana Private Channels Operator | Infrastructure, operator metrics (fetched, backlog, sent, errors, DB updates), Solana RPC, withdrawal status breakdown, pending withdrawals over time | Prometheus, Postgres |
+| Solana Private Channels RPC | Gateway request rates, latency, errors | Prometheus |
 
 ### Alerting
 
-Grafana alert rules fire when any Contra service becomes unreachable:
+Grafana alert rules fire when any Solana Private Channels service becomes unreachable:
 
-- **Scrape-based** (`service-down-scrape`) -- alerts when `up` metric drops to 0 for gateway, indexer-solana, indexer-contra, operator-solana, or operator-contra (services that expose Prometheus metrics).
+- **Scrape-based** (`service-down-scrape`) -- alerts when `up` metric drops to 0 for gateway, indexer-solana, indexer-private_channel, operator-solana, or operator-private_channel (services that expose Prometheus metrics).
 - **Probe-based** (`service-down-probe`) -- alerts when blackbox-exporter's HTTP probe fails for write-node, read-node, or streamer `/health` endpoints.
 
 Both rules use a 30s pending period. Worst-case detection is ~55s (15s scrape + 10s eval + 30s pending). Alerts auto-resolve when services recover. The existing webhook contact point (`ALERT_WEBHOOK_URL`) handles all alerts.
@@ -444,21 +444,21 @@ Prometheus uses `Dockerfile.prometheus` which runs `envsubst` at startup to inte
 |---|---|
 | `railway.toml` | Tells Railway to use the Dockerfile for builds |
 | `indexer/config/railway/indexer-solana.toml` | Yellowstone indexer config (escrow program) |
-| `indexer/config/railway/indexer-contra.toml` | RPC polling indexer config (withdraw program) |
+| `indexer/config/railway/indexer-private_channel.toml` | RPC polling indexer config (withdraw program) |
 | `indexer/config/railway/operator-solana.toml` | Operator config (escrow program) |
-| `indexer/config/railway/operator-contra.toml` | Operator config (withdraw program) |
+| `indexer/config/railway/operator-private_channel.toml` | Operator config (withdraw program) |
 | `admin-ui/Dockerfile` | Separate Dockerfile for the React/Vite admin UI |
 | `Dockerfile.grafana` | Grafana image with dashboards and provisioning baked in |
 | `Dockerfile.prometheus` | Prometheus image with `envsubst` entrypoint for `HOST_SUFFIX` interpolation |
 | `grafana/provisioning/datasources/prometheus.yml` | Grafana Prometheus datasource provisioning |
 | `grafana/provisioning/datasources/postgres.yml` | Grafana Postgres datasource provisioning (indexer DB) |
-| `grafana/dashboards/contra-indexer.json` | Indexer dashboard (infrastructure + indexer metrics + lag) |
-| `grafana/dashboards/contra-operator.json` | Operator dashboard (operator metrics + withdrawals) |
-| `grafana/dashboards/contra-rpc.json` | RPC/Gateway dashboard |
+| `grafana/dashboards/private-channel-indexer.json` | Indexer dashboard (infrastructure + indexer metrics + lag) |
+| `grafana/dashboards/private-channel-operator.json` | Operator dashboard (operator metrics + withdrawals) |
+| `grafana/dashboards/private-channel-rpc.json` | RPC/Gateway dashboard |
 | `grafana/provisioning/alerting/alert-rules.yml` | Grafana alert rules (indexer lag + service-down) |
 
 ## Dockerfile Changes for Railway
 
 - **Removed** `VOLUME` directive (Railway bans it; use Railway volumes instead)
-- **Added** `COPY indexer/config /etc/contra/config` to include config files in the runtime image
-- **Added** `RUN rm -f core/precompiles/contra_withdraw_program.so && cp target/deploy/contra_withdraw_program.so core/precompiles/contra_withdraw_program.so` to resolve the symlink during Docker build (the source `core/precompiles/contra_withdraw_program.so` is a symlink to `../../target/deploy/` which only exists after the program is built in the builder stage)
+- **Added** `COPY indexer/config /etc/private_channel/config` to include config files in the runtime image
+- **Added** `RUN rm -f core/precompiles/private_channel_withdraw_program.so && cp target/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so` to resolve the symlink during Docker build (the source `core/precompiles/private_channel_withdraw_program.so` is a symlink to `../../target/deploy/` which only exists after the program is built in the builder stage)

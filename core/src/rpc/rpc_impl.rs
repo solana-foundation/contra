@@ -1,5 +1,5 @@
 use {
-    super::api::ContraRpcServer,
+    super::api::PrivateChannelRpcServer,
     crate::{
         accounts::AccountsDB,
         rpc::{
@@ -66,13 +66,13 @@ pub struct WriteDeps {
     pub dedup_tx: mpsc::UnboundedSender<SanitizedTransaction>,
 }
 
-/// RPC implementation for Contra
-pub struct ContraRpcImpl {
+/// RPC implementation for PrivateChannel
+pub struct PrivateChannelRpcImpl {
     pub read_deps: Option<ReadDeps>,
     pub write_deps: Option<WriteDeps>,
 }
 
-impl ContraRpcImpl {
+impl PrivateChannelRpcImpl {
     pub async fn new(read_deps: Option<ReadDeps>, write_deps: Option<WriteDeps>) -> Self {
         Self {
             read_deps,
@@ -82,7 +82,7 @@ impl ContraRpcImpl {
 }
 
 #[async_trait]
-impl ContraRpcServer for ContraRpcImpl {
+impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     async fn send_transaction(
         &self,
         transaction: String,

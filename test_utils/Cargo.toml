@@ -5,9 +5,9 @@ edition.workspace = true
 
 [dependencies]
 bs58.workspace = true
-contra-escrow-program-client.workspace = true
-contra-withdraw-program-client.workspace = true
-contra-indexer = { path = "../indexer" }
+private-channel-escrow-program-client.workspace = true
+private-channel-withdraw-program-client.workspace = true
+private-channel-indexer = { path = "../indexer" }
 serde_json.workspace = true
 solana-address.workspace = true
 solana-client.workspace = true
@@ -48,9 +48,9 @@ test-mock-yellowstone = [
 ]
 # Exposes `OperatorMockHarness` (in `operator_helper`) — an in-process
 # operator runner wired to `MockRpcServer` + `Storage::Mock` for fault-
-# injection integration tests. Forwards to `contra-indexer/test-mock-storage`
+# injection integration tests. Forwards to `private-channel-indexer/test-mock-storage`
 # to enable the `Storage::Mock` variant.
-test-mock-storage = ["contra-indexer/test-mock-storage"]
+test-mock-storage = ["private-channel-indexer/test-mock-storage"]
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }

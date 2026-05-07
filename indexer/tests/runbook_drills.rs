@@ -18,7 +18,7 @@
 //! tracing output if a drill needs debugging.
 
 use chrono::Utc;
-use contra_indexer::{
+use private_channel_indexer::{
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };
@@ -266,7 +266,7 @@ fn drill_1_error_message_contracts_present_in_source() {
         // Deposit — idempotency memo prefix. Anchors `_verify_onchain_mint.md`
         // step 3.
         (
-            "contra:mint-idempotency:",
+            "private_channel:mint-idempotency:",
             "indexer/src/operator/constants.rs",
         ),
     ];

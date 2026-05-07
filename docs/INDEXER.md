@@ -3,7 +3,7 @@
 
 ## Indexer Components
 
-Monitors Solana Mainnet and the Contra payment channel for deposits/withdrawals and writes to database.
+Monitors Solana Mainnet and the Solana Private Channels payment channel for deposits/withdrawals and writes to database.
 
 ### Datasource Strategies
 
@@ -14,7 +14,7 @@ Real-time block streaming via gRPC (requires a gRPC endpoint). Handles both Escr
 **Location**: [`indexer/src/indexer/datasource/yellowstone/`](../indexer/src/indexer/datasource/yellowstone/)
 
 
-**2. RPC Polling (Mainnet or Contra)**
+**2. RPC Polling (Mainnet or Solana Private Channels)**
 
 Polls `getBlock` RPC sequentially with higher latency (~1-5 seconds) and no special infrastructure required.
 
@@ -43,7 +43,7 @@ Recovers missed slots on indexer restart or network issues:
 
 ## Operator Components
 
-Processes pending deposits/withdrawals and executes transactions between Solana Mainnet and the Contra payment channel.
+Processes pending deposits/withdrawals and executes transactions between Solana Mainnet and the Solana Private Channels payment channel.
 
 ### Three-Stage Pipeline
 
@@ -58,9 +58,9 @@ Polls database for pending transactions with row-level locking to prevent duplic
 
 #### 2. Processor
 
-Validates transactions and builds Solana instructions that are managed by the Contra instance's authorized operators/admins. The processor is responsible for three main tasks:
-- Processing deposits (Mainnet → Contra) - handles building a `MintTo` instruction for the user on the Contra payment channel.
-- Processing withdrawals (Contra → Mainnet) - handles building a `ReleaseFunds` instruction (using the Escrow Program's SMT proof) for the user on Mainnet.
+Validates transactions and builds Solana instructions that are managed by the Solana Private Channels instance's authorized operators/admins. The processor is responsible for three main tasks:
+- Processing deposits (Mainnet → Solana Private Channels) - handles building a `MintTo` instruction for the user on the Solana Private Channels payment channel.
+- Processing withdrawals (Solana Private Channels → Mainnet) - handles building a `ReleaseFunds` instruction (using the Escrow Program's SMT proof) for the user on Mainnet.
 - Rotating the SMT root on the Mainnet escrow instance to prevent double spending of withdrawals.
 
 **Location**: [`indexer/src/operator/processor.rs`](../indexer/src/operator/processor.rs)
@@ -72,7 +72,7 @@ Submits transactions to the respective cluster with:
 - Exponential backoff retry (configurable max attempts)
 - Transaction confirmation polling
 - Status updates to database (processing → completed/failed)
-- Just-in-time mint initialization (if mint is not yet initialized on the Contra payment channel, the Sender will include an `InitializeMint` instruction in the transaction prior to the `MintTo` instruction)
+- Just-in-time mint initialization (if mint is not yet initialized on the Solana Private Channels payment channel, the Sender will include an `InitializeMint` instruction in the transaction prior to the `MintTo` instruction)
 
 **Location**: [`indexer/src/operator/sender/`](../indexer/src/operator/sender/)
 
@@ -92,4 +92,4 @@ Handles batched database writes for transaction status updates from the operator
 
 #### Program Type
 
-The indexer uses a `ProgramType` enum (`Escrow` | `Withdraw`) to determine which pipeline branch runs. This is why two parallel instances are deployed: one watching the Escrow program on Mainnet, and one watching the Withdraw program on the Contra payment channel.
+The indexer uses a `ProgramType` enum (`Escrow` | `Withdraw`) to determine which pipeline branch runs. This is why two parallel instances are deployed: one watching the Escrow program on Mainnet, and one watching the Withdraw program on the Solana Private Channels payment channel.

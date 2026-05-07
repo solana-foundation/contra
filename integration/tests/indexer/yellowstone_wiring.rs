@@ -14,11 +14,13 @@
 //!     `ProcessorMessage::Instruction(ProgramInstruction::Escrow(Deposit))`
 //!   - `call_count("subscribe") == 1` and `remaining_scripted == 0`
 
-use contra_indexer::config::ProgramType;
-use contra_indexer::indexer::datasource::common::datasource::DataSource;
-use contra_indexer::indexer::datasource::common::parser::escrow::CONTRA_ESCROW_PROGRAM_ID;
-use contra_indexer::indexer::datasource::common::types::{ProcessorMessage, ProgramInstruction};
-use contra_indexer::indexer::datasource::yellowstone::YellowstoneSource;
+use private_channel_indexer::config::ProgramType;
+use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
+use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_indexer::indexer::datasource::common::types::{
+    ProcessorMessage, ProgramInstruction,
+};
+use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource;
 use std::str::FromStr;
 use std::time::Duration;
 use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher};
@@ -39,7 +41,8 @@ use yellowstone_grpc_proto::solana::storage::confirmed_block::{
 /// The account list is padded with deterministic junk pubkeys so parsing the
 /// Deposit accounts (12 required) succeeds.
 fn deposit_tx_update(slot: u64) -> SubscribeUpdate {
-    let program_id = solana_sdk::pubkey::Pubkey::from_str(CONTRA_ESCROW_PROGRAM_ID).unwrap();
+    let program_id =
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
 
     // 12 account keys + program id at index 12 (the instruction references
     // indices 0..12 and program_id_index = 12).
@@ -90,7 +93,7 @@ fn deposit_tx_update(slot: u64) -> SubscribeUpdate {
     };
 
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(tx_info),
             slot,
@@ -117,7 +120,7 @@ fn block_meta(slot: u64) -> SubscribeUpdate {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn yellowstone_source_consumes_scripted_stream() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,contra_indexer=debug")
+        .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
         .try_init();
 
@@ -164,7 +167,7 @@ async fn yellowstone_source_consumes_scripted_stream() {
             ProcessorMessage::Instruction(meta) => {
                 if matches!(meta.instruction, ProgramInstruction::Escrow(ref b) if matches!(
                     **b,
-                    contra_indexer::indexer::datasource::common::parser::EscrowInstruction::Deposit { .. }
+                    private_channel_indexer::indexer::datasource::common::parser::EscrowInstruction::Deposit { .. }
                 )) {
                     deposits_seen += 1;
                     assert_eq!(meta.slot, 101);

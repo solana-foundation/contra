@@ -17,9 +17,9 @@ mod helpers;
 #[allow(dead_code)]
 mod setup;
 
-use contra_indexer::storage::{PostgresDb, Storage};
-use contra_indexer::PostgresConfig;
 use helpers::{db, send_and_confirm_instructions, test_types::*};
+use private_channel_indexer::storage::{PostgresDb, Storage};
+use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
@@ -54,7 +54,7 @@ async fn execute_deposit(
         &spl_token::ID,
     );
 
-    let deposit_ix = contra_escrow_program_client::instructions::DepositBuilder::new()
+    let deposit_ix = private_channel_escrow_program_client::instructions::DepositBuilder::new()
         .payer(user.pubkey())
         .user(user.pubkey())
         .instance(*instance)
@@ -66,7 +66,9 @@ async fn execute_deposit(
         .token_program(spl_token::ID)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .contra_escrow_program(contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(
+            private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        )
         .amount(amount)
         .instruction();
 
@@ -360,7 +362,7 @@ async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::er
     let pool = db::connect(&db_url).await?;
 
     let storage = Storage::Postgres(
-        PostgresDb::new(&contra_indexer::PostgresConfig {
+        PostgresDb::new(&private_channel_indexer::PostgresConfig {
             database_url: db_url.clone(),
             max_connections: 50,
         })

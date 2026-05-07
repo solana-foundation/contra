@@ -22,9 +22,9 @@ use {
 pub use solana_epoch_info::EpochInfo;
 pub use solana_epoch_schedule::EpochSchedule;
 
-/// The main RPC API trait for Contra
+/// The main RPC API trait for PrivateChannel
 #[rpc(server)]
-pub trait ContraRpc {
+pub trait PrivateChannelRpc {
     /// Send a transaction to the network
     #[method(name = "sendTransaction")]
     async fn send_transaction(

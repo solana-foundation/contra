@@ -1,5 +1,5 @@
 [package]
-name = "contra-core"
+name = "private-channel-core"
 version = "0.1.0"
 edition = "2021"
 
@@ -15,8 +15,8 @@ base64 = { workspace = true }
 bincode = { workspace = true }
 bs58 = { workspace = true }
 clap = { workspace = true }
-contra-metrics = { path = "../metrics" }
-contra-withdraw-program-client = { path = "../contra-withdraw-program/clients/rust" }
+private-channel-metrics = { path = "../metrics" }
+private-channel-withdraw-program-client = { path = "../private-channel-withdraw-program/clients/rust" }
 enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }

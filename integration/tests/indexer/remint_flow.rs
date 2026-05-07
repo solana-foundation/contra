@@ -34,7 +34,7 @@
 mod sender_fixtures;
 
 use {
-    contra_indexer::{
+    private_channel_indexer::{
         config::ProgramType,
         operator::{
             sender::{

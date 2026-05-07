@@ -1,4 +1,4 @@
-//! Withdraw setup phase — Solana escrow bootstrap + Contra mint preparation.
+//! Withdraw setup phase — Solana escrow bootstrap + PrivateChannel mint preparation.
 //!
 //! Creates all on-chain state needed for the full e2e withdraw load test
 //! **without** running operator-solana or waiting for deposits to land.
@@ -7,16 +7,16 @@
 //!   1. Load admin keypair and instance-seed keypair.
 //!   2. CreateInstance — initialises the escrow instance PDA.
 //!   3. AddOperator   — registers admin as the ReleaseFunds operator.
-//!   4. Create Solana SPL mint (admin = mint authority, same keypair reused on Contra).
+//!   4. Create Solana SPL mint (admin = mint authority, same keypair reused on PrivateChannel).
 //!   5. AllowMint     — registers the mint; creates allowed_mint PDA and
 //!      instance ATA on Solana.
 //!   6. Seed the instance ATA with `num_accounts × initial_balance` tokens so
 //!      ReleaseFunds has enough tokens to release for every withdrawal.
 //!
-//! Contra (write-node):
-//!   7. Initialize the same mint on Contra (same pubkey, implicit account creation).
-//!   8. Create Contra ATAs for each withdrawer account.
-//!   9. Mint `initial_balance` tokens to each Contra ATA.
+//! PrivateChannel (write-node):
+//!   7. Initialize the same mint on PrivateChannel (same pubkey, implicit account creation).
+//!   8. Create PrivateChannel ATAs for each withdrawer account.
+//!   9. Mint `initial_balance` tokens to each PrivateChannel ATA.
 //!
 //! This bypasses operator-solana entirely — setup completes in seconds rather
 //! than waiting for the full deposit → mint pipeline.
@@ -28,15 +28,15 @@ use {
         types::{BenchState, WithdrawConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
-    contra_core::client::{
+    private_channel_core::client::{
         create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction,
     },
-    contra_escrow_program_client::{
+    private_channel_escrow_program_client::{
         instructions::{
             AddOperator, AddOperatorInstructionArgs, AllowMint, AllowMintInstructionArgs,
             CreateInstance, CreateInstanceInstructionArgs,
         },
-        CONTRA_ESCROW_PROGRAM_ID,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
     rayon::prelude::*,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
@@ -69,18 +69,18 @@ fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
             instance_pda.as_ref(),
             mint.as_ref(),
         ],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
 fn find_event_authority() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &CONTRA_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
 }
 
 fn find_operator_pda(instance_pda: &Pubkey, operator: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[OPERATOR_SEED, instance_pda.as_ref(), operator.as_ref()],
-        &CONTRA_ESCROW_PROGRAM_ID,
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
 
@@ -88,19 +88,19 @@ fn find_operator_pda(instance_pda: &Pubkey, operator: &Pubkey) -> (Pubkey, u8) {
 /// the withdraw load phase.
 ///
 /// `solana_rpc_url`     — Solana validator RPC endpoint
-/// `contra_rpc_url`     — Contra write-node / gateway RPC endpoint
+/// `private_channel_rpc_url`     — PrivateChannel write-node / gateway RPC endpoint
 /// `admin_path`         — path to the admin keypair JSON file
 /// `instance_seed_path` — optional path to save/load the instance-seed keypair;
 ///                        reuse the same file as the deposit bench so that
-///                        operator-contra (pre-configured with the matching PDA)
+///                        operator-private_channel (pre-configured with the matching PDA)
 ///                        can observe the resulting ReleaseFunds calls.
-/// `num_accounts`       — number of Contra withdrawer accounts to create
-/// `initial_balance`    — raw token units minted to each Contra withdrawer ATA;
+/// `num_accounts`       — number of PrivateChannel withdrawer accounts to create
+/// `initial_balance`    — raw token units minted to each PrivateChannel withdrawer ATA;
 ///                        also determines the total seed amount for the Solana
 ///                        instance ATA (`num_accounts × initial_balance`).
 pub async fn run_setup_withdraw_phase(
     solana_rpc_url: &str,
-    contra_rpc_url: &str,
+    private_channel_rpc_url: &str,
     admin_path: &Path,
     instance_seed_path: Option<&Path>,
     num_accounts: usize,
@@ -110,7 +110,7 @@ pub async fn run_setup_withdraw_phase(
     // Task 1: Load admin keypair
     // ------------------------------------------------------------------
     let admin_keypair = Arc::new(
-        contra_core::client::load_keypair(admin_path)
+        private_channel_core::client::load_keypair(admin_path)
             .map_err(|e| anyhow::anyhow!("failed to load admin keypair: {e}"))?,
     );
     info!(pubkey = %admin_keypair.pubkey(), "Loaded admin keypair (withdraw setup)");
@@ -122,7 +122,7 @@ pub async fn run_setup_withdraw_phase(
     // COMMON_ESCROW_INSTANCE_ID in docker-compose matches what we create here.
     // ------------------------------------------------------------------
     let instance_seed_keypair: Keypair = match instance_seed_path {
-        Some(path) if path.exists() => contra_core::client::load_keypair(path)
+        Some(path) if path.exists() => private_channel_core::client::load_keypair(path)
             .map_err(|e| anyhow::anyhow!("failed to load instance-seed keypair: {e}"))?,
         Some(path) => {
             let kp = Keypair::new();
@@ -212,7 +212,7 @@ pub async fn run_setup_withdraw_phase(
                         instance: instance_pda,
                         system_program: program::id(),
                         event_authority,
-                        contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
+                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(CreateInstanceInstructionArgs {
                         bump: instance_bump,
@@ -250,7 +250,7 @@ pub async fn run_setup_withdraw_phase(
     // ------------------------------------------------------------------
     // Task 4: AddOperator on Solana
     //
-    // Register admin as the ReleaseFunds operator so operator-contra
+    // Register admin as the ReleaseFunds operator so operator-private_channel
     // (which signs with the admin key) can call ReleaseFunds on this instance.
     // ------------------------------------------------------------------
     let t4 = Instant::now();
@@ -272,7 +272,7 @@ pub async fn run_setup_withdraw_phase(
                         operator_pda,
                         system_program: program::id(),
                         event_authority,
-                        contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
+                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(AddOperatorInstructionArgs {
                         bump: operator_bump,
@@ -307,7 +307,7 @@ pub async fn run_setup_withdraw_phase(
     // ------------------------------------------------------------------
     // Task 5: Create Solana SPL mint
     //
-    // A single mint keypair is generated here and reused for Contra (Task 7)
+    // A single mint keypair is generated here and reused for PrivateChannel (Task 7)
     // so both chains share the same mint pubkey — required for ReleaseFunds
     // to use the correct Solana token_program when deriving ATAs.
     // ------------------------------------------------------------------
@@ -402,7 +402,7 @@ pub async fn run_setup_withdraw_phase(
                         token_program: spl_token::id(),
                         associated_token_program: spl_associated_token_account::id(),
                         event_authority,
-                        contra_escrow_program: CONTRA_ESCROW_PROGRAM_ID,
+                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(AllowMintInstructionArgs { bump: allow_bump });
                     let tx = Transaction::new_signed_with_payer(
@@ -503,7 +503,7 @@ pub async fn run_setup_withdraw_phase(
     // ------------------------------------------------------------------
     // Task 8: Generate N withdrawer keypairs
     //
-    // Generated here (before Contra phase) so that Solana ATAs can be created
+    // Generated here (before PrivateChannel phase) so that Solana ATAs can be created
     // for the same pubkeys that will be used as ReleaseFunds recipients.
     // ------------------------------------------------------------------
     let keypairs: Vec<Arc<Keypair>> = (0..num_accounts)
@@ -593,30 +593,30 @@ pub async fn run_setup_withdraw_phase(
     }
 
     // ====================================================================
-    // Contra phase — write-node
+    // PrivateChannel phase — write-node
     // ====================================================================
 
-    let t_contra = Instant::now();
-    info!("Starting Contra setup phase");
+    let t_private_channel = Instant::now();
+    info!("Starting PrivateChannel setup phase");
 
-    let contra_rpc = RpcClient::new(contra_rpc_url.to_owned());
+    let private_channel_rpc = RpcClient::new(private_channel_rpc_url.to_owned());
 
     // ------------------------------------------------------------------
-    // Task 9: Initialize same mint on Contra
+    // Task 9: Initialize same mint on PrivateChannel
     //
-    // The Contra write-node creates accounts implicitly (gasless), so only
+    // The PrivateChannel write-node creates accounts implicitly (gasless), so only
     // `initialize_mint` is needed — no `create_account` like on Solana.
     // Using the same mint pubkey ensures ReleaseFunds on Solana looks up the
     // correct token_program (spl_token) via the existing Solana mint account.
     // ------------------------------------------------------------------
     let t9 = Instant::now();
-    let contra_mint_sig = 'send: {
+    let private_channel_mint_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
-            match contra_rpc.get_latest_blockhash().await {
+            match private_channel_rpc.get_latest_blockhash().await {
                 Err(e) => {
                     warn!(attempt, err = %e,
-                        "get_latest_blockhash failed (contra mint init), retrying in {delay_secs}s");
+                        "get_latest_blockhash failed (private_channel mint init), retrying in {delay_secs}s");
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
@@ -626,10 +626,10 @@ pub async fn run_setup_withdraw_phase(
                         MINT_DECIMALS,
                         blockhash,
                     );
-                    match contra_rpc.send_transaction(&init_tx).await {
+                    match private_channel_rpc.send_transaction(&init_tx).await {
                         Ok(sig) => break 'send sig,
                         Err(e) => {
-                            warn!(attempt, err = %e, "contra mint init send failed, retrying");
+                            warn!(attempt, err = %e, "private_channel mint init send failed, retrying");
                             last_err = e.to_string();
                         }
                     }
@@ -638,26 +638,26 @@ pub async fn run_setup_withdraw_phase(
             tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
         return Err(anyhow::anyhow!(
-            "contra mint init: all retries exhausted: {last_err}"
+            "private_channel mint init: all retries exhausted: {last_err}"
         ));
     };
     let retry = poll_confirmations(
-        &contra_rpc,
-        &[Some(contra_mint_sig)],
-        "contra_mint_init",
+        &private_channel_rpc,
+        &[Some(private_channel_mint_sig)],
+        "private_channel_mint_init",
         0,
         1,
     )
     .await?;
     if !retry.is_empty() {
         return Err(anyhow::anyhow!(
-            "contra_mint_init failed to confirm on-chain"
+            "private_channel_mint_init failed to confirm on-chain"
         ));
     }
-    info!(%mint, elapsed_ms = t9.elapsed().as_millis(), "Mint initialized on Contra");
+    info!(%mint, elapsed_ms = t9.elapsed().as_millis(), "Mint initialized on PrivateChannel");
 
     // ------------------------------------------------------------------
-    // Tasks 10 + 11: Create Contra ATAs and mint tokens in batches
+    // Tasks 10 + 11: Create PrivateChannel ATAs and mint tokens in batches
     // ------------------------------------------------------------------
     let total = keypairs.len();
 
@@ -670,18 +670,18 @@ pub async fn run_setup_withdraw_phase(
             let mut next_round: Vec<Arc<Keypair>> = Vec::new();
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = contra_rpc
+                let blockhash = private_channel_rpc
                     .get_latest_blockhash()
                     .await
-                    .context("get_latest_blockhash (contra create-ata)")?;
+                    .context("get_latest_blockhash (private_channel create-ata)")?;
                 info!(
                     batch = batch_num,
                     size = batch.len(),
                     total,
-                    "Sending Contra ATA batch"
+                    "Sending PrivateChannel ATA batch"
                 );
                 let sigs = send_parallel(
-                    contra_rpc_url,
+                    private_channel_rpc_url,
                     batch,
                     blockhash,
                     "create-ata(withdraw)",
@@ -698,7 +698,7 @@ pub async fn run_setup_withdraw_phase(
                 )
                 .await;
                 let retry_indices = poll_confirmations(
-                    &contra_rpc,
+                    &private_channel_rpc,
                     &sigs,
                     "create-ata(withdraw)",
                     confirmed_so_far,
@@ -714,12 +714,12 @@ pub async fn run_setup_withdraw_phase(
             if !to_send.is_empty() {
                 warn!(
                     count = to_send.len(),
-                    "Retrying failed Contra ATA transactions"
+                    "Retrying failed PrivateChannel ATA transactions"
                 );
             }
         }
     }
-    info!(total, "All Contra withdrawer ATAs confirmed");
+    info!(total, "All PrivateChannel withdrawer ATAs confirmed");
 
     // Mint-to
     {
@@ -730,18 +730,18 @@ pub async fn run_setup_withdraw_phase(
             let mut next_round: Vec<Arc<Keypair>> = Vec::new();
             for batch in to_send.chunks(SETUP_BATCH_SIZE) {
                 batch_num += 1;
-                let blockhash = contra_rpc
+                let blockhash = private_channel_rpc
                     .get_latest_blockhash()
                     .await
-                    .context("get_latest_blockhash (contra mint-to)")?;
+                    .context("get_latest_blockhash (private_channel mint-to)")?;
                 info!(
                     batch = batch_num,
                     size = batch.len(),
                     total,
-                    "Sending Contra mint-to batch"
+                    "Sending PrivateChannel mint-to batch"
                 );
                 let sigs = send_parallel(
-                    contra_rpc_url,
+                    private_channel_rpc_url,
                     batch,
                     blockhash,
                     "mint-to(withdraw)",
@@ -764,7 +764,7 @@ pub async fn run_setup_withdraw_phase(
                 )
                 .await;
                 let retry_indices = poll_confirmations(
-                    &contra_rpc,
+                    &private_channel_rpc,
                     &sigs,
                     "mint-to(withdraw)",
                     confirmed_so_far,
@@ -780,27 +780,27 @@ pub async fn run_setup_withdraw_phase(
             if !to_send.is_empty() {
                 warn!(
                     count = to_send.len(),
-                    "Retrying failed Contra mint-to transactions"
+                    "Retrying failed PrivateChannel mint-to transactions"
                 );
             }
         }
     }
-    info!(total, "All Contra mint-to confirmed");
+    info!(total, "All PrivateChannel mint-to confirmed");
 
     // ------------------------------------------------------------------
-    // Task 12: Seed BenchState with current Contra blockhash
+    // Task 12: Seed BenchState with current PrivateChannel blockhash
     // ------------------------------------------------------------------
-    let initial_blockhash = contra_rpc
+    let initial_blockhash = private_channel_rpc
         .get_latest_blockhash()
         .await
-        .context("get_latest_blockhash (contra seed)")?;
+        .context("get_latest_blockhash (private_channel seed)")?;
     let state = Arc::new(BenchState {
         current_blockhash: RwLock::new(initial_blockhash),
     });
     info!(
         blockhash = %initial_blockhash,
-        contra_elapsed_ms = t_contra.elapsed().as_millis(),
-        "Contra blockhash seeded — withdraw setup complete",
+        private_channel_elapsed_ms = t_private_channel.elapsed().as_millis(),
+        "PrivateChannel blockhash seeded — withdraw setup complete",
     );
 
     Ok(WithdrawConfig {

@@ -11,22 +11,22 @@ mod setup;
 #[path = "parser_malformation.rs"]
 mod parser_malformation;
 
-use contra_indexer::operator::tree_constants::MAX_TREE_LEAVES;
-use contra_indexer::storage::{PostgresDb, Storage};
-use contra_indexer::PostgresConfig;
 use helpers::{
     calculate_user_total_deposited, db, execute_user_deposits, execute_user_withdrawal,
     get_token_balance, operator_util, test_types::*, verify_database,
 };
+use private_channel_indexer::operator::tree_constants::MAX_TREE_LEAVES;
+use private_channel_indexer::storage::{PostgresDb, Storage};
+use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::SeedDerivable;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signer};
 use std::sync::{Arc, Once};
-use test_utils::indexer_helper::{start_contra_indexer, start_solana_indexer};
+use test_utils::indexer_helper::{start_private_channel_indexer, start_solana_indexer};
 use test_utils::operator_helper::{
-    start_contra_to_solana_operator, start_solana_to_contra_operator,
+    start_private_channel_to_solana_operator, start_solana_to_private_channel_operator,
 };
 use test_utils::validator_helper::start_test_validator;
 use testcontainers::runners::AsyncRunner;
@@ -129,7 +129,7 @@ async fn setup_test_environments(
                 &spl_token::ID,
             );
 
-        let deposit_ix = contra_escrow_program_client::instructions::DepositBuilder::new()
+        let deposit_ix = private_channel_escrow_program_client::instructions::DepositBuilder::new()
             .payer(user.pubkey())
             .user(user.pubkey())
             .instance(env.instance)
@@ -141,7 +141,9 @@ async fn setup_test_environments(
             .token_program(spl_token::ID)
             .associated_token_program(spl_associated_token_account::ID)
             .event_authority(event_authority_pda)
-            .contra_escrow_program(contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID)
+            .private_channel_escrow_program(
+                private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            )
             .amount(amount)
             .instruction();
 
@@ -546,7 +548,7 @@ async fn verify_withdrawal_processing(
         expected_withdrawals
     );
 
-    println!("\nWaiting for operator-contra to process withdrawals...");
+    println!("\nWaiting for operator-private_channel to process withdrawals...");
     let total_expected_completed = deposit_transactions.len() + expected_withdrawals;
     operator_util::wait_for_operator_completion(pool, total_expected_completed, "withdrawals")
         .await?;
@@ -722,7 +724,7 @@ async fn execute_tree_rotation_boundary_phase(
     // Verify on-chain tree_index incremented
     println!("\nVerifying tree rotation occurred...");
     let instance_data = client.get_account_data(&env.instance).await?;
-    let instance = contra_escrow_program_client::Instance::from_bytes(&instance_data)?;
+    let instance = private_channel_escrow_program_client::Instance::from_bytes(&instance_data)?;
 
     assert_eq!(
         instance.current_tree_index, 1,
@@ -782,7 +784,7 @@ async fn execute_post_rotation_verification_phase(
 
     // Final verification that tree_index is still 1
     let instance_data = client.get_account_data(&env.instance).await?;
-    let instance = contra_escrow_program_client::Instance::from_bytes(&instance_data)?;
+    let instance = private_channel_escrow_program_client::Instance::from_bytes(&instance_data)?;
     assert_eq!(
         instance.current_tree_index, 1,
         "Tree index should remain at 1 after post-rotation withdrawals"
@@ -867,17 +869,18 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     println!("{}{}", CYAN, "=".repeat(40));
     println!("{}PHASE 1: Start Indexers and Operators{}", BOLD, ORANGE);
     println!("{}{}", CYAN, "=".repeat(40));
-    // Start Contra indexer (Yellowstone) in background
-    println!("\n=== Starting Contra Indexer (Yellowstone) ===");
-    let (_contra_indexer_handle, _contra_indexer_storage) = start_contra_indexer(
-        Some(geyser_endpoint.clone()),
-        test_validator.rpc_url(),
-        indexer_db_url.clone(),
-    )
-    .await
-    .expect("Failed to start Contra indexer");
+    // Start PrivateChannel indexer (Yellowstone) in background
+    println!("\n=== Starting PrivateChannel Indexer (Yellowstone) ===");
+    let (_private_channel_indexer_handle, _private_channel_indexer_storage) =
+        start_private_channel_indexer(
+            Some(geyser_endpoint.clone()),
+            test_validator.rpc_url(),
+            indexer_db_url.clone(),
+        )
+        .await
+        .expect("Failed to start PrivateChannel indexer");
 
-    println!("Contra Indexer started successfully");
+    println!("PrivateChannel Indexer started successfully");
 
     // Start Solana indexer (Yellowstone geyser) in background
     println!("\n=== Starting Solana Indexer (Yellowstone Geyser) ===");
@@ -893,31 +896,31 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
 
     println!("Solana Indexer started successfully");
 
-    // Start Solana -> Contra operator
+    // Start Solana -> PrivateChannel operator
     let operator_key = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).unwrap();
-    println!("\n=== Starting Solana -> Contra Operator ===");
+    println!("\n=== Starting Solana -> PrivateChannel Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let _solana_to_contra_operator_handle = start_solana_to_contra_operator(
+    let _solana_to_private_channel_operator_handle = start_solana_to_private_channel_operator(
         test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,
     )
     .await
-    .expect("Failed to start Solana -> Contra operator");
-    println!("Solana -> Contra Operator started successfully");
+    .expect("Failed to start Solana -> PrivateChannel operator");
+    println!("Solana -> PrivateChannel Operator started successfully");
 
-    println!("\n=== Starting Contra -> Solana Operator ===");
+    println!("\n=== Starting PrivateChannel -> Solana Operator ===");
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
-    let _contra_to_solana_operator_handle = start_contra_to_solana_operator(
+    let _private_channel_to_solana_operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,
     )
     .await
-    .expect("Failed to start Contra -> Solana operator");
-    println!("Contra -> Solana Operator started successfully");
+    .expect("Failed to start PrivateChannel -> Solana operator");
+    println!("PrivateChannel -> Solana Operator started successfully");
 
     println!("\n{}{}", GREEN, "=".repeat(40));
     println!("{}PHASE 2: Verify Backfill{}", BOLD, RESET);
@@ -1010,7 +1013,7 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
 // ─────────────────────────────────────────────────────────────────────────────
 // Config-validation tests
 //
-// These two tests exercise `ContraIndexerConfig::validate()` and the
+// These two tests exercise `PrivateChannelIndexerConfig::validate()` and the
 // startup-reconciliation skip branch logic. They are intentionally placed
 // in the `indexer_integration` binary so they share its build artefacts
 // with the main chaos test — but they require *no* fixtures (no Postgres,
@@ -1021,17 +1024,17 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
 
 /// Config validation rejects Escrow mode without an `escrow_instance_id`.
 ///
-/// Targets `contra_indexer::config::ContraIndexerConfig::validate()`. The error
+/// Targets `private_channel_indexer::config::PrivateChannelIndexerConfig::validate()`. The error
 /// message contract is part of the CLI's public surface (operators rely on it
 /// to diagnose startup failures), so we assert the exact substring.
 #[test]
 fn test_indexer_missing_escrow_instance_id_fails() {
-    let bad = contra_indexer::ContraIndexerConfig {
-        program_type: contra_indexer::ProgramType::Escrow,
-        storage_type: contra_indexer::StorageType::Postgres,
+    let bad = private_channel_indexer::PrivateChannelIndexerConfig {
+        program_type: private_channel_indexer::ProgramType::Escrow,
+        storage_type: private_channel_indexer::StorageType::Postgres,
         rpc_url: "http://localhost:0".to_string(),
         source_rpc_url: None,
-        postgres: contra_indexer::PostgresConfig {
+        postgres: private_channel_indexer::PostgresConfig {
             database_url: "postgresql://unused".to_string(),
             max_connections: 1,
         },
@@ -1050,18 +1053,18 @@ fn test_indexer_missing_escrow_instance_id_fails() {
 
 /// Complement of the Escrow-validation test above: Withdraw mode must
 /// reject an *unexpected* `escrow_instance_id` for symmetry. Exercises
-/// the matching arm of `ContraIndexerConfig::validate()` that the config
+/// the matching arm of `PrivateChannelIndexerConfig::validate()` that the config
 /// unit tests also lock in.
 #[test]
 fn test_indexer_withdraw_with_instance_id_fails() {
     use std::str::FromStr;
 
-    let bad = contra_indexer::ContraIndexerConfig {
-        program_type: contra_indexer::ProgramType::Withdraw,
-        storage_type: contra_indexer::StorageType::Postgres,
+    let bad = private_channel_indexer::PrivateChannelIndexerConfig {
+        program_type: private_channel_indexer::ProgramType::Withdraw,
+        storage_type: private_channel_indexer::StorageType::Postgres,
         rpc_url: "http://localhost:0".to_string(),
         source_rpc_url: None,
-        postgres: contra_indexer::PostgresConfig {
+        postgres: private_channel_indexer::PostgresConfig {
             database_url: "postgresql://unused".to_string(),
             max_connections: 1,
         },
@@ -1090,14 +1093,14 @@ fn test_indexer_withdraw_with_instance_id_fails() {
 
 #[test]
 fn test_backfill_validate_gap_no_gap() {
-    use contra_indexer::indexer::backfill::validate_gap;
+    use private_channel_indexer::indexer::backfill::validate_gap;
     assert!(matches!(validate_gap(100, 100, 50), Ok(None)));
     assert!(matches!(validate_gap(99, 100, 50), Ok(None)));
 }
 
 #[test]
 fn test_backfill_validate_gap_within_threshold() {
-    use contra_indexer::indexer::backfill::validate_gap;
+    use private_channel_indexer::indexer::backfill::validate_gap;
     let r = validate_gap(150, 100, 50).expect("gap within threshold must be Ok");
     assert_eq!(r, Some(50));
 
@@ -1107,8 +1110,8 @@ fn test_backfill_validate_gap_within_threshold() {
 
 #[test]
 fn test_backfill_validate_gap_rejects_too_large() {
-    use contra_indexer::error::BackfillError;
-    use contra_indexer::indexer::backfill::validate_gap;
+    use private_channel_indexer::error::BackfillError;
+    use private_channel_indexer::indexer::backfill::validate_gap;
     let err = validate_gap(200, 100, 50).expect_err("gap > max must be rejected");
     match err {
         BackfillError::GapTooLarge { gap, max_gap } => {

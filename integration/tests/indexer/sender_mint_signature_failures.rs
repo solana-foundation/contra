@@ -19,7 +19,7 @@
 //!     short-circuits `Ok(None)` without any RPC traffic.
 
 use {
-    contra_indexer::operator::{
+    private_channel_indexer::operator::{
         sender::find_existing_mint_signature_with_memo,
         utils::{
             instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},

@@ -17,7 +17,7 @@
 
 use {
     chrono::Utc,
-    contra_indexer::{
+    private_channel_indexer::{
         config::ProgramType,
         operator::{sender::TransactionStatusUpdate, DbTransactionWriter},
         storage::{common::models::TransactionStatus, common::storage::mock::MockStorage, Storage},

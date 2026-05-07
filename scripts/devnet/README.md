@@ -33,7 +33,7 @@ cargo run --bin allow_mint -- \
   <MINT_ADDRESS>
 ```
 
-## 4. Deposit (Solana → Contra)
+## 4. Deposit (Solana → Solana Private Channels)
 ```bash
 cargo run --bin deposit -- \
   https://api.devnet.solana.com \
@@ -43,7 +43,7 @@ cargo run --bin deposit -- \
   <AMOUNT>
 ```
 
-## 5. Withdraw (Contra → Solana)
+## 5. Withdraw (Solana Private Channels → Solana)
 ```bash
 cargo run --bin withdraw -- \
   http://localhost:8898 \
@@ -55,8 +55,8 @@ cargo run --bin withdraw -- \
 ## Monitor
 ```bash
 # Watch deposit processing
-docker logs -f contra-operator-solana
+docker logs -f private-channel-operator-solana
 
 # Watch withdrawal processing
-docker logs -f contra-operator-contra
+docker logs -f private-channel-operator-private-channel
 ```

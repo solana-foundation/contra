@@ -16,7 +16,7 @@
 //!   - full operator bootstrap + end-to-end status-flip assertions
 
 use {
-    contra_indexer::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry},
+    private_channel_indexer::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry},
     serde_json::json,
     solana_sdk::{commitment_config::CommitmentConfig, signature::Signature},
     std::{str::FromStr, time::Duration},

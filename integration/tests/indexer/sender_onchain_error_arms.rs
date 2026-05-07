@@ -23,8 +23,8 @@
 mod sender_fixtures;
 
 use {
-    contra_escrow_program_client::errors::ContraEscrowProgramError,
-    contra_indexer::{
+    private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError,
+    private_channel_indexer::{
         error::{ProgramError, TransactionError},
         operator::{
             sender::{test_hooks, types::TransactionStatusUpdate},
@@ -77,7 +77,7 @@ async fn drive_and_recv(
 #[tokio::test]
 async fn invalid_transaction_nonce_routes_to_fatal_arm() {
     let result = Ok(ConfirmationResult::Failed(Some(
-        ContraEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
+        PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
     )));
     let update = drive_and_recv(result, RetryPolicy::Idempotent, 401).await;
     assert_eq!(update.transaction_id, 401);
@@ -101,7 +101,7 @@ async fn invalid_transaction_nonce_routes_to_fatal_arm() {
 #[tokio::test]
 async fn unmapped_program_error_routes_to_generic_failed_arm() {
     let result = Ok(ConfirmationResult::Failed(Some(
-        ContraEscrowProgramError::InvalidMint,
+        PrivateChannelEscrowProgramError::InvalidMint,
     )));
     let update = drive_and_recv(result, RetryPolicy::Idempotent, 402).await;
     assert_eq!(update.status, TransactionStatus::Failed);

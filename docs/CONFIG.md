@@ -1,6 +1,6 @@
 # Configuration & Operations
 
-Reference for configuring, tuning, and operating Contra services.
+Reference for configuring, tuning, and operating Solana Private Channels services.
 
 **Note:** When running via Docker Compose, all configuration is set through environment variables in `.env.devnet` (or your environment file). The CLI flags listed below are their equivalent for running binaries directly. You do not need to modify Dockerfiles or container commands — just update your env file and restart the service.
 
@@ -8,33 +8,33 @@ Reference for configuring, tuning, and operating Contra services.
 
 ## Configuration Reference
 
-### Write Node (`contra-node --mode write`)
+### Write Node (`private-channel-node --mode write`)
 
 **Source**: [`core/src/bin/node.rs`](../core/src/bin/node.rs)
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--mode` | `CONTRA_MODE` | `aio` | Node mode: `read`, `write`, or `aio` (all-in-one) |
-| `--port` | `CONTRA_PORT` | `8899` | RPC listen port |
-| `--sigverify-workers` | `CONTRA_SIGVERIFY_WORKERS` | `4` | Parallel signature verification threads |
-| `--sigverify-queue-size` | `CONTRA_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded queue between dedup and sigverify |
-| `--max-tx-per-batch` | `CONTRA_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
-| `--max-connections` | `CONTRA_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
-| `--blocktime-ms` | `CONTRA_BLOCKTIME_MS` | `100` | Settlement interval (ms) |
-| `--transaction-expiration-ms` | `CONTRA_TRANSACTION_EXPIRATION_MS` | `15000` | Transaction lifetime before dedup eviction |
-| `--admin-keys` | `CONTRA_ADMIN_KEYS` | — | Comma-separated base58 pubkeys for admin operations |
-| `--accountsdb-connection-url` | `CONTRA_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string |
-| `--log-level` | `CONTRA_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `--json-logs` | `CONTRA_JSON_LOGS` | `false` | Structured JSON log output |
-| `--perf-sample-period-secs` | `CONTRA_PERF_SAMPLE_PERIOD_SECS` | `60` | Performance metrics sampling interval |
-| `--metrics` | `CONTRA_METRICS` | `false` | Enable Prometheus stage metrics server |
-| — | `CONTRA_METRICS_PORT` | `9090` | Port for the stage metrics server |
+| `--mode` | `PRIVATE_CHANNEL_MODE` | `aio` | Node mode: `read`, `write`, or `aio` (all-in-one) |
+| `--port` | `PRIVATE_CHANNEL_PORT` | `8899` | RPC listen port |
+| `--sigverify-workers` | `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | `4` | Parallel signature verification threads |
+| `--sigverify-queue-size` | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded queue between dedup and sigverify |
+| `--max-tx-per-batch` | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
+| `--max-connections` | `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
+| `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Settlement interval (ms) |
+| `--transaction-expiration-ms` | `PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS` | `15000` | Transaction lifetime before dedup eviction |
+| `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 pubkeys for admin operations |
+| `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string |
+| `--log-level` | `PRIVATE_CHANNEL_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--json-logs` | `PRIVATE_CHANNEL_JSON_LOGS` | `false` | Structured JSON log output |
+| `--perf-sample-period-secs` | `PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS` | `60` | Performance metrics sampling interval |
+| `--metrics` | `PRIVATE_CHANNEL_METRICS` | `false` | Enable Prometheus stage metrics server |
+| — | `PRIVATE_CHANNEL_METRICS_PORT` | `9090` | Port for the stage metrics server |
 
 **Startup validation:** The node rejects `blocktime_ms == 0` and `transaction_expiration_ms < blocktime_ms` to prevent misconfiguration.
 
-### Read Node (`contra-node --mode read`)
+### Read Node (`private-channel-node --mode read`)
 
-Uses the same binary with `--mode read` (or `CONTRA_MODE=read`). Points to a PostgreSQL replica for read isolation.
+Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points to a PostgreSQL replica for read isolation.
 
 ### Gateway
 
@@ -56,7 +56,7 @@ Routes `sendTransaction` to the write node; all other RPC methods go to the read
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--port` | `PORT` (fallback: `STREAMER_PORT`) | `8902` | WebSocket listen port |
-| `--accountsdb-connection-url` | `STREAMER_ACCOUNTSDB_CONNECTION_URL` | — | Contra DB connection |
+| `--accountsdb-connection-url` | `STREAMER_ACCOUNTSDB_CONNECTION_URL` | — | Solana Private Channels DB connection |
 | `--poll-interval-ms` | `STREAMER_POLL_INTERVAL_MS` | `700` | DB polling interval (ms) |
 | `--cors-allowed-origin` | `STREAMER_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
 
@@ -68,7 +68,7 @@ Set the corresponding environment variable in your `.env.devnet` file (or equiva
 
 ```shell
 # Example: increase sigverify workers to 16
-CONTRA_SIGVERIFY_WORKERS=16
+PRIVATE_CHANNEL_SIGVERIFY_WORKERS=16
 
 # Restart the write node to pick up changes
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d write-node
@@ -100,14 +100,14 @@ On restart, the indexer compares its last checkpoint slot against the current on
 
 **Source**: [`core/src/bin/admin.rs`](../core/src/bin/admin.rs)
 
-The `contra-admin` binary provides database maintenance commands:
+The `private-channel-admin` binary provides database maintenance commands:
 
 ```shell
 # Truncate old blocks/transactions (requires recent backup)
-contra-admin truncate --keep-slots 100000
+private-channel-admin truncate --keep-slots 100000
 
 # Dry run to preview what would be deleted
-contra-admin truncate --keep-slots 100000 --dry-run
+private-channel-admin truncate --keep-slots 100000 --dry-run
 ```
 
 ### Makefile Targets

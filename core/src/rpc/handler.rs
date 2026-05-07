@@ -1,5 +1,5 @@
 use {
-    super::{api::ContraRpcServer, rpc_impl::ContraRpcImpl},
+    super::{api::PrivateChannelRpcServer, rpc_impl::PrivateChannelRpcImpl},
     crate::{
         health::HeartbeatRegistry,
         rpc::{
@@ -173,7 +173,7 @@ pub async fn create_rpc_module(
     read_deps: Option<ReadDeps>,
     write_deps: Option<WriteDeps>,
 ) -> RpcModule<()> {
-    let rpc_impl = ContraRpcImpl::new(read_deps, write_deps).await;
+    let rpc_impl = PrivateChannelRpcImpl::new(read_deps, write_deps).await;
     let mut module = RpcModule::new(());
 
     // Register all RPC methods

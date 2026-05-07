@@ -1,7 +1,7 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    contra_core::accounts::{
+    private_channel_core::accounts::{
         postgres::PostgresAccountsDB,
         truncate::{truncate_slots, TruncateOptions, TruncateReport},
     },
@@ -11,20 +11,20 @@ use {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "contra-admin",
-    about = "Manual administrative commands for Contra core databases"
+    name = "private-channel-admin",
+    about = "Manual administrative commands for PrivateChannel core databases"
 )]
 struct Args {
     /// Accounts database connection URL (PostgreSQL only)
-    #[arg(long, env = "CONTRA_ACCOUNTSDB_CONNECTION_URL")]
+    #[arg(long, env = "PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")]
     accountsdb_connection_url: String,
 
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info", env = "CONTRA_LOG_LEVEL")]
+    #[arg(long, default_value = "info", env = "PRIVATE_CHANNEL_LOG_LEVEL")]
     log_level: String,
 
     /// Enable JSON logging format
-    #[arg(long, env = "CONTRA_JSON_LOGS")]
+    #[arg(long, env = "PRIVATE_CHANNEL_JSON_LOGS")]
     json_logs: bool,
 
     #[command(subcommand)]

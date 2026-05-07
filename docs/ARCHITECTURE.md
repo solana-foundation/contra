@@ -1,6 +1,6 @@
-# Contra Architecture
+# Solana Private Channels Architecture
 
-Contra is a **payment channel** with direct access to Solana Mainnet liquidity. It enables instant finality, zero-fee transactions, and custom compliance rules with assets readily accessible to and from Solana Mainnet.
+Solana Private Channels is a **payment channel** with direct access to Solana Mainnet liquidity. It enables instant finality, zero-fee transactions, and custom compliance rules with assets readily accessible to and from Solana Mainnet.
 
 ### Key Features
 
@@ -10,18 +10,18 @@ Contra is a **payment channel** with direct access to Solana Mainnet liquidity. 
 - **Solana Compatible**: Runs standard Solana programs: SPL Token and Token Extensions
 - **Mainnet Access**: Cryptographically secure token deposits and withdrawals
 
-Contra achieves these features through escrow/withdraw programs and an indexer/operator that syncs deposits/withdrawals with Solana Mainnet.
+Solana Private Channels achieves these features through escrow/withdraw programs and an indexer/operator that syncs deposits/withdrawals with Solana Mainnet.
 
 ### Table of Contents
 
-- [Contra Core](#contra-core)
+- [Solana Private Channels Core](#private-channel-core)
 - [Escrow & Withdrawal Programs](#escrow--withdrawal-programs)
 - [Indexer & Operator](#indexer--operator)
 - [Database Layer](#database-layer)
 
 ## Core Components
 
-### Contra Core
+### Solana Private Channels Core
 
 The core payment channel processes transactions through a five-stage pipeline optimized for low latency and high throughput.
 
@@ -41,7 +41,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 **Program ID**: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83` (Solana Devnet)
 
-**Location**: [`contra-escrow-program/`](../contra-escrow-program/)
+**Location**: [`private-channel-escrow-program/`](../private-channel-escrow-program/)
 
 **Key Instructions**:
 - `CreateInstance`: Initialize a new escrow instance with admin
@@ -51,7 +51,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 - `ReleaseFunds`: Withdraw funds with SMT proof verification
 
 **Security**:
-- Isolation for each Contra instance (with unique admin, operators, mints, and Merkle tree roots)
+- Isolation for each Solana Private Channels instance (with unique admin, operators, mints, and Merkle tree roots)
 - Sparse Merkle Tree (SMT) proof verification to prevent double spending of withdrawals
 - Admin-only mint whitelisting
 - Operator-based withdrawal processing
@@ -62,7 +62,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 **Program ID**: `J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi`
 
-**Location**: `contra-withdraw-program/`
+**Location**: `private-channel-withdraw-program/`
 
 **Key Instructions**:
 - `WithdrawFunds`: Burn tokens from payment channel and unlock them from the escrow program
@@ -92,7 +92,7 @@ PostgreSQL 16+ with streaming replication
 
 **Databases**:
 
-1. **Contra DB** (`contra`): Payment channel account state and transaction history
+1. **Solana Private Channels DB** (`private_channel`): Payment channel account state and transaction history
    - Accounts table (pubkey, data, lamports, owner, slot)
    - Transactions table (signature, slot, status, block_time)
    - Blocks table (slot, blockhash, parent_slot, block_time)
@@ -115,10 +115,10 @@ flowchart TB
     Wallet([User Wallet])
     Escrow[Escrow Program<br/><i>Solana Mainnet</i>]
     IS[Indexer Solana]
-    IC[Indexer Contra]
+    IC[Indexer Solana Private Channels]
     PG_I[(Indexer DB)]
     OS[Operator Solana]
-    OC[Operator Contra]
+    OC[Operator Solana Private Channels]
     GW[Gateway :8899]
     WN[Write Node :8900]
     WP[Withdraw Program]
@@ -154,8 +154,8 @@ flowchart TB
 
 | Flow | Path |
 |------|------|
-| **Deposit** | User → Escrow Program (Mainnet) → Indexer Solana → Indexer DB → Operator Solana → Gateway → Write Node (mint on Contra) |
+| **Deposit** | User → Escrow Program (Mainnet) → Indexer Solana → Indexer DB → Operator Solana → Gateway → Write Node (mint on Solana Private Channels) |
 | **Transfer** | User → Gateway → Write Node → Postgres Primary |
-| **Withdrawal** | User → Gateway → Write Node → Withdraw Program (burn) → Indexer Contra → Indexer DB → Operator Contra → Escrow Program (release on Mainnet) |
+| **Withdrawal** | User → Gateway → Write Node → Withdraw Program (burn) → Indexer Solana Private Channels → Indexer DB → Operator Solana Private Channels → Escrow Program (release on Mainnet) |
 | **Reads** | User → Gateway → Read Node → Postgres Replica |
 | **Streaming** | Postgres Primary → Streamer → WebSocket → User |

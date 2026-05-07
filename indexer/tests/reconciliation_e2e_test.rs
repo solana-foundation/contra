@@ -8,8 +8,8 @@
 //!
 //! Uses testcontainers for isolated Postgres instances and mockito for webhook server.
 
-use contra_core::webhook::{WebhookClient, WebhookRetryConfig};
-use contra_indexer::{
+use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
+use private_channel_indexer::{
     config::OperatorConfig,
     operator::reconciliation::{compare_balances, send_webhook_alert, BalanceMismatch},
     storage::{PostgresDb, Storage},

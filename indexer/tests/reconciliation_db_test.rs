@@ -8,7 +8,7 @@
 //!
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 
-use contra_indexer::{
+use private_channel_indexer::{
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };

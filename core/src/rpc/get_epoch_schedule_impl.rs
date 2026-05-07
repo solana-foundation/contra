@@ -2,7 +2,7 @@ use jsonrpsee::core::RpcResult;
 use solana_epoch_schedule::EpochSchedule;
 
 pub async fn get_epoch_schedule_impl() -> RpcResult<EpochSchedule> {
-    // Contra has one massive epoch with u64::MAX slots and no warmup period
+    // PrivateChannel has one massive epoch with u64::MAX slots and no warmup period
     // There is exactly one leader, so no leader schedule slot offset is needed
     Ok(EpochSchedule {
         slots_per_epoch: u64::MAX,

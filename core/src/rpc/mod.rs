@@ -28,7 +28,7 @@ pub mod server;
 mod simulate_transaction_impl;
 
 pub use {
-    api::ContraRpcServer,
+    api::PrivateChannelRpcServer,
     handler::{create_rpc_module, handle_request},
     rpc_impl::{ReadDeps, WriteDeps},
 };
@@ -727,12 +727,12 @@ mod tests {
         assert_eq!(sigs[2].slot, 10);
     }
 
-    // ── rpc_impl ContraRpcImpl ────────────────────────────────────────────
+    // ── rpc_impl PrivateChannelRpcImpl ────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_rpc_impl_no_read_deps() {
-        use super::api::ContraRpcServer;
-        let rpc = rpc_impl::ContraRpcImpl::new(None, None).await;
+        use super::api::PrivateChannelRpcServer;
+        let rpc = rpc_impl::PrivateChannelRpcImpl::new(None, None).await;
         // All read operations should return "read not enabled"
         let result = rpc.get_slot(None).await;
         assert!(result.is_err());
@@ -742,8 +742,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_rpc_impl_no_write_deps() {
-        use super::api::ContraRpcServer;
-        let rpc = rpc_impl::ContraRpcImpl::new(None, None).await;
+        use super::api::PrivateChannelRpcServer;
+        let rpc = rpc_impl::PrivateChannelRpcImpl::new(None, None).await;
         let result = rpc.send_transaction("test".to_string(), None).await;
         assert!(result.is_err());
         let err = result.unwrap_err();

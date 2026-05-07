@@ -1,5 +1,5 @@
 [package]
-name = "contra-gateway"
+name = "private-channel-gateway"
 version.workspace = true
 edition.workspace = true
 
@@ -8,7 +8,7 @@ path = "src/lib.rs"
 
 [dependencies]
 clap = { workspace = true }
-contra-metrics = { path = "../metrics" }
+private-channel-metrics = { path = "../metrics" }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }

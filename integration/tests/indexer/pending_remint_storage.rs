@@ -24,7 +24,7 @@
 
 use {
     chrono::{Duration as ChronoDuration, Utc},
-    contra_indexer::{
+    private_channel_indexer::{
         storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
@@ -56,7 +56,7 @@ async fn start_pg(db_name: &str) -> (PostgresDb, String, testcontainers::Contain
 fn make_withdrawal(
     sig: &str,
     nonce: i64,
-) -> contra_indexer::storage::common::models::DbTransaction {
+) -> private_channel_indexer::storage::common::models::DbTransaction {
     let mint = Pubkey::new_unique().to_string();
     let recipient = Pubkey::new_unique().to_string();
     let mut tx = DbTransactionBuilder::new(sig.to_string(), 1, mint, 10_000u64)

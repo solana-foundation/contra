@@ -23,7 +23,7 @@ pub async fn get_supply_impl(
         })?
         .unwrap_or(0);
 
-    // Contra has no native token supply, so all values are 0
+    // PrivateChannel has no native token supply, so all values are 0
     Ok(Response {
         context: RpcResponseContext::new(slot),
         value: RpcSupply {

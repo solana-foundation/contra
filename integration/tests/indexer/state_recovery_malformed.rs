@@ -19,8 +19,8 @@
 
 use {
     chrono::{DateTime, Utc},
-    contra_indexer::{
-        config::{ContraIndexerConfig, PostgresConfig, ProgramType, StorageType},
+    private_channel_indexer::{
+        config::{PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator::sender::{test_hooks, TransactionStatusUpdate},
         storage::{
             common::{
@@ -66,8 +66,8 @@ fn make_row(
     }
 }
 
-fn make_config() -> ContraIndexerConfig {
-    ContraIndexerConfig {
+fn make_config() -> PrivateChannelIndexerConfig {
+    PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         rpc_url: "http://127.0.0.1:1".to_string(),

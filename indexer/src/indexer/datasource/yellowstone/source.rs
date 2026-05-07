@@ -1,9 +1,9 @@
 use super::convert::create_message;
 use crate::metrics;
 use async_trait::async_trait;
-use contra_metrics::MetricLabel;
 use futures::stream::StreamExt;
 use futures::SinkExt;
+use private_channel_metrics::MetricLabel;
 use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
@@ -48,7 +48,7 @@ pub struct YellowstoneSource {
     max_gap_slots: u64,
     #[cfg(feature = "datasource-rpc")]
     batch_size: usize,
-    health: Option<Arc<contra_metrics::HealthState>>,
+    health: Option<Arc<private_channel_metrics::HealthState>>,
 }
 
 impl YellowstoneSource {
@@ -75,7 +75,7 @@ impl YellowstoneSource {
         }
     }
 
-    pub fn with_health(mut self, health: Arc<contra_metrics::HealthState>) -> Self {
+    pub fn with_health(mut self, health: Arc<private_channel_metrics::HealthState>) -> Self {
         self.health = Some(health);
         self
     }
@@ -289,7 +289,7 @@ async fn connect_and_stream(
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     last_seen_slot: &AtomicU64,
-    health: Option<&Arc<contra_metrics::HealthState>>,
+    health: Option<&Arc<private_channel_metrics::HealthState>>,
 ) -> Result<(), DataSourceError> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())
         .map_err(|e| DataSourceRpcError::Protocol {
@@ -323,7 +323,7 @@ async fn connect_and_stream(
 
     let mut transaction_filters = HashMap::new();
     transaction_filters.insert(
-        "contra_program".to_string(),
+        "private_channel_program".to_string(),
         SubscribeRequestFilterTransactions {
             vote: Some(false),
             failed: Some(false),

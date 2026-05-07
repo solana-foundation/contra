@@ -5,14 +5,14 @@
 //!
 //! Strategy:
 //! - Spin up a real Postgres container (testcontainers).
-//! - Bootstrap the schema using `contra_auth::db::init_schema` — the same
+//! - Bootstrap the schema using `private_channel_auth::db::init_schema` — the same
 //!   function the auth service uses, so tests stay in sync with schema changes.
 //! - Insert test users and wallets directly via sqlx (no auth HTTP service needed).
 //! - Mint JWTs directly with `jsonwebtoken` using a known test secret.
 //! - Start the gateway with auth enforcement enabled, pointing at a mock backend.
 //!
 //! Run with:
-//!   cargo test --test auth_integration -p contra-gateway -- --test-threads=1
+//!   cargo test --test auth_integration -p private-channel-gateway -- --test-threads=1
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,8 +20,8 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::Utc;
-use contra_auth::db;
 use jsonwebtoken::{encode, EncodingKey, Header};
+use private_channel_auth::db;
 use reqwest::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use contra_gateway::{serve, Gateway};
+use private_channel_gateway::{serve, Gateway};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -75,8 +75,8 @@ async fn start_postgres() -> (PgPool, String, testcontainers::ContainerAsync<Pos
 async fn insert_user(pool: &PgPool, role: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO contra_auth.users (id, username, password_hash, role)
-         VALUES ($1, $2, 'irrelevant_hash', $3::contra_auth.user_role)",
+        "INSERT INTO private_channel_auth.users (id, username, password_hash, role)
+         VALUES ($1, $2, 'irrelevant_hash', $3::private_channel_auth.user_role)",
     )
     .bind(id)
     .bind(format!("testuser_{}", id))
@@ -90,7 +90,7 @@ async fn insert_user(pool: &PgPool, role: &str) -> Uuid {
 /// Register a pubkey as a verified wallet for the given user.
 async fn insert_wallet(pool: &PgPool, user_id: Uuid, pubkey: &str) {
     sqlx::query(
-        "INSERT INTO contra_auth.verified_wallets (id, user_id, pubkey)
+        "INSERT INTO private_channel_auth.verified_wallets (id, user_id, pubkey)
          VALUES ($1, $2, $3)",
     )
     .bind(Uuid::new_v4())
@@ -108,8 +108,8 @@ fn generate_token(user_id: Uuid, role: &str) -> String {
         "sub": user_id.to_string(),
         "role": role,
         "exp": (Utc::now().timestamp() + 3600) as usize,
-        "iss": "contra-auth",
-        "aud": "contra-gateway",
+        "iss": "private-channel-auth",
+        "aud": "private-channel-gateway",
     });
     encode(
         &Header::default(),
@@ -126,8 +126,8 @@ fn generate_expired_token(user_id: Uuid, role: &str) -> String {
         "sub": user_id.to_string(),
         "role": role,
         "exp": (Utc::now().timestamp() - 3600) as usize,
-        "iss": "contra-auth",
-        "aud": "contra-gateway",
+        "iss": "private-channel-auth",
+        "aud": "private-channel-gateway",
     });
     encode(
         &Header::default(),

@@ -1,28 +1,28 @@
-use contra_metrics::{counter_vec, histogram_vec};
+use private_channel_metrics::{counter_vec, histogram_vec};
 
 counter_vec!(
     GATEWAY_REQUESTS_TOTAL,
-    "contra_gateway_requests_total",
+    "private_channel_gateway_requests_total",
     "Total gateway requests by method, target, and status",
     &["method", "target", "status"]
 );
 
 histogram_vec!(
     GATEWAY_REQUEST_DURATION,
-    "contra_gateway_request_duration_seconds",
+    "private_channel_gateway_request_duration_seconds",
     "End-to-end gateway request latency",
     &["method", "target"]
 );
 
 counter_vec!(
     GATEWAY_ERRORS_TOTAL,
-    "contra_gateway_errors_total",
+    "private_channel_gateway_errors_total",
     "Pre-routing and backend errors by type",
     &["error_type"]
 );
 
 pub fn init() {
-    contra_metrics::init_metrics!(
+    private_channel_metrics::init_metrics!(
         GATEWAY_REQUESTS_TOTAL,
         GATEWAY_REQUEST_DURATION,
         GATEWAY_ERRORS_TOTAL,

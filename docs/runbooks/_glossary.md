@@ -17,7 +17,7 @@ DB type `transaction_status`.
 | `pending_remint` | no | no | **Withdrawal-only.** Failed but signatures were stashed; finality check queued. Recovery query (`get_pending_remint_transactions`) re-loads these on restart. Deposits never enter this state. |
 | `completed` | yes | no | Withdrawal release or deposit mint confirmed on-chain. |
 | `failed` | yes | yes | Terminal failure with no on-chain proof. **Primary alert for deposits** (sender-side failures terminate here since there is no remint path). Rare for withdrawals - those go through `pending_remint`. |
-| `failed_reminted` | yes | yes | **Withdrawal-only.** Original withdrawal failed, remint of burned Contra tokens succeeded. Deposits do not have a remint path. |
+| `failed_reminted` | yes | yes | **Withdrawal-only.** Original withdrawal failed, remint of burned private channel tokens succeeded. Deposits do not have a remint path. |
 | `manual_review` | yes | yes | Operator stopped acting on this row. Requires human triage. Withdrawals: six triggers (build error → halt, pre-flight bail → no halt, four sender-side ambiguities). Deposits: build error only (no halt, no sweep). |
 
 Webhook receivers should treat `failed`, `failed_reminted`, `manual_review` as
@@ -82,10 +82,10 @@ the deposit ones do not.
 ## Idempotency memo (deposit-side)
 
 Every deposit mint carries a deterministic memo:
-`contra:mint-idempotency:<transaction_id>`
+`private_channel:mint-idempotency:<transaction_id>`
 (`indexer/src/operator/constants.rs::MINT_IDEMPOTENCY_MEMO_PREFIX`).
 Before sending, the operator scans the recipient ATA's recent signatures
-on the Contra chain (`find_existing_mint_signature_with_memo`) and
+on the private channel chain (`find_existing_mint_signature_with_memo`) and
 short-circuits to `Completed` if a memo'd signature is already
 finalized.
 
@@ -103,7 +103,7 @@ checks finality of stashed signatures before reminting.
 - `_verify_onchain_release.md` - withdrawal-side verification: did a
   release land on Solana?
 - `_verify_onchain_mint.md` - deposit-side verification: did a mint
-  land on Contra?
+  land on the private channel?
 - `_escalation.md` - escalation tiers and contacts. Every "escalate"
   reference in the recovery runbooks links here.
 - `withdrawal_manual_review.md` - withdrawal manual review, dispatches

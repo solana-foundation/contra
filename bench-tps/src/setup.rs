@@ -12,7 +12,7 @@
 //!
 //! The setup phase must complete successfully before the load phase starts.
 //! All transactions use `send_transaction` + `poll_confirmations` rather than
-//! `send_and_confirm_transaction` because the contra node confirms
+//! `send_and_confirm_transaction` because the private_channel node confirms
 //! asynchronously through its pipeline, which outlasts the client-side
 //! blockhash-expiry timeout.
 
@@ -22,7 +22,7 @@ use {
         types::{BenchState, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
-    contra_core::client::{
+    private_channel_core::client::{
         create_admin_initialize_mint, create_admin_mint_to, create_ata_transaction,
     },
     rayon::prelude::*,
@@ -66,7 +66,7 @@ pub async fn run_setup_phase(
     // to pay transaction fees for all setup operations.
     // ------------------------------------------------------------------
     let admin_keypair = Arc::new(
-        contra_core::client::load_keypair(admin_path)
+        private_channel_core::client::load_keypair(admin_path)
             .map_err(|e| anyhow::anyhow!("failed to load admin keypair: {e}"))?,
     );
     info!(pubkey = %admin_keypair.pubkey(), path = %admin_path.display(), "Loaded admin keypair");

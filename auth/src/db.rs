@@ -10,19 +10,19 @@ use crate::{
 /// Create all tables, enums and indexes if they don't already exist.
 /// Safe to call on every startup.
 ///
-/// All objects live under the `contra_auth` schema to isolate them from the
+/// All objects live under the `private_channel_auth` schema to isolate them from the
 /// core application tables (accounts, transactions, etc.) in the same database.
 pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     // Create the dedicated schema first.
-    sqlx::query("CREATE SCHEMA IF NOT EXISTS contra_auth")
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS private_channel_auth")
         .execute(pool)
         .await?;
 
-    // Create the role enum scoped to the contra_auth schema.
+    // Create the role enum scoped to the private_channel_auth schema.
     sqlx::query(
         r#"
         DO $$ BEGIN
-            CREATE TYPE contra_auth.user_role AS ENUM ('operator', 'user');
+            CREATE TYPE private_channel_auth.user_role AS ENUM ('operator', 'user');
         EXCEPTION
             WHEN duplicate_object THEN null;
         END $$;
@@ -33,11 +33,11 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS contra_auth.users (
+        CREATE TABLE IF NOT EXISTS private_channel_auth.users (
             id UUID PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
-            role contra_auth.user_role NOT NULL DEFAULT 'user',
+            role private_channel_auth.user_role NOT NULL DEFAULT 'user',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         "#,
@@ -47,9 +47,9 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS contra_auth.challenges (
+        CREATE TABLE IF NOT EXISTS private_channel_auth.challenges (
             id UUID PRIMARY KEY,
-            user_id UUID NOT NULL REFERENCES contra_auth.users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES private_channel_auth.users(id) ON DELETE CASCADE,
             nonce UUID NOT NULL UNIQUE,
             expires_at TIMESTAMPTZ NOT NULL,
             used_at TIMESTAMPTZ
@@ -61,9 +61,9 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS contra_auth.verified_wallets (
+        CREATE TABLE IF NOT EXISTS private_channel_auth.verified_wallets (
             id UUID PRIMARY KEY,
-            user_id UUID NOT NULL REFERENCES contra_auth.users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES private_channel_auth.users(id) ON DELETE CASCADE,
             pubkey TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (user_id, pubkey)
@@ -74,13 +74,13 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query(
-        r#"CREATE INDEX IF NOT EXISTS idx_verified_wallets_user_id ON contra_auth.verified_wallets (user_id)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_verified_wallets_user_id ON private_channel_auth.verified_wallets (user_id)"#,
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"CREATE INDEX IF NOT EXISTS idx_challenges_user_id ON contra_auth.challenges (user_id)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_challenges_user_id ON private_channel_auth.challenges (user_id)"#,
     )
     .execute(pool)
     .await?;
@@ -90,7 +90,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 pub async fn find_user_by_username(pool: &PgPool, username: &str) -> AppResult<Option<User>> {
     let row: Option<(Uuid, String, String, String, DateTime<Utc>)> = sqlx::query_as(
-        r#"SELECT id, username, password_hash, role::text, created_at FROM contra_auth.users WHERE username = $1"#,
+        r#"SELECT id, username, password_hash, role::text, created_at FROM private_channel_auth.users WHERE username = $1"#,
     )
     .bind(username)
     .fetch_optional(pool)
@@ -113,7 +113,7 @@ pub async fn find_user_by_username(pool: &PgPool, username: &str) -> AppResult<O
 pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> AppResult<User> {
     let row: (Uuid, String, String, String, DateTime<Utc>) = sqlx::query_as(
         r#"
-        INSERT INTO contra_auth.users (id, username, password_hash, role)
+        INSERT INTO private_channel_auth.users (id, username, password_hash, role)
         VALUES ($1, $2, $3, 'user')
         RETURNING id, username, password_hash, role::text, created_at
         "#,
@@ -139,7 +139,7 @@ pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppR
 
     let row: (Uuid, DateTime<Utc>) = sqlx::query_as(
         r#"
-        INSERT INTO contra_auth.challenges (id, user_id, nonce, expires_at)
+        INSERT INTO private_channel_auth.challenges (id, user_id, nonce, expires_at)
         VALUES ($1, $2, $3, $4)
         RETURNING nonce, expires_at
         "#,
@@ -166,7 +166,7 @@ pub async fn consume_challenge(
 ) -> AppResult<Option<Challenge>> {
     let row: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
         r#"
-        UPDATE contra_auth.challenges SET used_at = NOW()
+        UPDATE private_channel_auth.challenges SET used_at = NOW()
         WHERE user_id = $1 AND nonce = $2 AND used_at IS NULL AND expires_at > NOW()
         RETURNING nonce, expires_at
         "#,
@@ -186,7 +186,7 @@ pub async fn insert_verified_wallet(
 ) -> AppResult<VerifiedWallet> {
     let row: (String, DateTime<Utc>) = sqlx::query_as(
         r#"
-        INSERT INTO contra_auth.verified_wallets (id, user_id, pubkey)
+        INSERT INTO private_channel_auth.verified_wallets (id, user_id, pubkey)
         VALUES ($1, $2, $3)
         RETURNING pubkey, created_at
         "#,
@@ -211,7 +211,7 @@ pub async fn delete_verified_wallet(
     pubkey: &str,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        r#"DELETE FROM contra_auth.verified_wallets WHERE user_id = $1 AND pubkey = $2"#,
+        r#"DELETE FROM private_channel_auth.verified_wallets WHERE user_id = $1 AND pubkey = $2"#,
     )
     .bind(user_id)
     .bind(pubkey)
@@ -226,7 +226,7 @@ pub async fn delete_verified_wallet(
 /// Returns the number of rows deleted.
 pub async fn cleanup_stale_challenges(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        r#"DELETE FROM contra_auth.challenges WHERE used_at IS NOT NULL OR expires_at < NOW()"#,
+        r#"DELETE FROM private_channel_auth.challenges WHERE used_at IS NOT NULL OR expires_at < NOW()"#,
     )
     .execute(pool)
     .await?;
@@ -236,7 +236,7 @@ pub async fn cleanup_stale_challenges(pool: &PgPool) -> Result<u64, sqlx::Error>
 
 pub async fn list_verified_wallets(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<VerifiedWallet>> {
     let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-        r#"SELECT pubkey, created_at FROM contra_auth.verified_wallets WHERE user_id = $1"#,
+        r#"SELECT pubkey, created_at FROM private_channel_auth.verified_wallets WHERE user_id = $1"#,
     )
     .bind(user_id)
     .fetch_all(pool)

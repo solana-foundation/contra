@@ -1,7 +1,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Returns `true` if `pubkey` is registered in `contra_auth.verified_wallets`
+/// Returns `true` if `pubkey` is registered in `private_channel_auth.verified_wallets`
 /// for the given `user_id`.
 ///
 /// This is the ownership check the gateway performs before allowing a User-role
@@ -14,7 +14,7 @@ pub async fn is_wallet_owned_by_user(
     let exists: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
-            SELECT 1 FROM contra_auth.verified_wallets
+            SELECT 1 FROM private_channel_auth.verified_wallets
             WHERE user_id = $1 AND pubkey = $2
         )
         "#,

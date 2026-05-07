@@ -5,7 +5,7 @@ use {
     redis::AsyncCommands,
 };
 
-// Contra doesn't have epochs like Solana - it has one massive epoch
+// PrivateChannel doesn't have epochs like Solana - it has one massive epoch
 // We use u64::MAX to represent an effectively infinite epoch
 const SLOTS_IN_EPOCH: u64 = u64::MAX;
 const EPOCH: u64 = 0;

@@ -27,7 +27,7 @@ pub struct HealthConfig {
 }
 
 impl HealthConfig {
-    /// Defaults for the Solana / Contra slot indexer:
+    /// Defaults for the Solana / PrivateChannel slot indexer:
     /// - 50-slot lag tolerance (~20s on Solana mainnet)
     /// - 30-second staleness window, applied unconditionally because
     ///   the chain is always producing slots.

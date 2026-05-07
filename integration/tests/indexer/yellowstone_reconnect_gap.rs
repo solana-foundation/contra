@@ -15,12 +15,12 @@
 //! simulates a mid-subscription disconnect; an in-process `mockito` RPC
 //! server stands in for the backfill RPC endpoint.
 
-use contra_indexer::config::ProgramType;
-use contra_indexer::indexer::datasource::common::datasource::DataSource;
-use contra_indexer::indexer::datasource::common::types::ProcessorMessage;
-use contra_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller;
-use contra_indexer::indexer::datasource::yellowstone::YellowstoneSource;
 use mockito::{Matcher, Server as MockitoServer};
+use private_channel_indexer::config::ProgramType;
+use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
+use private_channel_indexer::indexer::datasource::common::types::ProcessorMessage;
+use private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller;
+use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource;
 use serde_json::json;
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
@@ -61,7 +61,7 @@ fn empty_block_json() -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gap_fill_runs_after_drop_stream() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,contra_indexer=debug")
+        .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
         .try_init();
 

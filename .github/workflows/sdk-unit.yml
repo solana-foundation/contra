@@ -9,28 +9,28 @@ on:
   push:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - "contra-escrow-program/clients/typescript/**"
-      - "contra-withdraw-program/clients/typescript/**"
+      - "private-channel-escrow-program/clients/typescript/**"
+      - "private-channel-withdraw-program/clients/typescript/**"
       - ".github/workflows/sdk-unit.yml"
-      - "contra-escrow-program/idl/**"
-      - "contra-escrow-program/scripts/**"
-      - "contra-escrow-program/package.json"
-      - "contra-withdraw-program/idl/**"
-      - "contra-withdraw-program/scripts/**"
-      - "contra-withdraw-program/package.json"
+      - "private-channel-escrow-program/idl/**"
+      - "private-channel-escrow-program/scripts/**"
+      - "private-channel-escrow-program/package.json"
+      - "private-channel-withdraw-program/idl/**"
+      - "private-channel-withdraw-program/scripts/**"
+      - "private-channel-withdraw-program/package.json"
 
   pull_request:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - "contra-escrow-program/clients/typescript/**"
-      - "contra-withdraw-program/clients/typescript/**"
+      - "private-channel-escrow-program/clients/typescript/**"
+      - "private-channel-withdraw-program/clients/typescript/**"
       - ".github/workflows/sdk-unit.yml"
-      - "contra-escrow-program/idl/**"
-      - "contra-escrow-program/scripts/**"
-      - "contra-escrow-program/package.json"
-      - "contra-withdraw-program/idl/**"
-      - "contra-withdraw-program/scripts/**"
-      - "contra-withdraw-program/package.json"
+      - "private-channel-escrow-program/idl/**"
+      - "private-channel-escrow-program/scripts/**"
+      - "private-channel-escrow-program/package.json"
+      - "private-channel-withdraw-program/idl/**"
+      - "private-channel-withdraw-program/scripts/**"
+      - "private-channel-withdraw-program/package.json"
 
 jobs:
   typescript-sdk-unit:
@@ -38,7 +38,7 @@ jobs:
     runs-on: contra-runner-1
     strategy:
       matrix:
-        program: [contra-escrow-program, contra-withdraw-program]
+        program: [private-channel-escrow-program, private-channel-withdraw-program]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5

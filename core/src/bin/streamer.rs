@@ -10,7 +10,7 @@ use {
         Router,
     },
     clap::Parser,
-    contra_core::accounts::{
+    private_channel_core::accounts::{
         traits::{AccountsDB, BlockInfo},
         types::StoredTransaction,
     },
@@ -81,15 +81,15 @@ struct StreamedTransaction {
 // ---------------------------------------------------------------------------
 #[derive(Parser, Debug)]
 #[command(
-    name = "contra-streamer",
-    about = "WebSocket streamer for real-time Contra transactions"
+    name = "private-channel-streamer",
+    about = "WebSocket streamer for real-time PrivateChannel transactions"
 )]
 struct Args {
     /// Port to listen on
     #[arg(short, long, env = "STREAMER_PORT")]
     port: Option<u16>,
 
-    /// PostgreSQL connection URL (Contra read replica — for mint/burn/transfer)
+    /// PostgreSQL connection URL (PrivateChannel read replica — for mint/burn/transfer)
     #[arg(long, env = "STREAMER_ACCOUNTSDB_CONNECTION_URL")]
     accountsdb_connection_url: String,
 
@@ -396,7 +396,7 @@ fn parse_stored_transaction(
 
     StreamedTransaction {
         signature: signature.to_string(),
-        chain: "contra".into(),
+        chain: "private_channel".into(),
         tx_type: result.tx_type,
         from: result.from,
         to: result.to,
@@ -491,7 +491,7 @@ async fn poll_indexer(
 
             let streamed = StreamedTransaction {
                 signature: row.signature,
-                chain: "contra".into(),
+                chain: "private_channel".into(),
                 tx_type: tx_type.to_string(),
                 from: row.initiator,
                 to: row.recipient,
@@ -518,7 +518,7 @@ async fn poll_indexer(
 }
 
 // ---------------------------------------------------------------------------
-// Poller — AccountsDB for Contra-internal transactions (mint/burn/transfer)
+// Poller — AccountsDB for PrivateChannel-internal transactions (mint/burn/transfer)
 // ---------------------------------------------------------------------------
 
 async fn poll_loop(
@@ -725,7 +725,10 @@ async fn main() {
             .unwrap_or(8902)
     });
 
-    info!("Starting Contra streamer v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting PrivateChannel streamer v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Connect to the read replica
     let accounts_db = AccountsDB::new(&args.accountsdb_connection_url, true)
@@ -770,7 +773,7 @@ async fn main() {
         });
     }
 
-    // Spawn AccountsDB poller (mint / burn / transfer on Contra)
+    // Spawn AccountsDB poller (mint / burn / transfer on PrivateChannel)
     let poller_db = accounts_db.clone();
     let poller_tx = tx_sender.clone();
     let poller_heartbeat = accounts_poll_at.clone();

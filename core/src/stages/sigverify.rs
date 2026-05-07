@@ -1,4 +1,4 @@
-// Signature verification stage for Contra
+// Signature verification stage for PrivateChannel
 
 use {
     crate::{

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# End-to-end devnet test for Contra escrow system
+# End-to-end devnet test for Solana Private Channels escrow system
 #
 # Required env vars:
 #   DEVNET_RPC_URL          - Solana devnet RPC URL (e.g. https://api.devnet.solana.com)
 #
 # Optional env vars:
-#   CONTRA_GATEWAY_URL      - Contra gateway URL (default: http://localhost:8899)
+#   PRIVATE_CHANNEL_GATEWAY_URL      - Solana Private Channels gateway URL (default: http://localhost:8899)
 #   ADMIN_KEYPAIR           - Path to admin keypair (default: ./keypairs/admin.json)
 #   MINT_KEYPAIR            - Path to mint keypair (default: ./keypairs/mint.json)
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
@@ -20,7 +20,7 @@ if [ -f .env ]; then
 fi
 
 RPC_URL="${DEVNET_RPC_URL:?DEVNET_RPC_URL is required}"
-CONTRA_GATEWAY_URL="${CONTRA_GATEWAY_URL:-http://localhost:8899}"
+PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:8899}"
 ADMIN_KEYPAIR="${ADMIN_KEYPAIR:-./keypairs/admin.json}"
 MINT_KEYPAIR="${MINT_KEYPAIR:-./keypairs/mint.json}"
 USER_KEYPAIR="${USER_KEYPAIR:-./keypairs/user.json}"
@@ -128,7 +128,7 @@ for i in {1..30}; do
 done
 
 # Get initial deposit count from database
-INITIAL_DEPOSIT_COUNT=$(docker exec contra-postgres-indexer psql -U contra -d indexer -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n' || echo "0")
+INITIAL_DEPOSIT_COUNT=$(docker exec private-channel-postgres-indexer psql -U private_channel -d indexer -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n' || echo "0")
 EXPECTED_DEPOSIT_COUNT=$((INITIAL_DEPOSIT_COUNT + 2))
 echo "Initial deposit count: $INITIAL_DEPOSIT_COUNT, expecting: $EXPECTED_DEPOSIT_COUNT after test"
 
@@ -187,7 +187,7 @@ echo "=== Step 9: Validate Backfill ==="
 echo "Waiting for backfill to complete..."
 
 for i in {1..30}; do
-  TX_COUNT=$(docker exec contra-postgres-indexer psql -U contra -d indexer -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n')
+  TX_COUNT=$(docker exec private-channel-postgres-indexer psql -U private_channel -d indexer -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n')
   if [ "$TX_COUNT" -eq "$EXPECTED_DEPOSIT_COUNT" ]; then
     echo "✅ Backfill validated: $EXPECTED_DEPOSIT_COUNT completed deposits found (added 2 new)!"
     break
@@ -204,7 +204,7 @@ fi
 
 echo ""
 echo "=== Deposit Details ==="
-docker exec contra-postgres-indexer psql -U contra -d indexer -c "SELECT id, signature, slot, initiator, amount, status, transaction_type FROM transactions WHERE transaction_type = 'deposit' ORDER BY slot;" 2>/dev/null
+docker exec private-channel-postgres-indexer psql -U private_channel -d indexer -c "SELECT id, signature, slot, initiator, amount, status, transaction_type FROM transactions WHERE transaction_type = 'deposit' ORDER BY slot;" 2>/dev/null
 
 echo ""
 echo "=== Step 10: Additional Deposits ==="
@@ -244,7 +244,7 @@ WITHDRAW_AMOUNT=300000
 echo "Withdrawing $WITHDRAW_AMOUNT tokens (sum of deposits 2-4)"
 
 cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin withdraw -- \
-  "$CONTRA_GATEWAY_URL" \
+  "$PRIVATE_CHANNEL_GATEWAY_URL" \
   "$USER_KEYPAIR" \
   "$MINT" \
   "$WITHDRAW_AMOUNT"
@@ -267,9 +267,9 @@ echo "=== Final Balances ==="
 USER_SOLANA_FINAL=$(get_token_balance "$USER" "$MINT")
 INSTANCE_SOLANA_FINAL=$(get_token_balance "$INSTANCE_ID" "$MINT")
 
-# Get Contra balance via RPC - need to derive ATA first (raw amount)
+# Get Solana Private Channels balance via RPC - need to derive ATA first (raw amount)
 USER_ATA=$(spl-token address --verbose --owner "$USER" --token "$MINT" 2>/dev/null | grep "Associated token address" | awk '{print $4}')
-USER_CONTRA_FINAL=$(curl -s -X POST "$CONTRA_GATEWAY_URL" \
+USER_PRIVATE_CHANNEL_FINAL=$(curl -s -X POST "$PRIVATE_CHANNEL_GATEWAY_URL" \
   -H "Content-Type: application/json" \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountBalance\",\"params\":[\"$USER_ATA\"]}" \
   | jq -r '.result.value.amount // "0"')
@@ -285,7 +285,7 @@ EXPECTED_USER_AFTER_DEP34=$((EXPECTED_USER_AFTER_DEP12 - 200000))
 EXPECTED_INSTANCE_AFTER_DEP34=350000
 EXPECTED_USER_AFTER_WITHDRAW=$((EXPECTED_USER_AFTER_DEP34 + WITHDRAW_AMOUNT))
 EXPECTED_INSTANCE_AFTER_WITHDRAW=$((EXPECTED_INSTANCE_AFTER_DEP34 - WITHDRAW_AMOUNT))
-EXPECTED_CONTRA_AFTER_WITHDRAW=$((350000 - WITHDRAW_AMOUNT))
+EXPECTED_PRIVATE_CHANNEL_AFTER_WITHDRAW=$((350000 - WITHDRAW_AMOUNT))
 
 # Helper to check if values match
 check() {
@@ -300,7 +300,7 @@ printf "%-20s %20s %20s %12s %12s\n" "3. After backfill" "$USER_SOLANA_AFTER_BAC
 printf "%-20s %20s %20s %12s %12s %s\n" "4. After dep 3-4" "$USER_SOLANA_AFTER_ALL_DEPOSITS" "$EXPECTED_USER_AFTER_DEP34" "$INSTANCE_SOLANA_AFTER_ALL_DEPOSITS" "$EXPECTED_INSTANCE_AFTER_DEP34" "$(check "$INSTANCE_SOLANA_AFTER_ALL_DEPOSITS" "$EXPECTED_INSTANCE_AFTER_DEP34")"
 printf "%-20s %20s %20s %12s %12s %s\n" "5. After withdrawal" "$USER_SOLANA_FINAL" "$EXPECTED_USER_AFTER_WITHDRAW" "$INSTANCE_SOLANA_FINAL" "$EXPECTED_INSTANCE_AFTER_WITHDRAW" "$(check "$INSTANCE_SOLANA_FINAL" "$EXPECTED_INSTANCE_AFTER_WITHDRAW")"
 echo ""
-printf "Contra User Balance: %s (expected: %s) %s\n" "$USER_CONTRA_FINAL" "$EXPECTED_CONTRA_AFTER_WITHDRAW" "$(check "$USER_CONTRA_FINAL" "$EXPECTED_CONTRA_AFTER_WITHDRAW")"
+printf "Solana Private Channels User Balance: %s (expected: %s) %s\n" "$USER_PRIVATE_CHANNEL_FINAL" "$EXPECTED_PRIVATE_CHANNEL_AFTER_WITHDRAW" "$(check "$USER_PRIVATE_CHANNEL_FINAL" "$EXPECTED_PRIVATE_CHANNEL_AFTER_WITHDRAW")"
 echo ""
 echo "=== Summary ==="
 echo "Instance ID: $INSTANCE_ID"

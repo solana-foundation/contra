@@ -23,11 +23,11 @@
 //!    ID ⇒ inner-loop `continue`, no stream-level impact, no error, no
 //!    reconnect; subsequent updates on the same stream keep flowing.
 
-use contra_indexer::config::ProgramType;
-use contra_indexer::indexer::datasource::common::datasource::DataSource;
-use contra_indexer::indexer::datasource::common::parser::escrow::CONTRA_ESCROW_PROGRAM_ID;
-use contra_indexer::indexer::datasource::common::types::ProcessorMessage;
-use contra_indexer::indexer::datasource::yellowstone::YellowstoneSource;
+use private_channel_indexer::config::ProgramType;
+use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
+use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_indexer::indexer::datasource::common::types::ProcessorMessage;
+use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource;
 use std::str::FromStr;
 use std::time::Duration;
 use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher};
@@ -95,7 +95,7 @@ fn tx_update_with_program(slot: u64, program_id: solana_sdk::pubkey::Pubkey) -> 
     };
 
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(SubscribeUpdateTransactionInfo {
                 signature: vec![7u8; 64],
@@ -146,7 +146,7 @@ fn tx_update_bad_program_index(slot: u64) -> SubscribeUpdate {
         message: Some(message),
     };
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(SubscribeUpdateTransactionInfo {
                 signature: vec![0x77u8; 64],
@@ -170,7 +170,7 @@ fn tx_update_missing_message(slot: u64) -> SubscribeUpdate {
     };
 
     SubscribeUpdate {
-        filters: vec!["contra_program".to_string()],
+        filters: vec!["private_channel_program".to_string()],
         update_oneof: Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(SubscribeUpdateTransactionInfo {
                 signature: vec![0x55; 64],
@@ -194,7 +194,7 @@ struct TestHarness {
 
 async fn spin_up() -> TestHarness {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,contra_indexer=debug")
+        .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
         .try_init();
 
@@ -439,7 +439,7 @@ async fn wrong_program_id_is_silently_filtered() {
     // for — the filtered tx legitimately did not match.
     assert_ne!(
         wrong_program,
-        solana_sdk::pubkey::Pubkey::from_str(CONTRA_ESCROW_PROGRAM_ID).unwrap()
+        solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap()
     );
 
     tear_down(h).await;

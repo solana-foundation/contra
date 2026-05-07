@@ -4,8 +4,8 @@ on:
   push:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - "contra-escrow-program/**"
-      - "contra-withdraw-program/**"
+      - "private-channel-escrow-program/**"
+      - "private-channel-withdraw-program/**"
       - "Cargo.*"
       - "Makefile"
       - ".github/workflows/program-integration.yml"
@@ -13,8 +13,8 @@ on:
   pull_request:
     branches: [main, hardening/pre-release-audit]
     paths:
-      - "contra-escrow-program/**"
-      - "contra-withdraw-program/**"
+      - "private-channel-escrow-program/**"
+      - "private-channel-withdraw-program/**"
       - "Cargo.*"
       - "Makefile"
       - ".github/workflows/program-integration.yml"
@@ -44,14 +44,14 @@ jobs:
 
       - name: Build programs
         run: |
-          make -C contra-escrow-program build
-          make -C contra-withdraw-program build
+          make -C private-channel-escrow-program build
+          make -C private-channel-withdraw-program build
 
       - name: Run escrow integration tests
-        run: make -C contra-escrow-program integration-test-no-build
+        run: make -C private-channel-escrow-program integration-test-no-build
 
       - name: Run withdraw integration tests
-        run: make -C contra-withdraw-program integration-test-no-build
+        run: make -C private-channel-withdraw-program integration-test-no-build
 
       - name: Show failure logs
         if: failure()

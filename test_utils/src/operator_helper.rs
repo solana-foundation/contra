@@ -1,6 +1,8 @@
 use {
-    contra_indexer::{
-        config::{ContraIndexerConfig, OperatorConfig, PostgresConfig, ProgramType, StorageType},
+    private_channel_indexer::{
+        config::{
+            OperatorConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
+        },
         operator,
         storage::{PostgresDb, Storage},
     },
@@ -12,7 +14,7 @@ use {
 #[cfg(feature = "test-mock-storage")]
 use crate::mock_rpc::MockRpcServer;
 #[cfg(feature = "test-mock-storage")]
-use contra_indexer::storage::common::storage::mock::MockStorage;
+use private_channel_indexer::storage::common::storage::mock::MockStorage;
 
 pub struct OperatorHandle {
     pub _handle: JoinHandle<()>,
@@ -49,9 +51,9 @@ fn set_operator_env_vars(keypair: &Keypair) {
     std::env::set_var("OPERATOR_PRIVATE_KEY", &private_key_base58);
 }
 
-/// Start the operator that reads from Solana indexer and mints tokens on Contra.
-pub async fn start_solana_to_contra_operator(
-    contra_rpc_url: String,
+/// Start the operator that reads from Solana indexer and mints tokens on PrivateChannel.
+pub async fn start_solana_to_private_channel_operator(
+    private_channel_rpc_url: String,
     solana_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
@@ -63,10 +65,10 @@ pub async fn start_solana_to_contra_operator(
 
     let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
-        rpc_url: contra_rpc_url,
+        rpc_url: private_channel_rpc_url,
         source_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
@@ -163,11 +165,11 @@ fn mock_operator_config() -> OperatorConfig {
     }
 }
 
-/// Start the operator that reads from Contra indexer and releases funds on Solana,
+/// Start the operator that reads from PrivateChannel indexer and releases funds on Solana,
 /// wired against a scripted `MockRpcServer` + in-memory `Storage::Mock`. Program
 /// type is `Withdraw`.
 #[cfg(feature = "test-mock-storage")]
-pub async fn start_contra_to_solana_operator_with_mocks(
+pub async fn start_private_channel_to_solana_operator_with_mocks(
     escrow_instance_id: Pubkey,
     operator_keypair: Keypair,
 ) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
@@ -182,7 +184,7 @@ pub async fn start_contra_to_solana_operator_with_mocks(
         max_connections: 1,
     };
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres, // no Mock variant on StorageType enum
         rpc_url: rpc.url(),
@@ -213,11 +215,11 @@ pub async fn start_contra_to_solana_operator_with_mocks(
     })
 }
 
-/// Start the operator that reads from Solana indexer and mints on Contra,
+/// Start the operator that reads from Solana indexer and mints on PrivateChannel,
 /// wired against a scripted `MockRpcServer` + in-memory `Storage::Mock`. Program
 /// type is `Escrow`.
 #[cfg(feature = "test-mock-storage")]
-pub async fn start_solana_to_contra_operator_with_mocks(
+pub async fn start_solana_to_private_channel_operator_with_mocks(
     escrow_instance_id: Pubkey,
     operator_keypair: Keypair,
 ) -> Result<OperatorMockHarness, Box<dyn std::error::Error>> {
@@ -230,7 +232,7 @@ pub async fn start_solana_to_contra_operator_with_mocks(
         max_connections: 1,
     };
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         rpc_url: rpc.url(),
@@ -261,21 +263,21 @@ pub async fn start_solana_to_contra_operator_with_mocks(
     })
 }
 
-/// Start the operator that reads from Contra indexer and releases funds on Solana.
-pub async fn start_contra_to_solana_operator(
+/// Start the operator that reads from PrivateChannel indexer and releases funds on Solana.
+pub async fn start_private_channel_to_solana_operator(
     solana_rpc_url: String,
-    contra_indexer_db_url: String,
+    private_channel_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
     let postgres_config = PostgresConfig {
-        database_url: contra_indexer_db_url,
+        database_url: private_channel_indexer_db_url,
         max_connections: 10,
     };
 
     let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
 
-    let common_config = ContraIndexerConfig {
+    let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         rpc_url: solana_rpc_url,

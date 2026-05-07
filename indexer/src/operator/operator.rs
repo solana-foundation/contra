@@ -7,8 +7,8 @@ use crate::operator::{
 };
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
-use crate::ContraIndexerConfig;
-use contra_metrics::{HealthState, MetricLabel};
+use crate::PrivateChannelIndexerConfig;
+use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -17,11 +17,11 @@ use tracing::{error, info, warn};
 
 pub async fn run(
     storage: Arc<Storage>,
-    common_config: ContraIndexerConfig,
+    common_config: PrivateChannelIndexerConfig,
     config: OperatorConfig,
     health: Option<Arc<HealthState>>,
 ) -> Result<(), OperatorError> {
-    info!("Starting Contra Operator");
+    info!("Starting PrivateChannel Operator");
     info!("Program: {:?}", common_config.program_type);
     info!("Poll interval: {:?}", config.db_poll_interval);
     info!("Batch size: {}", config.batch_size);

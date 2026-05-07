@@ -3,7 +3,8 @@
 use solana_sdk::pubkey::Pubkey;
 
 pub const LOCAL_RPC_URL: &str = "http://localhost:18899";
-pub const DEFAULT_INDEXER_DB_URL: &str = "postgres://contra:contra_password@localhost:5434/indexer";
+pub const DEFAULT_INDEXER_DB_URL: &str =
+    "postgres://private_channel:private_channel_password@localhost:5434/indexer";
 pub const INDEXER_DB_ENV_VAR: &str = "TEST_INDEXER_DB_URL";
 
 pub const NUM_USERS: usize = 5;
@@ -14,10 +15,10 @@ pub const BASE_AMOUNT: u64 = 10_000;
 // the timeout is never reached.
 //
 // Coverage-instrumented builds are ~2-3x slower than release/debug. CI sets
-// CONTRA_TEST_WAIT_TIMEOUT_SECS=600 for the coverage target to give those runs
+// PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600 for the coverage target to give those runs
 // enough headroom; all other invocations fall back to 240 s.
 pub static WAIT_TIMEOUT_SECS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
-    std::env::var("CONTRA_TEST_WAIT_TIMEOUT_SECS")
+    std::env::var("PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(240)

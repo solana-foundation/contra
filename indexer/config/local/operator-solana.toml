@@ -2,7 +2,7 @@
 
 [common]
 program_type = "escrow"
-# Contra write node (gateway) — where mint transactions are sent
+# Solana Private Channels write node (gateway) — where mint transactions are sent
 rpc_url = "http://localhost:8898"
 
 # Solana Solana validator — source of escrow deposit metadata and mint account state
@@ -26,5 +26,5 @@ batch_size = 1000
 retry_max_attempts = 3
 retry_base_delay_secs = 1
 channel_buffer_size = 1000
-# Contra block time is 100 ms so poll quickly
+# Solana Private Channels block time is 100 ms so poll quickly
 confirmation_poll_interval_ms = 100

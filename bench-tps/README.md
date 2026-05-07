@@ -1,12 +1,12 @@
-# contra-bench-tps
+# private-channel-bench-tps
 
-Load testing binary for the Contra payment channel. Supports three flows:
+Load testing binary for the Solana Private Channels payment channel. Supports three flows:
 
 | Flow | What it stresses |
 |------|-----------------|
-| \`transfer\` | Contra SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
-| `deposit` | Solana escrow deposits (Solana → Contra, measured end-to-end via operator-solana) |
-| `withdraw` | Contra burn + Solana release (Contra → Solana, measured end-to-end via operator-contra) |
+| \`transfer\` | Solana Private Channels SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
+| `deposit` | Solana escrow deposits (Solana → Solana Private Channels, measured end-to-end via operator-solana) |
+| `withdraw` | Solana Private Channels burn + Solana release (Solana Private Channels → Solana, measured end-to-end via operator-private_channel) |
 
 ---
 
@@ -17,8 +17,8 @@ Load testing binary for the Contra payment channel. Supports three flows:
 cp bench-tps/.env.sample bench-tps/.env
 
 # 2. Build (from repo root)
-cargo build --release -p contra-bench-tps
-# Binary: target/release/contra-bench-tps
+cargo build --release -p private-channel-bench-tps
+# Binary: target/release/private-channel-bench-tps
 
 # 3. Run (from repo root)
 ./bench-tps/scripts/run.sh                        # transfer flow, defaults
@@ -38,7 +38,7 @@ containers on exit.
 
 ### What it does
 
-Generates sustained Contra SPL token transfers against the Contra write-node
+Generates sustained Solana Private Channels SPL token transfers against the Solana Private Channels write-node
 (via the gateway).  Each sender thread cycles through funded source accounts,
 signing a unique transfer + memo instruction per transaction.
 
@@ -67,7 +67,7 @@ signing a unique transfer + memo instruction per transaction.
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Contra gateway endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Solana Private Channels gateway endpoint |
 | `--accounts` | `BENCH_ACCOUNTS` | `50` | Source keypairs; must be ≥ `--threads` |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
@@ -84,11 +84,11 @@ signing a unique transfer + memo instruction per transaction.
 Sends `Deposit` instructions to the Solana validator's escrow program.
 Each transaction transfers tokens from a depositor's Solana ATA into the shared
 escrow instance ATA.  The full e2e path ends when `operator-solana` picks up
-the indexed deposit and mints an equivalent amount on Contra.
+the indexed deposit and mints an equivalent amount on Solana Private Channels.
 
 ```
 bench → Solana Deposit → indexer-solana indexes event
-      → operator-solana mints on Contra
+      → operator-solana mints on Solana Private Channels
 ```
 
 ### How to run
@@ -106,10 +106,10 @@ bench → Solana Deposit → indexer-solana indexes event
 |-------|--------|---------|
 | `sent` | `AtomicU64` | Deposit txs dispatched |
 | `solana_landed` | `getTransactionCount` delta on Solana | Confirmed by validator |
-| `contra_minted` | `contra_operator_mints_sent_total{escrow}` delta | Contra mints confirmed by operator |
-| `drop` | `solana_landed - contra_minted` | Deposits landed but not yet minted (indexer/operator lag) |
+| `private_channel_minted` | `private_channel_operator_mints_sent_total{escrow}` delta | Solana Private Channels mints confirmed by operator |
+| `drop` | `solana_landed - private_channel_minted` | Deposits landed but not yet minted (indexer/operator lag) |
 
-`contra_minted` requires `BENCH_OPERATOR_METRICS_URL` to be set (operator-solana
+`private_channel_minted` requires `BENCH_OPERATOR_METRICS_URL` to be set (operator-solana
 exposes metrics on port 9102).
 
 ### Config parameters
@@ -133,11 +133,11 @@ exposes metrics on port 9102).
 The most complex flow — exercises the full cross-chain withdrawal path:
 
 ```
-bench → Contra WithdrawFunds (burn) → indexer-contra indexes event
-      → operator-contra sends Solana ReleaseFunds → funds released on Solana
+bench → Solana Private Channels WithdrawFunds (burn) → indexer-private_channel indexes event
+      → operator-private_channel sends Solana ReleaseFunds → funds released on Solana
 ```
 
-Setup creates both Solana and Contra state: an escrow instance on Solana, Contra ATAs
+Setup creates both Solana and Solana Private Channels state: an escrow instance on Solana, Solana Private Channels ATAs
 funded with tokens, and Solana ATAs so that `ReleaseFunds` can transfer to them.
 
 ### How to run
@@ -154,23 +154,23 @@ funded with tokens, and Solana ATAs so that `ReleaseFunds` can transfer to them.
 | Field | Source | Meaning |
 |-------|--------|---------|
 | `sent` | `AtomicU64` | WithdrawFunds txs dispatched |
-| `contra_burned` | `getTransactionCount` delta on Contra | Burns confirmed by the write-node |
-| `solana_released` | `contra_operator_mints_sent_total{withdraw}` delta | Solana ReleaseFunds confirmed by operator |
-| `drop` | `contra_burned - solana_released` | Burns not yet released (indexer/operator lag) |
+| `private_channel_burned` | `getTransactionCount` delta on Solana Private Channels | Burns confirmed by the write-node |
+| `solana_released` | `private_channel_operator_mints_sent_total{withdraw}` delta | Solana ReleaseFunds confirmed by operator |
+| `drop` | `private_channel_burned - solana_released` | Burns not yet released (indexer/operator lag) |
 
-`solana_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-contra
+`solana_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-private_channel
 on port 9103).
 
 ### Config parameters
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Contra gateway endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Solana Private Channels gateway endpoint |
 | `--solana-rpc-url` | `BENCH_SOLANA_RPC_URL` | `http://localhost:18899` | Solana validator endpoint |
 | `--accounts` | `BENCH_WITHDRAW_ACCOUNTS` | `20` | Withdrawer keypairs |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
-| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Contra token units per account |
+| `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Solana Private Channels token units per account |
 | `--operator-metrics-url` | `BENCH_WITHDRAW_OPERATOR_METRICS_URL` | — | `http://localhost:9103/metrics` for e2e tracking |
 | `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Must match `COMMON_ESCROW_INSTANCE_ID` in docker-compose |
 
@@ -189,7 +189,7 @@ INFO Mint-to confirmed confirmed=500 elapsed_ms=1950
 INFO Initial blockhash seeded — setup complete
 ```
 
-Long `elapsed_ms` on confirmations is normal — the Contra pipeline settles
+Long `elapsed_ms` on confirmations is normal — the Solana Private Channels pipeline settles
 asynchronously (1–3 s per batch).
 
 ### Load phase (logged every second)
@@ -209,14 +209,14 @@ INFO Final summary duration_secs=60 sent=18900 landed=18540 dropped=360 drop_rat
 
 **Deposit:**
 ```
-INFO Final summary duration_secs=60 sent=30000 solana_landed=28500 contra_minted=280 drop=28220 drop_rate=99.0% solana_tps=475.0 contra_tps=4.7
+INFO Final summary duration_secs=60 sent=30000 solana_landed=28500 private_channel_minted=280 drop=28220 drop_rate=99.0% solana_tps=475.0 private_channel_tps=4.7
 ```
-> High `drop` between `solana_landed` and `contra_minted` is expected during the run — the operator
+> High `drop` between `solana_landed` and `private_channel_minted` is expected during the run — the operator
 > pipeline has latency. Re-run with a longer `--duration` to reach steady state.
 
 **Withdraw:**
 ```
-INFO Final summary duration_secs=60 sent=3000 contra_burned=2940 solana_released=21 drop=2919 drop_rate=99.3% contra_tps=49.0 solana_tps=0.4
+INFO Final summary duration_secs=60 sent=3000 private_channel_burned=2940 solana_released=21 drop=2919 drop_rate=99.3% private_channel_tps=49.0 solana_tps=0.4
 ```
 
 ### Common warnings
@@ -248,7 +248,7 @@ bench-tps/src/
 ├── types.rs           Shared constants, BenchConfig, BenchState, BatchQueue
 ├── setup.rs           Transfer setup — mint, ATAs, balances
 ├── setup_deposit.rs   Deposit setup — escrow instance, depositor accounts
-├── setup_withdraw.rs  Withdraw setup — escrow instance, Contra accounts, Solana ATAs
+├── setup_withdraw.rs  Withdraw setup — escrow instance, Solana Private Channels accounts, Solana ATAs
 ├── background.rs      Blockhash poller, metrics sampler, operator mints sampler
 ├── load.rs            Transfer generator + sender threads
 ├── load_deposit.rs    Deposit generator + sender threads
@@ -266,7 +266,7 @@ bench-tps/src/
 - **Metrics sampler** — polls `getTransactionCount` every second to compute
   landed TPS and returns `(start, end)` counts for the final summary.
 - **Operator mints sampler** (deposit/withdraw only) — scrapes
-  `contra_operator_mints_sent_total` from the operator Prometheus endpoint
+  `private_channel_operator_mints_sent_total` from the operator Prometheus endpoint
   every second for e2e confirmation tracking.
 
 **Phase 3 — Load generation**:
@@ -297,13 +297,13 @@ dedup stage from dropping them as duplicates.
 the workspace root target directory:
 
 ```
-target/release/contra-bench-tps   ← correct
+target/release/private-channel-bench-tps   ← correct
 bench-tps/target/                  ← does not exist
 ```
 
 Build command:
 ```bash
-cargo build --release -p contra-bench-tps
+cargo build --release -p private-channel-bench-tps
 ```
 
 ---
@@ -312,9 +312,9 @@ cargo build --release -p contra-bench-tps
 
 ```bash
 # Container CPU sets
-docker ps --filter "name=contra-" --format "{{.Names}}" \
+docker ps --filter "name=private-channel-" --format "{{.Names}}" \
   | xargs -I{} docker inspect --format '{{.Name}} {{.HostConfig.CpusetCpus}}' {}
 
 # Bench process CPU set
-taskset -pc $(pgrep -f contra-bench-tps)
+taskset -pc $(pgrep -f private-channel-bench-tps)
 ```

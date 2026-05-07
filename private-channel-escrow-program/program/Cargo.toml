@@ -1,0 +1,44 @@
+[package]
+name = "private-channel-escrow-program"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+] }
+
+[features]
+no-entrypoint = []
+idl = []
+devnet = []
+
+# Use smaller tree size for integration tests (with the indexer)
+test-tree = []
+
+[dependencies]
+const-crypto = { workspace = true }
+pinocchio = { workspace = true, features = ["cpi", "copy"] }
+solana-address = { version = "2.0", features = ["curve25519"] }
+pinocchio-associated-token-account = { workspace = true }
+pinocchio-log = { workspace = true }
+pinocchio-system = { workspace = true }
+pinocchio-token = { workspace = true }
+pinocchio-token-2022 = { workspace = true }
+codama = { workspace = true }
+spl-token-2022 = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+codama = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = "0.10.9"
+sparse-merkle-tree = "0.6.1"
+
+[package.metadata.cargo-machete]
+ignored = ["pinocchio-log"]

@@ -6,7 +6,7 @@
 //! Run with: `cd indexer && cargo test --test postgres_db_test -- --test-threads=1`
 
 use chrono::Utc;
-use contra_indexer::{
+use private_channel_indexer::{
     storage::{
         common::models::DbMint, DbTransaction, PostgresDb, Storage, TransactionStatus,
         TransactionType,

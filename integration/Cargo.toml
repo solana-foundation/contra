@@ -1,11 +1,11 @@
 [package]
-name = "contra-integration"
+name = "private-channel-integration"
 version = "0.1.0"
 edition = "2021"
 
 [[test]]
-name = "contra_integration"
-path = "tests/contra/integration.rs"
+name = "private_channel_integration"
+path = "tests/private-channel/integration.rs"
 
 [[test]]
 name = "indexer_integration"
@@ -25,7 +25,7 @@ path = "tests/indexer/gap_detection.rs"
 
 [[test]]
 name = "truncate_integration"
-path = "tests/contra/truncate.rs"
+path = "tests/private-channel/truncate.rs"
 
 [[test]]
 name = "operator_lifecycle_integration"
@@ -61,15 +61,15 @@ path = "tests/indexer/remint_recovery.rs"
 
 [[test]]
 name = "test_rpc_http_malformed"
-path = "tests/contra/rpc/test_rpc_http_malformed.rs"
+path = "tests/private-channel/rpc/test_rpc_http_malformed.rs"
 
 [[test]]
 name = "test_simulate_transaction_guards"
-path = "tests/contra/rpc/test_simulate_transaction_guards.rs"
+path = "tests/private-channel/rpc/test_simulate_transaction_guards.rs"
 
 [[test]]
 name = "test_health_endpoint_standalone"
-path = "tests/contra/rpc/test_health_endpoint_standalone.rs"
+path = "tests/private-channel/rpc/test_health_endpoint_standalone.rs"
 
 [[test]]
 name = "bootstrap_validation"
@@ -170,27 +170,27 @@ path = "tests/indexer/sender_cancellation_drain.rs"
 # sequencer zero-deadline drain branch.
 [[test]]
 name = "test_sequencer_zero_deadline"
-path = "tests/contra/test_sequencer_zero_deadline.rs"
+path = "tests/private-channel/test_sequencer_zero_deadline.rs"
 
 # get_signatures_for_address data-corruption guards.
 [[test]]
 name = "test_signatures_corruption_guard"
-path = "tests/contra/test_signatures_corruption_guard.rs"
+path = "tests/private-channel/test_signatures_corruption_guard.rs"
 
 # run_node config-validation guards (blocktime / max_blockhashes).
 [[test]]
 name = "test_node_config_validation"
-path = "tests/contra/test_node_config_validation.rs"
+path = "tests/private-channel/test_node_config_validation.rs"
 
 # Redis-backend warm-cache + read-path coverage test. Runs independently of
-# contra_integration so it still contributes coverage even when the broader
+# private_channel_integration so it still contributes coverage even when the broader
 # suite is flaky.
 [[test]]
 name = "test_redis_cache_path"
-path = "tests/contra/rpc/test_redis_cache_path.rs"
+path = "tests/private-channel/rpc/test_redis_cache_path.rs"
 
 [features]
-test-tree = ["contra-indexer/test-tree"]
+test-tree = ["private-channel-indexer/test-tree"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -198,14 +198,14 @@ base64 = { workspace = true }
 bs58 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
-contra-core = { path = "../core" }
-contra-escrow-program-client = { path = "../contra-escrow-program/clients/rust" }
-contra-indexer = { path = "../indexer", features = [
+private-channel-core = { path = "../core" }
+private-channel-escrow-program-client = { path = "../private-channel-escrow-program/clients/rust" }
+private-channel-indexer = { path = "../indexer", features = [
     "datasource-rpc",
     "datasource-yellowstone",
     "test-mock-storage",
 ] }
-contra-withdraw-program-client = { path = "../contra-withdraw-program/clients/rust" }
+private-channel-withdraw-program-client = { path = "../private-channel-withdraw-program/clients/rust" }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -237,7 +237,7 @@ test_utils = { path = "../test_utils", features = [
 # but we also need direct access to its `SubscribeUpdate` / `CompiledInstruction`
 # proto types in the test bodies to enqueue scripted updates into the mock.
 yellowstone-grpc-proto = { workspace = true, features = ["tonic"] }
-# async-trait + tokio-util come in transitively via contra-indexer but are used
+# async-trait + tokio-util come in transitively via private-channel-indexer but are used
 # directly by the Yellowstone-source driver tests.
 async-trait = "0.1"
 tokio = { workspace = true }

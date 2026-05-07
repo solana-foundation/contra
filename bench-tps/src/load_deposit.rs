@@ -12,7 +12,7 @@ use {
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_DEPOSIT},
         types::{BatchQueue, BenchState, DepositConfig, MAX_QUEUE_DEPTH},
     },
-    contra_escrow_program_client::instructions::{Deposit, DepositInstructionArgs},
+    private_channel_escrow_program_client::instructions::{Deposit, DepositInstructionArgs},
     solana_client::rpc_config::RpcSendTransactionConfig,
     solana_sdk::{
         commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -67,7 +67,7 @@ fn build_deposit_tx(
         token_program: spl_token::id(),
         associated_token_program: spl_associated_token_account::id(),
         event_authority: config.event_authority,
-        contra_escrow_program: contra_escrow_program_client::CONTRA_ESCROW_PROGRAM_ID,
+        private_channel_escrow_program: private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     };
 
     let deposit_ix = accounts.instruction(DepositInstructionArgs {

@@ -63,14 +63,14 @@ async fn scrape_prometheus_metric(
     Err("metric line not found in response")
 }
 
-/// Samples `contra_operator_mints_sent_total` every second from a Prometheus
+/// Samples `private_channel_operator_mints_sent_total` every second from a Prometheus
 /// `/metrics` endpoint, logging instantaneous confirmed/s and remaining test time.
 ///
 /// Mirrors `run_metrics_sampler` but measures operator-confirmed transactions instead
-/// of raw Contra transaction count — giving the true end-to-end completion rate.
+/// of raw PrivateChannel transaction count — giving the true end-to-end completion rate.
 ///
 /// `program_type` selects which operator to sample:
-///   - `"escrow"`  → deposit operator (Contra mints confirmed)
+///   - `"escrow"`  → deposit operator (PrivateChannel mints confirmed)
 ///   - `"withdraw"` → withdraw operator (Solana releases confirmed)
 ///
 /// Returns `(start_count, final_count)` for drop-rate calculation.
@@ -88,7 +88,7 @@ pub async fn run_operator_mints_sampler(
     let mut start_count: Option<u64> = None;
     let mut prev_count: Option<u64> = None;
 
-    const METRIC: &str = "contra_operator_mints_sent_total";
+    const METRIC: &str = "private_channel_operator_mints_sent_total";
     let label = format!(r#"program_type="{}""#, program_type);
 
     loop {

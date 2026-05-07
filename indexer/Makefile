@@ -13,12 +13,12 @@
 # on signal::ctrl_c(); no logic of their own and covered by integration tests.
 COV_IGNORE := --ignore-filename-regex '(error/|constants\.rs|bin/|models\.rs|shutdown_utils\.rs|types\.rs|indexer/indexer\.rs|operator/operator\.rs)'
 
-CONTRA_ESCROW_PROGRAM_ID ?= GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
-CONTRA_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
-CONTRA_ESCROW_PROGRAM_SO ?= ../target/deploy/contra_escrow_program.so
-CONTRA_WITHDRAW_PROGRAM_SO ?= ../target/deploy/contra_withdraw_program.so
+PRIVATE_CHANNEL_ESCROW_PROGRAM_ID ?= GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
+PRIVATE_CHANNEL_ESCROW_PROGRAM_SO ?= ../target/deploy/private_channel_escrow_program.so
+PRIVATE_CHANNEL_WITHDRAW_PROGRAM_SO ?= ../target/deploy/private_channel_withdraw_program.so
 GEYSER_CONFIG ?= src/indexer/datasource/common/yellowstone_grpc/config.json
-DATABASE_URL ?= postgres://contra:contra_password@localhost:5432/indexer
+DATABASE_URL ?= postgres://private_channel:private_channel_password@localhost:5432/indexer
 ESCROW_INSTANCE_ID ?=
 
 # Yellowstone gRPC plugin configuration
@@ -43,13 +43,13 @@ fmt:
 # Docker compose services
 ###################################
 compose-indexer:
-	@docker compose up -d validator indexer-solana indexer-contra
+	@docker compose up -d validator indexer-solana indexer-private-channel
 
 compose-operator:
-	@docker compose up -d postgres-indexer operator-solana operator-contra
+	@docker compose up -d postgres-indexer operator-solana operator-private-channel
 
 compose-all:
-	@docker compose up -d validator indexer-solana indexer-contra postgres-indexer operator-solana operator-contra
+	@docker compose up -d validator indexer-solana indexer-private-channel postgres-indexer operator-solana operator-private-channel
 
 ###################################
 # Individual service start
@@ -60,8 +60,8 @@ start-validator:
 	@echo "gRPC endpoint will be available at: localhost:10000"
 	@echo "Prometheus metrics at: localhost:8999"
 	@solana-test-validator -r \
-		--bpf-program $(CONTRA_ESCROW_PROGRAM_ID) $(CONTRA_ESCROW_PROGRAM_SO) \
-		--bpf-program $(CONTRA_WITHDRAW_PROGRAM_ID) $(CONTRA_WITHDRAW_PROGRAM_SO) \
+		--bpf-program $(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID) $(PRIVATE_CHANNEL_ESCROW_PROGRAM_SO) \
+		--bpf-program $(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID) $(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_SO) \
 		--geyser-plugin-config $(GEYSER_CONFIG) \
 		--port 18899
 
@@ -75,7 +75,7 @@ run-yellowstone:
 	fi
 	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
 		DATABASE_URL=$(DATABASE_URL) \
-		cargo run --bin contra-indexer -- \
+		cargo run --bin private-channel-indexer -- \
 		--config config/local/indexer-solana.toml \
 		--verbose \
 		indexer
@@ -90,8 +90,8 @@ run-rpc:
 	fi
 	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
 		DATABASE_URL=$(DATABASE_URL) \
-		cargo run --bin contra-indexer -- \
-		--config config/local/indexer-contra.toml \
+		cargo run --bin private-channel-indexer -- \
+		--config config/local/indexer-private-channel.toml \
 		--verbose \
 		indexer
 
@@ -114,7 +114,7 @@ run-operator:
 		ADMIN_PRIVATE_KEY=$(ADMIN_PRIVATE_KEY) \
 		OPERATOR_SIGNER=memory \
 		OPERATOR_PRIVATE_KEY=$(or $(OPERATOR_PRIVATE_KEY),$(ADMIN_PRIVATE_KEY)) \
-		cargo run --bin contra-indexer -- \
+		cargo run --bin private-channel-indexer -- \
 		--config config/local/operator-solana.toml \
 		--verbose \
 		operator

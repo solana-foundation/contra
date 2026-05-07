@@ -1,8 +1,8 @@
 # Runbooks - Operator
 
-Operator runbooks for the Contra payment-channel system. Covers both the
-withdrawal operator (Contra → Solana releases) and the deposit / escrow
-operator (Solana → Contra mints). Start here when an alert fires.
+Operator runbooks for the Solana Private Channels payment-channel system. Covers both the
+withdrawal operator (private channel → Solana releases) and the deposit / escrow
+operator (Solana → private channel mints). Start here when an alert fires.
 
 The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
@@ -45,7 +45,7 @@ itself fail.
 
 The system has exactly one **automatic** restoration path: a
 withdrawal that fails sender-side on Solana auto-remints the user's
-burned Contra tokens. That outcome ends with `status=failed_reminted`
+burned private channel tokens. That outcome ends with `status=failed_reminted`
 and no human action.
 
 Every other terminal outcome - withdrawal `failed` after a build error,
@@ -70,7 +70,7 @@ The runbooks call this out at every relevant site.
 - [`_verify_onchain_release.md`](_verify_onchain_release.md) - withdrawal
   on-chain check (Solana mainnet).
 - [`_verify_onchain_mint.md`](_verify_onchain_mint.md) - deposit
-  on-chain check (Contra chain).
+  on-chain check (private channel chain).
 - [`_escalation.md`](_escalation.md) - escalation tiers and contacts.
   Every "escalate" call-site in the recovery runbooks links here.
 
@@ -110,10 +110,10 @@ make drill NAME=drill_2      # single drill (substring match)
 Or directly via cargo:
 
 ```bash
-cargo test -p contra-indexer --test runbook_drills -- --ignored --nocapture
+cargo test -p private-channel-indexer --test runbook_drills -- --ignored --nocapture
 
 # Single drill, with trace logs for debugging:
-RUST_LOG=trace cargo test -p contra-indexer --test runbook_drills -- \
+RUST_LOG=trace cargo test -p private-channel-indexer --test runbook_drills -- \
     --ignored --nocapture drill_2
 ```
 

@@ -53,7 +53,7 @@ solana confirm -v <signature> --url <solana-rpc-url>
 
 Deposits do not need on-chain mint verification before recovery - the
 quarantine triggers on row-data validation, before any RPC call. The
-idempotency memo (`contra:mint-idempotency:<transaction_id>`) prevents
+idempotency memo (`private_channel:mint-idempotency:<transaction_id>`) prevents
 double-mint on retry even if the mint somehow did land.
 
 That said: **if `error_message` is `program_error`** the trigger is less
@@ -70,7 +70,7 @@ UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
-The user's tokens are locked in escrow on Solana but no Contra-side
+The user's tokens are locked in escrow on Solana but no private channel side
 mint will be issued. [Escalate](_escalation.md) (Tier 1) for refund
 coordination -
 typically a manual `release_funds` back to the depositor.

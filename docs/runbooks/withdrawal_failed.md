@@ -37,7 +37,7 @@ A withdrawal row reaching `failed` therefore means one of:
      code path that produced this; the classifier or routing has a bug.
      Capture `error_message`, the `failed` `processed_at`, and the
      discovered signature.
-   - `NOT_LANDED`: no on-chain action; user's Contra-side state must be
+   - `NOT_LANDED`: no on-chain action; user's private channel side state must be
      reconciled (burn may have completed without release). Treat the same as
      Path B in [`withdrawal_manual_review.md`](withdrawal_manual_review.md):
      check burn state, [escalate](_escalation.md) (Tier 1) for manual

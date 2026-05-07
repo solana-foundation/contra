@@ -2,7 +2,7 @@
 
 Triggered by webhook `status=failed_reminted`. **This is a success outcome.**
 The original withdrawal failed on Solana; the channel-side remint restored
-the user's burned Contra tokens.
+the user's burned private channel tokens.
 
 ## Symptom
 
@@ -19,7 +19,7 @@ No funds are stranded. No recovery action needed.
    ```bash
    solana confirm -v <remint_signature> --url <rpc-url>
    ```
-   Expected: `Finalized` with no error. The remint targets the Contra-side
+   Expected: `Finalized` with no error. The remint targets the private channel side
    token program, so use the channel read node's RPC.
 2. **Confirm the original withdrawal did NOT land** by running
    [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected

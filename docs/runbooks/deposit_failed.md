@@ -26,7 +26,7 @@ maps to a specific sender-side site:
 ## Recovery
 
 The decision shape is the same for every trigger: did the mint land on
-Contra or not?
+the private channel or not?
 
 ### Step 1 - verify on-chain
 
@@ -37,7 +37,7 @@ drives every recovery path below.
 
 #### `LANDED <signature>` - mint actually succeeded
 
-The user already received Contra-side tokens. The `Failed` status is
+The user already received private channel side tokens. The `Failed` status is
 incorrect; make it `completed` with the observed signature:
 
 ```sql
@@ -73,7 +73,7 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
 
 Before re-arming for `Mint initialization failed` specifically: confirm
 the underlying mint account and authority are correctly set up on the
-Contra chain. Without that, the next attempt fails the same way.
+private channel chain. Without that, the next attempt fails the same way.
 
 For program-error cases (paused mint, bad authority, etc.), fix the
 underlying condition first, then re-arm.
@@ -109,5 +109,5 @@ landed mint).
 - On-chain verdict (`LANDED <sig>` / `NOT_LANDED` / `AMBIGUOUS`).
 - Recovery action taken.
 - If the trigger pointed to environmental misconfiguration (paused mint,
-  bad authority), the remediation step taken on the Contra side.
+  bad authority), the remediation step taken on the private channel side.
 

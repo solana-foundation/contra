@@ -1,12 +1,12 @@
 # Procedure - Verify On-Chain Mint
 
 **Scope:** deposit operator only. This procedure verifies whether a
-`MintTo` instruction landed on the **Contra chain** (the channel side, not
+`MintTo` instruction landed on the **private channel chain** (the channel side, not
 Solana mainnet). For withdrawals, see
 [`_verify_onchain_release.md`](_verify_onchain_release.md).
 
 Run this before taking any deposit recovery action. **Do not skip - this
-is the gate that prevents double-minting Contra tokens to the user.**
+is the gate that prevents double-minting private channel tokens to the user.**
 
 ## Inputs
 
@@ -14,14 +14,14 @@ You need:
 - `transaction_id` - DB primary key of the deposit row.
 - The recipient ATA - derivable from `recipient` and `mint` columns of the
   row, or already in `counterpart_signature`'s associated transaction.
-- A working RPC endpoint for the **Contra chain** (the channel, served by
+- A working RPC endpoint for the **private channel chain** (the channel, served by
   the gateway / read-node, not the Solana mainnet RPC). The operator's
   `COMMON_RPC_URL` env var is the same endpoint.
 
 ## Output
 
 Exactly one of:
-- `LANDED <signature>` - mint confirmed on Contra; tokens were minted.
+- `LANDED <signature>` - mint confirmed on the private channel; tokens were minted.
 - `NOT_LANDED` - no mint in operator history for this transaction_id.
 - `AMBIGUOUS` - RPC unreachable, no decisive evidence, or the lookback
   window does not cover `processed_at`.
@@ -52,7 +52,7 @@ sig - verify it directly in Step 2 and skip Step 3.
 ### Step 2 - confirm a known signature
 
 ```bash
-solana confirm -v <counterpart_signature> --url <contra-rpc-url>
+solana confirm -v <counterpart_signature> --url <private-channel-rpc-url>
 ```
 
 - `Finalized`, no error → output `LANDED <counterpart_signature>`.
@@ -64,7 +64,7 @@ solana confirm -v <counterpart_signature> --url <contra-rpc-url>
 ### Step 3 - search by idempotency memo
 
 The operator attaches a deterministic memo to every mint:
-`contra:mint-idempotency:<transaction_id>`
+`private_channel:mint-idempotency:<transaction_id>`
 (`indexer/src/operator/constants.rs::MINT_IDEMPOTENCY_MEMO_PREFIX`).
 
 Derive the recipient ATA:
@@ -73,26 +73,26 @@ Derive the recipient ATA:
 spl-token address \
   --token <mint> \
   --owner <recipient> \
-  --url <contra-rpc-url> \
+  --url <private-channel-rpc-url> \
   --verbose
 ```
 
 Scan recent signatures on that ATA:
 
 ```bash
-solana transaction-history <recipient-ata> --limit 1000 --url <contra-rpc-url>
+solana transaction-history <recipient-ata> --limit 1000 --url <private-channel-rpc-url>
 ```
 
 For each candidate, fetch and inspect:
 
 ```bash
-solana confirm -v <signature> --url <contra-rpc-url>
+solana confirm -v <signature> --url <private-channel-rpc-url>
 ```
 
 A match has all of:
 - A `MintTo` instruction targeting the same mint and recipient ATA.
 - A memo instruction whose data contains
-  `contra:mint-idempotency:<transaction_id>`.
+  `private_channel:mint-idempotency:<transaction_id>`.
 - `Finalized` commitment, no error.
 
 Outcomes:
@@ -124,5 +124,5 @@ in `AMBIGUOUS` cases.**
 Capture the verdict, the signature(s) checked, and the RPC endpoint used
 in the incident record. Without this trail, a future user dispute or
 reconciliation mismatch cannot tell whether a row's
-`counterpart_signature` was actually verified on Contra or hand-picked,
+`counterpart_signature` was actually verified on the private channel or hand-picked,
 and a postmortem cannot reproduce the recovery decision.

@@ -96,7 +96,7 @@ collateral.
    query. If you have *multiple* unresolved trigger rows from different
    incidents, recover them one at a time and exclude each via `id <> :id`.
 5. **Restart the withdraw operator** (Docker: `docker compose restart
-   contra-operator-contra`). The fetcher picks up `pending` rows and
+   private-channel-operator-private-channel`). The fetcher picks up `pending` rows and
    processing resumes.
 6. **Confirm recovery** by watching for new `Completed` webhooks for
    the re-armed rows.
@@ -178,12 +178,12 @@ release and the channel-side remint may have left partial state.
    - If `NOT_LANDED` → continue.
    - If `AMBIGUOUS` → [escalate](_escalation.md) (Tier 2).
 2. **Verify the remint signature on the channel side.** The remint targets
-   the Contra side, not Solana mainnet. Check the contra read node for the
+   the private channel side, not Solana mainnet. Check the private channel read node for the
    user's ATA balance before/after `processed_at`. If the balance moved, the
    remint actually succeeded and the failure was a confirmation glitch - mark
    `failed_reminted` and capture the remint signature manually.
 3. **If both confirmed not-landed,** the user's funds are stuck:
-   - Their Contra-side tokens were burned for the withdrawal.
+   - Their private channel side tokens were burned for the withdrawal.
    - Solana-side release did not happen.
    - Remint to restore burned tokens did not happen.
    - **[Escalate](_escalation.md) (Tier 1).** Out-of-band restoration
@@ -208,7 +208,7 @@ committing the row to manual review. Three sub-triggers; same recovery.
           updated_at = NOW()
     WHERE id = :transaction_id;
    ```
-3. **If `NOT_LANDED`:** withdrawal did not happen. The user's Contra tokens
+3. **If `NOT_LANDED`:** withdrawal did not happen. The user's private channel tokens
    may or may not be burned (depends on the trigger sub-site). Confirm burn
    state via channel read node before deciding:
    - Burned, no release → re-arm to `pending` and restart operator. The

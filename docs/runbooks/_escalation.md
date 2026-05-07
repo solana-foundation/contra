@@ -16,7 +16,7 @@ support.
 
 Send:
 - `transaction_id`, `transaction_type`, `amount`, `mint`, `recipient`.
-- Originating signature (Solana for deposits, Contra-side for
+- Originating signature (Solana for deposits, private channel side for
   withdrawals).
 - On-chain verdict from the verify procedure and every signature
   checked.
@@ -36,7 +36,7 @@ those are Tier 1 only.
 
 Send:
 - `transaction_id`, `transaction_type`, `amount`, `mint`, `recipient`.
-- Originating signature (Solana for deposits, Contra-side for
+- Originating signature (Solana for deposits, private channel side for
   withdrawals).
 - On-chain verdict from the verify procedure and every signature
   checked.
@@ -58,7 +58,7 @@ File: a P1 ticket against the engineering team that owns the operator.
 
 Capture:
 - `transaction_id`, `transaction_type`, `amount`, `mint`, `recipient`.
-- Originating signature (Solana for deposits, Contra-side for
+- Originating signature (Solana for deposits, private channel side for
   withdrawals).
 - On-chain verdict from the verify procedure and every signature
   checked.

@@ -19,7 +19,6 @@ set -uo pipefail
 PROMETHEUS_URL="${PROMETHEUS_URL:-http://127.0.0.1:9090}"
 INDEXER_LAG_MAX="${INDEXER_LAG_MAX:-50}"            # slots
 OPERATOR_BACKLOG_MAX="${OPERATOR_BACKLOG_MAX:-100}" # tx
-FEEPAYER_MIN_LAMPORTS="${FEEPAYER_MIN_LAMPORTS:-100000000}"  # 0.1 SOL
 GATEWAY_ERROR_RATIO_MAX="${GATEWAY_ERROR_RATIO_MAX:-0.05}"
 RECONCILE_LOG_WINDOW="${RECONCILE_LOG_WINDOW:-10m}"
 PIPELINE_OBSERVE_SECS="${PIPELINE_OBSERVE_SECS:-10}"
@@ -184,24 +183,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# CHECK 6: Operator feepayer SOL balance
+# CHECK 6: Pipeline counters incrementing (sample twice over a window)
 # ---------------------------------------------------------------------------
-banner 6 "operator feepayer balance (≥ ${FEEPAYER_MIN_LAMPORTS} lamports)"
-
-fp=$(prom "min(private_channel_feepayer_balance_lamports)")
-if [ -z "$fp" ]; then
-  sk "feepayer balance metric not yet emitted (operator-solana may still be initializing)"
-elif le "$FEEPAYER_MIN_LAMPORTS" "$fp"; then
-  sol=$(python3 -c "print(round(float('$fp') / 1e9, 4))")
-  ok "feepayer = $fp lamports ($sol SOL) — above $FEEPAYER_MIN_LAMPORTS threshold"
-else
-  no "feepayer = $fp lamports — below $FEEPAYER_MIN_LAMPORTS threshold; operator may stop submitting tx"
-fi
-
-# ---------------------------------------------------------------------------
-# CHECK 7: Pipeline counters incrementing (sample twice over a window)
-# ---------------------------------------------------------------------------
-banner 7 "pipeline movement (dedup_received_total over ${PIPELINE_OBSERVE_SECS}s)"
+banner 6 "pipeline movement (dedup_received_total over ${PIPELINE_OBSERVE_SECS}s)"
 
 c1=$(prom "sum(private_channel_dedup_received_total)")
 sleep "$PIPELINE_OBSERVE_SECS"
@@ -220,9 +204,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# CHECK 8: Reconciliation log signals
+# CHECK 7: Reconciliation log signals
 # ---------------------------------------------------------------------------
-banner 8 "operator-solana reconciliation logs (last ${RECONCILE_LOG_WINDOW})"
+banner 7 "operator-solana reconciliation logs (last ${RECONCILE_LOG_WINDOW})"
 
 logs=$(docker logs --since "$RECONCILE_LOG_WINDOW" private-channel-operator-solana 2>&1 || true)
 recon_err=$(echo "$logs" | grep -c "MismatchExceedsThreshold" || true)
@@ -242,7 +226,7 @@ fi
 echo
 echo "==== SANITY SUMMARY: ${pass} PASS · ${fail} FAIL · ${skip} SKIP ===="
 echo "Threshold knobs: INDEXER_LAG_MAX=${INDEXER_LAG_MAX}  OPERATOR_BACKLOG_MAX=${OPERATOR_BACKLOG_MAX}"
-echo "                 FEEPAYER_MIN_LAMPORTS=${FEEPAYER_MIN_LAMPORTS}  GATEWAY_ERROR_RATIO_MAX=${GATEWAY_ERROR_RATIO_MAX}"
+echo "                 GATEWAY_ERROR_RATIO_MAX=${GATEWAY_ERROR_RATIO_MAX}"
 echo
 
 if [ "$fail" -gt 0 ]; then

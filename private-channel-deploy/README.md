@@ -107,18 +107,19 @@ Cluster-agnostic by design, the commands don't change between localnet, devnet/m
 
 ## Sanity check
 
-Default-on after deploy (skip with `--skip-tags sanity`). **Passive** — sends no transactions, just inspects HTTP `/health` endpoints, Prometheus metrics, and recent container logs. Each check prints `==== CHECK N: <name> ====` followed by `PASS` / `FAIL` / `SKIP` lines. Eight checks:
+Default-on after deploy (skip with `--skip-tags sanity`). **Passive** — sends no transactions, just inspects HTTP `/health` endpoints, Prometheus metrics, and recent container logs. Each check prints `==== CHECK N: <name> ====` followed by `PASS` / `FAIL` / `SKIP` lines. Seven checks:
 
 1. **Service `/health` endpoints** — gateway, write/read nodes, indexer + operator (`/health` on `:9100` inside containers), Postgres `pg_isready`.
 2. **Indexer lag** — `chain_tip_slot − current_slot` per program, asserted ≤ `INDEXER_LAG_MAX` (default 50 slots).
 3. **Operator backlog depth** — `private_channel_operator_backlog_depth` per program, ≤ `OPERATOR_BACKLOG_MAX` (default 100).
 4. **Yellowstone gRPC stability** — `private_channel_indexer_datasource_reconnects_total` snapshot, wait 10 s, re-snapshot; PASS if unchanged.
 5. **Gateway error ratio** — `errors_total / requests_total` < `GATEWAY_ERROR_RATIO_MAX` (default 0.05). SKIPs on a fresh deploy with zero requests.
-6. **Operator feepayer balance** — `private_channel_feepayer_balance_lamports` ≥ `FEEPAYER_MIN_LAMPORTS` (default 0.1 SOL).
-7. **Pipeline movement** — `private_channel_dedup_received_total` sampled twice over 10 s; PASS if incrementing, SKIP if zero (no traffic on a fresh deploy is expected).
-8. **Reconciliation log signals** — last 10 min of `private-channel-operator-solana` logs; FAIL on `MismatchExceedsThreshold`, PASS on recent reconciliation-OK lines, SKIP if neither.
+6. **Pipeline movement** — `private_channel_dedup_received_total` sampled twice over 10 s; PASS if incrementing, SKIP if zero (no traffic on a fresh deploy is expected).
+7. **Reconciliation log signals** — last 10 min of `private-channel-operator-solana` logs; FAIL on `MismatchExceedsThreshold`, PASS on recent reconciliation-OK lines, SKIP if neither.
 
 Tunable via env vars (see [`scripts/sanity.sh`](./scripts/sanity.sh) header). Sanity exits 0 on no-FAIL, 1 otherwise. SKIPs are honest and don't fail — they tell you what couldn't be verified passively.
+
+Operator feepayer balance is **not** a sanity gate. It's monitored continuously via the `feepayer-warn-balance` (< 1 SOL, warning) and `feepayer-low-balance` (< 0.5 SOL, critical) Grafana alerts in [`monitoring/provisioning/alerting/alert-rules.yml`](../monitoring/provisioning/alerting/alert-rules.yml). A fresh deploy with an unfunded feepayer no longer fails sanity; alerts will fire if it stays unfunded.
 
 ## Monitoring
 

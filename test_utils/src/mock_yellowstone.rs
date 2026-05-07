@@ -61,7 +61,7 @@ pub enum Update {
     Ok(Box<SubscribeUpdate>),
     /// Returns `Err(Status::invalid_argument(reason))` on the stream.
     /// Models a corrupt / malformed update that gRPC layer surfaces as a
-    /// stream error. The indexer's production private_channelct on such errors is
+    /// stream error. The indexer's production contract on such errors is
     /// to `error!()` + reconnect — see `source.rs::connect_and_stream`.
     Malformed(String),
 }

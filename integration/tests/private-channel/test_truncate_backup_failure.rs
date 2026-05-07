@@ -5,13 +5,13 @@
 //! The production code calls `verify_backup_readiness` *before* any rows
 //! are deleted; a failure there returns an `anyhow!("Backup verification
 //! failed. WAL: {}. pg_dump: {}")` with no side effects. This test proves
-//! that private_channelct across two realistic failure modes:
+//! that contract across two realistic failure modes:
 //!
 //!   A. `pg_dump_path` points at a file that cannot be read (e.g. missing
 //!      parent dir). Backup is considered invalid; truncate aborts; all
 //!      rows remain; `first_available_block` unchanged.
 //!   B. `pg_dump_path` points at a file whose mtime is *too old*
-//!      (`max_backup_age` exceeded). Same abort private_channelct.
+//!      (`max_backup_age` exceeded). Same abort contract.
 //!
 //! NOTE on scope: chmod-style mid-write failures are timing-sensitive and
 //! hard to reproduce on tmpfs. The two cases above hit the

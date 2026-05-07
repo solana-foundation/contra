@@ -726,7 +726,7 @@ mod tests {
         }
     }
 
-    // Regression guard on async-channel's MPMC fan-out private_channelct, which the
+    // Regression guard on async-channel's MPMC fan-out contract, which the
     // sigverify workerpool relies on: N cloned receivers share a single queue,
     // every item is delivered to exactly one consumer, and work spreads
     // roughly evenly across consumers under contention.

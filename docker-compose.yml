@@ -1,6 +1,4 @@
-# Compose project name. Without this, docker compose derives the project
-# from the working directory ("contra"), which would tag implicit-image
-# services as `contra-<svc>:latest` and prefix volumes as `contra_*`.
+# Compose project name.
 name: private-channel
 
 # Build-arg anchor for Solana toolchain consumers.

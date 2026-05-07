@@ -3,9 +3,9 @@
 //! Exercises the error paths in
 //! `indexer/src/indexer/datasource/yellowstone/source.rs` that only fire on a
 //! malformed upstream `SubscribeUpdate`. All assertions pin the CURRENT
-//! production private_channelct; behaviour changes should fail these tests.
+//! production contract; behaviour changes should fail these tests.
 //!
-//! ## Pinned private_channelct (per source.rs, 2026-04)
+//! ## Pinned contract (per source.rs, 2026-04)
 //!
 //! 1. Stream-level error (`tonic::Status`) ⇒ `connect_and_stream` returns
 //!    `Err(DataSourceRpcError::Protocol)`, the outer loop logs via `error!`,
@@ -17,7 +17,7 @@
 //!    Source treats this as a stream-level protocol error and reconnects.
 //!    (Per source.rs comments this is the "category b" defensive branch —
 //!    a single malformed transaction kills the live subscription. This
-//!    behaviour is under-cautious but IS the current private_channelct; flagging
+//!    behaviour is under-cautious but IS the current contract; flagging
 //!    for follow-up in the commit message rather than fixing here.)
 //! 3. Transaction whose compiled instructions reference a different program
 //!    ID ⇒ inner-loop `continue`, no stream-level impact, no error, no
@@ -319,7 +319,7 @@ async fn stream_error_triggers_reconnect_and_resumes() {
 /// stream terminates and the source reconnects. Subsequent scripted updates
 /// are delivered on the new stream.
 ///
-/// Note: a more resilient private_channelct would skip the individual bad tx. Current
+/// Note: a more resilient contract would skip the individual bad tx. Current
 /// behaviour surfaces this as a stream-kill — documented above, flagging
 /// only — the test pins what the code does today.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

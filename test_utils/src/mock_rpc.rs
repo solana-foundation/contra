@@ -252,7 +252,7 @@ impl MockRpcServer {
     /// loop hasn't yet polled `notified()` at the moment shutdown fires
     /// (common when no requests were ever served), the notification is
     /// lost and the loop sits forever in `listener.accept()`. We abort the
-    /// task as a safety net — graceful shutdown isn't a private_channelct we need
+    /// task as a safety net — graceful shutdown isn't a contract we need
     /// to honour for a mock.
     pub async fn shutdown(mut self) {
         self.stop.notify_waiters();

@@ -1025,7 +1025,7 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
 /// Config validation rejects Escrow mode without an `escrow_instance_id`.
 ///
 /// Targets `private_channel_indexer::config::PrivateChannelIndexerConfig::validate()`. The error
-/// message private_channelct is part of the CLI's public surface (operators rely on it
+/// message contract is part of the CLI's public surface (operators rely on it
 /// to diagnose startup failures), so we assert the exact substring.
 #[test]
 fn test_indexer_missing_escrow_instance_id_fails() {

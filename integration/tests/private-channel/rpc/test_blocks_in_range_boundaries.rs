@@ -71,7 +71,7 @@ async fn case_a_single_slot(ctx: &PrivateChannelContext, n: u64) {
 }
 
 // ── Case B: [N, N-1] (inverted) → explicit JSON-RPC `-32602` error. ────────
-// PrivateChannelct: the handler rejects inverted ranges at the parameter-validation
+// Contract: the handler rejects inverted ranges at the parameter-validation
 // layer rather than silently returning an empty vec. The error text must
 // name the violated invariant so callers can diagnose without round-tripping
 // the server logs.

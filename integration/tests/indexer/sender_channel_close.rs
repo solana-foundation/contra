@@ -57,7 +57,7 @@ fn mock_config() -> PrivateChannelIndexerConfig {
 ///      the loop stalling waiting for a cancellation token that will
 ///      never arrive.
 ///   b. The return value is `Ok(())` — proves the shutdown path is
-///      treated as a normal termination (private_channelst: the `?` on
+///      treated as a normal termination (contrast: the `?` on
 ///      `recover_pending_remints` would have propagated an Err if that
 ///      recovery had failed, so reaching Ok proves the select loop was
 ///      actually entered before exiting).

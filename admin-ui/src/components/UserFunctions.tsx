@@ -20,6 +20,7 @@ import {
   assertIsTransactionMessageWithSingleSendingSigner,
 } from '@solana/kit';
 
+// Fallback host is a placeholder — set VITE_PRIVATE_CHANNEL_RPC_URL before building.
 const rawUrl = import.meta.env.VITE_PRIVATE_CHANNEL_RPC_URL || 'https://api.example.com';
 const PRIVATE_CHANNEL_RPC_URL = rawUrl.startsWith('http://') || rawUrl.startsWith('https://') ? rawUrl : `https://${rawUrl}`;
 

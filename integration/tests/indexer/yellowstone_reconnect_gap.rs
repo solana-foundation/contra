@@ -1,6 +1,6 @@
 //! Reconnect-gap recovery for `YellowstoneSource`.
 //!
-//! Exercises the production private_channelct documented at `source.rs::start`:
+//! Exercises the production contract documented at `source.rs::start`:
 //! after a Yellowstone disconnect, when
 //! configured with `.with_gap_detection(rpc_poller, max_gap_slots,
 //! batch_size)`, the source should

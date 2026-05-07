@@ -10,7 +10,7 @@
 //!   * the loser's error is the lock-contention variant, not some other
 //!     error (e.g. backup-verification)
 //!   * the winner's DB side effects are durable (count of deleted blocks
-//!     matches the expected keep_slots private_channelct)
+//!     matches the expected keep_slots contract)
 //!
 //! NOTE on error shape: `truncate_slots` returns `anyhow::Result<_>`, not
 //! a typed `TruncateError`. The contention branch's message is matched
@@ -153,7 +153,7 @@ async fn test_truncate_concurrent_lock_contention() -> Result<()> {
     let r1 = r1.expect("t1 panicked");
     let r2 = r2.expect("t2 panicked");
 
-    // PrivateChannelct: exactly one winner, exactly one LockHeld loser.
+    // Contract: exactly one winner, exactly one LockHeld loser.
     let wins = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
     assert_eq!(wins, 1, "expected exactly one winner; r1={r1:?} r2={r2:?}");
 

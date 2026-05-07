@@ -382,7 +382,7 @@ pub async fn execute_batch(
             accounts_to_preload.insert(*account);
         }
 
-        // Router private_channelct: a tx is admin-routed only when EVERY instruction is
+        // Router contract: a tx is admin-routed only when EVERY instruction is
         // listed in ADMIN_INSTRUCTIONS_MAP. A mixed tx is routed to
         // the regular SVM where the admin instruction will fail naturally
         let mut has_any_admin = false;
@@ -850,7 +850,7 @@ mod tests {
     // number of results for "typical" batch sizes. The tests below target
     // invariants that a count-only assertion would miss: ordering across
     // worker-thread joins, uneven-chunk handling, the gate that forces the
-    // sequential path, and the accumulation private_channelct of merge_svm_outputs.
+    // sequential path, and the accumulation contract of merge_svm_outputs.
 
     /// Order preservation end-to-end through the parallel path.
     ///
@@ -1007,7 +1007,7 @@ mod tests {
     // --- merge_svm_outputs unit tests ---
     //
     // merge_svm_outputs is pure, so we can test it directly with fabricated
-    // outputs instead of going through the SVM. These cover the private_channelct
+    // outputs instead of going through the SVM. These cover the contract
     // execute_parallel relies on: concatenation in chunk-vec order,
     // accumulation of error_metrics and execute_timings, and the constant
     // `balance_collector = None`.

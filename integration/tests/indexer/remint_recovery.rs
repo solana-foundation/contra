@@ -1,6 +1,6 @@
 //! Pending-remint recovery across operator restart.
 //!
-//! Verifies the integration-level private_channelct of
+//! Verifies the integration-level contract of
 //! `SenderState::recover_pending_remints`: on startup, every PendingRemint
 //! row in the database must be fully reconstructed into the in-memory
 //! `pending_remints` queue so the finality-check tick can pick up where

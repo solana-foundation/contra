@@ -5,7 +5,7 @@
 //!
 //! Production callers use the typed fluent API which always sets every
 //! field, but the defensive checks still exist — this test pins the
-//! error private_channelct for each missing field.
+//! error contract for each missing field.
 
 use {
     private_channel_indexer::operator::utils::instruction_util::MintToBuilder,

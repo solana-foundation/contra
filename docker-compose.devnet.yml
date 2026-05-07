@@ -1,5 +1,8 @@
+# Compose project name.
+name: private-channel
+
 # Build-arg anchor for Solana toolchain consumers.
-# Values come from versions.env 
+# Values come from versions.env
 # Invoke compose with `--env-file versions.env --env-file .env.devnet`.
 x-solana-build-args: &solana-build-args
   SOLANA_VERSION: ${SOLANA_VERSION}

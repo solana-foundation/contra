@@ -111,7 +111,7 @@ async fn method_not_found_returns_none_without_hard_failure() {
 
     assert!(
         result.is_none(),
-        "graceful-degradation private_channelct: -32601 yields Ok(None)"
+        "graceful-degradation contract: -32601 yields Ok(None)"
     );
     mock.shutdown().await;
 }

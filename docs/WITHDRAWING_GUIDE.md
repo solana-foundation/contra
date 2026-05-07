@@ -157,7 +157,8 @@ const withdrawIx = await getWithdrawFundsInstructionAsync({
   destination: none(), // Optionally pass a destination address on Mainnet
 });
 
-// Send to Solana Private Channels RPC
+// Send to Solana Private Channels RPC.
+// Replace the URL placeholder with your real RPC endpoint.
 const private_channelRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'https://private-channel-rpc.example.com' }));
 // ... sign and send transaction
 ```

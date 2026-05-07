@@ -17,7 +17,7 @@
 //!
 //! Deposits (Escrow program type) don't halt the pipeline — they
 //! quarantine the single row and keep flowing (614-635 path). This
-//! keeps the test focused on the observable private_channelct without needing
+//! keeps the test focused on the observable contract without needing
 //! the full withdrawal SMT harness.
 
 use {

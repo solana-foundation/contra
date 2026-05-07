@@ -270,7 +270,7 @@ all-test: unit-test integration-test
 # sender/transaction.rs / sender/remint.rs / db_transaction_writer.rs /
 # db_transaction_writer's webhook serializer / the indexer schema.
 drills:
-	@cargo test -p contra-indexer --test runbook_drills -- --ignored --nocapture
+	@cargo test -p private-channel-indexer --test runbook_drills -- --ignored --nocapture
 
 drill:
 	@if [ -z "$(NAME)" ]; then \
@@ -278,7 +278,7 @@ drill:
 	    echo "       (run a single drill by name; substring match is fine)"; \
 	    exit 1; \
 	fi
-	@cargo test -p contra-indexer --test runbook_drills -- --ignored --nocapture $(NAME)
+	@cargo test -p private-channel-indexer --test runbook_drills -- --ignored --nocapture $(NAME)
 
 unit-coverage:
 	@echo "Running unit tests with coverage..."

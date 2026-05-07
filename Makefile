@@ -12,7 +12,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
 .PHONY: install install-toolchain check-toolchain check-docker build fmt generate-idl generate-clients
-.PHONY: unit-test integration-test all-test
+.PHONY: unit-test integration-test all-test drills drill
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
 .PHONY: unit-coverage coverage-html all-coverage ci-unit-coverage ci-e2e-coverage
@@ -261,6 +261,24 @@ integration-test-ci-no-build:
 	@$(MAKE) ci-integration-test-build-test-tree
 
 all-test: unit-test integration-test
+
+# Runbook drills are #[ignore]-flagged in the indexer test suite so they're
+# skipped by default. They spin up a real Postgres via testcontainers and
+# verify the SQL in docs/runbooks/*.md still matches the schema and the
+# operator code's contracts. They are NOT in CI by design, run them
+# manually before merging a runbook edit, or after touching processor.rs /
+# sender/transaction.rs / sender/remint.rs / db_transaction_writer.rs /
+# db_transaction_writer's webhook serializer / the indexer schema.
+drills:
+	@cargo test -p contra-indexer --test runbook_drills -- --ignored --nocapture
+
+drill:
+	@if [ -z "$(NAME)" ]; then \
+	    echo "usage: make drill NAME=drill_3"; \
+	    echo "       (run a single drill by name; substring match is fine)"; \
+	    exit 1; \
+	fi
+	@cargo test -p contra-indexer --test runbook_drills -- --ignored --nocapture $(NAME)
 
 unit-coverage:
 	@echo "Running unit tests with coverage..."

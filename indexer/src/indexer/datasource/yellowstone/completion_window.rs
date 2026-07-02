@@ -10,8 +10,6 @@ pub(crate) struct SlotCompletionWindow {
     high_meta: u64,
     // Observed-but-not-yet-released slots, ordered so they release ascending.
     pending: BTreeSet<u64>,
-    // Highest slot already released, so a duplicate/late BlockMeta never re-emits it.
-    last_emitted: Option<u64>,
 }
 
 impl SlotCompletionWindow {
@@ -20,27 +18,22 @@ impl SlotCompletionWindow {
             window,
             high_meta: 0,
             pending: BTreeSet::new(),
-            last_emitted: None,
         }
     }
 
     /// Record a BlockMeta for `slot` and return the slots now eligible for
-    /// SlotComplete, ascending. `window == 0` returns `slot` immediately,
-    /// except a slot already released is never repeated.
+    /// SlotComplete, ascending. Every slot is released once it falls `window`
+    /// behind the tip; a slot re-observed after release re-emits an idempotent
+    /// SlotComplete rather than being dropped, so none is ever stranded.
     pub(crate) fn observe(&mut self, slot: u64) -> Vec<u64> {
         self.high_meta = self.high_meta.max(slot);
-
-        // At or below the release frontier means already finalized (duplicate/reorder); never re-queue.
-        if self.last_emitted.is_none_or(|emitted| slot > emitted) {
-            self.pending.insert(slot);
-        }
+        self.pending.insert(slot);
 
         let threshold = self.high_meta.saturating_sub(self.window);
         let mut ready = Vec::new();
         while let Some(&s) = self.pending.first() {
             if s <= threshold {
                 self.pending.pop_first();
-                self.last_emitted = Some(s);
                 ready.push(s);
             } else {
                 break;
@@ -90,11 +83,12 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_meta_emits_once() {
-        let mut w = SlotCompletionWindow::new(0);
-        assert_eq!(w.observe(4), vec![4]);
-        // A repeated BlockMeta for the same slot must not re-finalize it.
-        assert_eq!(w.observe(4), Vec::<u64>::new());
+    fn duplicate_meta_while_pending_dedups() {
+        // A BlockMeta redelivered while its slot is still held releases the slot once.
+        let mut w = SlotCompletionWindow::new(2);
+        assert!(w.observe(4).is_empty());
+        assert!(w.observe(4).is_empty());
+        assert_eq!(w.observe(6), vec![4]);
     }
 
     #[test]
@@ -110,11 +104,13 @@ mod tests {
     }
 
     #[test]
-    fn emits_strictly_ascending() {
+    fn every_observed_slot_is_eventually_emitted() {
+        // A lower slot arriving after higher ones were already released must still
+        // be emitted, not dropped; its buffered transactions depend on it.
         let mut w = SlotCompletionWindow::new(2);
-        let sequence = [7u64, 5, 6, 9, 8, 12, 4, 20];
+        let observed = [7u64, 5, 6, 9, 8, 12, 4, 20];
         let mut all = Vec::new();
-        for slot in sequence {
+        for slot in observed {
             let ready = w.observe(slot);
             // Each individual return is itself ascending.
             let mut sorted = ready.clone();
@@ -122,10 +118,24 @@ mod tests {
             assert_eq!(ready, sorted, "each return must be ascending");
             all.extend(ready);
         }
-        // The global emission order is strictly ascending (frontier-friendly, no
-        // slot released twice, none out of order).
-        for pair in all.windows(2) {
-            assert!(pair[0] < pair[1], "global order must be strictly ascending");
-        }
+        all.sort_unstable();
+
+        // No slot is released more than once.
+        let mut deduped = all.clone();
+        deduped.dedup();
+        assert_eq!(all, deduped, "no slot released twice");
+
+        // Every slot at least `window` behind the highest observed is released.
+        let high = *observed.iter().max().unwrap();
+        let mut expected: Vec<u64> = observed
+            .iter()
+            .copied()
+            .filter(|s| *s <= high - 2)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            all, expected,
+            "every eligible observed slot is emitted exactly once"
+        );
     }
 }

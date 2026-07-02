@@ -364,33 +364,39 @@ async fn drive_caller_arm_with_jit_setup(
     .await
 }
 
-/// JitOutcome::Retry path — the caller-arm match must invoke the
-/// recursive `send_and_confirm` and emit `Completed`.
+/// JitOutcome::Retry path - the retry is re-issued through the write-ahead
+/// fire-and-store path (journaled, then stashed in-flight), so it completes
+/// via the poll cycle rather than inline. Driving one poll_in_flight confirms
+/// it and emits `Completed`.
 #[tokio::test]
 async fn mint_not_initialized_jit_retry_completes() {
     let (mut state, mut storage_rx, storage_tx, mock, mint) =
         build_state_for_jit_caller_arm(true).await;
 
-    // JIT pre-check sees admin-owned init → Retry without sending init.
+    // JIT pre-check sees admin-owned init, so Retry without sending init.
     let admin_bytes = pack_mint_with_authority(COption::Some(SignerUtil::admin_signer().pubkey()));
     mock.enqueue("getAccountInfo", account_info_reply_bytes(&admin_bytes));
 
-    // Recursive send_and_confirm wire scripting — succeeds.
+    // fire-and-store re-issue: build/sign then broadcast (journaled write-ahead).
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    // The subsequent poll cycle confirms the stashed retry.
     mock.enqueue("getSignatureStatuses", confirmed_status_reply());
 
     drive_caller_arm_with_jit_setup(&mut state, 5001, mint, &storage_tx).await;
 
+    // The retry is stashed in-flight, not confirmed inline; drive one poll cycle.
+    test_hooks::poll_in_flight(&mut state, &storage_tx).await;
+
     let update = storage_rx
         .recv()
         .await
-        .expect("Retry path must drive the recursive send to a status update");
+        .expect("Retry path must drive the stashed mint to a status update");
     assert_eq!(update.transaction_id, 5001);
     assert_eq!(
         update.status,
         TransactionStatus::Completed,
-        "JitOutcome::Retry must complete via recursive send_and_confirm; got {:?}",
+        "JitOutcome::Retry must complete once the poll cycle confirms it; got {:?}",
         update.status
     );
     mock.shutdown().await;

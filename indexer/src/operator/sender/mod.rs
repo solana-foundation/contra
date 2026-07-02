@@ -6,7 +6,7 @@ mod transaction;
 pub mod types;
 
 pub use mint::JitOutcome;
-pub(crate) use remint::{classify_signatures, SigFinality};
+pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
 pub(crate) use state::validate_smt_root;
 pub use types::TransactionStatusUpdate;
 
@@ -611,6 +611,7 @@ mod tests {
         SenderState {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -672,6 +673,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),

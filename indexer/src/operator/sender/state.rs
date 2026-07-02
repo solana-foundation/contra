@@ -44,10 +44,27 @@ impl SenderState {
         let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
         let mint_cache = MintCache::with_rpc(storage.clone(), mint_rpc_client.clone());
 
+        // Optional destination fallback, same retry/commitment as its primary.
+        // Empty means unset (env renders unconfigured as ""), so it maps to None.
+        let fallback_rpc_client = config
+            .fallback_rpc_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|url| {
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    url.to_string(),
+                    RetryConfig::default(),
+                    CommitmentConfig {
+                        commitment: operator_commitment,
+                    },
+                ))
+            });
+
         Ok(Self {
             rpc_client,
             // Source chain client (also used by MintCache). Remints broadcast here.
             source_rpc_client: mint_rpc_client,
+            fallback_rpc_client,
             storage,
             instance_pda,
             smt_state: None,
@@ -404,6 +421,7 @@ mod tests {
         SenderState {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -906,6 +924,7 @@ mod tests {
         SenderState {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: pda,
             smt_state: None,
@@ -931,6 +950,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -1005,6 +1025,62 @@ mod tests {
         let state = result.unwrap();
         assert_eq!(state.instance_pda, Some(instance_pda));
         assert_eq!(state.retry_max_attempts, 5);
+    }
+
+    /// An empty fallback URL (how env renders an unconfigured value) must
+    /// build no client, so the destination oracle stays single-endpoint.
+    #[test]
+    fn empty_fallback_url_builds_no_client() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut config = make_config();
+        config.fallback_rpc_url = Some(String::new());
+
+        let state = SenderState::new(
+            &config,
+            CommitmentLevel::Confirmed,
+            None,
+            storage,
+            3,
+            400,
+            None,
+        )
+        .expect("construction must succeed with an empty fallback URL");
+
+        assert!(
+            state.fallback_rpc_client.is_none(),
+            "empty fallback URL must not build a client"
+        );
+        assert!(
+            state.dest_finality().fallback.is_none(),
+            "empty fallback must leave the destination single-endpoint"
+        );
+    }
+
+    /// A non-empty fallback URL builds a client, so the destination oracle
+    /// carries a corroborating endpoint.
+    #[test]
+    fn set_fallback_url_builds_client() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut config = make_config();
+        config.fallback_rpc_url = Some("http://localhost:9999".to_string());
+
+        let state = SenderState::new(
+            &config,
+            CommitmentLevel::Confirmed,
+            None,
+            storage,
+            3,
+            400,
+            None,
+        )
+        .expect("construction must succeed with a set fallback URL");
+
+        assert!(state.fallback_rpc_client.is_some());
+        assert!(state.dest_finality().fallback.is_some());
+        // Source stays single-endpoint regardless of the fallback.
+        assert!(state.source_finality().fallback.is_none());
     }
 
     /// Pins the SmtRootMismatch wedge: a landed release whose nonce never reaches

@@ -242,7 +242,9 @@ async fn yellowstone_handles_inner_instructions_and_unknown_discriminator() {
         "confirmed".to_string(),
         ProgramType::Escrow,
         None,
-    );
+    )
+    // Pin immediate emission: this asserts raw stream ordering, not the safety-window lag.
+    .with_safety_window(0);
     let handle = source
         .start(tx, cancel.clone())
         .await

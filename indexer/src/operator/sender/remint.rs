@@ -322,6 +322,18 @@ pub(crate) enum SigFinality {
     Uncertain(String),
 }
 
+impl SigFinality {
+    /// Short variant name plus its payload, for triage logs.
+    fn label(&self) -> String {
+        match self {
+            SigFinality::Landed(sig) => format!("Landed: {sig}"),
+            SigFinality::Live(reason) => format!("Live: {reason}"),
+            SigFinality::Dead => "Dead".to_string(),
+            SigFinality::Uncertain(reason) => format!("Uncertain: {reason}"),
+        }
+    }
+}
+
 /// A primary RPC endpoint plus an optional fallback. One endpoint's missing status
 /// can be a prune or lag rather than proof, so only a `Dead` verdict re-checks it.
 pub(crate) struct FinalityRpc<'a> {
@@ -351,9 +363,24 @@ pub(crate) async fn classify_signatures(
         return verdict;
     }
     match finality.fallback {
-        // The fallback's verdict is final: it overrides a wrong Dead, or confirms
-        // it. Both sides run the same classifier, so the check is apples to apples.
-        Some(fb) => classify_against(fb, sigs).await,
+        Some(fb) => {
+            // The fallback's verdict is final: it overrides a wrong Dead, or
+            // confirms it. Both sides run the same classifier.
+            let corroborated = classify_against(fb, sigs).await;
+            if !matches!(corroborated, SigFinality::Dead) {
+                // The case this feature exists to catch: the primary called it
+                // dead but an independent endpoint disagrees. Log for triage.
+                warn!(
+                    "finality fallback overrode a primary Dead verdict ({}) for signature(s): {}",
+                    corroborated.label(),
+                    sigs.iter()
+                        .map(|p| p.signature.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            corroborated
+        }
         None => {
             debug!("finality Dead on single endpoint (no fallback configured); trusting primary");
             SigFinality::Dead

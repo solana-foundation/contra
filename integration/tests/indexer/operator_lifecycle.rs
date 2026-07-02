@@ -118,6 +118,7 @@ async fn start_operator_with_alert(
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
         source_rpc_url: Some(rpc_url),
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -165,6 +166,7 @@ async fn start_operator_with_config(
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
         source_rpc_url: Some(rpc_url),
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };

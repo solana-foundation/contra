@@ -37,6 +37,7 @@ fn escrow_config() -> PrivateChannelIndexerConfig {
         // sender never gets past the lock check.
         rpc_url: "http://127.0.0.1:1".to_string(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         // Unused by run_sender; storage is passed in directly.
         postgres: PostgresConfig {
             database_url: "mock://unused".to_string(),

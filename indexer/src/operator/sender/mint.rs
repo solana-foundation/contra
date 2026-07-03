@@ -401,30 +401,23 @@ async fn mint_authority_check_with_backoff(
 /// Which serviced operation a consumed channel mint corresponds to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsumedMintKind {
-    /// A deposit `mint_to` (carries `MINT_IDEMPOTENCY_MEMO_PREFIX`).
+    /// A deposit `mint_to`
     Deposit,
-    /// A withdrawal remint `mint_to` (carries `REMINT_IDEMPOTENCY_MEMO_PREFIX`).
+    /// A withdrawal remint `mint_to`
     Remint,
 }
 
 /// Set of source events the PrivateChannel has already serviced, keyed by their durable
 /// source-event-id. Built once, before a resync wipe, so the rebuild can reconcile each
-/// row to its terminal state instead of re-emitting a serviceable `pending`.
+/// row to its terminal state.
 pub type ConsumedSet = HashMap<SourceEventId, (Signature, ConsumedMintKind)>;
 
 /// Enumerate every idempotency-memo'd mint the `authority` has confirmed on the channel
 /// into a `ConsumedSet`.
 ///
-/// Fails closed (returns `Err`, never a partial/empty set) on any RPC/pagination error
-/// so an unverifiable lookup cannot be mistaken for "nothing was minted". Also fails
-/// closed if it finds an idempotency-prefixed memo that does not parse to a current
-/// source-event-id (a legacy serial-id memo): those are serviced mints a resync cannot
-/// reconcile, and proceeding would re-mint them.
-///
-/// Completeness assumes the PrivateChannel RPC populates the `memo` field in its
-/// getSignaturesForAddress responses (our channel node does). A confirmed signature with
-/// no memo is treated as a non-idempotency mint and skipped; we do not issue a
-/// per-signature getTransaction fallback to recover a missing memo.
+/// Fails closed on any RPC/pagination error, and on an idempotency-prefixed memo that
+/// doesn't parse to a current source-event-id (a serviced mint resync can't reconcile —
+/// proceeding would re-mint it).
 pub async fn enumerate_consumed_mints(
     rpc: &RpcClientWithRetry,
     authority: &Pubkey,

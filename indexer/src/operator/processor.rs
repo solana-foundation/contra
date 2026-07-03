@@ -400,7 +400,7 @@ async fn build_release_funds(
     );
     let remint_info = WithdrawalRemintInfo {
         transaction_id: transaction.id,
-        source_event_id: SourceEventId::from_row(&transaction),
+        source_event_id: SourceEventId::from_row(transaction),
         trace_id: transaction.trace_id.clone(),
         mint,
         user: recipient,

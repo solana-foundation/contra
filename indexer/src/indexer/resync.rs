@@ -85,19 +85,18 @@ impl ResyncService {
             RetryConfig::default(),
             CommitmentConfig::confirmed(),
         );
-        let set = enumerate_consumed_mints(
-            &channel_rpc,
-            &reconcile.authority,
-            CONSUMED_SET_PAGE_SIZE,
-        )
-        .await
-        .map_err(|reason| {
-            error!(
-                authority = %reconcile.authority,
-                "Consumed-set enumeration failed; aborting resync before drop: {reason}"
-            );
-            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable { reason })
-        })?;
+        let set =
+            enumerate_consumed_mints(&channel_rpc, &reconcile.authority, CONSUMED_SET_PAGE_SIZE)
+                .await
+                .map_err(|reason| {
+                    error!(
+                        authority = %reconcile.authority,
+                        "Consumed-set enumeration failed; aborting resync before drop: {reason}"
+                    );
+                    IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                        reason,
+                    })
+                })?;
         info!(
             "Consumed-set built: {} serviced mint(s) on the channel",
             set.len()

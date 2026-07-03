@@ -1384,7 +1384,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         let inserted = mock.inserted_transactions.lock().unwrap();
         let row = &inserted[0][0];
@@ -1412,7 +1413,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         let inserted = mock.inserted_transactions.lock().unwrap();
         let row = &inserted[0][0];
@@ -1435,7 +1437,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         let inserted = mock.inserted_transactions.lock().unwrap();
         let row = &inserted[0][0];
@@ -1463,7 +1466,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         let inserted = mock.inserted_transactions.lock().unwrap();
         assert_eq!(inserted[0][0].status, TransactionStatus::Pending);
@@ -1481,7 +1485,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         let inserted = mock.inserted_transactions.lock().unwrap();
         assert_eq!(inserted[0][0].status, TransactionStatus::Pending);

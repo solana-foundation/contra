@@ -18,6 +18,10 @@
 //! those exact coordinates, then scripts the matching memo and runs again. The
 //! coordinates are chain-derived, hence stable across runs.
 
+// Shared `#[path]` helper modules (helpers, setup) expose more than this binary
+// uses; match the sibling integration test crates and allow the unused items.
+#![allow(dead_code)]
+
 #[path = "helpers/mod.rs"]
 mod helpers;
 

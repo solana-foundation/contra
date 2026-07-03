@@ -21,20 +21,12 @@ pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:remint:";
 const NO_INNER_INDEX: i32 = -1;
 
 /// Length in bytes of the SHA256 digest a current-scheme source-event-id encodes.
-/// A memo whose value does not base58-decode to exactly this many bytes is from an
-/// older (serial-id) scheme and cannot be reconciled.
 pub const SOURCE_EVENT_ID_DIGEST_LEN: usize = 32;
 
 /// Durable, chain-reproducible identity for a single source economic event.
 ///
 /// Derived as `base58(SHA256(signature || instruction_index || inner_index))` from the
-/// event's on-chain coordinates. Because it depends only on chain-visible identity (not
-/// the volatile `BIGSERIAL transactions.id`), a row rebuilt after a resync wipe recomputes
-/// the same id as the mint that already serviced it, which is what lets a rebuild
-/// reconcile against existing channel mints. The (signature, instruction_index,
-/// inner_index) triple is already globally unique on the source chain, so no instance
-/// scoping is needed; including it would only let the memo-write scope (real instance PDA)
-/// drift from the resync-read scope (which lacks an instance) and cause replays to miss.
+/// event's on-chain coordinates. Because it depends only on chain-visible identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceEventId(String);
 

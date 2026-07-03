@@ -37,7 +37,7 @@ use private_channel_indexer::{
     },
     operator::{
         utils::instruction_util::{mint_idempotency_memo, remint_idempotency_memo, SourceEventId},
-        ConsumedMintKind, MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+        ConsumedMintKind, CONSUMED_SET_PAGE_SIZE,
     },
     storage::{PostgresDb, Storage},
     PostgresConfig,
@@ -83,7 +83,7 @@ const DEPOSIT_AMOUNT_B: u64 = 22_000;
 const WITHDRAW_AMOUNT: u64 = 7_000;
 /// Page size resync uses to enumerate the channel; mirrored so the page-2 test
 /// can fill an exact first page and force the `before`-cursor to advance.
-const CHANNEL_PAGE_LIMIT: usize = MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT;
+const CHANNEL_PAGE_LIMIT: usize = CONSUMED_SET_PAGE_SIZE;
 
 // ── postgres + service harness ──────────────────────────────────────────────
 

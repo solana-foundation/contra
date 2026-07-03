@@ -54,10 +54,14 @@ impl RpcPoller {
 
         // Check for RPC error
         if let Some(error) = json.get("error") {
-            // Slot was skipped or missing:
+            // Skipped/unavailable slot. At finalized commitment a slot at/below the
+            // tip with no block was skipped and carries no transactions — treat as
+            // empty, like the `result: null` case below. -32004 is the error-object
+            // spelling of that; without it a skipped slot aborts the whole backfill.
+            // -32004: Block not available for slot (skipped or missing)
             // -32007: Slot skipped or missing due to ledger jump to recent snapshot
             // -32009: Slot skipped or missing in long-term storage
-            if error["code"] == -32007 || error["code"] == -32009 {
+            if error["code"] == -32004 || error["code"] == -32007 || error["code"] == -32009 {
                 return Ok(None);
             }
             return Err(DataSourceRpcError::Protocol {
@@ -183,6 +187,25 @@ mod tests {
     async fn test_get_block_skipped_slot() {
         let mut server = Server::new_async().await;
         let _m = mock_rpc_error(&mut server, -32009, "Slot was skipped").await;
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_block(101).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_block_not_available_treated_as_skip() {
+        // -32004 "Block not available for slot" is the error-object spelling of a
+        // skipped/unavailable slot; at finalized commitment it must be treated as an
+        // empty slot (Ok(None)), not a fatal error that aborts the backfill.
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_error(&mut server, -32004, "Block not available for slot 101").await;
 
         let poller = RpcPoller::new(
             server.url(),

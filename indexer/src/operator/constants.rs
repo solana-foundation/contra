@@ -3,7 +3,7 @@ pub const DEFAULT_CU_MINT: Option<u32> = None;
 pub const MINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:mint-idempotency:";
 /// Per-page signature limit (getSignaturesForAddress max) used when the resync
 /// consumed-set enumeration pages the channel authority's mint history.
-pub const MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
+pub const CONSUMED_SET_PAGE_SIZE: usize = 1000;
 
 // SMT tree constants (must match on-chain program)
 #[cfg(not(feature = "test-tree"))]

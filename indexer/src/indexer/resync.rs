@@ -7,7 +7,7 @@ use crate::{
     },
     operator::{
         enumerate_consumed_mints, ConsumedSet, RetryConfig, RpcClientWithRetry,
-        MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+        CONSUMED_SET_PAGE_SIZE,
     },
     storage::Storage,
 };
@@ -88,7 +88,7 @@ impl ResyncService {
         let set = enumerate_consumed_mints(
             &channel_rpc,
             &reconcile.authority,
-            MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+            CONSUMED_SET_PAGE_SIZE,
         )
         .await
         .map_err(|reason| {

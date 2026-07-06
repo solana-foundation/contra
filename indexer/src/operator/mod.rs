@@ -17,5 +17,7 @@ pub use fetcher::run_fetcher;
 pub use operator::run;
 pub use processor::run_processor;
 pub use recovery::run_recovery_worker;
-pub use sender::{run_sender, TransactionStatusUpdate};
+pub use sender::{
+    enumerate_consumed_mints, run_sender, ConsumedMintKind, ConsumedSet, TransactionStatusUpdate,
+};
 pub use utils::*;

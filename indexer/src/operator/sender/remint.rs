@@ -108,7 +108,9 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         }
     }
 
-    let memo = remint_idempotency_memo(info.transaction_id);
+    // Durable, chain-reproducible memo (survives a resync wipe); the stored signature
+    // remains the live idempotency control.
+    let memo = remint_idempotency_memo(&info.source_event_id);
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
     // Memo is an on-chain marker only; the stored signature is the idempotency control.
@@ -794,6 +796,11 @@ mod tests {
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
+            source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                &format!("remint-sig-{txn_id}"),
+                0,
+                None,
+            ),
             trace_id: format!("trace-{txn_id}"),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             user: solana_sdk::pubkey::Pubkey::new_unique(),

@@ -55,9 +55,10 @@ impl RpcPoller {
         // Check for RPC error
         if let Some(error) = json.get("error") {
             // Slot skipped or missing; the node cannot tell the two apart:
+            // -32004: Block not available for slot (skipped or missing)
             // -32007: Slot skipped or missing due to ledger jump to recent snapshot
             // -32009: Slot skipped or missing in long-term storage
-            if error["code"] == -32007 || error["code"] == -32009 {
+            if error["code"] == -32004 || error["code"] == -32007 || error["code"] == -32009 {
                 return self.classify_absent_slot(slot).await;
             }
             return Err(DataSourceRpcError::Protocol {
@@ -324,6 +325,24 @@ mod tests {
         let result = poller.get_block(40).await;
 
         assert!(result.is_err());
+    }
+
+    /// -32004 "Block not available for slot" is the error-object spelling of an
+    /// absent slot; at or above the retained floor it is a proven skip.
+    #[tokio::test]
+    async fn get_block_not_available_classified_by_floor() {
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_error(&mut server, -32004, "Block not available for slot 101").await;
+        let _floor = mock_first_available_block(&mut server, 50);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_block(101).await;
+
+        assert!(matches!(result.unwrap(), BlockFetch::Skipped));
     }
 
     #[tokio::test]

@@ -83,10 +83,6 @@ pub struct RpcPollingConfig {
     pub encoding: UiTransactionEncoding,
     /// RPC commitment level for getSlot calls
     pub commitment: CommitmentLevel,
-    /// Optional archival/full-history RPC consulted once by the live polling loop
-    /// when the primary returns a slot with missing transaction metadata.
-    #[serde(default)]
-    pub fallback_rpc_url: Option<String>,
 }
 
 /// Yellowstone gRPC specific configuration
@@ -126,6 +122,10 @@ pub struct PrivateChannelIndexerConfig {
     pub storage_type: StorageType,
     /// RPC endpoint URL (destination chain for operators)
     pub rpc_url: String,
+    /// Optional archival fallback RPC for `rpc_url`, used by the operator to
+    /// re-check a `Dead` verdict and by the poller for missing-block failover.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
     /// Source chain RPC URL for cross-chain operators (optional)
     /// Used by escrow operator to read mint metadata from Solana
     /// while sending mint transactions to PrivateChannel via rpc_url
@@ -330,6 +330,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: Some("http://localhost:8899".to_string()),
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -349,7 +350,6 @@ mod tests {
                 batch_size: 10,
                 encoding: UiTransactionEncoding::Json,
                 commitment: CommitmentLevel::Finalized,
-                fallback_rpc_url: None,
             }),
             yellowstone: None,
             backfill: BackfillConfig {

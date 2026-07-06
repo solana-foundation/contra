@@ -4,6 +4,9 @@
 program_type = "withdraw"
 # Solana Solana validator — where ReleaseFunds transactions are sent
 rpc_url = "http://localhost:18899"
+# Optional archival Solana fallback for rpc_url. Re-checks a Dead finality verdict
+# before a remint/re-release. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
 
 # Solana Private Channels gateway — source of withdrawal/burn state and mint account data
 source_rpc_url = "http://localhost:8898"

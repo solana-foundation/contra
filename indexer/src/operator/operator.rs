@@ -43,6 +43,22 @@ pub async fn run(
         },
     ));
 
+    // Optional destination fallback for recovery and the boot pre-flight to
+    // re-check a Dead verdict. Empty means unset (env renders "") and maps to None.
+    let fallback_rpc_client = common_config
+        .fallback_rpc_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|url| {
+            Arc::new(RpcClientWithRetry::with_retry_config(
+                url.to_string(),
+                RetryConfig::default(),
+                CommitmentConfig {
+                    commitment: config.rpc_commitment,
+                },
+            ))
+        });
+
     // The withdraw operator's compensating remint MintTo must broadcast on the source
     // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
     // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
@@ -100,6 +116,7 @@ pub async fn run(
             let preflight = run_withdraw_preflight(
                 &storage,
                 &rpc_client,
+                fallback_rpc_client.clone(),
                 preflight_instance,
                 &storage_tx,
                 &cancellation_token,
@@ -234,12 +251,14 @@ pub async fn run(
     let recovery_handle = {
         let recovery_storage = storage.clone();
         let recovery_rpc = rpc_client.clone();
+        let recovery_fallback = fallback_rpc_client.clone();
         let recovery_program_type = common_config.program_type;
         let recovery_token = cancellation_token.clone();
         tokio::spawn(async move {
             if let Err(e) = recovery::run_recovery_worker(
                 recovery_storage,
                 recovery_rpc,
+                recovery_fallback,
                 recovery_program_type,
                 recovery_storage_tx,
                 recovery_token,
@@ -354,6 +373,7 @@ pub async fn run(
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,
+    fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     instance_pda: solana_sdk::pubkey::Pubkey,
     storage_tx: &mpsc::Sender<sender::TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
@@ -366,6 +386,7 @@ async fn run_withdraw_preflight(
     if let Err(e) = recovery::boot_reconcile_processing(
         storage,
         rpc_client,
+        fallback_rpc_client,
         crate::config::ProgramType::Withdraw,
         storage_tx,
         cancellation_token,
@@ -498,7 +519,15 @@ mod tests {
         let client = Arc::new(client);
         let (storage_tx, _rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
         let token = CancellationToken::new();
-        run_withdraw_preflight(&storage, &client, Pubkey::new_unique(), &storage_tx, &token).await
+        run_withdraw_preflight(
+            &storage,
+            &client,
+            None,
+            Pubkey::new_unique(),
+            &storage_tx,
+            &token,
+        )
+        .await
     }
 
     /// Matching local and on-chain roots: the pre-flight passes and the operator starts.

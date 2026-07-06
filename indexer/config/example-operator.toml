@@ -8,6 +8,9 @@ program_type = "escrow"
 
 # RPC endpoint URL for transaction submission
 rpc_url = "http://localhost:8899"
+# Optional archival Solana fallback for rpc_url. Re-checks a Dead finality verdict
+# before a remint/re-release. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
 
 # Escrow instance ID (required for escrow program type, omit for withdraw)
 # escrow_instance_id = "YourPubkeyHere..."

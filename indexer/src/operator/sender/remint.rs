@@ -84,7 +84,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
             }
         };
 
-        match classify_signatures(&state.source_rpc_client, &prior_attempts).await {
+        match classify_signatures(&state.source_finality(), &prior_attempts).await {
             SigFinality::Landed(signature) => {
                 info!(
                     "Remint already landed for transaction {}: {}",
@@ -322,11 +322,74 @@ pub(crate) enum SigFinality {
     Uncertain(String),
 }
 
-/// Classify `sigs` against on-chain state (see `SigFinality` variants).
+impl SigFinality {
+    /// Short variant name plus its payload, for triage logs.
+    fn label(&self) -> String {
+        match self {
+            SigFinality::Landed(sig) => format!("Landed: {sig}"),
+            SigFinality::Live(reason) => format!("Live: {reason}"),
+            SigFinality::Dead => "Dead".to_string(),
+            SigFinality::Uncertain(reason) => format!("Uncertain: {reason}"),
+        }
+    }
+}
+
+/// A primary RPC endpoint plus an optional fallback. One endpoint's missing status
+/// can be a prune or lag rather than proof, so only a `Dead` verdict re-checks it.
+pub(crate) struct FinalityRpc<'a> {
+    pub primary: &'a RpcClientWithRetry,
+    pub fallback: Option<&'a RpcClientWithRetry>,
+}
+
+impl<'a> FinalityRpc<'a> {
+    /// Single-endpoint oracle: no corroboration. Used where no independent second
+    /// endpoint exists (a single-provider chain) or none is configured.
+    pub fn single(primary: &'a RpcClientWithRetry) -> Self {
+        Self {
+            primary,
+            fallback: None,
+        }
+    }
+}
+
+/// Classify `sigs`. Only a `Dead` verdict is re-checked against the fallback; the
+/// safe verdicts return from `primary` first, so the fallback is queried rarely.
 pub(crate) async fn classify_signatures(
-    rpc: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
     sigs: &[PendingSig],
 ) -> SigFinality {
+    let verdict = classify_against(finality.primary, sigs).await;
+    if !matches!(verdict, SigFinality::Dead) {
+        return verdict;
+    }
+    match finality.fallback {
+        Some(fb) => {
+            // The fallback's verdict is final: it overrides a wrong Dead, or
+            // confirms it. Both sides run the same classifier.
+            let corroborated = classify_against(fb, sigs).await;
+            if !matches!(corroborated, SigFinality::Dead) {
+                // The case this feature exists to catch: the primary called it
+                // dead but an independent endpoint disagrees. Log for triage.
+                warn!(
+                    "finality fallback overrode a primary Dead verdict ({}) for signature(s): {}",
+                    corroborated.label(),
+                    sigs.iter()
+                        .map(|p| p.signature.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            corroborated
+        }
+        None => {
+            debug!("finality Dead on single endpoint (no fallback configured); trusting primary");
+            SigFinality::Dead
+        }
+    }
+}
+
+/// Classify `sigs` against a single endpoint (see `SigFinality` variants).
+pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
     let response = match rpc.get_signature_statuses_with_history(&flat).await {
@@ -438,7 +501,7 @@ pub async fn process_pending_remints(
         // Classify the stored signatures against on-chain state. This runs on
         // rpc_client (the destination/Solana chain where ReleaseFunds was sent),
         // not source_rpc_client which only the remint MintTo uses.
-        match classify_signatures(&state.rpc_client, &entry.signatures).await {
+        match classify_signatures(&state.dest_finality(), &entry.signatures).await {
             // Case 1: a sig finalized successfully, the withdrawal landed.
             SigFinality::Landed(sig) => {
                 // Chain root now includes this nonce. handle_permanent_failure
@@ -669,6 +732,7 @@ mod tests {
         let state = SenderState {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -754,6 +818,7 @@ mod tests {
         let state = SenderState {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -793,7 +858,11 @@ mod tests {
     /// Builds a SenderState with distinct rpc_client and source_rpc_client
     /// endpoints, matching the cross-chain withdraw operator (rpc_url=Solana,
     /// source_rpc_url=PrivateChannel).
-    fn make_sender_state_split_rpc(dest_url: &str, source_url: &str) -> (SenderState, MockStorage) {
+    fn make_sender_state_split_rpc(
+        dest_url: &str,
+        source_url: &str,
+        dest_fallback_url: Option<&str>,
+    ) -> (SenderState, MockStorage) {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let fast = crate::operator::RetryConfig {
@@ -808,12 +877,20 @@ mod tests {
         ));
         let source_rpc_client = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
             source_url.to_string(),
-            fast,
+            fast.clone(),
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ));
+        let fallback_rpc_client = dest_fallback_url.map(|url| {
+            Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+                url.to_string(),
+                fast,
+                solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            ))
+        });
         let state = SenderState {
             rpc_client,
             source_rpc_client,
+            fallback_rpc_client,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -890,7 +967,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (mut state, _mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, _mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {
@@ -1714,7 +1791,7 @@ mod tests {
             },
         ];
 
-        match classify_signatures(&rpc, &sigs).await {
+        match classify_against(&rpc, &sigs).await {
             SigFinality::Landed(s) => assert_eq!(
                 s, success,
                 "must return the finalized-success sig, not the failed one"
@@ -1753,7 +1830,7 @@ mod tests {
         ];
 
         assert!(
-            matches!(classify_signatures(&rpc, &sigs).await, SigFinality::Live(_)),
+            matches!(classify_against(&rpc, &sigs).await, SigFinality::Live(_)),
             "confirmed success behind a finalized failure must be Live, not Dead"
         );
     }
@@ -1790,7 +1867,7 @@ mod tests {
         ];
 
         assert!(
-            matches!(classify_signatures(&rpc, &sigs).await, SigFinality::Live(_)),
+            matches!(classify_against(&rpc, &sigs).await, SigFinality::Live(_)),
             "a still-valid null after an expired null must be Live, not Dead"
         );
     }
@@ -1822,11 +1899,287 @@ mod tests {
 
         assert!(
             matches!(
-                classify_signatures(&rpc, &sigs).await,
+                classify_against(&rpc, &sigs).await,
                 SigFinality::Uncertain(_)
             ),
             "length mismatch must be Uncertain"
         );
+    }
+
+    // ── classify_signatures corroboration wrapper (FinalityRpc) ─────────
+
+    /// The four canonical single-signature getSignatureStatuses response bodies,
+    /// so each corroboration test states its endpoint's verdict in one word.
+    enum StatusKind {
+        FinalizedSuccess,
+        ConfirmedLive,
+        Null,
+    }
+
+    fn status_body(kind: StatusKind) -> &'static str {
+        match kind {
+            StatusKind::FinalizedSuccess => {
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                    "slot":100,"confirmations":null,"err":null,
+                    "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#
+            }
+            StatusKind::ConfirmedLive => {
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                    "slot":100,"confirmations":10,"err":null,
+                    "status":{"Ok":null},"confirmationStatus":"confirmed"}]},"id":0}"#
+            }
+            StatusKind::Null => {
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#
+            }
+        }
+    }
+
+    /// One expired sig: current_height 1000 > lvbh 100, so a null status is Dead.
+    fn one_expired_sig() -> Vec<PendingSig> {
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 100,
+        }]
+    }
+
+    /// Make the endpoint return null + a block height past validity, i.e. Dead.
+    async fn mock_dead(server: &mut mockito::Server) {
+        mock_rpc(
+            server,
+            "getSignatureStatuses",
+            status_body(StatusKind::Null),
+        )
+        .await;
+        mock_rpc(
+            server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+    }
+
+    /// The bug scenario. The primary reports the release gone but the fallback
+    /// still has the finalized-success record, so the verdict is Landed, not Dead.
+    #[tokio::test]
+    async fn primary_dead_fallback_landed_returns_landed() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_dead(&mut primary).await;
+        mock_rpc(
+            &mut fb,
+            "getSignatureStatuses",
+            status_body(StatusKind::FinalizedSuccess),
+        )
+        .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Landed(_)
+            ),
+            "fallback finalized-success must override the primary's Dead"
+        );
+    }
+
+    /// Both endpoints agree the signatures are gone, so Dead stands and the
+    /// remint is safe.
+    #[tokio::test]
+    async fn dead_corroborated_by_fallback_stays_dead() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_dead(&mut primary).await;
+        mock_dead(&mut fb).await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Dead
+            ),
+            "both endpoints Dead must stay Dead"
+        );
+    }
+
+    /// The fallback still sees the sig on-chain (confirmed), so defer rather
+    /// than remint.
+    #[tokio::test]
+    async fn primary_dead_fallback_live_defers() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_dead(&mut primary).await;
+        mock_rpc(
+            &mut fb,
+            "getSignatureStatuses",
+            status_body(StatusKind::ConfirmedLive),
+        )
+        .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Live(_)
+            ),
+            "a live fallback status must defer, not remint"
+        );
+    }
+
+    /// The fallback is down. Never trust a lone Dead when a fallback was
+    /// configured to corroborate it: fail closed to Uncertain.
+    #[tokio::test]
+    async fn primary_dead_fallback_unavailable_is_uncertain() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_dead(&mut primary).await;
+        mock_rpc(
+            &mut fb,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+        )
+        .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Uncertain(_)
+            ),
+            "an unavailable fallback must fail closed to Uncertain, never Dead"
+        );
+    }
+
+    /// With no fallback configured, the primary's Dead is trusted exactly as
+    /// legacy single-endpoint behavior.
+    #[tokio::test]
+    async fn dead_without_fallback_stays_dead() {
+        let mut primary = mockito::Server::new_async().await;
+        mock_dead(&mut primary).await;
+
+        let p = make_rpc(&primary.url());
+        let finality = FinalityRpc::single(&p);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Dead
+            ),
+            "no fallback means the primary's Dead is trusted as today"
+        );
+    }
+
+    /// Positive evidence is unforgeable and needs no second opinion, so a
+    /// Landed primary must not query the fallback at all.
+    #[tokio::test]
+    async fn landed_on_primary_skips_fallback() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut primary,
+            "getSignatureStatuses",
+            status_body(StatusKind::FinalizedSuccess),
+        )
+        .await;
+        let fb_untouched = fb
+            .mock("POST", "/")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(matches!(
+            classify_signatures(&finality, &one_expired_sig()).await,
+            SigFinality::Landed(_)
+        ));
+        fb_untouched.assert_async().await;
+    }
+
+    /// A live primary defers without consulting the fallback.
+    #[tokio::test]
+    async fn live_on_primary_skips_fallback() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut primary,
+            "getSignatureStatuses",
+            status_body(StatusKind::ConfirmedLive),
+        )
+        .await;
+        let fb_untouched = fb
+            .mock("POST", "/")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(matches!(
+            classify_signatures(&finality, &one_expired_sig()).await,
+            SigFinality::Live(_)
+        ));
+        fb_untouched.assert_async().await;
+    }
+
+    /// A primary error is already fail-closed; the fallback is not consulted
+    /// to rescue an Uncertain (only the unsafe Dead verdict is corroborated).
+    #[tokio::test]
+    async fn uncertain_on_primary_skips_fallback() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut primary,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+        )
+        .await;
+        let fb_untouched = fb
+            .mock("POST", "/")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(matches!(
+            classify_signatures(&finality, &one_expired_sig()).await,
+            SigFinality::Uncertain(_)
+        ));
+        fb_untouched.assert_async().await;
     }
 
     // ── liveness gate paths ────────────────────────────────────────────
@@ -2191,7 +2544,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 901, 0);
         // A prior attempt is on record, so classification runs before any resend.
         mock.remint_signatures
@@ -2261,7 +2614,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 902, 0);
         // The write-ahead persist fails.
         mock.set_should_fail("insert_remint_signature", true);
@@ -2335,7 +2688,7 @@ mod tests {
         )
         .await;
 
-        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 904, 0);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
@@ -2407,7 +2760,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         // A crashed-mid-flight row on disk: PendingRemint carrying its release
         // signature, plus a write-ahead remint signature recorded before the crash.
         seed_pending_remint_row(&mock, 905, 0);
@@ -2472,7 +2825,7 @@ mod tests {
         )
         .await;
 
-        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 906, 0);
         mock.remint_signatures
             .lock()
@@ -2507,5 +2860,95 @@ mod tests {
             Some(&vec![(landed_sig.to_string(), 0)]),
             "write-ahead rows must be kept when the terminal record write fails"
         );
+    }
+
+    /// End-to-end remint gate. The primary reports the release gone but the
+    /// fallback finds it landed, so the withdrawal is Completed with no MintTo.
+    #[tokio::test]
+    async fn pending_remint_skips_remint_when_fallback_finds_release_landed() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut dest_fb = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+
+        let release_sig = Signature::new_unique();
+
+        // Destination primary: pruned, returns null for the release sig.
+        mock_rpc(
+            &mut dest,
+            "getSignatureStatuses",
+            status_body(StatusKind::Null),
+        )
+        .await;
+        // Block height past the stored lvbh so the null sig is treated as expired.
+        mock_rpc(
+            &mut dest,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        // Destination fallback (archival): still has the finalized-success record.
+        mock_rpc(
+            &mut dest_fb,
+            "getSignatureStatuses",
+            status_body(StatusKind::FinalizedSuccess),
+        )
+        .await;
+
+        // The compensating MintTo must never be broadcast on the source chain.
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, _mock) =
+            make_sender_state_split_rpc(&dest.url(), &source.url(), Some(&dest_fb.url()));
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(1500),
+                withdrawal_nonce: Some(15),
+                trace_id: Some("trace-1500".to_string()),
+            },
+            remint_info: make_remint_info(1500),
+            signatures: vec![PendingSig {
+                signature: release_sig,
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("fallback-found landed release must emit a Completed status");
+        assert_eq!(update.transaction_id, 1500);
+        assert_eq!(
+            update.status,
+            TransactionStatus::Completed,
+            "a release the fallback proves landed must mark Completed, not remint"
+        );
+        assert_eq!(
+            update.counterpart_signature.as_deref(),
+            Some(release_sig.to_string().as_str()),
+            "counterpart must be the landed release signature"
+        );
+        assert!(state.pending_remints.is_empty());
+        // No compensating MintTo was broadcast.
+        src_send.assert_async().await;
     }
 }

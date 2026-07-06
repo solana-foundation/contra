@@ -5,7 +5,7 @@ use crate::config::ProgramType;
 use crate::error::OperatorError;
 use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
 use crate::operator::sender::types::PendingSig;
-use crate::operator::sender::{classify_signatures, SigFinality};
+use crate::operator::sender::{classify_signatures, FinalityRpc, SigFinality};
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use crate::operator::TransactionStatusUpdate;
 use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
@@ -72,11 +72,18 @@ enum RecoveryAction {
 pub async fn run_recovery_worker(
     storage: Arc<Storage>,
     rpc_client: Arc<RpcClientWithRetry>,
+    fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
+    // Destination finality oracle. The optional fallback re-checks a Dead verdict;
+    // None keeps recovery single-endpoint (legacy behavior).
+    let finality = FinalityRpc {
+        primary: &rpc_client,
+        fallback: fallback_rpc_client.as_deref(),
+    };
     let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
     loop {
         tokio::select! {
@@ -87,7 +94,7 @@ pub async fn run_recovery_worker(
             _ = interval.tick() => {
                 if let Err(e) = recover_once(
                     &storage,
-                    &rpc_client,
+                    &finality,
                     program_type,
                     &storage_tx,
                     &cancellation_token,
@@ -106,7 +113,7 @@ pub async fn run_recovery_worker(
 
 async fn recover_once(
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
@@ -142,7 +149,7 @@ async fn recover_once(
         }
         // Capture `updated_at` before the RPC so the write below CAS-checks it.
         let captured = row.updated_at;
-        let action = decide_action(&row, storage, rpc_client).await;
+        let action = decide_action(&row, storage, finality).await;
         route_outcome(storage, &row, captured, action, program_type, storage_tx).await;
     }
 
@@ -165,16 +172,16 @@ async fn recover_once(
 async fn decide_action(
     row: &DbTransaction,
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
 ) -> RecoveryAction {
     let action = match row.transaction_type {
-        TransactionType::Deposit => match check_deposit(row, storage, rpc_client).await {
+        TransactionType::Deposit => match check_deposit(row, storage, finality).await {
             DepositOutcome::Landed { signature } => RecoveryAction::Complete { signature },
             DepositOutcome::NotLanded => RecoveryAction::Demote,
             DepositOutcome::Live { reason } => RecoveryAction::NoAction { reason },
             DepositOutcome::Ambiguous { reason } => RecoveryAction::Quarantine { reason },
         },
-        TransactionType::Withdrawal => match check_withdrawal(row, storage, rpc_client).await {
+        TransactionType::Withdrawal => match check_withdrawal(row, storage, finality).await {
             WithdrawalAction::Complete { signature } => RecoveryAction::Complete { signature },
             WithdrawalAction::Demote => RecoveryAction::Demote,
             WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
@@ -204,7 +211,7 @@ async fn decide_action(
 async fn check_deposit(
     row: &DbTransaction,
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
 ) -> DepositOutcome {
     let pending = match load_pending_sigs(storage, row.id).await {
         Ok(p) => p,
@@ -219,7 +226,7 @@ async fn check_deposit(
         return DepositOutcome::NotLanded;
     }
 
-    match classify_signatures(rpc_client, &pending).await {
+    match classify_signatures(finality, &pending).await {
         SigFinality::Landed(sig) => DepositOutcome::Landed {
             signature: sig.to_string(),
         },
@@ -238,7 +245,7 @@ async fn check_deposit(
 async fn check_withdrawal(
     row: &DbTransaction,
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
 ) -> WithdrawalAction {
     if row.withdrawal_nonce.is_none() {
         return WithdrawalAction::Quarantine {
@@ -259,7 +266,7 @@ async fn check_withdrawal(
         };
     }
 
-    match classify_signatures(rpc_client, &pending).await {
+    match classify_signatures(finality, &pending).await {
         SigFinality::Landed(sig) => WithdrawalAction::Complete {
             signature: sig.to_string(),
         },
@@ -455,15 +462,21 @@ async fn route_outcome(
 pub async fn boot_reconcile_processing(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
+    fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     max_passes: u32,
 ) -> Result<(), OperatorError> {
+    // Same corroboration bundle the periodic worker uses; None stays single-endpoint.
+    let finality = FinalityRpc {
+        primary: rpc_client,
+        fallback: fallback_rpc_client.as_deref(),
+    };
     for pass in 0..max_passes {
         recover_once(
             storage,
-            rpc_client,
+            &finality,
             program_type,
             storage_tx,
             cancellation_token,
@@ -505,9 +518,12 @@ pub mod test_hooks {
         // worker's STALE_THRESHOLD; the ZERO boot threshold is exercised by calling
         // recover_once directly.
         let token = CancellationToken::new();
+        // Single-endpoint bundle: the worker and boot reconcile pass a fallback
+        // via their own params; this test hook keeps legacy behavior.
+        let finality = FinalityRpc::single(rpc_client);
         recover_once(
             storage,
-            rpc_client,
+            &finality,
             program_type,
             storage_tx,
             &token,
@@ -609,14 +625,14 @@ mod tests {
         let storage = Storage::Mock(MockStorage::new());
         let client = make_rpc_client("http://localhost:1");
         let row = make_deposit_row(1);
-        let outcome = check_deposit(&row, &storage, &client).await;
+        let outcome = check_deposit(&row, &storage, &FinalityRpc::single(&client)).await;
         assert!(
             matches!(outcome, DepositOutcome::NotLanded),
             "empty sigs must map to NotLanded (Demote), not Ambiguous/Quarantine"
         );
         // Same state on the withdrawal side Quarantines; assert the difference.
         let wrow = make_withdrawal_row(2, Some(42));
-        let waction = check_withdrawal(&wrow, &storage, &client).await;
+        let waction = check_withdrawal(&wrow, &storage, &FinalityRpc::single(&client)).await;
         assert!(
             matches!(waction, WithdrawalAction::Quarantine { .. }),
             "withdrawal with no sigs must Quarantine - the deliberate deposit divergence"
@@ -647,7 +663,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        match check_deposit(&row, &storage, &client).await {
+        match check_deposit(&row, &storage, &FinalityRpc::single(&client)).await {
             DepositOutcome::Landed { signature } => assert_eq!(signature, landed_sig.to_string()),
             _ => panic!("expected Landed"),
         }
@@ -671,7 +687,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_deposit(&row, &storage, &client).await,
+                check_deposit(&row, &storage, &FinalityRpc::single(&client)).await,
                 DepositOutcome::NotLanded
             ),
             "dead sigs map to NotLanded (Demote)"
@@ -696,7 +712,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_deposit(&row, &storage, &client).await,
+                check_deposit(&row, &storage, &FinalityRpc::single(&client)).await,
                 DepositOutcome::Live { .. }
             ),
             "a still-live sig must leave the row Processing, not demote"
@@ -721,7 +737,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        match check_deposit(&row, &storage, &client).await {
+        match check_deposit(&row, &storage, &FinalityRpc::single(&client)).await {
             DepositOutcome::Ambiguous { reason } => {
                 assert!(
                     reason.contains("could not verify mint landed"),
@@ -744,7 +760,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
 
-        match check_deposit(&row, &storage, &client).await {
+        match check_deposit(&row, &storage, &FinalityRpc::single(&client)).await {
             DepositOutcome::Ambiguous { reason } => {
                 assert!(
                     reason.contains("malformed stored release signature"),
@@ -764,7 +780,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, None);
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(reason.contains("withdrawal row missing nonce"));
@@ -780,7 +796,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, Some(42));
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -824,7 +840,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
         assert!(
             matches!(action, WithdrawalAction::Demote),
             "expected Demote"
@@ -855,7 +871,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
         match action {
             WithdrawalAction::Complete { signature } => {
                 assert_eq!(signature, landed_sig.to_string());
@@ -896,7 +912,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
         assert!(
             matches!(action, WithdrawalAction::LeaveProcessing { .. }),
             "expected LeaveProcessing"
@@ -922,7 +938,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -1179,14 +1195,14 @@ mod tests {
         let mut row = make_deposit_row(52);
         // One below the cap still demotes (requeues) - pins the off-by-one boundary.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
-        let below = decide_action(&row, &storage, &client).await;
+        let below = decide_action(&row, &storage, &FinalityRpc::single(&client)).await;
         assert!(
             matches!(below, RecoveryAction::Demote),
             "one below the cap must still Demote (requeue)"
         );
         // At the cap, the demote is converted to Quarantine.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let at_cap = decide_action(&row, &storage, &client).await;
+        let at_cap = decide_action(&row, &storage, &FinalityRpc::single(&client)).await;
         assert!(
             matches!(at_cap, RecoveryAction::Quarantine { .. }),
             "demote at the cap must become Quarantine"
@@ -1307,7 +1323,7 @@ mod tests {
 
         recover_once(
             &storage,
-            &client,
+            &FinalityRpc::single(&client),
             ProgramType::Withdraw,
             &storage_tx,
             &CancellationToken::new(),
@@ -1353,6 +1369,7 @@ mod tests {
         boot_reconcile_processing(
             &storage,
             &client,
+            None,
             ProgramType::Withdraw,
             &storage_tx,
             &token,
@@ -1400,6 +1417,7 @@ mod tests {
         boot_reconcile_processing(
             &storage,
             &client,
+            None,
             ProgramType::Withdraw,
             &storage_tx,
             &token,
@@ -1423,6 +1441,77 @@ mod tests {
         assert!(
             after.iter().all(|t| t.status != TransactionStatus::Failed),
             "refuse-to-start must never mark a row Failed"
+        );
+    }
+
+    /// End-to-end recovery. The release looks gone on the primary but landed
+    /// on the fallback, so recovery completes the row instead of demoting it.
+    #[tokio::test]
+    async fn recovery_withdrawal_completes_when_fallback_finds_release_landed() {
+        let landed_sig = Signature::new_unique();
+
+        // Primary: pruned endpoint, release sig gone (null + expired).
+        let mut primary = mockito::Server::new_async().await;
+        let _p_status = primary
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
+            )
+            .create();
+        let _p_height = mock_block_height(&mut primary, 1000);
+
+        // Archival fallback: still has the finalized-success record.
+        let mut fb = mockito::Server::new_async().await;
+        let _fb_status = fb
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .create();
+
+        let mock = MockStorage::new();
+        let row = processing_withdrawal(1, 42);
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock.clone());
+        let primary_client = make_rpc_client(&primary.url());
+        let fb_client = make_rpc_client(&fb.url());
+        let finality = FinalityRpc {
+            primary: &primary_client,
+            fallback: Some(&fb_client),
+        };
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        recover_once(
+            &storage,
+            &finality,
+            ProgramType::Withdraw,
+            &storage_tx,
+            &CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Completed,
+            "fallback-corroborated landed release must Complete, not Demote"
+        );
+        assert_eq!(
+            after[0].counterpart_signature.as_deref(),
+            Some(landed_sig.to_string().as_str())
         );
     }
 }

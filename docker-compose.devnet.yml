@@ -318,6 +318,9 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      # Archival fallback for the poller's missing getBlock-metadata failover.
+      # Empty is treated as unset (single-endpoint).
+      - COMMON_FALLBACK_RPC_URL=${DEVNET_FALLBACK_RPC_URL}
       - METRICS_PORT=9100
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       - INDEXER_YELLOWSTONE_ENDPOINT=${DEVNET_YELLOWSTONE_ENDPOINT}
@@ -440,6 +443,9 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      # Archival Solana fallback that re-checks a Dead finality verdict before a remint.
+      # Empty is treated as unset (single-endpoint).
+      - COMMON_FALLBACK_RPC_URL=${DEVNET_FALLBACK_RPC_URL}
       # Channel-side reads go direct to the read-node, not the gateway, so they
       # aren't blocked by gateway JWT enforcement (see indexer-private-channel).
       # COMMON_RPC_URL above stays on devnet — that's where releases are sent.

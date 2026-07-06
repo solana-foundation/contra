@@ -4,6 +4,8 @@
 [common]
 program_type = "escrow"
 rpc_url = "http://gateway:8899"
+# fallback_rpc_url: N/A here. This operator's rpc_url is the single-provider
+# PrivateChannel gateway, which has no independent endpoint to corroborate.
 # TODO: Add devnet solana rpc url
 source_rpc_url = "your_devnet_solana_rpc_url"
 # TODO: Add escrow instance id

@@ -10,6 +10,20 @@ pub struct RpcBlock {
     pub transactions: Vec<RpcTransactionWithMeta>,
 }
 
+/// Outcome of fetching one slot's block. The domain has three states:
+/// a proven-empty slot is safe to checkpoint past, but a slot the endpoint
+/// cannot serve (pruned or snapshot-jumped) has unknown contents and must never
+/// be checkpointed past. Transport and protocol failures stay on the outer
+/// `Result::Err` so existing error handling is untouched.
+#[derive(Debug, Clone)]
+pub enum BlockFetch {
+    Present(RpcBlock),
+    /// Node retains the ledger region and reports no block: safe to advance.
+    Skipped,
+    /// Pruned or snapshot-jumped past: contents unknown, must not advance.
+    Unavailable,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcTransactionWithMeta {
     pub transaction: EncodedTransaction,

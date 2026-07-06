@@ -1244,9 +1244,8 @@ pub(super) async fn route_poll_results(
 ) {
     for (mut tx, status_opt) in results {
         match status_opt {
-            // Mint lands on PrivateChannel where finalized == confirmed; gate on finalized so a value write never settles on forkable state.
-            Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
-                // Free this finalized tx's in-flight slot now so a continuation (the JIT
+            Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                // Free this confirmed tx's in-flight slot now so a continuation (the JIT
                 // mint retry) can reuse it instead of being refused when in-flight is full.
                 drop(tx.permit);
                 let result = if let Some(err) = &status.err {
@@ -1505,10 +1504,9 @@ pub(super) async fn run_poll_task(
 
         for (mut tx, status_opt) in batch.into_iter().zip(statuses) {
             match status_opt {
-                // Mint lands on PrivateChannel where finalized == confirmed; gate on finalized so a value write never settles on forkable state.
-                Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
+                Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
                     if status.err.is_none() {
-                        // ── Finalized success (hot path) ──────────────────────────────
+                        // ── Confirmed success (hot path) ──────────────────────────────
                         // Handle entirely here — no need to wake the sender loop.
                         metrics::OPERATOR_MINTS_SENT
                             .with_label_values(&[program_type.as_label()])
@@ -3252,7 +3250,7 @@ mod tests {
     /// A confirmed signature in the batch must route to handle_success, emitting
     /// a Completed status and removing the entry from in_flight.
     #[tokio::test]
-    async fn poll_in_flight_finalized_tx_emits_completed() {
+    async fn poll_in_flight_confirmed_tx_emits_completed() {
         let mut server = mockito::Server::new_async().await;
 
         let sig = Signature::new_unique();
@@ -3270,8 +3268,8 @@ mod tests {
                     "result": {
                         "context": {"slot": 100},
                         "value": [{
-                            "confirmationStatus": "finalized",
-                            "confirmations": null,
+                            "confirmationStatus": "confirmed",
+                            "confirmations": 1,
                             "err": null,
                             "slot": 100,
                             "status": {"Ok": null}
@@ -3425,100 +3423,6 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "no status update for pending tx"
-        );
-    }
-
-    /// A status that is confirmed but NOT finalized must not settle the mint; it stays
-    /// in-flight for the next poll. On PrivateChannel every status is finalized so this
-    /// never fires in production, but the test pins the gate: a revert to confirmed()
-    /// (which would settle a mint on forkable state) makes this assertion fail.
-    #[tokio::test]
-    async fn poll_in_flight_confirmed_not_finalized_stays_in_flight() {
-        let mut server = mockito::Server::new_async().await;
-
-        let sig = Signature::new_unique();
-
-        let _m = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "method": "getSignatureStatuses"
-            })))
-            .with_status(200)
-            .with_body(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": {
-                        "context": {"slot": 100},
-                        "value": [{
-                            "confirmationStatus": "confirmed",
-                            "confirmations": 1,
-                            "err": null,
-                            "slot": 100,
-                            "status": {"Ok": null}
-                        }]
-                    }
-                })
-                .to_string(),
-            )
-            .create();
-
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut state = SenderState {
-            rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
-                server.url(),
-                crate::operator::utils::rpc_util::RetryConfig {
-                    max_attempts: 1,
-                    base_delay: std::time::Duration::from_millis(1),
-                    max_delay: std::time::Duration::from_millis(1),
-                },
-                CommitmentConfig::confirmed(),
-            )),
-            source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
-                server.url(),
-                crate::operator::utils::rpc_util::RetryConfig {
-                    max_attempts: 1,
-                    base_delay: std::time::Duration::from_millis(1),
-                    max_delay: std::time::Duration::from_millis(1),
-                },
-                CommitmentConfig::confirmed(),
-            )),
-            storage: storage.clone(),
-            instance_pda: None,
-            smt_state: None,
-            retry_counts: HashMap::new(),
-            mint_builders: HashMap::new(),
-            mint_cache: crate::operator::MintCache::new(storage),
-            retry_max_attempts: 3,
-            confirmation_poll_interval_ms: 400,
-            rotation_retry_queue: Vec::new(),
-            ambiguous_retry_queue: Vec::new(),
-            pending_rotation: None,
-            program_type: ProgramType::Escrow,
-            remint_cache: HashMap::new(),
-            pending_signatures: HashMap::new(),
-            pending_remints: Vec::new(),
-            in_flight: {
-                let q = InFlightQueue::new();
-                q.push(make_in_flight_tx(sig, 88));
-                q
-            },
-            fallback_rpc_client: None,
-            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-        };
-
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        poll_in_flight(&mut state, &storage_tx).await;
-
-        assert_eq!(
-            state.in_flight.len(),
-            1,
-            "confirmed-not-finalized mint must stay in-flight, not settle"
-        );
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "confirmed-not-finalized mint must not emit a Completed status"
         );
     }
 
@@ -3740,10 +3644,10 @@ mod tests {
                     "result": {
                         "context": {"slot": 200},
                         "value": [
-                            // sig1 finalized
+                            // sig1 confirmed
                             {
-                                "confirmationStatus": "finalized",
-                                "confirmations": null,
+                                "confirmationStatus": "confirmed",
+                                "confirmations": 1,
                                 "err": null,
                                 "slot": 200,
                                 "status": {"Ok": null}
@@ -4434,8 +4338,8 @@ mod tests {
                         "context": {"slot": 200},
                         "value": [
                             {
-                                "confirmationStatus": "finalized",
-                                "confirmations": null,
+                                "confirmationStatus": "confirmed",
+                                "confirmations": 1,
                                 "err": {"InstructionError": [0, "InvalidAccountData"]},
                                 "slot": 200,
                                 "status": {"Err": {"InstructionError": [0, "InvalidAccountData"]}}

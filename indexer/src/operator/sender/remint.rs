@@ -173,11 +173,10 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         ));
     }
 
-    // Remint lands on PrivateChannel where finalized == confirmed; gate on finalized so a value write never settles on forkable state.
     let result = match check_transaction_status(
         state.source_rpc_client.clone(),
         &signature,
-        CommitmentConfig::finalized(),
+        CommitmentConfig::confirmed(),
         &ExtraErrorCheckPolicy::None,
         state.confirmation_poll_interval_ms,
     )

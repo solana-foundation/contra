@@ -83,10 +83,6 @@ pub struct RpcPollingConfig {
     pub encoding: UiTransactionEncoding,
     /// RPC commitment level for getSlot calls
     pub commitment: CommitmentLevel,
-    /// Optional archival/full-history RPC consulted once by the live polling loop
-    /// when the primary returns a slot with missing transaction metadata.
-    #[serde(default)]
-    pub fallback_rpc_url: Option<String>,
 }
 
 /// Yellowstone gRPC specific configuration
@@ -98,6 +94,17 @@ pub struct YellowstoneConfig {
     pub x_token: Option<String>,
     /// Commitment level: "processed", "confirmed", or "finalized"
     pub commitment: String,
+    /// Slots to hold a live SlotComplete behind the highest BlockMeta seen, so a late tx still lands
+    /// before finalize. Live gRPC stream only; getBlock backfill/gap-fill never delayed. `0` = immediate.
+    #[serde(default = "default_safety_window")]
+    pub safety_window_slots: u64,
+}
+
+/// Default live SlotComplete lag in slots (~1.2s at ~2.5 slots/s); a conservative reorder margin.
+pub const DEFAULT_SLOT_SAFETY_WINDOW: u64 = 3;
+
+pub fn default_safety_window() -> u64 {
+    DEFAULT_SLOT_SAFETY_WINDOW
 }
 
 /// Backfill configuration
@@ -126,6 +133,10 @@ pub struct PrivateChannelIndexerConfig {
     pub storage_type: StorageType,
     /// RPC endpoint URL (destination chain for operators)
     pub rpc_url: String,
+    /// Optional archival fallback RPC for `rpc_url`, used by the operator to
+    /// re-check a `Dead` verdict and by the poller for missing-block failover.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
     /// Source chain RPC URL for cross-chain operators (optional)
     /// Used by escrow operator to read mint metadata from Solana
     /// while sending mint transactions to PrivateChannel via rpc_url
@@ -330,6 +341,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: Some("http://localhost:8899".to_string()),
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -349,7 +361,6 @@ mod tests {
                 batch_size: 10,
                 encoding: UiTransactionEncoding::Json,
                 commitment: CommitmentLevel::Finalized,
-                fallback_rpc_url: None,
             }),
             yellowstone: None,
             backfill: BackfillConfig {
@@ -459,6 +470,36 @@ mod tests {
             let err_msg = result.unwrap_err();
             assert!(err_msg.contains("Yellowstone datasource not compiled"));
         }
+    }
+
+    #[test]
+    fn yellowstone_safety_window_defaults_when_absent() {
+        // The key is optional; an existing config without it must keep parsing.
+        let cfg: YellowstoneConfig = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:10000",
+            "x_token": null,
+            "commitment": "confirmed"
+        }))
+        .unwrap();
+        assert_eq!(cfg.safety_window_slots, DEFAULT_SLOT_SAFETY_WINDOW);
+    }
+
+    #[test]
+    fn yellowstone_safety_window_explicit_value_honored() {
+        let cfg: YellowstoneConfig = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://localhost:10000",
+            "x_token": null,
+            "commitment": "confirmed",
+            "safety_window_slots": 7
+        }))
+        .unwrap();
+        assert_eq!(cfg.safety_window_slots, 7);
+    }
+
+    #[test]
+    fn safety_window_default_constant_is_pinned() {
+        // A change to the default is a conscious edit, not an accident.
+        assert_eq!(DEFAULT_SLOT_SAFETY_WINDOW, 3);
     }
 
     #[test]

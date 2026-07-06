@@ -69,6 +69,11 @@ reset_state: false
 # empty chain.
 validator_reset: true
 
+# --- Optional archival RPC fallback ---
+# Cross-env default for the archival Solana RPC that re-checks a Dead finality
+# verdict. Empty (single-endpoint) by default; set per-env in vars/<env>.yml.
+fallback_rpc_url: ""
+
 # --- Optional notification webhook posted from the report phase ---
 notify_webhook: ""
 

@@ -208,7 +208,9 @@ async fn spin_up() -> TestHarness {
         "confirmed".to_string(),
         ProgramType::Escrow,
         None,
-    );
+    )
+    // Pin immediate emission: malformed-update handling is independent of the safety window.
+    .with_safety_window(0);
     let handle = source
         .start(tx, cancel.clone())
         .await

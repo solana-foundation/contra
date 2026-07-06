@@ -4,6 +4,8 @@
 program_type = "escrow"
 # Solana Private Channels write node (gateway) — where mint transactions are sent
 rpc_url = "http://localhost:8898"
+# fallback_rpc_url: N/A here. This operator's rpc_url is the single-provider
+# PrivateChannel gateway, which has no independent endpoint to corroborate.
 
 # Solana Solana validator — source of escrow deposit metadata and mint account state
 source_rpc_url = "http://localhost:18899"

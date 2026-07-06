@@ -168,7 +168,9 @@ async fn yellowstone_source_consumes_scripted_stream() {
         "confirmed".to_string(),
         ProgramType::Escrow,
         None,
-    );
+    )
+    // Pin immediate emission: this covers raw stream wiring, not the safety-window lag.
+    .with_safety_window(0);
 
     let handle = source
         .start(tx, cancel.clone())

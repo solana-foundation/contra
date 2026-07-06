@@ -231,7 +231,7 @@ pub async fn run(
                 rpc_config.commitment,
                 common_config.program_type,
                 common_config.escrow_instance_id,
-                rpc_config.fallback_rpc_url.clone(),
+                common_config.fallback_rpc_url.clone(),
             );
             if let Some(h) = health.clone() {
                 source = source.with_health(h);
@@ -258,7 +258,8 @@ pub async fn run(
                 yellowstone_config.commitment.clone(),
                 common_config.program_type,
                 common_config.escrow_instance_id,
-            );
+            )
+            .with_safety_window(yellowstone_config.safety_window_slots);
 
             #[cfg(feature = "datasource-rpc")]
             let source = {

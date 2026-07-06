@@ -3,7 +3,9 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
-use private_channel_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
+use private_channel_indexer::config::{
+    default_safety_window, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+};
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
     PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
@@ -24,6 +26,8 @@ use std::time::Duration;
 struct CommonSection {
     program_type: ProgramType,
     rpc_url: String,
+    #[serde(default)]
+    fallback_rpc_url: Option<String>,
     source_rpc_url: Option<String>,
     escrow_instance_id: Option<String>,
 }
@@ -61,8 +65,6 @@ struct RpcPollingSection {
     encoding: Option<UiTransactionEncoding>,
     #[serde(default)]
     commitment: Option<CommitmentLevel>,
-    #[serde(default)]
-    fallback_rpc_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +72,8 @@ struct YellowstoneSection {
     endpoint: Option<String>,
     commitment: String,
     x_token: Option<String>,
+    #[serde(default = "default_safety_window")]
+    safety_window_slots: u64,
 }
 
 #[derive(Deserialize)]
@@ -258,7 +262,6 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
                 commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
-                fallback_rpc_url: rpc.fallback_rpc_url,
             };
             (Some(config), None)
         }
@@ -279,6 +282,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 endpoint,
                 x_token: token,
                 commitment: ys.commitment,
+                safety_window_slots: ys.safety_window_slots,
             };
 
             // Parse RPC polling config if provided (needed for backfill)
@@ -289,7 +293,6 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
                 commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
-                fallback_rpc_url: rpc.fallback_rpc_url,
             });
 
             (rpc_config, Some(config))
@@ -327,6 +330,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         storage_type: storage.storage_type,
         postgres: postgres_config,
         rpc_url: common.rpc_url,
+        fallback_rpc_url: common.fallback_rpc_url,
         source_rpc_url: common.source_rpc_url,
         escrow_instance_id,
     };
@@ -410,6 +414,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         storage_type: storage_section.storage_type,
         postgres: postgres_config,
         rpc_url: common.rpc_url,
+        fallback_rpc_url: common.fallback_rpc_url,
         source_rpc_url: common.source_rpc_url,
         escrow_instance_id,
     };

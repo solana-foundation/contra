@@ -103,10 +103,12 @@ impl DataSource for RpcPollingSource {
             self.commitment,
         ));
 
-        // Built once; consulted only on the rare missing-meta path
+        // Built once, used only on the rare missing-meta path. Empty means unset
+        // (env renders unconfigured as ""), so no poller is aimed at "".
         let fallback_poller = self
             .fallback_rpc_url
             .clone()
+            .filter(|url| !url.is_empty())
             .map(|url| Arc::new(RpcPoller::new(url, self.encoding, self.commitment)));
 
         // Current slot is either the from slot or the latest slot

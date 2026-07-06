@@ -9,6 +9,10 @@ program_type = "escrow"
 # RPC endpoint URL
 rpc_url = "http://localhost:8899"
 
+# Optional archival fallback for rpc_url. Re-checks a Dead finality verdict (operator)
+# and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
+
 # Escrow instance ID (required for escrow program type, omit for withdraw)
 # escrow_instance_id = "YourPubkeyHere..."
 
@@ -41,13 +45,8 @@ error_retry_interval_ms = 5000
 # Batch size for processing blocks
 batch_size = 50
 
-# Optional fallback for the live RPC-polling loop only, consulted once (and
-# re-validated) when the primary returns a slot with missing metadata
-# (meta: null). It MUST be archival/full-history; a load-balanced peer can
-# return the same meta: null. Backfill and resync ignore it and fail closed,
-# so point indexer.backfill.rpc_url at a full-history endpoint for those paths.
-# Omit to fail closed. Env override: INDEXER_RPC_POLLING_FALLBACK_RPC_URL
-# fallback_rpc_url = "https://your-archival-endpoint"
+# The polling loop's missing-metadata failover reads common.fallback_rpc_url (see
+# [common] above); it must be archival. Backfill/resync ignore it and fail closed.
 
 # === Yellowstone gRPC Configuration ===
 [indexer.yellowstone]

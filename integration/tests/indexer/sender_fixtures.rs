@@ -71,6 +71,7 @@ pub fn make_config(rpc_url: String, program_type: ProgramType) -> PrivateChannel
         storage_type: StorageType::Postgres,
         rpc_url,
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: PostgresConfig {
             database_url: "postgres://placeholder/none".to_string(),
             max_connections: 1,

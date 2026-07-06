@@ -1,3 +1,4 @@
+use super::remint::FinalityRpc;
 use crate::config::ProgramType;
 use crate::operator::utils::instruction_util::{
     ExtraErrorCheckPolicy, MintToBuilder, ReleaseFundsBuilderWithNonce, RetryPolicy,
@@ -150,6 +151,9 @@ pub struct SenderState {
     /// burn happened. Remints broadcast here to restore the burned balance.
     /// rpc_client is the destination chain (Solana) for ReleaseFunds.
     pub source_rpc_client: Arc<RpcClientWithRetry>,
+    /// Optional second endpoint that re-checks a `Dead` verdict on the destination
+    /// `rpc_client`. `None` keeps it single-endpoint. Never used for the source.
+    pub fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
     pub smt_state: Option<SenderSMTState>,
@@ -184,6 +188,23 @@ pub struct SenderState {
     /// (confirmed, permanent failure, or transfer to a retry), so
     /// `available_permits()` accurately reflects remaining capacity at all times.
     pub semaphore: Arc<Semaphore>,
+}
+
+impl SenderState {
+    /// Finality oracle for the destination `rpc_client`, carrying the optional
+    /// fallback used to re-check a `Dead` verdict (the prunable Solana path).
+    pub(crate) fn dest_finality(&self) -> FinalityRpc<'_> {
+        FinalityRpc {
+            primary: &self.rpc_client,
+            fallback: self.fallback_rpc_client.as_deref(),
+        }
+    }
+
+    /// Finality oracle for the source `source_rpc_client`, single-endpoint: the
+    /// PrivateChannel gateway is single-provider, with no second node to check.
+    pub(crate) fn source_finality(&self) -> FinalityRpc<'_> {
+        FinalityRpc::single(&self.source_rpc_client)
+    }
 }
 
 /// Withdrawal signature + its blockhash's `last_valid_block_height`, so the

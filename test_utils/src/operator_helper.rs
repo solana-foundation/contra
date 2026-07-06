@@ -70,6 +70,7 @@ pub async fn start_solana_to_private_channel_operator(
         storage_type: StorageType::Postgres,
         rpc_url: private_channel_rpc_url,
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -191,6 +192,7 @@ pub async fn start_private_channel_to_solana_operator_with_mocks(
         // Withdraw operator requires a source chain for remints; the mock harness
         // is single-server, so point it at the same scripted RPC.
         source_rpc_url: Some(rpc.url()),
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -239,6 +241,7 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
         storage_type: StorageType::Postgres,
         rpc_url: rpc.url(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -286,6 +289,7 @@ pub async fn start_private_channel_to_solana_operator(
         rpc_url: solana_rpc_url,
         // Source chain (PrivateChannel), where the burn happened and remints land.
         source_rpc_url: Some(private_channel_rpc_url),
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };

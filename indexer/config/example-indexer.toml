@@ -48,15 +48,20 @@ batch_size = 50
 # The polling loop's missing-metadata failover reads common.fallback_rpc_url (see
 # [common] above); it must be archival. Backfill/resync ignore it and fail closed.
 
+# Ingestion commitment. MUST be "finalized" (enforced at startup); defaults to "finalized"
+# when omitted. Indexing is the value-finalizing source of truth, so a forkable commitment
+# is rejected.
+# commitment = "finalized"
+
 # === Yellowstone gRPC Configuration ===
 [indexer.yellowstone]
 # Yellowstone gRPC endpoint URL
 # endpoint = "grpc://your-yellowstone-endpoint:10000"
 
-# Commitment level: "processed", "confirmed", or "finalized".
-# Keep "finalized" for escrow ingestion: deposits become irreversible
-# private-channel mints, so a "confirmed" deposit lost to a Solana reorg would
-# produce an unbacked mint with no rollback path.
+# Commitment level. MUST be "finalized" (enforced at startup - a sub-finalized value is
+# rejected). Deposits become irreversible private-channel mints, so a "confirmed" deposit
+# lost to a Solana reorg would produce an unbacked mint with no rollback path. Omitting
+# this key defaults to "finalized". The gap-detection poller inherits this value.
 commitment = "finalized"
 
 # Token must be set via environment variable: INDEXER_YELLOWSTONE_TOKEN

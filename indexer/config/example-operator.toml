@@ -42,6 +42,12 @@ retry_base_delay_secs = 1
 # Channel buffer size for internal queues
 channel_buffer_size = 100
 
+# Operational RPC commitment for blockhash fetch and preflight ONLY. It does not gate
+# settlement: terminal Completed/FailedReminted writes and the recovery reconcile always
+# use a hardcoded `finalized` gate regardless of this value. "confirmed" (default) or
+# "finalized" are accepted; "processed" is rejected at startup as too weak.
+# rpc_commitment = "confirmed"
+
 # === Signer Configuration (via Environment Variables) ===
 #
 # Required for all operators:

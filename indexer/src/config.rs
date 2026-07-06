@@ -81,7 +81,8 @@ pub struct RpcPollingConfig {
     pub batch_size: usize,
     /// RPC encoding format for getBlock calls
     pub encoding: UiTransactionEncoding,
-    /// RPC commitment level for getSlot calls
+    /// RPC commitment for block ingestion. Must be `finalized` (floored at startup):
+    /// indexing is the value-finalizing source of truth, so a forkable commitment is rejected.
     pub commitment: CommitmentLevel,
 }
 
@@ -92,7 +93,8 @@ pub struct YellowstoneConfig {
     pub endpoint: String,
     /// Token to use for authentication
     pub x_token: Option<String>,
-    /// Commitment level: "processed", "confirmed", or "finalized"
+    /// Stream commitment. Must be "finalized": indexing is the value-finalizing source of
+    /// truth, so a sub-finalized stream could index a forked block. Validated at startup.
     pub commitment: String,
     /// Slots to hold a live SlotComplete behind the highest BlockMeta seen, so a late tx still lands
     /// before finalize. Live gRPC stream only; getBlock backfill/gap-fill never delayed. `0` = immediate.
@@ -105,6 +107,50 @@ pub const DEFAULT_SLOT_SAFETY_WINDOW: u64 = 3;
 
 pub fn default_safety_window() -> u64 {
     DEFAULT_SLOT_SAFETY_WINDOW
+}
+
+/// Commitment levels below `finalized` are forkable, so the value-finalizing indexing
+/// source of truth requires `finalized`. Returns the level unchanged on success.
+pub fn require_finalized_indexing(level: CommitmentLevel) -> Result<CommitmentLevel, String> {
+    match level {
+        CommitmentLevel::Finalized => Ok(level),
+        other => Err(format!(
+            "indexing requires commitment=finalized, got {:?}; a sub-finalized commitment can \
+             index a forked block and mint against a deposit that never settles",
+            other
+        )),
+    }
+}
+
+/// Parse and floor a string commitment for indexing: unset defaults to `finalized`;
+/// anything below `finalized` is rejected. Used for the Yellowstone stream commitment.
+pub fn parse_indexing_commitment_str(raw: Option<String>) -> Result<String, String> {
+    match raw
+        .unwrap_or_else(|| "finalized".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "finalized" => Ok("finalized".to_string()),
+        other => Err(format!(
+            "indexing requires commitment=\"finalized\", got \"{other}\"; a sub-finalized \
+             commitment can index a forked block"
+        )),
+    }
+}
+
+/// Floor the operator's operational RPC commitment. This knob only affects blockhash/preflight
+/// lifetime, never a settlement decision, so `confirmed` and `finalized` are both accepted;
+/// only `processed` is rejected as too weak for even operational use.
+pub fn floor_operator_commitment(level: CommitmentLevel) -> Result<CommitmentLevel, String> {
+    match level {
+        CommitmentLevel::Processed => Err(
+            "operator rpc_commitment=processed is too weak; use confirmed or finalized (this knob \
+             sets only the operational blockhash/preflight commitment, not the finalized \
+             settlement gate)"
+                .to_string(),
+        ),
+        other => Ok(other),
+    }
 }
 
 /// Backfill configuration
@@ -270,7 +316,11 @@ pub struct OperatorConfig {
     pub retry_base_delay: std::time::Duration,
     /// Size of channel buffers
     pub channel_buffer_size: usize,
-    /// RPC commitment level for operator transactions
+    /// Operational RPC commitment for the operator's blockhash fetch and preflight only.
+    /// It does NOT gate settlement: the terminal Completed/FailedReminted writes and the
+    /// recovery reconcile always use a hardcoded `finalized` gate regardless of this value.
+    /// `confirmed` is a reasonable default (a finalized blockhash is ~13s stale and shortens
+    /// transaction lifetime for no safety gain); `processed` is rejected as too weak.
     pub rpc_commitment: CommitmentLevel,
     /// Webhook URL for alerting on failed transactions. Set via ALERT_WEBHOOK env var.
     pub alert_webhook_url: Option<String>,
@@ -511,5 +561,57 @@ mod tests {
             let result = config.validate();
             assert!(result.is_ok());
         }
+    }
+
+    // ── commitment-floor validation (C1-C4) ─────────────────────────────
+
+    /// C1: a sub-finalized Yellowstone stream commitment is rejected at startup.
+    #[test]
+    fn yellowstone_commitment_rejects_sub_finalized() {
+        for value in ["confirmed", "processed", "CONFIRMED"] {
+            assert!(
+                parse_indexing_commitment_str(Some(value.to_string())).is_err(),
+                "yellowstone commitment {value:?} must be rejected"
+            );
+        }
+    }
+
+    /// C2: an unset Yellowstone commitment defaults to finalized.
+    #[test]
+    fn yellowstone_commitment_defaults_finalized() {
+        assert_eq!(
+            parse_indexing_commitment_str(None).unwrap(),
+            "finalized".to_string()
+        );
+        // Case-insensitive accept of an explicit finalized.
+        assert_eq!(
+            parse_indexing_commitment_str(Some("Finalized".to_string())).unwrap(),
+            "finalized".to_string()
+        );
+    }
+
+    /// C3: RPC-polling ingestion floors to finalized; confirmed/processed are rejected.
+    #[test]
+    fn rpc_polling_commitment_floored_to_finalized() {
+        assert_eq!(
+            require_finalized_indexing(CommitmentLevel::Finalized).unwrap(),
+            CommitmentLevel::Finalized
+        );
+        assert!(require_finalized_indexing(CommitmentLevel::Confirmed).is_err());
+        assert!(require_finalized_indexing(CommitmentLevel::Processed).is_err());
+    }
+
+    /// C4: operator rpc_commitment rejects only `processed`; confirmed/finalized pass.
+    #[test]
+    fn operator_commitment_rejects_only_processed() {
+        assert!(floor_operator_commitment(CommitmentLevel::Processed).is_err());
+        assert_eq!(
+            floor_operator_commitment(CommitmentLevel::Confirmed).unwrap(),
+            CommitmentLevel::Confirmed
+        );
+        assert_eq!(
+            floor_operator_commitment(CommitmentLevel::Finalized).unwrap(),
+            CommitmentLevel::Finalized
+        );
     }
 }

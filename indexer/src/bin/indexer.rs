@@ -4,7 +4,8 @@ use figment::{
     Figment,
 };
 use private_channel_indexer::config::{
-    default_safety_window, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    default_safety_window, floor_operator_commitment, parse_indexing_commitment_str,
+    require_finalized_indexing, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
 };
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
@@ -70,7 +71,8 @@ struct RpcPollingSection {
 #[derive(Deserialize)]
 struct YellowstoneSection {
     endpoint: Option<String>,
-    commitment: String,
+    #[serde(default)]
+    commitment: Option<String>,
     x_token: Option<String>,
     #[serde(default = "default_safety_window")]
     safety_window_slots: u64,
@@ -261,7 +263,9 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 batch_size: rpc.batch_size,
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
-                commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                commitment: require_finalized_indexing(
+                    rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                )?,
             };
             (Some(config), None)
         }
@@ -281,19 +285,28 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
             let config = YellowstoneConfig {
                 endpoint,
                 x_token: token,
-                commitment: ys.commitment,
+                // Default and floor the primary stream to finalized; the gap poller below
+                // inherits this validated value.
+                commitment: parse_indexing_commitment_str(ys.commitment)?,
                 safety_window_slots: ys.safety_window_slots,
             };
 
             // Parse RPC polling config if provided (needed for backfill)
-            let rpc_config = indexer.rpc_polling.map(|rpc| RpcPollingConfig {
-                poll_interval_ms: rpc.poll_interval_ms,
-                error_retry_interval_ms: rpc.error_retry_interval_ms,
-                batch_size: rpc.batch_size,
-                from_slot: rpc.start_slot,
-                encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
-                commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
-            });
+            let rpc_config = indexer
+                .rpc_polling
+                .map(|rpc| {
+                    Ok::<_, String>(RpcPollingConfig {
+                        poll_interval_ms: rpc.poll_interval_ms,
+                        error_retry_interval_ms: rpc.error_retry_interval_ms,
+                        batch_size: rpc.batch_size,
+                        from_slot: rpc.start_slot,
+                        encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
+                        commitment: require_finalized_indexing(
+                            rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                        )?,
+                    })
+                })
+                .transpose()?;
 
             (rpc_config, Some(config))
         }
@@ -425,9 +438,11 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         retry_max_attempts: operator.retry_max_attempts,
         retry_base_delay: Duration::from_secs(operator.retry_base_delay_secs),
         channel_buffer_size: operator.channel_buffer_size,
-        rpc_commitment: operator
-            .rpc_commitment
-            .unwrap_or(CommitmentLevel::Confirmed),
+        rpc_commitment: floor_operator_commitment(
+            operator
+                .rpc_commitment
+                .unwrap_or(CommitmentLevel::Confirmed),
+        )?,
         alert_webhook_url: std::env::var("ALERT_WEBHOOK_URL").ok(),
         reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
         reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
@@ -491,11 +506,13 @@ async fn run_resync(
         .as_ref()
         .and_then(|rpc| rpc.encoding)
         .unwrap_or(UiTransactionEncoding::Json);
-    let rpc_commitment = indexer
-        .rpc_polling
-        .as_ref()
-        .and_then(|rpc| rpc.commitment)
-        .unwrap_or(CommitmentLevel::Finalized);
+    let rpc_commitment = require_finalized_indexing(
+        indexer
+            .rpc_polling
+            .as_ref()
+            .and_then(|rpc| rpc.commitment)
+            .unwrap_or(CommitmentLevel::Finalized),
+    )?;
 
     let rpc_poller = Arc::new(
         private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(

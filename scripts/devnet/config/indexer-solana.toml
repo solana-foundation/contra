@@ -20,9 +20,6 @@ datasource_type = "yellowstone"
 [indexer.yellowstone]
 # TODO: Add devnet solana yellowstone endpoint
 endpoint = "your_devnet_solana_yellowstone_endpoint"
-# Must stay "finalized": deposits become irreversible private-channel mints, so
-# ingesting at "confirmed" would let a Solana reorg produce an unbacked mint.
-commitment = "finalized"
 
 [indexer.rpc_polling]
 poll_interval_ms = 1000

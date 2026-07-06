@@ -5,7 +5,7 @@ mod state;
 mod transaction;
 pub mod types;
 
-pub use mint::JitOutcome;
+pub use mint::{enumerate_consumed_mints, ConsumedMintKind, ConsumedSet, JitOutcome};
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
 pub(crate) use state::validate_smt_root;
 pub use types::TransactionStatusUpdate;
@@ -577,7 +577,8 @@ mod tests {
         SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
-        ExtraErrorCheckPolicy, ReleaseFundsBuilderWithNonce, RetryPolicy, WithdrawalRemintInfo,
+        ExtraErrorCheckPolicy, ReleaseFundsBuilderWithNonce, RetryPolicy, SourceEventId,
+        WithdrawalRemintInfo,
     };
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::utils::smt_util::SmtState;
@@ -836,6 +837,11 @@ mod tests {
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    "remint-sig-1",
+                    0,
+                    None,
+                ),
                 trace_id: "t".to_string(),
                 mint: Pubkey::new_unique(),
                 user: Pubkey::new_unique(),
@@ -923,6 +929,11 @@ mod tests {
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    "remint-sig-1",
+                    0,
+                    None,
+                ),
                 trace_id: "t".to_string(),
                 mint: Pubkey::new_unique(),
                 user: Pubkey::new_unique(),
@@ -1055,6 +1066,7 @@ mod tests {
                 user_ata: Pubkey::new_unique(),
                 token_program: spl_token::id(),
                 amount: 1000,
+                source_event_id: SourceEventId::new("sig-20", 0, None),
             },
         );
         state.rotation_retry_queue.push((
@@ -1100,6 +1112,7 @@ mod tests {
                 user_ata: Pubkey::new_unique(),
                 token_program: spl_token::id(),
                 amount: 1000,
+                source_event_id: SourceEventId::new("sig-20", 0, None),
             },
         );
         state.rotation_retry_queue.push((

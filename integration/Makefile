@@ -48,7 +48,7 @@ integration-test:
 	@cargo test --test truncate_integration -- --nocapture
 	@cargo test --test pausable_mint_integration -- --nocapture
 	@cargo test --test permanent_delegate_mint_integration -- --nocapture
-	@cargo test --test resync_integration -- --nocapture
+	@cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cargo test --test reconciliation_e2e_test -- --nocapture
 	@cargo test --test mock_rpc_retry -- --nocapture
 	@cargo test --test checkpoint_partial_flush -- --nocapture
@@ -243,7 +243,7 @@ integration-coverage-indexer:
 	@echo "Running permanent delegate mint integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Running resync integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture
+	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture --test-threads=1
 	@echo "Running reconciliation e2e tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_e2e_test -- --nocapture
 	@echo "Running mock-rpc retry tests with coverage instrumentation..."

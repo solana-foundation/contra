@@ -1,4 +1,6 @@
+use super::completion_window::SlotCompletionWindow;
 use super::convert::create_message;
+use crate::config::DEFAULT_SLOT_SAFETY_WINDOW;
 use crate::metrics;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
@@ -39,6 +41,8 @@ pub struct YellowstoneSource {
     commitment: String,
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
+    // Slots to hold a live SlotComplete behind the tip so a late tx still lands before finalize.
+    safety_window: u64,
     #[cfg(feature = "datasource-rpc")]
     rpc_poller: Option<Arc<RpcPoller>>,
     #[cfg(feature = "datasource-rpc")]
@@ -64,6 +68,7 @@ impl YellowstoneSource {
             commitment,
             program_type,
             escrow_instance_id,
+            safety_window: DEFAULT_SLOT_SAFETY_WINDOW,
             #[cfg(feature = "datasource-rpc")]
             rpc_poller: None,
             #[cfg(feature = "datasource-rpc")]
@@ -78,6 +83,12 @@ impl YellowstoneSource {
 
     pub fn with_health(mut self, health: Arc<private_channel_metrics::HealthState>) -> Self {
         self.health = Some(health);
+        self
+    }
+
+    /// Slots to lag live SlotComplete behind the tip; `0` restores immediate emission.
+    pub fn with_safety_window(mut self, window: u64) -> Self {
+        self.safety_window = window;
         self
     }
 
@@ -181,6 +192,7 @@ impl DataSource for YellowstoneSource {
         let x_token = self.x_token.clone();
         let program_type = self.program_type;
         let escrow_instance_id = self.escrow_instance_id;
+        let safety_window = self.safety_window;
         let health = self.health.clone();
 
         #[cfg(feature = "datasource-rpc")]
@@ -205,6 +217,7 @@ impl DataSource for YellowstoneSource {
                     commitment_level,
                     program_type,
                     escrow_instance_id,
+                    safety_window,
                     tx.clone(),
                     cancellation_token.clone(),
                     health.as_ref(),
@@ -317,6 +330,7 @@ async fn connect_and_stream(
     commitment: CommitmentLevel,
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
+    safety_window: u64,
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     health: Option<&Arc<private_channel_metrics::HealthState>>,
@@ -397,7 +411,11 @@ async fn connect_and_stream(
             reason: e.to_string(),
         })?;
 
-    loop {
+    // Only the live push stream is delayed: BlockMeta(S) can arrive before a late tx for S, so we
+    // finalize a few slots behind the tip. Authoritative getBlock backfill/gap-fill are never delayed.
+    let mut completion_window = SlotCompletionWindow::new(safety_window);
+
+    'stream: loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
                 info!("Yellowstone stream cancelled, closing connection...");
@@ -433,21 +451,20 @@ async fn connect_and_stream(
                     }
                     debug!("Yellowstone BlockMeta for slot {}", block_meta.slot);
 
-                    let res = send_guaranteed(
-                        &tx,
-                        ProcessorMessage::SlotComplete {
-                            slot: block_meta.slot,
-                            program_type,
-                        },
-                        "SlotComplete (yellowstone)",
-                    )
-                    .await;
-                    if let Err(e) = res {
-                        error!(
-                            "SlotComplete send failed, stopping Yellowstone gracefully: {}",
-                            e
-                        );
-                        break;
+                    for slot in completion_window.observe(block_meta.slot) {
+                        let res = send_guaranteed(
+                            &tx,
+                            ProcessorMessage::SlotComplete { slot, program_type },
+                            "SlotComplete (yellowstone)",
+                        )
+                        .await;
+                        if let Err(e) = res {
+                            error!(
+                                "SlotComplete send failed, stopping Yellowstone gracefully: {}",
+                                e
+                            );
+                            break 'stream;
+                        }
                     }
                 }
                 Some(UpdateOneof::Ping(_)) => {

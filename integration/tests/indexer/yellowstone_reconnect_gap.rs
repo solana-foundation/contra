@@ -115,6 +115,8 @@ async fn gap_fill_runs_after_drop_stream() {
         ProgramType::Escrow,
         None,
     )
+    // Pin immediate emission so the live checkpoint reaches the streamed slots and the gap math stays exact.
+    .with_safety_window(0)
     .with_gap_detection(rpc_poller, 1_000, 16)
     .with_storage(storage);
 
@@ -231,6 +233,8 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         ProgramType::Escrow,
         None,
     )
+    // Pin immediate emission so the live checkpoint reaches the streamed slots and the gap math stays exact.
+    .with_safety_window(0)
     .with_gap_detection(rpc_poller, 1_000, 16)
     .with_storage(storage);
 

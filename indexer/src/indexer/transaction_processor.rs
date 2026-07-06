@@ -1685,4 +1685,139 @@ mod tests {
         let inserted = mock.inserted_transactions.lock().unwrap();
         assert!(inserted.iter().flatten().all(|t| t.slot != N1 as i64));
     }
+
+    // Live safety-window end-to-end tests: the reordering race through the real processor + window + MockStorage.
+
+    /// With a non-zero window, a transaction Yellowstone delivers AFTER
+    /// BlockMeta(S) still lands in slot S before S is finalized, so the row is
+    /// persisted. This is the reordering bug the window fixes.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[tokio::test]
+    async fn late_tx_included_with_window() {
+        use crate::indexer::datasource::yellowstone::completion_window::SlotCompletionWindow;
+        const S: u64 = 500;
+        const WINDOW: u64 = 1;
+
+        let (processor, _checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut window = SlotCompletionWindow::new(WINDOW);
+
+        // BlockMeta(S): the window holds S back, so no SlotComplete is emitted.
+        assert!(window.observe(S).is_empty());
+        // The late transaction for S arrives after its BlockMeta and is buffered.
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            S,
+            Some("late".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        // The tip advances; S is now WINDOW behind and releases, finalizing the buffered late tx.
+        for meta in (S + 1)..=(S + WINDOW) {
+            for slot in window.observe(meta) {
+                tx.send(ProcessorMessage::SlotComplete {
+                    slot,
+                    program_type: ProgramType::Escrow,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        processor.start(rx).await.unwrap();
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(
+            inserted.len(),
+            1,
+            "the late tx must be finalized into slot S"
+        );
+        assert_eq!(inserted[0][0].signature, "late");
+        assert_eq!(inserted[0][0].slot, S as i64);
+    }
+
+    /// Window 0 reproduces the original bug: BlockMeta(S) finalizes S immediately,
+    /// so a transaction that arrives afterward lands in an orphaned buffer that is
+    /// never finalized. This is the oracle proving the harness exercises the race.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[tokio::test]
+    async fn late_tx_lost_with_window_zero() {
+        use crate::indexer::datasource::yellowstone::completion_window::SlotCompletionWindow;
+        const S: u64 = 600;
+
+        let (processor, _checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut window = SlotCompletionWindow::new(0);
+
+        // BlockMeta(S) finalizes S at once, before the late tx exists.
+        for slot in window.observe(S) {
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+        // The late tx lands in a fresh buffer that no later SlotComplete drains.
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            S,
+            Some("late-lost".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+        processor.start(rx).await.unwrap();
+
+        assert!(
+            mock.inserted_transactions.lock().unwrap().is_empty(),
+            "row must be absent: the pre-window bug loses the late tx at window 0"
+        );
+    }
+
+    /// Empty (activity-free) slots still checkpoint under the window, just lagged:
+    /// the frontier advances across every observed slot once it is WINDOW behind
+    /// the tip.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[tokio::test]
+    async fn empty_slots_still_checkpoint() {
+        use crate::indexer::datasource::yellowstone::completion_window::SlotCompletionWindow;
+        const WINDOW: u64 = 3;
+        const N: u64 = 8;
+
+        let (processor, mut checkpoint_rx, _mock) = make_processor_with_mock(deposit_instance());
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut window = SlotCompletionWindow::new(WINDOW);
+
+        let mut emitted = Vec::new();
+        for meta in 1..=N {
+            for slot in window.observe(meta) {
+                emitted.push(slot);
+                tx.send(ProcessorMessage::SlotComplete {
+                    slot,
+                    program_type: ProgramType::Escrow,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        processor.start(rx).await.unwrap();
+
+        let mut checkpointed = Vec::new();
+        while let Ok(cp) = checkpoint_rx.try_recv() {
+            checkpointed.push(cp.slot);
+        }
+
+        // The window lags finalization by WINDOW, so slots 1..=(N-WINDOW) release.
+        let expected: Vec<u64> = (1..=(N - WINDOW)).collect();
+        assert_eq!(
+            emitted, expected,
+            "eligible slots are those WINDOW behind the tip"
+        );
+        assert_eq!(
+            checkpointed, expected,
+            "each eligible empty slot checkpoints"
+        );
+    }
 }

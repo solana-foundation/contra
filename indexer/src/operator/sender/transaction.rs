@@ -1246,7 +1246,7 @@ pub(super) async fn route_poll_results(
         match status_opt {
             // Mint lands on PrivateChannel where finalized == confirmed; gate on finalized so a value write never settles on forkable state.
             Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
-                // Free this confirmed tx's in-flight slot now so a continuation (the JIT
+                // Free this finalized tx's in-flight slot now so a continuation (the JIT
                 // mint retry) can reuse it instead of being refused when in-flight is full.
                 drop(tx.permit);
                 let result = if let Some(err) = &status.err {
@@ -1508,7 +1508,7 @@ pub(super) async fn run_poll_task(
                 // Mint lands on PrivateChannel where finalized == confirmed; gate on finalized so a value write never settles on forkable state.
                 Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
                     if status.err.is_none() {
-                        // ── Confirmed success (hot path) ──────────────────────────────
+                        // ── Finalized success (hot path) ──────────────────────────────
                         // Handle entirely here — no need to wake the sender loop.
                         metrics::OPERATOR_MINTS_SENT
                             .with_label_values(&[program_type.as_label()])

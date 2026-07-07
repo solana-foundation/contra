@@ -26,7 +26,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -102,11 +102,11 @@ pub struct Args {
     /// Maximum number of concurrent client connections. Connections beyond this
     /// are dropped so a flood cannot exhaust file descriptors or memory.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS", default_value = "1024")]
-    pub max_connections: usize,
+    pub max_connections: NonZeroUsize,
 
     /// Maximum concurrent connections from a single client IP.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS_PER_IP", default_value = "64")]
-    pub max_connections_per_ip: usize,
+    pub max_connections_per_ip: NonZeroUsize,
 
     /// Seconds a client may take to send the full request header block before
     /// the connection is closed (slowloris protection).
@@ -131,11 +131,11 @@ pub struct Args {
 
     /// Sustained request rate allowed per client IP (requests per second).
     #[arg(long, env = "GATEWAY_RATE_LIMIT_PER_SECOND", default_value = "50")]
-    pub rate_limit_per_second: u32,
+    pub rate_limit_per_second: NonZeroU32,
 
     /// Burst capacity per client IP (token bucket size).
     #[arg(long, env = "GATEWAY_RATE_LIMIT_BURST", default_value = "100")]
-    pub rate_limit_burst: u32,
+    pub rate_limit_burst: NonZeroU32,
 }
 
 /// Tunable resource limits for the serve loop and request handling.
@@ -143,10 +143,10 @@ pub struct Args {
 pub struct Limits {
     /// Max concurrent client connections. Connections past this are dropped
     /// so a flood cannot exhaust file descriptors or memory.
-    pub max_connections: usize,
+    pub max_connections: NonZeroUsize,
     /// Max concurrent connections from a single client IP, so one host cannot
     /// consume the whole global connection budget.
-    pub max_connections_per_ip: usize,
+    pub max_connections_per_ip: NonZeroUsize,
     /// Max time a client may take to send the full request header block.
     /// Slowloris header-trickle connections are closed after this.
     pub header_read_timeout: Duration,
@@ -158,22 +158,22 @@ pub struct Limits {
     /// Interval between TCP keepalive probes.
     pub tcp_keepalive_interval: Duration,
     /// Sustained request rate allowed per client IP (requests per second).
-    pub rate_limit_per_second: u32,
+    pub rate_limit_per_second: NonZeroU32,
     /// Burst capacity per client IP, i.e. the token bucket size.
-    pub rate_limit_burst: u32,
+    pub rate_limit_burst: NonZeroU32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_connections: 1024,
-            max_connections_per_ip: 64,
+            max_connections: NonZeroUsize::new(1024).unwrap(),
+            max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
             tcp_keepalive_idle: Duration::from_secs(60),
             tcp_keepalive_interval: Duration::from_secs(15),
-            rate_limit_per_second: 50,
-            rate_limit_burst: 100,
+            rate_limit_per_second: NonZeroU32::new(50).unwrap(),
+            rate_limit_burst: NonZeroU32::new(100).unwrap(),
         }
     }
 }
@@ -817,20 +817,14 @@ pub async fn serve(
 
     // Cap total concurrent connections. A connection past the cap is dropped
     // at once rather than queued, so a flood can't pile up resources.
-    let connection_slots = Arc::new(Semaphore::new(gateway.limits.max_connections));
+    let connection_slots = Arc::new(Semaphore::new(gateway.limits.max_connections.get()));
     // Per-IP connection counts, so one host can't consume the global budget.
     let ip_counts: IpConnCounts = Arc::new(Mutex::new(HashMap::new()));
 
     // Per-IP request rate limiter (token bucket): refills at rate_limit_per_second
     // and holds up to rate_limit_burst tokens.
-    let quota = Quota::per_second(
-        NonZeroU32::new(gateway.limits.rate_limit_per_second)
-            .expect("rate_limit_per_second must be non-zero"),
-    )
-    .allow_burst(
-        NonZeroU32::new(gateway.limits.rate_limit_burst)
-            .expect("rate_limit_burst must be non-zero"),
-    );
+    let quota = Quota::per_second(gateway.limits.rate_limit_per_second)
+        .allow_burst(gateway.limits.rate_limit_burst);
     let rate_limiter: Arc<IpRateLimiter> = Arc::new(RateLimiter::keyed(quota));
 
     // Prune IPs that have fully replenished so the keyed store stays bounded.
@@ -862,7 +856,8 @@ pub async fn serve(
 
         // Take a per-IP slot. None means this IP is at its cap; continue to drop
         // the socket and release the global permit.
-        let ip_guard = match try_acquire_ip(&ip_counts, ip, gateway.limits.max_connections_per_ip) {
+        let ip_guard =
+            match try_acquire_ip(&ip_counts, ip, gateway.limits.max_connections_per_ip.get()) {
             Some(guard) => guard,
             None => {
                 warn!("Per-IP connection limit reached for {ip}, dropping connection");
@@ -1462,7 +1457,7 @@ mod tests {
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",
             Limits {
-                max_connections: 1,
+                max_connections: NonZeroUsize::new(1).unwrap(),
                 ..Default::default()
             },
         )
@@ -1476,8 +1471,8 @@ mod tests {
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",
             Limits {
-                rate_limit_per_second: 1,
-                rate_limit_burst: 1,
+                rate_limit_per_second: NonZeroU32::new(1).unwrap(),
+                rate_limit_burst: NonZeroU32::new(1).unwrap(),
                 ..Default::default()
             },
         )
@@ -1570,7 +1565,7 @@ mod tests {
             "http://127.0.0.1:1",
             "http://127.0.0.1:1",
             Limits {
-                max_connections_per_ip: 1,
+                max_connections_per_ip: NonZeroUsize::new(1).unwrap(),
                 ..Default::default()
             },
         )

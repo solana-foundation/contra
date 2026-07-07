@@ -1244,8 +1244,8 @@ pub(super) async fn route_poll_results(
 ) {
     for (mut tx, status_opt) in results {
         match status_opt {
-            Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
-                // Free this confirmed tx's in-flight slot now so a continuation (the JIT
+            Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
+                // Free this finalized tx's in-flight slot now so a continuation (the JIT
                 // mint retry) can reuse it instead of being refused when in-flight is full.
                 drop(tx.permit);
                 let result = if let Some(err) = &status.err {
@@ -1504,9 +1504,9 @@ pub(super) async fn run_poll_task(
 
         for (mut tx, status_opt) in batch.into_iter().zip(statuses) {
             match status_opt {
-                Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
                     if status.err.is_none() {
-                        // ── Confirmed success (hot path) ──────────────────────────────
+                        // ── Finalized success (hot path) ──────────────────────────────
                         // Handle entirely here — no need to wake the sender loop.
                         metrics::OPERATOR_MINTS_SENT
                             .with_label_values(&[program_type.as_label()])
@@ -3250,7 +3250,7 @@ mod tests {
     /// A confirmed signature in the batch must route to handle_success, emitting
     /// a Completed status and removing the entry from in_flight.
     #[tokio::test]
-    async fn poll_in_flight_confirmed_tx_emits_completed() {
+    async fn poll_in_flight_finalized_tx_emits_completed() {
         let mut server = mockito::Server::new_async().await;
 
         let sig = Signature::new_unique();
@@ -3268,8 +3268,8 @@ mod tests {
                     "result": {
                         "context": {"slot": 100},
                         "value": [{
-                            "confirmationStatus": "confirmed",
-                            "confirmations": 1,
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
                             "err": null,
                             "slot": 100,
                             "status": {"Ok": null}
@@ -3646,8 +3646,8 @@ mod tests {
                         "value": [
                             // sig1 confirmed
                             {
-                                "confirmationStatus": "confirmed",
-                                "confirmations": 1,
+                                "confirmationStatus": "finalized",
+                                "confirmations": null,
                                 "err": null,
                                 "slot": 200,
                                 "status": {"Ok": null}
@@ -4338,8 +4338,8 @@ mod tests {
                         "context": {"slot": 200},
                         "value": [
                             {
-                                "confirmationStatus": "confirmed",
-                                "confirmations": 1,
+                                "confirmationStatus": "finalized",
+                                "confirmations": null,
                                 "err": {"InstructionError": [0, "InvalidAccountData"]},
                                 "slot": 200,
                                 "status": {"Err": {"InstructionError": [0, "InvalidAccountData"]}}

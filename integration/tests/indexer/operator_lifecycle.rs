@@ -25,6 +25,7 @@ mod setup;
 
 use chrono::Utc;
 use helpers::test_types::WAIT_TIMEOUT_SECS;
+use helpers::private_channel_node::start_private_channel_node;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
 use private_channel_indexer::config::{
@@ -309,10 +310,16 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 
     storage.insert_db_transaction(&deposit_txn).await?;
 
-    // 3. Start start_solana_to_private_channel_operator()
+    // 3. Start a PrivateChannel core node as the mint target. It reports every
+    // found transaction as `finalized` instantly, so the operator's finalized
+    // mint gate completes on the first poll - mirroring production, where mints
+    // land on the PC node rather than slow Solana.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let pc_node = start_private_channel_node(operator_keypair.pubkey()).await?;
+
+    // rpc_url (mint target) = PC node; the escrow instance stays on Solana.
     let operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        pc_node.url.clone(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -330,6 +337,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     assert!(db_tx.counterpart_signature.is_some());
 
     operator_handle.shutdown().await;
+    pc_node.shutdown().await;
 
     Ok(())
 }
@@ -400,11 +408,18 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     // Duplicate insert with same signature should not create a second mint.
     storage.insert_db_transaction(&deposit_txn).await?;
 
-    let balance_before = get_token_balance(&client, &user_pubkey, &env.mint).await?;
-
+    // Mint target is the PrivateChannel node (instant finality), so balances are
+    // checked there, not on the Solana validator. The recipient ATA does not
+    // exist on the PC node until the first mint, so treat "before" as 0.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let pc_node = start_private_channel_node(operator_keypair.pubkey()).await?;
+    let pc_client = RpcClient::new(pc_node.url.clone());
+    let balance_before = get_token_balance(&pc_client, &user_pubkey, &env.mint)
+        .await
+        .unwrap_or(0);
+
     let operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        pc_node.url.clone(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -413,7 +428,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     operator_util::wait_for_transaction_completion(&pool, &signature, 180).await?;
 
-    let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    let balance_after = get_token_balance(&pc_client, &user_pubkey, &env.mint).await?;
     assert_eq!(
         balance_after,
         balance_before + amount,
@@ -421,6 +436,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     );
 
     operator_handle.shutdown().await;
+    pc_node.shutdown().await;
     Ok(())
 }
 
@@ -747,10 +763,14 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         signatures.push(sig);
     }
 
-    // Start the Solana → PrivateChannel operator and wait for all deposits to be processed.
+    // Start the Solana -> PrivateChannel operator and wait for all deposits to be processed.
+    // The mint target is a PrivateChannel node (instant finality), so balances
+    // are verified there rather than on the Solana validator.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let pc_node = start_private_channel_node(operator_keypair.pubkey()).await?;
+    let pc_client = RpcClient::new(pc_node.url.clone());
     let operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        pc_node.url.clone(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -771,7 +791,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
             "Deposit {i} missing counterpart signature"
         );
 
-        let balance = get_token_balance(&client, &env.users[i].pubkey(), &env.mint).await?;
+        let balance = get_token_balance(&pc_client, &env.users[i].pubkey(), &env.mint).await?;
         assert_eq!(
             balance, DEPOSIT_AMOUNT,
             "User {i} balance mismatch after deposit"
@@ -779,6 +799,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
     }
 
     operator_handle.shutdown().await;
+    pc_node.shutdown().await;
     Ok(())
 }
 

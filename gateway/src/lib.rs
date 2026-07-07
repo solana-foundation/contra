@@ -858,15 +858,15 @@ pub async fn serve(
         // the socket and release the global permit.
         let ip_guard =
             match try_acquire_ip(&ip_counts, ip, gateway.limits.max_connections_per_ip.get()) {
-            Some(guard) => guard,
-            None => {
-                warn!("Per-IP connection limit reached for {ip}, dropping connection");
-                metrics::GATEWAY_REJECTED_TOTAL
-                    .with_label_values(&["per_ip_limit"])
-                    .inc();
-                continue;
-            }
-        };
+                Some(guard) => guard,
+                None => {
+                    warn!("Per-IP connection limit reached for {ip}, dropping connection");
+                    metrics::GATEWAY_REJECTED_TOTAL
+                        .with_label_values(&["per_ip_limit"])
+                        .inc();
+                    continue;
+                }
+            };
 
         // Enable OS TCP keepalive so a peer that vanishes without a close (its
         // network dropped) is detected and the socket reclaimed. Best-effort:

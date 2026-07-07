@@ -171,6 +171,20 @@ pub mod escrow_fixtures {
 #[cfg(test)]
 pub mod rpc_mocks {
     use mockito::{Mock, Server};
+    use serde_json::json;
+
+    /// Mock `getFirstAvailableBlock` replying with `floor`. Body-matched so it only
+    /// answers the floor call and coexists with the getBlock mocks in the same test.
+    pub fn mock_first_available_block(server: &mut Server, floor: u64) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getFirstAvailableBlock"
+            })))
+            .with_status(200)
+            .with_body(json!({ "jsonrpc": "2.0", "result": floor, "id": 1 }).to_string())
+            .create()
+    }
 
     /// Create a mock JSON-RPC response with a successful result
     pub async fn mock_rpc_success(server: &mut Server, result: &str) -> Mock {

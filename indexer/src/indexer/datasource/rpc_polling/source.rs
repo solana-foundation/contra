@@ -1,5 +1,5 @@
 use super::rpc::RpcPoller;
-use super::types::RpcBlock;
+use super::types::{BlockFetch, RpcBlock};
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::DataSourceError;
@@ -80,7 +80,7 @@ async fn refetch_missing_meta_via_fallback(
 ) -> Option<RpcBlock> {
     let (_slot, result) = fallback.get_blocks_batch(vec![slot]).await.pop()?;
     match result {
-        Ok(Some(block))
+        Ok(BlockFetch::Present(block))
             if block.blockhash == expected_blockhash
                 && decoder::first_missing_meta(&block).is_none() =>
         {
@@ -175,7 +175,7 @@ impl DataSource for RpcPollingSource {
                 // Parse and send instructions from each block
                 for (slot, block_result) in blocks {
                     match block_result {
-                        Ok(Some(block)) => {
+                        Ok(BlockFetch::Present(block)) => {
                             // A missing-meta block is unverifiable: try one fallback re-fetch, and if that
                             // is unavailable or also incomplete, fail closed (no SlotComplete, no advance).
                             let block = match decoder::first_missing_meta(&block) {
@@ -256,8 +256,21 @@ impl DataSource for RpcPollingSource {
                                 }
                             }
                         }
-                        Ok(None) => {
-                            info!("Slot {} was skipped", slot);
+                        Ok(BlockFetch::Skipped) => {
+                            debug!("Slot {} proven skipped (>= first_available_block)", slot);
+                        }
+                        Ok(BlockFetch::Unavailable) => {
+                            error!(
+                                "Slot {} is unavailable (pruned/snapshot-jumped); refusing to checkpoint past unknown contents",
+                                slot
+                            );
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "block_unavailable"])
+                                .inc();
+                            // Fail closed, Break so the next poll re-fetches from `current_slot`.
+                            tokio::time::sleep(Duration::from_millis(error_retry_interval_ms))
+                                .await;
+                            break;
                         }
                         Err(e) => {
                             error!("Failed to fetch block {}: {}", slot, e);
@@ -315,6 +328,7 @@ impl DataSource for RpcPollingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::rpc_mocks::mock_first_available_block;
     use mockito::Server;
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -351,6 +365,32 @@ mod tests {
                         "parentSlot": slot - 1,
                         "transactions": []
                     },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .expect_at_least(expect_at_least)
+            .create()
+    }
+
+    /// getBlock returns a `-32009` skipped-or-missing response for `slot`, which the
+    /// classifier resolves against the ledger floor.
+    fn mock_get_block_absent(
+        server: &mut Server,
+        slot: u64,
+        expect_at_least: usize,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32009, "message": "Slot was skipped" },
                     "id": 1
                 })
                 .to_string(),
@@ -493,6 +533,108 @@ mod tests {
             )
             .expect_at_least(expect_at_least)
             .create()
+    }
+
+    /// An Unavailable slot (absent below the ledger floor) must fail closed exactly
+    /// like a transport error: no SlotComplete, and the slot is re-fetched.
+    #[tokio::test]
+    async fn unavailable_does_not_emit_slot_complete_and_retries() {
+        let mut server = Server::new_async().await;
+
+        // Chain tip ahead so get_slots_to_process always returns [100].
+        let _m_slot = mock_get_slot(&mut server, 105);
+        // Slot 100 is absent; floor 200 > 100 => Unavailable. Expect >=2 retries.
+        let m_block = mock_get_block_absent(&mut server, 100, 2);
+        let _floor = mock_first_available_block(&mut server, 200);
+
+        let mut source = RpcPollingSource::new(
+            server.url(),
+            Some(100),
+            10,
+            10,
+            10,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Escrow,
+            None,
+            None,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        // Slot 100 re-requested at least twice: it did not advance past the unavailable slot.
+        m_block.assert();
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        let advanced_past_100 = messages
+            .iter()
+            .any(|m| matches!(m, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100));
+        assert!(
+            !advanced_past_100,
+            "SlotComplete{{slot:100}} must not be emitted for an unavailable slot"
+        );
+    }
+
+    /// A proven skip (absent at or above the ledger floor) keeps the old behavior:
+    /// SlotComplete is emitted and polling advances past the slot.
+    #[tokio::test]
+    async fn proven_skip_emits_slot_complete_and_advances() {
+        let mut server = Server::new_async().await;
+
+        // Chain tip 103 => get_slots_to_process(100, 10) returns [100,101,102].
+        let _m_slot = mock_get_slot(&mut server, 103);
+        // Slot 100 is absent; floor 0 <= 100 => proven Skipped, so it must advance.
+        let _m100 = mock_get_block_absent(&mut server, 100, 1);
+        let _floor = mock_first_available_block(&mut server, 0);
+        let _m101 = mock_get_block_success(&mut server, 101, 1);
+        let _m102 = mock_get_block_success(&mut server, 102, 1);
+
+        let mut source = RpcPollingSource::new(
+            server.url(),
+            Some(100),
+            10,
+            10,
+            10,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Escrow,
+            None,
+            None,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        while seen.len() < 3 && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                seen.insert(slot);
+            }
+        }
+        cancel.cancel();
+        let _ = handle.await;
+
+        assert!(
+            seen.contains(&100),
+            "SlotComplete{{slot:100}} must be emitted for a proven-skipped slot; got {seen:?}"
+        );
+        assert!(
+            seen.contains(&101) && seen.contains(&102),
+            "polling must advance past the skipped slot; got {seen:?}"
+        );
     }
 
     /// getBlock failure must not emit SlotComplete or advance.

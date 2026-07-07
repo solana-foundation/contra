@@ -7,7 +7,7 @@ use crate::{
         checkpoint::get_last_checkpoint,
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
-            rpc_polling::{decoder, rpc::RpcPoller, types::RpcBlock},
+            rpc_polling::{decoder, rpc::RpcPoller, types::BlockFetch},
         },
     },
     storage::Storage,
@@ -62,7 +62,7 @@ async fn fetch_blocks_with_retry(
     rpc_poller: &RpcPoller,
     slots: &[u64],
     retry_count: usize,
-) -> Result<Vec<(u64, Result<Option<RpcBlock>, BackfillError>)>, IndexerError> {
+) -> Result<Vec<(u64, Result<BlockFetch, BackfillError>)>, IndexerError> {
     if retry_count > 0 {
         tokio::time::sleep(Duration::from_millis(
             BACKFILL_RETRY_DELAY_MS * retry_count as u64,
@@ -80,7 +80,7 @@ async fn fetch_blocks_with_retry(
                 result.map_err(|e| BackfillError::SlotFetchFailed { slot, source: e }),
             )
         })
-        .collect::<Vec<(u64, Result<Option<RpcBlock>, BackfillError>)>>())
+        .collect::<Vec<(u64, Result<BlockFetch, BackfillError>)>>())
 }
 
 /// Fill a range of slots by fetching blocks via RPC and sending parsed instructions.
@@ -132,7 +132,7 @@ pub async fn fill_slot_range(
 
         for (slot, block_result) in blocks {
             match block_result {
-                Ok(Some(block)) => {
+                Ok(BlockFetch::Present(block)) => {
                     // A missing-meta block is unverifiable: abort before the SlotComplete send so the
                     // checkpoint never advances past it; the caller surfaces the error and retries.
                     if let Some(signature) = decoder::first_missing_meta(&block) {
@@ -164,8 +164,18 @@ pub async fn fill_slot_range(
                     }
                     processed_count += 1;
                 }
-                Ok(None) => {
+                Ok(BlockFetch::Skipped) => {
                     processed_count += 1;
+                }
+                Ok(BlockFetch::Unavailable) => {
+                    error!(
+                        "Backfill slot {} is unavailable (pruned/snapshot-jumped); aborting before checkpoint",
+                        slot
+                    );
+                    metrics::INDEXER_RPC_ERRORS
+                        .with_label_values(&[program_type.as_label(), "block_unavailable"])
+                        .inc();
+                    return Err(BackfillError::SlotUnavailable { slot }.into());
                 }
                 Err(e) => {
                     warn!("Error fetching block {}: {}", slot, e);
@@ -442,6 +452,7 @@ mod tests {
     mod fill_slot_range_tests {
         use super::*;
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+        use crate::test_utils::rpc_mocks::mock_first_available_block;
         use mockito::Server;
         use serde_json::json;
         use solana_sdk::commitment_config::CommitmentLevel;
@@ -589,6 +600,8 @@ mod tests {
 
             let _m1 = mock_get_block_skipped(&mut server, 101);
             let _m2 = mock_get_block_skipped(&mut server, 102);
+            // Floor 0 so both absent slots (>= 0) resolve as proven Skipped.
+            let _floor = mock_first_available_block(&mut server, 0);
 
             let poller = RpcPoller::new(
                 server.url(),
@@ -612,6 +625,45 @@ mod tests {
             for msg in &messages {
                 assert!(matches!(msg, ProcessorMessage::SlotComplete { .. }));
             }
+        }
+
+        /// A batch where slot N is absent below the ledger floor (Unavailable) must
+        /// abort with `SlotUnavailable { slot: N }` before sending SlotComplete{N}
+        /// (and before any later slot's SlotComplete), so the checkpoint never
+        /// advances past a slot whose contents are unknown.
+        #[tokio::test]
+        async fn fill_slot_range_unavailable_aborts_before_slot_complete() {
+            let mut server = Server::new_async().await;
+
+            // Batch over (100, 102] = [101, 102]; slot 101 is absent below the floor.
+            let _m1 = mock_get_block_skipped(&mut server, 101);
+            let _m2 = mock_get_block_success(&mut server, 102);
+            let _floor = mock_first_available_block(&mut server, 500);
+
+            let poller = RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            );
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            let err = result.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("unavailable"), "unexpected error: {msg}");
+            assert!(msg.contains("101"), "error should name the slot: {msg}");
+
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let advanced = messages
+                .iter()
+                .any(|m| matches!(m, ProcessorMessage::SlotComplete { slot, .. } if *slot >= 101));
+            assert!(
+                !advanced,
+                "no SlotComplete must be sent for slot 101 or beyond on an unavailable block"
+            );
         }
 
         #[tokio::test]

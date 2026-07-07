@@ -1,5 +1,5 @@
 use crate::error::DataSourceRpcError;
-use crate::indexer::datasource::rpc_polling::types::RpcBlock;
+use crate::indexer::datasource::rpc_polling::types::{BlockFetch, RpcBlock};
 use futures::future::join_all;
 use serde_json::json;
 use solana_sdk::commitment_config::CommitmentLevel;
@@ -27,8 +27,10 @@ impl RpcPoller {
         }
     }
 
-    /// Get a single block by slot
-    async fn get_block(&self, slot: u64) -> Result<Option<RpcBlock>, DataSourceRpcError> {
+    /// Fetch just the getBlock result: `Some(block)` when present, `None` for a
+    /// `-32004/-32007/-32009/null` "skipped or missing" response (which the node
+    /// cannot tell apart from unavailable). Other RPC errors surface as `Err`.
+    async fn fetch_block_raw(&self, slot: u64) -> Result<Option<RpcBlock>, DataSourceRpcError> {
         let response = self
             .client
             .post(&self.rpc_url)
@@ -52,12 +54,7 @@ impl RpcPoller {
 
         let json: serde_json::Value = response.json().await?;
 
-        // Check for RPC error
         if let Some(error) = json.get("error") {
-            // Skipped/unavailable slot. At finalized commitment a slot at/below the
-            // tip with no block was skipped and carries no transactions — treat as
-            // empty, like the `result: null` case below. -32004 is the error-object
-            // spelling of that; without it a skipped slot aborts the whole backfill.
             // -32004: Block not available for slot (skipped or missing)
             // -32007: Slot skipped or missing due to ledger jump to recent snapshot
             // -32009: Slot skipped or missing in long-term storage
@@ -69,28 +66,82 @@ impl RpcPoller {
             });
         }
 
-        // Check if result is null (block not available)
+        // A null result is the same "skipped or missing" ambiguity as the errors above.
         if json["result"].is_null() {
             return Ok(None);
         }
 
-        // Parse the block
         let block: RpcBlock =
             serde_json::from_value(json["result"].clone()).map_err(DataSourceRpcError::from)?;
         Ok(Some(block))
     }
 
-    /// Get multiple blocks in parallel
+    /// Classify a "skipped or missing" slot against the node's retained ledger
+    /// floor: at or above `floor` it is a proven skip (safe to advance), below it
+    /// the block was pruned and its contents are unknown. Inclusive because `floor`
+    /// is itself a retained slot. Assumes the getBlock and getFirstAvailableBlock
+    /// calls observe a consistent node view; a load-balanced endpoint split across
+    /// lagging replicas can still misclassify.
+    fn classify_absent(slot: u64, floor: u64) -> BlockFetch {
+        if slot >= floor {
+            BlockFetch::Skipped
+        } else {
+            BlockFetch::Unavailable
+        }
+    }
+
+    /// Get a single block by slot, classifying an absent slot with its own floor
+    /// query. Only the batch path runs in production; this is the single-slot form
+    /// the unit tests drive.
+    #[cfg(test)]
+    async fn get_block(&self, slot: u64) -> Result<BlockFetch, DataSourceRpcError> {
+        match self.fetch_block_raw(slot).await? {
+            Some(block) => Ok(BlockFetch::Present(block)),
+            None => Ok(Self::classify_absent(
+                slot,
+                self.get_first_available_block().await?,
+            )),
+        }
+    }
+
+    /// Get multiple blocks in parallel. The ledger floor is queried at most once
+    /// per batch, and only when some slot is absent, so a fully-present batch adds
+    /// no extra round-trips and N absent slots do not each re-query the floor.
     pub async fn get_blocks_batch(
         &self,
         slots: Vec<u64>,
-    ) -> Vec<(u64, Result<Option<RpcBlock>, DataSourceRpcError>)> {
-        let futures = slots.into_iter().map(|slot| async move {
-            let result = self.get_block(slot).await;
-            (slot, result)
-        });
+    ) -> Vec<(u64, Result<BlockFetch, DataSourceRpcError>)> {
+        let raws = join_all(
+            slots
+                .into_iter()
+                .map(|slot| async move { (slot, self.fetch_block_raw(slot).await) }),
+        )
+        .await;
 
-        join_all(futures).await
+        let floor = if raws.iter().any(|(_, r)| matches!(r, Ok(None))) {
+            Some(self.get_first_available_block().await)
+        } else {
+            None
+        };
+
+        raws.into_iter()
+            .map(|(slot, raw)| {
+                let result = match raw {
+                    Ok(Some(block)) => Ok(BlockFetch::Present(block)),
+                    Ok(None) => match &floor {
+                        Some(Ok(f)) => Ok(Self::classify_absent(slot, *f)),
+                        // The single floor query failed, so no absent slot in this
+                        // batch can be classified; fail closed for each.
+                        Some(Err(e)) => Err(DataSourceRpcError::Protocol {
+                            reason: format!("getFirstAvailableBlock failed: {e}"),
+                        }),
+                        None => unreachable!("floor is queried whenever a slot is absent"),
+                    },
+                    Err(e) => Err(e),
+                };
+                (slot, result)
+            })
+            .collect()
     }
 
     /// Get the latest slot
@@ -122,6 +173,37 @@ impl RpcPoller {
             .as_u64()
             .ok_or_else(|| DataSourceRpcError::Protocol {
                 reason: "Invalid slot response".to_string(),
+            })
+    }
+
+    /// Get the first slot the node still retains (its ledger floor). Takes no
+    /// params and returns node-local ledger state, so no commitment argument.
+    pub async fn get_first_available_block(&self) -> Result<u64, DataSourceRpcError> {
+        let response = self
+            .client
+            .post(&self.rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getFirstAvailableBlock",
+                "params": []
+            }))
+            .send()
+            .await
+            .map_err(DataSourceRpcError::from)?;
+
+        let json: serde_json::Value = response.json().await.map_err(DataSourceRpcError::from)?;
+
+        if let Some(error) = json.get("error") {
+            return Err(DataSourceRpcError::Protocol {
+                reason: format!("RPC error: {}", error),
+            });
+        }
+
+        json["result"]
+            .as_u64()
+            .ok_or_else(|| DataSourceRpcError::Protocol {
+                reason: "Invalid getFirstAvailableBlock response".to_string(),
             })
     }
 
@@ -173,9 +255,10 @@ mod tests {
         let result = poller.get_block(101).await;
 
         assert!(result.is_ok());
-        let block = result.unwrap();
-        assert!(block.is_some());
-        let block = block.unwrap();
+        let block = match result.unwrap() {
+            BlockFetch::Present(block) => block,
+            other => panic!("expected Present, got {other:?}"),
+        };
         assert_eq!(
             block.blockhash,
             "TestBlockHash11111111111111111111111111111"
@@ -183,10 +266,12 @@ mod tests {
         assert_eq!(block.parent_slot, 100);
     }
 
+    /// -32009 at or above the retained floor is a proven skip, safe to advance.
     #[tokio::test]
-    async fn test_get_block_skipped_slot() {
+    async fn get_block_skipped_when_slot_at_or_above_floor() {
         let mut server = Server::new_async().await;
         let _m = mock_rpc_error(&mut server, -32009, "Slot was skipped").await;
+        let _floor = mock_first_available_block(&mut server, 50);
 
         let poller = RpcPoller::new(
             server.url(),
@@ -195,33 +280,100 @@ mod tests {
         );
         let result = poller.get_block(101).await;
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(matches!(result, Ok(BlockFetch::Skipped)));
     }
 
+    /// -32009 below the retained floor is pruned history: Unavailable, must not advance.
     #[tokio::test]
-    async fn test_get_block_not_available_treated_as_skip() {
-        // -32004 "Block not available for slot" is the error-object spelling of a
-        // skipped/unavailable slot; at finalized commitment it must be treated as an
-        // empty slot (Ok(None)), not a fatal error that aborts the backfill.
+    async fn get_block_unavailable_when_slot_below_floor() {
         let mut server = Server::new_async().await;
-        let _m = mock_rpc_error(&mut server, -32004, "Block not available for slot 101").await;
+        let _m = mock_rpc_error(&mut server, -32009, "Slot missing in long-term storage").await;
+        let _floor = mock_first_available_block(&mut server, 50);
 
         let poller = RpcPoller::new(
             server.url(),
             UiTransactionEncoding::Json,
             CommitmentLevel::Finalized,
         );
-        let result = poller.get_block(101).await;
+        let result = poller.get_block(40).await;
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(matches!(result, Ok(BlockFetch::Unavailable)));
     }
 
+    /// A null result takes the same floor-classified path; below floor is Unavailable.
     #[tokio::test]
-    async fn test_get_block_null_result() {
+    async fn get_block_null_result_classified_by_floor() {
         let mut server = Server::new_async().await;
         let _m = mock_rpc_success(&mut server, "null").await;
+        let _floor = mock_first_available_block(&mut server, 50);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_block(40).await;
+
+        assert!(matches!(result, Ok(BlockFetch::Unavailable)));
+    }
+
+    /// The `slot >= floor` boundary is inclusive: slot exactly at the floor is Skipped.
+    #[tokio::test]
+    async fn get_block_floor_boundary_inclusive() {
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_error(&mut server, -32007, "Slot skipped or ledger jump").await;
+        let _floor = mock_first_available_block(&mut server, 50);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_block(50).await;
+
+        assert!(matches!(result, Ok(BlockFetch::Skipped)));
+    }
+
+    /// A failed floor fetch is transient and retryable, so it propagates as Err,
+    /// never as a proven-unavailable verdict.
+    #[tokio::test]
+    async fn get_block_floor_fetch_error_propagates_err() {
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_error(&mut server, -32009, "Slot was skipped").await;
+        // Floor call errors; body-matched so it only answers getFirstAvailableBlock.
+        let _floor_err = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getFirstAvailableBlock"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "Invalid request" },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create();
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_block(40).await;
+
+        assert!(result.is_err());
+    }
+
+    /// -32004 "Block not available for slot" is the error-object spelling of an
+    /// absent slot; at or above the retained floor it is a proven skip.
+    #[tokio::test]
+    async fn get_block_not_available_classified_by_floor() {
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_error(&mut server, -32004, "Block not available for slot 101").await;
+        let _floor = mock_first_available_block(&mut server, 50);
 
         let poller = RpcPoller::new(
             server.url(),
@@ -230,8 +382,38 @@ mod tests {
         );
         let result = poller.get_block(101).await;
 
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(matches!(result.unwrap(), BlockFetch::Skipped));
+    }
+
+    #[tokio::test]
+    async fn get_first_available_block_success() {
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_success(&mut server, "42").await;
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_first_available_block().await;
+
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn get_first_available_block_rpc_error() {
+        let mut server = Server::new_async().await;
+        let _m = mock_rpc_error(&mut server, -32600, "Invalid request").await;
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        let result = poller.get_first_available_block().await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("RPC error"));
     }
 
     #[tokio::test]
@@ -272,15 +454,18 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
+        // The null result routes through the floor check; slot 101 >= 0 is a proven skip.
+        let _floor = mock_first_available_block(&mut server, 0);
 
         let poller = RpcPoller::new(
             server.url(),
             UiTransactionEncoding::Json,
             CommitmentLevel::Confirmed,
         );
-        let _ = poller.get_block(101).await;
+        let result = poller.get_block(101).await;
 
         m.assert_async().await;
+        assert!(matches!(result.unwrap(), BlockFetch::Skipped));
     }
 
     // ============================================================================
@@ -436,6 +621,9 @@ mod tests {
             .create_async()
             .await;
 
+        // Floor 100 so slot 101's -32009 (101 >= 100) classifies as Skipped.
+        let _floor = mock_first_available_block(&mut server, 100);
+
         let poller = RpcPoller::new(
             server.url(),
             UiTransactionEncoding::Json,
@@ -445,24 +633,26 @@ mod tests {
 
         assert_eq!(results.len(), 3);
 
-        // Slot 100: success
+        // Slot 100: present
         assert_eq!(results[0].0, 100);
-        assert!(results[0].1.is_ok());
-        let block = results[0].1.as_ref().unwrap();
-        assert!(block.is_some());
-        assert_eq!(block.as_ref().unwrap().blockhash, "Block100");
+        match results[0].1.as_ref().unwrap() {
+            BlockFetch::Present(block) => assert_eq!(block.blockhash, "Block100"),
+            other => panic!("slot 100 expected Present, got {other:?}"),
+        }
 
-        // Slot 101: skipped
+        // Slot 101: proven skipped (>= floor)
         assert_eq!(results[1].0, 101);
-        assert!(results[1].1.is_ok());
-        assert!(results[1].1.as_ref().unwrap().is_none());
+        assert!(matches!(
+            results[1].1.as_ref().unwrap(),
+            BlockFetch::Skipped
+        ));
 
-        // Slot 102: success
+        // Slot 102: present
         assert_eq!(results[2].0, 102);
-        assert!(results[2].1.is_ok());
-        let block = results[2].1.as_ref().unwrap();
-        assert!(block.is_some());
-        assert_eq!(block.as_ref().unwrap().blockhash, "Block102");
+        match results[2].1.as_ref().unwrap() {
+            BlockFetch::Present(block) => assert_eq!(block.blockhash, "Block102"),
+            other => panic!("slot 102 expected Present, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -98,6 +98,9 @@ pub enum BackfillError {
     #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
     MissingMeta { slot: u64, signature: String },
 
+    #[error("Slot {slot} is unavailable (pruned or snapshot-jumped); block contents are unknown")]
+    SlotUnavailable { slot: u64 },
+
     // Channel errors
     #[error("Channel send failed: {0}")]
     ChannelSend(#[source] Box<dyn std::error::Error + Send + Sync>),

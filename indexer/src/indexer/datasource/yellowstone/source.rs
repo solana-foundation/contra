@@ -502,6 +502,7 @@ async fn connect_and_stream(
 mod tests {
     use super::*;
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+    use crate::test_utils::rpc_mocks::mock_first_available_block;
     use mockito::Server;
     use serde_json::json;
     use solana_sdk::commitment_config::CommitmentLevel;
@@ -623,6 +624,55 @@ mod tests {
         }
 
         assert_eq!(slots, vec![100, 101, 102, 103]);
+    }
+
+    /// An unavailable slot encountered during reconnect gap-fill must abort the fill
+    /// with GapFillFailed rather than checkpoint past the gap.
+    #[tokio::test]
+    async fn try_fill_reconnect_gap_unavailable_slot_fails_closed() {
+        let mut server = Server::new_async().await;
+
+        // checkpoint = 100, current_slot = 103 => replay anchor 99, batch [100..=103].
+        // Slot 100 is absent below the floor (100 < 500) => Unavailable.
+        let _m_slot = mock_get_slot(&mut server, 103);
+        let _m_absent = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [100]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32009, "message": "Slot was skipped" },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create();
+        let _floor = mock_first_available_block(&mut server, 500);
+
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        let (tx, _rx) = mpsc::channel(64);
+        let result =
+            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
+
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("Gap fill failed"),
+            "expected GapFillFailed: {err_str}"
+        );
+        assert!(
+            err_str.contains("unavailable") && err_str.contains("100"),
+            "error should name the unavailable slot: {err_str}"
+        );
     }
 
     #[tokio::test]

@@ -64,8 +64,10 @@ pub async fn start_private_channel_node(
         .await?;
     let host = db_container.get_host().await?;
     let port = db_container.get_host_port_ipv4(5432).await?;
-    let accountsdb_connection_url =
-        format!("postgres://postgres:password@{}:{}/private_channel_node", host, port);
+    let accountsdb_connection_url = format!(
+        "postgres://postgres:password@{}:{}/private_channel_node",
+        host, port
+    );
 
     let node_port = get_free_port();
     let node_config = NodeConfig {

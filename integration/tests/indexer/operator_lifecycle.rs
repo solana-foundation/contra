@@ -24,8 +24,8 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
-use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::private_channel_node::start_private_channel_node;
+use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
 use private_channel_indexer::config::{

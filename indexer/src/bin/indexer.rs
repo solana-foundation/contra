@@ -4,7 +4,7 @@ use figment::{
     Figment,
 };
 use private_channel_indexer::config::{
-    default_safety_window, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    default_safety_window, floor_operator_commitment, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
 };
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
@@ -63,14 +63,11 @@ struct RpcPollingSection {
     batch_size: usize,
     #[serde(default)]
     encoding: Option<UiTransactionEncoding>,
-    #[serde(default)]
-    commitment: Option<CommitmentLevel>,
 }
 
 #[derive(Deserialize)]
 struct YellowstoneSection {
     endpoint: Option<String>,
-    commitment: String,
     x_token: Option<String>,
     #[serde(default = "default_safety_window")]
     safety_window_slots: u64,
@@ -261,7 +258,9 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 batch_size: rpc.batch_size,
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
-                commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                // Ingestion is the value-finalizing source of truth; fixed at finalized,
+                // so a forked block can never be indexed into an unbacked mint.
+                commitment: CommitmentLevel::Finalized,
             };
             (Some(config), None)
         }
@@ -281,7 +280,8 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
             let config = YellowstoneConfig {
                 endpoint,
                 x_token: token,
-                commitment: ys.commitment,
+                // Fixed at finalized; the gap poller below inherits it.
+                commitment: "finalized".to_string(),
                 safety_window_slots: ys.safety_window_slots,
             };
 
@@ -292,7 +292,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 batch_size: rpc.batch_size,
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
-                commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                commitment: CommitmentLevel::Finalized,
             });
 
             (rpc_config, Some(config))
@@ -425,9 +425,11 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         retry_max_attempts: operator.retry_max_attempts,
         retry_base_delay: Duration::from_secs(operator.retry_base_delay_secs),
         channel_buffer_size: operator.channel_buffer_size,
-        rpc_commitment: operator
-            .rpc_commitment
-            .unwrap_or(CommitmentLevel::Confirmed),
+        rpc_commitment: floor_operator_commitment(
+            operator
+                .rpc_commitment
+                .unwrap_or(CommitmentLevel::Confirmed),
+        )?,
         alert_webhook_url: std::env::var("ALERT_WEBHOOK_URL").ok(),
         reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
         reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
@@ -491,11 +493,8 @@ async fn run_resync(
         .as_ref()
         .and_then(|rpc| rpc.encoding)
         .unwrap_or(UiTransactionEncoding::Json);
-    let rpc_commitment = indexer
-        .rpc_polling
-        .as_ref()
-        .and_then(|rpc| rpc.commitment)
-        .unwrap_or(CommitmentLevel::Finalized);
+    // Resync reads Solana blocks, so it uses the same fixed finalized ingestion commitment.
+    let rpc_commitment = CommitmentLevel::Finalized;
 
     let rpc_poller = Arc::new(
         private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(

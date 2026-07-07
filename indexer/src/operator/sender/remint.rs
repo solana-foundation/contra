@@ -176,7 +176,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
     let result = match check_transaction_status(
         state.source_rpc_client.clone(),
         &signature,
-        CommitmentConfig::confirmed(),
+        CommitmentConfig::finalized(),
         &ExtraErrorCheckPolicy::None,
         state.confirmation_poll_interval_ms,
     )

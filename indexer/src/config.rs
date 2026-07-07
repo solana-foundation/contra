@@ -81,7 +81,8 @@ pub struct RpcPollingConfig {
     pub batch_size: usize,
     /// RPC encoding format for getBlock calls
     pub encoding: UiTransactionEncoding,
-    /// RPC commitment level for getSlot calls
+    /// RPC commitment for block ingestion. Fixed at `finalized`: indexing is
+    /// the value-finalizing source of truth, so a forkable block must never be indexed.
     pub commitment: CommitmentLevel,
 }
 
@@ -92,7 +93,8 @@ pub struct YellowstoneConfig {
     pub endpoint: String,
     /// Token to use for authentication
     pub x_token: Option<String>,
-    /// Commitment level: "processed", "confirmed", or "finalized"
+    /// Stream commitment. Fixed at "finalized": indexing is the
+    /// value-finalizing source of truth, so a sub-finalized stream could index a forked block.
     pub commitment: String,
     /// Slots to hold a live SlotComplete behind the highest BlockMeta seen, so a late tx still lands
     /// before finalize. Live gRPC stream only; getBlock backfill/gap-fill never delayed. `0` = immediate.
@@ -105,6 +107,21 @@ pub const DEFAULT_SLOT_SAFETY_WINDOW: u64 = 3;
 
 pub fn default_safety_window() -> u64 {
     DEFAULT_SLOT_SAFETY_WINDOW
+}
+
+/// Floor the operator's operational RPC commitment. This knob only affects blockhash/preflight
+/// lifetime, never a settlement decision, so `confirmed` and `finalized` are both accepted;
+/// only `processed` is rejected as too weak for even operational use.
+pub fn floor_operator_commitment(level: CommitmentLevel) -> Result<CommitmentLevel, String> {
+    match level {
+        CommitmentLevel::Processed => Err(
+            "operator rpc_commitment=processed is too weak; use confirmed or finalized (this knob \
+             sets only the operational blockhash/preflight commitment, not the finalized \
+             settlement gate)"
+                .to_string(),
+        ),
+        other => Ok(other),
+    }
 }
 
 /// Backfill configuration
@@ -270,7 +287,11 @@ pub struct OperatorConfig {
     pub retry_base_delay: std::time::Duration,
     /// Size of channel buffers
     pub channel_buffer_size: usize,
-    /// RPC commitment level for operator transactions
+    /// Operational RPC commitment for the operator's blockhash fetch and preflight only.
+    /// It does NOT gate settlement: the terminal Completed/FailedReminted writes and the
+    /// recovery reconcile always use a hardcoded `finalized` gate regardless of this value.
+    /// `confirmed` is a reasonable default (a finalized blockhash is ~13s stale and shortens
+    /// transaction lifetime for no safety gain); `processed` is rejected as too weak.
     pub rpc_commitment: CommitmentLevel,
     /// Webhook URL for alerting on failed transactions. Set via ALERT_WEBHOOK env var.
     pub alert_webhook_url: Option<String>,
@@ -511,5 +532,22 @@ mod tests {
             let result = config.validate();
             assert!(result.is_ok());
         }
+    }
+
+    // ── operator operational commitment floor ───────────────────────────
+
+    /// Operator rpc_commitment rejects only `processed`; confirmed/finalized pass.
+    /// (Indexing commitment is not configurable, so it has no validation test.)
+    #[test]
+    fn operator_commitment_rejects_only_processed() {
+        assert!(floor_operator_commitment(CommitmentLevel::Processed).is_err());
+        assert_eq!(
+            floor_operator_commitment(CommitmentLevel::Confirmed).unwrap(),
+            CommitmentLevel::Confirmed
+        );
+        assert_eq!(
+            floor_operator_commitment(CommitmentLevel::Finalized).unwrap(),
+            CommitmentLevel::Finalized
+        );
     }
 }

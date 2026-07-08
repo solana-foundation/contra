@@ -237,8 +237,9 @@ impl DataSource for YellowstoneSource {
                 #[cfg(feature = "datasource-rpc")]
                 {
                     // Anchor on the durable checkpoint, not an in-memory watermark.
-                    // BlockMeta(S) can race partial tx delivery, so replay must include S itself.
-                    // Tx/mint inserts are idempotent, so replaying the boundary slot is safe.
+                    // A live block can partially forward before erroring, so the boundary slot
+                    // may be incomplete; replay must include S itself. Inserts are idempotent,
+                    // so replaying the boundary slot is safe.
                     if let (Some(ref poller), Some(ref storage)) = (&rpc_poller, &storage) {
                         let checkpoint = match get_last_checkpoint(storage, program_type).await {
                             Ok(slot) => slot,
@@ -717,7 +718,9 @@ mod tests {
                     signatures: vec![signature_placeholder()],
                     message: Some(message),
                 }),
-                meta: None,
+                // Present-but-empty meta: a real tx always carries meta, and the handler
+                // now requires it; tests that add inner instructions override this.
+                meta: Some(proto::TransactionStatusMeta::default()),
                 index: 0,
             }),
         }
@@ -1208,7 +1211,8 @@ mod tests {
         use yellowstone_grpc_proto::prelude as proto;
         let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
 
-        // A tx whose inner message is absent triggers the "Missing message" Err path.
+        // A tx whose inner message is absent triggers the "Missing message" Err path
+        // (meta is present so the missing-meta guard is not what fires here).
         let bad = proto::SubscribeUpdateTransactionInfo {
             signature: vec![5u8; 64],
             is_vote: false,
@@ -1216,7 +1220,7 @@ mod tests {
                 signatures: vec![signature_placeholder()],
                 message: None,
             }),
-            meta: None,
+            meta: Some(proto::TransactionStatusMeta::default()),
             index: 0,
         };
         let block = block_update(900, vec![bad]);
@@ -1303,6 +1307,33 @@ mod tests {
         assert_eq!(instructions, 0, "a failed tx must not be indexed");
         assert!(completed, "the slot still completes");
     }
+
+    /// A transaction without meta cannot be proven successful or in scope, so the
+    /// whole block fails closed and the slot is not completed (gap-fill replays it).
+    #[tokio::test]
+    async fn block_missing_meta_tx_errs_without_completing() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // A well-formed withdraw that would otherwise parse, but carrying no meta.
+        let mut no_meta = withdraw_tx_update(vec![9u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        no_meta.meta = None;
+        let block = block_update(1200, vec![no_meta]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        assert!(res.is_err(), "a tx without meta must fail the block");
+        drop(tx);
+
+        let mut saw_complete = false;
+        while let Some(m) = rx.recv().await {
+            if matches!(m, ProcessorMessage::SlotComplete { .. }) {
+                saw_complete = true;
+            }
+        }
+        assert!(!saw_complete, "slot must not complete when a tx lacks meta");
+    }
 }
 
 /// Parse all of the block's transactions, then send SlotComplete last so a completion never
@@ -1359,53 +1390,57 @@ async fn handle_transaction_info(
     program_type: ProgramType,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
-    let mut inner_instructions_vec: Vec<InnerInstructions> = vec![];
-    // ALT-resolved keys live on meta, not the message; capture them here to
-    // append below so inner and v0 top-level account indices resolve (no RPC).
-    let mut loaded_pubkeys: Vec<Pubkey> = vec![];
+    // A tx without meta cannot be proven successful or in scope (it loses its revert status,
+    // CPI events, and v0 ALT keys), so fail closed rather than index it: the slot is not
+    // checkpointed and gap-fill replays it, the same guard the getBlock backfill applies.
+    let Some(meta) = &tx_info.meta else {
+        return Err(DataSourceRpcError::Protocol {
+            reason: format!("transaction at slot {slot} missing meta"),
+        });
+    };
 
-    if let Some(meta) = &tx_info.meta {
-        // A failed on-chain tx is still in the block; skip it so a reverted deposit/withdrawal
-        // is never indexed as real (the RPC decoder skips the same way; blocks cannot filter it).
-        if meta.err.is_some() {
+    // A failed on-chain tx is still in the block; skip it so a reverted deposit/withdrawal
+    // is never indexed as real (the RPC decoder skips the same way; blocks cannot filter it).
+    if meta.err.is_some() {
+        return Ok(());
+    }
+
+    // ALT-resolved keys live on meta, not the message; capture them so inner and v0
+    // top-level account indices resolve (no RPC).
+    let inner_instructions_vec: Vec<InnerInstructions> = meta
+        .inner_instructions
+        .iter()
+        .map(|ix_set| InnerInstructions {
+            index: ix_set.index as u8,
+            instructions: ix_set
+                .instructions
+                .iter()
+                .map(|ix| InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: ix.program_id_index as u8,
+                        accounts: ix.accounts.clone(),
+                        data: bs58::encode(&ix.data).into_string(),
+                    },
+                    stack_height: ix.stack_height,
+                })
+                .collect(),
+        })
+        .collect();
+
+    // Order matters: writable then readonly, matching execution order.
+    let loaded_pubkeys: Vec<Pubkey> = match meta
+        .loaded_writable_addresses
+        .iter()
+        .chain(meta.loaded_readonly_addresses.iter())
+        .map(|bytes| Pubkey::try_from(bytes.as_slice()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Skipping transaction at slot {slot}: invalid loaded address: {e}");
             return Ok(());
         }
-
-        inner_instructions_vec = meta
-            .inner_instructions
-            .iter()
-            .map(|ix_set| InnerInstructions {
-                index: ix_set.index as u8,
-                instructions: ix_set
-                    .instructions
-                    .iter()
-                    .map(|ix| InnerInstruction {
-                        instruction: CompiledInstruction {
-                            program_id_index: ix.program_id_index as u8,
-                            accounts: ix.accounts.clone(),
-                            data: bs58::encode(&ix.data).into_string(),
-                        },
-                        stack_height: ix.stack_height,
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        // Order matters: writable then readonly, matching execution order.
-        loaded_pubkeys = match meta
-            .loaded_writable_addresses
-            .iter()
-            .chain(meta.loaded_readonly_addresses.iter())
-            .map(|bytes| Pubkey::try_from(bytes.as_slice()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(keys) => keys,
-            Err(e) => {
-                warn!("Skipping transaction at slot {slot}: invalid loaded address: {e}");
-                return Ok(());
-            }
-        };
-    }
+    };
 
     // Extract signature
     let signature = bs58::encode(&tx_info.signature).into_string();

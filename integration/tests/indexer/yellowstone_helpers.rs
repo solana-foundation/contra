@@ -155,7 +155,7 @@ pub fn unknown_discriminator_tx_info() -> SubscribeUpdateTransactionInfo {
             signatures: vec![vec![0x42u8; 64]],
             message: Some(message),
         }),
-        meta: None,
+        meta: Some(TransactionStatusMeta::default()),
         index: 0,
     }
 }
@@ -196,7 +196,7 @@ pub fn bad_program_index_tx_info() -> SubscribeUpdateTransactionInfo {
             signatures: vec![vec![0x77u8; 64]],
             message: Some(message),
         }),
-        meta: None,
+        meta: Some(TransactionStatusMeta::default()),
         index: 0,
     }
 }
@@ -211,7 +211,7 @@ pub fn missing_message_tx_info() -> SubscribeUpdateTransactionInfo {
             signatures: vec![vec![0x55; 64]],
             message: None,
         }),
-        meta: None,
+        meta: Some(TransactionStatusMeta::default()),
         index: 0,
     }
 }
@@ -259,7 +259,7 @@ pub fn wrong_program_tx_info(
             signatures: vec![vec![7u8; 64]],
             message: Some(message),
         }),
-        meta: None,
+        meta: Some(TransactionStatusMeta::default()),
         index: 0,
     }
 }

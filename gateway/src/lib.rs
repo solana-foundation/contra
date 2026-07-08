@@ -936,18 +936,24 @@ pub async fn serve(
         };
 
         // Take a per-IP slot. None means this IP is at its cap; continue to drop
-        // the socket and release the global permit.
-        let ip_guard =
-            match try_acquire_ip(&ip_counts, ip, gateway.limits.max_connections_per_ip.get()) {
-                Some(guard) => guard,
-                None => {
-                    warn!("Per-IP connection limit reached for {ip}, dropping connection");
-                    metrics::GATEWAY_REJECTED_TOTAL
-                        .with_label_values(&["per_ip_limit"])
-                        .inc();
-                    continue;
-                }
-            };
+        // the socket and release the global permit. Key by the same /64-masked
+        // value the rate limiter uses so a client owning a whole IPv6 /64 cannot
+        // spray connections across it to bypass the per-IP cap.
+        let rate_key = rate_limit_key(ip);
+        let ip_guard = match try_acquire_ip(
+            &ip_counts,
+            rate_key,
+            gateway.limits.max_connections_per_ip.get(),
+        ) {
+            Some(guard) => guard,
+            None => {
+                warn!("Per-IP connection limit reached for {ip}, dropping connection");
+                metrics::GATEWAY_REJECTED_TOTAL
+                    .with_label_values(&["per_ip_limit"])
+                    .inc();
+                continue;
+            }
+        };
 
         // Enable OS TCP keepalive so a peer that vanishes without a close (its
         // network dropped) is detected and the socket reclaimed. Best-effort:
@@ -962,7 +968,6 @@ pub async fn serve(
         let io = TokioIo::new(stream);
         let gateway = Arc::clone(&gateway);
         let rate_limiter = Arc::clone(&rate_limiter);
-        let rate_key = rate_limit_key(ip);
 
         tokio::spawn(async move {
             // Hold both slots for the connection's lifetime; released on drop.

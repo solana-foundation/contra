@@ -372,7 +372,11 @@ services:
       --url https://api.mainnet-beta.solana.com
       --geyser-plugin-config /config/yellowstone-config.json
     networks:
-      - private-channel-network
+      # Second alias so the withdraw operator's mandatory fallback is a distinct
+      # URL reaching this same single local validator (no independent node exists).
+      private-channel-network:
+        aliases:
+          - validator-fallback
     healthcheck:
       test: ["CMD-SHELL", "solana cluster-version || exit 1"]
       interval: 10s
@@ -567,6 +571,9 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # rpc_url = Solana Solana validator (where ReleaseFunds transactions are sent)
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
+      # Mandatory fallback for the withdraw operator; same validator via its distinct
+      # alias since local has no independent node. Use a real archival provider in prod.
+      - COMMON_FALLBACK_RPC_URL=http://validator-fallback:8899
       # source_rpc_url = Solana Private Channels gateway (source of withdrawal/burn state)
       - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
       - ADMIN_SIGNER=memory

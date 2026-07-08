@@ -617,6 +617,18 @@ mod tests {
             .create()
     }
 
+    /// Covered ledger floor so an absence-Dead resolves to Dead, not a prune.
+    fn mock_first_available_block(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":1}}"#))
+            .create()
+    }
+
     /// The keystone divergence from withdrawal: a deposit with no persisted signature is
     /// provably never broadcast (pre-broadcast persist), so it Demotes for a safe re-mint
     /// rather than Quarantining. No RPC is consulted.
@@ -676,6 +688,8 @@ mod tests {
         let _status = mock_null_status(&mut server);
         // current_height (1000) > lvbh (100) means expired/dead.
         let _height = mock_block_height(&mut server, 1000);
+        // Covered floor (0) so the single-endpoint absence is proven Dead.
+        let _floor = mock_first_available_block(&mut server, 0);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
@@ -830,6 +844,8 @@ mod tests {
             .with_status(200)
             .with_body(r#"{"jsonrpc":"2.0","result":1000,"id":1}"#)
             .create();
+        // Covered floor (0) so the single-endpoint absence is proven Dead.
+        let _floor = mock_first_available_block(&mut server, 0);
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));

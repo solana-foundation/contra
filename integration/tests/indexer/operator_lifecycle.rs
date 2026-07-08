@@ -118,8 +118,11 @@ async fn start_operator_with_alert(
         rpc_url: rpc_url.clone(),
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
-        source_rpc_url: Some(rpc_url),
-        fallback_rpc_url: None,
+        source_rpc_url: Some(rpc_url.clone()),
+        // The withdraw operator now requires an independent, same-cluster fallback.
+        // Reach the same node via a distinct host string so the URL differs while
+        // the genesis hash matches. Harmless for Escrow callers (never validated).
+        fallback_rpc_url: Some(rpc_url.replace("127.0.0.1", "localhost")),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -166,8 +169,11 @@ async fn start_operator_with_config(
         rpc_url: rpc_url.clone(),
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
-        source_rpc_url: Some(rpc_url),
-        fallback_rpc_url: None,
+        source_rpc_url: Some(rpc_url.clone()),
+        // The withdraw operator now requires an independent, same-cluster fallback.
+        // Reach the same node via a distinct host string so the URL differs while
+        // the genesis hash matches. Harmless for Escrow callers (never validated).
+        fallback_rpc_url: Some(rpc_url.replace("127.0.0.1", "localhost")),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };

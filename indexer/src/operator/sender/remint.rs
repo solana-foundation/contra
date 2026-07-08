@@ -324,18 +324,6 @@ pub(crate) enum SigFinality {
     Uncertain(String),
 }
 
-impl SigFinality {
-    /// Short variant name plus its payload, for triage logs.
-    fn label(&self) -> String {
-        match self {
-            SigFinality::Landed(sig) => format!("Landed: {sig}"),
-            SigFinality::Live(reason) => format!("Live: {reason}"),
-            SigFinality::Dead => "Dead".to_string(),
-            SigFinality::Uncertain(reason) => format!("Uncertain: {reason}"),
-        }
-    }
-}
-
 /// A primary RPC endpoint plus an optional fallback. One endpoint's missing status
 /// can be a prune or lag rather than proof, so only a `Dead` verdict re-checks it.
 pub(crate) struct FinalityRpc<'a> {
@@ -354,71 +342,167 @@ impl<'a> FinalityRpc<'a> {
     }
 }
 
-/// Classify `sigs`. Only a `Dead` verdict is re-checked against the fallback; the
-/// safe verdicts return from `primary` first, so the fallback is queried rarely.
+/// A blockhash is valid for this many blocks (`MAX_PROCESSING_AGE`), so a landed
+/// transaction's block height is at most this far below its `last_valid_block_height`.
+const BLOCKHASH_VALIDITY_BLOCKS: u64 = 150;
+
+/// Per-endpoint classification carrying the extra detail the policy layer needs
+/// to decide whether an absence-based `Dead` requires a ledger-coverage proof.
+enum EndpointVerdict {
+    Landed(Signature),
+    Live(String),
+    Uncertain(String),
+    /// Every signature carries a finalized-failed status: positive on-chain
+    /// evidence of non-inclusion, so no coverage proof is needed.
+    DeadFinalizedFailure,
+    /// At least one signature is null-status past its blockhash validity. Absence
+    /// is trustworthy only if the endpoint still retains the attempt's slot range;
+    /// `min_lvbh` is the lowest such height, bounding that range.
+    DeadByAbsence {
+        min_lvbh: u64,
+    },
+}
+
+/// Ledger-floor coverage decision for an absence-based `Dead`. `covered` is the
+/// verdict; `floor` and `bound` are surfaced so an uncovered `Uncertain` names the
+/// concrete slots an operator must retain to resolve it.
+struct AbsenceCoverage {
+    covered: bool,
+    floor: u64,
+    bound: u64,
+}
+
+/// True when the endpoint's ledger floor covers every slot the attempt could occupy.
+/// `lvbh - 150` lower-bounds the landing slot (slot >= height), so a floor at or below it proves retention.
+async fn absence_is_covered(
+    rpc: &RpcClientWithRetry,
+    min_lvbh: u64,
+) -> Result<AbsenceCoverage, String> {
+    let floor = rpc
+        .get_first_available_block()
+        .await
+        .map_err(|e| format!("ledger floor RPC failed: {e}"))?;
+    let bound = min_lvbh.saturating_sub(BLOCKHASH_VALIDITY_BLOCKS);
+    Ok(AbsenceCoverage {
+        covered: floor <= bound,
+        floor,
+        bound,
+    })
+}
+
+/// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
+/// attempt's slot range, else `Uncertain`. Assumes a single consistent archival endpoint, not a split pool.
+async fn coverage_verdict(
+    rpc: &RpcClientWithRetry,
+    min_lvbh: u64,
+    endpoint_label: &str,
+) -> SigFinality {
+    match absence_is_covered(rpc, min_lvbh).await {
+        Ok(c) if c.covered => SigFinality::Dead,
+        Ok(c) => SigFinality::Uncertain(format!(
+            "{endpoint_label}ledger floor {} above attempt window (lvbh {min_lvbh}, retained-slot bound {}); pruned or lagging, absence is not proof of non-inclusion",
+            c.floor, c.bound
+        )),
+        Err(e) => SigFinality::Uncertain(e),
+    }
+}
+
+/// Log the case corroboration exists to catch: the primary called signatures dead but the fallback disagrees.
+/// `detail` carries the overriding verdict's payload (landed signature or live reason) so triage needs no re-query.
+fn warn_fallback_override(verdict: &str, detail: &str, sigs: &[PendingSig]) {
+    warn!(
+        "finality fallback overrode a primary Dead verdict ({verdict}: {detail}) for signature(s): {}",
+        sigs.iter()
+            .map(|p| p.signature.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+/// Classify `sigs` into a corroborated, coverage-proven verdict: a `Dead` must survive a ledger-floor
+/// check, so a prunable absence degrades to `Uncertain`. Safe verdicts return early, so the floor RPC is rare.
 pub(crate) async fn classify_signatures(
     finality: &FinalityRpc<'_>,
     sigs: &[PendingSig],
 ) -> SigFinality {
-    let verdict = classify_against(finality.primary, sigs).await;
-    if !matches!(verdict, SigFinality::Dead) {
-        return verdict;
-    }
+    let primary_lvbh = match classify_endpoint(finality.primary, sigs).await {
+        EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
+        EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
+        EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
+        // A finalized-failed status is positive on-chain evidence; trust it directly.
+        EndpointVerdict::DeadFinalizedFailure => return SigFinality::Dead,
+        EndpointVerdict::DeadByAbsence { min_lvbh } => min_lvbh,
+    };
+
     match finality.fallback {
-        Some(fb) => {
-            // The fallback's verdict is final: it overrides a wrong Dead, or
-            // confirms it. Both sides run the same classifier.
-            let corroborated = classify_against(fb, sigs).await;
-            if !matches!(corroborated, SigFinality::Dead) {
-                // The case this feature exists to catch: the primary called it
-                // dead but an independent endpoint disagrees. Log for triage.
-                warn!(
-                    "finality fallback overrode a primary Dead verdict ({}) for signature(s): {}",
-                    corroborated.label(),
-                    sigs.iter()
-                        .map(|p| p.signature.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+        // Destination path: the primary is allowed to be pruned (that is why the
+        // fallback exists), so we trust the fallback's verdict and coverage-check
+        // the fallback, never the primary.
+        Some(fb) => match classify_endpoint(fb, sigs).await {
+            EndpointVerdict::Landed(sig) => {
+                warn_fallback_override("Landed", &sig.to_string(), sigs);
+                SigFinality::Landed(sig)
             }
-            corroborated
-        }
-        None => {
-            debug!("finality Dead on single endpoint (no fallback configured); trusting primary");
+            EndpointVerdict::Live(reason) => {
+                warn_fallback_override("Live", &reason, sigs);
+                SigFinality::Live(reason)
+            }
+            EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
+            EndpointVerdict::DeadFinalizedFailure => SigFinality::Dead,
+            EndpointVerdict::DeadByAbsence { min_lvbh } => {
+                coverage_verdict(fb, min_lvbh, "fallback ").await
+            }
+        },
+        // Source/escrow single endpoint: no second node can corroborate, so the
+        // sole endpoint's coverage is the whole protection.
+        None => coverage_verdict(finality.primary, primary_lvbh, "").await,
+    }
+}
+
+/// Thin test-only wrapper over `classify_endpoint` mapping both `Dead` shapes to `SigFinality::Dead`.
+/// Lets the per-endpoint unit tests assert status logic without the coverage gate `classify_signatures` adds.
+#[cfg(test)]
+pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
+    match classify_endpoint(rpc, sigs).await {
+        EndpointVerdict::Landed(sig) => SigFinality::Landed(sig),
+        EndpointVerdict::Live(reason) => SigFinality::Live(reason),
+        EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
+        EndpointVerdict::DeadFinalizedFailure | EndpointVerdict::DeadByAbsence { .. } => {
             SigFinality::Dead
         }
     }
 }
 
-/// Classify `sigs` against a single endpoint (see `SigFinality` variants).
-pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
+/// Classify `sigs` against one endpoint's `getSignatureStatuses` history, distinguishing a
+/// finalized-failed `Dead` from an absence-based one so only the latter needs a coverage proof.
+async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
     let response = match rpc.get_signature_statuses_with_history(&flat).await {
         Ok(r) => r,
         Err(e) => {
-            return SigFinality::Uncertain(format!("signature status RPC failed: {}", e));
+            return EndpointVerdict::Uncertain(format!("signature status RPC failed: {}", e));
         }
     };
 
     // RPC returns one status per signature in order; a length mismatch would
     // silently skip checks below, so treat it as uncertain.
     if response.value.len() != flat.len() {
-        return SigFinality::Uncertain(format!(
+        return EndpointVerdict::Uncertain(format!(
             "RPC returned {} statuses for {} signatures",
             response.value.len(),
             flat.len()
         ));
     }
 
-    // Any sig finalized successfully → the release landed.
+    // Any sig finalized successfully means the transaction landed.
     let finalized_success_index = response.value.iter().position(|signature_status| {
         signature_status.as_ref().is_some_and(|status| {
             status.satisfies_commitment(CommitmentConfig::finalized()) && status.err.is_none()
         })
     });
     if let Some(index) = finalized_success_index {
-        return SigFinality::Landed(flat[index]);
+        return EndpointVerdict::Landed(flat[index]);
     }
 
     // Fetch block height only for the lvbh check on null-status sigs, so a
@@ -427,13 +511,17 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
         match rpc.get_block_height().await {
             Ok(h) => h,
             Err(e) => {
-                return SigFinality::Uncertain(format!("block height RPC failed: {}", e));
+                return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
             }
         }
     } else {
         // Unused: the null-status branch below only fires when some status is None.
         0
     };
+
+    // Lowest lvbh across null-status expired sigs bounds the slot range whose
+    // retention the coverage proof must cover.
+    let mut min_absent_lvbh: Option<u64> = None;
 
     // Walk the sigs to see if any could still land (index-aligned with response.value).
     for (index, pending_sig) in sigs.iter().enumerate() {
@@ -445,23 +533,32 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
                 continue;
             }
             // confirmed/processed: in a block, will finalize regardless of blockhash validity.
-            return SigFinality::Live(
+            return EndpointVerdict::Live(
                 "signature is on-chain (confirmed/processed) and awaiting finalization".to_string(),
             );
         }
 
         // No status entry. lvbh is the only thing keeping it alive.
         if current_height > pending_sig.last_valid_block_height {
+            min_absent_lvbh = Some(
+                min_absent_lvbh.map_or(pending_sig.last_valid_block_height, |m| {
+                    m.min(pending_sig.last_valid_block_height)
+                }),
+            );
             continue;
         }
-        return SigFinality::Live(format!(
+        return EndpointVerdict::Live(format!(
             "signatures still within blockhash validity (current_height={})",
             current_height
         ));
     }
 
-    // Every sig is finalized-failed or expired.
-    SigFinality::Dead
+    match min_absent_lvbh {
+        // At least one sig is an expired absence: its non-inclusion needs a proof.
+        Some(min_lvbh) => EndpointVerdict::DeadByAbsence { min_lvbh },
+        // No absence: every sig carried a finalized-failed status.
+        None => EndpointVerdict::DeadFinalizedFailure,
+    }
 }
 
 /// Process matured entries in the deferred remint queue. For each matured
@@ -1498,6 +1595,13 @@ mod tests {
             r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
         )
         .await;
+        // Covered ledger floor so the absence-Dead is proven, not a prune.
+        let _floor_mock = mock_rpc(
+            &mut rpc_server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":0,"id":0}"#,
+        )
+        .await;
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
@@ -1949,7 +2053,18 @@ mod tests {
         }]
     }
 
-    /// Make the endpoint return null + a block height past validity, i.e. Dead.
+    /// Register a `getFirstAvailableBlock` reply of `floor` on `server`.
+    async fn mock_floor(server: &mut mockito::Server, floor: u64) {
+        mock_rpc(
+            server,
+            "getFirstAvailableBlock",
+            &format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":0}}"#),
+        )
+        .await;
+    }
+
+    /// Make the endpoint return null + a block height past validity (absence-Dead)
+    /// with a covered ledger floor (0), so the absence resolves to Dead.
     async fn mock_dead(server: &mut mockito::Server) {
         mock_rpc(
             server,
@@ -1963,6 +2078,25 @@ mod tests {
             r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
         )
         .await;
+        mock_floor(server, 0).await;
+    }
+
+    /// Like `mock_dead` but with a pruned ledger floor above the attempt window,
+    /// so the absence is uncovered and must resolve to Uncertain, never Dead.
+    async fn mock_dead_pruned(server: &mut mockito::Server, floor: u64) {
+        mock_rpc(
+            server,
+            "getSignatureStatuses",
+            status_body(StatusKind::Null),
+        )
+        .await;
+        mock_rpc(
+            server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        mock_floor(server, floor).await;
     }
 
     /// The bug scenario. The primary reports the release gone but the fallback
@@ -1994,10 +2128,10 @@ mod tests {
         );
     }
 
-    /// Both endpoints agree the signatures are gone, so Dead stands and the
-    /// remint is safe.
+    /// Both endpoints agree the signatures are gone and the fallback's floor covers
+    /// the attempt window, so Dead stands and the remint is safe.
     #[tokio::test]
-    async fn dead_corroborated_by_fallback_stays_dead() {
+    async fn dead_corroborated_by_fallback_covered_stays_dead() {
         let mut primary = mockito::Server::new_async().await;
         let mut fb = mockito::Server::new_async().await;
         mock_dead(&mut primary).await;
@@ -2014,8 +2148,123 @@ mod tests {
                 classify_signatures(&finality, &one_expired_sig()).await,
                 SigFinality::Dead
             ),
-            "both endpoints Dead must stay Dead"
+            "both endpoints Dead with a covered fallback floor must stay Dead"
         );
+    }
+
+    /// The fallback also sees the signatures gone, but its ledger floor is above the attempt window
+    /// (pruned/lagging), so absence on the pruned fallback must be Uncertain, never Dead.
+    #[tokio::test]
+    async fn dead_by_fallback_uncovered_is_uncertain() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        mock_dead(&mut primary).await;
+        mock_dead_pruned(&mut fb, 1000).await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        match classify_signatures(&finality, &one_expired_sig()).await {
+            SigFinality::Uncertain(reason) => {
+                assert!(
+                    reason.contains("fallback ledger floor"),
+                    "reason must name the fallback: {reason}"
+                );
+            }
+            _ => panic!("a pruned fallback absence must be Uncertain, not Dead/Live/Landed"),
+        }
+    }
+
+    /// Coverage is judged on the fallback only: the primary's floor is pruned high and never consulted,
+    /// while the fallback's floor covers the window, so the verdict is Dead.
+    #[tokio::test]
+    async fn primary_pruned_fallback_covered_is_dead() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        // Primary absence with a pruned floor; asserting it is never queried.
+        mock_rpc(
+            &mut primary,
+            "getSignatureStatuses",
+            status_body(StatusKind::Null),
+        )
+        .await;
+        mock_rpc(
+            &mut primary,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        let primary_floor_untouched = primary
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .expect(0)
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":9999,"id":0}"#)
+            .create_async()
+            .await;
+        // Fallback absence with a covered floor.
+        mock_dead(&mut fb).await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Dead
+            ),
+            "coverage on the fallback alone must decide Dead"
+        );
+        primary_floor_untouched.assert_async().await;
+    }
+
+    /// A finalized-failed primary status is definitive non-inclusion: neither a
+    /// coverage floor check nor the fallback is consulted.
+    #[tokio::test]
+    async fn primary_finalized_failure_is_dead_without_coverage_check() {
+        let mut primary = mockito::Server::new_async().await;
+        let mut fb = mockito::Server::new_async().await;
+        // Finalized-failed status: positive on-chain failure evidence.
+        mock_rpc(
+            &mut primary,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,
+                "err":{"InstructionError":[0,{"Custom":1}]},
+                "status":{"Err":{"InstructionError":[0,{"Custom":1}]}},
+                "confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+        // No floor mock: reaching getFirstAvailableBlock would 501-fail the test.
+        let fb_untouched = fb
+            .mock("POST", "/")
+            .expect(0)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = make_rpc(&primary.url());
+        let f = make_rpc(&fb.url());
+        let finality = FinalityRpc {
+            primary: &p,
+            fallback: Some(&f),
+        };
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Dead
+            ),
+            "a finalized-failed status must be Dead with no coverage or fallback call"
+        );
+        fb_untouched.assert_async().await;
     }
 
     /// The fallback still sees the sig on-chain (confirmed), so defer rather
@@ -2076,10 +2325,10 @@ mod tests {
         );
     }
 
-    /// With no fallback configured, the primary's Dead is trusted exactly as
-    /// legacy single-endpoint behavior.
+    /// Single endpoint, absence-Dead, ledger floor covers the attempt window:
+    /// the absence is proven non-inclusion, so Dead stands.
     #[tokio::test]
-    async fn dead_without_fallback_stays_dead() {
+    async fn dead_by_absence_covered_single_endpoint_is_dead() {
         let mut primary = mockito::Server::new_async().await;
         mock_dead(&mut primary).await;
 
@@ -2090,7 +2339,63 @@ mod tests {
                 classify_signatures(&finality, &one_expired_sig()).await,
                 SigFinality::Dead
             ),
-            "no fallback means the primary's Dead is trusted as today"
+            "a covered single-endpoint absence must stay Dead"
+        );
+    }
+
+    /// Single endpoint, absence-Dead, but the ledger floor sits above the attempt window (pruned/lagging).
+    /// Absence is no longer proof of non-inclusion, so it must degrade to Uncertain and carry the floor.
+    #[tokio::test]
+    async fn dead_by_absence_uncovered_single_endpoint_is_uncertain() {
+        let mut primary = mockito::Server::new_async().await;
+        mock_dead_pruned(&mut primary, 1000).await;
+
+        let p = make_rpc(&primary.url());
+        let finality = FinalityRpc::single(&p);
+        match classify_signatures(&finality, &one_expired_sig()).await {
+            SigFinality::Uncertain(reason) => {
+                assert!(reason.contains("ledger floor"), "reason: {reason}");
+                assert!(
+                    reason.contains("1000"),
+                    "reason must carry the floor: {reason}"
+                );
+            }
+            _ => panic!("expected Uncertain on a pruned single endpoint, got Dead/Live/Landed"),
+        }
+    }
+
+    /// Single endpoint, absence-Dead, but the floor RPC itself fails. We cannot
+    /// prove coverage, so fail closed to Uncertain rather than trust the absence.
+    #[tokio::test]
+    async fn dead_by_absence_floor_rpc_error_single_endpoint_is_uncertain() {
+        let mut primary = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut primary,
+            "getSignatureStatuses",
+            status_body(StatusKind::Null),
+        )
+        .await;
+        mock_rpc(
+            &mut primary,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        mock_rpc(
+            &mut primary,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+        )
+        .await;
+
+        let p = make_rpc(&primary.url());
+        let finality = FinalityRpc::single(&p);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &one_expired_sig()).await,
+                SigFinality::Uncertain(_)
+            ),
+            "a floor-RPC failure must fail closed to Uncertain, never Dead"
         );
     }
 
@@ -2214,6 +2519,13 @@ mod tests {
             &mut rpc_server,
             "getBlockHeight",
             r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        // Covered ledger floor so the absence-Dead is proven, not a prune.
+        let _floor_mock = mock_rpc(
+            &mut rpc_server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":0,"id":0}"#,
         )
         .await;
 
@@ -2957,5 +3269,283 @@ mod tests {
         assert!(state.pending_remints.is_empty());
         // No compensating MintTo was broadcast.
         src_send.assert_async().await;
+    }
+
+    // ── absence_is_covered boundaries ───────────────────────────────
+
+    /// Register a single `getFirstAvailableBlock` reply and return a fast client.
+    async fn floor_client(floor: u64) -> (mockito::ServerGuard, RpcClientWithRetry) {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut server,
+            "getFirstAvailableBlock",
+            &format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":0}}"#),
+        )
+        .await;
+        let client = make_rpc(&server.url());
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn covered_when_floor_below_bound() {
+        // lvbh 1000 -> bound 850; floor 500 <= 850.
+        let (_s, rpc) = floor_client(500).await;
+        assert!(absence_is_covered(&rpc, 1000).await.unwrap().covered);
+    }
+
+    #[tokio::test]
+    async fn boundary_floor_equals_bound_is_covered() {
+        // lvbh 1000 -> bound 850; floor 850 == 850 is covered (inclusive).
+        let (_s, rpc) = floor_client(850).await;
+        assert!(absence_is_covered(&rpc, 1000).await.unwrap().covered);
+    }
+
+    #[tokio::test]
+    async fn boundary_floor_one_above_is_uncovered() {
+        // lvbh 1000 -> bound 850; floor 851 > 850 is uncovered.
+        let (_s, rpc) = floor_client(851).await;
+        assert!(!absence_is_covered(&rpc, 1000).await.unwrap().covered);
+    }
+
+    #[tokio::test]
+    async fn underflow_low_lvbh_requires_floor_zero() {
+        // lvbh 100 -> saturating bound 0. Only a floor of 0 covers it.
+        let (_s1, rpc1) = floor_client(1).await;
+        assert!(!absence_is_covered(&rpc1, 100).await.unwrap().covered);
+        let (_s0, rpc0) = floor_client(0).await;
+        assert!(absence_is_covered(&rpc0, 100).await.unwrap().covered);
+    }
+
+    #[tokio::test]
+    async fn floor_rpc_error_is_err() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+        )
+        .await;
+        let rpc = make_rpc(&server.url());
+        assert!(absence_is_covered(&rpc, 1000).await.is_err());
+    }
+
+    // ── coverage-gated absence ──────────────────────────────────────
+
+    /// The release signatures are expired but the destination endpoint's ledger
+    /// floor is pruned above the attempt window, so absence is not proof of
+    /// non-inclusion. The gate must defer (no remint, no status write) and bump.
+    #[tokio::test]
+    async fn process_pending_remints_expired_but_pruned_dest_defers() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        seed_pending_remint_row(&mock, 110, 0);
+
+        let sig = Signature::new_unique();
+        let _status_mock = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        let _block_height_mock = mock_rpc(
+            &mut rpc_server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        // Pruned floor: above the lvbh(100)-150 bound (0), so absence is uncovered.
+        let _floor_mock = mock_rpc(
+            &mut rpc_server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(110),
+                withdrawal_nonce: Some(30),
+                trace_id: Some("trace-110".to_string()),
+            },
+            remint_info: make_remint_info(110),
+            signatures: vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 100,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a pruned dest absence must defer, not remint or write a status"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    }
+
+    /// A prior remint signature exists but the source endpoint's ledger floor is
+    /// pruned above the attempt window, so its absence cannot prove non-inclusion.
+    /// attempt_remint must refuse to resend and escalate to ManualReview, never
+    /// broadcast a duplicate MintTo.
+    #[tokio::test]
+    async fn attempt_remint_source_pruned_refuses_and_escalates() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // A prior remint attempt is on record, so classification runs before resend.
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(710, vec![(Signature::new_unique().to_string(), 0)]);
+        mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        mock_rpc(
+            &mut rpc_server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        // Pruned floor: the source cannot prove the prior attempt did not land.
+        mock_rpc(
+            &mut rpc_server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        // A resend must never be broadcast.
+        let send = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let entry = PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(710),
+                withdrawal_nonce: Some(71),
+                trace_id: Some("trace-710".to_string()),
+            },
+            remint_info: make_remint_info(710),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        };
+
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+        assert!(matches!(outcome, DeferredRemintOutcome::Resolved));
+        let update = storage_rx
+            .try_recv()
+            .expect("a pruned source must escalate to a status update");
+        assert_eq!(update.transaction_id, 710);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("refusing to remint"),
+            "must fail closed: {err}"
+        );
+        send.assert_async().await;
+    }
+
+    /// The mirror of the pruned case: a prior remint signature exists and the
+    /// source floor covers the attempt window, so the absence is proven Dead and
+    /// the idempotency gate allows the resend to proceed.
+    #[tokio::test]
+    async fn attempt_remint_source_covered_dead_resends() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(720, vec![(Signature::new_unique().to_string(), 0)]);
+        // Source: expired absence with a covered floor, so classification is Dead.
+        mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+        mock_rpc(
+            &mut source,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+        mock_rpc(
+            &mut source,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":0,"id":0}"#,
+        )
+        .await;
+        // The resend build needs a blockhash, then broadcasts a fresh MintTo.
+        mock_rpc(
+            &mut source,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let entry = PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(720),
+                withdrawal_nonce: Some(72),
+                trace_id: Some("trace-720".to_string()),
+            },
+            remint_info: make_remint_info(720),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        };
+
+        // Covered Dead classification lets the resend broadcast (confirmation then
+        // stays unconfirmed here, so the entry defers; the broadcast is the point).
+        let _ = execute_deferred_remint(&state, entry, &storage_tx).await;
+        send.assert_async().await;
     }
 }

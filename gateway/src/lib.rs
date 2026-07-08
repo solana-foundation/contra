@@ -25,7 +25,7 @@ use socket2::{SockRef, TcpKeepalive};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -109,23 +109,42 @@ pub struct Args {
     pub max_connections_per_ip: NonZeroUsize,
 
     /// Seconds a client may take to send the full request header block before
-    /// the connection is closed (slowloris protection).
-    #[arg(long, env = "GATEWAY_HEADER_READ_TIMEOUT_SECS", default_value = "10")]
+    /// the connection is closed (slowloris protection). Must be non-zero; a
+    /// zero timeout would fail every request instantly.
+    #[arg(
+        long,
+        env = "GATEWAY_HEADER_READ_TIMEOUT_SECS",
+        default_value = "10",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub header_read_timeout_secs: u64,
 
-    /// Seconds to read the full request body once headers are in.
-    #[arg(long, env = "GATEWAY_BODY_READ_TIMEOUT_SECS", default_value = "15")]
+    /// Seconds to read the full request body once headers are in. Must be
+    /// non-zero; a zero timeout would fail every request instantly.
+    #[arg(
+        long,
+        env = "GATEWAY_BODY_READ_TIMEOUT_SECS",
+        default_value = "15",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub body_read_timeout_secs: u64,
 
-    /// Idle seconds before the OS starts sending TCP keepalive probes.
-    #[arg(long, env = "GATEWAY_TCP_KEEPALIVE_IDLE_SECS", default_value = "60")]
+    /// Idle seconds before the OS starts sending TCP keepalive probes. Must be
+    /// non-zero.
+    #[arg(
+        long,
+        env = "GATEWAY_TCP_KEEPALIVE_IDLE_SECS",
+        default_value = "60",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub tcp_keepalive_idle_secs: u64,
 
-    /// Seconds between TCP keepalive probes.
+    /// Seconds between TCP keepalive probes. Must be non-zero.
     #[arg(
         long,
         env = "GATEWAY_TCP_KEEPALIVE_INTERVAL_SECS",
-        default_value = "15"
+        default_value = "15",
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub tcp_keepalive_interval_secs: u64,
 
@@ -215,6 +234,33 @@ type IpConnCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
 /// Per-IP request rate limiter (token bucket). Idle IPs are pruned periodically
 /// by `retain_recent` so the keyed store stays bounded.
 type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+
+/// True for accept errors that reflect one failed connection (the peer went
+/// away before we accepted it) rather than a problem with the listener. These
+/// are safe to skip without any backoff.
+fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Collapses a peer address to the key the rate limiter buckets by. IPv4 is
+/// used as-is; IPv6 is masked to its /64 prefix. A single client is routinely
+/// handed a whole /64, so without masking it could mint a fresh key per request
+/// and bloat the limiter's keyed store faster than pruning reclaims it.
+fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
 
 /// Increments the connection count for `ip` when it is below `max`, returning a
 /// guard that decrements it on drop. Returns None when the IP is at the cap.
@@ -504,6 +550,8 @@ impl Gateway {
     async fn handle_request(
         self: Arc<Self>,
         req: Request<Incoming>,
+        rate_key: IpAddr,
+        rate_limiter: Arc<IpRateLimiter>,
     ) -> Result<
         Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
         hyper::Error,
@@ -579,6 +627,26 @@ impl Gateway {
                 start.elapsed().as_secs_f64(),
             );
             return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, None));
+        }
+
+        // Rate-limit only the JSON-RPC POST path. OPTIONS preflights, /health,
+        // and /ready returned above, so a 429 here never blocks a CORS preflight
+        // or trips a health probe.
+        if rate_limiter.check_key(&rate_key).is_err() {
+            metrics::GATEWAY_REJECTED_TOTAL
+                .with_label_values(&["rate_limit"])
+                .inc();
+            Self::record_metrics(
+                Some("rate_limited"),
+                "unknown",
+                "none",
+                "429",
+                start.elapsed().as_secs_f64(),
+            );
+            return Ok(self.error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some(Self::too_many_requests_body()),
+            ));
         }
 
         if let Some(content_length) = req.headers().get(hyper::header::CONTENT_LENGTH) {
@@ -828,9 +896,11 @@ pub async fn serve(
     let rate_limiter: Arc<IpRateLimiter> = Arc::new(RateLimiter::keyed(quota));
 
     // Prune IPs that have fully replenished so the keyed store stays bounded.
+    // retain_recent only reclaims replenished keys, so run it often to shed
+    // entries soon after churning IPs go quiet.
     let pruner = Arc::clone(&rate_limiter);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        let mut ticker = tokio::time::interval(Duration::from_secs(10));
         loop {
             ticker.tick().await;
             pruner.retain_recent();
@@ -838,7 +908,18 @@ pub async fn serve(
     });
 
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) if is_connection_error(&e) => continue,
+            Err(e) => {
+                // Anything else, notably EMFILE/ENFILE under an fd flood, must
+                // not kill the listener and restart the process. Back off
+                // briefly so we don't spin while the fd table drains.
+                warn!("accept() failed: {e}; backing off before retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let ip = peer_addr.ip();
 
         // Take a global slot. None free means we are at the cap, so drop the
@@ -881,6 +962,7 @@ pub async fn serve(
         let io = TokioIo::new(stream);
         let gateway = Arc::clone(&gateway);
         let rate_limiter = Arc::clone(&rate_limiter);
+        let rate_key = rate_limit_key(ip);
 
         tokio::spawn(async move {
             // Hold both slots for the connection's lifetime; released on drop.
@@ -890,19 +972,7 @@ pub async fn serve(
             let service = service_fn(move |req| {
                 let gateway = Arc::clone(&gateway);
                 let rate_limiter = Arc::clone(&rate_limiter);
-                async move {
-                    // Reject over-budget IPs before doing any request work.
-                    if rate_limiter.check_key(&ip).is_err() {
-                        metrics::GATEWAY_REJECTED_TOTAL
-                            .with_label_values(&["rate_limit"])
-                            .inc();
-                        return Ok(gateway.error_response(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Some(Gateway::too_many_requests_body()),
-                        ));
-                    }
-                    gateway.handle_request(req).await
-                }
+                async move { gateway.handle_request(req, rate_key, rate_limiter).await }
             });
 
             // The timer is required for header_read_timeout to take effect; it
@@ -1487,11 +1557,50 @@ mod tests {
 
         // Burst of 1 from this IP: the first request passes the limiter (then
         // 502s on the unreachable backend), the immediate second is over budget
-        // and is rejected with 429 before routing.
+        // and is rejected with 429 before it reaches the backend.
         let first = send_raw(addr, req.as_bytes()).await;
         assert_status(&first, 502);
         let second = send_raw(addr, req.as_bytes()).await;
         assert_status(&second, 429);
+    }
+
+    #[tokio::test]
+    async fn health_and_preflight_are_exempt_from_rate_limit() {
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                rate_limit_per_second: NonZeroU32::new(1).unwrap(),
+                rate_limit_burst: NonZeroU32::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Drain the one-token bucket for this IP with a POST, so anything the
+        // limiter guards is now over budget.
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let post = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = send_raw(addr, post.as_bytes()).await;
+
+        // The limiter sits behind routing, so /health probes stay 200 with the
+        // bucket drained. Under the old in-front placement they would 429 and
+        // the orchestrator would read the gateway as down.
+        let health = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        for _ in 0..5 {
+            let response = send_raw(addr, health.as_bytes()).await;
+            assert_status(&response, 200);
+        }
+
+        // A CORS preflight is likewise exempt, so a drained bucket cannot block
+        // the real POST it precedes.
+        let preflight = "OPTIONS / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let response = send_raw(addr, preflight.as_bytes()).await;
+        assert_status(&response, 200);
     }
 
     #[tokio::test]
@@ -1571,5 +1680,24 @@ mod tests {
         )
         .await;
         assert_second_connection_refused(addr).await;
+    }
+
+    #[test]
+    fn rate_limit_key_masks_ipv6_to_64() {
+        use std::net::Ipv4Addr;
+
+        // Two addresses sharing a /64 collapse to one key, so a client cannot
+        // spray its /64 to bloat the keyed store or dodge the per-IP budget.
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(rate_limit_key(a), rate_limit_key(b));
+
+        // A different /64 stays a distinct key.
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(rate_limit_key(a), rate_limit_key(other));
+
+        // IPv4 is keyed by the full address.
+        let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert_eq!(rate_limit_key(v4), v4);
     }
 }

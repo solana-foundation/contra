@@ -22,21 +22,10 @@ use std::time::Duration;
 use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlockMeta,
-};
 
-fn block_meta(slot: u64) -> SubscribeUpdate {
-    SubscribeUpdate {
-        filters: vec!["all_blocks_meta".to_string()],
-        update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
-            slot,
-            blockhash: format!("hash-{slot}"),
-            ..Default::default()
-        })),
-        created_at: None,
-    }
-}
+#[path = "yellowstone_helpers.rs"]
+mod yellowstone_helpers;
+use yellowstone_helpers::empty_block;
 
 fn empty_block_json() -> serde_json::Value {
     json!({
@@ -115,8 +104,6 @@ async fn gap_fill_runs_after_drop_stream() {
         ProgramType::Escrow,
         None,
     )
-    // Pin immediate emission so the live checkpoint reaches the streamed slots and the gap math stays exact.
-    .with_safety_window(0)
     .with_gap_detection(rpc_poller, 1_000, 16)
     .with_storage(storage);
 
@@ -126,8 +113,8 @@ async fn gap_fill_runs_after_drop_stream() {
         .expect("yellowstone source start");
 
     // Phase 1: deliver slots 100, 101 pre-disconnect.
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(100)));
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(101)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(101)));
 
     // Collect both initial slots.
     let mut seen: HashSet<u64> = HashSet::new();
@@ -148,8 +135,8 @@ async fn gap_fill_runs_after_drop_stream() {
     server.drop_stream();
 
     // Phase 3: queue 107,108 to prove streaming resumes post-backfill.
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(107)));
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(108)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(107)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(108)));
 
     // Expect 101..=106 from inclusive backfill + 107,108 from resumed stream.
     let deadline_phase2 = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -233,8 +220,6 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         ProgramType::Escrow,
         None,
     )
-    // Pin immediate emission so the live checkpoint reaches the streamed slots and the gap math stays exact.
-    .with_safety_window(0)
     .with_gap_detection(rpc_poller, 1_000, 16)
     .with_storage(storage);
 
@@ -244,7 +229,7 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         .expect("yellowstone source start");
 
     // Stream one slot, drop, give the reconnect path time to run.
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(100)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
     let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
     server.drop_stream();
     tokio::time::sleep(Duration::from_millis(500)).await;

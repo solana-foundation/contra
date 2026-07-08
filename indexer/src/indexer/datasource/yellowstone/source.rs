@@ -1,6 +1,4 @@
-use super::completion_window::SlotCompletionWindow;
 use super::convert::create_message;
-use crate::config::DEFAULT_SLOT_SAFETY_WINDOW;
 use crate::metrics;
 use async_trait::async_trait;
 use futures::stream::StreamExt;
@@ -14,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocks,
+    SubscribeRequestPing, SubscribeUpdateTransactionInfo,
 };
 
 use crate::channel_utils::send_guaranteed;
@@ -34,15 +32,13 @@ use crate::indexer::{
     datasource::rpc_polling::rpc::RpcPoller,
 };
 
-/// Yellowstone gRPC datasource - directly subscribes to transactions + blocks_meta
+/// Yellowstone gRPC datasource - subscribes to atomic per-slot blocks
 pub struct YellowstoneSource {
     endpoint: String,
     x_token: Option<String>,
     commitment: String,
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
-    // Slots to hold a live SlotComplete behind the tip so a late tx still lands before finalize.
-    safety_window: u64,
     #[cfg(feature = "datasource-rpc")]
     rpc_poller: Option<Arc<RpcPoller>>,
     #[cfg(feature = "datasource-rpc")]
@@ -68,7 +64,6 @@ impl YellowstoneSource {
             commitment,
             program_type,
             escrow_instance_id,
-            safety_window: DEFAULT_SLOT_SAFETY_WINDOW,
             #[cfg(feature = "datasource-rpc")]
             rpc_poller: None,
             #[cfg(feature = "datasource-rpc")]
@@ -83,12 +78,6 @@ impl YellowstoneSource {
 
     pub fn with_health(mut self, health: Arc<private_channel_metrics::HealthState>) -> Self {
         self.health = Some(health);
-        self
-    }
-
-    /// Slots to lag live SlotComplete behind the tip; `0` restores immediate emission.
-    pub fn with_safety_window(mut self, window: u64) -> Self {
-        self.safety_window = window;
         self
     }
 
@@ -191,8 +180,9 @@ impl DataSource for YellowstoneSource {
         let endpoint = self.endpoint.clone();
         let x_token = self.x_token.clone();
         let program_type = self.program_type;
+        // Only the reconnect gap-fill (RPC path) still needs the instance id.
+        #[cfg(feature = "datasource-rpc")]
         let escrow_instance_id = self.escrow_instance_id;
-        let safety_window = self.safety_window;
         let health = self.health.clone();
 
         #[cfg(feature = "datasource-rpc")]
@@ -216,8 +206,6 @@ impl DataSource for YellowstoneSource {
                     x_token.clone(),
                     commitment_level,
                     program_type,
-                    escrow_instance_id,
-                    safety_window,
                     tx.clone(),
                     cancellation_token.clone(),
                     health.as_ref(),
@@ -323,14 +311,11 @@ impl DataSource for YellowstoneSource {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn connect_and_stream(
     endpoint: &str,
     x_token: Option<String>,
     commitment: CommitmentLevel,
     program_type: ProgramType,
-    escrow_instance_id: Option<Pubkey>,
-    safety_window: u64,
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     health: Option<&Arc<private_channel_metrics::HealthState>>,
@@ -357,42 +342,27 @@ async fn connect_and_stream(
 
     info!("Connected to Yellowstone gRPC at {}", endpoint);
 
-    // Subscribe to transactions for our program
-    // Always put program_id in account_required
-    // If escrow_instance_id is provided, also add it to account_required
-    let mut account_required = vec![program_id.to_string()];
-    if let Some(instance_id) = escrow_instance_id {
-        account_required.push(instance_id.to_string());
-    }
-
-    let mut transaction_filters = HashMap::new();
-    transaction_filters.insert(
-        "private_channel_program".to_string(),
-        SubscribeRequestFilterTransactions {
-            vote: Some(false),
-            failed: Some(false),
-            signature: None,
-            account_include: vec![],
-            account_exclude: vec![],
-            account_required,
+    // One blocks message carries a slot plus all its transactions, so a completion never races a tx.
+    // program-id is the only filter blocks allows; instance scoping happens later in the parser.
+    let mut blocks = HashMap::new();
+    blocks.insert(
+        "private_channel_blocks".to_string(),
+        SubscribeRequestFilterBlocks {
+            account_include: vec![program_id.to_string()],
+            include_transactions: Some(true),
+            include_accounts: Some(false),
+            include_entries: Some(false),
         },
-    );
-
-    // Subscribe to ALL block metadata for slot completion
-    let mut blocks_meta = HashMap::new();
-    blocks_meta.insert(
-        "all_blocks_meta".to_string(),
-        SubscribeRequestFilterBlocksMeta {},
     );
 
     let subscribe_request = SubscribeRequest {
         slots: HashMap::new(),
         accounts: HashMap::new(),
-        transactions: transaction_filters,
+        transactions: HashMap::new(),
         transactions_status: HashMap::new(),
         entry: HashMap::new(),
-        blocks: HashMap::new(),
-        blocks_meta,
+        blocks,
+        blocks_meta: HashMap::new(),
         commitment: Some(commitment as i32),
         accounts_data_slice: vec![],
         ping: None,
@@ -400,7 +370,7 @@ async fn connect_and_stream(
     };
 
     info!(
-        "Subscribing to Yellowstone gRPC with transactions (program: {}) + blocks_meta (all slots)",
+        "Subscribing to Yellowstone gRPC blocks (program: {})",
         program_id.to_string()
     );
 
@@ -411,11 +381,7 @@ async fn connect_and_stream(
             reason: e.to_string(),
         })?;
 
-    // Only the live push stream is delayed: BlockMeta(S) can arrive before a late tx for S, so we
-    // finalize a few slots behind the tip. Authoritative getBlock backfill/gap-fill are never delayed.
-    let mut completion_window = SlotCompletionWindow::new(safety_window);
-
-    'stream: loop {
+    loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
                 info!("Yellowstone stream cancelled, closing connection...");
@@ -429,42 +395,28 @@ async fn connect_and_stream(
                     None => break,
                     Some(message) => match message {
             Ok(msg) => match msg.update_oneof {
-                Some(UpdateOneof::Transaction(tx_update)) => {
-                    if let Err(e) =
-                        handle_transaction(tx_update, &program_id, program_type, &tx).await
-                    {
-                        error!("Error handling transaction: {}", e);
-                        // Convert RpcError to DataSourceError for consistency
-                        return Err(DataSourceError::Rpc(e));
-                    }
-                }
-                Some(UpdateOneof::BlockMeta(block_meta)) => {
+                Some(UpdateOneof::Block(block)) => {
                     metrics::INDEXER_CHAIN_TIP_SLOT
                         .with_label_values(&[program_type.as_label()])
-                        .set(block_meta.slot as f64);
+                        .set(block.slot as f64);
                     if let Some(h) = health {
-                        // Yellowstone is push-based — a BlockMeta per slot means
+                        // Yellowstone is push-based - a block per produced slot means
                         // we're caught up; pending stays 0. The continuous_progress
                         // flag in HealthConfig::indexer() makes the staleness check
                         // fire even at pending=0, so a dead stream is detected.
                         h.set_pending(0);
                     }
-                    debug!("Yellowstone BlockMeta for slot {}", block_meta.slot);
+                    debug!(
+                        "Yellowstone Block for slot {} with {} txs",
+                        block.slot,
+                        block.transactions.len()
+                    );
 
-                    for slot in completion_window.observe(block_meta.slot) {
-                        let res = send_guaranteed(
-                            &tx,
-                            ProcessorMessage::SlotComplete { slot, program_type },
-                            "SlotComplete (yellowstone)",
-                        )
-                        .await;
-                        if let Err(e) = res {
-                            error!(
-                                "SlotComplete send failed, stopping Yellowstone gracefully: {}",
-                                e
-                            );
-                            break 'stream;
-                        }
+                    // Fail-closed: any parse/send failure returns Err (reconnect + gap-fill
+                    // replays the slot) and no SlotComplete is emitted for it.
+                    if let Err(e) = handle_block(block, &program_id, program_type, &tx).await {
+                        error!("Error handling block: {}", e);
+                        return Err(DataSourceError::Rpc(e));
                     }
                 }
                 Some(UpdateOneof::Ping(_)) => {
@@ -1133,8 +1085,256 @@ mod tests {
         );
         assert_eq!(escrow_deposit_amount(&metas[0]), 555);
     }
+
+    // ============================================================================
+    // Block handler: parse-all-then-complete, fail-closed on a malformed tx.
+    // ============================================================================
+
+    /// Wrap tx infos in a block for the given slot.
+    fn block_update(
+        slot: u64,
+        txs: Vec<yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo>,
+    ) -> yellowstone_grpc_proto::geyser::SubscribeUpdateBlock {
+        yellowstone_grpc_proto::geyser::SubscribeUpdateBlock {
+            slot,
+            transactions: txs,
+            ..Default::default()
+        }
+    }
+
+    /// Every tx is forwarded, then SlotComplete lands strictly last, so a
+    /// completion can never precede one of its slot's transactions.
+    #[tokio::test]
+    async fn block_forwards_all_txs_then_completes() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let tx_a = withdraw_tx_update(vec![1u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        let tx_b = withdraw_tx_update(vec![2u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        let block = block_update(500, vec![tx_a, tx_b]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut msgs = vec![];
+        while let Some(m) = rx.recv().await {
+            msgs.push(m);
+        }
+
+        assert_eq!(msgs.len(), 3);
+        let sig_a = bs58::encode([1u8; 64]).into_string();
+        let sig_b = bs58::encode([2u8; 64]).into_string();
+        match &msgs[0] {
+            ProcessorMessage::Instruction(m) => {
+                assert_eq!(m.signature.as_deref(), Some(sig_a.as_str()))
+            }
+            _ => panic!("expected instruction A first"),
+        }
+        match &msgs[1] {
+            ProcessorMessage::Instruction(m) => {
+                assert_eq!(m.signature.as_deref(), Some(sig_b.as_str()))
+            }
+            _ => panic!("expected instruction B second"),
+        }
+        match &msgs[2] {
+            ProcessorMessage::SlotComplete { slot, .. } => assert_eq!(*slot, 500),
+            _ => panic!("expected SlotComplete last"),
+        }
+    }
+
+    /// A block with no program txs still checkpoints its slot.
+    #[tokio::test]
+    async fn empty_block_completes() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let block = block_update(700, vec![]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut msgs = vec![];
+        while let Some(m) = rx.recv().await {
+            msgs.push(m);
+        }
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            ProcessorMessage::SlotComplete { slot, .. } => assert_eq!(*slot, 700),
+            _ => panic!("expected a lone SlotComplete"),
+        }
+    }
+
+    /// A tx targeting a foreign program is soft-skipped, yet the slot still completes.
+    #[tokio::test]
+    async fn block_with_foreign_tx_skips_but_completes() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // program_id_index 0 points at a non-program account, so it is filtered out.
+        let foreign = withdraw_tx_update_with_program_indices(vec![3u8; 64], &program_id, &[0])
+            .transaction
+            .unwrap();
+        let block = block_update(800, vec![foreign]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut msgs = vec![];
+        while let Some(m) = rx.recv().await {
+            msgs.push(m);
+        }
+        assert_eq!(msgs.len(), 1, "foreign tx yields no Instruction");
+        match &msgs[0] {
+            ProcessorMessage::SlotComplete { slot, .. } => assert_eq!(*slot, 800),
+            _ => panic!("slot still completes after a soft-skipped tx"),
+        }
+    }
+
+    /// A malformed protobuf tx fails the whole block and no SlotComplete is sent,
+    /// so an incompletely parsed slot is never checkpointed.
+    #[tokio::test]
+    async fn block_malformed_tx_errs_without_completing() {
+        use std::str::FromStr;
+        use yellowstone_grpc_proto::prelude as proto;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+
+        // A tx whose inner message is absent triggers the "Missing message" Err path.
+        let bad = proto::SubscribeUpdateTransactionInfo {
+            signature: vec![5u8; 64],
+            is_vote: false,
+            transaction: Some(proto::Transaction {
+                signatures: vec![signature_placeholder()],
+                message: None,
+            }),
+            meta: None,
+            index: 0,
+        };
+        let block = block_update(900, vec![bad]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        assert!(res.is_err(), "a malformed tx must fail the block");
+        drop(tx);
+
+        let mut saw_complete = false;
+        while let Some(m) = rx.recv().await {
+            if matches!(m, ProcessorMessage::SlotComplete { .. }) {
+                saw_complete = true;
+            }
+        }
+        assert!(
+            !saw_complete,
+            "slot must not complete when a tx fails to parse"
+        );
+    }
+
+    /// Absolute per-instruction indices from the block path match the per-tx path.
+    #[tokio::test]
+    async fn block_absolute_instruction_index_preserved() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let tx = withdraw_tx_update(vec![6u8; 64], &program_id, 2)
+            .transaction
+            .unwrap();
+        let block = block_update(1000, vec![tx]);
+
+        let (chan, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, &chan)
+            .await
+            .unwrap();
+        drop(chan);
+
+        let mut metas = vec![];
+        while let Some(m) = rx.recv().await {
+            if let ProcessorMessage::Instruction(meta) = m {
+                metas.push(meta);
+            }
+        }
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].instruction_index, 0);
+        assert_eq!(metas[1].instruction_index, 1);
+    }
+
+    /// A transaction that reverted on-chain is skipped, never indexed, yet the
+    /// block still completes, so a failed deposit/withdrawal is not credited.
+    #[tokio::test]
+    async fn block_skips_failed_tx_but_completes() {
+        use std::str::FromStr;
+        use yellowstone_grpc_proto::prelude as proto;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // A well-formed withdraw that would otherwise parse to one instruction,
+        // marked as failed on-chain via meta.err.
+        let mut failed = withdraw_tx_update(vec![8u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        failed.meta = Some(proto::TransactionStatusMeta {
+            err: Some(proto::TransactionError { err: vec![1] }),
+            ..Default::default()
+        });
+        let block = block_update(1100, vec![failed]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut instructions = 0;
+        let mut completed = false;
+        while let Some(m) = rx.recv().await {
+            match m {
+                ProcessorMessage::Instruction(_) => instructions += 1,
+                ProcessorMessage::SlotComplete { slot, .. } => {
+                    assert_eq!(slot, 1100);
+                    completed = true;
+                }
+            }
+        }
+        assert_eq!(instructions, 0, "a failed tx must not be indexed");
+        assert!(completed, "the slot still completes");
+    }
 }
 
+/// Parse all of the block's transactions, then send SlotComplete last so a completion never
+/// precedes a tx. A malformed tx returns Err and the slot is not checkpointed, so gap-fill replays it.
+async fn handle_block(
+    block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
+    program_id: &Pubkey,
+    program_type: ProgramType,
+    channel: &InstructionSender,
+) -> Result<(), DataSourceRpcError> {
+    let slot = block.slot;
+
+    for tx_info in block.transactions {
+        handle_transaction_info(tx_info, slot, program_id, program_type, channel).await?;
+    }
+
+    send_guaranteed(
+        channel,
+        ProcessorMessage::SlotComplete { slot, program_type },
+        "SlotComplete (yellowstone)",
+    )
+    .await
+    .map_err(|e| DataSourceRpcError::Protocol {
+        reason: format!("SlotComplete send failed: {e}"),
+    })?;
+
+    Ok(())
+}
+
+/// Thin wrapper preserving the per-transaction entry point for the unit tests;
+/// the live path now flows through `handle_block` instead.
+#[cfg(all(test, feature = "datasource-rpc"))]
 async fn handle_transaction(
     tx_update: yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
     program_id: &Pubkey,
@@ -1149,12 +1349,28 @@ async fn handle_transaction(
             reason: "Missing transaction info".to_string(),
         })?;
 
+    handle_transaction_info(tx_info, slot, program_id, program_type, channel).await
+}
+
+async fn handle_transaction_info(
+    tx_info: SubscribeUpdateTransactionInfo,
+    slot: u64,
+    program_id: &Pubkey,
+    program_type: ProgramType,
+    channel: &InstructionSender,
+) -> Result<(), DataSourceRpcError> {
     let mut inner_instructions_vec: Vec<InnerInstructions> = vec![];
     // ALT-resolved keys live on meta, not the message; capture them here to
     // append below so inner and v0 top-level account indices resolve (no RPC).
     let mut loaded_pubkeys: Vec<Pubkey> = vec![];
 
     if let Some(meta) = &tx_info.meta {
+        // A failed on-chain tx is still in the block; skip it so a reverted deposit/withdrawal
+        // is never indexed as real (the RPC decoder skips the same way; blocks cannot filter it).
+        if meta.err.is_some() {
+            return Ok(());
+        }
+
         inner_instructions_vec = meta
             .inner_instructions
             .iter()

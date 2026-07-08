@@ -3479,7 +3479,7 @@ mod tests {
     #[tokio::test]
     async fn attempt_remint_source_covered_dead_resends() {
         ensure_test_signer();
-        let mut dest = mockito::Server::new_async().await;
+        let dest = mockito::Server::new_async().await;
         let mut source = mockito::Server::new_async().await;
         let (state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         let (storage_tx, _storage_rx) = mpsc::channel(10);

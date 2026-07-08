@@ -373,7 +373,8 @@ struct AbsenceCoverage {
 }
 
 /// True when the endpoint's ledger floor covers every slot the attempt could occupy.
-/// `lvbh - 150` lower-bounds the landing slot (slot >= height), so a floor at or below it proves retention.
+/// `lvbh - 150` lower-bounds the landing slot (slot >= height), so a floor at or below it proves
+/// retention; comparing a floor slot to a height bound only over-reports Uncertain, never a false covered.
 async fn absence_is_covered(
     rpc: &RpcClientWithRetry,
     min_lvbh: u64,
@@ -429,7 +430,8 @@ pub(crate) async fn classify_signatures(
         EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
         EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
         EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
-        // A finalized-failed status is positive on-chain evidence; trust it directly.
+        // A finalized-failed status is immutable on-chain evidence, so trust it directly and
+        // skip fallback corroboration; only an absence-based Dead needs a coverage proof.
         EndpointVerdict::DeadFinalizedFailure => return SigFinality::Dead,
         EndpointVerdict::DeadByAbsence { min_lvbh } => min_lvbh,
     };

@@ -47,6 +47,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::sync::Arc;
 use std::time::Duration;
+use test_utils::operator_helper::same_host_fallback_url;
 use test_utils::operator_helper::start_solana_to_private_channel_operator;
 use test_utils::operator_helper::OperatorHandle;
 use test_utils::validator_helper::start_test_validator_no_geyser;
@@ -122,7 +123,7 @@ async fn start_operator_with_alert(
         // The withdraw operator now requires an independent, same-cluster fallback.
         // Reach the same node via a distinct host string so the URL differs while
         // the genesis hash matches. Harmless for Escrow callers (never validated).
-        fallback_rpc_url: Some(rpc_url.replace("127.0.0.1", "localhost")),
+        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -173,7 +174,7 @@ async fn start_operator_with_config(
         // The withdraw operator now requires an independent, same-cluster fallback.
         // Reach the same node via a distinct host string so the URL differs while
         // the genesis hash matches. Harmless for Escrow callers (never validated).
-        fallback_rpc_url: Some(rpc_url.replace("127.0.0.1", "localhost")),
+        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };

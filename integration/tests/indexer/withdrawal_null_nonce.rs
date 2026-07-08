@@ -43,7 +43,7 @@ use {
         signature::{Keypair, Signature, Signer},
     },
     std::{sync::Arc, time::Duration},
-    test_utils::operator_helper::OperatorHandle,
+    test_utils::operator_helper::{same_host_fallback_url, OperatorHandle},
     test_utils::validator_helper::start_test_validator_no_geyser,
     testcontainers::runners::AsyncRunner,
     testcontainers_modules::postgres::Postgres,
@@ -97,7 +97,7 @@ async fn start_withdraw_operator(
         // The withdraw operator now requires an independent, same-cluster fallback.
         // Single-validator test: reach the same node via a distinct host string so
         // the URL differs while the genesis hash matches.
-        fallback_rpc_url: Some(rpc_url.replace("127.0.0.1", "localhost")),
+        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };

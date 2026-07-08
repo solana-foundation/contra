@@ -40,6 +40,7 @@ use private_channel_indexer::storage::common::models::{
 };
 use private_channel_indexer::storage::{PostgresDb, Storage, TransactionType};
 use private_channel_indexer::PostgresConfig;
+use private_channel_metrics::{HealthConfig, HealthState};
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -867,18 +868,21 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// (periodic reconciliation): the reconciliation loop fires a webhook
-/// alert when on-chain escrow balances diverge from the DB's completed totals.
+/// (periodic reconciliation): on a mismatch the reconciliation loop fires a
+/// webhook alert and fails closed, quarantining active withdrawals and
+/// degrading health.
 ///
 /// Approach:
 /// 1. `AllowMint` creates an escrow ATA with 0 on-chain balance.
 /// 2. A completed deposit is seeded in the DB so the DB shows a positive balance.
-/// 3. The operator runs with `reconciliation_interval = 500 ms` and
+/// 3. A Pending withdrawal is seeded so the quarantine sweep has a row to flip.
+/// 4. The operator runs with `reconciliation_interval = 500 ms` and
 ///    `reconciliation_tolerance_bps = 0`, guaranteeing that any delta triggers
 ///    the alert.
-/// 4. We verify the mock webhook received at least one POST request.
+/// 5. We verify the webhook fired, health degraded, and the withdrawal moved to
+///    `manual_review`.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
+async fn test_periodic_reconciliation_fires_webhook_and_fails_closed_on_mismatch(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Operator Lifecycle: Reconciliation Webhook on Mismatch ===");
 
@@ -940,6 +944,16 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
     .execute(&pool)
     .await?;
 
+    // Seed a Pending withdrawal so the fail-closed teeth have a row to quarantine.
+    let withdrawal_sig = Signature::new_unique().to_string();
+    let withdrawal_txn =
+        DbTransactionBuilder::new(withdrawal_sig.clone(), 2, env.mint.to_string(), 1_000)
+            .initiator(Pubkey::new_unique().to_string())
+            .recipient(Pubkey::new_unique().to_string())
+            .transaction_type(TransactionType::Withdrawal)
+            .build();
+    storage.insert_db_transaction(&withdrawal_txn).await?;
+
     // Start a mock HTTP server; expect at least one reconciliation POST.
     // No content-type constraint here — the reconciliation webhook client sends
     // `Content-Type: application/json` via reqwest, but we only care that a POST
@@ -978,6 +992,11 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         .await?,
     ));
 
+    // Health starts healthy; a detected mismatch must degrade it.
+    let health = HealthState::new(HealthConfig::operator());
+    assert!(health.is_healthy(), "health should start healthy");
+    let recon_health = health.clone();
+
     // Spawn `run_reconciliation` directly so the test exercises the exact same
     // code path that the operator uses, without the ctrl_c() gate in `operator::run`.
     let recon_token_clone = cancellation_token.clone();
@@ -985,8 +1004,10 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         if let Err(e) = run_reconciliation(
             recon_storage,
             recon_config,
+            rpc_client.clone(),
             rpc_client,
             env.instance,
+            Some(recon_health),
             recon_token_clone,
         )
         .await
@@ -1004,6 +1025,173 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
 
     // Confirm the reconciliation loop fired the webhook at least once.
     recon_mock.assert_async().await;
+
+    // The mismatch must have failed closed: health degraded and the active
+    // withdrawal quarantined to ManualReview.
+    assert!(
+        !health.is_healthy(),
+        "detected mismatch must degrade health"
+    );
+    let withdrawal_status: String =
+        sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+            .bind(&withdrawal_sig)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        withdrawal_status, "manual_review",
+        "active withdrawal must be quarantined by the fail-closed teeth"
+    );
+    Ok(())
+}
+
+/// (channel-supply reconciliation): the loop fails closed when a mint's total
+/// on-chain supply exceeds the escrow ATA that backs it.
+///
+/// Each check runs two independent comparisons:
+///   A. custody vs ledger: escrow ATA balance  vs  DB (deposits - withdrawals)
+///   B. supply vs escrow:   mint total supply   vs  escrow ATA balance
+///
+/// The setup keeps A balanced and trips only B, so the teeth are attributable
+/// to the supply invariant alone:
+/// 1. Escrow ATA stays at 0 and no deposit is seeded, so A is 0 == 0.
+/// 2. `SUPPLY` is minted to a NON-escrow ATA. That raises the mint's total
+///    supply (read by B) without changing the escrow ATA balance or the DB
+///    ledger (so A is untouched). B now sees supply=SUPPLY > escrow=0.
+/// 3. A Pending withdrawal is seeded so the quarantine sweep has a row to flip.
+/// 4. We verify the webhook fired, health degraded, and the withdrawal moved to
+///    `manual_review`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_periodic_reconciliation_fails_closed_on_channel_supply_breach(
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Operator Lifecycle: Reconciliation Channel Supply Breach ===");
+
+    const SUPPLY: u64 = 1_000;
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("operator_supply_breach")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/operator_supply_breach",
+        pg_host, pg_port
+    );
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    // Escrow ATA is created at 0 balance; the mint starts at 0 total supply.
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 0, 0, None).await?;
+
+    // Register the mint but seed no deposit, so check A (custody vs ledger) is 0 == 0.
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+
+    // Raise the mint's total supply by minting to a NON-escrow ATA: check B now
+    // sees supply=SUPPLY > escrow=0, while the escrow ATA balance stays 0 (check
+    // A untouched). admin is the mint authority set by generate_mint.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).expect("admin keypair");
+    mint_to_owner(&client, &admin, env.mint, Pubkey::new_unique(), &admin, SUPPLY).await?;
+
+    // Seed a Pending withdrawal so the quarantine sweep has a row to flip.
+    let withdrawal_sig = Signature::new_unique().to_string();
+    let withdrawal_txn =
+        DbTransactionBuilder::new(withdrawal_sig.clone(), 1, env.mint.to_string(), 500)
+            .initiator(Pubkey::new_unique().to_string())
+            .recipient(Pubkey::new_unique().to_string())
+            .transaction_type(TransactionType::Withdrawal)
+            .build();
+    storage.insert_db_transaction(&withdrawal_txn).await?;
+
+    let mut mock_server = Server::new_async().await;
+    let recon_mock = mock_server
+        .mock("POST", "/")
+        .with_status(200)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    // Short interval; zero tolerance so any supply excess trips.
+    let recon_config = OperatorConfig {
+        reconciliation_interval: Duration::from_millis(500),
+        reconciliation_tolerance_bps: 0,
+        reconciliation_webhook_url: Some(mock_server.url()),
+        ..default_operator_config(None)
+    };
+
+    // One validator backs both roles in this test: it is passed as the Solana
+    // custody-sweep client and the PrivateChannel channel-supply client. In
+    // production these are two distinct RPCs (mainnet vs internal channel).
+    let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
+        test_validator.rpc_url(),
+        RetryConfig::default(),
+        CommitmentConfig::confirmed(),
+    ));
+
+    let cancellation_token = CancellationToken::new();
+    let recon_storage = Arc::new(Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 5,
+        })
+        .await?,
+    ));
+
+    let health = HealthState::new(HealthConfig::operator());
+    assert!(health.is_healthy(), "health should start healthy");
+    let recon_health = health.clone();
+
+    let recon_token_clone = cancellation_token.clone();
+    let recon_handle: JoinHandle<()> = tokio::spawn(async move {
+        if let Err(e) = run_reconciliation(
+            recon_storage,
+            recon_config,
+            rpc_client.clone(),
+            rpc_client,
+            env.instance,
+            Some(recon_health),
+            recon_token_clone,
+        )
+        .await
+        {
+            tracing::error!("Reconciliation task error: {}", e);
+        }
+    });
+
+    // Give the reconciliation loop time to complete several cycles (interval = 500 ms).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    cancellation_token.cancel();
+    let _ = recon_handle.await;
+
+    recon_mock.assert_async().await;
+
+    // Check A is balanced (escrow 0, DB ledger 0), so the teeth are attributable
+    // to check B (channel supply > escrow) alone.
+    assert!(!health.is_healthy(), "supply breach must degrade health");
+    let pool = db::connect(&db_url).await?;
+    let withdrawal_status: String =
+        sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+            .bind(&withdrawal_sig)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        withdrawal_status, "manual_review",
+        "supply breach must quarantine active withdrawals"
+    );
     Ok(())
 }
 

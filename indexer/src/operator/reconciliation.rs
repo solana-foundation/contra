@@ -16,7 +16,13 @@ use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::Storage;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
+use private_channel_metrics::HealthState;
+use solana_rpc_client_api::client_error;
+use solana_rpc_client_api::client_error::ErrorKind;
+use solana_rpc_client_api::request::RpcError;
 use solana_sdk::pubkey::Pubkey;
+use spl_token::solana_program::program_pack::Pack;
+use spl_token::state::Mint;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,7 +72,9 @@ pub async fn run_reconciliation(
     storage: Arc<Storage>,
     config: OperatorConfig,
     rpc_client: Arc<RpcClientWithRetry>,
+    channel_rpc_client: Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    health: Option<Arc<HealthState>>,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
     info!("Starting reconciliation");
@@ -100,7 +108,9 @@ pub async fn run_reconciliation(
             &storage,
             &config,
             &rpc_client,
+            &channel_rpc_client,
             escrow_instance_id,
+            &health,
             &webhook_client,
             &mut previously_alerted_orphans,
         )
@@ -132,15 +142,22 @@ pub async fn run_reconciliation(
 ///
 /// This function orchestrates the complete reconciliation flow:
 /// 1. Surface orphan deposit rows
-/// 2. Fetch on-chain balances for all mints held by the escrow
+/// 2. Fetch on-chain escrow ATA balances (Solana) for all mints held by the escrow
 /// 3. Query database for sum of completed deposits minus withdrawals per mint
-/// 4. Compare balances with tolerance threshold
-/// 5. Send webhook alert if mismatch exceeds tolerance
+/// 4. Compare balances against the DB ledger; on a breach, alert and fail closed
+/// 5. Read channel-token supply on PrivateChannel and assert supply <= escrow
+///    balance; on a breach, alert and fail closed
+///
+/// `rpc_client` sweeps the Solana escrow ATAs; `channel_rpc_client` reads the
+/// PrivateChannel mints where channel-token supply lives.
+#[allow(clippy::too_many_arguments)]
 async fn perform_reconciliation_check(
     storage: &Arc<Storage>,
     config: &OperatorConfig,
     rpc_client: &Arc<RpcClientWithRetry>,
+    channel_rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    health: &Option<Arc<HealthState>>,
     webhook_client: &WebhookClient,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
 ) -> Result<(), OperatorError> {
@@ -183,7 +200,7 @@ async fn perform_reconciliation_check(
         config.reconciliation_tolerance_bps,
     );
 
-    // Step 5: Send webhook alert if mismatches found
+    // Step 5: On a custody-vs-ledger breach, fail closed then alert.
     if !mismatches.is_empty() {
         error!(
             "Balance reconciliation failed: found {} mismatch(es) exceeding tolerance of {} bps",
@@ -198,6 +215,9 @@ async fn perform_reconciliation_check(
             );
         }
 
+        // Teeth first: a webhook delivery failure must not skip quarantine/health.
+        enforce_fail_closed(storage, health).await;
+
         send_webhook_alert(
             &config.reconciliation_webhook_url,
             &mismatches,
@@ -208,7 +228,69 @@ async fn perform_reconciliation_check(
         info!("Balance reconciliation successful: all mints within tolerance");
     }
 
+    // Step 6: Assert channel-token supply on PrivateChannel does not exceed the
+    // on-chain escrow balance. This reads issuance from the chain directly, so
+    // an unbacked mint the DB ledger cannot see still trips the invariant.
+    let channel_supplies =
+        read_channel_supplies(channel_rpc_client, &on_chain_balances, &db_balances).await;
+    let supply_breaches = compare_channel_supply(
+        &channel_supplies,
+        &on_chain_balances,
+        config.reconciliation_tolerance_bps,
+    );
+
+    if !supply_breaches.is_empty() {
+        error!(
+            "Channel supply reconciliation failed: {} mint(s) issue more than the escrow backs",
+            supply_breaches.len()
+        );
+
+        for breach in &supply_breaches {
+            error!(
+                "Supply breach for mint {}: channel_supply={}, escrow={}, delta={} bps",
+                breach.mint, breach.channel_supply, breach.escrow_balance, breach.delta_bps
+            );
+        }
+
+        enforce_fail_closed(storage, health).await;
+
+        // Reuse the balance-mismatch webhook: escrow balance rides in
+        // `on_chain_balance`, channel supply in `db_balance`.
+        let alerts: Vec<BalanceMismatch> = supply_breaches
+            .iter()
+            .map(|breach| BalanceMismatch {
+                mint: breach.mint,
+                on_chain_balance: breach.escrow_balance,
+                db_balance: breach.channel_supply,
+                delta_bps: breach.delta_bps,
+            })
+            .collect();
+
+        send_webhook_alert(&config.reconciliation_webhook_url, &alerts, webhook_client).await?;
+    } else {
+        info!("Channel supply reconciliation successful: all mints backed by escrow");
+    }
+
     Ok(())
+}
+
+/// Fail closed on a detected reconciliation breach: quarantine every active
+/// withdrawal so the withdraw pipeline drains to nothing, and latch health
+/// degraded so `/health` returns 503 and orchestration reacts. Both effects
+/// are best-effort and logged; the loop keeps running so it re-checks and
+/// re-alerts on the next tick.
+async fn enforce_fail_closed(storage: &Arc<Storage>, health: &Option<Arc<HealthState>>) {
+    match storage.quarantine_all_active_withdrawals(None).await {
+        Ok(quarantined) => error!(
+            quarantined,
+            "Reconciliation breach: quarantined active withdrawals"
+        ),
+        Err(e) => error!("Reconciliation breach: failed to quarantine withdrawals: {}", e),
+    }
+
+    if let Some(health) = health {
+        health.set_degraded();
+    }
 }
 
 /// Surface orphan deposit rows (deposits whose mint was not `allowed` at the
@@ -367,6 +449,112 @@ pub fn compare_balances(
     }
 
     mismatches
+}
+
+/// A mint whose channel-token supply on PrivateChannel exceeds the on-chain
+/// escrow balance backing it beyond tolerance. Signals unbacked issuance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupplyBreach {
+    pub mint: Pubkey,
+    pub channel_supply: u64,
+    pub escrow_balance: u64,
+    pub delta_bps: u64,
+}
+
+/// True if `e` reports a missing account rather than a transient RPC failure.
+/// `get_account_data` surfaces a not-found as `ForUser("AccountNotFound...")`;
+/// the `-32602` code is the `getAccountInfo` response shape some providers use.
+fn is_missing_account(e: &client_error::Error) -> bool {
+    match &e.kind {
+        ErrorKind::RpcError(RpcError::ForUser(msg)) => msg.contains("AccountNotFound"),
+        ErrorKind::RpcError(RpcError::RpcResponseError { code, .. }) => *code == -32602,
+        _ => false,
+    }
+}
+
+/// Read one mint's channel-token supply from PrivateChannel.
+///
+/// A missing mint account means no channel tokens were ever issued (`Some(0)`).
+/// A transient RPC failure or a decode failure returns `None` so the caller
+/// skips the mint this tick rather than asserting on data it could not read.
+async fn read_channel_supply(channel_rpc: &RpcClientWithRetry, mint: &Pubkey) -> Option<u64> {
+    match channel_rpc.get_account_data(mint).await {
+        Ok(data) => match Mint::unpack_unchecked(&data) {
+            Ok(m) if m.is_initialized => Some(m.supply),
+            // Allocated but not yet a mint: no supply.
+            Ok(_) => Some(0),
+            Err(_) => {
+                warn!(mint = %mint, "Channel supply: account did not decode as SPL Mint; skipping");
+                None
+            }
+        },
+        Err(e) if is_missing_account(&e) => Some(0),
+        Err(e) => {
+            warn!(mint = %mint, "Channel supply: RPC read failed, skipping this tick: {}", e);
+            None
+        }
+    }
+}
+
+/// Read channel-token supply for the union of mints seen on-chain and in the DB.
+/// Mints whose supply could not be read are omitted (skipped this tick).
+async fn read_channel_supplies(
+    channel_rpc: &RpcClientWithRetry,
+    on_chain_balances: &HashMap<Pubkey, u64>,
+    db_balances: &HashMap<Pubkey, u64>,
+) -> HashMap<Pubkey, u64> {
+    let mut all_mints: HashSet<Pubkey> = on_chain_balances.keys().copied().collect();
+    all_mints.extend(db_balances.keys().copied());
+
+    let mut supplies = HashMap::new();
+    for mint in all_mints {
+        if let Some(supply) = read_channel_supply(channel_rpc, &mint).await {
+            supplies.insert(mint, supply);
+        }
+    }
+    supplies
+}
+
+/// Flag mints whose channel supply exceeds the escrow balance beyond tolerance.
+///
+/// The invariant is one-directional: only `channel_supply > escrow_balance`
+/// (over-issuance) is a breach. Under-supply is legitimate in-flight state
+/// (a mint lands after its deposit; a burn lands before its release), so it
+/// never alerts. `escrow_balance == 0` with non-zero supply is critical.
+pub fn compare_channel_supply(
+    channel_supplies: &HashMap<Pubkey, u64>,
+    on_chain_balances: &HashMap<Pubkey, u64>,
+    tolerance_bps: u16,
+) -> Vec<SupplyBreach> {
+    let mut breaches = Vec::new();
+
+    for (mint, &channel_supply) in channel_supplies {
+        let escrow_balance = *on_chain_balances.get(mint).unwrap_or(&0);
+
+        // Supply within (or under) what the escrow backs is fine.
+        if channel_supply <= escrow_balance {
+            continue;
+        }
+
+        let delta_bps = if escrow_balance == 0 {
+            // Issuance with zero backing: always a breach.
+            u64::MAX
+        } else {
+            let excess = channel_supply - escrow_balance;
+            ((excess as u128 * 10000) / escrow_balance as u128) as u64
+        };
+
+        if delta_bps > tolerance_bps as u64 {
+            breaches.push(SupplyBreach {
+                mint: *mint,
+                channel_supply,
+                escrow_balance,
+                delta_bps,
+            });
+        }
+    }
+
+    breaches
 }
 
 /// Fetches on-chain token balances for all token accounts owned by the escrow
@@ -770,6 +958,137 @@ mod tests {
         assert_eq!(mismatches.len(), 0);
     }
 
+    // ── compare_channel_supply ────────────────────────────────────────────
+
+    #[test]
+    fn supply_over_issuance_is_flagged() {
+        let mint = Pubkey::new_unique();
+        let supplies = HashMap::from([(mint, 1100)]);
+        let escrow = HashMap::from([(mint, 1000)]);
+
+        // 100 excess on 1000 base = 1000 bps, well past a 10 bps tolerance.
+        let breaches = compare_channel_supply(&supplies, &escrow, 10);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].mint, mint);
+        assert_eq!(breaches[0].channel_supply, 1100);
+        assert_eq!(breaches[0].escrow_balance, 1000);
+        assert_eq!(breaches[0].delta_bps, 1000);
+    }
+
+    #[test]
+    fn supply_under_escrow_is_not_flagged() {
+        // In-flight state (mint lands after deposit, burn before release) leaves
+        // supply below escrow; that must never alert.
+        let mint = Pubkey::new_unique();
+        let supplies = HashMap::from([(mint, 900)]);
+        let escrow = HashMap::from([(mint, 1000)]);
+
+        assert!(compare_channel_supply(&supplies, &escrow, 0).is_empty());
+    }
+
+    #[test]
+    fn supply_equal_to_escrow_is_not_flagged() {
+        let mint = Pubkey::new_unique();
+        let supplies = HashMap::from([(mint, 1000)]);
+        let escrow = HashMap::from([(mint, 1000)]);
+
+        assert!(compare_channel_supply(&supplies, &escrow, 0).is_empty());
+    }
+
+    #[test]
+    fn supply_with_zero_escrow_is_critical() {
+        let mint = Pubkey::new_unique();
+        let supplies = HashMap::from([(mint, 1)]);
+        let escrow = HashMap::new();
+
+        let breaches = compare_channel_supply(&supplies, &escrow, u16::MAX);
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].delta_bps, u64::MAX);
+    }
+
+    #[test]
+    fn supply_excess_within_tolerance_is_not_flagged() {
+        let mint = Pubkey::new_unique();
+        // 10 excess on 100_000 base = 1 bps, within a 1 bps tolerance.
+        let supplies = HashMap::from([(mint, 100_010)]);
+        let escrow = HashMap::from([(mint, 100_000)]);
+
+        assert!(compare_channel_supply(&supplies, &escrow, 1).is_empty());
+    }
+
+    // ── enforce_fail_closed ───────────────────────────────────────────────
+
+    /// Push a single Pending withdrawal so the quarantine sweep has a row to flip.
+    fn seed_pending_withdrawal(mock: &MockStorage) {
+        use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+        use chrono::Utc;
+        mock.pending_transactions.lock().unwrap().push(DbTransaction {
+            id: 1,
+            signature: "sig_w".to_string(),
+            trace_id: "trace_w".to_string(),
+            slot: 1,
+            initiator: "init".to_string(),
+            recipient: "recip".to_string(),
+            mint: "mint".to_string(),
+            amount: TokenAmount(1),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(0),
+            status: TransactionStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn enforce_fail_closed_quarantines_and_degrades_health() {
+        use crate::storage::common::models::TransactionStatus;
+        use private_channel_metrics::{HealthConfig, HealthState};
+
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let health = HealthState::new(HealthConfig::operator());
+        assert!(health.is_healthy());
+
+        enforce_fail_closed(&storage, &Some(health.clone())).await;
+
+        assert!(!health.is_healthy(), "breach must degrade health");
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::ManualReview,
+            "active withdrawal must be quarantined"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_fail_closed_degrades_health_even_when_quarantine_fails() {
+        use private_channel_metrics::{HealthConfig, HealthState};
+
+        let mock = MockStorage::new();
+        mock.set_should_fail("quarantine_all_active_withdrawals", true);
+        let storage = Arc::new(Storage::Mock(mock));
+
+        let health = HealthState::new(HealthConfig::operator());
+        enforce_fail_closed(&storage, &Some(health.clone())).await;
+
+        assert!(
+            !health.is_healthy(),
+            "health must degrade even if the quarantine sweep errors"
+        );
+    }
+
     fn make_operator_config() -> OperatorConfig {
         use solana_sdk::commitment_config::CommitmentLevel;
         OperatorConfig {
@@ -809,8 +1128,10 @@ mod tests {
         let result = run_reconciliation(
             storage,
             config,
+            rpc_client.clone(),
             rpc_client,
             solana_sdk::pubkey::Pubkey::new_unique(),
+            None,
             ct,
         )
         .await;

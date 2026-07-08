@@ -97,6 +97,10 @@ async fn health_handler(
 ) -> (axum::http::StatusCode, String) {
     match health.check() {
         HealthOutcome::Healthy => (axum::http::StatusCode::OK, r#"{"status":"ok"}"#.to_string()),
+        HealthOutcome::Degraded => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"degraded","reason":"reconciliation_mismatch"}"#.to_string(),
+        ),
         HealthOutcome::BacklogExceeded { pending, ceiling } => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             format!(

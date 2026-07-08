@@ -222,16 +222,22 @@ pub async fn run(
         if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
             let reconciliation_storage = storage.clone();
             let reconciliation_config = config.clone();
+            // Solana escrow ATA sweep (source RPC).
             let reconciliation_rpc = source_rpc_client
                 .clone()
                 .unwrap_or_else(|| rpc_client.clone());
+            // PrivateChannel RPC (rpc_url) where channel-token mints live.
+            let reconciliation_channel_rpc = rpc_client.clone();
+            let reconciliation_health = health.clone();
             let reconciliation_token = cancellation_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = reconciliation::run_reconciliation(
                     reconciliation_storage,
                     reconciliation_config,
                     reconciliation_rpc,
+                    reconciliation_channel_rpc,
                     reconciliation_escrow,
+                    reconciliation_health,
                     reconciliation_token,
                 )
                 .await

@@ -346,6 +346,20 @@ impl OperatorConfig {
 
         Ok(())
     }
+
+    /// Reject a config where a detected reconciliation mismatch could not reach
+    /// an alert channel. Escrow operators run reconciliation, so they must have
+    /// a webhook configured.
+    pub fn validate(&self, program_type: ProgramType) -> Result<(), String> {
+        if program_type == ProgramType::Escrow && self.reconciliation_webhook_url.is_none() {
+            return Err(
+                "reconciliation_webhook_url is required for escrow operators \
+                 (set OPERATOR_RECONCILIATION_WEBHOOK_URL)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -549,5 +563,42 @@ mod tests {
             floor_operator_commitment(CommitmentLevel::Finalized).unwrap(),
             CommitmentLevel::Finalized
         );
+    }
+
+    // ── operator reconciliation-webhook gate ────────────────────────────
+
+    fn operator_config_with_webhook(reconciliation_webhook_url: Option<String>) -> OperatorConfig {
+        OperatorConfig {
+            db_poll_interval: std::time::Duration::from_secs(1),
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay: std::time::Duration::from_millis(100),
+            channel_buffer_size: 100,
+            rpc_commitment: CommitmentLevel::Confirmed,
+            alert_webhook_url: None,
+            reconciliation_interval: std::time::Duration::from_secs(60),
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url,
+            feepayer_monitor_interval: std::time::Duration::from_secs(60),
+            confirmation_poll_interval_ms: 400,
+        }
+    }
+
+    #[test]
+    fn escrow_operator_requires_reconciliation_webhook() {
+        let config = operator_config_with_webhook(None);
+        assert!(config.validate(ProgramType::Escrow).is_err());
+    }
+
+    #[test]
+    fn escrow_operator_with_webhook_validates() {
+        let config = operator_config_with_webhook(Some("http://example.com/hook".to_string()));
+        assert!(config.validate(ProgramType::Escrow).is_ok());
+    }
+
+    #[test]
+    fn withdraw_operator_does_not_require_reconciliation_webhook() {
+        let config = operator_config_with_webhook(None);
+        assert!(config.validate(ProgramType::Withdraw).is_ok());
     }
 }

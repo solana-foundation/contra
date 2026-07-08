@@ -441,6 +441,10 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
     // Validate signer configuration early (from environment variables)
     OperatorConfig::validate_signers().map_err(|e| format!("Signer configuration error: {}", e))?;
 
+    operator_config
+        .validate(common_config.program_type)
+        .map_err(|e| format!("Operator configuration error: {}", e))?;
+
     private_channel_indexer::operator::run(storage, common_config, operator_config, Some(health))
         .await?;
 

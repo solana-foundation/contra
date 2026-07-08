@@ -6,7 +6,7 @@
 //! (b) backlog is non-zero AND no progress has been recorded within the
 //! staleness window. Idle (no backlog, no progress) stays healthy.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,12 +58,18 @@ pub struct HealthState {
     last_progress_at: AtomicI64,
     /// Service-defined backlog metric (slot lag for indexer, queue depth for operator).
     pending: AtomicU64,
+    /// One-way latch for an unrecoverable integrity failure (e.g. a
+    /// reconciliation mismatch). Once set, `check()` reports `Degraded`
+    /// regardless of backlog. Cleared only by a process restart.
+    degraded: AtomicBool,
     config: HealthConfig,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HealthOutcome {
     Healthy,
+    /// Degraded latch tripped; takes precedence over backlog/staleness.
+    Degraded,
     /// Backlog has exceeded the configured ceiling.
     BacklogExceeded {
         pending: u64,
@@ -81,12 +87,18 @@ impl HealthState {
         Arc::new(Self {
             last_progress_at: AtomicI64::new(0),
             pending: AtomicU64::new(0),
+            degraded: AtomicBool::new(false),
             config,
         })
     }
 
     pub fn record_progress(&self) {
         self.last_progress_at.store(now_unix(), Ordering::Relaxed);
+    }
+
+    /// Trip the degraded latch. `/health` reports 503 until the next restart.
+    pub fn set_degraded(&self) {
+        self.degraded.store(true, Ordering::Relaxed);
     }
 
     pub fn set_pending(&self, value: u64) {
@@ -106,6 +118,10 @@ impl HealthState {
     /// Variant used by tests to inject a deterministic "now". Production code
     /// should call `check()`.
     pub fn check_at(&self, now: i64) -> HealthOutcome {
+        // Latch wins over every derived signal.
+        if self.degraded.load(Ordering::Relaxed) {
+            return HealthOutcome::Degraded;
+        }
         let pending = self.pending.load(Ordering::Relaxed);
         if pending > self.config.max_pending {
             return HealthOutcome::BacklogExceeded {
@@ -297,6 +313,24 @@ mod tests {
         h.last_progress_at.store(1000, Ordering::Relaxed);
         h.set_pending(0);
         assert_eq!(h.check_at(1010), HealthOutcome::Healthy);
+    }
+
+    #[test]
+    fn degraded_latch_reports_degraded() {
+        let h = HealthState::new(cfg(10, 30));
+        h.set_degraded();
+        assert_eq!(h.check_at(1000), HealthOutcome::Degraded);
+        assert!(!h.is_healthy());
+    }
+
+    #[test]
+    fn degraded_latch_wins_over_healthy_backlog() {
+        // Fresh progress would otherwise read Healthy; the latch overrides it.
+        let h = HealthState::new(cfg(10, 30));
+        h.last_progress_at.store(1000, Ordering::Relaxed);
+        h.set_pending(0);
+        h.set_degraded();
+        assert_eq!(h.check_at(1010), HealthOutcome::Degraded);
     }
 
     #[test]

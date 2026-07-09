@@ -7,6 +7,9 @@ use crate::auth::{
     AuthDecision,
 };
 use clap::Parser;
+use governor::clock::DefaultClock;
+use governor::state::keyed::DefaultKeyedStateStore;
+use governor::{Quota, RateLimiter};
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -14,17 +17,20 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use jsonrpsee::types::error::INVALID_REQUEST_CODE;
 use jsonwebtoken::DecodingKey;
 use serde_json::Value;
+use socket2::{SockRef, TcpKeepalive};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
 /// Maximum allowed request body size (64 KB).
@@ -92,12 +98,110 @@ pub struct Args {
     /// check, so this should be sized to match expected peak concurrency.
     #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
     pub auth_database_max_connections: u32,
+
+    /// Maximum number of concurrent client connections. Connections beyond this
+    /// are dropped so a flood cannot exhaust file descriptors or memory.
+    #[arg(long, env = "GATEWAY_MAX_CONNECTIONS", default_value = "1024")]
+    pub max_connections: NonZeroUsize,
+
+    /// Maximum concurrent connections from a single client IP.
+    #[arg(long, env = "GATEWAY_MAX_CONNECTIONS_PER_IP", default_value = "64")]
+    pub max_connections_per_ip: NonZeroUsize,
+
+    /// Seconds a client may take to send the full request header block before
+    /// the connection is closed (slowloris protection). Must be non-zero; a
+    /// zero timeout would fail every request instantly.
+    #[arg(
+        long,
+        env = "GATEWAY_HEADER_READ_TIMEOUT_SECS",
+        default_value = "10",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub header_read_timeout_secs: u64,
+
+    /// Seconds to read the full request body once headers are in. Must be
+    /// non-zero; a zero timeout would fail every request instantly.
+    #[arg(
+        long,
+        env = "GATEWAY_BODY_READ_TIMEOUT_SECS",
+        default_value = "15",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub body_read_timeout_secs: u64,
+
+    /// Idle seconds before the OS starts sending TCP keepalive probes. Must be
+    /// non-zero.
+    #[arg(
+        long,
+        env = "GATEWAY_TCP_KEEPALIVE_IDLE_SECS",
+        default_value = "60",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub tcp_keepalive_idle_secs: u64,
+
+    /// Seconds between TCP keepalive probes. Must be non-zero.
+    #[arg(
+        long,
+        env = "GATEWAY_TCP_KEEPALIVE_INTERVAL_SECS",
+        default_value = "15",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub tcp_keepalive_interval_secs: u64,
+
+    /// Sustained request rate allowed per client IP (requests per second).
+    #[arg(long, env = "GATEWAY_RATE_LIMIT_PER_SECOND", default_value = "50")]
+    pub rate_limit_per_second: NonZeroU32,
+
+    /// Burst capacity per client IP (token bucket size).
+    #[arg(long, env = "GATEWAY_RATE_LIMIT_BURST", default_value = "100")]
+    pub rate_limit_burst: NonZeroU32,
+}
+
+/// Tunable resource limits for the serve loop and request handling.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// Max concurrent client connections. Connections past this are dropped
+    /// so a flood cannot exhaust file descriptors or memory.
+    pub max_connections: NonZeroUsize,
+    /// Max concurrent connections from a single client IP, so one host cannot
+    /// consume the whole global connection budget.
+    pub max_connections_per_ip: NonZeroUsize,
+    /// Max time a client may take to send the full request header block.
+    /// Slowloris header-trickle connections are closed after this.
+    pub header_read_timeout: Duration,
+    /// Max time to read the full request body once headers are in. Bounds
+    /// slow-body (trickle) clients that the header timeout doesn't cover.
+    pub body_read_timeout: Duration,
+    /// Idle time before the OS starts sending TCP keepalive probes.
+    pub tcp_keepalive_idle: Duration,
+    /// Interval between TCP keepalive probes.
+    pub tcp_keepalive_interval: Duration,
+    /// Sustained request rate allowed per client IP (requests per second).
+    pub rate_limit_per_second: NonZeroU32,
+    /// Burst capacity per client IP, i.e. the token bucket size.
+    pub rate_limit_burst: NonZeroU32,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: NonZeroUsize::new(1024).unwrap(),
+            max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
+            header_read_timeout: Duration::from_secs(10),
+            body_read_timeout: Duration::from_secs(15),
+            tcp_keepalive_idle: Duration::from_secs(60),
+            tcp_keepalive_interval: Duration::from_secs(15),
+            rate_limit_per_second: NonZeroU32::new(50).unwrap(),
+            rate_limit_burst: NonZeroU32::new(100).unwrap(),
+        }
+    }
 }
 
 pub struct Gateway {
     write_url: String,
     read_url: String,
     cors_allowed_origin: String,
+    limits: Limits,
     client: Client<
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         Full<Bytes>,
@@ -121,6 +225,75 @@ struct ReadyCache {
 
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Tracks how many connections each client IP currently holds. Entries are
+/// removed when an IP's count reaches zero, so the map only holds IPs with a
+/// live connection and stays bounded by the global connection cap.
+type IpConnCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// Per-IP request rate limiter (token bucket). Idle IPs are pruned periodically
+/// by `retain_recent` so the keyed store stays bounded.
+type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+
+/// True for accept errors that reflect one failed connection (the peer went
+/// away before we accepted it) rather than a problem with the listener. These
+/// are safe to skip without any backoff.
+fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Collapses a peer address to the key the rate limiter buckets by. IPv4 is
+/// used as-is; IPv6 is masked to its /64 prefix. A single client is routinely
+/// handed a whole /64, so without masking it could mint a fresh key per request
+/// and bloat the limiter's keyed store faster than pruning reclaims it.
+fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
+
+/// Increments the connection count for `ip` when it is below `max`, returning a
+/// guard that decrements it on drop. Returns None when the IP is at the cap.
+fn try_acquire_ip(counts: &IpConnCounts, ip: IpAddr, max: usize) -> Option<IpConnGuard> {
+    let mut map = counts.lock().unwrap();
+    let count = map.entry(ip).or_insert(0);
+    if *count >= max {
+        return None;
+    }
+    *count += 1;
+    Some(IpConnGuard {
+        counts: Arc::clone(counts),
+        ip,
+    })
+}
+
+/// Releases one per-IP connection slot on drop.
+struct IpConnGuard {
+    counts: IpConnCounts,
+    ip: IpAddr,
+}
+
+impl Drop for IpConnGuard {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap();
+        if let Some(count) = map.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// A `JWT_SECRET` counts as "configured" only if non-empty after trimming, mirroring the
 /// auth service so a whitespace-only secret doesn't enable gateway RBAC while auth refuses
@@ -151,11 +324,18 @@ impl Gateway {
             write_url,
             read_url,
             cors_allowed_origin,
+            limits: Limits::default(),
             client,
             jwt_secret,
             auth_db,
             ready_cache: Arc::new(AsyncMutex::new(None)),
         }
+    }
+
+    /// Overrides the default resource limits.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Probes a single upstream's /health with a short timeout.
@@ -357,9 +537,21 @@ impl Gateway {
         )
     }
 
+    /// Build a JSON-RPC–style error body for 429 responses.
+    fn too_many_requests_body() -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "error": { "code": -32005, "message": "Too many requests" }
+            })
+            .to_string(),
+        )
+    }
+
     async fn handle_request(
         self: Arc<Self>,
         req: Request<Incoming>,
+        rate_key: IpAddr,
+        rate_limiter: Arc<IpRateLimiter>,
     ) -> Result<
         Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
         hyper::Error,
@@ -437,6 +629,26 @@ impl Gateway {
             return Ok(self.error_response(StatusCode::METHOD_NOT_ALLOWED, None));
         }
 
+        // Rate-limit only the JSON-RPC POST path. OPTIONS preflights, /health,
+        // and /ready returned above, so a 429 here never blocks a CORS preflight
+        // or trips a health probe.
+        if rate_limiter.check_key(&rate_key).is_err() {
+            metrics::GATEWAY_REJECTED_TOTAL
+                .with_label_values(&["rate_limit"])
+                .inc();
+            Self::record_metrics(
+                Some("rate_limited"),
+                "unknown",
+                "none",
+                "429",
+                start.elapsed().as_secs_f64(),
+            );
+            return Ok(self.error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some(Self::too_many_requests_body()),
+            ));
+        }
+
         if let Some(content_length) = req.headers().get(hyper::header::CONTENT_LENGTH) {
             match content_length
                 .to_str()
@@ -476,7 +688,28 @@ impl Gateway {
             .map(|s| s.to_owned());
 
         let limited_body = Limited::new(req.into_body(), MAX_BODY_SIZE);
-        let body_bytes = match limited_body.collect().await {
+        // Bound how long we wait for the body so a slow-body client can't pin
+        // the connection open after its headers are in.
+        let collected =
+            match tokio::time::timeout(self.limits.body_read_timeout, limited_body.collect()).await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        "Request body read timed out after {:?}",
+                        self.limits.body_read_timeout
+                    );
+                    Self::record_metrics(
+                        Some("body_timeout"),
+                        "unknown",
+                        "none",
+                        "408",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(self.error_response(StatusCode::REQUEST_TIMEOUT, None));
+                }
+            };
+        let body_bytes = match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
                 if e.downcast_ref::<LengthLimitError>().is_some() {
@@ -650,18 +883,110 @@ pub async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Gateway listening on http://{}", listener.local_addr()?);
 
+    // Cap total concurrent connections. A connection past the cap is dropped
+    // at once rather than queued, so a flood can't pile up resources.
+    let connection_slots = Arc::new(Semaphore::new(gateway.limits.max_connections.get()));
+    // Per-IP connection counts, so one host can't consume the global budget.
+    let ip_counts: IpConnCounts = Arc::new(Mutex::new(HashMap::new()));
+
+    // Per-IP request rate limiter (token bucket): refills at rate_limit_per_second
+    // and holds up to rate_limit_burst tokens.
+    let quota = Quota::per_second(gateway.limits.rate_limit_per_second)
+        .allow_burst(gateway.limits.rate_limit_burst);
+    let rate_limiter: Arc<IpRateLimiter> = Arc::new(RateLimiter::keyed(quota));
+
+    // Prune IPs that have fully replenished so the keyed store stays bounded.
+    // retain_recent only reclaims replenished keys, so run it often to shed
+    // entries soon after churning IPs go quiet.
+    let pruner = Arc::clone(&rate_limiter);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            ticker.tick().await;
+            pruner.retain_recent();
+        }
+    });
+
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) if is_connection_error(&e) => continue,
+            Err(e) => {
+                // Anything else, notably EMFILE/ENFILE under an fd flood, must
+                // not kill the listener and restart the process. Back off
+                // briefly so we don't spin while the fd table drains.
+                warn!("accept() failed: {e}; backing off before retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let ip = peer_addr.ip();
+
+        // Take a global slot. None free means we are at the cap, so drop the
+        // socket immediately.
+        let permit = match Arc::clone(&connection_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("Connection limit reached, dropping new connection");
+                metrics::GATEWAY_REJECTED_TOTAL
+                    .with_label_values(&["global_limit"])
+                    .inc();
+                continue;
+            }
+        };
+
+        // Take a per-IP slot. None means this IP is at its cap; continue to drop
+        // the socket and release the global permit. Key by the same /64-masked
+        // value the rate limiter uses so a client owning a whole IPv6 /64 cannot
+        // spray connections across it to bypass the per-IP cap.
+        let rate_key = rate_limit_key(ip);
+        let ip_guard = match try_acquire_ip(
+            &ip_counts,
+            rate_key,
+            gateway.limits.max_connections_per_ip.get(),
+        ) {
+            Some(guard) => guard,
+            None => {
+                warn!("Per-IP connection limit reached for {ip}, dropping connection");
+                metrics::GATEWAY_REJECTED_TOTAL
+                    .with_label_values(&["per_ip_limit"])
+                    .inc();
+                continue;
+            }
+        };
+
+        // Enable OS TCP keepalive so a peer that vanishes without a close (its
+        // network dropped) is detected and the socket reclaimed. Best-effort:
+        // log and keep serving if it fails.
+        let keepalive = TcpKeepalive::new()
+            .with_time(gateway.limits.tcp_keepalive_idle)
+            .with_interval(gateway.limits.tcp_keepalive_interval);
+        if let Err(e) = SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
+            warn!("Failed to set TCP keepalive for {ip}: {e}");
+        }
+
         let io = TokioIo::new(stream);
         let gateway = Arc::clone(&gateway);
+        let rate_limiter = Arc::clone(&rate_limiter);
 
         tokio::spawn(async move {
+            // Hold both slots for the connection's lifetime; released on drop.
+            let _permit = permit;
+            let _ip_guard = ip_guard;
+            let header_timeout = gateway.limits.header_read_timeout;
             let service = service_fn(move |req| {
                 let gateway = Arc::clone(&gateway);
-                async move { gateway.handle_request(req).await }
+                let rate_limiter = Arc::clone(&rate_limiter);
+                async move { gateway.handle_request(req, rate_key, rate_limiter).await }
             });
 
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            // The timer is required for header_read_timeout to take effect; it
+            // closes clients that trickle their headers (slowloris).
+            let conn = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_timeout)
+                .serve_connection(io, service);
+            if let Err(err) = conn.await {
                 error!("Error serving connection: {:?}", err);
             }
         });
@@ -721,13 +1046,27 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let gateway = Arc::new(Gateway::new(
-        args.write_url,
-        args.read_url,
-        args.cors_allowed_origin,
-        args.jwt_secret,
-        auth_db,
-    ));
+    let limits = Limits {
+        max_connections: args.max_connections,
+        max_connections_per_ip: args.max_connections_per_ip,
+        header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
+        body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
+        tcp_keepalive_idle: Duration::from_secs(args.tcp_keepalive_idle_secs),
+        tcp_keepalive_interval: Duration::from_secs(args.tcp_keepalive_interval_secs),
+        rate_limit_per_second: args.rate_limit_per_second,
+        rate_limit_burst: args.rate_limit_burst,
+    };
+
+    let gateway = Arc::new(
+        Gateway::new(
+            args.write_url,
+            args.read_url,
+            args.cors_allowed_origin,
+            args.jwt_secret,
+            auth_db,
+        )
+        .with_limits(limits),
+    );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
     let listener = TcpListener::bind(addr).await?;
@@ -745,17 +1084,30 @@ mod tests {
     /// Spawn a test gateway with configurable backend URLs.
     /// Each invocation binds to a unique port via port 0 (OS-assigned).
     async fn start_gateway_with_urls(write_url: &str, read_url: &str) -> SocketAddr {
+        start_gateway_with_limits(write_url, read_url, Limits::default()).await
+    }
+
+    /// Like `start_gateway_with_urls` but with custom resource limits, for the
+    /// guard tests.
+    async fn start_gateway_with_limits(
+        write_url: &str,
+        read_url: &str,
+        limits: Limits,
+    ) -> SocketAddr {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
-        let gateway = Arc::new(Gateway::new(
-            write_url.to_string(),
-            read_url.to_string(),
-            "*".to_string(),
-            None, // no auth enforcement in these tests
-            None,
-        ));
+        let gateway = Arc::new(
+            Gateway::new(
+                write_url.to_string(),
+                read_url.to_string(),
+                "*".to_string(),
+                None, // no auth enforcement in these tests
+                None,
+            )
+            .with_limits(limits),
+        );
 
         // Port 0 lets the OS assign a unique free port; avoids collisions between concurrent tests.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1136,5 +1488,221 @@ mod tests {
             let response = send_raw(addr, req.as_bytes()).await;
             assert_status(&response, 200);
         }
+    }
+
+    /// Holds one slot with a keep-alive connection, then asserts a second
+    /// connection is refused rather than served. Shared by the connection-cap
+    /// guards, which both cap the second connection opened from this IP.
+    async fn assert_second_connection_refused(addr: SocketAddr) {
+        // Hold a slot with a keep-alive connection. Reading its 200 back proves
+        // the connection was accepted and its permit taken; the socket then
+        // stays open, holding the slot for the rest of the check.
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        held.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = held.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("200 OK"));
+
+        // A second connection is over the cap. Send it a real request: a broken
+        // cap would serve it and return a response, failing the test fast. A
+        // working cap drops the socket, so the read ends in EOF or a reset.
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        // Best-effort: the socket may already be closed by the time we write.
+        let _ = over
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(2), over.read(&mut buf))
+            .await
+            .expect("over-cap connection should resolve promptly, not hang");
+        match read {
+            Ok(0) | Err(_) => {} // EOF or reset: the connection was refused.
+            Ok(n) => panic!(
+                "connection over the cap was served, got {n} bytes: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_cap_refuses_over_limit() {
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                max_connections: NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_second_connection_refused(addr).await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_when_exceeded() {
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                rate_limit_per_second: NonZeroU32::new(1).unwrap(),
+                rate_limit_burst: NonZeroU32::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        // Burst of 1 from this IP: the first request passes the limiter (then
+        // 502s on the unreachable backend), the immediate second is over budget
+        // and is rejected with 429 before it reaches the backend.
+        let first = send_raw(addr, req.as_bytes()).await;
+        assert_status(&first, 502);
+        let second = send_raw(addr, req.as_bytes()).await;
+        assert_status(&second, 429);
+    }
+
+    #[tokio::test]
+    async fn health_and_preflight_are_exempt_from_rate_limit() {
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                rate_limit_per_second: NonZeroU32::new(1).unwrap(),
+                rate_limit_burst: NonZeroU32::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Drain the one-token bucket for this IP with a POST, so anything the
+        // limiter guards is now over budget.
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+        let post = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = send_raw(addr, post.as_bytes()).await;
+
+        // The limiter sits behind routing, so /health probes stay 200 with the
+        // bucket drained. Under the old in-front placement they would 429 and
+        // the orchestrator would read the gateway as down.
+        let health = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        for _ in 0..5 {
+            let response = send_raw(addr, health.as_bytes()).await;
+            assert_status(&response, 200);
+        }
+
+        // A CORS preflight is likewise exempt, so a drained bucket cannot block
+        // the real POST it precedes.
+        let preflight = "OPTIONS / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let response = send_raw(addr, preflight.as_bytes()).await;
+        assert_status(&response, 200);
+    }
+
+    #[tokio::test]
+    async fn body_read_timeout_returns_408_for_slow_body() {
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                body_read_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Finish the headers and promise a body via Content-Length, then send
+        // none of it.
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_all(
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        // With the timeout the server replies 408 ~200ms in. Without it the
+        // server waits for the body forever and this read hangs; the 2s bound
+        // turns that regression into a failure, not a stuck test.
+        let mut buf = [0u8; 128];
+        let n = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("server should reply to the slow-body client, not hang")
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("408"), "expected 408, got: {response}");
+    }
+
+    #[tokio::test]
+    async fn header_read_timeout_closes_slow_client() {
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                header_read_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Slowloris: send a partial request and never finish the header block
+        // (no terminating blank line).
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+
+        // With the timeout the server closes it ~200ms in, so the read resolves.
+        // Without it the server waits for headers forever and this read hangs;
+        // the 2s bound turns that regression into a failure, not a stuck test.
+        let mut buf = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf)).await;
+        assert!(
+            closed.is_ok(),
+            "server should close the slow client, not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_ip_connection_cap_refuses_over_limit() {
+        // Global cap stays high; only the per-IP cap of 1 is under test, and all
+        // test connections come from 127.0.0.1.
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            Limits {
+                max_connections_per_ip: NonZeroUsize::new(1).unwrap(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_second_connection_refused(addr).await;
+    }
+
+    #[test]
+    fn rate_limit_key_masks_ipv6_to_64() {
+        use std::net::Ipv4Addr;
+
+        // Two addresses sharing a /64 collapse to one key, so a client cannot
+        // spray its /64 to bloat the keyed store or dodge the per-IP budget.
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(rate_limit_key(a), rate_limit_key(b));
+
+        // A different /64 stays a distinct key.
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(rate_limit_key(a), rate_limit_key(other));
+
+        // IPv4 is keyed by the full address.
+        let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert_eq!(rate_limit_key(v4), v4);
     }
 }

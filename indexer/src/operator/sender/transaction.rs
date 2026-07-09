@@ -32,7 +32,7 @@ use super::mint::{cleanup_mint_builder, try_jit_mint_initialization, JitOutcome}
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
     InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
-    SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
+    SendDurability, SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
 };
 
 use std::sync::Arc;
@@ -230,9 +230,14 @@ pub async fn handle_transaction_submission(
                 // proof ordering requires at-most-one in-flight withdrawal at a time.
                 match &tx_builder {
                     TransactionBuilder::Mint(_) | TransactionBuilder::InitializeMint(_) => {
-                        // Only a real user-fund Mint persists write-ahead; InitializeMint
-                        // mints no balance and is on-chain idempotent, so it is excluded.
-                        let persist = matches!(tx_builder, TransactionBuilder::Mint(_));
+                        // A user-fund Mint is Recoverable (persisted write-ahead, re-minted
+                        // by recovery on failure); InitializeMint mints no balance and is
+                        // on-chain idempotent, so it is Terminal.
+                        let durability = if matches!(tx_builder, TransactionBuilder::Mint(_)) {
+                            SendDurability::Recoverable
+                        } else {
+                            SendDurability::Terminal
+                        };
                         spawn_fire_and_store(
                             state,
                             instruction,
@@ -241,7 +246,7 @@ pub async fn handle_transaction_submission(
                             retry_policy,
                             extra_error_checks_policy,
                             storage_tx.clone(),
-                            persist,
+                            durability,
                         );
                     }
                     _ => {
@@ -609,7 +614,7 @@ pub(super) fn handle_confirmation_result<'a>(
                                     retry_policy,
                                     mint_extra_error_checks_policy(),
                                     storage_tx.clone(),
-                                    true,
+                                    SendDurability::Recoverable,
                                     permit,
                                 )
                                 .await;
@@ -1068,8 +1073,8 @@ pub(super) fn spawn_fire_and_store(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    // True only for a real user-fund Mint
-    persist: bool,
+    // Recoverable only for a real user-fund Mint
+    durability: SendDurability,
 ) -> bool {
     let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
         Ok(p) => p,
@@ -1102,17 +1107,17 @@ pub(super) fn spawn_fire_and_store(
         retry_policy,
         extra_error_checks_policy,
         storage_tx,
-        persist,
+        durability,
         permit,
     ));
 
     true
 }
 
-/// Build, sign, persist the signature when `persist` is set, then broadcast and stash
-/// the in-flight tx. A persist failure aborts before broadcast and leaves the row
-/// Processing for recovery. Split from `spawn_fire_and_store` so tests can await it
-/// directly without `tokio::spawn`.
+/// Build, sign, and persist the signature write-ahead when `durability` is `Recoverable`,
+/// then broadcast and stash the in-flight tx. A persist failure aborts before broadcast
+/// and leaves the row Processing for recovery. Split from `spawn_fire_and_store` so tests
+/// can await it directly without `tokio::spawn`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fire_and_store_task(
     rpc_client: Arc<RpcClientWithRetry>,
@@ -1125,30 +1130,54 @@ pub(super) async fn fire_and_store_task(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    persist: bool,
+    durability: SendDurability,
     permit: OwnedSemaphorePermit,
 ) {
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
-    let (transaction, signature, last_valid_block_height) =
-        match build_and_sign(&rpc_client, instruction.clone()).await {
-            Ok(signed) => signed,
-            Err(e) => {
-                drop(permit);
-                metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[pt, "error"])
-                    .observe(send_start.elapsed().as_secs_f64());
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "build_sign_error"])
-                    .inc();
-                error!("Failed to build/sign transaction (fire-and-forget): {}", e);
-                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
-                return;
+    let (transaction, signature, last_valid_block_height) = match build_and_sign(
+        &rpc_client,
+        instruction.clone(),
+    )
+    .await
+    {
+        Ok(signed) => signed,
+        Err(e) => {
+            drop(permit);
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "build_sign_error"])
+                .inc();
+            // build_and_sign fetches a blockhash and calls the signer before any
+            // signature exists or is broadcast. A Recoverable mint that fails here
+            // minted no tokens, so a terminal Failed would strand the deposit: no
+            // worker re-claims a Failed row. Leave it Processing so the recovery sweep
+            // sees no signature and re-mints it. Terminal sends (InitializeMint) mint
+            // no balance, so fail fast.
+            match durability {
+                SendDurability::Recoverable => {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "left_processing_for_recovery"])
+                        .inc();
+                    warn!(
+                            transaction_id = ctx.transaction_id,
+                            "Build/sign failed for recoverable mint before broadcast; leaving row Processing for recovery: {}",
+                            e
+                        );
+                }
+                SendDurability::Terminal => {
+                    error!("Failed to build/sign transaction (fire-and-forget): {}", e);
+                    send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+                }
             }
-        };
+            return;
+        }
+    };
 
-    let persisted = if persist {
+    let persisted = if durability == SendDurability::Recoverable {
         match ctx.transaction_id {
             Some(txid) => {
                 if persist_signature_or_abort(
@@ -3897,7 +3926,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            true,
+            SendDurability::Recoverable,
             permit,
         )
         .await;
@@ -3955,7 +3984,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            true,
+            SendDurability::Recoverable,
             permit,
         )
         .await;
@@ -4016,7 +4045,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            true,
+            SendDurability::Recoverable,
             permit,
         )
         .await;
@@ -4044,7 +4073,78 @@ mod tests {
         );
     }
 
-    // ── JIT mint retry: write-ahead journaling before broadcast ──────
+    /// A build/sign failure on a Recoverable mint happens before any signature exists or is
+    /// broadcast, so it must not be terminalized: no status update is written (row left
+    /// Processing for the recovery sweep to re-mint) and the permit is released.
+    #[tokio::test]
+    async fn mint_build_sign_failure_leaves_processing() {
+        let txn_id = 77;
+        let mut server = mockito::Server::new_async().await;
+        // getLatestBlockhash fails, so build_and_sign returns Err before signing or sending.
+        let _hash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(500)
+            .with_body("blockhash rpc down")
+            .create();
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(txn_id),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            SendDurability::Recoverable,
+            permit,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "build/sign failure must emit no terminal status; row left Processing for recovery",
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "nothing stashed when build/sign failed",
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(txn_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no signature persisted when build/sign failed before signing",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be released on build/sign failure",
+        );
+    }
+
+    // ── JIT mint retry: write-ahead persist before broadcast ──────
 
     static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
 
@@ -4436,9 +4536,9 @@ mod tests {
         );
     }
 
-    /// A non-persisting run (persist = false) broadcasts without writing any signature
-    /// even though a transaction_id is present, proving the `persist` gate (not the
-    /// id-presence guard) is what excludes the on-chain-idempotent initialization path.
+    /// A Terminal run broadcasts without writing any signature even though a
+    /// transaction_id is present, proving `durability` (not the id-presence guard) is what
+    /// excludes the on-chain-idempotent initialization path from write-ahead persist.
     #[tokio::test]
     async fn initialize_mint_does_not_persist() {
         let mut server = mockito::Server::new_async().await;
@@ -4463,8 +4563,8 @@ mod tests {
         let permit = state.semaphore.clone().try_acquire_owned().unwrap();
         let (storage_tx, _rx) = mpsc::channel(10);
 
-        // Carry a transaction_id so the assertion exercises the `persist` gate
-        // itself rather than the inner id-presence guard short-circuiting.
+        // Carry a transaction_id so the assertion exercises `durability` itself
+        // rather than the inner id-presence guard short-circuiting.
         let ctx = TransactionContext {
             transaction_id: Some(909),
             withdrawal_nonce: None,
@@ -4482,7 +4582,7 @@ mod tests {
             RetryPolicy::Idempotent,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            false,
+            SendDurability::Terminal,
             permit,
         )
         .await;
@@ -4492,7 +4592,7 @@ mod tests {
         };
         assert!(
             mock.get_release_signatures(909).await.unwrap().is_empty(),
-            "persist = false must not write a signature even with a transaction_id"
+            "Terminal durability must not write a signature even with a transaction_id"
         );
         assert_eq!(
             state.in_flight.len(),
@@ -4532,7 +4632,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            false,
+            SendDurability::Terminal,
         );
 
         assert!(!result, "must return false when at capacity");
@@ -4565,7 +4665,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            false,
+            SendDurability::Terminal,
         );
 
         assert!(result, "must return true when capacity is available");

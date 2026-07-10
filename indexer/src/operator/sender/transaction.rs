@@ -429,7 +429,23 @@ pub(super) async fn send_and_confirm(
                     .with_label_values(&[pt, "build_sign_error"])
                     .inc();
                 error!("Failed to build/sign transaction: {}", e);
-                handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await;
+                // build_and_sign failed before a signature existed. A withdrawal
+                // with no signature stashed from an earlier attempt provably never
+                // broadcast, so requeue it for an automatic retry; the attempt cap
+                // above bounds the loop. With stashed signatures (Retry recursion
+                // after a broadcast) or no nonce (ResetSmtRoot), keep the
+                // permanent-failure path.
+                match (ctx.withdrawal_nonce, ctx.transaction_id) {
+                    (Some(nonce), Some(transaction_id))
+                        if state
+                            .pending_signatures
+                            .get(&nonce)
+                            .is_none_or(|sigs| sigs.is_empty()) =>
+                    {
+                        requeue_prebroadcast_failure(state, nonce, transaction_id).await;
+                    }
+                    _ => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
+                }
                 return;
             }
         };
@@ -857,6 +873,48 @@ fn leave_processing_for_recovery(
     );
 }
 
+/// Requeue a withdrawal whose build/sign failed before any signature existed.
+/// Nothing was broadcast, so an automatic retry is safe: roll back the nonce's
+/// local SMT state and CAS the row Processing → Pending for the fetcher to
+/// re-claim. Keeps `retry_counts` so the attempt cap in `send_and_confirm`
+/// still bounds the loop across requeues. If the requeue write fails the row
+/// stays Processing and recovery quarantines it (no signatures recorded).
+pub(super) async fn requeue_prebroadcast_failure(
+    state: &mut SenderState,
+    nonce: u64,
+    transaction_id: i64,
+) {
+    if let Some(ref mut smt_state) = state.smt_state {
+        if smt_state.smt_state.remove_nonce(nonce) {
+            warn!("Rolled back SMT state for nonce {nonce} after pre-broadcast failure");
+        }
+        smt_state.nonce_to_builder.remove(&nonce);
+    }
+    // Re-inserted by handle_transaction_builder on the next attempt.
+    state.remint_cache.remove(&nonce);
+
+    let pt = state.program_type.as_label();
+    match state.storage.try_requeue_prebroadcast(transaction_id).await {
+        Ok(true) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeued"])
+                .inc();
+            info!(
+                transaction_id,
+                nonce, "Requeued withdrawal to Pending after pre-broadcast build/sign failure"
+            );
+        }
+        Ok(false) => warn!(
+            transaction_id,
+            nonce, "Pre-broadcast requeue skipped: row no longer Processing"
+        ),
+        Err(e) => warn!(
+            transaction_id,
+            nonce, "Pre-broadcast requeue failed, row left Processing for recovery: {e}"
+        ),
+    }
+}
+
 pub(super) async fn handle_permanent_failure(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -882,8 +940,8 @@ pub(super) async fn handle_permanent_failure(
         return;
     };
 
-    // Zero signatures means sign_and_send itself failed — we have nothing to verify.
-    // The RPC may have broadcast the tx before erroring, so blind remint is unsafe.
+    // Zero signatures means no broadcast succeeded for this nonce, but the RPC
+    // may still have broadcast one before erroring, so blind remint is unsafe.
     if signatures.is_empty() {
         error!(
             "No signatures to verify for nonce {:?} — cannot safely remint, sending to ManualReview",
@@ -1629,6 +1687,8 @@ mod tests {
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::operator::ReleaseFundsBuilderWithNonce;
+    use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::{DbTransaction, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -2245,6 +2305,225 @@ mod tests {
             .try_recv()
             .expect("send failure must surface a status update");
         assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    // ── pre-broadcast build/sign failure requeues withdrawals ────────
+
+    fn processing_withdrawal_row(txn_id: i64, nonce: u64) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id: txn_id,
+            signature: format!("sig-{txn_id}"),
+            instruction_index: 0,
+            trace_id: format!("trace-{txn_id}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(1_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce as i64),
+            status: TransactionStatus::Processing,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
+    fn mock_blockhash_failure(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(500)
+            .with_body("blockhash rpc down")
+            .create()
+    }
+
+    /// A withdrawal build/sign failure happens before any signature exists, so the
+    /// row must requeue Processing → Pending for an automatic retry: SMT rolled
+    /// back, no terminal status, retry count kept so the attempt cap still binds.
+    #[tokio::test]
+    async fn withdrawal_build_sign_failure_requeues_to_pending() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "pre-broadcast failure must not write a terminal status"
+        );
+        assert!(state.pending_remints.is_empty(), "no deferred remint");
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "nonce rolled back from local SMT"
+        );
+        assert!(!smt.nonce_to_builder.contains_key(&nonce));
+        assert!(!state.remint_cache.contains_key(&nonce));
+        assert_eq!(
+            state.retry_counts.get(&nonce),
+            Some(&1),
+            "retry count survives the requeue so the attempt cap still binds"
+        );
+
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Pending,
+            "row requeued for the fetcher"
+        );
+        assert_eq!(row.recovery_requeue_attempts, 1);
+    }
+
+    /// With a signature stashed from an earlier broadcast of the same nonce, a
+    /// later build/sign failure is not provably pre-broadcast: it must take the
+    /// finality-checked remint path, not the requeue.
+    #[tokio::test]
+    async fn build_sign_failure_with_prior_broadcast_defers_remint() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        let prior_sig = Signature::new_unique();
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: prior_sig,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "remint is deferred, no status update yet"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "prior broadcast must defer a remint, not requeue"
+        );
+        assert_eq!(state.pending_remints[0].signatures[0].signature, prior_sig);
+    }
+
+    /// If the requeue write fails the row stays Processing: recovery quarantines
+    /// no-signature withdrawals, so the failure still pages instead of stranding.
+    #[tokio::test]
+    async fn build_sign_failure_requeue_write_error_leaves_processing() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+        mock.set_should_fail("try_requeue_prebroadcast", true);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no terminal status on requeue write failure"
+        );
+        assert!(state.pending_remints.is_empty());
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "SMT rollback happens regardless of the requeue write"
+        );
+
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "row left Processing for recovery"
+        );
     }
 
     // ── set_pending_remint persistence ───────────────────────────────

@@ -1,20 +1,32 @@
 //! E2E tests for the stuck-`Processing` recovery worker.
 
+#[path = "sender_fixtures.rs"]
+mod sender_fixtures;
+
 use {
     chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
         config::ProgramType,
-        metrics::OPERATOR_STALE_PROCESSING_RECOVERED,
+        metrics::{OPERATOR_STALE_PROCESSING_RECOVERED, OPERATOR_TRANSACTION_ERRORS},
         operator::{
             recovery::test_hooks,
+            sender::{test_hooks as sender_hooks, types::SenderState},
+            utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
             utils::rpc_util::{RetryConfig, RpcClientWithRetry},
             TransactionStatusUpdate,
         },
         storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
+    sender_fixtures::{
+        blockhash_reply, deposit_ctx, make_config, make_instruction, send_transaction_echo_reply,
+    },
     serde_json::json,
-    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{
+        commitment_config::{CommitmentConfig, CommitmentLevel},
+        pubkey::Pubkey,
+        signature::Signature,
+    },
     std::{sync::Arc, time::Duration},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -1165,4 +1177,307 @@ async fn threshold_boundary_returns_only_strictly_older_rows() {
         returned_ids.contains(&ids[2]),
         "5:01-old row MUST be returned (older than threshold)"
     );
+}
+
+// ── ownership-checked deposit claim: the double-mint invariant end-to-end ─────
+//
+// One escrow deposit must produce at most one channel mint even when the
+// recovery worker demotes a row while a live in-memory Mint builder still
+// holds it. These drive the production sender's first-fire path
+// (`fire_and_store_task` via `run_fire_and_store_task`) against a real
+// Postgres, so the claim CAS and recovery's demote race on the same rows.
+
+const OWNERSHIP_LOST_REASON: &str = "deposit_ownership_lost";
+const MINT_BROADCAST_METHOD: &str = "sendTransaction";
+
+/// Count private-channel mint broadcasts so each assertion is falsifiable.
+fn mint_broadcast_count(mock: &MockRpcServer) -> usize {
+    mock.call_count(MINT_BROADCAST_METHOD)
+}
+
+async fn build_pg_sender_state(storage: Arc<Storage>, rpc_url: String) -> SenderState {
+    sender_fixtures::ensure_admin_signer_env();
+    sender_hooks::new_sender_state(
+        &make_config(rpc_url, ProgramType::Escrow),
+        CommitmentLevel::Confirmed,
+        None,
+        storage,
+        1,
+        1,
+        None,
+    )
+    .expect("sender state construction against Postgres storage")
+}
+
+/// Drive one deposit first-fire builder through the production persist/claim
+/// path with the given ownership token.
+async fn drive_first_fire(
+    state: &SenderState,
+    tx_id: i64,
+    token: chrono::DateTime<Utc>,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    sender_hooks::run_fire_and_store_task(
+        state,
+        make_instruction(),
+        None,
+        deposit_ctx(tx_id),
+        RetryPolicy::None,
+        ExtraErrorCheckPolicy::None,
+        storage_tx,
+        true,
+        Some(token),
+    )
+    .await;
+}
+
+// IT1: a stale sender-owned builder whose row recovery already demoted must NOT
+// broadcast. This is the exact reported bug, closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_owned_builder_does_not_double_mint() {
+    let (db, url, _container) = start_pg("it_claim_stale").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        100,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // The row was locked at T_lock; the stale builder still carries this token.
+    let t_lock = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    // build_and_sign needs a blockhash; the claim aborts before any broadcast.
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    let recovery_client = test_client(mock.url());
+    let state = build_pg_sender_state(storage.clone(), mock.url()).await;
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    // Recovery sees empty sigs and demotes the row to Pending (bumping updated_at).
+    test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+
+    let metric = OPERATOR_TRANSACTION_ERRORS.with_label_values(&["escrow", OWNERSHIP_LOST_REASON]);
+    let metric_before = metric.get();
+
+    drive_first_fire(&state, tx_id, t_lock, &storage_tx).await;
+
+    assert_eq!(
+        mint_broadcast_count(&mock),
+        0,
+        "a demoted row's stale builder must not broadcast a mint"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending",
+        "the lost claim must leave the row untouched for its current owner"
+    );
+    assert!(
+        db.get_release_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a lost claim persists no signature"
+    );
+    assert!(
+        metric.get() > metric_before,
+        "a lost claim increments deposit_ownership_lost"
+    );
+    mock.shutdown().await;
+}
+
+// Bug oracle: the unguarded write-ahead persist (a plain insert with no ownership
+// check) broadcasts a stale mint on a demoted row. This reproduces the reported
+// bug through production code: the mint lands on a Pending row, so its Completed
+// write no-ops (it9) and the row is re-fetched for a second mint (it3). IT1 is the
+// exact contrast: with its ownership token the first-fire broadcasts nothing on the
+// same setup. The JIT re-fire still uses this token-less path but is kept off a
+// demoted row by the bounded confirmation window.
+#[tokio::test(flavor = "multi_thread")]
+async fn unguarded_first_fire_would_broadcast_on_demoted_row() {
+    let (db, url, _container) = start_pg("it_oracle_unguarded").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        100,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    let recovery_client = test_client(mock.url());
+    let state = build_pg_sender_state(storage.clone(), mock.url()).await;
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    // Same setup as IT1: recovery demotes the stale row to Pending.
+    test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+
+    // Drive the persist with no ownership token: the token-less (unguarded) path.
+    sender_hooks::run_fire_and_store_task(
+        &state,
+        make_instruction(),
+        None,
+        deposit_ctx(tx_id),
+        RetryPolicy::None,
+        ExtraErrorCheckPolicy::None,
+        &storage_tx,
+        true,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        mint_broadcast_count(&mock),
+        1,
+        "the token-less path broadcasts a stale mint on a demoted (Pending) row"
+    );
+    assert!(
+        !db.get_release_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the token-less path persists a signature against a Pending row"
+    );
+    mock.shutdown().await;
+}
+
+// IT2: an owned deposit mints exactly once. The happy-path oracle proving the
+// guard does not strangle a legitimate mint.
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_deposit_mints_once() {
+    let (db, url, _container) = start_pg("it_claim_owned").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        100,
+    );
+    db.insert_transaction_internal(&tx).await.unwrap();
+
+    // Lock the deposit the way the fetcher does and carry its true post-lock token.
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await
+        .unwrap();
+    let row = locked.first().expect("locked deposit");
+    let tx_id = row.id;
+    let token = row.updated_at;
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    let state = build_pg_sender_state(storage.clone(), mock.url()).await;
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    drive_first_fire(&state, tx_id, token, &storage_tx).await;
+
+    assert_eq!(
+        mint_broadcast_count(&mock),
+        1,
+        "an owned deposit must broadcast exactly one mint"
+    );
+    assert_eq!(
+        db.get_release_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the owned claim persists exactly one write-ahead signature"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "the claim keeps the row Processing (its terminal write is status-guarded)"
+    );
+    assert_ne!(
+        updated_at_of(&pool, tx_id).await,
+        token,
+        "a successful claim bumps updated_at"
+    );
+    mock.shutdown().await;
+}
+
+// IT3: demote then re-fetch, then drive BOTH the stale first builder and the
+// second builder. Exactly one mint broadcasts across the whole sequence.
+#[tokio::test(flavor = "multi_thread")]
+async fn demote_then_refetch_mints_exactly_once() {
+    let (db, url, _container) = start_pg("it_claim_refetch").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        100,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // First lock at T_lock1, held by the stale builder B1.
+    let t_lock1 = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    // Two first-fires each build+sign (blockhash); only the owned one broadcasts.
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    let recovery_client = test_client(mock.url());
+    let state = build_pg_sender_state(storage.clone(), mock.url()).await;
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    // Recovery demotes B1's row to Pending.
+    test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+
+    // A fresh fetch re-locks the row as a new incarnation B2 with token T_lock2.
+    let relocked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await
+        .unwrap();
+    let t_lock2 = relocked
+        .iter()
+        .find(|r| r.id == tx_id)
+        .expect("row re-locked")
+        .updated_at;
+    assert_ne!(t_lock1, t_lock2, "the re-lock must advance the token");
+
+    // Drive the stale B1 first (must abort), then the owned B2 (mints once).
+    drive_first_fire(&state, tx_id, t_lock1, &storage_tx).await;
+    drive_first_fire(&state, tx_id, t_lock2, &storage_tx).await;
+
+    assert_eq!(
+        mint_broadcast_count(&mock),
+        1,
+        "across demote + re-fetch, exactly one mint broadcasts"
+    );
+    assert_eq!(
+        db.get_release_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "only the owned incarnation persists a signature"
+    );
+    mock.shutdown().await;
 }

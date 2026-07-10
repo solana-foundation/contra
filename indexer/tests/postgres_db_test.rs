@@ -1210,3 +1210,121 @@ async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
     );
     Ok(())
 }
+
+// ── claim_and_persist_deposit_signature: ownership CAS + write-ahead ──────────
+
+/// The lock must hand back the post-lock token: the returned row's `status` is
+/// `Processing` and its `updated_at` is the trigger-bumped value equal to the
+/// DB's current value, not the stale Pending-era timestamp. Without this the
+/// deposit claim would CAS against a timestamp that never matches.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_returns_processing_era_updated_at() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction("lock_token", TransactionType::Deposit))
+        .await?;
+    let pending_era = updated_at_of(&pool, id).await;
+
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    let row = locked.iter().find(|t| t.id == id).expect("row was locked");
+    assert_eq!(
+        row.status,
+        TransactionStatus::Processing,
+        "the returned row must carry the post-lock Processing status"
+    );
+    assert_ne!(
+        row.updated_at, pending_era,
+        "the returned updated_at must be the post-lock trigger-bumped value"
+    );
+    assert_eq!(
+        row.updated_at,
+        updated_at_of(&pool, id).await,
+        "the returned updated_at must equal the DB's current value"
+    );
+    Ok(())
+}
+
+/// A successful claim leaves exactly one signature and a changed `updated_at`;
+/// a failed claim (wrong token) leaves zero new signatures and an unchanged
+/// `updated_at` (proving there is no bumped-but-no-signature partial state).
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim_atomic",
+            TransactionType::Deposit,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    let token = updated_at_of(&pool, id).await;
+
+    let claimed = storage
+        .claim_and_persist_deposit_signature(id, token, "sig-claim".to_string(), 555)
+        .await?;
+    assert!(claimed, "owning the Processing incarnation must claim");
+    let sigs = storage.get_release_signatures(id).await?;
+    assert_eq!(sigs.len(), 1, "a successful claim persists exactly one sig");
+    assert_eq!(sigs[0], ("sig-claim".to_string(), 555));
+    let bumped = updated_at_of(&pool, id).await;
+    assert_ne!(bumped, token, "a successful claim bumps updated_at");
+
+    // A stale token must abort atomically: no new sig, no timestamp change.
+    let stale = bumped - chrono::Duration::seconds(60);
+    let failed = storage
+        .claim_and_persist_deposit_signature(id, stale, "sig-fail".to_string(), 1)
+        .await?;
+    assert!(!failed, "a stale token must not claim");
+    assert_eq!(
+        storage.get_release_signatures(id).await?.len(),
+        1,
+        "a failed claim persists no additional signature"
+    );
+    assert_eq!(
+        updated_at_of(&pool, id).await,
+        bumped,
+        "a failed claim leaves updated_at unchanged"
+    );
+    Ok(())
+}
+
+/// Claiming the same signature twice yields a single row (ON CONFLICT
+/// (signature) DO NOTHING), even though each claim owns the current token.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_dedups_signature_on_conflict() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim_dedup",
+            TransactionType::Deposit,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+
+    let token1 = updated_at_of(&pool, id).await;
+    assert!(
+        storage
+            .claim_and_persist_deposit_signature(id, token1, "dup-sig".to_string(), 1)
+            .await?
+    );
+    // The first claim bumped updated_at; the second claim owns the new token but
+    // re-inserts the same signature, which must be deduped.
+    let token2 = updated_at_of(&pool, id).await;
+    assert!(
+        storage
+            .claim_and_persist_deposit_signature(id, token2, "dup-sig".to_string(), 999)
+            .await?
+    );
+    assert_eq!(
+        storage.get_release_signatures(id).await?.len(),
+        1,
+        "a duplicate signature must persist only once"
+    );
+    Ok(())
+}

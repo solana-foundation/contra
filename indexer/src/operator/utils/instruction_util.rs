@@ -196,6 +196,16 @@ impl TransactionBuilder {
         }
     }
 
+    /// The fetch-time ownership token, present only for a deposit `Mint`. The
+    /// sender CASes on it at the write-ahead persist; other variants have no
+    /// such token so they take the plain-insert path.
+    pub fn fetched_updated_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Mint(b) => Some(b.fetched_updated_at),
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
+        }
+    }
+
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.nonce),
@@ -407,6 +417,10 @@ pub struct MintToBuilderWithTxnId {
     pub builder: MintToBuilder,
     pub txn_id: i64,
     pub trace_id: String,
+    /// The row's `updated_at` at fetch time, used as the ownership token the
+    /// sender CASes on when it persists the write-ahead signature. Proves the
+    /// deposit is still the same `Processing` incarnation before broadcast.
+    pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Builder for initialize_mint instruction (sent before first mint)
@@ -569,6 +583,7 @@ mod tests {
             builder: fully_configured_builder(),
             txn_id: 10,
             trace_id: "trace-mint".to_string(),
+            fetched_updated_at: chrono::Utc::now(),
         }))
     }
 
@@ -633,6 +648,15 @@ mod tests {
             Some("trace-mint".to_string())
         );
         assert_eq!(make_reset_smt_builder().trace_id(), None);
+    }
+
+    #[test]
+    fn fetched_updated_at_some_only_for_mint() {
+        // Only a deposit Mint carries the ownership token the sender CASes on.
+        assert!(make_mint_builder().fetched_updated_at().is_some());
+        assert!(make_release_funds_builder().fetched_updated_at().is_none());
+        assert!(make_init_mint_builder().fetched_updated_at().is_none());
+        assert!(make_reset_smt_builder().fetched_updated_at().is_none());
     }
 
     #[test]

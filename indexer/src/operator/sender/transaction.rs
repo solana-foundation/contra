@@ -233,6 +233,9 @@ pub async fn handle_transaction_submission(
                         // Only a real user-fund Mint persists write-ahead; InitializeMint
                         // mints no balance and is on-chain idempotent, so it is excluded.
                         let persist = matches!(tx_builder, TransactionBuilder::Mint(_));
+                        // Some only for a deposit Mint: the fetch-time token the
+                        // write-ahead persist proves ownership against.
+                        let deposit_expected_updated_at = tx_builder.fetched_updated_at();
                         spawn_fire_and_store(
                             state,
                             instruction,
@@ -242,6 +245,7 @@ pub async fn handle_transaction_submission(
                             extra_error_checks_policy,
                             storage_tx.clone(),
                             persist,
+                            deposit_expected_updated_at,
                         );
                     }
                     _ => {
@@ -610,6 +614,8 @@ pub(super) fn handle_confirmation_result<'a>(
                                     mint_extra_error_checks_policy(),
                                     storage_tx.clone(),
                                     true,
+                                    // Plain persist: already owned by the bounded first claim.
+                                    None,
                                     permit,
                                 )
                                 .await;
@@ -1070,6 +1076,8 @@ pub(super) fn spawn_fire_and_store(
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     // True only for a real user-fund Mint
     persist: bool,
+    // Deposit first-fire ownership token; `None` for InitializeMint (no persist).
+    deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
     let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
         Ok(p) => p,
@@ -1103,6 +1111,7 @@ pub(super) fn spawn_fire_and_store(
         extra_error_checks_policy,
         storage_tx,
         persist,
+        deposit_expected_updated_at,
         permit,
     ));
 
@@ -1126,6 +1135,12 @@ pub(super) async fn fire_and_store_task(
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     persist: bool,
+    // For a deposit's first mint attempt, this is the row's `updated_at` from
+    // fetch time. Before broadcasting we check the row still has it; if it
+    // changed, recovery requeued the row and we drop the mint instead of sending
+    // a duplicate. `None` skips the check (the JIT retry, which claimed the row
+    // moments earlier).
+    deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     permit: OwnedSemaphorePermit,
 ) {
     let pt = program_type.as_label();
@@ -1149,8 +1164,60 @@ pub(super) async fn fire_and_store_task(
         };
 
     let persisted = if persist {
-        match ctx.transaction_id {
-            Some(txid) => {
+        let Some(txid) = ctx.transaction_id else {
+            // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
+            drop(permit);
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "pre_send_persist_error"])
+                .inc();
+            error!("Persist required but transaction has no id; aborting before broadcast");
+            return;
+        };
+        match deposit_expected_updated_at {
+            // Deposit first-fire: the persist doubles as an ownership claim,
+            // since the builder may have waited behind the cap long enough for
+            // recovery to demote the row. A lost claim drops it without broadcast.
+            Some(expected) => {
+                match storage
+                    .claim_and_persist_deposit_signature(
+                        txid,
+                        expected,
+                        signature.to_string(),
+                        last_valid_block_height as i64,
+                    )
+                    .await
+                {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        drop(permit);
+                        metrics::OPERATOR_TRANSACTION_ERRORS
+                            .with_label_values(&[pt, "deposit_ownership_lost"])
+                            .inc();
+                        warn!(
+                            transaction_id = txid,
+                            signature = %signature,
+                            "Deposit ownership lost before broadcast; dropping stale builder without minting",
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        drop(permit);
+                        metrics::OPERATOR_TRANSACTION_ERRORS
+                            .with_label_values(&[pt, "pre_send_persist_error"])
+                            .inc();
+                        error!(
+                            transaction_id = txid,
+                            signature = %signature,
+                            "Aborting before broadcast, leaving row Processing for recovery: {e}",
+                        );
+                        return;
+                    }
+                }
+            }
+            // JIT re-fire: plain write-ahead insert. It runs only after a
+            // successful first claim, within a window far shorter than the
+            // recovery staleness threshold, so the row is provably still ours.
+            None => {
                 if persist_signature_or_abort(
                     &storage,
                     pt,
@@ -1165,15 +1232,6 @@ pub(super) async fn fire_and_store_task(
                     return;
                 }
                 true
-            }
-            // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
-            None => {
-                drop(permit);
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "pre_send_persist_error"])
-                    .inc();
-                error!("Persist required but transaction has no id; aborting before broadcast");
-                return;
             }
         }
     } else {
@@ -3898,6 +3956,7 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             true,
+            None,
             permit,
         )
         .await;
@@ -3956,6 +4015,7 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             true,
+            None,
             permit,
         )
         .await;
@@ -4017,6 +4077,7 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             true,
+            None,
             permit,
         )
         .await;
@@ -4483,6 +4544,7 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             false,
+            None,
             permit,
         )
         .await;
@@ -4499,6 +4561,186 @@ mod tests {
             1,
             "broadcast still stashes in-flight"
         );
+    }
+
+    // ── deposit first-fire: ownership-checked claim routing ───────────
+
+    /// Seed one deposit row directly into the mock with an explicit status and
+    /// `updated_at` so the claim CAS can be exercised against it.
+    fn seed_mock_deposit(
+        state: &SenderState,
+        id: i64,
+        status: TransactionStatus,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let row = crate::storage::common::models::DbTransaction {
+            id,
+            signature: format!("src-sig-{id}"),
+            trace_id: format!("trace-{id}"),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: "recipient".to_string(),
+            mint: "mint_addr".to_string(),
+            amount: crate::storage::common::amount::TokenAmount(1_000),
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status,
+            created_at: updated_at,
+            updated_at,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        };
+        mock.pending_transactions.lock().unwrap().push(row);
+    }
+
+    /// A deposit first-fire whose row was demoted (claim `Ok(false)`) must NOT
+    /// broadcast, must persist no signature, must write no status, must release
+    /// its permit, and must meter `deposit_ownership_lost`. This is the bug
+    /// closed in isolation: a stale sender-owned builder cannot double-mint.
+    #[tokio::test]
+    async fn deposit_first_fire_aborts_when_ownership_lost() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        // Recovery already demoted the row to Pending, so the fetch-time token
+        // no longer owns a Processing incarnation.
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Pending, t_lock);
+
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before_permits = state.semaphore.available_permits();
+        let metric = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "deposit_ownership_lost"]);
+        let before_metric = metric.get();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            true,
+            Some(t_lock),
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "a lost claim must persist no signature"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lost claim writes no status; the row's current owner handles it"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "nothing broadcast, nothing stashed in-flight"
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before_permits + 1,
+            "the permit must be released on abort"
+        );
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "a lost claim increments deposit_ownership_lost"
+        );
+    }
+
+    /// A deposit first-fire that still owns its Processing incarnation (claim
+    /// `Ok(true)`) mints exactly once: the signature is persisted, the tx is
+    /// broadcast and stashed in-flight, and the token advances (the D3 bump).
+    #[tokio::test]
+    async fn deposit_first_fire_broadcasts_when_owned() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            true,
+            Some(t_lock),
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let sigs = mock.get_release_signatures(77).await.unwrap();
+        assert_eq!(sigs.len(), 1, "owned claim persists exactly one signature");
+        assert_eq!(sigs[0].0, Signature::default().to_string());
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "owned claim broadcasts and stashes"
+        );
+        let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
+        assert_ne!(after, t_lock, "a successful claim bumps updated_at");
     }
 
     // ── spawn_fire_and_store: cap enforcement ─────────────────────────
@@ -4533,6 +4775,7 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             false,
+            None,
         );
 
         assert!(!result, "must return false when at capacity");
@@ -4566,6 +4809,7 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             false,
+            None,
         );
 
         assert!(result, "must return true when capacity is available");

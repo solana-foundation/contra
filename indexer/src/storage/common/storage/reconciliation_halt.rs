@@ -13,9 +13,7 @@ pub async fn set_reconciliation_halt(storage: &Storage, reason: &str) -> Result<
 }
 
 /// Return the halt info when the flag is set, else `None`.
-pub async fn is_reconciliation_halted(
-    storage: &Storage,
-) -> Result<Option<HaltInfo>, StorageError> {
+pub async fn is_reconciliation_halted(storage: &Storage) -> Result<Option<HaltInfo>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.is_reconciliation_halted_internal().await?),
         #[cfg(any(test, feature = "test-mock-storage"))]

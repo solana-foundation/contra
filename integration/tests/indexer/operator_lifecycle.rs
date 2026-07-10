@@ -29,7 +29,6 @@ use helpers::private_channel_node::start_private_channel_node;
 use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
-use private_channel_metrics::{HealthConfig, HealthState};
 use private_channel_indexer::config::{
     OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
 };
@@ -42,6 +41,7 @@ use private_channel_indexer::storage::common::models::{
 };
 use private_channel_indexer::storage::{PostgresDb, Storage, TransactionType};
 use private_channel_indexer::PostgresConfig;
+use private_channel_metrics::{HealthConfig, HealthState};
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -934,11 +934,12 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     // One active (pending) withdrawal so the halt's quarantine has a row to flip.
     // Its amount joins the mint's in-flight envelope but stays well under the gap.
     let wd_sig = Signature::new_unique().to_string();
-    let withdrawal = DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
-        .initiator(Pubkey::new_unique().to_string())
-        .recipient(Pubkey::new_unique().to_string())
-        .transaction_type(TransactionType::Withdrawal)
-        .build();
+    let withdrawal =
+        DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
+            .initiator(Pubkey::new_unique().to_string())
+            .recipient(Pubkey::new_unique().to_string())
+            .transaction_type(TransactionType::Withdrawal)
+            .build();
     storage.insert_db_transaction(&withdrawal).await?;
 
     // The halt's alert POST is the only webhook under the single-invariant design;

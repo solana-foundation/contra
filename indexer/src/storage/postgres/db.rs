@@ -2088,10 +2088,7 @@ impl PostgresDb {
 
     /// Set (or refresh) the durable reconciliation halt flag. Idempotent on the
     /// single row so repeated trips do not error or duplicate.
-    pub async fn set_reconciliation_halt_internal(
-        &self,
-        reason: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn set_reconciliation_halt_internal(&self, reason: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO reconciliation_halt (id, halted, reason, halted_at)
@@ -2108,9 +2105,7 @@ impl PostgresDb {
 
     /// Return the halt reason/timestamp when the flag is set, else `None`.
     /// A row with `halted = FALSE` (cleared) also reads as not halted.
-    pub async fn is_reconciliation_halted_internal(
-        &self,
-    ) -> Result<Option<HaltInfo>, sqlx::Error> {
+    pub async fn is_reconciliation_halted_internal(&self) -> Result<Option<HaltInfo>, sqlx::Error> {
         sqlx::query_as::<_, HaltInfo>(
             r#"
             SELECT reason, halted_at

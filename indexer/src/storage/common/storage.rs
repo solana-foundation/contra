@@ -1554,13 +1554,28 @@ mod tests {
         {
             let mut db = mock.pending_transactions.lock().unwrap();
             db.push(in_flight_txn(1, "mint_a", 100, TransactionStatus::Pending));
-            db.push(in_flight_txn(2, "mint_a", 200, TransactionStatus::Processing));
+            db.push(in_flight_txn(
+                2,
+                "mint_a",
+                200,
+                TransactionStatus::Processing,
+            ));
             db.push(in_flight_txn(3, "mint_a", 400, TransactionStatus::Parked));
-            db.push(in_flight_txn(4, "mint_a", 800, TransactionStatus::PendingRemint));
+            db.push(in_flight_txn(
+                4,
+                "mint_a",
+                800,
+                TransactionStatus::PendingRemint,
+            ));
             // Terminal statuses must be excluded from the envelope.
             db.push(in_flight_txn(5, "mint_a", 1, TransactionStatus::Completed));
             db.push(in_flight_txn(6, "mint_a", 2, TransactionStatus::Failed));
-            db.push(in_flight_txn(7, "mint_a", 4, TransactionStatus::ManualReview));
+            db.push(in_flight_txn(
+                7,
+                "mint_a",
+                4,
+                TransactionStatus::ManualReview,
+            ));
         }
         let rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -1574,7 +1589,12 @@ mod tests {
         {
             let mut db = mock.pending_transactions.lock().unwrap();
             db.push(in_flight_txn(1, "mint_a", 100, TransactionStatus::Pending));
-            db.push(in_flight_txn(2, "mint_b", 250, TransactionStatus::Processing));
+            db.push(in_flight_txn(
+                2,
+                "mint_b",
+                250,
+                TransactionStatus::Processing,
+            ));
         }
         let mut rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
         rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));

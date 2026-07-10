@@ -211,6 +211,13 @@ async fn perform_reconciliation_check(
     )
     .await;
 
+    // Re-sync the set-once guard with the durable flag each tick: a manual clear
+    // (runbook) must let a fresh insolvency re-trip, while a still-set flag keeps
+    // re-firing suppressed. On a read error leave the guard as-is.
+    if let Ok(flag) = storage.is_reconciliation_halted().await {
+        *halted = flag.is_some();
+    }
+
     // Custody (Solana) plus the DB mint set enumerate the mints to check; the DB
     // set keeps a zero-custody mint with outstanding supply in scope.
     let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
@@ -235,10 +242,7 @@ async fn perform_reconciliation_check(
             )
             .await;
         }
-        Err(e) => warn!(
-            "Skipping halt evaluation this tick (counters held): {}",
-            e
-        ),
+        Err(e) => warn!("Skipping halt evaluation this tick (counters held): {}", e),
     }
 
     Ok(())
@@ -275,10 +279,12 @@ async fn fetch_in_flight_envelope(
     Ok(out)
 }
 
-/// Load the halt inputs together: the in-flight envelope (DB) and per-mint
-/// channel supply (PrivateChannel RPC) for the custody-plus-DB mint union.
-/// Bundled so a failure of either is a single skip point that holds the breach
-/// counters.
+/// Load the halt inputs: the in-flight envelope (DB) and per-mint channel supply
+/// (PrivateChannel RPC) for the custody-plus-DB mint union. An envelope-query
+/// failure skips the whole tick (one DB read), but a single mint's supply read
+/// failing must not blind the others: that mint is omitted from the returned map
+/// and held in `evaluate_and_maybe_halt`, so a flaky read on one mint cannot
+/// suppress detection on a genuinely over-issued one.
 async fn load_halt_inputs(
     storage: &Arc<Storage>,
     channel_rpc: &Arc<RpcClientWithRetry>,
@@ -290,10 +296,15 @@ async fn load_halt_inputs(
     mints.extend(db_mints.iter().copied());
     let mut supply = HashMap::new();
     for mint in &mints {
-        let s = fetch_channel_supply(channel_rpc, mint)
-            .await
-            .map_err(|e| OperatorError::RpcError(e.reason))?;
-        supply.insert(*mint, s);
+        match fetch_channel_supply(channel_rpc, mint).await {
+            Ok(s) => {
+                supply.insert(*mint, s);
+            }
+            Err(e) => warn!(
+                mint = %mint,
+                "Channel supply read failed; skipping this mint this tick: {}", e.reason
+            ),
+        }
     }
     Ok((supply, envelope))
 }
@@ -332,8 +343,17 @@ async fn evaluate_and_maybe_halt(
     // disappears) resets to zero rather than lingering.
     let mut next_counters: HashMap<Pubkey, u32> = HashMap::new();
     for mint in mints {
+        // A mint absent from `supply` had its read fail this tick (an absent
+        // account reads as Ok(0), not a miss). Hold its counter rather than
+        // resetting, so a transient per-mint glitch neither halts it nor erases
+        // its evidence, and never blocks the other mints.
+        let Some(&s) = supply.get(&mint) else {
+            if let Some(&held) = breach_counters.get(&mint) {
+                next_counters.insert(mint, held);
+            }
+            continue;
+        };
         let c = *custody.get(&mint).unwrap_or(&0);
-        let s = *supply.get(&mint).unwrap_or(&0);
         let env = *envelope.get(&mint).unwrap_or(&0);
         let tolerance = insolvency_tolerance_raw(c, config.reconciliation_tolerance_bps);
 
@@ -1107,7 +1127,10 @@ mod tests {
             .await;
         }
 
-        assert!(halted, "a zero-custody mint from the DB set must still halt");
+        assert!(
+            halted,
+            "a zero-custody mint from the DB set must still halt"
+        );
         assert!(storage.is_reconciliation_halted().await.unwrap().is_some());
     }
 
@@ -1150,6 +1173,46 @@ mod tests {
         assert!(!halted, "per-mint counters must not aggregate across mints");
         assert_eq!(counters.get(&b).copied(), Some(1));
         assert_eq!(counters.get(&a).copied(), None, "A reset on its clean tick");
+    }
+
+    #[tokio::test]
+    async fn one_mint_supply_read_failure_does_not_block_another_mints_halt() {
+        // Mint A is omitted from the supply map (its read failed this tick); mint
+        // B is over-issued. A's failure must not suppress B's halt.
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let config = recon_config_zero_tolerance();
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let custody = HashMap::from([(a, 900u64), (b, 900u64)]);
+        let db_mints = HashSet::from([a, b]);
+        let envelope = HashMap::from([(a, 100u64), (b, 100u64)]);
+        let supply = HashMap::from([(b, 1200u64)]); // A absent: read failed
+        let mut counters = HashMap::new();
+        let mut halted = false;
+        let webhook = test_webhook_client();
+
+        for _ in 0..3 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &webhook,
+                &custody,
+                &db_mints,
+                &supply,
+                &envelope,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(
+            halted,
+            "a failed supply read on one mint must not block another"
+        );
+        assert_eq!(counters.get(&b).copied(), Some(3));
     }
 
     /// Mock the escrow custody sweep on a mockito server: the SPL Token program
@@ -1260,6 +1323,71 @@ mod tests {
             counters.get(&mint).copied(),
             Some(2),
             "a read failure must hold the breach counter, not reset it"
+        );
+    }
+
+    #[tokio::test]
+    async fn halted_guard_is_resynced_from_durable_flag_each_tick() {
+        // The in-memory guard is refreshed from the durable flag every tick, not
+        // latched for the process lifetime: a manual clear (runbook) must let a
+        // fresh insolvency re-trip, and a still-set flag keeps re-firing suppressed.
+        use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        // Unreachable RPC: the custody fetch fails fast, but only after the guard
+        // has already been resynced from the flag at the top of the check.
+        let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            "http://127.0.0.1:1".to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::finalized(),
+        ));
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = recon_config_zero_tolerance();
+        let webhook = test_webhook_client();
+        let mut orphans = None;
+        let mut counters = HashMap::new();
+
+        // Flag set: the guard is raised even though it started false.
+        storage.set_reconciliation_halt("prior halt").await.unwrap();
+        let mut halted = false;
+        let _ = perform_reconciliation_check(
+            &storage,
+            &config,
+            &rpc,
+            &rpc,
+            Pubkey::new_unique(),
+            &webhook,
+            &None,
+            &mut orphans,
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+        assert!(halted, "a set durable flag must raise the in-memory guard");
+
+        // Flag cleared: the guard drops so a fresh insolvency can re-trip.
+        storage.clear_reconciliation_halt().await.unwrap();
+        let mut halted = true;
+        let _ = perform_reconciliation_check(
+            &storage,
+            &config,
+            &rpc,
+            &rpc,
+            Pubkey::new_unique(),
+            &webhook,
+            &None,
+            &mut orphans,
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+        assert!(
+            !halted,
+            "a cleared durable flag must drop the in-memory guard"
         );
     }
 

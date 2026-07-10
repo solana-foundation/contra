@@ -597,10 +597,7 @@ async fn reconciliation_halt_round_trips() -> Result<(), Box<dyn std::error::Err
     );
 
     storage.set_reconciliation_halt("mint X insolvent").await?;
-    let info = storage
-        .is_reconciliation_halted()
-        .await?
-        .expect("halt set");
+    let info = storage.is_reconciliation_halted().await?.expect("halt set");
     assert_eq!(info.reason, "mint X insolvent");
 
     // Idempotent re-set overwrites the reason on the single row.

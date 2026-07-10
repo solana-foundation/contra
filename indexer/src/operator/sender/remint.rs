@@ -19,7 +19,9 @@ use crate::{
 };
 use chrono::Utc;
 use solana_keychain::SolanaSigner;
-use solana_sdk::{commitment_config::CommitmentConfig, signature::Signature};
+use solana_sdk::{
+    clock::MAX_PROCESSING_AGE, commitment_config::CommitmentConfig, signature::Signature,
+};
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -342,10 +344,6 @@ impl<'a> FinalityRpc<'a> {
     }
 }
 
-/// A blockhash is valid for this many blocks (`MAX_PROCESSING_AGE`), so a landed
-/// transaction's block height is at most this far below its `last_valid_block_height`.
-const BLOCKHASH_VALIDITY_BLOCKS: u64 = 150;
-
 /// Per-endpoint classification carrying the extra detail the policy layer needs
 /// to decide whether an absence-based `Dead` requires a ledger-coverage proof.
 enum EndpointVerdict {
@@ -363,48 +361,27 @@ enum EndpointVerdict {
     },
 }
 
-/// Ledger-floor coverage decision for an absence-based `Dead`. `covered` is the
-/// verdict; `floor` and `bound` are surfaced so an uncovered `Uncertain` names the
-/// concrete slots an operator must retain to resolve it.
-struct AbsenceCoverage {
-    covered: bool,
-    floor: u64,
-    bound: u64,
-}
-
-/// True when the endpoint's ledger floor covers every slot the attempt could occupy.
-/// `lvbh - 150` lower-bounds the landing slot (slot >= height), so a floor at or below it proves
-/// retention; comparing a floor slot to a height bound only over-reports Uncertain, never a false covered.
-async fn absence_is_covered(
-    rpc: &RpcClientWithRetry,
-    min_lvbh: u64,
-) -> Result<AbsenceCoverage, String> {
-    let floor = rpc
-        .get_first_available_block()
-        .await
-        .map_err(|e| format!("ledger floor RPC failed: {e}"))?;
-    let bound = min_lvbh.saturating_sub(BLOCKHASH_VALIDITY_BLOCKS);
-    Ok(AbsenceCoverage {
-        covered: floor <= bound,
-        floor,
-        bound,
-    })
-}
-
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
-/// attempt's slot range, else `Uncertain`. Assumes a single consistent archival endpoint, not a split pool.
+/// attempt's slot range, else `Uncertain`. A blockhash is valid for `MAX_PROCESSING_AGE`
+/// blocks, so `lvbh - MAX_PROCESSING_AGE` lower-bounds the landing slot (slot >= height); a
+/// floor at or below it proves retention, and the height-vs-slot slack only over-reports
+/// Uncertain, never a false covered. Assumes a single consistent archival endpoint, not a split pool.
 async fn coverage_verdict(
     rpc: &RpcClientWithRetry,
     min_lvbh: u64,
     endpoint_label: &str,
 ) -> SigFinality {
-    match absence_is_covered(rpc, min_lvbh).await {
-        Ok(c) if c.covered => SigFinality::Dead,
-        Ok(c) => SigFinality::Uncertain(format!(
-            "{endpoint_label}ledger floor {} above attempt window (lvbh {min_lvbh}, retained-slot bound {}); pruned or lagging, absence is not proof of non-inclusion",
-            c.floor, c.bound
-        )),
-        Err(e) => SigFinality::Uncertain(e),
+    let floor = match rpc.get_first_available_block().await {
+        Ok(floor) => floor,
+        Err(e) => return SigFinality::Uncertain(format!("ledger floor RPC failed: {e}")),
+    };
+    let bound = min_lvbh.saturating_sub(MAX_PROCESSING_AGE as u64);
+    if floor <= bound {
+        SigFinality::Dead
+    } else {
+        SigFinality::Uncertain(format!(
+            "{endpoint_label}ledger floor {floor} above attempt window (lvbh {min_lvbh}, retained-slot bound {bound}); pruned or lagging, absence is not proof of non-inclusion"
+        ))
     }
 }
 
@@ -3273,7 +3250,7 @@ mod tests {
         src_send.assert_async().await;
     }
 
-    // ── absence_is_covered boundaries ───────────────────────────────
+    // ── coverage_verdict boundaries ─────────────────────────────────
 
     /// Register a single `getFirstAvailableBlock` reply and return a fast client.
     async fn floor_client(floor: u64) -> (mockito::ServerGuard, RpcClientWithRetry) {
@@ -3292,34 +3269,49 @@ mod tests {
     async fn covered_when_floor_below_bound() {
         // lvbh 1000 -> bound 850; floor 500 <= 850.
         let (_s, rpc) = floor_client(500).await;
-        assert!(absence_is_covered(&rpc, 1000).await.unwrap().covered);
+        assert!(matches!(
+            coverage_verdict(&rpc, 1000, "").await,
+            SigFinality::Dead
+        ));
     }
 
     #[tokio::test]
     async fn boundary_floor_equals_bound_is_covered() {
         // lvbh 1000 -> bound 850; floor 850 == 850 is covered (inclusive).
         let (_s, rpc) = floor_client(850).await;
-        assert!(absence_is_covered(&rpc, 1000).await.unwrap().covered);
+        assert!(matches!(
+            coverage_verdict(&rpc, 1000, "").await,
+            SigFinality::Dead
+        ));
     }
 
     #[tokio::test]
     async fn boundary_floor_one_above_is_uncovered() {
         // lvbh 1000 -> bound 850; floor 851 > 850 is uncovered.
         let (_s, rpc) = floor_client(851).await;
-        assert!(!absence_is_covered(&rpc, 1000).await.unwrap().covered);
+        assert!(matches!(
+            coverage_verdict(&rpc, 1000, "").await,
+            SigFinality::Uncertain(_)
+        ));
     }
 
     #[tokio::test]
     async fn underflow_low_lvbh_requires_floor_zero() {
         // lvbh 100 -> saturating bound 0. Only a floor of 0 covers it.
         let (_s1, rpc1) = floor_client(1).await;
-        assert!(!absence_is_covered(&rpc1, 100).await.unwrap().covered);
+        assert!(matches!(
+            coverage_verdict(&rpc1, 100, "").await,
+            SigFinality::Uncertain(_)
+        ));
         let (_s0, rpc0) = floor_client(0).await;
-        assert!(absence_is_covered(&rpc0, 100).await.unwrap().covered);
+        assert!(matches!(
+            coverage_verdict(&rpc0, 100, "").await,
+            SigFinality::Dead
+        ));
     }
 
     #[tokio::test]
-    async fn floor_rpc_error_is_err() {
+    async fn floor_rpc_error_is_uncertain() {
         let mut server = mockito::Server::new_async().await;
         mock_rpc(
             &mut server,
@@ -3328,7 +3320,10 @@ mod tests {
         )
         .await;
         let rpc = make_rpc(&server.url());
-        assert!(absence_is_covered(&rpc, 1000).await.is_err());
+        assert!(matches!(
+            coverage_verdict(&rpc, 1000, "").await,
+            SigFinality::Uncertain(_)
+        ));
     }
 
     // ── coverage-gated absence ──────────────────────────────────────

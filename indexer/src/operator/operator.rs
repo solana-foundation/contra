@@ -45,19 +45,19 @@ pub async fn run(
 
     // Optional destination fallback for recovery and the boot pre-flight to
     // re-check a Dead verdict. Empty means unset (env renders "") and maps to None.
-    let fallback_rpc_client = common_config
+    let normalized_fallback_url = common_config
         .fallback_rpc_url
         .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|url| {
-            Arc::new(RpcClientWithRetry::with_retry_config(
-                url.to_string(),
-                RetryConfig::default(),
-                CommitmentConfig {
-                    commitment: config.rpc_commitment,
-                },
-            ))
-        });
+        .filter(|s| !s.is_empty());
+    let fallback_rpc_client = normalized_fallback_url.map(|url| {
+        Arc::new(RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig::default(),
+            CommitmentConfig {
+                commitment: config.rpc_commitment,
+            },
+        ))
+    });
 
     // The withdraw operator's compensating remint MintTo must broadcast on the source
     // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
@@ -74,11 +74,7 @@ pub async fn run(
     }
 
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require an
-    // independent, same-cluster, reachable fallback (empty env string treated as unset) before starting.
-    let normalized_fallback_url = common_config
-        .fallback_rpc_url
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    // independent, same-cluster, reachable fallback before starting.
     validate_withdraw_fallback(
         common_config.program_type,
         &rpc_client,

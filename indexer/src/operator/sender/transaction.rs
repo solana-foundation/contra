@@ -887,6 +887,10 @@ pub(super) async fn requeue_prebroadcast_failure(
     if let Some(ref mut smt_state) = state.smt_state {
         if smt_state.smt_state.remove_nonce(nonce) {
             warn!("Rolled back SMT state for nonce {nonce} after pre-broadcast failure");
+        } else {
+            // The builder inserted this nonce before build/sign ran, so a miss
+            // means the local SMT disagrees with the row being requeued.
+            error!("Nonce {nonce} missing from local SMT during pre-broadcast rollback");
         }
         smt_state.nonce_to_builder.remove(&nonce);
     }

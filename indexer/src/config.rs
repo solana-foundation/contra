@@ -154,9 +154,8 @@ pub struct PrivateChannelIndexerConfig {
     /// re-check a `Dead` verdict and by the poller for missing-block failover.
     #[serde(default)]
     pub fallback_rpc_url: Option<String>,
-    /// Source chain RPC URL for cross-chain operators (optional)
-    /// Used by escrow operator to read mint metadata from Solana
-    /// while sending mint transactions to PrivateChannel via rpc_url
+    /// Second-chain RPC, role-dependent (optional): Solana custody for the escrow operator,
+    /// PrivateChannel gateway for the escrow indexer's startup supply check, remint target for withdraw.
     pub source_rpc_url: Option<String>,
     /// Postgres configuration
     pub postgres: PostgresConfig,

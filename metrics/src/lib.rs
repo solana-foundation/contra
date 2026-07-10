@@ -97,6 +97,14 @@ async fn health_handler(
 ) -> (axum::http::StatusCode, String) {
     match health.check() {
         HealthOutcome::Healthy => (axum::http::StatusCode::OK, r#"{"status":"ok"}"#.to_string()),
+        HealthOutcome::ForcedUnhealthy { reason } => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                r#"{{"status":"degraded","reason":"forced","detail":"{}"}}"#,
+                // Escape so an operator-supplied reason cannot break the JSON body.
+                reason.replace('\\', "\\\\").replace('"', "\\\"")
+            ),
+        ),
         HealthOutcome::BacklogExceeded { pending, ceiling } => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             format!(

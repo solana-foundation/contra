@@ -181,6 +181,7 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        None,
         &pda,
     )
     .await;
@@ -204,6 +205,7 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        None,
         &pda,
     )
     .await;

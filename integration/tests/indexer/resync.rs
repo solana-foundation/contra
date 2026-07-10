@@ -1133,6 +1133,7 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
         ProgramType::Escrow,
         &recon_storage,
         &validator.rpc_url(),
+        None,
         &env.instance,
     )
     .await;

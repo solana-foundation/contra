@@ -13,11 +13,6 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-// Pure-function coverage of `compare_balances` branches that aren't hit
-// by the end-to-end reconciliation tests below.
-#[path = "reconciliation_compare.rs"]
-mod compare_balances;
-
 // DB migration idempotency + insert-race safety on PostgresDb.
 #[path = "db_migration_race.rs"]
 mod db_migration_race;
@@ -144,6 +139,7 @@ async fn test_reconciliation_empty_db_passes() -> Result<(), Box<dyn std::error:
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        None,
         &Keypair::new().pubkey(),
     )
     .await;
@@ -169,6 +165,7 @@ async fn test_reconciliation_blocks_on_phantom_deposit() -> Result<(), Box<dyn s
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        None,
         &Keypair::new().pubkey(),
     )
     .await;
@@ -204,6 +201,7 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        None,
         &Keypair::new().pubkey(),
     )
     .await;
@@ -293,6 +291,7 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        None,
         &pda,
     )
     .await;

@@ -5,8 +5,8 @@ use tracing::{info, warn};
 use crate::{
     error::StorageError,
     storage::common::models::{
-        DbMint, DbMintStatus, DbTransaction, MintDbBalance, MintStatusAtSlot, TransactionStatus,
-        TransactionType,
+        DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
+        MintStatusAtSlot, TransactionStatus, TransactionType,
     },
     PostgresConfig,
 };
@@ -644,6 +644,22 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Durable single-row reconciliation halt flag. The CHECK(id) plus the
+        // fixed TRUE default pins the table to at most one row, so both operators'
+        // fetchers read the same flag. Absent row (fresh deploy) means not halted.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS reconciliation_halt (
+                id          BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+                halted      BOOLEAN NOT NULL,
+                reason      TEXT NOT NULL,
+                halted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -657,6 +673,10 @@ impl PostgresDb {
             .await?;
 
         sqlx::query("DROP TABLE IF EXISTS pending_remint_signatures CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DROP TABLE IF EXISTS reconciliation_halt CASCADE")
             .execute(&self.pool)
             .await?;
 
@@ -2042,6 +2062,78 @@ impl PostgresDb {
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Per-mint sum of every unsettled transaction amount (the in-flight
+    /// envelope). Both types are summed as a deliberate over-approximation: a
+    /// larger envelope only ever delays detection of a real insolvency, never
+    /// fabricates a false halt.
+    pub async fn get_in_flight_amounts_by_mint_internal(
+        &self,
+    ) -> Result<Vec<MintInFlightAmount>, sqlx::Error> {
+        // Sum of every in-flight row per mint: the supply-vs-custody transient bound.
+        // Deposits and pending_remint raise supply; burn-side withdrawals over-count but only widen it, never false-halt.
+        sqlx::query_as::<_, MintInFlightAmount>(
+            r#"
+            SELECT mint AS mint_address,
+                   COALESCE(SUM(amount), 0)::NUMERIC AS in_flight_amount
+            FROM transactions
+            WHERE status IN ('pending', 'processing', 'parked', 'pending_remint')
+            GROUP BY mint
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Set (or refresh) the durable reconciliation halt flag. Idempotent on the
+    /// single row so repeated trips do not error or duplicate.
+    pub async fn set_reconciliation_halt_internal(
+        &self,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO reconciliation_halt (id, halted, reason, halted_at)
+            VALUES (TRUE, TRUE, $1, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW()
+            "#,
+        )
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return the halt reason/timestamp when the flag is set, else `None`.
+    /// A row with `halted = FALSE` (cleared) also reads as not halted.
+    pub async fn is_reconciliation_halted_internal(
+        &self,
+    ) -> Result<Option<HaltInfo>, sqlx::Error> {
+        sqlx::query_as::<_, HaltInfo>(
+            r#"
+            SELECT reason, halted_at
+            FROM reconciliation_halt
+            WHERE id = TRUE AND halted = TRUE
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Clear the halt so the pipelines can resume. Manual/runbook use only.
+    pub async fn clear_reconciliation_halt_internal(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE reconciliation_halt
+            SET halted = FALSE, halted_at = NOW()
+            WHERE id = TRUE
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// `transactions.id` for every `deposit` row whose mint was not in

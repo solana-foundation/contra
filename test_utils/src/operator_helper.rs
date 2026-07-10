@@ -37,7 +37,7 @@ fn default_operator_config() -> OperatorConfig {
         alert_webhook_url: None,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
         confirmation_poll_interval_ms: 400,
     }
@@ -157,7 +157,7 @@ fn mock_operator_config() -> OperatorConfig {
         // to fire. Tests that do can script the relevant RPC replies.
         reconciliation_interval: Duration::from_secs(60 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         // Long feepayer monitor interval so the test isn't racing against
         // unrelated `getBalance` traffic. The first tick still happens at
         // start; tests that need it stubbed should enqueue a reply.

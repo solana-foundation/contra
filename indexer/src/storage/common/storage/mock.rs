@@ -1,8 +1,9 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    DbMint, DbMintStatus, DbTransaction, MintDbBalance, MintStatusAtSlot, TransactionStatus,
-    TransactionType,
+    DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
+    MintStatusAtSlot, TransactionStatus, TransactionType,
 };
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,8 @@ pub struct MockStorage {
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `pending_remint_signatures` write-ahead table.
     pub remint_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the single-row `reconciliation_halt` table; `None` = not halted.
+    pub reconciliation_halt: Arc<Mutex<Option<HaltInfo>>>,
 }
 
 impl MockStorage {
@@ -458,6 +461,66 @@ impl MockStorage {
 
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         Ok(self.mint_balances.lock().unwrap().clone())
+    }
+
+    pub async fn get_in_flight_amounts_by_mint(
+        &self,
+    ) -> Result<Vec<MintInFlightAmount>, StorageError> {
+        self.check_should_fail("get_in_flight_amounts_by_mint")?;
+        // Mirror the Postgres query: sum amounts per mint over the unsettled
+        // statuses across every transaction store the mock holds, deduped by id.
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut sums: HashMap<String, BigDecimal> = HashMap::new();
+        {
+            let pending = self.pending_transactions.lock().unwrap();
+            let singles = self.inserted_single_transactions.lock().unwrap();
+            let batches = self.inserted_transactions.lock().unwrap();
+            for t in pending
+                .iter()
+                .chain(singles.iter())
+                .chain(batches.iter().flatten())
+            {
+                if !seen_ids.insert(t.id) {
+                    continue;
+                }
+                if matches!(
+                    t.status,
+                    TransactionStatus::Pending
+                        | TransactionStatus::Processing
+                        | TransactionStatus::Parked
+                        | TransactionStatus::PendingRemint
+                ) {
+                    *sums.entry(t.mint.clone()).or_default() += BigDecimal::from(t.amount.value());
+                }
+            }
+        }
+        Ok(sums
+            .into_iter()
+            .map(|(mint_address, in_flight_amount)| MintInFlightAmount {
+                mint_address,
+                in_flight_amount,
+            })
+            .collect())
+    }
+
+    pub async fn set_reconciliation_halt(&self, reason: &str) -> Result<(), StorageError> {
+        self.check_should_fail("set_reconciliation_halt")?;
+        *self.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
+            reason: reason.to_string(),
+            halted_at: Utc::now(),
+        });
+        Ok(())
+    }
+
+    pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {
+        self.check_should_fail("is_reconciliation_halted")?;
+        Ok(self.reconciliation_halt.lock().unwrap().clone())
+    }
+
+    pub async fn clear_reconciliation_halt(&self) -> Result<(), StorageError> {
+        self.check_should_fail("clear_reconciliation_halt")?;
+        *self.reconciliation_halt.lock().unwrap() = None;
+        Ok(())
     }
 
     pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {

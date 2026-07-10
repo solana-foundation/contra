@@ -73,6 +73,26 @@ pub async fn run(
         ));
     }
 
+    // A detected reconciliation mismatch must never degrade to a silent log, so
+    // the escrow operator refuses to start without an alert webhook. Blank or
+    // whitespace (env renders an unset var as "") counts as unset, mirroring the
+    // fallback_rpc_url normalization above. Placed before any task spawns, so the
+    // early return needs no writer drain.
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && config
+            .reconciliation_webhook_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(OperatorError::WebhookError(
+            "reconciliation_webhook_url required for Escrow operator: a reconciliation \
+             mismatch must always alert, never silently log"
+                .to_string(),
+        ));
+    }
+
     // Initialize source RPC client if configured
     let source_rpc_client = common_config.source_rpc_url.as_ref().map(|url| {
         Arc::new(RpcClientWithRetry::with_retry_config(
@@ -222,16 +242,24 @@ pub async fn run(
         if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
             let reconciliation_storage = storage.clone();
             let reconciliation_config = config.clone();
+            // Custody (Solana escrow ATAs) is the source_rpc_client; when unset it
+            // falls back to rpc_client. Channel-token supply lives on rpc_url (the
+            // PrivateChannel chain the escrow operator mints to), so the supply
+            // read always uses rpc_client.
             let reconciliation_rpc = source_rpc_client
                 .clone()
                 .unwrap_or_else(|| rpc_client.clone());
+            let reconciliation_channel_rpc = rpc_client.clone();
+            let reconciliation_health = health.clone();
             let reconciliation_token = cancellation_token.clone();
             tokio::spawn(async move {
                 if let Err(e) = reconciliation::run_reconciliation(
                     reconciliation_storage,
                     reconciliation_config,
                     reconciliation_rpc,
+                    reconciliation_channel_rpc,
                     reconciliation_escrow,
+                    reconciliation_health,
                     reconciliation_token,
                 )
                 .await

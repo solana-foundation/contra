@@ -121,6 +121,24 @@ pub struct MintDbBalance {
     pub total_withdrawals: BigDecimal,
 }
 
+/// Durable reconciliation-halt state. Its presence (a single row) is the
+/// cross-process, restart-surviving signal that freezes both operators'
+/// fetchers after a proven insolvency; absence means not halted.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HaltInfo {
+    pub reason: String,
+    pub halted_at: DateTime<Utc>,
+}
+
+/// Per-mint sum of every in-flight (unsettled) transaction amount. This bounds
+/// the maximum transient balance swing reconciliation may observe, so a gap
+/// larger than it cannot be explained by pending work alone.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MintInFlightAmount {
+    pub mint_address: String,
+    pub in_flight_amount: BigDecimal,
+}
+
 /// Mint metadata stored
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DbMint {

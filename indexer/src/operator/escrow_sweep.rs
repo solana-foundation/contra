@@ -15,6 +15,7 @@ use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
+use spl_token::state::Mint;
 use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::warn;
@@ -117,6 +118,47 @@ pub async fn fetch_escrow_balances_by_mint(
     }
 
     Ok(balances)
+}
+
+/// Read the channel-token supply for `mint` on the PrivateChannel chain. An
+/// absent mint account (nothing minted yet) reads as supply 0; any other RPC or
+/// decode failure is surfaced so a bad read never silently looks like 0 supply.
+pub async fn fetch_channel_supply(
+    channel_rpc: &RpcClientWithRetry,
+    mint: &Pubkey,
+) -> Result<u64, EscrowSweepError> {
+    // get_account_with_commitment cleanly separates a truly-absent account
+    // (Ok(value = None)) from a transport/node error (Err). The plain get_account
+    // convenience formats BOTH as an "AccountNotFound" error, which would let an
+    // RPC outage masquerade as zero supply and blind the supply invariant.
+    let commitment = channel_rpc.rpc_client.commitment();
+    let response = channel_rpc
+        .with_retry(
+            "get_channel_mint_account",
+            RetryPolicy::Idempotent,
+            || async {
+                channel_rpc
+                    .rpc_client
+                    .get_account_with_commitment(mint, commitment)
+                    .await
+            },
+        )
+        .await
+        .map_err(|e| EscrowSweepError {
+            reason: format!("Failed to fetch channel mint account {mint}: {e}"),
+        })?;
+
+    // Absent account = nothing minted yet.
+    let account = match response.value {
+        Some(account) => account,
+        None => return Ok(0),
+    };
+
+    // The channel program mints classic SPL tokens (not Token-2022).
+    let mint_state = Mint::unpack(&account.data).map_err(|e| EscrowSweepError {
+        reason: format!("Failed to parse channel mint account {mint}: {e}"),
+    })?;
+    Ok(mint_state.supply)
 }
 
 #[cfg(test)]
@@ -281,6 +323,83 @@ mod tests {
             .unwrap();
 
         assert!(balances.is_empty());
+    }
+
+    /// getAccountInfo response wrapping an 82-byte SPL Mint blob with `supply`.
+    fn mint_account_body(supply: u64) -> String {
+        let mint = Mint {
+            mint_authority: COption::Some(Pubkey::new_unique()),
+            supply,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut buf = vec![0u8; Mint::LEN];
+        mint.pack_into_slice(&mut buf);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+            prog = spl_token::id(),
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_supply_decodes_supply() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(mint_account_body(1_234_567))
+            .create_async()
+            .await;
+
+        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
+            .await
+            .unwrap();
+        assert_eq!(supply, 1_234_567);
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_supply_absent_mint_is_zero() {
+        let mut server = mockito::Server::new_async().await;
+        // A null account value: the channel mint does not exist yet -> 0 supply.
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#)
+            .create_async()
+            .await;
+
+        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
+            .await
+            .unwrap();
+        assert_eq!(supply, 0, "absent mint account must read as zero supply");
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_supply_rpc_error_is_err() {
+        // A transport/node error must surface as Err, never Ok(0): the plain
+        // get_account convenience formats a 503 with the same AccountNotFound
+        // prefix as a genuinely-absent mint, which would let an RPC outage
+        // masquerade as zero supply and blind the invariant.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let fast = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::finalized(),
+        );
+        let result = fetch_channel_supply(&fast, &Pubkey::new_unique()).await;
+        assert!(result.is_err(), "an RPC outage must be Err, not Ok(0)");
     }
 
     #[tokio::test]

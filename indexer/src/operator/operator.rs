@@ -239,37 +239,45 @@ pub async fn run(
     // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
     let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
     {
-        if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
-            let reconciliation_storage = storage.clone();
-            let reconciliation_config = config.clone();
-            // Custody (Solana escrow ATAs) is the source_rpc_client; when unset it
-            // falls back to rpc_client. Channel-token supply lives on rpc_url (the
-            // PrivateChannel chain the escrow operator mints to), so the supply
-            // read always uses rpc_client.
-            let reconciliation_rpc = source_rpc_client
-                .clone()
-                .unwrap_or_else(|| rpc_client.clone());
-            let reconciliation_channel_rpc = rpc_client.clone();
-            let reconciliation_health = health.clone();
-            let reconciliation_token = cancellation_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = reconciliation::run_reconciliation(
-                    reconciliation_storage,
-                    reconciliation_config,
-                    reconciliation_rpc,
-                    reconciliation_channel_rpc,
-                    reconciliation_escrow,
-                    reconciliation_health,
-                    reconciliation_token,
-                )
-                .await
-                {
-                    tracing::error!("Reconciliation error: {}", e);
-                }
-            })
-        } else {
-            warn!("Skipping reconciliation: escrow_instance_id is not configured");
-            tokio::spawn(async {})
+        match (common_config.escrow_instance_id, source_rpc_client.clone()) {
+            (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
+                let reconciliation_storage = storage.clone();
+                let reconciliation_config = config.clone();
+                // Custody (Solana escrow ATAs) is read from source_rpc_client;
+                // channel-token supply lives on rpc_url (the PrivateChannel chain
+                // the escrow operator mints to). Custody must never be read from
+                // rpc_client: the escrow ATAs do not exist on the channel, so it
+                // would read 0 and trip a false halt.
+                let reconciliation_channel_rpc = rpc_client.clone();
+                let reconciliation_health = health.clone();
+                let reconciliation_token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = reconciliation::run_reconciliation(
+                        reconciliation_storage,
+                        reconciliation_config,
+                        reconciliation_rpc,
+                        reconciliation_channel_rpc,
+                        reconciliation_escrow,
+                        reconciliation_health,
+                        reconciliation_token,
+                    )
+                    .await
+                    {
+                        tracing::error!("Reconciliation error: {}", e);
+                    }
+                })
+            }
+            (Some(_), None) => {
+                warn!(
+                    "Skipping reconciliation: source_rpc_url (Solana custody) is not \
+                     configured; custody cannot be read without it"
+                );
+                tokio::spawn(async {})
+            }
+            (None, _) => {
+                warn!("Skipping reconciliation: escrow_instance_id is not configured");
+                tokio::spawn(async {})
+            }
         }
     } else {
         tokio::spawn(async {})

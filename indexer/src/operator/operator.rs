@@ -268,9 +268,12 @@ pub async fn run(
                 })
             }
             (Some(_), None) => {
-                warn!(
-                    "Skipping reconciliation: source_rpc_url (Solana custody) is not \
-                     configured; custody cannot be read without it"
+                // Loud, not fatal: mock/test harnesses run the escrow operator
+                // without a Solana RPC and never reconcile, and production always sets it.
+                error!(
+                    "RECONCILIATION DISABLED: source_rpc_url (Solana custody) is not \
+                     configured, so the supply-vs-custody solvency check cannot run. \
+                     Set source_rpc_url on the escrow operator to enable it."
                 );
                 tokio::spawn(async {})
             }

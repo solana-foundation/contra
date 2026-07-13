@@ -84,6 +84,15 @@ pub async fn run_startup_reconciliation(
         return Ok(());
     }
 
+    // The supply invariant must always run for an escrow indexer, so the channel
+    // RPC is a hard config gate: a missing or blank one fails the boot even in empty state.
+    let channel_rpc_url = channel_rpc_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(IndexerError::Reconciliation(
+            ReconciliationError::MissingChannelRpc,
+        ))?;
+
     let instance_pda = *instance_pda;
     info!(
         instance_pda = %instance_pda,
@@ -130,15 +139,8 @@ pub async fn run_startup_reconciliation(
     classify_and_report(config, &results)?;
 
     // Independent supply invariant: the minted channel-token supply must not
-    // exceed on-chain custody. Skipped (custody-vs-ledger only) when the escrow
-    // indexer has no channel RPC configured, so existing deploys keep booting.
-    match channel_rpc_url {
-        Some(url) => check_channel_supply_invariant(url, config, &results).await?,
-        None => warn!(
-            "Startup reconciliation: channel-supply invariant skipped (no channel RPC \
-             configured); custody-vs-ledger check unchanged"
-        ),
-    }
+    // exceed on-chain custody.
+    check_channel_supply_invariant(channel_rpc_url, config, &results).await?;
 
     Ok(())
 }
@@ -705,6 +707,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escrow_without_channel_rpc_is_fatal() {
+        // The supply invariant must always run, so a missing channel RPC fails the
+        // escrow indexer boot rather than silently skipping the check.
+        let mut server = mockito::Server::new_async().await;
+        mock_escrow_sweep(&mut server, &[]).await;
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let storage = Storage::Mock(MockStorage::new());
+        let seed = Pubkey::new_unique();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &server.url(),
+            None,
+            &seed,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::MissingChannelRpc
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_reconciliation_empty_db_and_empty_escrow_passes() {
         let mut server = mockito::Server::new_async().await;
         mock_escrow_sweep(&mut server, &[]).await;
@@ -719,7 +749,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
-            None,
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -748,7 +778,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
-            None,
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -784,7 +814,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
-            None,
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -811,7 +841,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
-            None,
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -842,7 +872,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
-            None,
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -878,7 +908,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
-            None,
+            Some(&server.url()),
             &seed,
         )
         .await;

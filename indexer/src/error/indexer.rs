@@ -53,6 +53,12 @@ pub enum ReconciliationError {
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 
+    #[error(
+        "source_rpc_url (channel RPC) required for the escrow indexer: the startup \
+         supply invariant reads channel-token supply from it and must always run"
+    )]
+    MissingChannelRpc,
+
     #[error("DB net balance for mint {mint} exceeds u64::MAX ({net}); the escrow ATA cannot hold this, so the DB is corrupt")]
     DbBalanceOverflow { mint: String, net: String },
 

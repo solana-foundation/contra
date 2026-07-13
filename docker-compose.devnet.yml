@@ -318,8 +318,8 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
-      # source_rpc_url = channel read-node, used only by the startup supply
-      # invariant (supply <= custody). A failed read skips the check with a warn.
+      # source_rpc_url = channel read-node for the startup supply invariant
+      # (supply <= custody). Required for escrow: the indexer refuses to start without it.
       - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
       # Archival fallback for the poller's missing getBlock-metadata failover.
       # Empty is treated as unset (single-endpoint).

@@ -151,8 +151,9 @@ pub async fn start_solana_indexer_rpc_polling(
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
+        // Single-validator harness: the channel RPC is the same node.
+        source_rpc_url: Some(rpc_url.clone()),
         rpc_url,
-        source_rpc_url: None,
         fallback_rpc_url: None,
         escrow_instance_id,
     };
@@ -231,8 +232,9 @@ pub async fn start_solana_indexer(
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
+        // Single-validator harness: the channel RPC is the same node.
+        source_rpc_url: Some(rpc_url.clone()),
         rpc_url,
-        source_rpc_url: None,
         fallback_rpc_url: None,
         escrow_instance_id,
     };

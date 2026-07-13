@@ -7,6 +7,9 @@ rpc_url = "your_devnet_solana_rpc_url"
 # Optional archival fallback for rpc_url. Re-checks a Dead finality verdict (operator)
 # and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"
+# Channel (gateway) RPC. Required for escrow: the startup supply invariant reads from it.
+# TODO: Add devnet gateway read url
+source_rpc_url = "your_devnet_gateway_url"
 # TODO: Add escrow instance id
 escrow_instance_id = "your_escrow_instance_id"
 

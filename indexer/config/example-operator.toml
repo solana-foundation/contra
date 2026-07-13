@@ -12,6 +12,9 @@ rpc_url = "http://localhost:8899"
 # operator (independent, same-cluster, reachable) or it refuses to start; optional for escrow. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"
 
+# Solana custody RPC. Required for escrow: the reconciliation solvency check reads custody from it.
+source_rpc_url = "http://localhost:18899"
+
 # Escrow instance ID (required for escrow program type, omit for withdraw)
 # escrow_instance_id = "YourPubkeyHere..."
 

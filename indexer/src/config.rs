@@ -143,8 +143,9 @@ pub struct PrivateChannelIndexerConfig {
     /// re-check a `Dead` verdict and by the poller for missing-block failover.
     #[serde(default)]
     pub fallback_rpc_url: Option<String>,
-    /// Second-chain RPC, role-dependent (optional): Solana custody for the escrow operator,
-    /// PrivateChannel gateway for the escrow indexer's startup supply check, remint target for withdraw.
+    /// Second-chain RPC, role-dependent. Required (fatal if unset) for the escrow operator
+    /// (Solana custody), the escrow indexer (channel gateway supply check), and the withdraw
+    /// operator (remint target); unused by the withdraw indexer.
     pub source_rpc_url: Option<String>,
     /// Postgres configuration
     pub postgres: PostgresConfig,
@@ -152,17 +153,29 @@ pub struct PrivateChannelIndexerConfig {
     pub escrow_instance_id: Option<Pubkey>,
 }
 
+/// Trim an optional config string, treating blank/whitespace as unset.
+fn normalized(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
 impl PrivateChannelIndexerConfig {
     pub fn validate(&self) -> Result<(), String> {
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {
-                Err("--escrow-instance-id required when program_type is Escrow".to_string())
+                return Err("--escrow-instance-id required when program_type is Escrow".to_string())
             }
             (ProgramType::Withdraw, Some(_)) => {
-                Err("--escrow-instance-id should not be set for Withdraw program".to_string())
+                return Err(
+                    "--escrow-instance-id should not be set for Withdraw program".to_string(),
+                )
             }
-            _ => Ok(()),
+            _ => {}
         }
+        // Escrow reconciliation always reads the second-chain RPC, so require it (blank counts as unset).
+        if self.program_type == ProgramType::Escrow && normalized(&self.source_rpc_url).is_none() {
+            return Err("source_rpc_url required when program_type is Escrow".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -424,6 +437,26 @@ mod tests {
         let config = create_common_config();
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_common_config_escrow_missing_source_rpc_url() {
+        let config = PrivateChannelIndexerConfig {
+            source_rpc_url: None,
+            ..create_common_config()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("source_rpc_url required"));
+    }
+
+    #[test]
+    fn test_validate_common_config_escrow_blank_source_rpc_url() {
+        let config = PrivateChannelIndexerConfig {
+            source_rpc_url: Some("   ".to_string()),
+            ..create_common_config()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("source_rpc_url required"));
     }
 
     // ============================================================================

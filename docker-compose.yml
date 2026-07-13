@@ -436,8 +436,8 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
-      # source_rpc_url = channel (gateway) handle, used only by the startup
-      # supply invariant (supply <= custody). Absent skips that check with a warn.
+      # source_rpc_url = channel (gateway) handle for the startup supply invariant
+      # (supply <= custody). Required for escrow: the indexer refuses to start without it.
       - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
       - INDEXER_YELLOWSTONE_ENDPOINT=http://validator:10000
       - METRICS_PORT=9100

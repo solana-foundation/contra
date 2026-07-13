@@ -68,8 +68,9 @@ pub async fn start_solana_to_private_channel_operator(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
+        // Single-validator harness: Solana custody and the channel share one node.
+        source_rpc_url: Some(private_channel_rpc_url.clone()),
         rpc_url: private_channel_rpc_url,
-        source_rpc_url: None,
         fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
@@ -239,8 +240,9 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
+        // Mock harness: custody and channel both point at the one mock RPC.
+        source_rpc_url: Some(rpc.url()),
         rpc_url: rpc.url(),
-        source_rpc_url: None,
         fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),

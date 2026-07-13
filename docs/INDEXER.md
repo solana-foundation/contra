@@ -91,7 +91,7 @@ Submits transactions to the respective cluster with:
 
 #### Reconciliation
 
-Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation fails closed on a proven insolvency: alongside the custody-vs-ledger check it enforces an independent on-chain `channel_supply <= custody` invariant, and an insolvency-direction gap exceeding the in-flight envelope for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md).
+Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation checks a single on-chain invariant, `channel_supply <= custody`, over finalized reads and fails closed on a proven insolvency: an insolvency-direction gap exceeding the in-flight envelope for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md). The custody-vs-ledger comparison now runs only at startup, where it also enforces the same supply invariant before the pipeline boots.
 
 **Location**: [`indexer/src/operator/reconciliation.rs`](../indexer/src/operator/reconciliation.rs), [`indexer/src/indexer/reconciliation.rs`](../indexer/src/indexer/reconciliation.rs)
 

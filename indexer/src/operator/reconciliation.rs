@@ -181,6 +181,17 @@ fn insolvency_tolerance_raw(custody: u64, tolerance_bps: u16) -> u64 {
     ((custody as u128 * tolerance_bps as u128) / 10_000).min(u64::MAX as u128) as u64
 }
 
+/// Insolvency gap in basis points of custody for the alert payload. A tiny
+/// custody against a huge gap can push the ratio past u64::MAX, so saturate
+/// rather than let the u128->u64 cast wrap into a garbage value. Zero custody has
+/// no ratio, so report the max, matching every other reconciliation alert.
+fn insolvency_delta_bps(custody: u64, gap: u64) -> u64 {
+    if custody == 0 {
+        return u64::MAX;
+    }
+    u64::try_from((gap as u128 * 10_000) / custody as u128).unwrap_or(u64::MAX)
+}
+
 /// Performs a single reconciliation check.
 ///
 /// One invariant over finalized reads: per mint, freeze when channel supply
@@ -219,14 +230,16 @@ async fn perform_reconciliation_check(
     }
 
     // Custody (Solana) plus the DB mint set enumerate the mints to check; the DB
-    // set keeps a zero-custody mint with outstanding supply in scope.
+    // set keeps a zero-custody mint with outstanding supply in scope. The union is
+    // built once here and shared with both the supply fetch and the evaluation.
     let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
-    let db_mints = fetch_db_mint_set(storage).await?;
+    let mut mints: HashSet<Pubkey> = custody.keys().copied().collect();
+    mints.extend(fetch_db_mint_set(storage).await?);
 
     // Envelope (DB) and channel supply (PrivateChannel RPC) are the remaining
     // halt inputs. A failure of either holds the breach counters and skips the
     // tick, so a transient glitch cannot reset a building breach.
-    match load_halt_inputs(storage, channel_rpc, &custody, &db_mints).await {
+    match load_halt_inputs(storage, channel_rpc, &mints).await {
         Ok((supply, envelope)) => {
             evaluate_and_maybe_halt(
                 storage,
@@ -234,7 +247,7 @@ async fn perform_reconciliation_check(
                 health,
                 webhook_client,
                 &custody,
-                &db_mints,
+                &mints,
                 &supply,
                 &envelope,
                 breach_counters,
@@ -280,22 +293,19 @@ async fn fetch_in_flight_envelope(
 }
 
 /// Load the halt inputs: the in-flight envelope (DB) and per-mint channel supply
-/// (PrivateChannel RPC) for the custody-plus-DB mint union. An envelope-query
-/// failure skips the whole tick (one DB read), but a single mint's supply read
-/// failing must not blind the others: that mint is omitted from the returned map
-/// and held in `evaluate_and_maybe_halt`, so a flaky read on one mint cannot
-/// suppress detection on a genuinely over-issued one.
+/// (PrivateChannel RPC) for the given mint set. An envelope-query failure skips
+/// the whole tick (one DB read), but a single mint's supply read failing must not
+/// blind the others: that mint is omitted from the returned map and held in
+/// `evaluate_and_maybe_halt`, so a flaky read on one mint cannot suppress
+/// detection on a genuinely over-issued one.
 async fn load_halt_inputs(
     storage: &Arc<Storage>,
     channel_rpc: &Arc<RpcClientWithRetry>,
-    custody: &HashMap<Pubkey, u64>,
-    db_mints: &HashSet<Pubkey>,
+    mints: &HashSet<Pubkey>,
 ) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), OperatorError> {
     let envelope = fetch_in_flight_envelope(storage).await?;
-    let mut mints: HashSet<Pubkey> = custody.keys().copied().collect();
-    mints.extend(db_mints.iter().copied());
     let mut supply = HashMap::new();
-    for mint in &mints {
+    for mint in mints {
         match fetch_channel_supply(channel_rpc, mint).await {
             Ok(s) => {
                 supply.insert(*mint, s);
@@ -322,7 +332,8 @@ fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
 /// on the `HALT_CONFIRM_TICKS`-th consecutive breach freeze the pipelines once
 /// (durable flag + quarantine + forced-unhealthy + webhook). Every action is
 /// best-effort and logged, so one failing action never skips the others.
-/// `db_mints` only widens the enumeration set; its net is never compared.
+/// `mints` is the shared custody-plus-DB enumeration set; the DB net is never
+/// compared, only the addresses widen the set.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_and_maybe_halt(
     storage: &Arc<Storage>,
@@ -330,19 +341,16 @@ async fn evaluate_and_maybe_halt(
     health: &Option<Arc<HealthState>>,
     webhook_client: &WebhookClient,
     custody: &HashMap<Pubkey, u64>,
-    db_mints: &HashSet<Pubkey>,
+    mints: &HashSet<Pubkey>,
     supply: &HashMap<Pubkey, u64>,
     envelope: &HashMap<Pubkey, u64>,
     breach_counters: &mut HashMap<Pubkey, u32>,
     halted: &mut bool,
 ) {
-    let mut mints: HashSet<Pubkey> = custody.keys().copied().collect();
-    mints.extend(db_mints.iter().copied());
-
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
     let mut next_counters: HashMap<Pubkey, u32> = HashMap::new();
-    for mint in mints {
+    for &mint in mints {
         // A mint absent from `supply` had its read fail this tick (an absent
         // account reads as Ok(0), not a miss). Hold its counter rather than
         // resetting, so a transient per-mint glitch neither halts it nor erases
@@ -430,16 +438,11 @@ async fn trip_halt(
     // (u64::MAX when custody is 0).
     let gap = breach.supply_gap;
     let expected = custody.saturating_add(gap);
-    let delta_bps = if custody == 0 {
-        u64::MAX
-    } else {
-        ((gap as u128 * 10_000) / custody as u128) as u64
-    };
     let alert = BalanceMismatch {
         mint: *mint,
         on_chain_balance: custody,
         db_balance: expected,
-        delta_bps,
+        delta_bps: insolvency_delta_bps(custody, gap),
     };
     if let Err(e) =
         send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await
@@ -820,6 +823,14 @@ mod tests {
         assert_eq!(insolvency_tolerance_raw(0, 100), 0);
         // A large bps against max custody must saturate, not wrap down.
         assert_eq!(insolvency_tolerance_raw(u64::MAX, u16::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn insolvency_delta_bps_saturates_on_small_custody() {
+        assert_eq!(insolvency_delta_bps(10_000, 100), 100);
+        assert_eq!(insolvency_delta_bps(0, 5), u64::MAX);
+        // A huge gap over a tiny custody overflows u64 in bps; saturate, don't wrap.
+        assert_eq!(insolvency_delta_bps(1, u64::MAX), u64::MAX);
     }
 
     #[test]

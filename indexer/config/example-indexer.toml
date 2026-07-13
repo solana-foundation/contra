@@ -13,6 +13,9 @@ rpc_url = "http://localhost:8899"
 # and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"
 
+# Channel (gateway) RPC. Required for escrow: the startup supply invariant reads from it.
+source_rpc_url = "http://localhost:8898"
+
 # Escrow instance ID (required for escrow program type, omit for withdraw)
 # escrow_instance_id = "YourPubkeyHere..."
 

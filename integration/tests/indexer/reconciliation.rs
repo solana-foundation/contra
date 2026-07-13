@@ -139,7 +139,8 @@ async fn test_reconciliation_empty_db_passes() -> Result<(), Box<dyn std::error:
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        None,
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
     )
     .await;
@@ -165,7 +166,8 @@ async fn test_reconciliation_blocks_on_phantom_deposit() -> Result<(), Box<dyn s
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        None,
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
     )
     .await;
@@ -201,7 +203,8 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        None,
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
     )
     .await;
@@ -291,7 +294,8 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        None,
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &pda,
     )
     .await;

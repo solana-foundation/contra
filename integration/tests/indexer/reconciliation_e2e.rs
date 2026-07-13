@@ -181,7 +181,8 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        None,
+        // Single-validator harness: the channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &pda,
     )
     .await;
@@ -205,7 +206,8 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
-        None,
+        // Single-validator harness: the channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &pda,
     )
     .await;

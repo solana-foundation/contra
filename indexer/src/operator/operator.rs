@@ -93,6 +93,23 @@ pub async fn run(
         ));
     }
 
+    // The runtime solvency check must always run, so the escrow operator refuses to
+    // start without the Solana custody RPC it reads balances from (blank counts as unset).
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && common_config
+            .source_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(OperatorError::RpcError(
+            "source_rpc_url required for Escrow operator: the supply-vs-custody \
+             reconciliation reads Solana custody from it and must always run"
+                .to_string(),
+        ));
+    }
+
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require an
     // independent, same-cluster, reachable fallback before starting.
     validate_withdraw_fallback(
@@ -250,6 +267,9 @@ pub async fn run(
     // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
     let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
     {
+        // Both are guaranteed present for a validated escrow config: source_rpc_url
+        // is enforced above and escrow_instance_id by config validation. Fail loud
+        // rather than silently skip if that ever regresses.
         match (common_config.escrow_instance_id, source_rpc_client.clone()) {
             (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
                 let reconciliation_storage = storage.clone();
@@ -278,19 +298,12 @@ pub async fn run(
                     }
                 })
             }
-            (Some(_), None) => {
-                // Loud, not fatal: mock/test harnesses run the escrow operator
-                // without a Solana RPC and never reconcile, and production always sets it.
-                error!(
-                    "RECONCILIATION DISABLED: source_rpc_url (Solana custody) is not \
-                     configured, so the supply-vs-custody solvency check cannot run. \
-                     Set source_rpc_url on the escrow operator to enable it."
-                );
-                tokio::spawn(async {})
-            }
-            (None, _) => {
-                warn!("Skipping reconciliation: escrow_instance_id is not configured");
-                tokio::spawn(async {})
+            _ => {
+                return Err(OperatorError::RpcError(
+                    "escrow reconciliation requires both escrow_instance_id and \
+                     source_rpc_url; one is missing after startup validation"
+                        .to_string(),
+                ));
             }
         }
     } else {

@@ -1133,7 +1133,8 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
         ProgramType::Escrow,
         &recon_storage,
         &validator.rpc_url(),
-        None,
+        // The channel is modeled by the mock (empty), where the supply invariant reads.
+        Some(&mock.url()),
         &env.instance,
     )
     .await;

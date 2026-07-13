@@ -12,6 +12,7 @@ use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use solana_account_decoder_client_types::UiAccountData;
 use solana_client::rpc_request::TokenAccountsFilter;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
@@ -53,11 +54,13 @@ pub async fn fetch_escrow_balances_by_mint(
                 || async {
                     rpc_client
                         .rpc_client
-                        .get_token_accounts_by_owner(
+                        .get_token_accounts_by_owner_with_commitment(
                             &escrow_instance_id,
                             TokenAccountsFilter::ProgramId(token_program_id),
+                            CommitmentConfig::finalized(),
                         )
                         .await
+                        .map(|response| response.value)
                 },
             )
             .await
@@ -131,7 +134,7 @@ pub async fn fetch_channel_supply(
     // (Ok(value = None)) from a transport/node error (Err). The plain get_account
     // convenience formats BOTH as an "AccountNotFound" error, which would let an
     // RPC outage masquerade as zero supply and blind the supply invariant.
-    let commitment = channel_rpc.rpc_client.commitment();
+    let commitment = CommitmentConfig::finalized();
     let response = channel_rpc
         .with_retry(
             "get_channel_mint_account",

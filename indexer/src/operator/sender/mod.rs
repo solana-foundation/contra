@@ -157,6 +157,45 @@ pub mod test_hooks {
         )
         .await
     }
+
+    /// Drives one `fire_and_store_task` for a deposit-mint first-fire. Acquires
+    /// a permit from the sender's semaphore, then builds, (claims +) persists,
+    /// and broadcasts. Lets tests pin the ownership-claim routing (abort vs
+    /// broadcast) without the sender loop. Returns `false` if the semaphore was
+    /// already at capacity.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_fire_and_store_task(
+        state: &SenderState,
+        instruction: super::types::InstructionWithSigners,
+        compute_unit_price: Option<u64>,
+        ctx: super::types::TransactionContext,
+        retry_policy: crate::operator::utils::instruction_util::RetryPolicy,
+        extra_error_checks_policy: crate::operator::utils::instruction_util::ExtraErrorCheckPolicy,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+        durability: super::types::SendDurability,
+        deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> bool {
+        let Ok(permit) = Arc::clone(&state.semaphore).try_acquire_owned() else {
+            return false;
+        };
+        super::transaction::fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            instruction,
+            compute_unit_price,
+            ctx,
+            retry_policy,
+            extra_error_checks_policy,
+            storage_tx.clone(),
+            durability,
+            deposit_expected_updated_at,
+            permit,
+        )
+        .await;
+        true
+    }
 }
 
 use crate::channel_utils::send_guaranteed;

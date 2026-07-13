@@ -230,18 +230,20 @@ impl MockStorage {
             return Ok(matched);
         }
 
-        // Deposits: FIFO by insertion order, removed from the queue on return.
+        // Deposits: FIFO by insertion order. Mirror Postgres: lock only Pending
+        // rows, flip them to Processing in place (keep them in the store so a
+        // later claim's CAS can find the row), and hand back the post-lock token.
         let mut matched = Vec::new();
-        let mut remaining = Vec::new();
-        for txn in pending.drain(..) {
-            if txn.transaction_type == transaction_type && (matched.len() as i64) < limit {
-                matched.push(txn);
-            } else {
-                remaining.push(txn);
+        for txn in pending.iter_mut() {
+            if txn.transaction_type == transaction_type
+                && txn.status == TransactionStatus::Pending
+                && (matched.len() as i64) < limit
+            {
+                txn.status = TransactionStatus::Processing;
+                txn.updated_at = Utc::now();
+                matched.push(txn.clone());
             }
         }
-
-        *pending = remaining;
         Ok(matched)
     }
 
@@ -820,6 +822,43 @@ impl MockStorage {
             .or_default()
             .push((signature, last_valid_block_height));
         Ok(())
+    }
+
+    /// Mirror `claim_and_persist_deposit_signature_internal`: CAS the row on
+    /// `(id, Processing, updated_at)`; on a hit bump `updated_at`, persist the
+    /// signature (mirroring the `ON CONFLICT (signature)` dedup) and return
+    /// `Ok(true)`; on a miss return `Ok(false)` and persist nothing.
+    pub async fn claim_and_persist_deposit_signature(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("claim_and_persist_deposit_signature")?;
+        // Scope the guard so it is released before the await below.
+        let claimed = {
+            let mut pending = self.pending_transactions.lock().unwrap();
+            match pending.iter_mut().find(|t| {
+                t.id == transaction_id
+                    && t.status == TransactionStatus::Processing
+                    && t.updated_at == expected_updated_at
+            }) {
+                Some(txn) => {
+                    txn.updated_at = Utc::now();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !claimed {
+            return Ok(false);
+        }
+
+        // Reuse the write-ahead insert (mirrors the ON CONFLICT (signature) dedup).
+        self.insert_release_signature(transaction_id, signature, last_valid_block_height)
+            .await?;
+        Ok(true)
     }
 
     pub async fn get_release_signatures(

@@ -1123,7 +1123,7 @@ impl PostgresDb {
         // Use a transaction to ensure atomicity
         let mut tx = self.pool.begin().await?;
 
-        let transactions = sqlx::query_as::<_, DbTransaction>(&format!(
+        let mut transactions = sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
@@ -1172,18 +1172,30 @@ impl PostgresDb {
         .fetch_all(&mut *tx)
         .await?;
 
-        // Update status to Processing in a single query
+        // Update status to Processing and RETURNING the trigger-bumped
+        // `updated_at`, so the fetched row carries its true post-lock token (the
+        // deposit sender CASes on it at broadcast, not the stale Pending value).
         if !transactions.is_empty() {
             let ids: Vec<i64> = transactions.iter().map(|txn| txn.id).collect();
-            sqlx::query(&format!(
-                "UPDATE transactions SET {} = $1 WHERE {} = ANY($2)",
+            let bumped: Vec<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(
+                "UPDATE transactions SET {} = $1 WHERE {} = ANY($2) RETURNING {}",
                 transaction_cols::STATUS,
-                transaction_cols::ID
+                transaction_cols::ID,
+                transaction_cols::UPDATED_AT,
             ))
             .bind(TransactionStatus::Processing)
             .bind(&ids)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
+
+            // NOW() is constant across this transaction, so every locked row got
+            // the same post-lock timestamp; apply that one value to all of them.
+            if let Some(&post_lock_updated_at) = bumped.first() {
+                for txn in transactions.iter_mut() {
+                    txn.status = TransactionStatus::Processing;
+                    txn.updated_at = post_lock_updated_at;
+                }
+            }
         }
 
         // Commit to release locks with Processing status
@@ -1643,6 +1655,57 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically claim a `Processing` deposit and persist its broadcast
+    /// signature in one transaction. The CAS on `updated_at` bumps the row so a
+    /// racing recovery demote (also a CAS on that column) loses; sharing one
+    /// transaction leaves no bumped-but-unsigned window. `Ok(false)` means the
+    /// row was demoted or re-locked, so the caller must not broadcast.
+    pub async fn claim_and_persist_deposit_signature_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let claimed = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET updated_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&mut *tx)
+        .await?;
+
+        if claimed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO pending_release_signatures
+                (transaction_id, signature, last_valid_block_height)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (signature) DO NOTHING
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .bind(last_valid_block_height)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Return a transaction's release signatures as (signature, lvbh).

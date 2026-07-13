@@ -109,6 +109,18 @@ and Step 2's re-arm path applies. The retry is safe because the next
 attempt will run the memo scan again (and will detect any prior
 landed mint).
 
+## Not an alert - `deposit_ownership_lost` metric
+
+`OPERATOR_TRANSACTION_ERRORS{error_reason="deposit_ownership_lost"}` is
+**informational, not an incident**. It counts a deposit mint whose sender
+lost ownership of its row before broadcast: while the built mint was queued,
+the recovery worker demoted the row (or a re-fetch re-locked it), so the
+stale builder was dropped without broadcasting and without writing any
+status. The row's current owner or recovery mints it instead, so the
+one-deposit-one-mint invariant holds. No operator action; a sustained rate
+only signals the in-flight cap is stranding builders long enough for
+recovery to reclaim them (a throughput tuning signal, not a correctness bug).
+
 ## Post-incident artifacts
 
 - Transaction id, originating Solana deposit `signature`, `recipient`,

@@ -1123,7 +1123,7 @@ impl PostgresDb {
         // Use a transaction to ensure atomicity
         let mut tx = self.pool.begin().await?;
 
-        let transactions = sqlx::query_as::<_, DbTransaction>(&format!(
+        let mut transactions = sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
@@ -1175,7 +1175,6 @@ impl PostgresDb {
         // Update status to Processing and RETURNING the trigger-bumped
         // `updated_at`, so the fetched row carries its true post-lock token (the
         // deposit sender CASes on it at broadcast, not the stale Pending value).
-        let mut transactions = transactions;
         if !transactions.is_empty() {
             let ids: Vec<i64> = transactions.iter().map(|txn| txn.id).collect();
             let bumped: Vec<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(

@@ -4,7 +4,7 @@ use figment::{
     Figment,
 };
 use private_channel_indexer::config::{
-    default_safety_window, floor_operator_commitment, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    floor_operator_commitment, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
 };
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
@@ -69,8 +69,6 @@ struct RpcPollingSection {
 struct YellowstoneSection {
     endpoint: Option<String>,
     x_token: Option<String>,
-    #[serde(default = "default_safety_window")]
-    safety_window_slots: u64,
 }
 
 #[derive(Deserialize)]
@@ -282,7 +280,6 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 x_token: token,
                 // Fixed at finalized; the gap poller below inherits it.
                 commitment: "finalized".to_string(),
-                safety_window_slots: ys.safety_window_slots,
             };
 
             // Parse RPC polling config if provided (needed for backfill)

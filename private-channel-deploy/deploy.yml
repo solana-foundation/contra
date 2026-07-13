@@ -92,6 +92,19 @@
 
           Fix: solana-keygen new --no-bip39-passphrase --silent --outfile {{ admin_keypair_path }}
 
+    # The withdraw operator re-checks a Dead finality verdict against this fallback
+    # before reminting and refuses to start without one. localnet reuses the local
+    # validator via the compose file, so the var is only required off localnet.
+    - name: Assert archival fallback RPC is set off localnet
+      ansible.builtin.assert:
+        that: network == 'localnet' or (fallback_rpc_url | default('') | length > 0)
+        fail_msg: |
+          fallback_rpc_url is empty for network={{ network }}.
+          The withdraw operator needs an independent, same-cluster archival Solana
+          RPC to corroborate a Dead finality verdict and refuses to start without
+          one. Set fallback_rpc_url in vars/{{ network }}.yml to a provider
+          independent from rpc_url ({{ rpc_url | default('unset') }}).
+
     - name: Derive admin pubkey via solana-keygen
       ansible.builtin.command: "solana-keygen pubkey {{ admin_keypair_path }}"
       changed_when: false

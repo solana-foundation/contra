@@ -163,6 +163,27 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get the node's lowest retained slot with retry. An absence-based `Dead`
+    /// finality verdict consults this to prove the endpoint still retains the
+    /// attempt's slot range.
+    pub async fn get_first_available_block(&self) -> Result<u64, Box<client_error::Error>> {
+        self.with_retry(
+            "get_first_available_block",
+            RetryPolicy::Idempotent,
+            || async { self.rpc_client.get_first_available_block().await },
+        )
+        .await
+    }
+
+    /// Get the cluster genesis hash with retry. Used once at withdraw startup to
+    /// prove the fallback endpoint is on the same cluster as the primary.
+    pub async fn get_genesis_hash(&self) -> Result<Hash, Box<client_error::Error>> {
+        self.with_retry("get_genesis_hash", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_genesis_hash().await
+        })
+        .await
+    }
+
     /// Send transaction with configurable retry policy
     ///
     /// # Arguments
@@ -687,5 +708,90 @@ mod tests {
             5,
             "unrelated ForUser error must be retried"
         );
+    }
+
+    fn make_client_at(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    #[tokio::test]
+    async fn get_first_available_block_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":12345,"id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        assert_eq!(client.get_first_available_block().await.unwrap(), 12345);
+    }
+
+    #[tokio::test]
+    async fn get_first_available_block_rpc_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        assert!(client.get_first_available_block().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_genesis_hash_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":"11111111111111111111111111111111","id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let hash = client.get_genesis_hash().await.unwrap();
+        assert_eq!(hash, Hash::default());
+    }
+
+    #[tokio::test]
+    async fn get_genesis_hash_rpc_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        assert!(client.get_genesis_hash().await.is_err());
     }
 }

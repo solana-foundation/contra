@@ -96,17 +96,6 @@ pub struct YellowstoneConfig {
     /// Stream commitment. Fixed at "finalized": indexing is the
     /// value-finalizing source of truth, so a sub-finalized stream could index a forked block.
     pub commitment: String,
-    /// Slots to hold a live SlotComplete behind the highest BlockMeta seen, so a late tx still lands
-    /// before finalize. Live gRPC stream only; getBlock backfill/gap-fill never delayed. `0` = immediate.
-    #[serde(default = "default_safety_window")]
-    pub safety_window_slots: u64,
-}
-
-/// Default live SlotComplete lag in slots (~1.2s at ~2.5 slots/s); a conservative reorder margin.
-pub const DEFAULT_SLOT_SAFETY_WINDOW: u64 = 3;
-
-pub fn default_safety_window() -> u64 {
-    DEFAULT_SLOT_SAFETY_WINDOW
 }
 
 /// Floor the operator's operational RPC commitment. This knob only affects blockhash/preflight
@@ -490,36 +479,6 @@ mod tests {
             let err_msg = result.unwrap_err();
             assert!(err_msg.contains("Yellowstone datasource not compiled"));
         }
-    }
-
-    #[test]
-    fn yellowstone_safety_window_defaults_when_absent() {
-        // The key is optional; an existing config without it must keep parsing.
-        let cfg: YellowstoneConfig = serde_json::from_value(serde_json::json!({
-            "endpoint": "http://localhost:10000",
-            "x_token": null,
-            "commitment": "confirmed"
-        }))
-        .unwrap();
-        assert_eq!(cfg.safety_window_slots, DEFAULT_SLOT_SAFETY_WINDOW);
-    }
-
-    #[test]
-    fn yellowstone_safety_window_explicit_value_honored() {
-        let cfg: YellowstoneConfig = serde_json::from_value(serde_json::json!({
-            "endpoint": "http://localhost:10000",
-            "x_token": null,
-            "commitment": "confirmed",
-            "safety_window_slots": 7
-        }))
-        .unwrap();
-        assert_eq!(cfg.safety_window_slots, 7);
-    }
-
-    #[test]
-    fn safety_window_default_constant_is_pinned() {
-        // A change to the default is a conscious edit, not an accident.
-        assert_eq!(DEFAULT_SLOT_SAFETY_WINDOW, 3);
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use {
     private_channel_indexer::{
-        config::DEFAULT_SLOT_SAFETY_WINDOW,
         storage::{PostgresDb, Storage},
         BackfillConfig, DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig,
         ProgramType, RpcPollingConfig, StorageType, YellowstoneConfig,
@@ -54,7 +53,6 @@ pub async fn start_private_channel_indexer(
                 endpoint,
                 x_token: None,
                 commitment: "finalized".to_string(),
-                safety_window_slots: DEFAULT_SLOT_SAFETY_WINDOW,
             }),
         )
     } else {
@@ -209,7 +207,6 @@ pub async fn start_solana_indexer(
         endpoint: geyser_endpoint,
         x_token: None,
         commitment: "finalized".to_string(),
-        safety_window_slots: DEFAULT_SLOT_SAFETY_WINDOW,
     };
 
     let rpc_polling_config = RpcPollingConfig {

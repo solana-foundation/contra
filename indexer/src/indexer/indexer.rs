@@ -261,8 +261,7 @@ pub async fn run(
                 yellowstone_config.commitment.clone(),
                 common_config.program_type,
                 common_config.escrow_instance_id,
-            )
-            .with_safety_window(yellowstone_config.safety_window_slots);
+            );
 
             #[cfg(feature = "datasource-rpc")]
             let source = {

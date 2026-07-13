@@ -45,19 +45,19 @@ pub async fn run(
 
     // Optional destination fallback for recovery and the boot pre-flight to
     // re-check a Dead verdict. Empty means unset (env renders "") and maps to None.
-    let fallback_rpc_client = common_config
+    let normalized_fallback_url = common_config
         .fallback_rpc_url
         .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|url| {
-            Arc::new(RpcClientWithRetry::with_retry_config(
-                url.to_string(),
-                RetryConfig::default(),
-                CommitmentConfig {
-                    commitment: config.rpc_commitment,
-                },
-            ))
-        });
+        .filter(|s| !s.is_empty());
+    let fallback_rpc_client = normalized_fallback_url.map(|url| {
+        Arc::new(RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig::default(),
+            CommitmentConfig {
+                commitment: config.rpc_commitment,
+            },
+        ))
+    });
 
     // The withdraw operator's compensating remint MintTo must broadcast on the source
     // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
@@ -72,6 +72,17 @@ pub async fn run(
                 .to_string(),
         ));
     }
+
+    // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require an
+    // independent, same-cluster, reachable fallback before starting.
+    validate_withdraw_fallback(
+        common_config.program_type,
+        &rpc_client,
+        fallback_rpc_client.as_deref(),
+        &common_config.rpc_url,
+        normalized_fallback_url,
+    )
+    .await?;
 
     // Initialize source RPC client if configured
     let source_rpc_client = common_config.source_rpc_url.as_ref().map(|url| {
@@ -422,6 +433,53 @@ async fn run_withdraw_preflight(
     }
 }
 
+/// Withdraw-only gate for the mandatory Solana fallback: require a second endpoint that is independent, same-cluster
+/// (equal genesis hash), and reachable, or refuse to start. Archival depth is left to the per-attempt ledger-floor check.
+async fn validate_withdraw_fallback(
+    program_type: crate::config::ProgramType,
+    rpc_client: &RpcClientWithRetry,
+    fallback: Option<&RpcClientWithRetry>,
+    rpc_url: &str,
+    fallback_url: Option<&str>,
+) -> Result<(), OperatorError> {
+    if program_type != crate::config::ProgramType::Withdraw {
+        return Ok(());
+    }
+
+    let (Some(fallback), Some(fallback_url)) = (fallback, fallback_url) else {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url is required for the withdraw operator: a lone Solana endpoint's \
+             absent status is not proof of non-inclusion"
+                .to_string(),
+        ));
+    };
+
+    if fallback_url == rpc_url {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url must differ from rpc_url: an independent endpoint, not the same node"
+                .to_string(),
+        ));
+    }
+
+    // getGenesisHash doubles as a reachability probe for each endpoint.
+    let primary_genesis = rpc_client
+        .get_genesis_hash()
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("rpc_url unreachable at startup: {e}")))?;
+    let fallback_genesis = fallback.get_genesis_hash().await.map_err(|e| {
+        OperatorError::RpcError(format!("fallback_rpc_url unreachable at startup: {e}"))
+    })?;
+
+    if primary_genesis != fallback_genesis {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url is on a different cluster than rpc_url (genesis hash mismatch)"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Log + metric for a critical task that exited before cancellation.
 ///
 /// We don't abort the process here — the caller falls through to
@@ -441,6 +499,7 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProgramType;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::operator::utils::smt_util::SmtState;
     use crate::storage::common::storage::mock::MockStorage;
@@ -448,6 +507,7 @@ mod tests {
     use base64::Engine;
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::Instance;
+    use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
 
@@ -572,6 +632,145 @@ mod tests {
                 ))
             ),
             "a real mismatch must refuse to start: {result:?}"
+        );
+    }
+
+    // ── withdraw fallback startup gate ───────────────────────────────
+
+    /// Register a `getGenesisHash` reply of `hash` (base58) on `server`.
+    fn mock_genesis(server: &mut mockito::ServerGuard, hash: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":"{hash}","id":0}}"#))
+            .create()
+    }
+
+    /// A withdraw operator with no fallback configured must refuse to start.
+    #[tokio::test]
+    async fn withdraw_missing_fallback_refuses_start() {
+        let primary = make_rpc_client("http://localhost:8899");
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            None,
+            "http://localhost:8899",
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// A fallback whose URL equals rpc_url is not independent; refuse to start.
+    #[tokio::test]
+    async fn withdraw_fallback_same_url_refuses_start() {
+        let primary = make_rpc_client("http://localhost:8899");
+        let fallback = make_rpc_client("http://localhost:8899");
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            "http://localhost:8899",
+            Some("http://localhost:8899"),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// Two reachable endpoints on different clusters (differing genesis) refuse.
+    #[tokio::test]
+    async fn withdraw_fallback_different_genesis_refuses_start() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let _p = mock_genesis(&mut primary_server, &Hash::new_unique().to_string());
+        let _f = mock_genesis(&mut fallback_server, &Hash::new_unique().to_string());
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            &primary_server.url(),
+            Some(&fallback_server.url()),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// An unreachable fallback (genesis RPC error) refuses to start.
+    #[tokio::test]
+    async fn withdraw_fallback_unreachable_refuses_start() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let _p = mock_genesis(&mut primary_server, &Hash::new_unique().to_string());
+        let _f = fallback_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"down"},"id":0}"#)
+            .create();
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            &primary_server.url(),
+            Some(&fallback_server.url()),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// Independent, same-cluster, reachable fallback: the gate passes.
+    #[tokio::test]
+    async fn withdraw_valid_fallback_passes() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let genesis = Hash::new_unique().to_string();
+        let _p = mock_genesis(&mut primary_server, &genesis);
+        let _f = mock_genesis(&mut fallback_server, &genesis);
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            &primary_server.url(),
+            Some(&fallback_server.url()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "matching genesis + distinct URLs must pass: {result:?}"
+        );
+    }
+
+    /// The mandatory-fallback rule is withdraw-only: an escrow operator with no
+    /// fallback passes the gate untouched.
+    #[tokio::test]
+    async fn escrow_no_fallback_passes() {
+        let primary = make_rpc_client("http://localhost:8899");
+        let result = validate_withdraw_fallback(
+            ProgramType::Escrow,
+            &primary,
+            None,
+            "http://localhost:8899",
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "escrow must not require a fallback: {result:?}"
         );
     }
 }

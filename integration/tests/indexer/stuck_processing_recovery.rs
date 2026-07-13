@@ -10,7 +10,7 @@ use {
         metrics::{OPERATOR_STALE_PROCESSING_RECOVERED, OPERATOR_TRANSACTION_ERRORS},
         operator::{
             recovery::test_hooks,
-            sender::{test_hooks as sender_hooks, types::SenderState},
+            sender::{test_hooks as sender_hooks, types::SendDurability, types::SenderState},
             utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
             utils::rpc_util::{RetryConfig, RpcClientWithRetry},
             TransactionStatusUpdate,
@@ -312,6 +312,8 @@ async fn it2b_deposit_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -351,6 +353,8 @@ async fn it3_withdrawal_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -1225,7 +1229,7 @@ async fn drive_first_fire(
         RetryPolicy::None,
         ExtraErrorCheckPolicy::None,
         storage_tx,
-        true,
+        SendDurability::Recoverable,
         Some(token),
     )
     .await;
@@ -1337,7 +1341,7 @@ async fn unguarded_first_fire_would_broadcast_on_demoted_row() {
         RetryPolicy::None,
         ExtraErrorCheckPolicy::None,
         &storage_tx,
-        true,
+        SendDurability::Recoverable,
         None,
     )
     .await;

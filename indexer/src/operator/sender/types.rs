@@ -83,6 +83,19 @@ pub struct TransactionContext {
     pub trace_id: Option<String>,
 }
 
+/// How a fire-and-store send is handled, decided by whether it carries user value.
+///
+/// `Recoverable` (value-bearing user `Mint`): journal the signature before broadcast, and
+/// on a pre-broadcast build/sign failure leave the row Processing for recovery.
+///
+/// `Terminal` (`InitializeMint`): mints no balance and is on-chain idempotent, so no
+/// journal, and a build/sign failure fails fast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendDurability {
+    Recoverable,
+    Terminal,
+}
+
 /// Transaction status update to send to storage
 #[derive(Debug, Clone)]
 pub struct TransactionStatusUpdate {

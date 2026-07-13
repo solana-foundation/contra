@@ -172,7 +172,7 @@ pub mod test_hooks {
         retry_policy: crate::operator::utils::instruction_util::RetryPolicy,
         extra_error_checks_policy: crate::operator::utils::instruction_util::ExtraErrorCheckPolicy,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-        persist: bool,
+        durability: super::types::SendDurability,
         deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> bool {
         let Ok(permit) = Arc::clone(&state.semaphore).try_acquire_owned() else {
@@ -189,7 +189,7 @@ pub mod test_hooks {
             retry_policy,
             extra_error_checks_policy,
             storage_tx.clone(),
-            persist,
+            durability,
             deposit_expected_updated_at,
             permit,
         )

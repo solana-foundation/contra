@@ -25,8 +25,9 @@ network: localnet
 #   mainnet  : your dedicated RPC (Helius, Triton, QuickNode, etc.).
 rpc_url: http://127.0.0.1:18899
 
-# fallback_rpc_url - optional archival Solana RPC that re-checks a Dead finality
-# verdict. Set on devnet/mainnet (different provider); leave empty on localnet.
+# fallback_rpc_url - archival Solana RPC that re-checks a Dead finality verdict.
+# REQUIRED off localnet: the withdraw operator refuses to start without an
+# independent, same-cluster endpoint. Leave empty only on localnet.
 fallback_rpc_url: ""
 
 # yellowstone_endpoint — Yellowstone gRPC endpoint for indexer-solana real-time

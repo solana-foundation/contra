@@ -300,6 +300,8 @@ async fn it2b_deposit_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -339,6 +341,8 @@ async fn it3_withdrawal_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 

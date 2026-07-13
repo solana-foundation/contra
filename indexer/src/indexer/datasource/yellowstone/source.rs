@@ -26,11 +26,17 @@ use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInst
 use crate::storage::Storage;
 
 #[cfg(feature = "datasource-rpc")]
+use crate::error::{BackfillError, CheckpointError};
+#[cfg(feature = "datasource-rpc")]
 use crate::indexer::{
     backfill::{fill_slot_range, validate_gap},
     checkpoint::get_last_checkpoint,
     datasource::rpc_polling::rpc::RpcPoller,
 };
+#[cfg(feature = "datasource-rpc")]
+use std::future::Future;
+#[cfg(feature = "datasource-rpc")]
+use std::time::Duration;
 
 /// Yellowstone gRPC datasource - subscribes to atomic per-slot blocks
 pub struct YellowstoneSource {
@@ -104,57 +110,160 @@ impl YellowstoneSource {
 }
 
 #[cfg(feature = "datasource-rpc")]
-async fn try_fill_reconnect_gap(
-    checkpoint: u64,
+const RECONNECT_GAP_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Terminal states of the reconnect gap repair; there is no error variant because
+/// failures retry inside the loop instead of falling through to a resubscribe.
+#[cfg(feature = "datasource-rpc")]
+#[derive(Debug, PartialEq, Eq)]
+enum GapFillOutcome {
+    Resolved,
+    Cancelled,
+}
+
+/// Repairs the reconnect gap (checkpoint, tip], returning Resolved only once every
+/// slot is indexed or proven empty; failures retry in place with backoff so the
+/// caller can never resubscribe over an open gap. Cancellation wins every wait.
+#[cfg(feature = "datasource-rpc")]
+#[allow(clippy::too_many_arguments)]
+async fn ensure_reconnect_gap_filled<F, Fut>(
+    get_checkpoint: F,
     rpc_poller: &RpcPoller,
     max_gap_slots: u64,
     batch_size: usize,
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
     instruction_tx: &InstructionSender,
-) -> Result<u64, DataSourceError> {
-    let current_slot =
-        rpc_poller
-            .get_latest_slot()
-            .await
-            .map_err(|e| DataSourceError::GapFillFailed {
-                reason: format!("Failed to get latest slot: {}", e),
-            })?;
+    cancel: &CancellationToken,
+    backoff: Duration,
+) -> GapFillOutcome
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<u64, CheckpointError>>,
+{
+    loop {
+        if cancel.is_cancelled() {
+            return GapFillOutcome::Cancelled;
+        }
 
-    // Validate against the real checkpoint distance; the boundary slot is
-    // included only when handing off to fill_slot_range below.
-    match validate_gap(current_slot, checkpoint, max_gap_slots) {
-        Ok(None) => {
-            info!(
-                "No gap detected on reconnect. Current slot: {}, checkpoint: {}",
-                current_slot, checkpoint
-            );
-            Ok(0)
+        // Re-read every cycle so an operator resync moves the anchor without a restart.
+        let checkpoint = match get_checkpoint().await {
+            Ok(slot) => slot,
+            Err(e) => {
+                warn!(
+                    "Reconnect gap-fill: checkpoint read failed, retrying: {}",
+                    e
+                );
+                record_gap_fill_error(program_type);
+                if backoff_cancelled(cancel, backoff).await {
+                    return GapFillOutcome::Cancelled;
+                }
+                continue;
+            }
+        };
+
+        // Fresh system: startup backfill owns initial catch-up.
+        if checkpoint == 0 {
+            return GapFillOutcome::Resolved;
         }
-        Ok(Some(gap)) => {
-            let replay_anchor = checkpoint.saturating_sub(1);
-            info!(
-                "Gap detected on reconnect: {} slots (replaying from {} to {}). Backfilling...",
-                gap, replay_anchor, current_slot
-            );
-            fill_slot_range(
-                rpc_poller,
-                replay_anchor,
-                current_slot,
-                batch_size,
-                program_type,
-                escrow_instance_id,
-                instruction_tx,
-            )
-            .await
-            .map_err(|e| DataSourceError::GapFillFailed {
-                reason: e.to_string(),
-            })
+
+        let current_slot = match rpc_poller.get_latest_slot().await {
+            Ok(slot) => slot,
+            Err(e) => {
+                warn!("Reconnect gap-fill: tip fetch failed, retrying: {}", e);
+                record_gap_fill_error(program_type);
+                if backoff_cancelled(cancel, backoff).await {
+                    return GapFillOutcome::Cancelled;
+                }
+                continue;
+            }
+        };
+
+        let gap = match validate_gap(current_slot, checkpoint, max_gap_slots) {
+            Ok(None) => {
+                info!(
+                    "No gap detected on reconnect. Current slot: {}, checkpoint: {}",
+                    current_slot, checkpoint
+                );
+                return GapFillOutcome::Resolved;
+            }
+            Ok(Some(gap)) => gap,
+            // Retrying cannot shrink an oversized gap (validate_gap is endpoint-independent),
+            // so hold the checkpoint frozen and stay loud until an operator intervenes.
+            Err(BackfillError::GapTooLarge { gap, max_gap }) => {
+                error!(
+                    "Reconnect gap too large: {} slots (max {}). Checkpoint frozen at {}; \
+                     raise backfill.max_gap_slots or resync. This will not self-heal.",
+                    gap, max_gap, checkpoint
+                );
+                record_gap_fill_error(program_type);
+                if backoff_cancelled(cancel, backoff).await {
+                    return GapFillOutcome::Cancelled;
+                }
+                continue;
+            }
+            Err(e) => {
+                warn!("Reconnect gap validation failed, retrying: {}", e);
+                record_gap_fill_error(program_type);
+                if backoff_cancelled(cancel, backoff).await {
+                    return GapFillOutcome::Cancelled;
+                }
+                continue;
+            }
+        };
+
+        // The boundary slot may be half-forwarded when the stream died, so replay
+        // from checkpoint-1 to include it; inserts are idempotent.
+        let replay_anchor = checkpoint.saturating_sub(1);
+        info!(
+            "Gap detected on reconnect: {} slots (replaying from {} to {}). Backfilling...",
+            gap, replay_anchor, current_slot
+        );
+
+        match fill_slot_range(
+            rpc_poller,
+            replay_anchor,
+            current_slot,
+            batch_size,
+            program_type,
+            escrow_instance_id,
+            instruction_tx,
+        )
+        .await
+        {
+            Ok(filled) => {
+                info!(
+                    "Reconnect gap-fill complete: {} slots backfilled (from checkpoint {})",
+                    filled, checkpoint
+                );
+                return GapFillOutcome::Resolved;
+            }
+            Err(e) => {
+                warn!("Reconnect gap-fill failed, retrying: {}", e);
+                record_gap_fill_error(program_type);
+            }
         }
-        Err(e) => Err(DataSourceError::GapFillFailed {
-            reason: e.to_string(),
-        }),
+
+        if backoff_cancelled(cancel, backoff).await {
+            return GapFillOutcome::Cancelled;
+        }
     }
+}
+
+/// Waits one backoff period; true means cancellation fired first.
+#[cfg(feature = "datasource-rpc")]
+async fn backoff_cancelled(cancel: &CancellationToken, backoff: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => true,
+        _ = tokio::time::sleep(backoff) => false,
+    }
+}
+
+#[cfg(feature = "datasource-rpc")]
+fn record_gap_fill_error(program_type: ProgramType) {
+    metrics::INDEXER_RPC_ERRORS
+        .with_label_values(&[program_type.as_label(), "gap_fill"])
+        .inc();
 }
 
 #[async_trait]
@@ -236,65 +345,25 @@ impl DataSource for YellowstoneSource {
 
                 #[cfg(feature = "datasource-rpc")]
                 {
-                    // Anchor on the durable checkpoint, not an in-memory watermark.
-                    // A live block can partially forward before erroring, so the boundary slot
-                    // may be incomplete; replay must include S itself. Inserts are idempotent,
-                    // so replaying the boundary slot is safe.
-                    if let (Some(ref poller), Some(ref storage)) = (&rpc_poller, &storage) {
-                        let checkpoint = match get_last_checkpoint(storage, program_type).await {
-                            Ok(slot) => slot,
-                            Err(e) => {
-                                warn!(
-                                    "Reconnect gap-fill skipped: failed to read checkpoint: {}",
-                                    e
-                                );
-                                // Backoff so a persistent storage outage paired with a
-                                // fast-failing Yellowstone endpoint can't spin the loop.
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                                continue;
-                            }
-                        };
-
-                        if checkpoint == 0 {
-                            // Fresh system, startup backfill handles initial catch-up.
-                            continue;
-                        }
-
-                        match try_fill_reconnect_gap(
-                            checkpoint,
+                    // Repairing the gap is a hard precondition for resubscribing: a live
+                    // SlotComplete at the tip would advance the durable checkpoint past
+                    // the unfilled range, so the loop must not fall through on failure.
+                    if let (Some(poller), Some(storage)) = (&rpc_poller, &storage) {
+                        match ensure_reconnect_gap_filled(
+                            || get_last_checkpoint(storage, program_type),
                             poller,
                             max_gap_slots,
                             batch_size,
                             program_type,
                             escrow_instance_id,
                             &tx,
+                            &cancellation_token,
+                            RECONNECT_GAP_RETRY_BACKOFF,
                         )
                         .await
                         {
-                            Ok(filled) => {
-                                if filled > 0 {
-                                    info!(
-                                        "Reconnect gap-fill complete: {} slots backfilled \
-                                         (from checkpoint {})",
-                                        filled, checkpoint
-                                    );
-                                }
-                            }
-                            Err(DataSourceError::GapFillFailed { ref reason })
-                                if reason.contains("Gap too large") =>
-                            {
-                                error!(
-                                    "Reconnect gap too large (checkpoint: {}): {}. \
-                                     Operator should investigate; next startup backfill will catch it.",
-                                    checkpoint, reason
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Reconnect gap-fill failed (checkpoint: {}): {}. Continuing reconnect.",
-                                    checkpoint, e
-                                );
-                            }
+                            GapFillOutcome::Resolved => {}
+                            GapFillOutcome::Cancelled => break,
                         }
                     }
                 }
@@ -525,48 +594,87 @@ mod tests {
             .create()
     }
 
-    #[tokio::test]
-    async fn try_fill_reconnect_gap_no_gap() {
-        let mut server = Server::new_async().await;
+    /// A short backoff keeps the retry-loop tests fast; prod uses RECONNECT_GAP_RETRY_BACKOFF.
+    const TEST_BACKOFF: Duration = Duration::from_millis(10);
 
-        let _m = mock_get_slot(&mut server, 100);
-
-        let poller = RpcPoller::new(
+    fn test_poller(server: &Server) -> RpcPoller {
+        RpcPoller::new(
             server.url(),
             UiTransactionEncoding::Json,
             CommitmentLevel::Finalized,
-        );
-
-        let (tx, _rx) = mpsc::channel(64);
-        let result =
-            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
-
-        assert_eq!(result.unwrap(), 0);
+        )
     }
 
+    fn checkpoint_ok(slot: u64) -> impl Fn() -> std::future::Ready<Result<u64, CheckpointError>> {
+        move || std::future::ready(Ok(slot))
+    }
+
+    /// no gap on reconnect resolves immediately without fetching any block.
     #[tokio::test]
-    async fn try_fill_reconnect_gap_fills_gap() {
+    async fn gap_fill_no_gap_resolves_without_fetching_blocks() {
         let mut server = Server::new_async().await;
+        let _m = mock_get_slot(&mut server, 100);
+        let no_blocks = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({"method": "getBlock"})))
+            .expect(0)
+            .create_async()
+            .await;
 
-        // checkpoint = 100, current_slot = 103 → replay anchor = 99,
-        // fill_slot_range emits slots 100..=103 (boundary slot included).
-        let _m_slot = mock_get_slot(&mut server, 103);
-        let _m0 = mock_get_block_success(&mut server, 100);
-        let _m1 = mock_get_block_success(&mut server, 101);
-        let _m2 = mock_get_block_success(&mut server, 102);
-        let _m3 = mock_get_block_success(&mut server, 103);
-
-        let poller = RpcPoller::new(
-            server.url(),
-            UiTransactionEncoding::Json,
-            CommitmentLevel::Finalized,
-        );
-
+        let poller = test_poller(&server);
         let (tx, mut rx) = mpsc::channel(64);
-        let result =
-            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
+        let cancel = CancellationToken::new();
 
-        assert_eq!(result.unwrap(), 4);
+        let outcome = ensure_reconnect_gap_filled(
+            checkpoint_ok(100),
+            &poller,
+            1000,
+            10,
+            ProgramType::Escrow,
+            None,
+            &tx,
+            &cancel,
+            TEST_BACKOFF,
+        )
+        .await;
+
+        assert_eq!(outcome, GapFillOutcome::Resolved);
+        no_blocks.assert_async().await;
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "no messages may be emitted when there is no gap"
+        );
+    }
+
+    /// Checkpoint 100, tip 103; the fill replays the boundary slot (anchor 99)
+    /// and emits SlotComplete for exactly 100..=103.
+    #[tokio::test]
+    async fn gap_fill_fills_gap_and_replays_boundary_slot() {
+        let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 103);
+        let _blocks: Vec<_> = (100..=103)
+            .map(|s| mock_get_block_success(&mut server, s))
+            .collect();
+
+        let poller = test_poller(&server);
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let outcome = ensure_reconnect_gap_filled(
+            checkpoint_ok(100),
+            &poller,
+            1000,
+            10,
+            ProgramType::Escrow,
+            None,
+            &tx,
+            &cancel,
+            TEST_BACKOFF,
+        )
+        .await;
+
+        assert_eq!(outcome, GapFillOutcome::Resolved);
         drop(tx);
 
         let mut slots = vec![];
@@ -575,20 +683,146 @@ mod tests {
                 slots.push(slot);
             }
         }
-
         assert_eq!(slots, vec![100, 101, 102, 103]);
     }
 
-    /// An unavailable slot encountered during reconnect gap-fill must abort the fill
-    /// with GapFillFailed rather than checkpoint past the gap.
+    /// Checkpoint 0 is a fresh system; startup backfill owns catch-up, so the
+    /// wrapper resolves without a single RPC call.
     #[tokio::test]
-    async fn try_fill_reconnect_gap_unavailable_slot_fails_closed() {
+    async fn gap_fill_fresh_system_resolves_without_rpc() {
         let mut server = Server::new_async().await;
+        let untouched = server.mock("POST", "/").expect(0).create_async().await;
 
-        // checkpoint = 100, current_slot = 103 => replay anchor 99, batch [100..=103].
-        // Slot 100 is absent below the floor (100 < 500) => Unavailable.
+        let poller = test_poller(&server);
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let outcome = ensure_reconnect_gap_filled(
+            checkpoint_ok(0),
+            &poller,
+            1000,
+            10,
+            ProgramType::Escrow,
+            None,
+            &tx,
+            &cancel,
+            TEST_BACKOFF,
+        )
+        .await;
+
+        assert_eq!(outcome, GapFillOutcome::Resolved);
+        untouched.assert_async().await;
+    }
+
+    /// A failing checkpoint read retries instead of skipping the gap check.
+    #[tokio::test]
+    async fn gap_fill_retries_checkpoint_read_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut server = Server::new_async().await;
+        let _m = mock_get_slot(&mut server, 100);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = calls.clone();
+        let get_checkpoint = move || {
+            let n = calls_in.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(CheckpointError::InvalidCheckpoint { slot: 0, last: 0 })
+                } else {
+                    Ok(100)
+                }
+            }
+        };
+
+        let poller = test_poller(&server);
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+
+        let outcome = ensure_reconnect_gap_filled(
+            get_checkpoint,
+            &poller,
+            1000,
+            10,
+            ProgramType::Escrow,
+            None,
+            &tx,
+            &cancel,
+            TEST_BACKOFF,
+        )
+        .await;
+
+        assert_eq!(outcome, GapFillOutcome::Resolved);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A failing tip fetch retries in place and resolves once the endpoint heals.
+    #[tokio::test]
+    async fn gap_fill_retries_tip_fetch_failures() {
+        let mut server = Server::new_async().await;
+        let err_mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({"method": "getSlot"})))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "Invalid request" },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let poller = test_poller(&server);
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            ensure_reconnect_gap_filled(
+                checkpoint_ok(100),
+                &poller,
+                1000,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+                &cancel_task,
+                TEST_BACKOFF,
+            )
+            .await
+        });
+
+        // Observe at least one failed attempt before healing the endpoint.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !err_mock.matched_async().await {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("tip fetch error was never observed");
+
+        // mockito matches the newest-registered mock first, so this overrides the error.
+        let _ok = mock_get_slot(&mut server, 100);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("must resolve after the tip fetch heals")
+            .unwrap();
+        assert_eq!(outcome, GapFillOutcome::Resolved);
+    }
+
+    /// An unavailable (pruned) slot stalls the loop with repeated attempts;
+    /// no SlotComplete ever leaks and cancellation ends the stall.
+    #[tokio::test]
+    async fn gap_fill_unavailable_slot_stalls_without_slot_complete() {
+        let mut server = Server::new_async().await;
         let _m_slot = mock_get_slot(&mut server, 103);
-        let _m_absent = server
+        // Slot 100 is absent below the floor (100 < 500) => Unavailable.
+        let absent = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
                 "method": "getBlock",
@@ -603,55 +837,151 @@ mod tests {
                 })
                 .to_string(),
             )
-            .create();
+            .expect_at_least(2)
+            .create_async()
+            .await;
         let _floor = mock_first_available_block(&mut server, 500);
+        let _rest: Vec<_> = (101..=103)
+            .map(|s| mock_get_block_success(&mut server, s))
+            .collect();
 
-        let poller = RpcPoller::new(
-            server.url(),
-            UiTransactionEncoding::Json,
-            CommitmentLevel::Finalized,
-        );
+        let poller = test_poller(&server);
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
 
-        let (tx, _rx) = mpsc::channel(64);
-        let result =
-            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
+        let mut handle = tokio::spawn(async move {
+            ensure_reconnect_gap_filled(
+                checkpoint_ok(100),
+                &poller,
+                1000,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+                &cancel_task,
+                TEST_BACKOFF,
+            )
+            .await
+        });
 
-        let err = result.unwrap_err();
-        let err_str = err.to_string();
+        // Stalls across at least two fill attempts instead of returning an error.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !absent.matched_async().await {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("expected at least two attempts on the pruned slot");
+
         assert!(
-            err_str.contains("Gap fill failed"),
-            "expected GapFillFailed: {err_str}"
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "must not return while the slot is unavailable"
         );
-        assert!(
-            err_str.contains("unavailable") && err_str.contains("100"),
-            "error should name the unavailable slot: {err_str}"
-        );
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg, ProcessorMessage::SlotComplete { .. }),
+                "no SlotComplete may leak past an unavailable slot"
+            );
+        }
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("cancellation must end the stall")
+            .unwrap();
+        assert_eq!(outcome, GapFillOutcome::Cancelled);
     }
 
+    /// An oversized gap stalls loudly with no fill attempt at all, because
+    /// validate_gap rejects it before any block fetch.
     #[tokio::test]
-    async fn try_fill_reconnect_gap_too_large() {
+    async fn gap_fill_too_large_stalls_without_fill() {
         let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 200);
+        let no_blocks = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({"method": "getBlock"})))
+            .expect(0)
+            .create_async()
+            .await;
 
-        let _m = mock_get_slot(&mut server, 200);
-
-        let poller = RpcPoller::new(
-            server.url(),
-            UiTransactionEncoding::Json,
-            CommitmentLevel::Finalized,
-        );
-
+        let poller = test_poller(&server);
         let (tx, _rx) = mpsc::channel(64);
-        let result =
-            try_fill_reconnect_gap(100, &poller, 10, 10, ProgramType::Escrow, None, &tx).await;
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let err_str = err.to_string();
+        let mut handle = tokio::spawn(async move {
+            ensure_reconnect_gap_filled(
+                checkpoint_ok(100),
+                &poller,
+                10,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+                &cancel_task,
+                TEST_BACKOFF,
+            )
+            .await
+        });
+
+        // Let several retry cycles elapse; the loop must neither resolve nor fill.
+        tokio::time::sleep(TEST_BACKOFF * 5).await;
         assert!(
-            err_str.contains("Gap too large"),
-            "Expected 'Gap too large' in error: {}",
-            err_str
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "an oversized gap must stall, not resolve"
         );
+        no_blocks.assert_async().await;
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("cancellation must end the stall")
+            .unwrap();
+        assert_eq!(outcome, GapFillOutcome::Cancelled);
+    }
+
+    /// Cancellation during the backoff returns promptly instead of sleeping
+    /// out the full production backoff.
+    #[tokio::test]
+    async fn gap_fill_cancellation_interrupts_backoff_promptly() {
+        let mut server = Server::new_async().await;
+        let _err = mock_get_slot_error(&mut server);
+
+        let poller = test_poller(&server);
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+
+        let handle = tokio::spawn(async move {
+            ensure_reconnect_gap_filled(
+                checkpoint_ok(100),
+                &poller,
+                1000,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+                &cancel_task,
+                RECONNECT_GAP_RETRY_BACKOFF,
+            )
+            .await
+        });
+
+        // Land inside the first (5s) backoff, then cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("cancellation must interrupt the backoff, not wait it out")
+            .unwrap();
+        assert_eq!(outcome, GapFillOutcome::Cancelled);
     }
 
     /// Borsh-encoded WithdrawFunds payload (discriminator 0, amount, None destination)
@@ -797,32 +1127,6 @@ mod tests {
         assert_eq!(metas.len(), 2);
         assert_eq!(metas[0].instruction_index, 0);
         assert_eq!(metas[1].instruction_index, 2);
-    }
-
-    #[tokio::test]
-    async fn try_fill_reconnect_gap_rpc_failure() {
-        let mut server = Server::new_async().await;
-
-        let _m = mock_get_slot_error(&mut server);
-
-        let poller = RpcPoller::new(
-            server.url(),
-            UiTransactionEncoding::Json,
-            CommitmentLevel::Finalized,
-        );
-
-        let (tx, _rx) = mpsc::channel(64);
-        let result =
-            try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let err_str = err.to_string();
-        assert!(
-            err_str.contains("Failed to get latest slot"),
-            "Expected 'Failed to get latest slot' in error: {}",
-            err_str
-        );
     }
 
     /// A CPI-only withdraw surfaces as a row carrying the parent's top-level index and the inner position.

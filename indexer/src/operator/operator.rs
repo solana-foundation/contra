@@ -73,6 +73,43 @@ pub async fn run(
         ));
     }
 
+    // A detected reconciliation mismatch must never degrade to a silent log, so
+    // the escrow operator refuses to start without an alert webhook. Blank or
+    // whitespace (env renders an unset var as "") counts as unset, mirroring the
+    // fallback_rpc_url normalization above. Placed before any task spawns, so the
+    // early return needs no writer drain.
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && config
+            .reconciliation_webhook_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(OperatorError::WebhookError(
+            "reconciliation_webhook_url required for Escrow operator: a reconciliation \
+             mismatch must always alert, never silently log"
+                .to_string(),
+        ));
+    }
+
+    // The runtime solvency check must always run, so the escrow operator refuses to
+    // start without the Solana custody RPC it reads balances from (blank counts as unset).
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && common_config
+            .source_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(OperatorError::RpcError(
+            "source_rpc_url required for Escrow operator: the supply-vs-custody \
+             reconciliation reads Solana custody from it and must always run"
+                .to_string(),
+        ));
+    }
+
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require an
     // independent, same-cluster, reachable fallback before starting.
     validate_withdraw_fallback(
@@ -230,29 +267,44 @@ pub async fn run(
     // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
     let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
     {
-        if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
-            let reconciliation_storage = storage.clone();
-            let reconciliation_config = config.clone();
-            let reconciliation_rpc = source_rpc_client
-                .clone()
-                .unwrap_or_else(|| rpc_client.clone());
-            let reconciliation_token = cancellation_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = reconciliation::run_reconciliation(
-                    reconciliation_storage,
-                    reconciliation_config,
-                    reconciliation_rpc,
-                    reconciliation_escrow,
-                    reconciliation_token,
-                )
-                .await
-                {
-                    tracing::error!("Reconciliation error: {}", e);
-                }
-            })
-        } else {
-            warn!("Skipping reconciliation: escrow_instance_id is not configured");
-            tokio::spawn(async {})
+        // Both are guaranteed present for a validated escrow config: source_rpc_url
+        // is enforced above and escrow_instance_id by config validation. Fail loud
+        // rather than silently skip if that ever regresses.
+        match (common_config.escrow_instance_id, source_rpc_client.clone()) {
+            (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
+                let reconciliation_storage = storage.clone();
+                let reconciliation_config = config.clone();
+                // Custody (Solana escrow ATAs) is read from source_rpc_client;
+                // channel-token supply lives on rpc_url (the PrivateChannel chain
+                // the escrow operator mints to). Custody must never be read from
+                // rpc_client: the escrow ATAs do not exist on the channel, so it
+                // would read 0 and trip a false halt.
+                let reconciliation_channel_rpc = rpc_client.clone();
+                let reconciliation_health = health.clone();
+                let reconciliation_token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = reconciliation::run_reconciliation(
+                        reconciliation_storage,
+                        reconciliation_config,
+                        reconciliation_rpc,
+                        reconciliation_channel_rpc,
+                        reconciliation_escrow,
+                        reconciliation_health,
+                        reconciliation_token,
+                    )
+                    .await
+                    {
+                        tracing::error!("Reconciliation error: {}", e);
+                    }
+                })
+            }
+            _ => {
+                return Err(OperatorError::RpcError(
+                    "escrow reconciliation requires both escrow_instance_id and \
+                     source_rpc_url; one is missing after startup validation"
+                        .to_string(),
+                ));
+            }
         }
     } else {
         tokio::spawn(async {})

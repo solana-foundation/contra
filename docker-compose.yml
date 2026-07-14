@@ -436,6 +436,9 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
+      # source_rpc_url = channel (gateway) handle for the startup supply invariant
+      # (supply <= custody). Required for escrow: the indexer refuses to start without it.
+      - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
       - INDEXER_YELLOWSTONE_ENDPOINT=http://validator:10000
       - METRICS_PORT=9100
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
@@ -533,6 +536,10 @@ services:
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - METRICS_PORT=9102
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      # Required for the escrow operator: a reconciliation mismatch must always
+      # alert, so the operator refuses to start without this. Dev/devnet may point
+      # at any sink (presence is checked at startup, delivery failures are logged).
+      - OPERATOR_RECONCILIATION_WEBHOOK_URL=${RECONCILIATION_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:
       # Exposed to host so bench-tps can scrape private_channel_operator_mints_sent_total
       # from outside Docker for e2e deposit measurement (BENCH_INDEXER_METRICS_URL).

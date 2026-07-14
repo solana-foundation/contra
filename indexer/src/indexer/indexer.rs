@@ -90,6 +90,9 @@ pub async fn run(
                     common_config.program_type,
                     &storage,
                     &common_config.rpc_url,
+                    // For the escrow indexer, source_rpc_url is the channel (gateway)
+                    // handle used only for the supply invariant; None skips it.
+                    common_config.source_rpc_url.as_deref(),
                     &seed,
                 )
                 .await?;

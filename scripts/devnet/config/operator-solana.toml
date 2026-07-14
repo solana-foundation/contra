@@ -23,3 +23,7 @@ retry_base_delay_secs = 1
 channel_buffer_size = 1000
 # Solana Private Channels block time is ~100 ms; poll quickly to reduce per-mint latency
 confirmation_poll_interval_ms = 100
+# Required for the escrow operator: a reconciliation mismatch must always alert,
+# so the operator refuses to start without this. Override via
+# OPERATOR_RECONCILIATION_WEBHOOK_URL for a real endpoint.
+reconciliation_webhook_url = "http://localhost:9/no-op"

@@ -11,7 +11,8 @@
 //! 4. Failure alerts: failed mint and failed withdrawal each fire a webhook POST.
 //! 5. Batch deposits: operator processes 5 deposits for distinct recipients in one sweep.
 //! 6. Idle operator: no phantom records created when the DB has no pending work.
-//! 7. Periodic reconciliation: mismatch between DB totals and on-chain ATA fires a webhook.
+//! 7. Runtime reconciliation halt: channel supply over-issued beyond escrow custody
+//!    trips the durable halt, forced-unhealthy latch, quarantine, and webhook alert.
 //! 8. Sequential withdrawals: two consecutive withdrawal nonces both complete correctly.
 //! 9. SMT root mismatch on startup: a poisoned local SMT state (nonce 0 completed but
 //!    on-chain disagrees) must drive the next pending withdrawal out of `pending` via
@@ -40,6 +41,7 @@ use private_channel_indexer::storage::common::models::{
 };
 use private_channel_indexer::storage::{PostgresDb, Storage, TransactionType};
 use private_channel_indexer::PostgresConfig;
+use private_channel_metrics::{HealthConfig, HealthState};
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -84,7 +86,10 @@ fn default_operator_config(alert_url: Option<String>) -> OperatorConfig {
         alert_webhook_url: alert_url,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        // Escrow operators refuse to start without a reconciliation webhook; a
+        // placeholder satisfies the startup gate for harnesses that don't assert
+        // delivery. Tests that check delivery override this with a mock URL.
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
         confirmation_poll_interval_ms: 400,
     }
@@ -874,22 +879,21 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// (periodic reconciliation): the reconciliation loop fires a webhook
-/// alert when on-chain escrow balances diverge from the DB's completed totals.
-///
-/// Approach:
-/// 1. `AllowMint` creates an escrow ATA with 0 on-chain balance.
-/// 2. A completed deposit is seeded in the DB so the DB shows a positive balance.
-/// 3. The operator runs with `reconciliation_interval = 500 ms` and
-///    `reconciliation_tolerance_bps = 0`, guaranteeing that any delta triggers
-///    the alert.
-/// 4. We verify the mock webhook received at least one POST request.
+/// Runtime reconciliation must fail closed when on-chain channel-token supply
+/// exceeds escrow custody beyond the in-flight envelope (the custody-vs-supply
+/// invariant, which no other end-to-end test exercises). Supply is over-issued to a
+/// non-escrow holder so custody stays 0, then the durable halt flag, the
+/// forced-unhealthy latch, and quarantine of an active withdrawal are all
+/// asserted. The halt flag is polled with a timeout rather than slept on: it is
+/// monotonic (once set it stays set) and the mismatch is persistent, so every
+/// tick breaches and the 3-tick confirmation can never race.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
+async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Operator Lifecycle: Reconciliation Webhook on Mismatch ===");
+    println!("=== Operator Lifecycle: Reconciliation Halts on Supply Over-Issuance ===");
 
-    const SEEDED_AMOUNT: u64 = 50_000;
+    const OVER_ISSUED: u64 = 100_000;
+    const WITHDRAWAL_AMOUNT: u64 = 1_000;
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
@@ -917,40 +921,36 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
     );
     storage.init_schema().await?;
 
-    // AllowMint creates an escrow ATA with 0 on-chain balance — no real tokens
-    // are transferred, so the on-chain balance stays at 0 throughout the test.
+    // Escrow instance + allowed mint, escrow ATA custody 0, mint supply 0.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 0, 0, None).await?;
+    let mint = env.mint;
+    let instance = env.instance;
 
-    // Register the mint in the indexer DB so the reconciliation query includes it.
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
-    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+    seed_mint_status_allowed(&storage, &mint.to_string()).await?;
 
-    // Insert a deposit and mark it completed: DB now shows SEEDED_AMOUNT deposited,
-    // while on-chain remains 0 — a guaranteed mismatch with tolerance_bps = 0.
-    let sig = Signature::new_unique().to_string();
-    let deposit_txn =
-        DbTransactionBuilder::new(sig.clone(), 1, env.mint.to_string(), SEEDED_AMOUNT)
+    // Over-issue: mint supply to a NON-escrow holder so Mint.supply rises while
+    // the escrow custody stays 0. This is supply exceeding custody with no
+    // backing deposit, the operator-key over-issuance the invariant must catch.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])
+        .map_err(|e| format!("Failed to create admin keypair: {}", e))?;
+    let holder = Keypair::new();
+    mint_to_owner(&client, &admin, mint, holder.pubkey(), &admin, OVER_ISSUED).await?;
+
+    // One active (pending) withdrawal so the halt's quarantine has a row to flip.
+    // Its amount joins the mint's in-flight envelope but stays well under the gap.
+    let wd_sig = Signature::new_unique().to_string();
+    let withdrawal =
+        DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
             .initiator(Pubkey::new_unique().to_string())
             .recipient(Pubkey::new_unique().to_string())
-            .transaction_type(TransactionType::Deposit)
+            .transaction_type(TransactionType::Withdrawal)
             .build();
-    storage.insert_db_transaction(&deposit_txn).await?;
+    storage.insert_db_transaction(&withdrawal).await?;
 
-    // Bypass the operator pipeline and set the status directly — the reconciliation
-    // query only counts rows with status = 'completed'.
-    let pool = db::connect(&db_url).await?;
-    sqlx::query(
-        "UPDATE transactions SET status = 'completed'::transaction_status WHERE signature = $1",
-    )
-    .bind(&sig)
-    .execute(&pool)
-    .await?;
-
-    // Start a mock HTTP server; expect at least one reconciliation POST.
-    // No content-type constraint here — the reconciliation webhook client sends
-    // `Content-Type: application/json` via reqwest, but we only care that a POST
-    // arrived (matching the reconciliation unit-test mock convention).
+    // The halt's alert POST is the only webhook under the single-invariant design;
+    // assert it fired once the halt is observed.
     let mut mock_server = Server::new_async().await;
     let recon_mock = mock_server
         .mock("POST", "/")
@@ -959,24 +959,24 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         .create_async()
         .await;
 
-    // Short reconciliation interval so the first check fires almost immediately.
-    // Zero tolerance means any non-zero delta triggers an alert.
     let recon_config = OperatorConfig {
-        reconciliation_interval: Duration::from_millis(500),
+        reconciliation_interval: Duration::from_millis(200),
         reconciliation_tolerance_bps: 0,
         reconciliation_webhook_url: Some(mock_server.url()),
         ..default_operator_config(None)
     };
 
-    // Build a dedicated RPC client for the reconciliation task — mirrors what
-    // `operator::run` does when it spawns the reconciliation sub-task.
     let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
         test_validator.rpc_url(),
         RetryConfig::default(),
         CommitmentConfig::confirmed(),
     ));
+    // Single-validator test: custody and channel-supply reads both hit the same RPC.
+    let channel_rpc_client = rpc_client.clone();
 
-    let cancellation_token = CancellationToken::new();
+    let health = HealthState::new(HealthConfig::operator());
+    let health_for_task = Some(health.clone());
+
     let recon_storage = Arc::new(Storage::Postgres(
         PostgresDb::new(&PostgresConfig {
             database_url: db_url.clone(),
@@ -985,15 +985,16 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         .await?,
     ));
 
-    // Spawn `run_reconciliation` directly so the test exercises the exact same
-    // code path that the operator uses, without the ctrl_c() gate in `operator::run`.
+    let cancellation_token = CancellationToken::new();
     let recon_token_clone = cancellation_token.clone();
     let recon_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = run_reconciliation(
             recon_storage,
             recon_config,
             rpc_client,
-            env.instance,
+            channel_rpc_client,
+            instance,
+            health_for_task,
             recon_token_clone,
         )
         .await
@@ -1002,15 +1003,57 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         }
     });
 
-    // Give the reconciliation loop time to complete several cycles (interval = 500 ms).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Poll the monotonic halt flag with a deadline rather than sleeping a fixed
+    // window, so a slow CI just takes a few more ticks instead of going flaky.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let halt = loop {
+        if let Some(info) = storage.is_reconciliation_halted().await? {
+            break info;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reconciliation did not halt within the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
 
-    // Stop the reconciliation loop gracefully before asserting.
     cancellation_token.cancel();
     let _ = recon_handle.await;
 
-    // Confirm the reconciliation loop fired the webhook at least once.
+    // The reason names the mint and cites the supply gap, proving the custody-vs-supply
+    // invariant tripped the halt.
+    assert!(
+        halt.reason.contains(&mint.to_string()),
+        "halt reason should name the mint: {}",
+        halt.reason
+    );
+    assert!(
+        halt.reason.contains("supply by"),
+        "halt reason should cite the supply gap: {}",
+        halt.reason
+    );
+
+    // The halt fired the webhook alert, the only alert under the single invariant.
     recon_mock.assert_async().await;
+
+    // The forced-unhealthy latch is set so /health reports 503 for orchestration.
+    assert!(
+        !health.is_healthy(),
+        "operator health must be forced unhealthy after a halt"
+    );
+
+    // The active withdrawal was quarantined to manual_review by the halt.
+    let pool = db::connect(&db_url).await?;
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+            .bind(&wd_sig)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        status, "manual_review",
+        "active withdrawal must be quarantined when the pipeline halts"
+    );
+
     Ok(())
 }
 

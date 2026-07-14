@@ -14,6 +14,7 @@ pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
 pub mod get_escrow_balances_by_mint;
+pub mod get_in_flight_amounts_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
@@ -32,6 +33,7 @@ pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
 pub mod insert_remint_signature;
 pub mod quarantine_all_active_withdrawals;
+pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod sender_lock;
 pub mod set_mint_extension_flags;
@@ -223,6 +225,30 @@ impl Storage {
     /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
+    }
+
+    /// Per-mint sum of every unsettled transaction amount (pending / processing /
+    /// parked / pending_remint), used as the in-flight envelope by the runtime
+    /// reconciliation halt decision.
+    pub async fn get_in_flight_amounts_by_mint(
+        &self,
+    ) -> Result<Vec<MintInFlightAmount>, StorageError> {
+        get_in_flight_amounts_by_mint::get_in_flight_amounts_by_mint(self).await
+    }
+
+    /// Set the durable reconciliation halt flag. Idempotent.
+    pub async fn set_reconciliation_halt(&self, reason: &str) -> Result<(), StorageError> {
+        reconciliation_halt::set_reconciliation_halt(self, reason).await
+    }
+
+    /// Return the halt info when the flag is set, else `None` (not halted).
+    pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {
+        reconciliation_halt::is_reconciliation_halted(self).await
+    }
+
+    /// Clear the halt so both operators' fetchers resume (manual/runbook use).
+    pub async fn clear_reconciliation_halt(&self) -> Result<(), StorageError> {
+        reconciliation_halt::clear_reconciliation_halt(self).await
     }
 
     /// `transactions.id` for every `deposit` row whose mint was not in
@@ -1592,5 +1618,127 @@ mod tests {
         assert_eq!(poison.status, TransactionStatus::Processing);
         let sibling = rows.iter().find(|t| t.id == 43).unwrap();
         assert_eq!(sibling.status, TransactionStatus::ManualReview);
+    }
+
+    // ── reconciliation halt flag ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_then_is_halted_returns_reason() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        let info = storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halt should be set");
+        assert_eq!(info.reason, "mint X insolvent");
+    }
+
+    #[tokio::test]
+    async fn absent_is_not_halted() {
+        let (storage, _mock) = make_mock_storage();
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_unsets() {
+        let (storage, _mock) = make_mock_storage();
+        storage.set_reconciliation_halt("reason").await.unwrap();
+        storage.clear_reconciliation_halt().await.unwrap();
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_is_idempotent_on_conflict() {
+        let (storage, _mock) = make_mock_storage();
+        storage.set_reconciliation_halt("first").await.unwrap();
+        storage.set_reconciliation_halt("second").await.unwrap();
+        let info = storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halt should still be set");
+        assert_eq!(info.reason, "second", "re-set overwrites the reason");
+    }
+
+    // ── in-flight envelope query ──────────────────────────────────────
+
+    fn in_flight_txn(id: i64, mint: &str, amount: u64, status: TransactionStatus) -> DbTransaction {
+        let mut t = make_db_transaction();
+        t.id = id;
+        t.mint = mint.to_string();
+        t.amount = TokenAmount(amount);
+        t.status = status;
+        t
+    }
+
+    #[tokio::test]
+    async fn in_flight_sums_only_in_flight_statuses() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(in_flight_txn(1, "mint_a", 100, TransactionStatus::Pending));
+            db.push(in_flight_txn(
+                2,
+                "mint_a",
+                200,
+                TransactionStatus::Processing,
+            ));
+            db.push(in_flight_txn(3, "mint_a", 400, TransactionStatus::Parked));
+            db.push(in_flight_txn(
+                4,
+                "mint_a",
+                800,
+                TransactionStatus::PendingRemint,
+            ));
+            // Terminal statuses must be excluded from the envelope.
+            db.push(in_flight_txn(5, "mint_a", 1, TransactionStatus::Completed));
+            db.push(in_flight_txn(6, "mint_a", 2, TransactionStatus::Failed));
+            db.push(in_flight_txn(
+                7,
+                "mint_a",
+                4,
+                TransactionStatus::ManualReview,
+            ));
+        }
+        let rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mint_address, "mint_a");
+        assert_eq!(rows[0].in_flight_amount, BigDecimal::from(1500u64));
+    }
+
+    #[tokio::test]
+    async fn in_flight_groups_per_mint() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(in_flight_txn(1, "mint_a", 100, TransactionStatus::Pending));
+            db.push(in_flight_txn(
+                2,
+                "mint_b",
+                250,
+                TransactionStatus::Processing,
+            ));
+        }
+        let mut rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].mint_address, "mint_a");
+        assert_eq!(rows[0].in_flight_amount, BigDecimal::from(100u64));
+        assert_eq!(rows[1].mint_address, "mint_b");
+        assert_eq!(rows[1].in_flight_amount, BigDecimal::from(250u64));
+    }
+
+    #[tokio::test]
+    async fn in_flight_empty_is_absent() {
+        let (storage, _mock) = make_mock_storage();
+        assert!(storage
+            .get_in_flight_amounts_by_mint()
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

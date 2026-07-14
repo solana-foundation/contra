@@ -7,6 +7,9 @@ rpc_url = "http://localhost:18899"
 # and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"
 
+# Channel (gateway) RPC. Required for escrow: the startup supply invariant reads from it.
+source_rpc_url = "http://localhost:8898"
+
 # Placeholder — overridden at runtime by COMMON_ESCROW_INSTANCE_ID, which
 # bench-tps/scripts/run.sh derives from the persistent deposit-instance-seed.json
 # keypair and injects via .env before starting Docker services.

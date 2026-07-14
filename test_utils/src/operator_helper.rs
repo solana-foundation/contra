@@ -37,7 +37,7 @@ fn default_operator_config() -> OperatorConfig {
         alert_webhook_url: None,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
         confirmation_poll_interval_ms: 400,
     }
@@ -68,8 +68,9 @@ pub async fn start_solana_to_private_channel_operator(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
+        // Single-validator harness: Solana custody and the channel share one node.
+        source_rpc_url: Some(private_channel_rpc_url.clone()),
         rpc_url: private_channel_rpc_url,
-        source_rpc_url: None,
         fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
@@ -157,7 +158,7 @@ fn mock_operator_config() -> OperatorConfig {
         // to fire. Tests that do can script the relevant RPC replies.
         reconciliation_interval: Duration::from_secs(60 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         // Long feepayer monitor interval so the test isn't racing against
         // unrelated `getBalance` traffic. The first tick still happens at
         // start; tests that need it stubbed should enqueue a reply.
@@ -239,8 +240,9 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
+        // Mock harness: custody and channel both point at the one mock RPC.
+        source_rpc_url: Some(rpc.url()),
         rpc_url: rpc.url(),
-        source_rpc_url: None,
         fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),

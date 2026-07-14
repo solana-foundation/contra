@@ -193,7 +193,8 @@ where
             Err(BackfillError::GapTooLarge { gap, max_gap }) => {
                 error!(
                     "Reconnect gap too large: {} slots (max {}). Checkpoint frozen at {}; \
-                     raise backfill.max_gap_slots or resync. This will not self-heal.",
+                     resync to advance the checkpoint (the loop recovers without a restart \
+                     once the gap is within bounds), or raise backfill.max_gap_slots and restart.",
                     gap, max_gap, checkpoint
                 );
                 record_gap_fill_error(program_type);

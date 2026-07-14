@@ -28,8 +28,9 @@ pub(crate) const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// Per-tick batch cap; leftovers are picked up next tick.
 pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 
-/// Max durable Demote requeues before a stuck row is quarantined (paged).
-const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
+/// Max durable requeues before a stuck row is quarantined (paged). Bumped and
+/// enforced by both this sweep and the sender's pre-broadcast requeue path.
+pub(crate) const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
 /// Deposit recovery outcome. Uncertainty must NOT demote (double-mint risk); an
 /// in-flight signature leaves the row Processing for the next sweep.

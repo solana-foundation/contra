@@ -1361,6 +1361,41 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Status-only CAS `Processing` → `Pending` for pre-broadcast build/sign
+    /// failures. The sender owns the row while `processing`, so no `updated_at`
+    /// guard is needed. Bumps `recovery_requeue_attempts` so the recovery
+    /// quarantine cap survives restarts.
+    pub async fn try_requeue_prebroadcast_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending',
+                recovery_requeue_attempts = recovery_requeue_attempts + 1
+            WHERE id = $1
+              AND status = 'processing'
+            "#,
+        )
+        .bind(transaction_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Read a row's durable requeue counter; `None` if the row does not exist.
+    pub async fn get_recovery_requeue_attempts_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        sqlx::query_scalar("SELECT recovery_requeue_attempts FROM transactions WHERE id = $1")
+            .bind(transaction_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     /// CAS `Processing`/`Parked` → `Parked`. Accepts an already-parked row so the
     /// drain's per-tick re-park bumps `updated_at` (the heartbeat).
     pub async fn try_park_processing_internal(

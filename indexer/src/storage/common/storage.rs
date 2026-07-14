@@ -21,6 +21,7 @@ pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
+pub mod get_recovery_requeue_attempts;
 pub mod get_release_signatures;
 pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
@@ -43,6 +44,7 @@ pub mod try_complete_processing;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
+pub mod try_requeue_prebroadcast;
 pub mod try_requeue_processing;
 pub mod try_unpark_to_processing;
 pub mod update_committed_checkpoint;
@@ -390,6 +392,23 @@ impl Storage {
     ) -> Result<bool, StorageError> {
         try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
             .await
+    }
+
+    /// Status-only CAS `Processing` → `Pending`; `Ok(false)` if the row is not `Processing`.
+    /// For sender-side pre-broadcast failures where the sender owns the Processing row.
+    pub async fn try_requeue_prebroadcast(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        try_requeue_prebroadcast::try_requeue_prebroadcast(self, transaction_id).await
+    }
+
+    /// Read a row's durable requeue counter; `None` if the row does not exist.
+    pub async fn get_recovery_requeue_attempts(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<i32>, StorageError> {
+        get_recovery_requeue_attempts::get_recovery_requeue_attempts(self, transaction_id).await
     }
 
     /// CAS `Processing`/`Parked` → `Parked`; `Ok(false)` if the row is neither.

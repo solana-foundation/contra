@@ -746,6 +746,35 @@ impl MockStorage {
         Ok(false)
     }
 
+    pub async fn try_requeue_prebroadcast(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_requeue_prebroadcast")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id && txn.status == TransactionStatus::Processing {
+                txn.status = TransactionStatus::Pending;
+                txn.recovery_requeue_attempts += 1;
+                txn.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn get_recovery_requeue_attempts(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<i32>, StorageError> {
+        self.check_should_fail("get_recovery_requeue_attempts")?;
+        let pending = self.pending_transactions.lock().unwrap();
+        Ok(pending
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .map(|txn| txn.recovery_requeue_attempts))
+    }
+
     pub async fn try_park_processing(&self, transaction_id: i64) -> Result<bool, StorageError> {
         self.check_should_fail("try_park_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();

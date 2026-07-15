@@ -220,6 +220,8 @@ pub fn init_labels(program_type: &str) {
         "confirmation_timeout",
         "program_error",
         "confirmation_error",
+        "deposit_ownership_lost",
+        "jit_missing_claim_lease",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }

@@ -339,6 +339,7 @@ impl SenderState {
                 // handle_permanent_failure before the row was written as PendingRemint.
                 withdrawal_nonce: tx.withdrawal_nonce.map(|n| n as u64),
                 trace_id: Some(tx.trace_id.clone()),
+                deposit_claim_lease: None,
             };
 
             let remint_info = WithdrawalRemintInfo {

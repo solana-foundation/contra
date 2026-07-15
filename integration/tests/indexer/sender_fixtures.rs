@@ -40,6 +40,10 @@ use {
     solana_keychain::SolanaSigner,
     solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Keypair},
     spl_associated_token_account::get_associated_token_address_with_program_id,
+    spl_token::{
+        solana_program::{program_option::COption, program_pack::Pack},
+        state::Mint,
+    },
     std::sync::{Arc, Once},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -162,7 +166,49 @@ pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
         transaction_id: Some(transaction_id),
         withdrawal_nonce: None,
         trace_id: Some(format!("trace-{transaction_id}")),
+        deposit_claim_lease: None,
     }
+}
+
+/// `deposit_ctx` carrying the ownership epoch a prior claim returned, so
+/// JIT re-fire tests can present a valid or stale lease token.
+pub fn deposit_ctx_with_lease(
+    transaction_id: i64,
+    epoch: chrono::DateTime<chrono::Utc>,
+) -> TransactionContext {
+    TransactionContext {
+        deposit_claim_lease: Some(epoch),
+        ..deposit_ctx(transaction_id)
+    }
+}
+
+/// Packed SPL `Mint` bytes, initialized, with the supplied mint authority.
+pub fn pack_mint_with_authority(authority: COption<Pubkey>) -> Vec<u8> {
+    let mint = Mint {
+        mint_authority: authority,
+        supply: 0,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    };
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(mint, &mut data).expect("pack mint");
+    data
+}
+
+/// `getAccountInfo` reply wrapping raw account bytes as an SPL-token-owned account.
+pub fn account_info_reply_bytes(data: &[u8]) -> Reply {
+    Reply::result(json!({
+        "context": { "slot": 100 },
+        "value": {
+            "data": [STANDARD.encode(data), "base64"],
+            "executable": false,
+            "lamports": 1_461_600u64,
+            "owner": spl_token::id().to_string(),
+            "rentEpoch": 0u64,
+            "space": data.len(),
+        }
+    }))
 }
 
 /// Withdrawal-side `TransactionContext`: both fields set, drives the
@@ -173,6 +219,7 @@ pub fn withdrawal_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
         transaction_id: Some(transaction_id),
         withdrawal_nonce: Some(nonce),
         trace_id: Some(format!("trace-{transaction_id}")),
+        deposit_claim_lease: None,
     }
 }
 

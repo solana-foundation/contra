@@ -11,17 +11,20 @@ use {
         operator::{
             recovery::test_hooks,
             sender::{test_hooks as sender_hooks, types::SendDurability, types::SenderState},
-            utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
+            utils::instruction_util::{ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy},
             utils::rpc_util::{RetryConfig, RpcClientWithRetry},
-            TransactionStatusUpdate,
+            utils::transaction_util::ConfirmationResult,
+            SignerUtil, TransactionStatusUpdate,
         },
         storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
     sender_fixtures::{
-        blockhash_reply, deposit_ctx, make_config, make_instruction, send_transaction_echo_reply,
+        account_info_reply_bytes, blockhash_reply, deposit_ctx, deposit_ctx_with_lease,
+        make_config, make_instruction, pack_mint_with_authority, send_transaction_echo_reply,
     },
     serde_json::json,
+    solana_keychain::SolanaSigner,
     solana_sdk::{
         commitment_config::{CommitmentConfig, CommitmentLevel},
         pubkey::Pubkey,
@@ -1229,8 +1232,9 @@ async fn drive_first_fire(
         RetryPolicy::None,
         ExtraErrorCheckPolicy::None,
         storage_tx,
-        SendDurability::Recoverable,
-        Some(token),
+        SendDurability::Recoverable {
+            deposit_expected_updated_at: token,
+        },
     )
     .await;
 }
@@ -1296,16 +1300,14 @@ async fn stale_owned_builder_does_not_double_mint() {
     mock.shutdown().await;
 }
 
-// Bug oracle: the unguarded write-ahead persist (a plain insert with no ownership
-// check) broadcasts a stale mint on a demoted row. This reproduces the reported
-// bug through production code: the mint lands on a Pending row, so its Completed
-// write no-ops (it9) and the row is re-fetched for a second mint (it3). IT1 is the
-// exact contrast: with its ownership token the first-fire broadcasts nothing on the
-// same setup. The JIT re-fire still uses this token-less path but is kept off a
-// demoted row by the bounded confirmation window.
+// The mid-JIT double-mint window, closed: a first mint claims and broadcasts,
+// recovery demotes the row while the JIT verdict is pending, and the JIT
+// re-fire then presents the epoch of its own (now superseded) claim. The
+// re-claim must lose, so nothing new is journaled or broadcast and the row
+// stays with its current owner.
 #[tokio::test(flavor = "multi_thread")]
-async fn unguarded_first_fire_would_broadcast_on_demoted_row() {
-    let (db, url, _container) = start_pg("it_oracle_unguarded").await;
+async fn stale_jit_refire_does_not_double_mint() {
+    let (db, url, _container) = start_pg("it_stale_jit_refire").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -1317,46 +1319,91 @@ async fn unguarded_first_fire_would_broadcast_on_demoted_row() {
         100,
     );
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
-    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    let t_lock = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
     let mock = MockRpcServer::start().await;
+    // First fire: build/sign, claim the row, journal one signature, broadcast.
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
-    let recovery_client = test_client(mock.url());
-    let state = build_pg_sender_state(storage.clone(), mock.url()).await;
+    let mut state = build_pg_sender_state(storage.clone(), mock.url()).await;
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    // Same setup as IT1: recovery demotes the stale row to Pending.
+    drive_first_fire(&state, tx_id, t_lock, &storage_tx).await;
+    assert_eq!(
+        mint_broadcast_count(&mock),
+        1,
+        "the owned first fire broadcasts exactly once"
+    );
+    // The row's committed post-claim updated_at is the epoch the first claim
+    // returned; the JIT re-fire below carries it as its ownership token.
+    let claim_epoch = updated_at_of(&pool, tx_id).await;
+    assert_ne!(claim_epoch, t_lock, "the first claim advances the token");
+
+    // Recovery demotes mid-JIT: age the row past the staleness threshold and
+    // classify the journaled signature dead (null status, expired blockhash,
+    // covered attempt window), so the deposit is requeued to Pending.
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+    );
+    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
+    let recovery_client = test_client(mock.url());
     test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
         .await
         .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
+    let sigs_after_demote = db.get_release_signatures_internal(tx_id).await.unwrap();
 
-    // Drive the persist with no ownership token: the token-less (unguarded) path.
-    sender_hooks::run_fire_and_store_task(
-        &state,
+    // The JIT re-fire: MintNotInitialized verdict, pre-check reads an
+    // admin-authority initialized mint (Retry), build/sign gets a blockhash,
+    // then the re-claim runs with the stale epoch and must abort.
+    let mut builder = MintToBuilder::new();
+    builder.mint(Pubkey::new_unique());
+    state.mint_builders.insert(tx_id, builder);
+    let admin_bytes =
+        pack_mint_with_authority(spl_token::solana_program::program_option::COption::Some(
+            SignerUtil::admin_signer().pubkey(),
+        ));
+    mock.enqueue("getAccountInfo", account_info_reply_bytes(&admin_bytes));
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+
+    let metric = OPERATOR_TRANSACTION_ERRORS.with_label_values(&["escrow", OWNERSHIP_LOST_REASON]);
+    let metric_before = metric.get();
+    let ctx = deposit_ctx_with_lease(tx_id, claim_epoch);
+
+    sender_hooks::handle_confirmation_result(
+        &mut state,
+        Ok(ConfirmationResult::MintNotInitialized),
+        Signature::new_unique(),
+        None,
+        &ctx,
         make_instruction(),
-        None,
-        deposit_ctx(tx_id),
         RetryPolicy::None,
-        ExtraErrorCheckPolicy::None,
+        &ExtraErrorCheckPolicy::None,
         &storage_tx,
-        SendDurability::Recoverable,
-        None,
     )
     .await;
 
     assert_eq!(
         mint_broadcast_count(&mock),
         1,
-        "the token-less path broadcasts a stale mint on a demoted (Pending) row"
+        "the stale JIT re-fire must not broadcast a second mint"
+    );
+    assert_eq!(
+        db.get_release_signatures_internal(tx_id).await.unwrap(),
+        sigs_after_demote,
+        "a lost JIT claim journals no new signature"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending",
+        "the lost claim leaves the row to its current owner"
     );
     assert!(
-        !db.get_release_signatures_internal(tx_id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "the token-less path persists a signature against a Pending row"
+        metric.get() > metric_before,
+        "a lost JIT claim increments deposit_ownership_lost"
     );
     mock.shutdown().await;
 }

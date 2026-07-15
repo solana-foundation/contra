@@ -177,6 +177,7 @@ pub async fn handle_transaction_submission(
         transaction_id: tx_builder.transaction_id(),
         withdrawal_nonce: tx_builder.withdrawal_nonce(),
         trace_id: tx_builder.trace_id(),
+        deposit_claim_lease: None,
     };
 
     // For a withdrawal, which tree does its nonce belong to? None for other txs.
@@ -234,14 +235,12 @@ pub async fn handle_transaction_submission(
                         // A user-fund Mint is Recoverable (persisted write-ahead, re-minted
                         // by recovery on failure); InitializeMint mints no balance and is
                         // on-chain idempotent, so it is Terminal.
-                        let durability = if matches!(tx_builder, TransactionBuilder::Mint(_)) {
-                            SendDurability::Recoverable
-                        } else {
-                            SendDurability::Terminal
+                        let durability = match &tx_builder {
+                            TransactionBuilder::Mint(b) => SendDurability::Recoverable {
+                                deposit_expected_updated_at: b.fetched_updated_at,
+                            },
+                            _ => SendDurability::Terminal,
                         };
-                        // Some only for a deposit Mint: the fetch-time token the
-                        // write-ahead persist proves ownership against.
-                        let deposit_expected_updated_at = tx_builder.fetched_updated_at();
                         spawn_fire_and_store(
                             state,
                             instruction,
@@ -251,7 +250,6 @@ pub async fn handle_transaction_submission(
                             extra_error_checks_policy,
                             storage_tx.clone(),
                             durability,
-                            deposit_expected_updated_at,
                         );
                     }
                     _ => {
@@ -307,6 +305,7 @@ pub(super) async fn route_builder_error(
                         transaction_id: Some(builder_with_nonce.transaction_id),
                         withdrawal_nonce: Some(builder_with_nonce.nonce),
                         trace_id: Some(builder_with_nonce.trace_id),
+                        deposit_claim_lease: None,
                     },
                     builder_with_nonce.builder,
                 ));
@@ -644,7 +643,17 @@ pub(super) fn handle_confirmation_result<'a>(
                 );
                 match try_jit_mint_initialization(state, txn_id, instruction.clone()).await {
                     JitOutcome::Retry(new_instruction) => {
-                        // Journal the signature before broadcast
+                        let Some(lease) = ctx.deposit_claim_lease else {
+                            metrics::OPERATOR_TRANSACTION_ERRORS
+                                .with_label_values(&[pt, "jit_missing_claim_lease"])
+                                .inc();
+                            warn!(
+                                transaction_id = txn_id,
+                                "JIT retry missing deposit claim lease; leaving row Processing for recovery",
+                            );
+                            return;
+                        };
+                        // Journal the retry signature through the ownership claim before broadcast.
                         // Awaited inline since this rare retry is already off the hot path.
                         match Arc::clone(&state.semaphore).try_acquire_owned() {
                             Ok(permit) => {
@@ -663,9 +672,9 @@ pub(super) fn handle_confirmation_result<'a>(
                                     retry_policy,
                                     mint_extra_error_checks_policy(),
                                     storage_tx.clone(),
-                                    SendDurability::Recoverable,
-                                    // Plain persist: already owned by the bounded first claim.
-                                    None,
+                                    SendDurability::Recoverable {
+                                        deposit_expected_updated_at: lease,
+                                    },
                                     permit,
                                 )
                                 .await;
@@ -1170,10 +1179,7 @@ pub(super) fn spawn_fire_and_store(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    // Recoverable only for a real user-fund Mint
     durability: SendDurability,
-    // Deposit first-fire ownership token; `None` for the JIT re-fire and InitializeMint.
-    deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> bool {
     let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
         Ok(p) => p,
@@ -1207,7 +1213,6 @@ pub(super) fn spawn_fire_and_store(
         extra_error_checks_policy,
         storage_tx,
         durability,
-        deposit_expected_updated_at,
         permit,
     ));
 
@@ -1231,14 +1236,9 @@ pub(super) async fn fire_and_store_task(
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     durability: SendDurability,
-    // For a deposit's first mint attempt, this is the row's `updated_at` from
-    // fetch time. Before broadcasting we check the row still has it; if it
-    // changed, recovery requeued the row and we drop the mint instead of sending
-    // a duplicate. `None` skips the check (the JIT retry, which claimed the row
-    // moments earlier).
-    deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     permit: OwnedSemaphorePermit,
 ) {
+    let mut ctx = ctx;
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
@@ -1264,7 +1264,7 @@ pub(super) async fn fire_and_store_task(
             // sees no signature and re-mints it. Terminal sends (InitializeMint) mint
             // no balance, so fail fast.
             match durability {
-                SendDurability::Recoverable => {
+                SendDurability::Recoverable { .. } => {
                     metrics::OPERATOR_TRANSACTION_ERRORS
                         .with_label_values(&[pt, "left_processing_for_recovery"])
                         .inc();
@@ -1283,79 +1283,59 @@ pub(super) async fn fire_and_store_task(
         }
     };
 
-    let persisted = if durability == SendDurability::Recoverable {
-        let Some(txid) = ctx.transaction_id else {
-            // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
-            drop(permit);
-            metrics::OPERATOR_TRANSACTION_ERRORS
-                .with_label_values(&[pt, "pre_send_persist_error"])
-                .inc();
-            error!("Persist required but transaction has no id; aborting before broadcast");
-            return;
-        };
-        match deposit_expected_updated_at {
-            // Deposit first-fire: the persist doubles as an ownership claim,
-            // since the builder may have waited behind the cap long enough for
-            // recovery to demote the row. A lost claim drops it without broadcast.
-            Some(expected) => {
-                match storage
-                    .claim_and_persist_deposit_signature(
-                        txid,
-                        expected,
-                        signature.to_string(),
-                        last_valid_block_height as i64,
-                    )
-                    .await
-                {
-                    Ok(true) => true,
-                    Ok(false) => {
-                        drop(permit);
-                        metrics::OPERATOR_TRANSACTION_ERRORS
-                            .with_label_values(&[pt, "deposit_ownership_lost"])
-                            .inc();
-                        warn!(
-                            transaction_id = txid,
-                            signature = %signature,
-                            "Deposit ownership lost before broadcast; dropping stale builder without minting",
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        drop(permit);
-                        metrics::OPERATOR_TRANSACTION_ERRORS
-                            .with_label_values(&[pt, "pre_send_persist_error"])
-                            .inc();
-                        error!(
-                            transaction_id = txid,
-                            signature = %signature,
-                            "Aborting before broadcast, leaving row Processing for recovery: {e}",
-                        );
-                        return;
-                    }
-                }
-            }
-            // JIT re-fire: plain write-ahead insert. It runs only after a
-            // successful first claim, within a window far shorter than the
-            // recovery staleness threshold, so the row is provably still ours.
-            None => {
-                if persist_signature_or_abort(
-                    &storage,
-                    pt,
+    let persisted = match durability {
+        SendDurability::Recoverable {
+            deposit_expected_updated_at,
+        } => {
+            let Some(txid) = ctx.transaction_id else {
+                // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
+                drop(permit);
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "pre_send_persist_error"])
+                    .inc();
+                error!("Persist required but transaction has no id; aborting before broadcast");
+                return;
+            };
+            match storage
+                .claim_and_persist_deposit_signature(
                     txid,
-                    &signature,
-                    last_valid_block_height,
+                    deposit_expected_updated_at,
+                    signature.to_string(),
+                    last_valid_block_height as i64,
                 )
                 .await
-                .is_err()
-                {
+            {
+                Ok(Some(lease)) => {
+                    ctx.deposit_claim_lease = Some(lease);
+                    true
+                }
+                Ok(None) => {
                     drop(permit);
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "deposit_ownership_lost"])
+                        .inc();
+                    warn!(
+                        transaction_id = txid,
+                        signature = %signature,
+                        "Deposit ownership lost before broadcast; dropping stale builder without minting",
+                    );
                     return;
                 }
-                true
+                Err(e) => {
+                    drop(permit);
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "pre_send_persist_error"])
+                        .inc();
+                    error!(
+                        transaction_id = txid,
+                        signature = %signature,
+                        "Aborting before broadcast, leaving row Processing for recovery: {e}",
+                    );
+                    return;
+                }
             }
         }
-    } else {
-        false
+        SendDurability::Terminal => false,
     };
 
     match send_signed(&rpc_client, &transaction, retry_policy).await {
@@ -1902,6 +1882,7 @@ mod tests {
             transaction_id: Some(42),
             withdrawal_nonce: None, // not a withdrawal
             trace_id: Some("trace-42".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "some error").await;
@@ -1923,6 +1904,7 @@ mod tests {
             transaction_id: Some(7),
             withdrawal_nonce: Some(99),
             trace_id: Some("trace-7".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "max retries").await;
@@ -1953,6 +1935,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
@@ -1991,6 +1974,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "rpc send error").await;
@@ -2131,6 +2115,7 @@ mod tests {
             transaction_id: Some(50),
             withdrawal_nonce: Some(3),
             trace_id: Some("trace-50".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder
             .insert(3, (ctx.clone(), ReleaseFundsBuilder::new()));
@@ -2207,6 +2192,7 @@ mod tests {
             transaction_id: Some(txn_id),
             withdrawal_nonce: Some(nonce),
             trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
         }
     }
 
@@ -2775,6 +2761,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         let before = Utc::now();
@@ -2878,6 +2865,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
@@ -2905,6 +2893,7 @@ mod tests {
             transaction_id: Some(42),
             withdrawal_nonce: None,
             trace_id: Some("trace-1".to_string()),
+            deposit_claim_lease: None,
         };
 
         send_fatal_error(&tx, &ctx, "test error").await;
@@ -2925,6 +2914,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         send_fatal_error(&tx, &ctx, "test error").await;
@@ -2943,6 +2933,7 @@ mod tests {
             transaction_id: Some(7),
             withdrawal_nonce: None,
             trace_id: Some("trace-mint".to_string()),
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -2974,6 +2965,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -3004,6 +2996,7 @@ mod tests {
             transaction_id: Some(99),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-wd".to_string()),
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -3031,6 +3024,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3068,6 +3062,7 @@ mod tests {
             transaction_id: Some(11),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3140,6 +3135,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3207,6 +3203,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3243,6 +3240,7 @@ mod tests {
             transaction_id: Some(12),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3278,6 +3276,7 @@ mod tests {
             transaction_id: Some(13),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         let rpc_err = Box::new(
@@ -3326,6 +3325,7 @@ mod tests {
             transaction_id: Some(14),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3358,6 +3358,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3392,6 +3393,7 @@ mod tests {
             transaction_id: Some(20),
             withdrawal_nonce: Some(5),
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         send_and_confirm(
@@ -3429,6 +3431,7 @@ mod tests {
             transaction_id: Some(30),
             withdrawal_nonce: Some(2),
             trace_id: Some("trace-confirmed".to_string()),
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -3464,6 +3467,7 @@ mod tests {
             transaction_id: Some(15),
             withdrawal_nonce: None, // No nonce → rebuild_with_regenerated_proof returns None
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3581,6 +3585,7 @@ mod tests {
             transaction_id: Some(42),
             withdrawal_nonce: None,
             trace_id: Some("trace-fire".to_string()),
+            deposit_claim_lease: None,
         };
 
         fire_and_store(
@@ -3706,6 +3711,7 @@ mod tests {
             transaction_id: Some(55),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         fire_and_store(
@@ -3746,6 +3752,7 @@ mod tests {
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: Some(format!("trace-{txn_id}")),
+                deposit_claim_lease: None,
             },
             instruction: dummy_instruction(),
             compute_unit_price: None,
@@ -4371,70 +4378,24 @@ mod tests {
             transaction_id: Some(txn_id),
             withdrawal_nonce: None,
             trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
         }
     }
 
-    /// A persisting (Mint) fire-and-store run writes the signed transaction's signature
-    /// via `insert_release_signature` and then broadcasts that same signature.
-    #[tokio::test]
-    async fn mint_persists_signature_before_send() {
-        let mut server = mockito::Server::new_async().await;
-        let _hash = mock_blockhash(&mut server);
-        let send = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "method": "sendTransaction"
-            })))
-            .with_status(200)
-            .with_body(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": Signature::default().to_string()
-                })
-                .to_string(),
-            )
-            .expect(1)
-            .create();
+    fn mint_ctx_with_lease(
+        txn_id: i64,
+        lease: chrono::DateTime<chrono::Utc>,
+    ) -> TransactionContext {
+        TransactionContext {
+            deposit_claim_lease: Some(lease),
+            ..mint_ctx(txn_id)
+        }
+    }
 
-        let state = make_sender_state_with_server(&server.url());
-        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
-        let (storage_tx, _rx) = mpsc::channel(10);
-
-        fire_and_store_task(
-            state.rpc_client.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            state.program_type,
-            dummy_instruction(),
-            None,
-            mint_ctx(77),
-            RetryPolicy::None,
-            ExtraErrorCheckPolicy::None,
-            storage_tx,
-            SendDurability::Recoverable,
-            None,
-            permit,
-        )
-        .await;
-
-        send.assert();
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        let stored = mock.get_release_signatures(77).await.unwrap();
-        assert_eq!(stored.len(), 1, "exactly one mint signature persisted");
-        assert_eq!(
-            stored[0].0,
-            Signature::default().to_string(),
-            "persisted signature must be the broadcast signature"
-        );
-        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
-        assert_eq!(
-            state.in_flight.len(),
-            1,
-            "successful broadcast stashes the in-flight tx"
-        );
+    fn recoverable(lease: chrono::DateTime<chrono::Utc>) -> SendDurability {
+        SendDurability::Recoverable {
+            deposit_expected_updated_at: lease,
+        }
     }
 
     /// A failed write-ahead persist on the mint path must NOT broadcast, must stash no
@@ -4455,6 +4416,8 @@ mod tests {
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
         mock.set_should_fail("insert_release_signature", true);
         let permit = state.semaphore.clone().try_acquire_owned().unwrap();
         let before = state.semaphore.available_permits();
@@ -4471,8 +4434,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            SendDurability::Recoverable,
-            None,
+            recoverable(t_lock),
             permit,
         )
         .await;
@@ -4518,6 +4480,8 @@ mod tests {
             .create();
 
         let state = make_sender_state_with_server(&server.url());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
         let permit = state.semaphore.clone().try_acquire_owned().unwrap();
         let before = state.semaphore.available_permits();
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -4533,8 +4497,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            SendDurability::Recoverable,
-            None,
+            recoverable(t_lock),
             permit,
         )
         .await;
@@ -4602,8 +4565,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            SendDurability::Recoverable,
-            None,
+            recoverable(Utc::now()),
             permit,
         )
         .await;
@@ -4738,7 +4700,9 @@ mod tests {
 
         let mut state = make_sender_state_with_server(&server.url());
         seed_mint_builder(&mut state, 77, Pubkey::new_unique());
-        let ctx = mint_ctx(77);
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        let ctx = mint_ctx_with_lease(77, t_lock);
         let (storage_tx, _rx) = mpsc::channel(10);
 
         handle_confirmation_result(
@@ -4775,6 +4739,13 @@ mod tests {
             state.in_flight.entries.lock().unwrap()[0].persisted,
             "the stashed JIT-retry tx must be marked persisted"
         );
+        let stashed_lease = state.in_flight.entries.lock().unwrap()[0]
+            .ctx
+            .deposit_claim_lease;
+        assert!(
+            stashed_lease.is_some_and(|lease| lease != t_lock),
+            "the stashed JIT-retry ctx must carry the advanced claim lease"
+        );
     }
 
     /// A failed write-ahead persist on the JIT retry must abort before
@@ -4802,9 +4773,11 @@ mod tests {
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
-        mock.set_should_fail("insert_release_signature", true);
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        mock.set_should_fail("claim_and_persist_deposit_signature", true);
         let before = state.semaphore.available_permits();
-        let ctx = mint_ctx(77);
+        let ctx = mint_ctx_with_lease(77, t_lock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         handle_confirmation_result(
@@ -4836,6 +4809,135 @@ mod tests {
         );
     }
 
+    /// A JIT retry with no carried ownership lease must fail closed: no
+    /// signature, no broadcast, no status update, and the row remains for
+    /// recovery. This is defensive; normal deposit mints get the lease from the
+    /// first successful claim.
+    #[tokio::test]
+    async fn jit_refire_missing_lease_fails_closed() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let metric = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "jit_missing_claim_lease"]);
+        let before_metric = metric.get();
+        let ctx = mint_ctx(77);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "missing lease path must journal nothing"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "missing lease path must leave the row Processing"
+        );
+        assert!(state.in_flight.is_empty(), "missing lease stashes nothing");
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "missing lease increments jit_missing_claim_lease"
+        );
+    }
+
+    /// A stale JIT retry lease means recovery or a new incarnation owns the row.
+    /// The re-fire must drop without journaling or broadcasting.
+    #[tokio::test]
+    async fn jit_refire_aborts_when_ownership_lost() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Pending, t_lock);
+        let metric = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "deposit_ownership_lost"]);
+        let before_metric = metric.get();
+        let before_permits = state.semaphore.available_permits();
+        let ctx = mint_ctx_with_lease(77, t_lock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "lost JIT claim must persist no retry signature"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "lost JIT claim writes no status"
+        );
+        assert!(state.in_flight.is_empty(), "lost JIT claim stashes nothing");
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before_permits,
+            "the acquired JIT permit must be released on lost claim"
+        );
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "lost JIT claim increments deposit_ownership_lost"
+        );
+    }
+
     /// When the in-flight cap is reached, the JIT retry must not broadcast
     /// (nothing journaled, no status update, nothing stashed) so the row is left
     /// Processing for recovery.
@@ -4858,6 +4960,8 @@ mod tests {
 
         let mut state = make_sender_state_with_server(&server.url());
         seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
 
         // Drain every permit and hold them so the JIT retry can't acquire one.
         let _held: Vec<_> = (0..MAX_IN_FLIGHT)
@@ -4865,7 +4969,7 @@ mod tests {
             .collect();
         assert_eq!(state.semaphore.available_permits(), 0);
 
-        let ctx = mint_ctx(77);
+        let ctx = mint_ctx_with_lease(77, t_lock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         handle_confirmation_result(
@@ -4961,12 +5065,14 @@ mod tests {
 
         let mut state = make_sender_state_with_server(&server.url());
         seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
 
         // Parent in-flight tx holds a permit drawn from the state semaphore and carries
         // the mint policy so route_poll_results classifies MintNotInitialized.
         let parent = super::super::types::InFlightTx {
             signature: sig,
-            ctx: mint_ctx(77),
+            ctx: mint_ctx_with_lease(77, t_lock),
             instruction: dummy_instruction(),
             compute_unit_price: None,
             retry_policy: RetryPolicy::None,
@@ -5059,6 +5165,7 @@ mod tests {
             transaction_id: Some(909),
             withdrawal_nonce: None,
             trace_id: Some("trace-init".to_string()),
+            deposit_claim_lease: None,
         };
 
         fire_and_store_task(
@@ -5073,7 +5180,6 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             SendDurability::Terminal,
-            None,
             permit,
         )
         .await;
@@ -5174,8 +5280,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            SendDurability::Recoverable,
-            Some(t_lock),
+            recoverable(t_lock),
             permit,
         )
         .await;
@@ -5250,8 +5355,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            SendDurability::Recoverable,
-            Some(t_lock),
+            recoverable(t_lock),
             permit,
         )
         .await;
@@ -5270,6 +5374,13 @@ mod tests {
         );
         let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
         assert_ne!(after, t_lock, "a successful claim bumps updated_at");
+        assert_eq!(
+            state.in_flight.entries.lock().unwrap()[0]
+                .ctx
+                .deposit_claim_lease,
+            Some(after),
+            "the in-flight context carries the next ownership lease"
+        );
     }
 
     // ── spawn_fire_and_store: cap enforcement ─────────────────────────
@@ -5293,6 +5404,7 @@ mod tests {
             transaction_id: Some(9999),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         let result = spawn_fire_and_store(
@@ -5304,7 +5416,6 @@ mod tests {
             ExtraErrorCheckPolicy::None,
             storage_tx,
             SendDurability::Terminal,
-            None,
         );
 
         assert!(!result, "must return false when at capacity");
@@ -5333,12 +5444,12 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: None,
                 trace_id: None,
+                deposit_claim_lease: None,
             },
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
             SendDurability::Terminal,
-            None,
         );
 
         assert!(result, "must return true when capacity is available");
@@ -5498,6 +5609,7 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("t".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,

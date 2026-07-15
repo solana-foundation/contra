@@ -1602,10 +1602,16 @@ async fn demoted_deposit_reopens_through_gate_without_second_mint() {
         .unwrap();
 
     // Recovery-style demote, then the GC pass that used to destroy the evidence.
-    assert!(storage.try_requeue_processing(tx_id, captured).await.unwrap());
+    assert!(storage
+        .try_requeue_processing(tx_id, captured)
+        .await
+        .unwrap());
     storage.gc_stale_release_signatures().await.unwrap();
     assert_eq!(
-        db.get_release_signatures_internal(tx_id).await.unwrap().len(),
+        db.get_release_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .len(),
         1,
         "a demoted row's write-ahead signature must survive the GC"
     );

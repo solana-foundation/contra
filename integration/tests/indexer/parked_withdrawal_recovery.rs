@@ -277,7 +277,7 @@ async fn get_stale_parked_filters_and_orders() {
 
     // Stale parked only, oldest updated_at first.
     let stale = storage
-        .get_stale_parked_transactions(Duration::from_secs(5 * 60), 100)
+        .get_stale_parked_transactions(TransactionType::Withdrawal, Duration::from_secs(5 * 60), 100)
         .await
         .unwrap();
     let ids: Vec<i64> = stale.iter().map(|t| t.id).collect();
@@ -285,7 +285,7 @@ async fn get_stale_parked_filters_and_orders() {
 
     // Limit is honored (FIFO over stale → the oldest).
     let limited = storage
-        .get_stale_parked_transactions(Duration::from_secs(5 * 60), 1)
+        .get_stale_parked_transactions(TransactionType::Withdrawal, Duration::from_secs(5 * 60), 1)
         .await
         .unwrap();
     assert_eq!(limited.len(), 1);

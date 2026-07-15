@@ -374,14 +374,22 @@ impl Storage {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
 
-    /// Stale `Processing` rows past the threshold (used by recovery).
+    /// Stale `Processing` rows of one type past the threshold (used by recovery).
+    /// Type-scoped so each operator only recovers rows whose broadcasts target
+    /// the chain its RPC client points at.
     pub async fn get_stale_processing_transactions(
         &self,
+        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_stale_processing_transactions::get_stale_processing_transactions(self, threshold, limit)
-            .await
+        get_stale_processing_transactions::get_stale_processing_transactions(
+            self,
+            transaction_type,
+            threshold,
+            limit,
+        )
+        .await
     }
 
     /// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
@@ -424,13 +432,20 @@ impl Storage {
         try_unpark_to_processing::try_unpark_to_processing(self, transaction_id).await
     }
 
-    /// Stale `Parked` rows older than the threshold, oldest-first.
+    /// Stale `Parked` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_parked_transactions(
         &self,
+        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_stale_parked_transactions::get_stale_parked_transactions(self, threshold, limit).await
+        get_stale_parked_transactions::get_stale_parked_transactions(
+            self,
+            transaction_type,
+            threshold,
+            limit,
+        )
+        .await
     }
 
     /// CAS `Parked` → `Pending` on `updated_at`; `Ok(false)` if stale.
@@ -523,8 +538,9 @@ impl Storage {
         delete_release_signatures::delete_release_signatures(self, transaction_id).await
     }
 
-    /// Drop release signatures whose parent transaction is no longer
-    /// `Processing`. Returns the number of rows removed.
+    /// Drop release signatures only for genuinely terminal parents (completed,
+    /// failed, failed_reminted). Every non-terminal row keeps its write-ahead
+    /// evidence so the pre-mint gate can re-verify it. Returns the rows removed.
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
         gc_stale_release_signatures::gc_stale_release_signatures(self).await
     }

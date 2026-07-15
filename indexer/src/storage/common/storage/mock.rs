@@ -23,6 +23,8 @@ pub struct MockStorage {
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
     /// Per-op transient-failure counters: fail the first N calls of an op, then succeed.
     pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
+    /// Per-op call counts (bumped in `check_should_fail`); tests assert loop convergence.
+    pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
     pub pending_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
@@ -49,6 +51,12 @@ impl MockStorage {
     }
 
     fn check_should_fail(&self, operation: &str) -> Result<(), StorageError> {
+        *self
+            .call_counts
+            .lock()
+            .unwrap()
+            .entry(operation.to_string())
+            .or_default() += 1;
         // Transient injection takes precedence: fail the first N calls, then
         // fall through to the sticky bool (and otherwise succeed).
         {
@@ -89,6 +97,16 @@ impl MockStorage {
             .lock()
             .unwrap()
             .insert(program_type.to_string(), should_fail);
+    }
+
+    /// How many times `operation` has been invoked on this mock.
+    pub fn calls(&self, operation: &str) -> usize {
+        self.call_counts
+            .lock()
+            .unwrap()
+            .get(operation)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Make `operation` fail its next `times` calls, then succeed. Used to
@@ -706,6 +724,7 @@ impl MockStorage {
 
     pub async fn get_stale_processing_transactions(
         &self,
+        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
@@ -715,9 +734,14 @@ impl MockStorage {
             .unwrap_or_else(|_| chrono::Duration::days(1));
         let cutoff = Utc::now() - threshold_chrono;
         let pending = self.pending_transactions.lock().unwrap();
+        // Mirrors the Postgres type filter: recovery only sees its own row type.
         let mut matched: Vec<DbTransaction> = pending
             .iter()
-            .filter(|t| t.status == TransactionStatus::Processing && t.updated_at < cutoff)
+            .filter(|t| {
+                t.transaction_type == transaction_type
+                    && t.status == TransactionStatus::Processing
+                    && t.updated_at < cutoff
+            })
             .cloned()
             .collect();
         matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
@@ -811,6 +835,7 @@ impl MockStorage {
 
     pub async fn get_stale_parked_transactions(
         &self,
+        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
@@ -820,9 +845,14 @@ impl MockStorage {
             .unwrap_or_else(|_| chrono::Duration::days(1));
         let cutoff = Utc::now() - threshold_chrono;
         let pending = self.pending_transactions.lock().unwrap();
+        // Mirrors the Postgres type filter: recovery only sees its own row type.
         let mut matched: Vec<DbTransaction> = pending
             .iter()
-            .filter(|t| t.status == TransactionStatus::Parked && t.updated_at < cutoff)
+            .filter(|t| {
+                t.transaction_type == transaction_type
+                    && t.status == TransactionStatus::Parked
+                    && t.updated_at < cutoff
+            })
             .cloned()
             .collect();
         matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
@@ -978,24 +1008,33 @@ impl MockStorage {
 
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
         self.check_should_fail("gc_stale_release_signatures")?;
-        // Mirror the Postgres predicate: drop sigs whose parent is not
-        // `Processing`; an unknown transaction id counts as non-processing.
-        let processing_ids: std::collections::HashSet<i64> = self
+        // Mirror the Postgres predicate: reclaim only sigs whose parent row is
+        // terminal (completed, failed, failed_reminted). Every non-terminal row
+        // keeps its write-ahead journal for the pre-mint gate to re-verify; a
+        // sig with no matching row is retained, matching the SQL subquery.
+        let terminal_ids: std::collections::HashSet<i64> = self
             .pending_transactions
             .lock()
             .unwrap()
             .iter()
-            .filter(|t| t.status == TransactionStatus::Processing)
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TransactionStatus::Completed
+                        | TransactionStatus::Failed
+                        | TransactionStatus::FailedReminted
+                )
+            })
             .map(|t| t.id)
             .collect();
         let mut map = self.release_signatures.lock().unwrap();
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {
-            if processing_ids.contains(txn_id) {
-                true
-            } else {
+            if terminal_ids.contains(txn_id) {
                 removed += sigs.len() as u64;
                 false
+            } else {
+                true
             }
         });
         Ok(removed)

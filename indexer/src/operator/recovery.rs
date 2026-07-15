@@ -7,6 +7,7 @@ use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
 use crate::operator::sender::types::PendingSig;
 use crate::operator::sender::{classify_signatures, FinalityRpc, SigFinality};
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::TransactionStatusUpdate;
 use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
 use crate::storage::common::storage::Storage;
@@ -33,8 +34,9 @@ pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 pub(crate) const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
 /// Deposit recovery outcome. Uncertainty must NOT demote (double-mint risk); an
-/// in-flight signature leaves the row Processing for the next sweep.
-enum DepositOutcome {
+/// in-flight signature leaves the row Processing for the next sweep. Shared with
+/// the processor's pre-mint gate, which asks the same question at pickup time.
+pub(crate) enum DepositOutcome {
     Landed { signature: String },
     NotLanded,
     Live { reason: String },
@@ -112,6 +114,16 @@ pub async fn run_recovery_worker(
     Ok(())
 }
 
+/// The row type this operator services (same mapping the fetcher uses). Recovery
+/// sweeps are scoped to it so an operator never classifies another chain's
+/// signatures against its own RPC and wrongly demotes a landed row.
+fn expected_transaction_type(program_type: ProgramType) -> TransactionType {
+    match program_type {
+        ProgramType::Escrow => TransactionType::Deposit,
+        ProgramType::Withdraw => TransactionType::Withdrawal,
+    }
+}
+
 async fn recover_once(
     storage: &Storage,
     finality: &FinalityRpc<'_>,
@@ -132,7 +144,11 @@ async fn recover_once(
     }
 
     let stale = storage
-        .get_stale_processing_transactions(threshold, RECOVERY_BATCH_LIMIT)
+        .get_stale_processing_transactions(
+            expected_transaction_type(program_type),
+            threshold,
+            RECOVERY_BATCH_LIMIT,
+        )
         .await?;
 
     if !stale.is_empty() {
@@ -158,7 +174,11 @@ async fn recover_once(
     // these itself, so anything stale here lost its in-memory driver. Parked
     // rows were never sent on-chain, so requeue them without verifying finality.
     let stale_parked = storage
-        .get_stale_parked_transactions(threshold, RECOVERY_BATCH_LIMIT)
+        .get_stale_parked_transactions(
+            expected_transaction_type(program_type),
+            threshold,
+            RECOVERY_BATCH_LIMIT,
+        )
         .await?;
     for row in stale_parked {
         if cancellation_token.is_cancelled() {
@@ -175,6 +195,9 @@ async fn decide_action(
     storage: &Storage,
     finality: &FinalityRpc<'_>,
 ) -> RecoveryAction {
+    // Recovery is same-type by construction: the sweep queries filter on the
+    // operator's own row type, so `finality` is always the chain the row's
+    // signatures were broadcast to.
     let action = match row.transaction_type {
         TransactionType::Deposit => match check_deposit(row, storage, finality).await {
             DepositOutcome::Landed { signature } => RecoveryAction::Complete { signature },
@@ -209,22 +232,58 @@ async fn decide_action(
 /// where a withdrawal Quarantines: the pre-broadcast persist makes "no signature" mean
 /// "never broadcast", so re-minting cannot double-mint, and quarantining every such row
 /// would flood manual review at deposit volume.
-async fn check_deposit(
+pub(crate) async fn check_deposit(
     row: &DbTransaction,
     storage: &Storage,
     finality: &FinalityRpc<'_>,
 ) -> DepositOutcome {
-    let pending = match load_pending_sigs(storage, row.id).await {
-        Ok(p) => p,
-        Err(reason) => {
+    // Retry a transient DB blip before treating the read as uncertainty; an
+    // exhausted read still quarantines rather than risk a blind re-mint.
+    let stored = match with_storage_backoff("journal read", row.id, || {
+        storage.get_release_signatures(row.id)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
             return DepositOutcome::Ambiguous {
-                reason: format!("could not verify mint landed ({reason})"),
+                reason: format!(
+                    "could not verify mint landed (release signature lookup failed: {e})"
+                ),
             }
         }
     };
+    classify_deposit_signatures(&stored, finality).await
+}
 
-    if pending.is_empty() {
+/// Classify a deposit's already-read write-ahead signatures. Shared by the
+/// recovery sweep and the processor's pre-mint gate so the journal is read
+/// exactly once per decision. A malformed stored signature is uncertainty,
+/// never Dead, so a re-mint can never be authorized on an unreadable journal.
+pub(crate) async fn classify_deposit_signatures(
+    stored: &[(String, i64)],
+    finality: &FinalityRpc<'_>,
+) -> DepositOutcome {
+    if stored.is_empty() {
         return DepositOutcome::NotLanded;
+    }
+
+    let mut pending = Vec::with_capacity(stored.len());
+    for (sig_str, lvbh) in stored {
+        match Signature::from_str(sig_str) {
+            Ok(signature) => pending.push(PendingSig {
+                signature,
+                last_valid_block_height: *lvbh as u64,
+            }),
+             // Corrupt or tampered stored signature: treat as uncertain, never mint.
+            Err(e) => {
+                return DepositOutcome::Ambiguous {
+                    reason: format!(
+                        "could not verify mint landed (malformed stored release signature {sig_str}: {e})"
+                    ),
+                }
+            }
+        }
     }
 
     match classify_signatures(finality, &pending).await {
@@ -234,7 +293,7 @@ async fn check_deposit(
         SigFinality::Dead => DepositOutcome::NotLanded,
         // Still in flight; re-check next sweep rather than demote or complete.
         SigFinality::Live(reason) => DepositOutcome::Live { reason },
-        // Never demote on uncertainty — risks a double-mint on re-pickup.
+        // Never demote on uncertainty; risks a double-mint on re-pickup.
         SigFinality::Uncertain(reason) => DepositOutcome::Ambiguous {
             reason: format!("could not verify mint landed ({reason})"),
         },
@@ -486,7 +545,11 @@ pub async fn boot_reconcile_processing(
         .await?;
 
         let remaining = storage
-            .get_stale_processing_transactions(Duration::ZERO, RECOVERY_BATCH_LIMIT)
+            .get_stale_processing_transactions(
+                expected_transaction_type(program_type),
+                Duration::ZERO,
+                RECOVERY_BATCH_LIMIT,
+            )
             .await?;
         if remaining.is_empty() {
             return Ok(());
@@ -652,6 +715,24 @@ mod tests {
         );
     }
 
+    /// A transient DB blip on the deposit journal read is absorbed by the
+    /// bounded retry: the read recovers and classifies normally instead of
+    /// quarantining the row as uncertain.
+    #[tokio::test]
+    async fn deposit_read_blip_recovers_not_quarantined() {
+        let mock = MockStorage::new();
+        // First two reads fail, the third succeeds (empty): inside the budget.
+        mock.set_fail_times("get_release_signatures", 2);
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
+        let row = make_deposit_row(1);
+        let outcome = check_deposit(&row, &storage, &FinalityRpc::single(&client)).await;
+        assert!(
+            matches!(outcome, DepositOutcome::NotLanded),
+            "a transient read blip must be retried, not quarantined as Ambiguous"
+        );
+    }
+
     /// A finalized-success signature returns Landed and is never re-minted.
     #[tokio::test]
     async fn deposit_landed_sig_completes_without_remint() {
@@ -763,8 +844,8 @@ mod tests {
         }
     }
 
-    /// A malformed stored signature (via the shared `load_pending_sigs`) is uncertainty,
-    /// never read as "dead"; it must Quarantine rather than demote.
+    /// A malformed stored signature is uncertainty, never read as "dead"; it
+    /// must Quarantine rather than demote.
     #[tokio::test]
     async fn deposit_malformed_stored_sig_quarantines() {
         let mock = MockStorage::new();
@@ -1123,6 +1204,137 @@ mod tests {
             mock.pending_transactions.lock().unwrap()[0].status,
             TransactionStatus::Parked,
             "fresh parked row must be left alone"
+        );
+    }
+
+    // ── type-scoped sweeps ───────────────────────────────────────────
+
+    /// A withdraw operator's sweep must leave stale deposit rows alone: their
+    /// mint signatures live on the channel chain, which this operator's RPC
+    /// cannot see, so classifying them here would wrongly demote a landed mint.
+    #[tokio::test]
+    async fn withdraw_recovery_ignores_stale_deposit_rows() {
+        let mock = MockStorage::new();
+        let mut row = make_deposit_row(80);
+        row.status = TransactionStatus::Processing;
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        // Unreachable RPC doubles as proof the row is never classified.
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "withdraw sweep must not touch a deposit row"
+        );
+        assert_eq!(after[0].recovery_requeue_attempts, 0);
+        drop(after);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update may be sent for a cross-type row"
+        );
+    }
+
+    /// Mirrored direction: the escrow operator must not classify withdrawal
+    /// release signatures against the channel RPC.
+    #[tokio::test]
+    async fn escrow_recovery_ignores_stale_withdrawal_rows() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(81, Some(9));
+        row.status = TransactionStatus::Processing;
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+            .await
+            .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "escrow sweep must not touch a withdrawal row"
+        );
+        drop(after);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no alert may fire for a cross-type row"
+        );
+    }
+
+    /// The parked sweep is type-scoped too: only the withdraw operator may
+    /// requeue orphaned parked withdrawals.
+    #[tokio::test]
+    async fn escrow_parked_sweep_ignores_parked_withdrawals() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(82, Some(3));
+        row.status = TransactionStatus::Parked;
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Parked,
+            "escrow sweep must leave parked withdrawals for the withdraw operator"
+        );
+    }
+
+    /// A withdraw boot reconcile with only deposit rows in flight must leave
+    /// them untouched and converge on the first pass instead of exhausting
+    /// max_passes on rows it can never resolve.
+    #[tokio::test]
+    async fn boot_reconcile_converges_ignoring_other_type_rows() {
+        let mock = MockStorage::new();
+        // Fresh Processing deposit: the ZERO boot threshold would select it if unscoped.
+        let mut row = make_deposit_row(83);
+        row.status = TransactionStatus::Processing;
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        boot_reconcile_processing(
+            &storage,
+            &client,
+            None,
+            ProgramType::Withdraw,
+            &storage_tx,
+            &CancellationToken::new(),
+            5,
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "withdraw boot must not demote or quarantine an in-flight deposit"
+        );
+        drop(after);
+        // One sweep read plus one convergence read; more means the pass loop
+        // failed to converge and burned extra passes on the deposit row.
+        assert_eq!(
+            mock.calls("get_stale_processing_transactions"),
+            2,
+            "boot reconcile must converge after the first pass"
         );
     }
 

@@ -66,6 +66,16 @@ Re-arm the row to `pending`. The idempotency memo is a safety net even
 if a previous attempt did broadcast: the operator's pre-send memo scan
 short-circuits to `Completed` if it finds a memo'd signature.
 
+Re-arming is additionally guarded by the pre-mint signature gate: a
+non-terminal row keeps its persisted broadcast signatures
+(`pending_release_signatures` is only GC'd once the row is terminal), and
+the deposit processor re-classifies them on the channel before building a
+new mint. A signature that turns out to have landed completes the row
+instead of re-minting; an unverifiable one is left `processing` for the
+recovery sweep, which re-checks it on the channel and is the sole owner of
+the quarantine decision (see
+[`deposit_manual_review.md`](deposit_manual_review.md) Path E).
+
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;

@@ -170,14 +170,14 @@ pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
     }
 }
 
-/// `deposit_ctx` carrying the ownership epoch a prior claim returned, so
+/// `deposit_ctx` carrying the ownership lease a prior claim returned, so
 /// JIT re-fire tests can present a valid or stale lease token.
 pub fn deposit_ctx_with_lease(
     transaction_id: i64,
-    epoch: chrono::DateTime<chrono::Utc>,
+    lease: chrono::DateTime<chrono::Utc>,
 ) -> TransactionContext {
     TransactionContext {
-        deposit_claim_lease: Some(epoch),
+        deposit_claim_lease: Some(lease),
         ..deposit_ctx(transaction_id)
     }
 }

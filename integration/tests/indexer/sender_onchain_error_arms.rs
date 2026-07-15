@@ -328,21 +328,21 @@ fn make_mint_builder_for_caller_arm(mint: Pubkey) -> MintToBuilder {
 }
 
 /// Drive the caller arm with `Ok(MintNotInitialized)` after seeding the
-/// mint_builders entry. Pulled out so each test reads as a wire-script
-/// + assertions block. `claim_epoch` is the ownership token the JIT
-/// re-fire presents; only the Retry outcome needs one.
+/// mint_builders entry. Pulled out so each test reads as a wire-script plus
+/// assertions block. `claim_lease` is the ownership lease the JIT re-fire
+/// presents; only the Retry outcome needs one.
 async fn drive_caller_arm_with_jit_setup(
     state: &mut private_channel_indexer::operator::sender::types::SenderState,
     txn_id: i64,
     mint: Pubkey,
-    claim_epoch: Option<chrono::DateTime<chrono::Utc>>,
+    claim_lease: Option<chrono::DateTime<chrono::Utc>>,
     storage_tx: &tokio::sync::mpsc::Sender<TransactionStatusUpdate>,
 ) {
     state
         .mint_builders
         .insert(txn_id, make_mint_builder_for_caller_arm(mint));
-    let ctx = match claim_epoch {
-        Some(epoch) => deposit_ctx_with_lease(txn_id, epoch),
+    let ctx = match claim_lease {
+        Some(lease) => deposit_ctx_with_lease(txn_id, lease),
         None => deposit_ctx(txn_id),
     };
     test_hooks::handle_confirmation_result(

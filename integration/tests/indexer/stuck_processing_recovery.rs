@@ -1302,7 +1302,7 @@ async fn stale_owned_builder_does_not_double_mint() {
 
 // The mid-JIT double-mint window, closed: a first mint claims and broadcasts,
 // recovery demotes the row while the JIT verdict is pending, and the JIT
-// re-fire then presents the epoch of its own (now superseded) claim. The
+// re-fire then presents the lease of its own (now superseded) claim. The
 // re-claim must lose, so nothing new is journaled or broadcast and the row
 // stays with its current owner.
 #[tokio::test(flavor = "multi_thread")]
@@ -1334,10 +1334,10 @@ async fn stale_jit_refire_does_not_double_mint() {
         1,
         "the owned first fire broadcasts exactly once"
     );
-    // The row's committed post-claim updated_at is the epoch the first claim
+    // The row's committed post-claim updated_at is the lease the first claim
     // returned; the JIT re-fire below carries it as its ownership token.
-    let claim_epoch = updated_at_of(&pool, tx_id).await;
-    assert_ne!(claim_epoch, t_lock, "the first claim advances the token");
+    let claim_lease = updated_at_of(&pool, tx_id).await;
+    assert_ne!(claim_lease, t_lock, "the first claim advances the token");
 
     // Recovery demotes mid-JIT: age the row past the staleness threshold and
     // classify the journaled signature dead (null status, expired blockhash,
@@ -1358,7 +1358,7 @@ async fn stale_jit_refire_does_not_double_mint() {
 
     // The JIT re-fire: MintNotInitialized verdict, pre-check reads an
     // admin-authority initialized mint (Retry), build/sign gets a blockhash,
-    // then the re-claim runs with the stale epoch and must abort.
+    // then the re-claim runs with the stale lease and must abort.
     let mut builder = MintToBuilder::new();
     builder.mint(Pubkey::new_unique());
     state.mint_builders.insert(tx_id, builder);
@@ -1371,7 +1371,7 @@ async fn stale_jit_refire_does_not_double_mint() {
 
     let metric = OPERATOR_TRANSACTION_ERRORS.with_label_values(&["escrow", OWNERSHIP_LOST_REASON]);
     let metric_before = metric.get();
-    let ctx = deposit_ctx_with_lease(tx_id, claim_epoch);
+    let ctx = deposit_ctx_with_lease(tx_id, claim_lease);
 
     sender_hooks::handle_confirmation_result(
         &mut state,

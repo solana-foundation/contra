@@ -725,15 +725,27 @@ pub async fn process_deposit_funds(
                                 .with_label_values(&[pt_label, "completed"])
                                 .inc();
                         }
-                        // Row moved under us; another writer owns it now.
-                        Ok(false) => debug!(
-                            "reopened-deposit complete skipped; another writer touched the row"
-                        ),
-                        // Retries exhausted; the row stays Processing for recovery.
-                        Err(e) => warn!(
-                            "reopened-deposit complete write error after retries; leaving for recovery: {}",
-                            e
-                        ),
+                        // Row moved under us; another writer owns it now. The
+                        // gate still detected a landed mint, so signal it.
+                        Ok(false) => {
+                            debug!(
+                                "reopened-deposit complete skipped; another writer touched the row"
+                            );
+                            metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                                .with_label_values(&[pt_label, "complete_raced"])
+                                .inc();
+                        }
+                        // Retries exhausted; the row stays Processing for
+                        // recovery. Counted so the failed record is observable.
+                        Err(e) => {
+                            warn!(
+                                "reopened-deposit complete write error after retries; leaving for recovery: {}",
+                                e
+                            );
+                            metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                                .with_label_values(&[pt_label, "complete_write_failed"])
+                                .inc();
+                        }
                     }
                     return Ok(());
                 }

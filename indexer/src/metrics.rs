@@ -176,9 +176,10 @@ counter_vec!(
 
 // Reopened-deposit gate: a deposit picked up with persisted write-ahead mint
 // signatures was resolved by classifying them on the channel before minting.
-// `outcome` ∈ {completed, deferred_live, deferred_unverifiable}; the normal
-// proceed path is the plain mint flow and is not counted. The gate never
-// quarantines; an unresolved row is left Processing for the recovery sweep.
+// `outcome` ∈ {completed, complete_raced, complete_write_failed, deferred_live,
+// deferred_unverifiable}; the normal proceed path is the plain mint flow and is
+// not counted. The gate never quarantines; an unresolved row is left Processing
+// for the recovery sweep.
 counter_vec!(
     OPERATOR_REOPENED_DEPOSIT_GATE,
     "private_channel_operator_reopened_deposit_gate_total",
@@ -246,7 +247,13 @@ pub fn init_labels(program_type: &str) {
         OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
     }
 
-    for outcome in &["completed", "deferred_live", "deferred_unverifiable"] {
+    for outcome in &[
+        "completed",
+        "complete_raced",
+        "complete_write_failed",
+        "deferred_live",
+        "deferred_unverifiable",
+    ] {
         OPERATOR_REOPENED_DEPOSIT_GATE.with_label_values(&[program_type, outcome]);
     }
 

@@ -41,7 +41,7 @@ pub enum ReconciliationError {
     #[error("RPC error for mint {mint}: {reason}")]
     Rpc { mint: String, reason: String },
 
-    #[error("{count} mint(s) exceed mismatch threshold of {threshold} raw units; see logs for per-mint details")]
+    #[error("{count} mint(s) have a custody shortfall exceeding the threshold of {threshold} raw units; see logs for per-mint details")]
     MismatchExceedsThreshold { count: usize, threshold: u64 },
 
     #[error("Invalid pubkey '{pubkey}': {reason}")]

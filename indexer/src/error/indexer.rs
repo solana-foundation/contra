@@ -83,9 +83,6 @@ pub enum DataSourceError {
 
     #[error("Commitment level parse error: {value}")]
     InvalidCommitment { value: String },
-
-    #[error("Gap fill failed: {reason}")]
-    GapFillFailed { reason: String },
 }
 
 /// Errors specific to backfill operations

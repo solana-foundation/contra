@@ -48,6 +48,7 @@ impl SenderSMTState {
             transaction_id: Some(transaction_id),
             withdrawal_nonce: Some(nonce),
             trace_id: Some(trace_id),
+            deposit_claim_lease: None,
         };
         self.nonce_to_builder.insert(nonce, (ctx, builder.clone()));
 
@@ -319,6 +320,7 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder
             .insert(0, (ctx, ReleaseFundsBuilder::new()));
@@ -348,6 +350,7 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(5),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder
             .insert(5, (ctx, ReleaseFundsBuilder::new()));
@@ -541,6 +544,7 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder.insert(0, (ctx, builder));
         state.smt_state = Some(smt);
@@ -571,6 +575,7 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder.insert(0, (ctx, builder));
         state.smt_state = Some(smt);

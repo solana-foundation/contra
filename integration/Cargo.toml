@@ -103,6 +103,10 @@ path = "tests/indexer/malformed_yellowstone_update.rs"
 name = "yellowstone_reconnect_gap"
 path = "tests/indexer/yellowstone_reconnect_gap.rs"
 
+[[test]]
+name = "reconnect_gap_fill_fail_closed"
+path = "tests/indexer/reconnect_gap_fill_fail_closed.rs"
+
 # Yellowstone inner_instructions + unknown-discriminator arms.
 [[test]]
 name = "yellowstone_inner_and_unknown"

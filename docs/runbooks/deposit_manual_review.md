@@ -169,6 +169,10 @@ in `manual_review` (not `failed`) specifically because JIT's structural
 check distinguished it from generic program errors — the on-chain mint
 state needs human investigation before any retry can succeed.
 
+Note: the JIT retry's journal is ownership-checked; a retry that loses
+its lease surfaces as `deposit_ownership_lost` (see
+[`deposit_failed.md`](deposit_failed.md)), not as manual review.
+
 #### Step 1 - verify on-chain
 
 Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). Like Paths

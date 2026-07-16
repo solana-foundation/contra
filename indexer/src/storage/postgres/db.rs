@@ -1723,35 +1723,40 @@ impl PostgresDb {
     /// Atomically claim a `Processing` deposit and persist its broadcast
     /// signature in one transaction. The CAS on `updated_at` bumps the row so a
     /// racing recovery demote (also a CAS on that column) loses; sharing one
-    /// transaction leaves no bumped-but-unsigned window. `Ok(false)` means the
-    /// row was demoted or re-locked, so the caller must not broadcast.
+    /// transaction leaves no bumped-but-unsigned window. `Ok(Some(lease))`
+    /// returns the committed post-claim `updated_at`, valid as the next CAS
+    /// token; `Ok(None)` means the row was demoted or re-locked, so the caller
+    /// must not broadcast.
     pub async fn claim_and_persist_deposit_signature_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        let claimed = sqlx::query(
+        // RETURNING yields the post-trigger committed value, so the lease handed
+        // back is exactly the token a subsequent CAS must present.
+        let claimed = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
             r#"
             UPDATE transactions
             SET updated_at = NOW()
             WHERE id = $1
               AND status = 'processing'
               AND updated_at = $2
+            RETURNING updated_at
             "#,
         )
         .bind(transaction_id)
         .bind(expected_updated_at)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        if claimed.rows_affected() != 1 {
+        let Some(lease) = claimed else {
             tx.rollback().await?;
-            return Ok(false);
-        }
+            return Ok(None);
+        };
 
         sqlx::query(
             r#"
@@ -1768,7 +1773,7 @@ impl PostgresDb {
         .await?;
 
         tx.commit().await?;
-        Ok(true)
+        Ok(Some(lease))
     }
 
     /// Return a transaction's release signatures as (signature, lvbh).

@@ -949,38 +949,48 @@ impl MockStorage {
     /// Mirror `claim_and_persist_deposit_signature_internal`: CAS the row on
     /// `(id, Processing, updated_at)`; on a hit bump `updated_at`, persist the
     /// signature (mirroring the `ON CONFLICT (signature)` dedup) and return
-    /// `Ok(true)`; on a miss return `Ok(false)` and persist nothing.
+    /// `Ok(Some(new_updated_at))`; on a miss return `Ok(None)` and persist
+    /// nothing.
     pub async fn claim_and_persist_deposit_signature(
         &self,
         transaction_id: i64,
         expected_updated_at: DateTime<Utc>,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<DateTime<Utc>>, StorageError> {
         self.check_should_fail("claim_and_persist_deposit_signature")?;
         // Scope the guard so it is released before the await below.
-        let claimed = {
+        let lease = {
             let mut pending = self.pending_transactions.lock().unwrap();
-            match pending.iter_mut().find(|t| {
+            let owned = pending.iter().any(|t| {
                 t.id == transaction_id
                     && t.status == TransactionStatus::Processing
                     && t.updated_at == expected_updated_at
-            }) {
-                Some(txn) => {
-                    txn.updated_at = Utc::now();
-                    true
-                }
-                None => false,
+            });
+            // CAS miss: Postgres updates no row and never reaches the insert.
+            if !owned {
+                return Ok(None);
             }
+            // A simulated insert failure rolls the whole transaction back in
+            // Postgres, so it must abort here with no bump once the row is owned.
+            self.check_should_fail("insert_release_signature")?;
+            let lease = Utc::now();
+            let txn = pending
+                .iter_mut()
+                .find(|t| {
+                    t.id == transaction_id
+                        && t.status == TransactionStatus::Processing
+                        && t.updated_at == expected_updated_at
+                })
+                .expect("row present: ownership checked under the same lock");
+            txn.updated_at = lease;
+            lease
         };
-        if !claimed {
-            return Ok(false);
-        }
 
         // Reuse the write-ahead insert (mirrors the ON CONFLICT (signature) dedup).
         self.insert_release_signature(transaction_id, signature, last_valid_block_height)
             .await?;
-        Ok(true)
+        Ok(Some(lease))
     }
 
     pub async fn get_release_signatures(

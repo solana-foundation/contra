@@ -1,16 +1,17 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
 
 /// Atomic ownership claim + write-ahead signature persist for a deposit mint.
-/// `Ok(true)` means the sender still owns the `Processing` incarnation it was
-/// handed and may broadcast; `Ok(false)` means the row was demoted or re-locked
-/// so the builder must be dropped without broadcasting.
+/// `Ok(Some(lease))` means the sender still owns the `Processing` incarnation
+/// it was handed and may broadcast; the returned lease is the row's new
+/// `updated_at`, which a later re-claim must present. `Ok(None)` means the row
+/// was demoted or re-locked so the builder must be dropped without broadcasting.
 pub async fn claim_and_persist_deposit_signature(
     storage: &Storage,
     transaction_id: i64,
     expected_updated_at: chrono::DateTime<chrono::Utc>,
     signature: String,
     last_valid_block_height: i64,
-) -> Result<bool, StorageError> {
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db
             .claim_and_persist_deposit_signature_internal(

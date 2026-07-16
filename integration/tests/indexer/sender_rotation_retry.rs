@@ -73,6 +73,7 @@ async fn rotation_drain_matched_submits() {
             transaction_id: Some(20),
             withdrawal_nonce: Some(nonce),
             trace_id: Some("trace-2".to_string()),
+            deposit_claim_lease: None,
         },
         make_release_funds_builder(nonce),
     ));

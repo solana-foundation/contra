@@ -490,16 +490,18 @@ impl Storage {
     }
 
     /// Atomically claim a `Processing` deposit (CAS on `updated_at`) and persist
-    /// its broadcast signature in one transaction. `Ok(true)` means the sender
-    /// still owns the row and may broadcast; `Ok(false)` means it was demoted or
-    /// re-locked, so the builder must be dropped without broadcasting.
+    /// its broadcast signature in one transaction. `Ok(Some(lease))` means the
+    /// sender still owns the row and may broadcast; the returned lease is the
+    /// row's new `updated_at`, which a later re-claim must present. `Ok(None)`
+    /// means the row was demoted or re-locked, so the builder must be dropped
+    /// without broadcasting.
     pub async fn claim_and_persist_deposit_signature(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
         claim_and_persist_deposit_signature::claim_and_persist_deposit_signature(
             self,
             transaction_id,
@@ -743,18 +745,19 @@ mod tests {
     }
 
     /// Owned row (Processing, matching token): claim succeeds, the signature is
-    /// persisted, and `updated_at` advances (the D3 bump).
+    /// persisted, and `updated_at` advances. The returned lease must equal the
+    /// row's new `updated_at`, making it usable as the next CAS token.
     #[tokio::test]
     async fn claim_succeeds_when_owned() {
         let (storage, mock) = make_mock_storage();
         let t0 = Utc::now();
         seed_claim_row(&mock, 1, TransactionStatus::Processing, t0);
 
-        let claimed = storage
+        let lease = storage
             .claim_and_persist_deposit_signature(1, t0, "sig-owned".to_string(), 100)
             .await
-            .unwrap();
-        assert!(claimed, "owning the Processing incarnation must claim");
+            .unwrap()
+            .expect("owning the Processing incarnation must claim");
 
         let sigs = storage.get_release_signatures(1).await.unwrap();
         assert_eq!(sigs.len(), 1, "the broadcast signature must be persisted");
@@ -762,6 +765,10 @@ mod tests {
 
         let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
         assert_ne!(after, t0, "a successful claim must bump updated_at");
+        assert_eq!(
+            lease, after,
+            "the returned lease must equal the row's new updated_at"
+        );
     }
 
     /// Recovery already demoted the row to Pending: the claim must abort and
@@ -776,7 +783,7 @@ mod tests {
             .claim_and_persist_deposit_signature(1, t0, "sig-demoted".to_string(), 100)
             .await
             .unwrap();
-        assert!(!claimed, "a demoted row must not be claimable");
+        assert!(claimed.is_none(), "a demoted row must not be claimable");
         assert!(
             storage.get_release_signatures(1).await.unwrap().is_empty(),
             "no signature may be persisted on a lost claim"
@@ -797,7 +804,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !claimed,
+            claimed.is_none(),
             "a stale token must not claim the re-locked incarnation"
         );
         assert!(storage.get_release_signatures(1).await.unwrap().is_empty());
@@ -814,7 +821,7 @@ mod tests {
             .claim_and_persist_deposit_signature(1, t0, "sig-terminal".to_string(), 100)
             .await
             .unwrap();
-        assert!(!claimed, "a terminal row must not be claimable");
+        assert!(claimed.is_none(), "a terminal row must not be claimable");
         assert!(storage.get_release_signatures(1).await.unwrap().is_empty());
     }
 

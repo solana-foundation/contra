@@ -158,9 +158,9 @@ pub mod test_hooks {
         .await
     }
 
-    /// Drives one `fire_and_store_task` for a deposit-mint first-fire. Acquires
-    /// a permit from the sender's semaphore, then builds, (claims +) persists,
-    /// and broadcasts. Lets tests pin the ownership-claim routing (abort vs
+    /// Drives one `fire_and_store_task` for a deposit-mint fire. Acquires a
+    /// permit from the sender's semaphore, then builds, claims + persists, and
+    /// broadcasts. Lets tests pin the ownership-claim routing (abort vs
     /// broadcast) without the sender loop. Returns `false` if the semaphore was
     /// already at capacity.
     #[allow(clippy::too_many_arguments)]
@@ -173,7 +173,6 @@ pub mod test_hooks {
         extra_error_checks_policy: crate::operator::utils::instruction_util::ExtraErrorCheckPolicy,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
         durability: super::types::SendDurability,
-        deposit_expected_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> bool {
         let Ok(permit) = Arc::clone(&state.semaphore).try_acquire_owned() else {
             return false;
@@ -190,7 +189,6 @@ pub mod test_hooks {
             extra_error_checks_policy,
             storage_tx.clone(),
             durability,
-            deposit_expected_updated_at,
             permit,
         )
         .await;
@@ -688,6 +686,7 @@ mod tests {
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: None,
+                deposit_claim_lease: None,
             },
             instruction: InstructionWithSigners {
                 instructions: vec![],
@@ -873,6 +872,7 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: Some(2),
                 trace_id: Some("t".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
@@ -965,6 +965,7 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: Some(2),
                 trace_id: Some("t".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
@@ -1068,6 +1069,7 @@ mod tests {
                 transaction_id: Some(80),
                 withdrawal_nonce: Some(future_nonce),
                 trace_id: Some("trace-8".to_string()),
+                deposit_claim_lease: None,
             },
             ReleaseFundsBuilder::new(),
         ));
@@ -1113,6 +1115,7 @@ mod tests {
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(stale_nonce),
                 trace_id: Some("trace-2".to_string()),
+                deposit_claim_lease: None,
             },
             ReleaseFundsBuilder::new(),
         ));
@@ -1159,6 +1162,7 @@ mod tests {
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(stale_nonce),
                 trace_id: Some("trace-2".to_string()),
+                deposit_claim_lease: None,
             },
             ReleaseFundsBuilder::new(),
         ));
@@ -1167,6 +1171,7 @@ mod tests {
                 transaction_id: Some(200),
                 withdrawal_nonce: Some(future_nonce),
                 trace_id: Some("trace-future".to_string()),
+                deposit_claim_lease: None,
             },
             ReleaseFundsBuilder::new(),
         ));

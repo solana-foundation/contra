@@ -116,10 +116,19 @@ landed mint).
 lost ownership of its row before broadcast: while the built mint was queued,
 the recovery worker demoted the row (or a re-fetch re-locked it), so the
 stale builder was dropped without broadcasting and without writing any
-status. The row's current owner or recovery mints it instead, so the
-one-deposit-one-mint invariant holds. No operator action; a sustained rate
-only signals the in-flight cap is stranding builders long enough for
-recovery to reclaim them (a throughput tuning signal, not a correctness bug).
+status. The same label also fires when a `MintNotInitialized` JIT re-fire
+loses its lease mid-retry (recovery demoted the row during the JIT window);
+the semantics are identical. The row's current owner or recovery mints it
+instead, so the one-deposit-one-mint invariant holds. No operator action; a
+sustained rate only signals the in-flight cap or the JIT window is stranding
+builders long enough for recovery to reclaim them (a throughput tuning
+signal, not a correctness bug).
+
+`OPERATOR_TRANSACTION_ERRORS{error_reason="jit_missing_claim_lease"}` is a
+defensive counter that should never fire: a JIT re-fire arrived without the
+ownership epoch its first claim stored. The re-fire is dropped without
+broadcast and the row stays Processing for recovery. A sustained rate is a
+code bug, not an operational condition.
 
 ## Post-incident artifacts
 

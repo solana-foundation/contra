@@ -81,18 +81,28 @@ pub struct TransactionContext {
     pub transaction_id: Option<i64>,
     pub withdrawal_nonce: Option<u64>,
     pub trace_id: Option<String>,
+    /// Ownership lease from this deposit's most recent successful claim (the
+    /// row's post-claim `updated_at`). A JIT re-fire must present it to the
+    /// next claim before broadcasting again.
+    pub deposit_claim_lease: Option<DateTime<Utc>>,
 }
 
 /// How a fire-and-store send is handled, decided by whether it carries user value.
 ///
-/// `Recoverable` (value-bearing user `Mint`): journal the signature before broadcast, and
-/// on a pre-broadcast build/sign failure leave the row Processing for recovery.
+/// `Recoverable` (a user `Mint`, which moves value): before broadcasting, the
+/// signature is recorded by an atomic claim that also proves the sender still
+/// owns the row. If build or sign fails before broadcast, the row is left
+/// Processing so recovery re-mints it. If another writer changed the row first,
+/// the claim fails and the send is skipped; that only delays the mint until
+/// recovery retries, it never double-mints.
 ///
 /// `Terminal` (`InitializeMint`): mints no balance and is on-chain idempotent, so no
 /// journal, and a build/sign failure fails fast.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendDurability {
-    Recoverable,
+    Recoverable {
+        deposit_expected_updated_at: DateTime<Utc>,
+    },
     Terminal,
 }
 

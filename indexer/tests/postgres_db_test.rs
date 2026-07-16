@@ -1263,22 +1263,26 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let token = updated_at_of(&pool, id).await;
 
-    let claimed = storage
+    let epoch = storage
         .claim_and_persist_deposit_signature(id, token, "sig-claim".to_string(), 555)
-        .await?;
-    assert!(claimed, "owning the Processing incarnation must claim");
+        .await?
+        .expect("owning the Processing incarnation must claim");
     let sigs = storage.get_release_signatures(id).await?;
     assert_eq!(sigs.len(), 1, "a successful claim persists exactly one sig");
     assert_eq!(sigs[0], ("sig-claim".to_string(), 555));
     let bumped = updated_at_of(&pool, id).await;
     assert_ne!(bumped, token, "a successful claim bumps updated_at");
+    assert_eq!(
+        epoch, bumped,
+        "the returned epoch must equal the committed post-claim updated_at"
+    );
 
     // A stale token must abort atomically: no new sig, no timestamp change.
     let stale = bumped - chrono::Duration::seconds(60);
     let failed = storage
         .claim_and_persist_deposit_signature(id, stale, "sig-fail".to_string(), 1)
         .await?;
-    assert!(!failed, "a stale token must not claim");
+    assert!(failed.is_none(), "a stale token must not claim");
     assert_eq!(
         storage.get_release_signatures(id).await?.len(),
         1,
@@ -1308,19 +1312,17 @@ async fn claim_dedups_signature_on_conflict() -> Result<(), Box<dyn std::error::
         .await?;
 
     let token1 = updated_at_of(&pool, id).await;
-    assert!(
-        storage
-            .claim_and_persist_deposit_signature(id, token1, "dup-sig".to_string(), 1)
-            .await?
-    );
-    // The first claim bumped updated_at; the second claim owns the new token but
-    // re-inserts the same signature, which must be deduped.
-    let token2 = updated_at_of(&pool, id).await;
-    assert!(
-        storage
-            .claim_and_persist_deposit_signature(id, token2, "dup-sig".to_string(), 999)
-            .await?
-    );
+    let token2 = storage
+        .claim_and_persist_deposit_signature(id, token1, "dup-sig".to_string(), 1)
+        .await?
+        .expect("the first claim must own the fetch-time token");
+    // The first claim's returned epoch is presented directly as the second
+    // claim's token, pinning that a returned epoch is a valid next CAS token.
+    // The re-inserted duplicate signature must be deduped.
+    assert!(storage
+        .claim_and_persist_deposit_signature(id, token2, "dup-sig".to_string(), 999)
+        .await?
+        .is_some());
     assert_eq!(
         storage.get_release_signatures(id).await?.len(),
         1,

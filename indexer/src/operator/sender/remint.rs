@@ -1058,6 +1058,7 @@ mod tests {
                 transaction_id: Some(555),
                 withdrawal_nonce: Some(5),
                 trace_id: Some("trace-555".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(555),
             signatures: vec![PendingSig {
@@ -1092,6 +1093,7 @@ mod tests {
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(8),
                 trace_id: Some("trace-20".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(20),
             signatures: vec![PendingSig {
@@ -1144,6 +1146,7 @@ mod tests {
                 transaction_id: Some(30),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-30".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(30),
             signatures: vec![PendingSig {
@@ -1192,6 +1195,7 @@ mod tests {
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(8),
                 trace_id: Some("trace-20".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(20),
             signatures: vec![PendingSig {
@@ -1258,6 +1262,7 @@ mod tests {
                 transaction_id: Some(10),
                 withdrawal_nonce: Some(1),
                 trace_id: Some("trace-10".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(10),
             signatures: vec![PendingSig {
@@ -1275,6 +1280,7 @@ mod tests {
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(2),
                 trace_id: Some("trace-20".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(20),
             signatures: vec![PendingSig {
@@ -1371,6 +1377,7 @@ mod tests {
                 transaction_id: Some(99),
                 withdrawal_nonce: Some(7),
                 trace_id: Some("trace-99".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(99),
             signatures: vec![PendingSig {
@@ -1449,6 +1456,7 @@ mod tests {
                 transaction_id: Some(99),
                 withdrawal_nonce: Some(landed_nonce),
                 trace_id: Some("trace-99".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(99),
             signatures: vec![PendingSig {
@@ -1507,6 +1515,7 @@ mod tests {
                 transaction_id: Some(700),
                 withdrawal_nonce: Some(70),
                 trace_id: Some("trace-700".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(700),
             signatures: vec![PendingSig {
@@ -1587,6 +1596,7 @@ mod tests {
                 transaction_id: Some(77),
                 withdrawal_nonce: Some(11),
                 trace_id: Some("trace-77".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(77),
             signatures: vec![PendingSig {
@@ -1663,6 +1673,7 @@ mod tests {
                 transaction_id: Some(88),
                 withdrawal_nonce: Some(12),
                 trace_id: Some("trace-88".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(88),
             signatures: vec![PendingSig {
@@ -1730,6 +1741,7 @@ mod tests {
                 transaction_id: Some(89),
                 withdrawal_nonce: Some(13),
                 trace_id: Some("trace-89".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(89),
             signatures: vec![PendingSig {
@@ -1800,6 +1812,7 @@ mod tests {
                 transaction_id: Some(55),
                 withdrawal_nonce: Some(6),
                 trace_id: Some("trace-55".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(55),
             signatures: vec![
@@ -2513,6 +2526,7 @@ mod tests {
                 transaction_id: Some(100),
                 withdrawal_nonce: Some(20),
                 trace_id: Some("trace-100".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(100),
             signatures: vec![PendingSig {
@@ -2578,6 +2592,7 @@ mod tests {
                 transaction_id: Some(101),
                 withdrawal_nonce: Some(21),
                 trace_id: Some("trace-101".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(101),
             signatures: vec![PendingSig {
@@ -2633,6 +2648,7 @@ mod tests {
                 transaction_id: Some(102),
                 withdrawal_nonce: Some(22),
                 trace_id: Some("trace-102".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(102),
             signatures: vec![PendingSig {
@@ -2692,6 +2708,7 @@ mod tests {
                 transaction_id: Some(103),
                 withdrawal_nonce: Some(23),
                 trace_id: Some("trace-103".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(103),
             signatures: vec![PendingSig {
@@ -2763,6 +2780,7 @@ mod tests {
                 transaction_id: Some(105),
                 withdrawal_nonce: Some(25),
                 trace_id: Some("trace-105".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(105),
             signatures: vec![PendingSig {
@@ -2856,6 +2874,7 @@ mod tests {
                 transaction_id: Some(901),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-901".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(901),
             signatures: vec![PendingSig {
@@ -2923,6 +2942,7 @@ mod tests {
                 transaction_id: Some(902),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-902".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(902),
             signatures: vec![PendingSig {
@@ -2995,6 +3015,7 @@ mod tests {
                 transaction_id: Some(904),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-904".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(904),
             signatures: vec![PendingSig {
@@ -3138,6 +3159,7 @@ mod tests {
                 transaction_id: Some(906),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-906".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(906),
             signatures: vec![PendingSig {
@@ -3218,6 +3240,7 @@ mod tests {
                 transaction_id: Some(1500),
                 withdrawal_nonce: Some(15),
                 trace_id: Some("trace-1500".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(1500),
             signatures: vec![PendingSig {
@@ -3365,6 +3388,7 @@ mod tests {
                 transaction_id: Some(110),
                 withdrawal_nonce: Some(30),
                 trace_id: Some("trace-110".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(110),
             signatures: vec![PendingSig {
@@ -3442,6 +3466,7 @@ mod tests {
                 transaction_id: Some(710),
                 withdrawal_nonce: Some(71),
                 trace_id: Some("trace-710".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(710),
             signatures: vec![PendingSig {
@@ -3529,6 +3554,7 @@ mod tests {
                 transaction_id: Some(720),
                 withdrawal_nonce: Some(72),
                 trace_id: Some("trace-720".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_remint_info(720),
             signatures: vec![PendingSig {

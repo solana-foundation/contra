@@ -1171,7 +1171,11 @@ async fn threshold_boundary_returns_only_strictly_older_rows() {
         .unwrap();
 
     let stale = db
-        .get_stale_processing_transactions_internal(Duration::from_secs(5 * 60), 100)
+        .get_stale_processing_transactions_internal(
+            TransactionType::Deposit,
+            Duration::from_secs(5 * 60),
+            100,
+        )
         .await
         .unwrap();
     // 4:59 excluded; 5:00 is timing-dependent (Postgres `<` is strict).
@@ -1531,4 +1535,198 @@ async fn demote_then_refetch_mints_exactly_once() {
         "only the owned incarnation persists a signature"
     );
     mock.shutdown().await;
+}
+
+// ── cross-operator recovery and the reopened-row gate ───────────────────────
+
+// The reported exploit end-to-end: a stale Processing deposit whose mint landed
+// on the channel is invisible to the withdraw operator's sweep (whose Solana
+// RPC would prove a coverage-backed false absence) and is completed, not
+// re-minted, by the escrow operator's own sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_operator_recovery_does_not_replay_deposit_mint() {
+    let (db, url, _container) = start_pg("cross_op_recovery").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        777,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    let landed_sig = Signature::new_unique();
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+        .await
+        .unwrap();
+
+    // Solana mock: absent-but-covered (null status, expired blockhash, floor 0).
+    // Pre-fix, this coverage-proven wrong-chain Dead is what demoted the row.
+    let solana = MockRpcServer::start().await;
+    solana.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+    );
+    solana.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    solana.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
+    let solana_client = test_client(solana.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(&storage, &solana_client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "the withdraw sweep must not touch a deposit row"
+    );
+    assert_eq!(
+        solana.call_count("getSignatureStatuses"),
+        0,
+        "a deposit's mint signatures must never be classified on Solana"
+    );
+
+    // Escrow sweep against the channel: the landed mint completes the row.
+    let channel = MockRpcServer::start().await;
+    channel.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
+    );
+    let channel_client = test_client(channel.url());
+    test_hooks::run_recovery_once(&storage, &channel_client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(landed_sig.to_string())
+    );
+    assert_eq!(channel.call_count("sendTransaction"), 0);
+    solana.shutdown().await;
+    channel.shutdown().await;
+}
+
+// A demoted deposit keeps its write-ahead signature (GC retention), and when the
+// row is re-locked the processor gate classifies it on the channel and completes
+// the row instead of dispatching a second mint: one broadcast total.
+#[tokio::test(flavor = "multi_thread")]
+async fn demoted_deposit_reopens_through_gate_without_second_mint() {
+    use private_channel_indexer::operator::{
+        processor::{process_deposit_funds, ProcessorState},
+        utils::instruction_util::TransactionBuilder,
+        MintCache,
+    };
+
+    let (db, url, _container) = start_pg("reopened_gate").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        888,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    let captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    // Write-ahead persist of the first (and only) mint broadcast.
+    let landed_sig = Signature::new_unique();
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+        .await
+        .unwrap();
+
+    // Recovery-style demote, then the GC pass that used to destroy the evidence.
+    assert!(storage
+        .try_requeue_processing(tx_id, captured)
+        .await
+        .unwrap());
+    storage.gc_stale_release_signatures().await.unwrap();
+    assert_eq!(
+        db.get_release_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a demoted row's write-ahead signature must survive the GC"
+    );
+
+    // The escrow fetcher re-locks the row; the gate must classify the retained
+    // signature on the channel before any mint is built.
+    let relocked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+        .await
+        .unwrap();
+    let row = relocked
+        .into_iter()
+        .find(|r| r.id == tx_id)
+        .expect("row re-locked");
+
+    let channel = MockRpcServer::start().await;
+    channel.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
+    );
+    let channel_client = Arc::new(test_client(channel.url()));
+
+    let mut ps = ProcessorState {
+        admin_pubkey: Pubkey::new_unique(),
+        release_funds_state: None,
+        mint_cache: MintCache::new(storage.clone()),
+    };
+    let (fetcher_tx, fetcher_rx) = tokio::sync::mpsc::channel(1);
+    let (sender_tx, mut sender_rx) = tokio::sync::mpsc::channel::<TransactionBuilder>(8);
+    let (storage_tx, _storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+    fetcher_tx.send(row).await.unwrap();
+    drop(fetcher_tx);
+
+    process_deposit_funds(
+        &mut ps,
+        fetcher_rx,
+        sender_tx,
+        storage_tx,
+        storage.clone(),
+        channel_client,
+        None,
+        ProgramType::Escrow,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        sender_rx.try_recv().is_err(),
+        "the gate must complete the row, never dispatch a second mint"
+    );
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(landed_sig.to_string())
+    );
+    assert_eq!(
+        channel.call_count("sendTransaction"),
+        0,
+        "exactly one mint broadcast total (the original write-ahead one)"
+    );
+    channel.shutdown().await;
 }

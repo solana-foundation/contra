@@ -174,6 +174,19 @@ counter_vec!(
     &["program_type", "outcome", "type"]
 );
 
+// Reopened-deposit gate: a deposit picked up with persisted write-ahead mint
+// signatures was resolved by classifying them on the channel before minting.
+// `outcome` ∈ {completed, complete_raced, complete_write_failed, deferred_live,
+// deferred_unverifiable}; the normal proceed path is the plain mint flow and is
+// not counted. The gate never quarantines; an unresolved row is left Processing
+// for the recovery sweep.
+counter_vec!(
+    OPERATOR_REOPENED_DEPOSIT_GATE,
+    "private_channel_operator_reopened_deposit_gate_total",
+    "Reopened deposits resolved by the pre-mint signature gate",
+    &["program_type", "outcome"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -237,6 +250,16 @@ pub fn init_labels(program_type: &str) {
         OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
     }
 
+    for outcome in &[
+        "completed",
+        "complete_raced",
+        "complete_write_failed",
+        "deferred_live",
+        "deferred_unverifiable",
+    ] {
+        OPERATOR_REOPENED_DEPOSIT_GATE.with_label_values(&[program_type, outcome]);
+    }
+
     for task in &[
         "fetcher",
         "processor",
@@ -286,6 +309,7 @@ pub fn init() {
         OPERATOR_TRANSACTION_QUARANTINED,
         OPERATOR_TASK_EXIT,
         OPERATOR_STALE_PROCESSING_RECOVERED,
+        OPERATOR_REOPENED_DEPOSIT_GATE,
     );
 }
 
@@ -375,6 +399,7 @@ mod tests {
             "private_channel_operator_transaction_quarantined_total",
             "private_channel_operator_task_exit_total",
             "private_channel_operator_stale_processing_recovered_total",
+            "private_channel_operator_reopened_deposit_gate_total",
         ];
 
         let families = prometheus::gather();

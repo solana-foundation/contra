@@ -1028,39 +1028,156 @@ async fn release_signature_delete_removes_all_for_txn() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// The GC may only reclaim signatures of genuinely terminal rows
+/// (completed, failed, failed_reminted). Every non-terminal status retains its
+/// write-ahead journal: a row can still be picked up, demoted, re-armed from
+/// manual review, or reminted, and the pre-mint gate re-verifies those
+/// signatures before it would mint again.
 #[tokio::test(flavor = "multi_thread")]
-async fn release_signature_gc_only_drops_non_processing() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn release_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
 
-    let proc_txn = make_db_transaction("rel_gc_proc", TransactionType::Withdrawal);
-    let proc_id = storage.insert_db_transaction(&proc_txn).await?;
-    let done_txn = make_db_transaction("rel_gc_done", TransactionType::Withdrawal);
-    let done_id = storage.insert_db_transaction(&done_txn).await?;
+    // (label, status, must_survive)
+    let cases = [
+        ("processing", true),
+        ("pending", true),
+        ("manual_review", true),
+        ("parked", true),
+        ("pending_remint", true),
+        ("completed", false),
+        ("failed", false),
+        ("failed_reminted", false),
+    ];
 
-    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
-        .bind(proc_id)
+    let mut ids = Vec::new();
+    for (status, survive) in cases {
+        let ty = if status == "pending_remint" || status == "parked" {
+            TransactionType::Withdrawal
+        } else {
+            TransactionType::Deposit
+        };
+        let txn = make_db_transaction(&format!("rel_gc_{status}"), ty);
+        let id = storage.insert_db_transaction(&txn).await?;
+        sqlx::query(&format!(
+            "UPDATE transactions SET status = '{status}'::transaction_status WHERE id = $1"
+        ))
+        .bind(id)
         .execute(&pool)
         .await?;
-    sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
-        .bind(done_id)
-        .execute(&pool)
-        .await?;
-
-    storage
-        .insert_release_signature(proc_id, "sig-proc".to_string(), 1)
-        .await?;
-    storage
-        .insert_release_signature(done_id, "sig-done".to_string(), 2)
-        .await?;
+        storage
+            .insert_release_signature(id, format!("sig-{status}"), 1)
+            .await?;
+        ids.push((status, id, survive));
+    }
 
     let removed = storage.gc_stale_release_signatures().await?;
+    let expected_removed = ids.iter().filter(|(_, _, s)| !s).count() as u64;
     assert_eq!(
-        removed, 1,
-        "GC must drop exactly the non-processing row's sig"
+        removed, expected_removed,
+        "GC must drop only the terminal rows' signatures"
     );
-    assert_eq!(storage.get_release_signatures(proc_id).await?.len(), 1);
-    assert!(storage.get_release_signatures(done_id).await?.is_empty());
+    for (status, id, survive) in ids {
+        let present = !storage.get_release_signatures(id).await?.is_empty();
+        assert_eq!(
+            present, survive,
+            "status '{status}' signature retention mismatch (survive={survive})"
+        );
+    }
+    Ok(())
+}
+
+// ── type-scoped stale queries ────────────────────────────────────────────────
+
+async fn backdate_updated_at(
+    pool: &PgPool,
+    id: i64,
+    age: chrono::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE transactions SET updated_at = $1 WHERE id = $2")
+        .bind(Utc::now() - age)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_processing_query_is_type_exclusive() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let dep = make_db_transaction("stale_type_dep", TransactionType::Deposit);
+    let dep_id = storage.insert_db_transaction(&dep).await?;
+    let wd = make_db_transaction("stale_type_wd", TransactionType::Withdrawal);
+    let wd_id = storage.insert_db_transaction(&wd).await?;
+    for id in [dep_id, wd_id] {
+        sqlx::query(
+            "UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await?;
+        backdate_updated_at(&pool, id, chrono::Duration::minutes(10)).await?;
+    }
+
+    let threshold = std::time::Duration::from_secs(5 * 60);
+    let deposits = storage
+        .get_stale_processing_transactions(TransactionType::Deposit, threshold, 100)
+        .await?;
+    assert_eq!(
+        deposits.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![dep_id],
+        "deposit scope must return exactly the deposit row"
+    );
+    let withdrawals = storage
+        .get_stale_processing_transactions(TransactionType::Withdrawal, threshold, 100)
+        .await?;
+    assert_eq!(
+        withdrawals.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![wd_id],
+        "withdrawal scope must return exactly the withdrawal row"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_parked_query_is_type_exclusive() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let dep = make_db_transaction("parked_type_dep", TransactionType::Deposit);
+    let dep_id = storage.insert_db_transaction(&dep).await?;
+    let wd = make_db_transaction("parked_type_wd", TransactionType::Withdrawal);
+    let wd_id = storage.insert_db_transaction(&wd).await?;
+    for id in [dep_id, wd_id] {
+        sqlx::query("UPDATE transactions SET status = 'parked'::transaction_status WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+        backdate_updated_at(&pool, id, chrono::Duration::minutes(10)).await?;
+    }
+
+    let threshold = std::time::Duration::from_secs(5 * 60);
+    let withdrawals = storage
+        .get_stale_parked_transactions(TransactionType::Withdrawal, threshold, 100)
+        .await?;
+    assert_eq!(
+        withdrawals.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![wd_id],
+        "withdrawal scope must return exactly the withdrawal row"
+    );
+    let deposits = storage
+        .get_stale_parked_transactions(TransactionType::Deposit, threshold, 100)
+        .await?;
+    assert_eq!(
+        deposits.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![dep_id],
+        "deposit scope must return exactly the deposit row"
+    );
     Ok(())
 }
 

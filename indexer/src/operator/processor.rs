@@ -4,13 +4,15 @@ use crate::metrics;
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawalRemintInfo,
 };
-use crate::operator::sender::TransactionStatusUpdate;
-use crate::operator::utils::mint_util::MintCache;
+use crate::operator::recovery::{classify_deposit_signatures, DepositOutcome};
+use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::{
     fetch_current_tree_index, find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
     tree_constants::MAX_TREE_LEAVES, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce,
     SignerUtil,
 };
+use crate::operator::{utils::mint_util::MintCache, RpcClientWithRetry};
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
 use crate::storage::Storage;
 use crate::ProgramType;
@@ -47,7 +49,7 @@ impl ProcessorState {
     pub fn new_with_release_funds_state(
         instance_pda: Pubkey,
         storage: Arc<Storage>,
-        rpc_client: Arc<crate::operator::RpcClientWithRetry>,
+        rpc_client: Arc<RpcClientWithRetry>,
     ) -> Self {
         let operator_pubkey = SignerUtil::get_operator_pubkey();
         let operator_pda = find_operator_pda(&instance_pda, &operator_pubkey);
@@ -70,7 +72,7 @@ impl ProcessorState {
 
     pub fn new_with_storage(
         storage: Arc<Storage>,
-        mint_rpc_client: Arc<crate::operator::RpcClientWithRetry>,
+        mint_rpc_client: Arc<RpcClientWithRetry>,
     ) -> Self {
         Self {
             admin_pubkey: SignerUtil::get_admin_pubkey(),
@@ -263,8 +265,9 @@ pub async fn run_processor(
     program_type: ProgramType,
     instance_pda: Option<Pubkey>,
     storage: Arc<Storage>,
-    rpc_client: Arc<crate::operator::RpcClientWithRetry>,
-    source_rpc_client: Option<Arc<crate::operator::RpcClientWithRetry>>,
+    rpc_client: Arc<RpcClientWithRetry>,
+    fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
+    source_rpc_client: Option<Arc<RpcClientWithRetry>>,
 ) {
     info!("Starting processor");
 
@@ -299,13 +302,20 @@ pub async fn run_processor(
         ProgramType::Escrow => {
             // Use source_rpc_client for mint cache if available, otherwise fall back to rpc_client
             let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
-            let mut processor_state = ProcessorState::new_with_storage(storage, mint_rpc_client);
+            let mut processor_state =
+                ProcessorState::new_with_storage(storage.clone(), mint_rpc_client);
 
+            // rpc_client is the channel chain for an escrow operator: the chain
+            // its deposit mints broadcast to, which is what the reopened-row
+            // gate must classify persisted signatures against.
             if let Err(e) = process_deposit_funds(
                 &mut processor_state,
                 fetcher_rx,
                 sender_tx,
                 storage_tx,
+                storage,
+                rpc_client,
+                fallback_rpc_client,
                 program_type,
             )
             .await
@@ -654,19 +664,120 @@ pub async fn process_release_funds(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_deposit_funds(
     processor_state: &mut ProcessorState,
     mut fetcher_rx: mpsc::Receiver<DbTransaction>,
     sender_tx: mpsc::Sender<TransactionBuilder>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
+    storage: Arc<Storage>,
+    channel_rpc: Arc<RpcClientWithRetry>,
+    channel_fallback: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
 ) -> Result<(), OperatorError> {
     let pt_label = program_type.as_label();
+
+    // Classifies persisted write-ahead signatures on the channel
+    let gate_finality = FinalityRpc {
+        primary: &channel_rpc,
+        fallback: channel_fallback.as_deref(),
+    };
 
     while let Some(transaction) = fetcher_rx.recv().await {
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
         let outcome: Result<(), OperatorError> = async {
+            // Idempotency gate for reopened rows. Read the write-ahead journal
+            // (retrying a transient DB blip); an exhausted read propagates as a
+            // transient error, and a first-time row (no signatures) falls
+            // straight through with no RPC. Each outcome is handled below.
+            let stored = with_storage_backoff("journal read", transaction.id, || {
+                storage.get_release_signatures(transaction.id)
+            })
+            .await?;
+            match classify_deposit_signatures(&stored, &gate_finality).await {
+                DepositOutcome::NotLanded => {}
+                DepositOutcome::Landed { signature } => {
+                    // CAS on the fetch-time token; a miss means another writer
+                    // took the row, and either way nothing is minted. A transient
+                    // write error is retried; the mint already landed, so an
+                    // exhausted write leaves the row Processing for the recovery
+                    // sweep to complete rather than exiting the task.
+                    let completed = with_storage_backoff(
+                        "reopened-deposit complete",
+                        transaction.id,
+                        || {
+                            storage.try_complete_processing(
+                                transaction.id,
+                                transaction.updated_at,
+                                Some(signature.clone()),
+                            )
+                        },
+                    )
+                    .await;
+                    match completed {
+                        Ok(true) => {
+                            info!(
+                                signature,
+                                "Reopened deposit's prior mint landed; completed without re-mint"
+                            );
+                            metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                                .with_label_values(&[pt_label, "completed"])
+                                .inc();
+                        }
+                        // Row moved under us; another writer owns it now. The
+                        // gate still detected a landed mint, so signal it.
+                        Ok(false) => {
+                            debug!(
+                                "reopened-deposit complete skipped; another writer touched the row"
+                            );
+                            metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                                .with_label_values(&[pt_label, "complete_raced"])
+                                .inc();
+                        }
+                        // Retries exhausted; the row stays Processing for
+                        // recovery. Counted so the failed record is observable.
+                        Err(e) => {
+                            warn!(
+                                "reopened-deposit complete write error after retries; leaving for recovery: {}",
+                                e
+                            );
+                            metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                                .with_label_values(&[pt_label, "complete_write_failed"])
+                                .inc();
+                        }
+                    }
+                    return Ok(());
+                }
+                DepositOutcome::Live { reason } => {
+                    // Still in flight: leave the row Processing; the recovery
+                    // sweep re-examines it after the stale threshold.
+                    info!(
+                        reason = %reason,
+                        "Reopened deposit's prior mint may still land; deferring to recovery"
+                    );
+                    metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                        .with_label_values(&[pt_label, "deferred_live"])
+                        .inc();
+                    return Ok(());
+                }
+                DepositOutcome::Ambiguous { reason } => {
+                    // Uncertain (transient channel RPC, or a corrupt stored
+                    // signature). Do not mint and do not quarantine here: leaving
+                    // the row Processing hands it to the recovery sweep, which
+                    // re-checks on the same chain and self-heals a transient
+                    // outage instead of dead-ending a healthy row in ManualReview.
+                    warn!(
+                        reason = %reason,
+                        "Reopened deposit's prior mint unverifiable; deferring to recovery"
+                    );
+                    metrics::OPERATOR_REOPENED_DEPOSIT_GATE
+                        .with_label_values(&[pt_label, "deferred_unverifiable"])
+                        .inc();
+                    return Ok(());
+                }
+            }
+
             let proc_t0 = tokio::time::Instant::now();
             let mint =
                 Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
@@ -787,6 +898,25 @@ mod tests {
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::Instance;
     use solana_client::rpc_request::RpcRequest;
+
+    /// Channel RPC client with a single fast attempt against `url`.
+    fn channel_client(url: &str) -> Arc<RpcClientWithRetry> {
+        Arc::new(RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            crate::operator::utils::rpc_util::RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ))
+    }
+
+    /// Channel RPC that refuses every connection: rows with no persisted
+    /// signatures must pass the reopened-row gate without any RPC call.
+    fn unreachable_channel_rpc() -> Arc<RpcClientWithRetry> {
+        channel_client("http://localhost:1")
+    }
 
     fn make_release_funds_state() -> ReleaseFundsState {
         ReleaseFundsState {
@@ -1449,6 +1579,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await;
@@ -1494,6 +1627,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await;
@@ -1531,6 +1667,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await
@@ -1575,6 +1714,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await;
@@ -2183,6 +2325,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await;
@@ -2269,6 +2414,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await;
@@ -2681,6 +2829,9 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
+            storage.clone(),
+            unreachable_channel_rpc(),
+            None,
             ProgramType::Escrow,
         )
         .await;
@@ -2707,6 +2858,499 @@ mod tests {
         assert!(
             sender_rx.try_recv().is_err(),
             "no Mint builder should be forwarded for an unknown mint",
+        );
+    }
+
+    // ── reopened-deposit gate (pre-broadcast idempotency) ───────────────
+
+    fn mock_status_reply(server: &mut mockito::ServerGuard, body: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(body)
+            .create()
+    }
+
+    fn mock_block_height(server: &mut mockito::ServerGuard, height: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{height},"id":1}}"#))
+            .create()
+    }
+
+    fn mock_first_available_block(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":1}}"#))
+            .create()
+    }
+
+    const FINALIZED_STATUS_BODY: &str = r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#;
+    const NULL_STATUS_BODY: &str =
+        r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#;
+
+    /// Seed one Processing deposit row with a persisted write-ahead signature
+    /// and return the txn to feed the processor (same updated_at as the store).
+    async fn seed_reopened_deposit(
+        mock: &MockStorage,
+        mint: &Pubkey,
+        sig: &str,
+        lvbh: i64,
+    ) -> DbTransaction {
+        let txn = make_db_transaction(
+            1,
+            &mint.to_string(),
+            &Pubkey::new_unique().to_string(),
+            None,
+            TransactionType::Deposit,
+        );
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+        mock.insert_release_signature(txn.id, sig.to_string(), lvbh)
+            .await
+            .unwrap();
+        txn
+    }
+
+    /// A reopened deposit whose persisted mint signature finalized on the
+    /// channel is completed in place; no second mint may reach the sender.
+    #[tokio::test]
+    async fn reopened_deposit_with_landed_sig_completes_without_mint() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_status_reply(&mut server, FINALIZED_STATUS_BODY);
+
+        let mock = MockStorage::new();
+        let landed_sig = solana_sdk::signature::Signature::new_unique();
+        let mint = Pubkey::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &landed_sig.to_string(), 100).await;
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "a landed mint must never be re-minted"
+        );
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::Completed);
+        assert_eq!(
+            rows[0].counterpart_signature.as_deref(),
+            Some(landed_sig.to_string().as_str())
+        );
+        drop(rows);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no quarantine update for a landed mint"
+        );
+    }
+
+    /// A reopened deposit whose signature could still land is deferred: no
+    /// mint, no quarantine, row left Processing for the recovery sweep.
+    #[tokio::test]
+    async fn reopened_deposit_with_live_sig_defers_without_mint() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
+        // current_height (50) <= lvbh (1000) means still live.
+        let _height = mock_block_height(&mut server, 50);
+
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let sig = solana_sdk::signature::Signature::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &sig.to_string(), 1000).await;
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "a possibly-live mint must not be re-minted"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Processing,
+            "live signature defers the row to the recovery sweep"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no quarantine update for a live signature"
+        );
+    }
+
+    /// A reopened deposit whose signatures are coverage-proven dead proceeds
+    /// to a normal re-mint (the first attempt provably never landed).
+    #[tokio::test]
+    async fn reopened_deposit_with_dead_sigs_proceeds_to_mint() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
+        // current_height (1000) > lvbh (100) means expired; floor 0 proves coverage.
+        let _height = mock_block_height(&mut server, 1000);
+        let _floor = mock_first_available_block(&mut server, 0);
+
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let sig = solana_sdk::signature::Signature::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &sig.to_string(), 100).await;
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        insert_mint_row(&storage, &mint);
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .unwrap();
+
+        let msg = sender_rx
+            .try_recv()
+            .expect("proven-dead first attempt must still re-mint");
+        let TransactionBuilder::Mint(b) = msg else {
+            panic!("expected Mint builder");
+        };
+        assert_eq!(b.txn_id, 1);
+    }
+
+    /// A reopened deposit whose signatures cannot be classified (transient
+    /// channel RPC) is deferred, not quarantined: uncertainty must never mint,
+    /// and it must never dead-end a possibly-landed row in ManualReview. The row
+    /// stays Processing for the recovery sweep to re-check on the same chain.
+    #[tokio::test]
+    async fn reopened_deposit_uncertain_defers_to_recovery() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_body("internal server error")
+            .create();
+
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let sig = solana_sdk::signature::Signature::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &sig.to_string(), 100).await;
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .unwrap();
+
+        assert!(sender_rx.try_recv().is_err(), "uncertainty must never mint");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the gate must not quarantine; recovery owns that decision"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Processing,
+            "an unverifiable reopened deposit stays Processing for the recovery sweep"
+        );
+    }
+
+    /// A sustained storage failure reading the write-ahead journal (retries
+    /// exhausted) surfaces as a transient error, never a quarantine. The gate's
+    /// point-read runs on every deposit, so it must stay retryable, never a
+    /// permanent ManualReview flip of a healthy row.
+    #[tokio::test]
+    async fn reopened_deposit_storage_read_error_is_transient_not_quarantine() {
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let sig = solana_sdk::signature::Signature::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &sig.to_string(), 100).await;
+        // The journal read fails; the gate must surface a transient error, not
+        // classify the row as unverifiable.
+        mock.set_should_fail("get_release_signatures", true);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client("http://localhost:1"),
+            None,
+            ProgramType::Escrow,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(OperatorError::Storage(_))),
+            "a journal read failure must be a transient Storage error, got {result:?}"
+        );
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "no mint on a transient read error"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a transient read error must not quarantine the row"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Processing,
+            "row must stay Processing for retry, not flip to ManualReview"
+        );
+    }
+
+    /// A brief DB blip on the journal read is absorbed by the gate's bounded
+    /// retry: the read recovers within budget and the landed prior mint
+    /// completes the row, without exiting the processor task.
+    #[tokio::test]
+    async fn reopened_deposit_transient_read_blip_recovers_and_completes() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_status_reply(&mut server, FINALIZED_STATUS_BODY);
+
+        let mock = MockStorage::new();
+        let landed_sig = solana_sdk::signature::Signature::new_unique();
+        let mint = Pubkey::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &landed_sig.to_string(), 100).await;
+        // The first two reads fail, the third succeeds: inside the retry budget.
+        mock.set_fail_times("get_release_signatures", 2);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "a landed mint must never be re-minted"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a recovered blip must not quarantine the row"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Completed,
+            "the retry absorbs the blip and the landed mint completes the row"
+        );
+    }
+
+    /// A brief DB blip on the completion write is absorbed by the same bounded
+    /// retry: the CAS recovers within budget and the landed row is completed.
+    #[tokio::test]
+    async fn reopened_deposit_transient_complete_blip_recovers_and_completes() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_status_reply(&mut server, FINALIZED_STATUS_BODY);
+
+        let mock = MockStorage::new();
+        let landed_sig = solana_sdk::signature::Signature::new_unique();
+        let mint = Pubkey::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &landed_sig.to_string(), 100).await;
+        // The first two completion writes fail, the third succeeds: inside budget.
+        mock.set_fail_times("try_complete_processing", 2);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "a landed mint must never be re-minted"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Completed,
+            "the retry absorbs the write blip and the row completes"
+        );
+    }
+
+    /// A sustained completion-write failure (retries exhausted) does not exit
+    /// the task or quarantine: the mint already landed, so the row is left
+    /// Processing for the recovery sweep to complete.
+    #[tokio::test]
+    async fn reopened_deposit_sustained_complete_failure_left_for_recovery() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_status_reply(&mut server, FINALIZED_STATUS_BODY);
+
+        let mock = MockStorage::new();
+        let landed_sig = solana_sdk::signature::Signature::new_unique();
+        let mint = Pubkey::new_unique();
+        let txn = seed_reopened_deposit(&mock, &mint, &landed_sig.to_string(), 100).await;
+        mock.set_should_fail("try_complete_processing", true);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            channel_client(&server.url()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a completion-write failure must not exit the task: {result:?}"
+        );
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "a landed mint must never be re-minted"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "leaving for recovery must not quarantine the row"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Processing,
+            "the row stays Processing for the recovery sweep to complete"
         );
     }
 }

@@ -1283,9 +1283,10 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Stale `Processing` rows older than the threshold, oldest-first.
+    /// Stale `Processing` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_processing_transactions_internal(
         &self,
+        transaction_type: TransactionType,
         threshold: Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
@@ -1298,8 +1299,9 @@ impl PostgresDb {
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
+              AND {} = $2
             ORDER BY {} ASC
-            LIMIT $2
+            LIMIT $3
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1328,10 +1330,12 @@ impl PostgresDb {
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
+            transaction_cols::TRANSACTION_TYPE,
             // Ordering (FIFO over stale)
             transaction_cols::UPDATED_AT,
         ))
         .bind(threshold_secs)
+        .bind(transaction_type)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1439,9 +1443,10 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Stale `Parked` rows older than the threshold, oldest-first.
+    /// Stale `Parked` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_parked_transactions_internal(
         &self,
+        transaction_type: TransactionType,
         threshold: Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
@@ -1454,8 +1459,9 @@ impl PostgresDb {
             FROM transactions
             WHERE {} = 'parked'
               AND {} < NOW() - make_interval(secs => $1)
+              AND {} = $2
             ORDER BY {} ASC
-            LIMIT $2
+            LIMIT $3
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1484,10 +1490,12 @@ impl PostgresDb {
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
+            transaction_cols::TRANSACTION_TYPE,
             // Ordering (FIFO over stale)
             transaction_cols::UPDATED_AT,
         ))
         .bind(threshold_secs)
+        .bind(transaction_type)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -1798,15 +1806,17 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Drop release signatures whose parent transaction is no longer
-    /// `processing`. Returns the number of rows removed.
+    /// Only genuinely terminal rows are reclaimed; every non-terminal
+    /// status keeps its write-ahead journal. A demoted, quarantined, parked, or
+    /// pending-remint row can still be picked up or reminted, and the pre-mint
+    /// gate re-verifies those signatures before it would broadcast again, so
+    /// deleting them early would let a landed mint be re-issued.
     pub async fn gc_stale_release_signatures_internal(&self) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             DELETE FROM pending_release_signatures
-            WHERE transaction_id IN (
-                SELECT id FROM transactions WHERE status <> 'processing'
-            )
+            WHERE transaction_id IN (SELECT id FROM transactions
+                                     WHERE status IN ('completed', 'failed', 'failed_reminted'))
             "#,
         )
         .execute(&self.pool)

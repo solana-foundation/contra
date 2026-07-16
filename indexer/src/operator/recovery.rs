@@ -350,8 +350,9 @@ async fn check_withdrawal(
 /// malformed stored signature returns a quarantine reason (uncertainty, never "dead"),
 /// so callers never demote a row whose signatures could not be read or parsed.
 async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>, String> {
-    let stored = storage
-        .get_release_signatures(id)
+    // Retry a transient DB blip before quarantining; matches the deposit gate so
+    // a momentary read failure never pages ops for a healthy withdrawal.
+    let stored = with_storage_backoff("journal read", id, || storage.get_release_signatures(id))
         .await
         .map_err(|e| format!("release signature lookup failed: {e}"))?;
 

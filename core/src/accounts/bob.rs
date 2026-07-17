@@ -102,6 +102,11 @@ pub struct BOB {
     max_cache_entries: usize,
     /// Entries evicted since the last cache_stats read; drained on read.
     evicted_delta: usize,
+    /// Running count of dirty (ahead-of-DB) entries. Maintained incrementally so
+    /// cache_stats is O(1), and reconciled against truth on the periodic sweep.
+    dirty_entries: usize,
+    /// Running sum of resident account-data bytes; maintained like dirty_entries.
+    cache_bytes: usize,
 }
 
 impl BOB {
@@ -120,6 +125,8 @@ impl BOB {
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
             evicted_delta: 0,
+            dirty_entries: 0,
+            cache_bytes: 0,
         }
     }
 
@@ -184,14 +191,15 @@ impl BOB {
                 // A DB-loaded account is byte-identical to the DB, so it is
                 // clean and belongs in the normally-evictable population.
                 // Reserve synced_since=None for execution-produced state.
-                self.accounts.insert(
-                    miss_keys[index],
-                    AccountWithMeta {
-                        account: account.clone(),
-                        synced_since: Some(now),
-                        deleted: false,
-                    },
-                );
+                let meta = AccountWithMeta {
+                    account: account.clone(),
+                    synced_since: Some(now),
+                    deleted: false,
+                };
+                self.note_added(&meta);
+                if let Some(old) = self.accounts.insert(miss_keys[index], meta) {
+                    self.note_removed(&old);
+                }
                 fetched += 1;
             }
         }
@@ -226,24 +234,19 @@ impl BOB {
                             .enumerate()
                         {
                             if sanitized_transaction.is_writable(index) {
-                                if account_data.lamports() == 0 && account_data.data().is_empty() {
-                                    self.accounts.insert(
-                                        *pubkey,
-                                        AccountWithMeta {
-                                            account: account_data.clone(),
-                                            deleted: true,
-                                            synced_since: None,
-                                        },
-                                    );
-                                } else {
-                                    self.accounts.insert(
-                                        *pubkey,
-                                        AccountWithMeta {
-                                            account: account_data.clone(),
-                                            deleted: false,
-                                            synced_since: None,
-                                        },
-                                    );
+                                // A zero-lamport, empty-data writable account is a
+                                // tombstone; either way the written state is ahead
+                                // of the DB, so it goes in as dirty.
+                                let deleted =
+                                    account_data.lamports() == 0 && account_data.data().is_empty();
+                                let meta = AccountWithMeta {
+                                    account: account_data.clone(),
+                                    deleted,
+                                    synced_since: None,
+                                };
+                                self.note_added(&meta);
+                                if let Some(old) = self.accounts.insert(*pubkey, meta) {
+                                    self.note_removed(&old);
                                 }
                             }
                         }
@@ -280,19 +283,27 @@ impl BOB {
                 if account_settlement.deleted {
                     // We expect the account to exist in-memory because we only
                     // tombstone deleted accounts
-                    if let Some(account) = self.accounts.get(&pubkey) {
-                        if account.deleted {
-                            self.accounts.remove(&pubkey);
+                    match self.accounts.get(&pubkey).map(|account| account.deleted) {
+                        Some(true) => {
+                            if let Some(old) = self.accounts.remove(&pubkey) {
+                                self.note_removed(&old);
+                            }
                         }
-                    } else {
-                        warn!("Account {} was deleted from in-memory, but we expected it to be tombstoned", pubkey);
+                        Some(false) => {}
+                        None => {
+                            warn!("Account {} was deleted from in-memory, but we expected it to be tombstoned", pubkey);
+                        }
                     }
                 } else if let Some(account) = self.accounts.get_mut(&pubkey) {
                     if account.deleted || account.account != account_settlement.account {
                         // In-memory is ahead of the AccountsDB
                         continue;
-                    } else {
-                        account.synced_since = Some(now);
+                    }
+                    // The settled bytes match, so this dirty entry is now clean.
+                    let was_dirty = account.synced_since.is_none();
+                    account.synced_since = Some(now);
+                    if was_dirty {
+                        self.dirty_entries = self.dirty_entries.saturating_sub(1);
                     }
                 } else {
                     warn!(
@@ -309,17 +320,31 @@ impl BOB {
         // its missed accounts, so those accounts are never evicted here.
         self.cap_evict();
 
-        // Phase 2: only run the O(N) eviction sweep periodically.
+        // Phase 2: only run the O(N) eviction sweep periodically. The same scan
+        // recomputes the dirty/byte totals from scratch, correcting any drift in
+        // the incremental accounting at least once per sweep.
         self.batches_since_eviction += 1;
         if self.batches_since_eviction >= GC_EVICTION_INTERVAL {
             self.batches_since_eviction = 0;
             let before = self.accounts.len();
-            self.accounts
-                .retain(|_pubkey, account| match account.synced_since {
+            let mut dirty = 0usize;
+            let mut bytes = 0usize;
+            self.accounts.retain(|_pubkey, account| {
+                let keep = match account.synced_since {
                     Some(synced_since) => synced_since + OLDEST_SYNCED_ACCOUNT_AGE >= now,
                     None => true, // Always keep accounts with synced_since = None
-                });
+                };
+                if keep {
+                    if account.synced_since.is_none() {
+                        dirty += 1;
+                    }
+                    bytes += account.account.data().len();
+                }
+                keep
+            });
             self.evicted_delta += before.saturating_sub(self.accounts.len());
+            self.dirty_entries = dirty;
+            self.cache_bytes = bytes;
         }
     }
 
@@ -353,32 +378,43 @@ impl BOB {
             return;
         }
         // Partition the oldest `remove_count` entries to the front in O(n)
-        // without a full sort; we evict all of them so their order is moot.
+        // without a full sort. When remove_count == clean.len() every clean entry
+        // is being evicted, so we skip the partition and drain the whole vec.
         if remove_count < clean.len() {
             clean.select_nth_unstable_by_key(remove_count, |(_, synced_since)| *synced_since);
         }
         for (pubkey, _) in clean.iter().take(remove_count) {
-            self.accounts.remove(pubkey);
+            if let Some(old) = self.accounts.remove(pubkey) {
+                self.note_removed(&old);
+            }
         }
         self.evicted_delta += remove_count;
     }
 
-    /// Return the current cache-size snapshot and drain the evicted counter.
-    /// Dirty and byte tallies are computed here so they stay exact and
-    /// consistent with `entries` on every batch, not only at the sweep cadence.
-    pub fn cache_stats(&mut self) -> BobCacheStats {
-        let mut dirty_entries = 0usize;
-        let mut bytes = 0usize;
-        for meta in self.accounts.values() {
-            if meta.synced_since.is_none() {
-                dirty_entries += 1;
-            }
-            bytes += meta.account.data().len();
+    /// Account the byte and dirty totals for an entry entering the cache.
+    fn note_added(&mut self, meta: &AccountWithMeta) {
+        self.cache_bytes += meta.account.data().len();
+        if meta.synced_since.is_none() {
+            self.dirty_entries += 1;
         }
+    }
+
+    /// Reverse `note_added` for an entry leaving the cache. Saturating so that a
+    /// drift in these metrics-only totals can never underflow and panic.
+    fn note_removed(&mut self, meta: &AccountWithMeta) {
+        self.cache_bytes = self.cache_bytes.saturating_sub(meta.account.data().len());
+        if meta.synced_since.is_none() {
+            self.dirty_entries = self.dirty_entries.saturating_sub(1);
+        }
+    }
+
+    /// Return the current cache-size snapshot and drain the evicted counter.
+    /// The dirty and byte totals are maintained incrementally, so this is O(1).
+    pub fn cache_stats(&mut self) -> BobCacheStats {
         let stats = BobCacheStats {
             entries: self.accounts.len(),
-            dirty_entries,
-            bytes,
+            dirty_entries: self.dirty_entries,
+            bytes: self.cache_bytes,
             evicted: self.evicted_delta,
         };
         self.evicted_delta = 0;
@@ -402,19 +438,22 @@ impl BOB {
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
             evicted_delta: 0,
+            dirty_entries: 0,
+            cache_bytes: 0,
         }
     }
 
     /// Insert an account directly into BOB's cache (test-only).
     pub(crate) fn insert_account_for_test(&mut self, pubkey: Pubkey, account: AccountSharedData) {
-        self.accounts.insert(
-            pubkey,
-            AccountWithMeta {
-                account,
-                synced_since: None,
-                deleted: false,
-            },
-        );
+        let meta = AccountWithMeta {
+            account,
+            synced_since: None,
+            deleted: false,
+        };
+        self.note_added(&meta);
+        if let Some(old) = self.accounts.insert(pubkey, meta) {
+            self.note_removed(&old);
+        }
     }
 }
 
@@ -1329,6 +1368,43 @@ mod tests {
 
         let drained = bob.cache_stats();
         assert_eq!(drained.evicted, 0, "the evicted delta drains after a read");
+    }
+
+    /// dirty_entries and bytes are maintained incrementally, so they are exact
+    /// between eviction sweeps, not only right after one.
+    #[tokio::test]
+    async fn cache_stats_maintained_without_sweep() {
+        let (mut bob, settled_tx) = create_test_bob();
+        let a = Pubkey::new_unique();
+        let account_a = make_account(1, &[0u8; 5], &Pubkey::default());
+        bob.insert_account_for_test(a, account_a.clone());
+        bob.insert_account_for_test(
+            Pubkey::new_unique(),
+            make_account(1, &[0u8; 3], &Pubkey::default()),
+        );
+
+        // No sweep is forced, so these totals come purely from incremental accounting.
+        let stats = bob.cache_stats();
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.dirty_entries, 2, "both inserts are dirty (None)");
+        assert_eq!(stats.bytes, 5 + 3);
+
+        // Settling `a` matches its in-memory bytes, flipping it clean with no sweep.
+        settled_tx
+            .send(vec![(
+                a,
+                AccountSettlement {
+                    account: account_a,
+                    deleted: false,
+                },
+            )])
+            .unwrap();
+        bob.garbage_collect();
+
+        let stats = bob.cache_stats();
+        assert_eq!(stats.dirty_entries, 1, "settling a marks it clean");
+        assert_eq!(stats.bytes, 5 + 3, "a clean flip does not change bytes");
+        assert_eq!(stats.entries, 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

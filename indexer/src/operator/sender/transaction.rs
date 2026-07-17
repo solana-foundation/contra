@@ -2424,10 +2424,11 @@ mod tests {
             (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
         );
         state.smt_state = Some(smt);
+        let prior_sig = Signature::new_unique();
         state.pending_signatures.insert(
             nonce,
             vec![PendingSig {
-                signature: Signature::new_unique(),
+                signature: prior_sig,
                 last_valid_block_height: 0,
             }],
         );
@@ -2465,6 +2466,17 @@ mod tests {
         assert!(
             smt.nonce_to_builder.contains_key(&nonce),
             "builder cache kept for the in-flight nonce"
+        );
+        // The stashed signature is the invariant the guard protects: recovery
+        // reconciles the in-flight nonce against it, so it must survive the abort.
+        let stashed = state
+            .pending_signatures
+            .get(&nonce)
+            .expect("stashed signature preserved for recovery to reconcile");
+        assert_eq!(stashed.len(), 1, "no signatures added or dropped");
+        assert_eq!(
+            stashed[0].signature, prior_sig,
+            "the pre-broadcast signature is intact"
         );
     }
 

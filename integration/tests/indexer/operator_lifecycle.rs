@@ -8,7 +8,8 @@
 //! 1. Single deposit mint: operator mints channel tokens for one pending deposit.
 //! 2. Issuance idempotency: duplicate deposit row does not trigger a double-mint.
 //! 3. Withdrawal nonce idempotency: duplicate withdrawal row releases funds only once.
-//! 4. Failure alerts: failed mint and failed withdrawal each fire a webhook POST.
+//! 4. Failure alerts: a failed withdrawal fires a webhook POST; a preflight-failed
+//!    mint is left Processing for recovery rather than terminalized.
 //! 5. Batch deposits: operator processes 5 deposits for distinct recipients in one sweep.
 //! 6. Idle operator: no phantom records created when the DB has no pending work.
 //! 7. Runtime reconciliation halt: channel supply over-issued beyond escrow custody
@@ -215,6 +216,36 @@ async fn wait_for_transaction_status(
     Err(format!(
         "Transaction {} did not reach status {} within {}s",
         signature, expected_status, timeout_secs
+    )
+    .into())
+}
+
+/// Poll until the deposit's write-ahead mint signature is journaled in
+/// `pending_release_signatures`. The journal is written right before broadcast,
+/// so a non-empty journal proves the mint reached the send step.
+async fn wait_for_release_signature_journaled(
+    pool: &sqlx::PgPool,
+    signature: &str,
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < timeout_secs {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pending_release_signatures prs \
+             JOIN transactions t ON t.id = prs.transaction_id \
+             WHERE t.signature = $1",
+        )
+        .bind(signature)
+        .fetch_one(pool)
+        .await?;
+        if count > 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "deposit {} did not journal a write-ahead mint signature within {}s",
+        signature, timeout_secs
     )
     .into())
 }
@@ -543,17 +574,22 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     Ok(())
 }
 
-/// Triggers one failed mint (wrong-authority `mint_to`, rejected at preflight)
-/// and one bad withdrawal (mint not whitelisted on the instance, escalated to
-/// `ManualReview` because the burn never produced a verifiable signature) and
-/// asserts that the configured `alert_webhook_url` receives exactly two POST
-/// requests — `db_transaction_writer::send_webhook_alert` fires for both
-/// `Failed` and `ManualReview` dispositions.
+/// Triggers one preflight-failing mint (wrong-authority `mint_to`) and one bad
+/// withdrawal (mint not whitelisted on the instance, escalated to `ManualReview`
+/// because the burn never produced a verifiable signature).
+///
+/// A write-ahead-persisted mint is never terminalized in the sender: on a send
+/// error it is left Processing for recovery, so it journals its signature and
+/// stays Processing rather than reaching Failed, and fires no alert. Only the
+/// withdrawal's `ManualReview` disposition fires a webhook, so the configured
+/// `alert_webhook_url` receives exactly one POST via
+/// `db_transaction_writer::send_webhook_alert`.
 ///
 /// Uses a `mockito` HTTP server as the webhook endpoint so no external service
 /// is required.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Operator Lifecycle: Alerts on Failure ===");
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
@@ -587,11 +623,13 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
 
     let mut server = Server::new_async().await;
+    // Only the withdrawal's ManualReview disposition fires a webhook; the
+    // preflight-failed mint is deferred to recovery and writes no status.
     let alert_mock = server
         .mock("POST", "/")
         .match_header("content-type", "application/json")
         .with_status(200)
-        .expect(2)
+        .expect(1)
         .create_async()
         .await;
 
@@ -613,9 +651,9 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     .await?;
 
     // Create a valid SPL mint with a *different* mint authority than the operator's
-    // admin key.  When the operator calls mint_to using the admin key, the SPL token
-    // program rejects it (wrong authority) → preflight fails → deposit reaches "failed"
-    // without going through the JIT initialization loop.
+    // admin key. When the operator calls mint_to using the admin key, the SPL token
+    // program rejects it (wrong authority), so the mint fails at preflight after the
+    // write-ahead signature is persisted.
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let bad_authority = Keypair::new(); // NOT the operator admin — intentionally wrong
     let bad_mint = Keypair::new();
@@ -646,7 +684,17 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
 
-    wait_for_transaction_status(&pool, &mint_fail_sig, "failed", 180).await?;
+    // A write-ahead-persisted mint is never terminalized in the sender: the send
+    // error leaves the row Processing for recovery to reconcile against the persisted
+    // signature. So the mint journals its signature and stays Processing, never Failed.
+    wait_for_release_signature_journaled(&pool, &mint_fail_sig, 180).await?;
+    let mint_row = db::get_transaction(&pool, &mint_fail_sig)
+        .await?
+        .expect("the deposit row must exist");
+    assert_eq!(
+        mint_row.status, "processing",
+        "a preflight-failed mint is deferred to recovery, not marked Failed"
+    );
 
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();

@@ -9,6 +9,8 @@
 //! 2. DB has a phantom deposit (mint registered, tokens never on-chain) → blocks startup.
 //! 3. Same phantom deposit but threshold covers the gap → passes with warning.
 //! 4. Real tokens minted to escrow ATA, DB matches → passes with strict threshold.
+//! 5. Extra tokens minted to escrow ATA with no DB row (attacker surplus) → passes
+//!    with strict threshold, since a surplus is benign and never blocks startup.
 
 #[path = "helpers/mod.rs"]
 mod helpers;

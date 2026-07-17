@@ -53,6 +53,26 @@ use {
 
 // TODO: Make this a config parameter
 const OLDEST_SYNCED_ACCOUNT_AGE: u64 = 60 * 60; // 1 hour
+
+/// Upper bound on resident cache entries. Once exceeded, the oldest clean
+/// entries are evicted down to a low watermark. Must stay well above the max
+/// distinct account keys a single batch can reference so a batch never evicts
+/// its own working set. At ~1 KiB/account this bounds the clean set near ~1 GiB.
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 1_000_000;
+
+/// Snapshot of BOB cache size, reported to metrics once per batch.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct BobCacheStats {
+    /// Total resident entries (exact, current).
+    pub entries: usize,
+    /// Resident entries that are ahead of the DB (`synced_since == None`).
+    pub dirty_entries: usize,
+    /// Resident account-data bytes across all entries.
+    pub bytes: usize,
+    /// Entries evicted (age + cap) since the previous read; drained on read.
+    pub evicted: usize,
+}
+
 struct AccountWithMeta {
     account: AccountSharedData,
     synced_since: Option<u64>,
@@ -78,6 +98,10 @@ pub struct BOB {
     pub accounts_db: AccountsDB,
     /// Counts preload calls since last eviction sweep
     batches_since_eviction: u64,
+    /// Hard cap on resident entries; the cap evicts clean entries above it.
+    max_cache_entries: usize,
+    /// Entries evicted since the last cache_stats read; drained on read.
+    evicted_delta: usize,
 }
 
 impl BOB {
@@ -94,6 +118,8 @@ impl BOB {
             settled_accounts_rx,
             accounts_db,
             batches_since_eviction: 0,
+            max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            evicted_delta: 0,
         }
     }
 
@@ -111,12 +137,15 @@ impl BOB {
     /// (not in BOB's HashMap and not a precompile). Once the working set is
     /// warm, most batches will skip the DB entirely.
     pub async fn preload_accounts(&mut self, pubkeys: &[Pubkey]) -> (usize, usize) {
-        // Drain settled_accounts channel to keep dirty/clean tracking current.
-        // The expensive eviction sweep only runs every GC_EVICTION_INTERVAL batches.
-        self.garbage_collect();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-        // Partition pubkeys into cache hits vs misses, skipping precompiles
-        // (which are always in memory and never need DB lookup).
+        // Split the keys into cache hits and misses, skipping precompiles (always
+        // in memory, no DB lookup). Each hit is stamped with the current time so
+        // that when eviction runs below, this batch's accounts look freshest and
+        // are never the ones evicted. Misses are fetched from the DB further down.
         let mut already_cached = 0usize;
         let mut miss_keys: Vec<Pubkey> = Vec::new();
 
@@ -124,12 +153,23 @@ impl BOB {
             if self.precompiles.contains_key(pubkey) {
                 continue;
             }
-            if self.accounts.contains_key(pubkey) {
+            if let Some(entry) = self.accounts.get_mut(pubkey) {
                 already_cached += 1;
+                // Reading a clean (in-sync) entry does not desync it, so refresh
+                // its recency; this keeps hot read-only accounts from aging or
+                // capping out.
+                if entry.synced_since.is_some() {
+                    entry.synced_since = Some(now);
+                }
             } else {
                 miss_keys.push(*pubkey);
             }
         }
+
+        // Drain settled_accounts to keep dirty/clean tracking current, enforce
+        // the hard cap, and run the periodic age sweep. Misses are not resident
+        // yet, so they are never eviction candidates here.
+        self.garbage_collect();
 
         // If everything is warm, skip the DB round-trip entirely.
         if miss_keys.is_empty() {
@@ -141,11 +181,14 @@ impl BOB {
         let mut fetched = 0usize;
         for (index, account_opt) in accounts.iter().enumerate() {
             if let Some(account) = account_opt {
+                // A DB-loaded account is byte-identical to the DB, so it is
+                // clean and belongs in the normally-evictable population.
+                // Reserve synced_since=None for execution-produced state.
                 self.accounts.insert(
                     miss_keys[index],
                     AccountWithMeta {
                         account: account.clone(),
-                        synced_since: None,
+                        synced_since: Some(now),
                         deleted: false,
                     },
                 );
@@ -260,18 +303,86 @@ impl BOB {
             }
         }
 
+        // Phase 1b: apply the hard entry cap. The len() check is cheap and skips
+        // out when under the cap, so the extra work only happens when the cache
+        // has actually grown too large. This runs before the current batch adds
+        // its missed accounts, so those accounts are never evicted here.
+        self.cap_evict();
+
         // Phase 2: only run the O(N) eviction sweep periodically.
         self.batches_since_eviction += 1;
         if self.batches_since_eviction >= GC_EVICTION_INTERVAL {
             self.batches_since_eviction = 0;
-            self.accounts.retain(|_pubkey, account| {
-                if let Some(synced_since) = account.synced_since {
-                    synced_since + OLDEST_SYNCED_ACCOUNT_AGE >= now
-                } else {
-                    true // Always keep accounts with synced_since = None
-                }
-            });
+            let before = self.accounts.len();
+            self.accounts
+                .retain(|_pubkey, account| match account.synced_since {
+                    Some(synced_since) => synced_since + OLDEST_SYNCED_ACCOUNT_AGE >= now,
+                    None => true, // Always keep accounts with synced_since = None
+                });
+            self.evicted_delta += before.saturating_sub(self.accounts.len());
         }
+    }
+
+    /// Evict the oldest clean entries when the cache exceeds `max_cache_entries`,
+    /// down to a 90% low watermark. Dirty (ahead-of-DB) entries are never
+    /// evicted, so the cap can only be enforced against clean state. The low
+    /// watermark amortizes the sort so it does not run every batch under
+    /// sustained pressure.
+    fn cap_evict(&mut self) {
+        if self.accounts.len() <= self.max_cache_entries {
+            return;
+        }
+
+        // Keep at least one entry of headroom even for a tiny cap so we trim
+        // toward a 90% watermark instead of collapsing the whole clean set.
+        let target = (self.max_cache_entries * 9 / 10).max(1);
+        let to_remove = self.accounts.len().saturating_sub(target);
+        if to_remove == 0 {
+            return;
+        }
+
+        // Oldest synced_since first; dirty entries are not candidates.
+        let mut clean: Vec<(Pubkey, u64)> = self
+            .accounts
+            .iter()
+            .filter_map(|(pubkey, meta)| meta.synced_since.map(|t| (*pubkey, t)))
+            .collect();
+
+        let remove_count = to_remove.min(clean.len());
+        if remove_count == 0 {
+            return;
+        }
+        // Partition the oldest `remove_count` entries to the front in O(n)
+        // without a full sort; we evict all of them so their order is moot.
+        if remove_count < clean.len() {
+            clean.select_nth_unstable_by_key(remove_count, |(_, synced_since)| *synced_since);
+        }
+        for (pubkey, _) in clean.iter().take(remove_count) {
+            self.accounts.remove(pubkey);
+        }
+        self.evicted_delta += remove_count;
+    }
+
+    /// Return the current cache-size snapshot and drain the evicted counter.
+    /// Dirty and byte tallies are computed here so they stay exact and
+    /// consistent with `entries` on every batch, not only at the sweep cadence.
+    pub fn cache_stats(&mut self) -> BobCacheStats {
+        let mut dirty_entries = 0usize;
+        let mut bytes = 0usize;
+        for meta in self.accounts.values() {
+            if meta.synced_since.is_none() {
+                dirty_entries += 1;
+            }
+            bytes += meta.account.data().len();
+        }
+        let stats = BobCacheStats {
+            entries: self.accounts.len(),
+            dirty_entries,
+            bytes,
+            evicted: self.evicted_delta,
+        };
+        self.evicted_delta = 0;
+        stats
     }
 }
 
@@ -289,6 +400,8 @@ impl BOB {
             settled_accounts_rx,
             accounts_db,
             batches_since_eviction: 0,
+            max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            evicted_delta: 0,
         }
     }
 
@@ -999,6 +1112,263 @@ mod tests {
             result.unwrap(),
             account,
             "Live account must be returned to SVM"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Preload recency touch, hard cap, and cache-size stats
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn preload_hit_refreshes_clean_recency() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let pubkey = Pubkey::new_unique();
+        let now = now_secs();
+
+        bob.accounts.insert(
+            pubkey,
+            AccountWithMeta {
+                account: make_account(1000, &[1], &Pubkey::default()),
+                synced_since: Some(now - 1800),
+                deleted: false,
+            },
+        );
+
+        // Everything is cached, so no DB round-trip happens.
+        bob.preload_accounts(&[pubkey]).await;
+
+        let meta = bob.accounts.get(&pubkey).unwrap();
+        assert!(
+            meta.synced_since.unwrap() >= now - 1,
+            "a clean cache hit must be restamped to the current time"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_hit_does_not_sync_dirty() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let pubkey = Pubkey::new_unique();
+
+        bob.accounts.insert(
+            pubkey,
+            AccountWithMeta {
+                account: make_account(1000, &[1], &Pubkey::default()),
+                synced_since: None,
+                deleted: false,
+            },
+        );
+
+        bob.preload_accounts(&[pubkey]).await;
+
+        let meta = bob.accounts.get(&pubkey).unwrap();
+        assert!(
+            meta.synced_since.is_none(),
+            "reading a dirty (ahead-of-DB) entry must not mark it clean"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_evicts_oldest_clean_over_limit() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_entries = 10;
+        let now = now_secs();
+
+        let mut keys = Vec::new();
+        for i in 0..12u64 {
+            let pk = Pubkey::new_unique();
+            keys.push(pk);
+            bob.accounts.insert(
+                pk,
+                AccountWithMeta {
+                    account: make_account(1, &[1], &Pubkey::default()),
+                    synced_since: Some(now - 100 + i), // strictly increasing recency
+                    deleted: false,
+                },
+            );
+        }
+
+        bob.garbage_collect();
+
+        assert_eq!(
+            bob.accounts.len(),
+            9,
+            "cap evicts down to the 90% low watermark"
+        );
+        for pk in &keys[..3] {
+            assert!(
+                !bob.accounts.contains_key(pk),
+                "the three oldest clean entries are evicted first"
+            );
+        }
+        for pk in &keys[3..] {
+            assert!(
+                bob.accounts.contains_key(pk),
+                "the newest clean entries survive the cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_never_evicts_dirty() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_entries = 2;
+
+        for _ in 0..3 {
+            bob.accounts.insert(
+                Pubkey::new_unique(),
+                AccountWithMeta {
+                    account: make_account(1, &[1], &Pubkey::default()),
+                    synced_since: None,
+                    deleted: false,
+                },
+            );
+        }
+
+        bob.garbage_collect();
+
+        assert_eq!(
+            bob.accounts.len(),
+            3,
+            "dirty (ahead-of-DB) entries are never evicted, even over the cap"
+        );
+    }
+
+    /// A clean account referenced by the current batch must survive the cap even
+    /// if it was cold, because preload restamps hits before eviction runs.
+    #[tokio::test]
+    async fn cap_keeps_account_referenced_this_batch() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_entries = 2;
+        let stale = now_secs() - 10_000;
+
+        // Two cold clean entries not referenced this batch (evictable).
+        for _ in 0..2 {
+            bob.accounts.insert(
+                Pubkey::new_unique(),
+                AccountWithMeta {
+                    account: make_account(1, &[1], &Pubkey::default()),
+                    synced_since: Some(stale),
+                    deleted: false,
+                },
+            );
+        }
+        // One equally-cold clean entry that this batch references.
+        let referenced = Pubkey::new_unique();
+        bob.accounts.insert(
+            referenced,
+            AccountWithMeta {
+                account: make_account(1, &[1], &Pubkey::default()),
+                synced_since: Some(stale),
+                deleted: false,
+            },
+        );
+
+        // All keys are cached, so this stays in-memory (no DB round-trip).
+        bob.preload_accounts(&[referenced]).await;
+
+        assert!(
+            bob.accounts.contains_key(&referenced),
+            "an account referenced this batch must not be cap-evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stats_reports_and_drains() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let now = now_secs();
+
+        // One old clean entry that the sweep will evict.
+        bob.accounts.insert(
+            Pubkey::new_unique(),
+            AccountWithMeta {
+                account: make_account(1, &[0u8; 5], &Pubkey::default()),
+                synced_since: Some(now - OLDEST_SYNCED_ACCOUNT_AGE - 1),
+                deleted: false,
+            },
+        );
+        // Two recent clean entries (kept), data lengths 3 and 7.
+        bob.accounts.insert(
+            Pubkey::new_unique(),
+            AccountWithMeta {
+                account: make_account(1, &[1u8; 3], &Pubkey::default()),
+                synced_since: Some(now),
+                deleted: false,
+            },
+        );
+        bob.accounts.insert(
+            Pubkey::new_unique(),
+            AccountWithMeta {
+                account: make_account(1, &[2u8; 7], &Pubkey::default()),
+                synced_since: Some(now),
+                deleted: false,
+            },
+        );
+        // One dirty entry (kept), data length 4.
+        bob.accounts.insert(
+            Pubkey::new_unique(),
+            AccountWithMeta {
+                account: make_account(1, &[3u8; 4], &Pubkey::default()),
+                synced_since: None,
+                deleted: false,
+            },
+        );
+
+        // Force the eviction sweep to run on this call.
+        bob.batches_since_eviction = GC_EVICTION_INTERVAL - 1;
+        bob.garbage_collect();
+
+        let stats = bob.cache_stats();
+        assert_eq!(stats.entries, 3, "one old clean entry was evicted");
+        assert_eq!(stats.dirty_entries, 1, "only the None entry is dirty");
+        assert_eq!(
+            stats.bytes,
+            3 + 7 + 4,
+            "bytes sums the data length of kept entries"
+        );
+        assert_eq!(stats.evicted, 1, "one entry was evicted this sweep");
+
+        let drained = bob.cache_stats();
+        assert_eq!(drained.evicted, 0, "the evicted delta drains after a read");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_marks_db_loaded_account_clean() {
+        let (mut redis_raw, _redis) = crate::test_helpers::start_test_redis().await;
+        let pubkey = Pubkey::new_unique();
+        let account = make_account(5000, &[7, 7, 7], &Pubkey::default());
+        // Seed Redis using the exact key/serialization get_accounts_redis expects.
+        redis_raw.set_account(pubkey, account.clone()).await;
+
+        let db = crate::accounts::AccountsDB::Redis(redis_raw);
+        let (_settled_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new_test(rx, db);
+
+        let now = now_secs();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        assert_eq!(
+            (fetched, cached),
+            (1, 0),
+            "account is loaded from the DB as a cache miss"
+        );
+
+        let synced = bob
+            .accounts
+            .get(&pubkey)
+            .unwrap()
+            .synced_since
+            .expect("a DB-loaded account must be marked clean, not pinned");
+        assert!(synced >= now - 1, "the clean stamp reflects load time");
+
+        // Backdate past the age cap and force a sweep: a pinned (None) account
+        // would survive, so eviction here proves the entry is unpinned.
+        bob.accounts.get_mut(&pubkey).unwrap().synced_since =
+            Some(now - OLDEST_SYNCED_ACCOUNT_AGE - 1);
+        bob.batches_since_eviction = GC_EVICTION_INTERVAL - 1;
+        bob.garbage_collect();
+
+        assert!(
+            !bob.accounts.contains_key(&pubkey),
+            "a clean DB-loaded account is age-evictable, no longer pinned in memory"
         );
     }
 }

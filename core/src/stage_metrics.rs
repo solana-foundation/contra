@@ -32,6 +32,12 @@ pub trait StageMetrics: Send + Sync {
     fn executor_svm_duration_ms(&self, kind: &'static str, ms: f64);
     fn executor_bob_update_duration_ms(&self, kind: &'static str, ms: f64);
 
+    // BOB account cache size
+    fn bob_cache_entries(&self, count: usize);
+    fn bob_cache_dirty_entries(&self, count: usize);
+    fn bob_cache_bytes(&self, bytes: usize);
+    fn bob_cache_evicted(&self, count: usize);
+
     // Settler
     fn settler_txs_settled(&self, count: usize);
     fn settler_settle_duration_ms(&self, ms: f64);
@@ -105,6 +111,18 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_bob_update_duration_ms(&self, kind: &'static str, ms: f64) {
         debug!("executor: bob_update_duration kind={} {:.3}ms", kind, ms);
+    }
+    fn bob_cache_entries(&self, count: usize) {
+        debug!("bob: cache_entries={}", count);
+    }
+    fn bob_cache_dirty_entries(&self, count: usize) {
+        debug!("bob: cache_dirty_entries={}", count);
+    }
+    fn bob_cache_bytes(&self, bytes: usize) {
+        debug!("bob: cache_bytes={}", bytes);
+    }
+    fn bob_cache_evicted(&self, count: usize) {
+        debug!("bob: cache_evicted={}", count);
     }
     fn settler_txs_settled(&self, n: usize) {
         debug!("settler: settled {}", n);
@@ -244,6 +262,30 @@ gauge_vec!(
     "Last observed depth of the address_signatures bounded mpsc channel",
     &[]
 );
+counter_vec!(
+    BOB_CACHE_EVICTED,
+    "private_channel_bob_cache_evicted_total",
+    "BOB account-cache entries evicted (age sweep + hard cap)",
+    &[]
+);
+gauge_vec!(
+    BOB_CACHE_ENTRIES,
+    "private_channel_bob_cache_entries",
+    "Total resident entries in the BOB account cache",
+    &[]
+);
+gauge_vec!(
+    BOB_CACHE_DIRTY_ENTRIES,
+    "private_channel_bob_cache_dirty_entries",
+    "Resident BOB entries ahead of the DB (un-evictable); refreshed at sweep cadence",
+    &[]
+);
+gauge_vec!(
+    BOB_CACHE_BYTES,
+    "private_channel_bob_cache_bytes",
+    "Approx resident account-data bytes in the BOB cache; refreshed at sweep cadence",
+    &[]
+);
 
 // Gauges
 
@@ -377,6 +419,26 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[kind])
             .observe(ms);
     }
+    fn bob_cache_entries(&self, count: usize) {
+        BOB_CACHE_ENTRIES
+            .with_label_values(&[] as &[&str])
+            .set(count as f64);
+    }
+    fn bob_cache_dirty_entries(&self, count: usize) {
+        BOB_CACHE_DIRTY_ENTRIES
+            .with_label_values(&[] as &[&str])
+            .set(count as f64);
+    }
+    fn bob_cache_bytes(&self, bytes: usize) {
+        BOB_CACHE_BYTES
+            .with_label_values(&[] as &[&str])
+            .set(bytes as f64);
+    }
+    fn bob_cache_evicted(&self, count: usize) {
+        BOB_CACHE_EVICTED
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
+    }
     fn settler_txs_settled(&self, n: usize) {
         SETTLER_TXS_SETTLED
             .with_label_values(&[] as &[&str])
@@ -441,6 +503,10 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_MISSING_RESULTS,
         EXECUTOR_DROPPED_EXPIRED_BH,
         SETTLER_TXS_SETTLED,
+        BOB_CACHE_EVICTED,
+        BOB_CACHE_ENTRIES,
+        BOB_CACHE_DIRTY_ENTRIES,
+        BOB_CACHE_BYTES,
         // Executor latency histograms
         EXECUTOR_BATCH_DURATION,
         EXECUTOR_PRELOAD_DURATION,

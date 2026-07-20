@@ -484,7 +484,7 @@ pub(super) async fn send_and_confirm(
 
     // A withdrawal nonce is consumed on broadcast, so a release that lands must already
     // have a durable signature record for crash recovery to reconcile against.
-    if let (Some(_nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
+    if let (Some(nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
         if persist_signature_or_abort(
             &state.storage,
             pt,
@@ -495,6 +495,20 @@ pub(super) async fn send_and_confirm(
         .await
         .is_err()
         {
+            // The persist WRITE just failed, so do not attempt another DB write here.
+            // With no stashed signature this nonce provably never broadcast, so the
+            // Stage-1 SMT/builder/retry/remint mutations describe a nonce the chain
+            // never accepted; roll them back so later withdrawals in this tree build
+            // on a root the chain agrees with. A stashed signature (retry recursion
+            // after a broadcast) means a real tx may land, so leave state intact for
+            // recovery. Row stays Processing either way.
+            if state
+                .pending_signatures
+                .get(&nonce)
+                .is_none_or(|sigs| sigs.is_empty())
+            {
+                cleanup_failed_transaction(state, Some(nonce));
+            }
             return;
         }
     }
@@ -2288,9 +2302,14 @@ mod tests {
         assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
     }
 
-    /// A failed write-ahead persist must NOT broadcast, must write no terminal status (row left Processing), and must stash nothing.
+    /// A failed write-ahead persist must NOT broadcast, must write no terminal status (row
+    /// left Processing), and must stash nothing. With nothing ever broadcast for this nonce
+    /// the Stage-1 SMT/builder/retry/remint mutations must also roll back so later
+    /// withdrawals in this tree build on a root the chain agrees with.
     #[tokio::test]
     async fn release_aborts_send_when_persist_fails() {
+        let txn_id = 10;
+        let nonce = 5;
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         // sendTransaction must never be called once persist fails.
@@ -2303,13 +2322,29 @@ mod tests {
             .create();
 
         let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
         mock.set_should_fail("insert_release_signature", true);
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
-        let ctx = withdrawal_ctx(10, 5);
+        let ctx = withdrawal_ctx(txn_id, nonce);
 
         send_and_confirm(
             &mut state,
@@ -2328,9 +2363,215 @@ mod tests {
             "no status update must be sent; row stays Processing for recovery"
         );
         assert!(
-            !state.pending_signatures.contains_key(&5),
+            !state.pending_signatures.contains_key(&nonce),
             "nothing stashed when persist failed"
         );
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "SMT nonce rolled back when nothing broadcast"
+        );
+        assert!(
+            !smt.nonce_to_builder.contains_key(&nonce),
+            "builder cache rolled back"
+        );
+        assert!(
+            !state.remint_cache.contains_key(&nonce),
+            "remint cache rolled back"
+        );
+        assert!(
+            !state.retry_counts.contains_key(&nonce),
+            "retry count rolled back"
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "row stays Processing for recovery, no requeue"
+        );
+    }
+
+    /// Guards D1: a signature stashed from an earlier broadcast of this nonce means a real
+    /// tx may still land, so a later persist failure must leave the Stage-1 state intact
+    /// for recovery instead of rolling a still-in-flight nonce out of the SMT.
+    #[tokio::test]
+    async fn persist_failure_with_prior_broadcast_keeps_state() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        let prior_sig = Signature::new_unique();
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: prior_sig,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("insert_release_signature", true);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = withdrawal_ctx(txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &ctx,
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row stays Processing for recovery"
+        );
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            smt.smt_state.contains_nonce(nonce),
+            "nonce kept in SMT while an earlier broadcast may still land"
+        );
+        assert!(
+            smt.nonce_to_builder.contains_key(&nonce),
+            "builder cache kept for the in-flight nonce"
+        );
+        // The stashed signature is the invariant the guard protects: recovery
+        // reconciles the in-flight nonce against it, so it must survive the abort.
+        let stashed = state
+            .pending_signatures
+            .get(&nonce)
+            .expect("stashed signature preserved for recovery to reconcile");
+        assert_eq!(stashed.len(), 1, "no signatures added or dropped");
+        assert_eq!(
+            stashed[0].signature, prior_sig,
+            "the pre-broadcast signature is intact"
+        );
+    }
+
+    /// Guards against over-cleaning: a persist that succeeds must still broadcast, persist
+    /// the write-ahead signature, and keep the chain-accepted nonce in the SMT on a
+    /// confirmed release. Pins that the abort-branch rollback never touches the success path.
+    #[tokio::test]
+    async fn persist_success_still_broadcasts_and_keeps_nonce() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .create();
+        // A confirmed status routes to handle_success instead of the idempotent retry loop.
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
+                            "err": null,
+                            "slot": 100,
+                            "status": {"Ok": null}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = withdrawal_ctx(txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &ctx,
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            smt.smt_state.contains_nonce(nonce),
+            "the chain-accepted nonce must stay in the SMT on a confirmed release"
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(txn_id).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the write-ahead signature is persisted on the success path"
+        );
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a confirmed release emits a status update");
+        assert_eq!(update.status, TransactionStatus::Completed);
     }
 
     /// The in-memory stash happens only after a successful broadcast, so a send that

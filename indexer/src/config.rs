@@ -151,15 +151,15 @@ impl PrivateChannelIndexerConfig {
 /// Only applies when `program_type = escrow`. Skipped for `withdraw` indexers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconciliationConfig {
-    /// Maximum absolute mismatch (in raw token units) allowed before blocking startup.
-    /// 0 (default) means any mismatch blocks startup.
-    /// Mismatches above this value log error + emit alert and abort.
-    /// Mismatches at or below this value (but > 0) log a warning and continue.
+    /// Maximum custody shortfall (in raw token units) tolerated before blocking startup.
+    /// The shortfall is db_expected minus the on-chain balance: the escrow holding less
+    /// than the DB expects is the only solvency-relevant direction. 0 (default) means any
+    /// shortfall blocks startup; a shortfall at or below this value logs a warning and continues.
     ///
-    /// There is a small race window between the DB balance query and the on-chain RPC
-    /// fetch: a deposit arriving in that window will appear in the ATA but not yet in
-    /// the DB, producing a transient false positive. If spurious failures occur in
-    /// production, set this to the raw amount of one or two minimum deposits.
+    /// A surplus (on-chain balance above db_expected) never blocks startup: anyone can send
+    /// tokens to an escrow-owned account, and holding more than expected is not a solvency
+    /// risk. This also removes the old race-window false positive where a deposit landed in
+    /// the ATA before the DB query observed it.
     pub mismatch_threshold_raw: u64,
 }
 

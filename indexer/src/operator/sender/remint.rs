@@ -1552,6 +1552,62 @@ mod tests {
         );
     }
 
+    /// The stored-signature lookup is the idempotency gate's first step. A
+    /// transient DB failure there is pre-broadcast: `attempt_remint` must defer
+    /// and retry the lookup on a later tick, never escalate or authorize a mint.
+    #[tokio::test]
+    async fn execute_deferred_remint_defers_when_signature_lookup_fails() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // No resend may be broadcast when the idempotency lookup cannot run.
+        let send = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        mock.set_should_fail("get_remint_signatures", true);
+
+        let entry = PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(730),
+                withdrawal_nonce: Some(73),
+                trace_id: Some("trace-730".to_string()),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(730),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        };
+
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        // Deferred, not resolved: the row stays PendingRemint for the next tick.
+        let DeferredRemintOutcome::Defer(_, reason) = outcome else {
+            panic!("lookup failure must defer, not resolve");
+        };
+        assert!(
+            reason.contains("stored remint-signature lookup failed"),
+            "defer reason must name the lookup failure: {reason}"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lookup failure must not emit a status update"
+        );
+        send.assert_async().await;
+    }
+
     /// When the finality check returns null for a withdrawal signature
     /// (transaction was dropped), `execute_deferred_remint` is called. If the
     /// remint cannot even be built (source blockhash RPC unreachable), nothing
@@ -1646,11 +1702,17 @@ mod tests {
     async fn process_pending_remints_finalized_with_onchain_error_proceeds_to_remint() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The remint proceeds and defers on the (unmocked) blockhash, which
+        // persists the bumped counter, so the row must exist.
+        seed_pending_remint_row(&mock, 88, 0);
 
         let sig = Signature::new_unique();
 
+        // Finalized-failed: status present with an error. A finalized-failed sig
+        // is dead outright, so classification needs no block-height check.
         let _status_mock = mock_rpc(
             &mut rpc_server,
             "getSignatureStatuses",
@@ -1668,15 +1730,6 @@ mod tests {
                 },
                 "id": 0
             }"#,
-        )
-        .await;
-
-        // Block height ahead of the stored lvbh (0) so the finalized-failed sig
-        // counts as dead and the gate falls through to Case 3 (remint).
-        let _block_height_mock = mock_rpc(
-            &mut rpc_server,
-            "getBlockHeight",
-            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
         )
         .await;
 
@@ -1699,15 +1752,14 @@ mod tests {
 
         process_pending_remints(&mut state, &storage_tx).await;
 
-        let update = storage_rx
-            .try_recv()
-            .expect("should receive a status update");
-        assert_ne!(
-            update.status,
-            TransactionStatus::Completed,
-            "finalized-with-error must NOT produce Completed — funds never left escrow"
+        // Not Completed: the gate reached Case 3 and attempted the remint, which
+        // defers on the unmocked blockhash rather than marking the withdrawal done.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "finalized-with-error must NOT produce Completed — it proceeds to remint"
         );
-        assert_eq!(update.transaction_id, 88);
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
     }
 
     /// Regression: when every stored signature already has a status entry, the

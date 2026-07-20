@@ -22,8 +22,6 @@ use chrono::Utc;
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
-use solana_rpc_client_api::client_error::ErrorKind;
-use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
@@ -891,27 +889,6 @@ pub(super) async fn handle_success(
     }
 }
 
-/// Handle permanent transaction failure with deferred remint for withdrawals.
-///
-/// For withdrawal transactions: removes remint info from cache, runs cleanup
-/// (which removes the nonce from SMT and builder caches), then queues a deferred
-/// remint that will execute after the Solana finality window passes. This prevents
-/// double-spend if the original withdrawal lands on-chain after our polling window.
-///
-/// For non-withdrawal transactions: delegates to send_fatal_error.
-/// Whether a send failure came back as an explicit RPC rejection from the node
-/// (preflight simulation failure, blockhash errors, etc.). Such a response means the
-/// transaction was never submitted to the cluster, so failing fast is safe. A transport
-/// or IO error instead leaves the outcome ambiguous (the request may have reached the
-/// cluster), so a persisted mint defers to recovery rather than risk stranding a landed one.
-fn send_rejected_by_node(e: &TransactionError) -> bool {
-    matches!(
-        e,
-        TransactionError::Rpc(err)
-            if matches!(&err.kind, ErrorKind::RpcError(RpcError::RpcResponseError { .. }))
-    )
-}
-
 /// Leave a persisted transaction Processing after an uncertain terminal outcome.
 /// The broadcast may have landed, so a terminal Failed would strand a possibly-funded
 /// deposit and drop the signature recovery needs; recovery reconciles it next sweep.
@@ -977,6 +954,14 @@ pub(super) async fn requeue_prebroadcast_failure(
     }
 }
 
+/// Handle permanent transaction failure with deferred remint for withdrawals.
+///
+/// For withdrawal transactions: removes remint info from cache, runs cleanup
+/// (which removes the nonce from SMT and builder caches), then queues a deferred
+/// remint that will execute after the Solana finality window passes. This prevents
+/// double-spend if the original withdrawal lands on-chain after our polling window.
+///
+/// For non-withdrawal transactions: delegates to send_fatal_error.
 pub(super) async fn handle_permanent_failure(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -1381,15 +1366,16 @@ pub(super) async fn fire_and_store_task(
                 .with_label_values(&[pt, "rpc_send_error"])
                 .inc();
             error!("Failed to send transaction (fire-and-forget): {}", e);
-            // A node rejection (e.g. preflight) means the tx never reached the cluster, so
-            // fail fast. An ambiguous transport error on a persisted mint may have landed,
-            // so leave it Processing for recovery rather than strand a possibly-funded mint.
-            if persisted && !send_rejected_by_node(&e) {
+            // A persisted mint may already have landed, and even a preflight rejection can be
+            // a stale-node false negative, so a terminal Failed would strand a funded deposit
+            // and drop the signature recovery needs. Leave it Processing for recovery to
+            // reconcile against the persisted signature. Terminal sends mint no balance, so fail fast.
+            if persisted {
                 leave_processing_for_recovery(
                     pt,
                     ctx.transaction_id,
                     &signature,
-                    "ambiguous send error after write-ahead persist",
+                    "send error after write-ahead persist",
                 );
             } else {
                 send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
@@ -4696,12 +4682,11 @@ mod tests {
         );
     }
 
-    /// A send error (e.g. preflight rejection) means the broadcast never reached the
-    /// network, so even with the signature already persisted the mint is terminal Failed,
-    /// same as the withdrawal send path. (The broadcast-accepted-but-unconfirmed case is
-    /// the one route_poll_results leaves Processing; see the poll timeout test.)
+    /// A send error after the signature is persisted may still have landed on-chain, so the
+    /// mint is never terminalized in the sender: the signature is kept and no status update is
+    /// written (row left Processing for recovery to reconcile against the persisted signature).
     #[tokio::test]
-    async fn mint_send_error_after_persist_routes_to_failed() {
+    async fn mint_send_error_after_persist_left_for_recovery() {
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         let _send = server
@@ -4748,12 +4733,147 @@ mod tests {
         };
         assert!(
             !mock.get_release_signatures(77).await.unwrap().is_empty(),
-            "signature must be persisted before the failing broadcast",
+            "signature must be preserved so recovery can reconcile it",
         );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row left Processing for recovery",
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a failed broadcast stashes no in-flight entry",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on send error",
+        );
+    }
+
+    /// A preflight-style RPC rejection after the signature is persisted is deferred to
+    /// recovery too: even a "deterministic" program error can be a stale-node false negative,
+    /// so the sender never marks a persisted mint Failed and keeps the signature.
+    #[tokio::test]
+    async fn mint_preflight_failure_after_persist_left_for_recovery() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        // A preflight failure surfaces as a distinct RPC response error code (-32002); the
+        // sender's branch treats every persisted send error identically, so recovery decides.
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32002,
+                        "message": "Transaction simulation failed",
+                        "data": {
+                            "err": {"InstructionError": [0, {"Custom": 1}]},
+                            "logs": ["Program log: preflight failure"]
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            recoverable(t_lock),
+            permit,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            !mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "signature must be preserved so recovery can reconcile it",
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a preflight rejection writes no status; row left Processing for recovery",
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a failed broadcast stashes no in-flight entry",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on send error",
+        );
+    }
+
+    /// A Terminal (non-persisted) send error still fails fast: InitializeMint mints no
+    /// balance, so there is nothing to strand and the row is terminalized to Failed.
+    #[tokio::test]
+    async fn terminal_send_error_routes_to_failed() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(909),
+            RetryPolicy::Idempotent,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            SendDurability::Terminal,
+            permit,
+        )
+        .await;
+
         let update = storage_rx
             .try_recv()
-            .expect("send error must emit a terminal status");
-        assert_eq!(update.transaction_id, 77);
+            .expect("a terminal send error must emit a status update");
+        assert_eq!(update.transaction_id, 909);
         assert_eq!(update.status, TransactionStatus::Failed);
         assert!(
             state.in_flight.is_empty(),
@@ -5341,35 +5461,6 @@ mod tests {
         assert!(
             !mock.get_release_signatures(77).await.unwrap().is_empty(),
             "JIT retry must reuse the freed parent slot and journal its signature at saturation"
-        );
-    }
-
-    /// A node RPC rejection (preflight, blockhash, etc.) is definitive - the tx was never
-    /// submitted - so a persisted mint fails fast; a transport/IO error is ambiguous and a
-    /// persisted mint instead defers to recovery. This classifier draws that line.
-    #[test]
-    fn send_rejected_by_node_distinguishes_rejection_from_transport_error() {
-        use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind};
-        use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
-
-        let node_rejection = TransactionError::Rpc(Box::new(ClientError::from(
-            ErrorKind::RpcError(RpcError::RpcResponseError {
-                code: -32002,
-                message: "preflight failure".to_string(),
-                data: RpcResponseErrorData::Empty,
-            }),
-        )));
-        assert!(
-            send_rejected_by_node(&node_rejection),
-            "an RPC response error is a definitive node rejection"
-        );
-
-        let transport_error = TransactionError::Rpc(Box::new(ClientError::from(
-            ErrorKind::Custom("connection reset".to_string()),
-        )));
-        assert!(
-            !send_rejected_by_node(&transport_error),
-            "a transport error is ambiguous, not a node rejection"
         );
     }
 

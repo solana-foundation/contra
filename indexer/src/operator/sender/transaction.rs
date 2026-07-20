@@ -1,7 +1,7 @@
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::TransactionError;
-use crate::error::{OperatorError, ProgramError};
+use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::recovery::MAX_RECOVERY_REQUEUE_ATTEMPTS;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
@@ -311,22 +311,54 @@ pub(super) async fn route_builder_error(
                 error!("TreeIndexMismatch for non-ReleaseFunds transaction");
             }
         }
+        // Transient lazy-init read failure: RPC instance fetch (AccountNotFound)
+        // or DB nonce read (Storage). Both fail before the SMT is built and before
+        // any signing, so this row provably never broadcast. Requeue it Pending for
+        // a bounded retry instead of freezing it for recovery to quarantine.
+        e @ OperatorError::Account(AccountError::AccountNotFound { .. })
+        | e @ OperatorError::Storage(_) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "smt_init_transient_error"])
+                .inc();
+            match (ctx.withdrawal_nonce, ctx.transaction_id) {
+                (Some(nonce), Some(transaction_id)) => {
+                    warn!(
+                        transaction_id,
+                        nonce, "Transient SMT init failure; requeueing withdrawal to Pending: {e}"
+                    );
+                    let reason = format!(
+                        "SMT init failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                    );
+                    requeue_or_fail_prebroadcast(
+                        state,
+                        ctx,
+                        storage_tx,
+                        nonce,
+                        transaction_id,
+                        &reason,
+                    )
+                    .await;
+                }
+                _ => {
+                    // Only ReleaseFunds lazy-inits, and it always carries nonce +
+                    // transaction_id. Without them, leave Processing for recovery.
+                    error!("Transient SMT init failure without nonce/transaction_id; leaving row Processing: {e}");
+                }
+            }
+        }
+        // Fail closed: root mismatch (DB behind chain, a release may have landed),
+        // uninitialized tree, malformed instance, or missing instance. Auto-replay
+        // could mask a needed DB resync, so leave Processing for recovery.
         e @ OperatorError::Program(ProgramError::SmtRootMismatch { .. })
         | e @ OperatorError::Program(ProgramError::SmtNotInitialized)
-        | e @ OperatorError::Account(_)
-        | e @ OperatorError::Storage(_) => {
-            // SMT-init-class failure: a root mismatch, an uninitialized tree, an
-            // RPC/account error fetching the instance, or a DB error reading the
-            // completed nonces during lazy init. The local SMT stays
-            // uninitialized, so this row never released: leave it Processing for
-            // the recovery worker and never mark it Failed.
+        | e @ OperatorError::Account(_) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[state.program_type.as_label(), "smt_init_error"])
                 .inc();
             error!(
                 transaction_id = ctx.transaction_id,
                 nonce = ctx.withdrawal_nonce.map(|n| n as i64),
-                "SMT init failed; leaving row Processing for recovery: {}",
+                "SMT init failed (fail-closed); leaving row Processing for recovery: {}",
                 e
             );
         }
@@ -444,35 +476,18 @@ pub(super) async fn send_and_confirm(
                             .get(&nonce)
                             .is_none_or(|sigs| sigs.is_empty()) =>
                     {
-                        // The attempt cap above is in-memory and resets on restart,
-                        // so also enforce the durable requeue cap here. Fail open
-                        // on a read error: if the requeue write then fails too, the
-                        // row goes stale in Processing and recovery quarantines it.
-                        let requeue_attempts = match state
-                            .storage
-                            .get_recovery_requeue_attempts(transaction_id)
-                            .await
-                        {
-                            Ok(attempts) => attempts.unwrap_or(0),
-                            Err(read_err) => {
-                                warn!(
-                                    transaction_id,
-                                    "Requeue cap read failed, requeueing anyway: {read_err}"
-                                );
-                                0
-                            }
-                        };
-                        if requeue_attempts >= MAX_RECOVERY_REQUEUE_ATTEMPTS {
-                            metrics::OPERATOR_TRANSACTION_ERRORS
-                                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
-                                .inc();
-                            let reason = format!(
+                        let reason = format!(
                             "build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
                         );
-                            handle_permanent_failure(state, ctx, storage_tx, &reason).await;
-                        } else {
-                            requeue_prebroadcast_failure(state, nonce, transaction_id).await;
-                        }
+                        requeue_or_fail_prebroadcast(
+                            state,
+                            ctx,
+                            storage_tx,
+                            nonce,
+                            transaction_id,
+                            &reason,
+                        )
+                        .await;
                     }
                     _ => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
                 }
@@ -906,6 +921,45 @@ fn leave_processing_for_recovery(
         signature = %signature,
         "{reason}; leaving row Processing for recovery to reconcile",
     );
+}
+
+/// Bounded pre-broadcast requeue for a withdrawal with no stashed signature
+/// (caller must confirm that first). Requeues Processing -> Pending for a retry,
+/// or fails permanently once the durable requeue cap is hit. The in-memory cap
+/// resets on restart, so `recovery_requeue_attempts` is the real bound. Fail open
+/// on a cap read error: if the requeue write then fails too, the row goes stale in
+/// Processing and recovery quarantines it.
+pub(super) async fn requeue_or_fail_prebroadcast(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    nonce: u64,
+    transaction_id: i64,
+    reason_at_cap: &str,
+) {
+    let pt = state.program_type.as_label();
+    let requeue_attempts = match state
+        .storage
+        .get_recovery_requeue_attempts(transaction_id)
+        .await
+    {
+        Ok(attempts) => attempts.unwrap_or(0),
+        Err(read_err) => {
+            warn!(
+                transaction_id,
+                "Requeue cap read failed, requeueing anyway: {read_err}"
+            );
+            0
+        }
+    };
+    if requeue_attempts >= MAX_RECOVERY_REQUEUE_ATTEMPTS {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+            .inc();
+        handle_permanent_failure(state, ctx, storage_tx, reason_at_cap).await;
+    } else {
+        requeue_prebroadcast_failure(state, nonce, transaction_id).await;
+    }
 }
 
 /// Requeue a withdrawal whose build/sign failed before any signature existed.
@@ -2020,10 +2074,9 @@ mod tests {
         );
     }
 
-    /// An SMT-init-class error from lazy init (SmtRootMismatch, SmtNotInitialized,
-    /// an OperatorError::Account from the instance fetch, or an OperatorError::Storage
-    /// from reading the completed nonces) must leave the triggering withdrawal
-    /// Processing, never Failed.
+    /// A fail-closed SMT-init error from lazy init (SmtRootMismatch, or an
+    /// OperatorError::Account that is not a transient read) must leave the
+    /// triggering withdrawal Processing for recovery, never Failed.
     #[tokio::test]
     async fn smt_init_error_leaves_row_processing_not_failed() {
         let ctx = withdrawal_ctx(10, 7);
@@ -2045,7 +2098,7 @@ mod tests {
         .await;
         assert_no_status_update(&mut storage_rx);
 
-        // Case 2: OperatorError::Account (e.g. RPC/account error during init).
+        // Case 2: OperatorError::Account that is not a transient read (missing instance).
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         route_builder_error(
             &mut state,
@@ -2059,12 +2112,64 @@ mod tests {
         )
         .await;
         assert_no_status_update(&mut storage_rx);
+    }
 
-        // Case 3: OperatorError::Storage (a transient DB read error during init) must also leave the row Processing.
+    /// A transient lazy-init read failure (RPC instance fetch AccountNotFound, or a
+    /// DB nonce read error) happens before any signing, so the row provably never
+    /// broadcast: it must requeue Processing → Pending for an automatic retry rather
+    /// than freeze for recovery to quarantine into ManualReview.
+    #[tokio::test]
+    async fn smt_init_transient_error_requeues_to_pending() {
+        // Case 1: OperatorError::Account(AccountNotFound) from the instance fetch.
+        let mut state = make_sender_state();
+        // Cached by handle_transaction_builder before init; requeue clears it.
+        state.remint_cache.insert(7, make_remint_info(10));
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(10, 7));
+
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         route_builder_error(
             &mut state,
-            &ctx,
+            &withdrawal_ctx(10, 7),
+            release_funds_builder(10, 7),
+            &storage_tx,
+            crate::error::AccountError::AccountNotFound {
+                pubkey: Pubkey::default(),
+            }
+            .into(),
+        )
+        .await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "transient init failure must not write a terminal status"
+        );
+        assert!(!state.remint_cache.contains_key(&7));
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(row.status, TransactionStatus::Pending, "row requeued");
+        assert_eq!(row.recovery_requeue_attempts, 1);
+
+        // Case 2: OperatorError::Storage from reading the completed nonces.
+        let mut state = make_sender_state();
+        state.remint_cache.insert(7, make_remint_info(10));
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(10, 7));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        route_builder_error(
+            &mut state,
+            &withdrawal_ctx(10, 7),
             release_funds_builder(10, 7),
             &storage_tx,
             crate::error::StorageError::DatabaseError {
@@ -2073,7 +2178,47 @@ mod tests {
             .into(),
         )
         .await;
-        assert_no_status_update(&mut storage_rx);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "transient init failure must not write a terminal status"
+        );
+        assert!(!state.remint_cache.contains_key(&7));
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(row.status, TransactionStatus::Pending, "row requeued");
+        assert_eq!(row.recovery_requeue_attempts, 1);
+    }
+
+    /// Once the durable requeue cap is hit, a transient init failure with no stashed
+    /// signature can no longer safely retry, so it escalates to ManualReview.
+    #[tokio::test]
+    async fn smt_init_transient_error_at_requeue_cap_goes_to_manual_review() {
+        let mut state = make_sender_state();
+        state.remint_cache.insert(7, make_remint_info(10));
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        let mut row = processing_withdrawal_row(10, 7);
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        route_builder_error(
+            &mut state,
+            &withdrawal_ctx(10, 7),
+            release_funds_builder(10, 7),
+            &storage_tx,
+            crate::error::AccountError::AccountNotFound {
+                pubkey: Pubkey::default(),
+            }
+            .into(),
+        )
+        .await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("at the cap, a transient init failure must escalate");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
     }
 
     /// A genuine build error (not SMT-init-class) MUST still mark the row Failed, so the exemption doesn't swallow real failures.

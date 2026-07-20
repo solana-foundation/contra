@@ -55,8 +55,8 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
     {
         Ok(rows) => rows,
         Err(e) => {
-            return RemintAttempt::Failed(format!(
-                "stored remint-signature lookup failed for transaction {}: {}; refusing to remint",
+            return RemintAttempt::Defer(format!(
+                "stored remint-signature lookup failed for transaction {}: {}; will retry",
                 info.transaction_id, e
             ));
         }
@@ -127,10 +127,15 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         .amount(info.amount)
         .idempotency_memo(memo);
 
+    // No transaction is broadcast until send_signed below, so instruction-build,
+    // blockhash and signing failures are pre-broadcast: defer and retry, never ManualReview.
     let instructions = match builder.instructions() {
         Ok(instructions) => instructions,
         Err(e) => {
-            return RemintAttempt::Failed(format!("Failed to build remint instructions: {}", e));
+            return RemintAttempt::Defer(format!(
+                "failed to build remint instructions for transaction {}: {}; will retry",
+                info.transaction_id, e
+            ));
         }
     };
 
@@ -146,9 +151,9 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         match build_and_sign(&state.source_rpc_client, ix).await {
             Ok(signed) => signed,
             Err(e) => {
-                return RemintAttempt::Failed(format!(
-                    "Failed to build/sign remint transaction: {}",
-                    e
+                return RemintAttempt::Defer(format!(
+                    "failed to build/sign remint for transaction {}: {}; will retry",
+                    info.transaction_id, e
                 ));
             }
         };
@@ -1548,15 +1553,18 @@ mod tests {
     }
 
     /// When the finality check returns null for a withdrawal signature
-    /// (transaction was dropped), `execute_deferred_remint` is called.
-    /// If the remint itself also fails (RPC unreachable after the finality
-    /// check mock is consumed), the combined error must be sent as ManualReview.
+    /// (transaction was dropped), `execute_deferred_remint` is called. If the
+    /// remint cannot even be built (source blockhash RPC unreachable), nothing
+    /// was broadcast, so the entry must defer and requeue, never ManualReview.
     #[tokio::test]
-    async fn process_pending_remints_not_finalized_remint_fails_sends_manual_review() {
+    async fn process_pending_remints_not_finalized_remint_build_fails_defers() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter, so the row must exist.
+        seed_pending_remint_row(&mock, 77, 0);
 
         let sig = Signature::new_unique();
 
@@ -1610,21 +1618,25 @@ mod tests {
 
         process_pending_remints(&mut state, &storage_tx).await;
 
-        let update = storage_rx.try_recv().expect("should receive ManualReview");
-        assert_eq!(update.transaction_id, 77);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-
-        let err = update.error_message.as_deref().unwrap();
         assert!(
-            err.contains("remint failed"),
-            "error should mention remint failure: {err}"
+            storage_rx.try_recv().is_err(),
+            "a pre-broadcast build failure must defer, not write ManualReview"
         );
-        assert!(
-            err.contains("release_funds failed"),
-            "error should include original withdrawal error: {err}"
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(
+            state.pending_remints[0].finality_check_attempts, 1,
+            "counter must be bumped after the deferral"
         );
 
-        assert!(state.pending_remints.is_empty());
+        // The row stays PendingRemint so restart recovery can retry the remint.
+        let persisted = mock
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == 77)
+            .map(|t| t.finality_check_attempts);
+        assert_eq!(persisted, Some(1));
     }
 
     /// A withdrawal that reached finality but failed on-chain (err field is set)
@@ -1706,8 +1718,11 @@ mod tests {
     async fn process_pending_remints_skips_block_height_when_all_sigs_classifiable() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter, so the row must exist.
+        seed_pending_remint_row(&mock, 89, 0);
 
         let sig = Signature::new_unique();
 
@@ -1732,9 +1747,16 @@ mod tests {
         )
         .await;
 
-        // Deliberately NOT mocking getBlockHeight: if the code reaches that
-        // call mockito returns 501, the call errors, and defer_or_escalate
-        // fires with "block height RPC failed" instead of execute_deferred_remint.
+        // getBlockHeight must NOT be called: every sig carries a status, so the
+        // classification is decided without it. expect(0) enforces the pre-check.
+        let block_height_never = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
@@ -1755,18 +1777,15 @@ mod tests {
 
         process_pending_remints(&mut state, &storage_tx).await;
 
-        let update = storage_rx
-            .try_recv()
-            .expect("should receive a status update");
-        assert_eq!(update.transaction_id, 89);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-        let err = update.error_message.as_deref().unwrap_or("");
+        // Reached execute_deferred_remint and deferred on the remint build (no
+        // blockhash mock), not on a spurious getBlockHeight call.
         assert!(
-            err.contains("remint failed"),
-            "must reach execute_deferred_remint; if this contains 'block height' \
-             the pre-check regressed: {err}"
+            storage_rx.try_recv().is_err(),
+            "classifiable-Dead then pre-broadcast build failure must defer"
         );
-        assert!(state.pending_remints.is_empty());
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        block_height_never.assert_async().await;
     }
 
     /// When a withdrawal was retried and produced multiple signatures, one of the
@@ -2494,8 +2513,11 @@ mod tests {
     async fn process_pending_remints_all_sigs_expired_proceeds_to_remint() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter, so the row must exist.
+        seed_pending_remint_row(&mock, 100, 0);
 
         let sig = Signature::new_unique();
 
@@ -2540,23 +2562,14 @@ mod tests {
 
         process_pending_remints(&mut state, &storage_tx).await;
 
-        // Reaching Case 3 triggers execute_deferred_remint, whose RPC calls
-        // have no matching mocks; the remint fails and writes ManualReview
-        // with "remint failed" in the error message.
-        let update = storage_rx
-            .try_recv()
-            .expect("should receive ManualReview from execute_deferred_remint");
-        assert_eq!(update.transaction_id, 100);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
+        // Reaching Case 3 triggers execute_deferred_remint; the remint build has
+        // no blockhash mock, so it fails pre-broadcast and the entry defers.
         assert!(
-            update
-                .error_message
-                .as_deref()
-                .unwrap_or("")
-                .contains("remint failed"),
-            "reaching Case 3 means execute_deferred_remint ran"
+            storage_rx.try_recv().is_err(),
+            "pre-broadcast remint failure must defer, not ManualReview"
         );
-        assert!(state.pending_remints.is_empty());
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
     }
 
     /// Sig has no on-chain record but its blockhash is still within validity.

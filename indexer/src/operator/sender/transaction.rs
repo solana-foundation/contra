@@ -312,16 +312,31 @@ pub(super) async fn route_builder_error(
             }
         }
         // Transient lazy-init read failure: RPC instance fetch (AccountNotFound)
-        // or DB nonce read (Storage). Both fail before the SMT is built and before
-        // any signing, so this row provably never broadcast. Requeue it Pending for
-        // a bounded retry instead of freezing it for recovery to quarantine.
+        // or DB nonce read (Storage) from validate_smt_root. The `smt_state.is_none()`
+        // guard bounds this to the pre-init window: the nonce is inserted into the SMT
+        // (proof.rs) and signing both happen only after init sets smt_state to Some, and
+        // it never reverts. So None proves nothing was mutated or broadcast and the
+        // requeue is safe. A Storage/Account error once initialized falls through to
+        // fail-closed. Requeue Pending for a bounded retry instead of freezing it for
+        // recovery to quarantine.
         e @ OperatorError::Account(AccountError::AccountNotFound { .. })
-        | e @ OperatorError::Storage(_) => {
+        | e @ OperatorError::Storage(_)
+            if state.smt_state.is_none() =>
+        {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[state.program_type.as_label(), "smt_init_transient_error"])
                 .inc();
             match (ctx.withdrawal_nonce, ctx.transaction_id) {
-                (Some(nonce), Some(transaction_id)) => {
+                // requeue_or_fail_prebroadcast requires no stashed signature for the
+                // nonce; confirm it here as send_and_confirm does. The smt_state guard
+                // above already implies it, but check explicitly so the contract does
+                // not rely on that reasoning holding.
+                (Some(nonce), Some(transaction_id))
+                    if state
+                        .pending_signatures
+                        .get(&nonce)
+                        .is_none_or(|sigs| sigs.is_empty()) =>
+                {
                     warn!(
                         transaction_id,
                         nonce, "Transient SMT init failure; requeueing withdrawal to Pending: {e}"
@@ -340,9 +355,9 @@ pub(super) async fn route_builder_error(
                     .await;
                 }
                 _ => {
-                    // Only ReleaseFunds lazy-inits, and it always carries nonce +
-                    // transaction_id. Without them, leave Processing for recovery.
-                    error!("Transient SMT init failure without nonce/transaction_id; leaving row Processing: {e}");
+                    // No nonce/transaction_id, or a stashed signature exists: cannot
+                    // safely requeue, so leave Processing for recovery.
+                    error!("Transient SMT init failure not safe to requeue; leaving row Processing: {e}");
                 }
             }
         }

@@ -535,6 +535,14 @@ pub async fn execute_batch(
     );
     metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
 
+    // Report BOB cache size and drain the eviction delta right after preload,
+    // when the cache reflects this batch's working set.
+    let cache_stats = execution_deps.bob.cache_stats();
+    metrics.bob_cache_entries(cache_stats.entries);
+    metrics.bob_cache_dirty_entries(cache_stats.dirty_entries);
+    metrics.bob_cache_bytes(cache_stats.bytes);
+    metrics.bob_cache_evicted(cache_stats.evicted);
+
     // Refresh the SVM's cached Clock sysvar from wall time. Contra has no
     // real Clock source (see `crate::vm::clock`); without this, programs
     // calling `Clock::get()` would read `unix_timestamp = 0`. Must run

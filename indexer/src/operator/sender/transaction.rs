@@ -362,11 +362,14 @@ pub(super) async fn route_builder_error(
             }
         }
         // Fail closed: root mismatch (DB behind chain, a release may have landed),
-        // uninitialized tree, malformed instance, or missing instance. Auto-replay
-        // could mask a needed DB resync, so leave Processing for recovery.
+        // uninitialized tree, malformed instance, missing instance, or any Account/
+        // Storage error that reached here after init (smt_state.is_some(), so the
+        // transient arm above did not match). Auto-replay could mask a needed DB
+        // resync, so leave Processing for recovery.
         e @ OperatorError::Program(ProgramError::SmtRootMismatch { .. })
         | e @ OperatorError::Program(ProgramError::SmtNotInitialized)
-        | e @ OperatorError::Account(_) => {
+        | e @ OperatorError::Account(_)
+        | e @ OperatorError::Storage(_) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[state.program_type.as_label(), "smt_init_error"])
                 .inc();

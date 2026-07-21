@@ -91,6 +91,8 @@ async fn block_stream_delivers_deposit_and_completes() {
                     assert_eq!(meta.slot, 101);
                 }
             }
+            // No reconnect in this test, so no gate re-arm is expected.
+            ProcessorMessage::Regate { .. } => {}
         }
     }
 

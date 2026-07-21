@@ -47,17 +47,9 @@ async fn gap_fill_runs_after_drop_stream() {
     // In-process mockito RPC backend for the RpcPoller backfill path.
     let mut rpc_mock = MockitoServer::new_async().await;
 
-    // Chain tip = 106. Anchor = checkpoint-1 = 100 → backfill 101..=106.
-    let _slot_mock = rpc_mock
-        .mock("POST", "/")
-        .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
-        .with_status(200)
-        .with_body(json!({"jsonrpc": "2.0", "result": 106, "id": 1}).to_string())
-        .expect_at_least(1)
-        .create_async()
-        .await;
-
-    // Empty blocks → only SlotComplete markers. Slot 101 was also streamed;
+    // The fill targets the observed resume slot (106 below), not a tip probe, so
+    // no getSlot mock is needed. Anchor = checkpoint-1 = 100 => backfill 101..=106.
+    // Empty blocks => only SlotComplete markers. Slot 101 was also streamed;
     // replay is harmless thanks to idempotent inserts in prod.
     let mut block_mocks = Vec::new();
     for slot in 101u64..=106u64 {
@@ -131,10 +123,13 @@ async fn gap_fill_runs_after_drop_stream() {
         }
     }
 
-    // Phase 2: drop the stream → source reads checkpoint and backfills 101..=106.
+    // Phase 2: drop the stream. On resubscribe the first live block (106) becomes the
+    // gate target, and the concurrent backfill fills 101..=106.
     server.drop_stream();
 
-    // Phase 3: queue 107,108 to prove streaming resumes post-backfill.
+    // Phase 3: queue 106,107,108. The 106 resume slot sets the fill target; 107,108
+    // prove streaming continues past the backfilled window.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(106)));
     server.enqueue(UpdateMatcher, Update::ok(empty_block(107)));
     server.enqueue(UpdateMatcher, Update::ok(empty_block(108)));
 

@@ -1,6 +1,9 @@
-//! Fail-closed reconnect gap-fill for `YellowstoneSource`: after a stream drop the
-//! source must not resubscribe until the gap `(checkpoint, tip]` is repaired, so no
-//! live `SlotComplete` can advance the durable checkpoint over the missing range.
+//! Reconnect gap gating for `YellowstoneSource`: after a stream drop the source
+//! resubscribes immediately, but on the first live block it arms the checkpoint gate
+//! to the observed resume slot before forwarding that block. A concurrent RPC backfill
+//! closes the residual window `(checkpoint, resume]`, and until it does the gate holds
+//! the durable checkpoint, so no live `SlotComplete` can advance it over the still
+//! missing range. An un-fillable boundary keeps the checkpoint frozen (fail-closed).
 
 use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::config::ProgramType;
@@ -21,6 +24,7 @@ use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher}
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[path = "yellowstone_helpers.rs"]
@@ -68,17 +72,6 @@ fn empty_block_json() -> serde_json::Value {
         "parentSlot": 0,
         "transactions": []
     })
-}
-
-async fn mock_get_slot(server: &mut MockitoServer, slot: u64) -> mockito::Mock {
-    server
-        .mock("POST", "/")
-        .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
-        .with_status(200)
-        .with_body(json!({"jsonrpc": "2.0", "result": slot, "id": 1}).to_string())
-        .expect_at_least(1)
-        .create_async()
-        .await
 }
 
 async fn mock_block_ok(server: &mut MockitoServer, slot: u64) -> mockito::Mock {
@@ -157,6 +150,26 @@ async fn wait_until_matched(mock: &mockito::Mock, secs: u64, what: &str) {
     .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
 }
 
+/// Poll the durable checkpoint until it reaches `want`, so a test can await a
+/// gate hand-off without racing the writer's batch timer.
+async fn wait_for_checkpoint(storage: &Arc<Storage>, program: &str, want: u64, secs: u64) {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            if storage
+                .get_committed_checkpoint(program)
+                .await
+                .expect("read checkpoint")
+                == Some(want)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("checkpoint for {program} never reached {want}"));
+}
+
 fn poller(server: &MockitoServer) -> Arc<RpcPoller> {
     Arc::new(RpcPoller::new(
         server.url(),
@@ -165,109 +178,102 @@ fn poller(server: &MockitoServer) -> Arc<RpcPoller> {
     ))
 }
 
-/// While the fill fails the source stalls fail-closed (no resubscribe, no
-/// SlotComplete, checkpoint frozen); once the RPC heals, the gap slots land
-/// first and only then does live delivery resume on subscribe #2.
+/// Wire the real processor + checkpoint writer over `storage`. The durable
+/// checkpoint is the observable: the gate holding the frontier is what keeps it
+/// from advancing over an unfilled window.
+fn spawn_pipeline(
+    storage: Arc<Storage>,
+) -> (mpsc::Sender<ProcessorMessage>, JoinHandle<()>, JoinHandle<()>) {
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(256);
+    let writer_handle = CheckpointWriter::new(storage.clone())
+        .with_batch_interval(1)
+        .start(checkpoint_rx);
+    let (tx, instruction_rx) = mpsc::channel::<ProcessorMessage>(256);
+    let processor = TransactionProcessor::new(storage, checkpoint_tx);
+    let processor_handle = tokio::spawn(async move {
+        let _ = processor.start(instruction_rx).await;
+    });
+    (tx, processor_handle, writer_handle)
+}
+
+fn make_source(ys_url: String, rpc: &MockitoServer, storage: Arc<Storage>) -> YellowstoneSource {
+    YellowstoneSource::new(ys_url, None, "confirmed".to_string(), ProgramType::Escrow, None)
+        .with_gap_detection(poller(rpc), 1_000, 16)
+        .with_storage(storage)
+}
+
+/// While the boundary slot stays pruned the gate holds the durable checkpoint at the
+/// seed even though the source resubscribed and delivered the live resume slot; once
+/// the RPC heals, the residual window fills and the checkpoint advances.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stalls_while_gap_fill_fails_then_recovers_in_order() {
+async fn stalled_gap_fill_gates_checkpoint_then_recovers() {
     init_tracing();
     let (_pg, storage) = start_postgres().await;
-    storage
-        .update_committed_checkpoint("escrow", CHECKPOINT)
-        .await
-        .expect("seed checkpoint");
 
     let mut rpc = MockitoServer::new_async().await;
-    let _slot = mock_get_slot(&mut rpc, TIP).await;
     for s in (CHECKPOINT + 1)..=TIP {
         let _m = mock_block_ok(&mut rpc, s).await;
     }
-    // The boundary slot is the blocker: expect the initial attempt plus at
-    // least one retry, proving the loop retries instead of falling through.
+    // The boundary slot blocks: expect the initial attempt plus at least one retry,
+    // proving the fill loops instead of resolving over the gap.
     let pruned = mock_block_pruned(&mut rpc, CHECKPOINT, 2).await;
     let _floor = mock_retention_floor(&mut rpc, 500).await;
 
     let ys = MockYellowstoneServer::start().await;
-    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(256);
+    let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
     let cancel = CancellationToken::new();
-
-    let mut source = YellowstoneSource::new(
-        ys.url(),
-        None,
-        "confirmed".to_string(),
-        ProgramType::Escrow,
-        None,
-    )
-    .with_gap_detection(poller(&rpc), 1_000, 16)
-    .with_storage(storage.clone());
-
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
     let handle = source
-        .start(tx, cancel.clone())
+        .start(tx.clone(), cancel.clone())
         .await
         .expect("yellowstone source start");
 
+    // Steady state: a live slot brings the writer frontier and durable checkpoint to
+    // CHECKPOINT before the drop, so the gate has a real anchor to hold.
     wait_for_subscribes(&ys, 1, 10).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT)));
+    wait_for_checkpoint(&storage, "escrow", CHECKPOINT, 15).await;
+
     ys.drop_stream();
+    // Resume slot delivered on subscribe #2 becomes the gate target; the fill of
+    // (CHECKPOINT, TIP] stalls on the pruned boundary.
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP)));
 
-    // Failing phase: two attempts on the pruned slot means one full 5s backoff
-    // elapsed with the gap still open.
-    wait_until_matched(&pruned, 20, "two gap-fill attempts on the pruned slot").await;
-
-    assert_eq!(
-        ys.call_count("subscribe"),
-        1,
-        "must not resubscribe while the gap is open"
-    );
-    while let Ok(msg) = rx.try_recv() {
-        assert!(
-            !matches!(msg, ProcessorMessage::SlotComplete { .. }),
-            "no SlotComplete may be emitted while the gap-fill is failing"
-        );
-    }
-    assert_eq!(
-        storage
-            .get_committed_checkpoint("escrow")
-            .await
-            .expect("read checkpoint"),
-        Some(CHECKPOINT),
-        "durable checkpoint must stay frozen during the stall"
-    );
-
-    // Heal: mockito matches the newest-registered mock first, so slot 100 now
-    // serves an empty block. Queue a live slot for the post-repair stream.
-    let _healed = mock_block_ok(&mut rpc, CHECKPOINT).await;
-    ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP + 1)));
-
-    let mut slots = vec![];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while slots.len() < 5 {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            panic!("timed out waiting for recovery; slots so far: {slots:?}");
-        }
-        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
-            tokio::time::timeout(remaining, rx.recv()).await
-        {
-            slots.push(slot);
-        }
-    }
-    assert_eq!(
-        slots,
-        vec![100, 101, 102, 103, 104],
-        "gap slots must land before the first live slot of subscribe #2"
-    );
+    wait_until_matched(&pruned, 20, "gap-fill retries on the pruned boundary").await;
     assert!(
         ys.call_count("subscribe") >= 2,
-        "the source must resubscribe only after the gap is repaired"
+        "the source resubscribes immediately under the gate; got {}",
+        ys.call_count("subscribe")
     );
+
+    // The gate holds the durable checkpoint at the seed while the window is unfilled,
+    // even though the live resume slot TIP was delivered and processed.
+    for _ in 0..6 {
+        assert_eq!(
+            storage
+                .get_committed_checkpoint("escrow")
+                .await
+                .expect("read checkpoint"),
+            Some(CHECKPOINT),
+            "gate must hold the checkpoint while the residual window is unfilled"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Heal the boundary; the fill closes (CHECKPOINT, TIP] and the checkpoint advances.
+    let _healed = mock_block_ok(&mut rpc, CHECKPOINT).await;
+    wait_for_checkpoint(&storage, "escrow", TIP, 30).await;
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), processor_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer_handle).await;
     ys.shutdown().await;
 }
 
-/// Cancellation during a stalled gap-fill joins the source task promptly
-/// and stops all RPC traffic.
+/// Cancellation during a stalled gap-fill joins the source task promptly and stops
+/// all RPC traffic, even though the fill runs as a spawned task under the gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_while_gap_fill_stalled_joins_promptly() {
     init_tracing();
@@ -278,7 +284,6 @@ async fn shutdown_while_gap_fill_stalled_joins_promptly() {
         .expect("seed checkpoint");
 
     let mut rpc = MockitoServer::new_async().await;
-    let _slot = mock_get_slot(&mut rpc, TIP).await;
     for s in (CHECKPOINT + 1)..=TIP {
         let _m = mock_block_ok(&mut rpc, s).await;
     }
@@ -286,19 +291,10 @@ async fn shutdown_while_gap_fill_stalled_joins_promptly() {
     let _floor = mock_retention_floor(&mut rpc, 500).await;
 
     let ys = MockYellowstoneServer::start().await;
+    // Keep the receiver alive so the source's sends never fail on a closed channel.
     let (tx, _rx) = mpsc::channel::<ProcessorMessage>(256);
     let cancel = CancellationToken::new();
-
-    let mut source = YellowstoneSource::new(
-        ys.url(),
-        None,
-        "confirmed".to_string(),
-        ProgramType::Escrow,
-        None,
-    )
-    .with_gap_detection(poller(&rpc), 1_000, 16)
-    .with_storage(storage.clone());
-
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
     let handle = source
         .start(tx, cancel.clone())
         .await
@@ -306,18 +302,21 @@ async fn shutdown_while_gap_fill_stalled_joins_promptly() {
 
     wait_for_subscribes(&ys, 1, 10).await;
     ys.drop_stream();
+    // The first live block on subscribe #2 arms the gate and spawns the fill, which
+    // then stalls on the pruned boundary.
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP)));
     wait_until_matched(&pruned, 20, "a failed gap-fill attempt").await;
 
-    // Cancel mid-stall; the select! on the backoff must wake immediately, far
-    // inside the 5s production backoff.
+    // Cancel mid-stall; the select! on the backoff must wake immediately, far inside
+    // the 5s production backoff.
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(3), handle)
         .await
         .expect("source must join promptly when cancelled during a stall")
         .expect("source task must not panic");
 
-    // Newest-registered mock matches first: any RPC call after the join would
-    // land here and fail the zero-hit expectation.
+    // Newest-registered mock matches first: any RPC call after the join would land
+    // here and fail the zero-hit expectation.
     let quiet = rpc.mock("POST", "/").expect(0).create_async().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     quiet.assert_async().await;
@@ -325,24 +324,17 @@ async fn shutdown_while_gap_fill_stalled_joins_promptly() {
     ys.shutdown().await;
 }
 
-/// The exact bug (#21) end-to-end: a live tip beyond the gap must never advance
-/// the durable checkpoint while the gap is unfilled. This wires the real
-/// processor and the ungated plain-max checkpoint writer, the component that
-/// corrupted the checkpoint in the bug, so the DB value is the observable. The
-/// boundary slot stays pruned for the whole test, so gap-fill can never resolve;
-/// a live block past the tip is queued but only a resubscribe would deliver it,
-/// and a fail-open regression would resubscribe and leap the checkpoint to it.
+/// The exact bug end-to-end: a live tip beyond the gap must never advance the durable
+/// checkpoint while the gap is unfilled. This wires the real processor and writer, the
+/// component that corrupted the checkpoint in the bug. The boundary stays pruned for
+/// the whole test, so the fill can never resolve; the source resubscribes and delivers
+/// the live resume slot and a tip beyond it, yet the gate keeps the checkpoint frozen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_gap_fill_never_advances_checkpoint_over_live_tip() {
     init_tracing();
     let (_pg, storage) = start_postgres().await;
-    storage
-        .update_committed_checkpoint("escrow", CHECKPOINT)
-        .await
-        .expect("seed checkpoint");
 
     let mut rpc = MockitoServer::new_async().await;
-    let _slot = mock_get_slot(&mut rpc, TIP).await;
     for s in (CHECKPOINT + 1)..=TIP {
         let _m = mock_block_ok(&mut rpc, s).await;
     }
@@ -350,45 +342,30 @@ async fn stalled_gap_fill_never_advances_checkpoint_over_live_tip() {
     let pruned = mock_block_pruned(&mut rpc, CHECKPOINT, 1).await;
     let _floor = mock_retention_floor(&mut rpc, 500).await;
 
-    // Real pipeline: the processor finalizes slots and the ungated writer
-    // plain-maxes each SlotComplete into the durable checkpoint.
-    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(64);
-    let writer_handle = CheckpointWriter::new(storage.clone())
-        .with_batch_interval(1)
-        .start(checkpoint_rx);
-    let (tx, instruction_rx) = mpsc::channel::<ProcessorMessage>(256);
-    let processor = TransactionProcessor::new(storage.clone(), checkpoint_tx);
-    let processor_handle = tokio::spawn(processor.start(instruction_rx));
-
     let ys = MockYellowstoneServer::start().await;
+    let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
     let cancel = CancellationToken::new();
-
-    let mut source = YellowstoneSource::new(
-        ys.url(),
-        None,
-        "confirmed".to_string(),
-        ProgramType::Escrow,
-        None,
-    )
-    .with_gap_detection(poller(&rpc), 1_000, 16)
-    .with_storage(storage.clone());
-
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
     let handle = source
         .start(tx.clone(), cancel.clone())
         .await
         .expect("yellowstone source start");
 
+    // Bring the frontier and durable checkpoint to CHECKPOINT before the drop.
     wait_for_subscribes(&ys, 1, 10).await;
-    ys.drop_stream();
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT)));
+    wait_for_checkpoint(&storage, "escrow", CHECKPOINT, 15).await;
 
-    // Queued after the drop, so only a resubscribe (subscribe #2) could deliver
-    // it. Under the fix that never happens; under the old fail-open it would land
-    // and push the checkpoint to TIP + 1.
+    ys.drop_stream();
+    // Subscribe #2 resumes at TIP (the gate target); a later live tip beyond the
+    // target is delivered too. Under the fix both are gated; a fail-open regression
+    // would plain-max the checkpoint to one of them.
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP)));
     ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP + 1)));
     wait_until_matched(&pruned, 20, "a gap-fill attempt on the pruned slot").await;
 
-    // Hold well past the 5s backoff so a regressed fail-open would have
-    // resubscribed and advanced the checkpoint by now; it must stay at the seed.
+    // Hold well past the 5s backoff so a regressed fail-open would have advanced the
+    // checkpoint by now; the gate must keep it at the seed.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
         assert_eq!(
@@ -399,13 +376,12 @@ async fn stalled_gap_fill_never_advances_checkpoint_over_live_tip() {
             Some(CHECKPOINT),
             "checkpoint must never advance past the unfilled gap"
         );
-        assert_eq!(
-            ys.call_count("subscribe"),
-            1,
-            "the source must not resubscribe while the gap is open"
-        );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    assert!(
+        ys.call_count("subscribe") >= 2,
+        "the source resubscribes; the gate, not a blocked resubscribe, is the guard"
+    );
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;

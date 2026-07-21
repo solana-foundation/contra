@@ -340,6 +340,88 @@ async fn cpi_inner_and_top_level_persist_as_distinct_rows() {
     );
 }
 
+// ── 1e. init_schema stays idempotent after CPI-colliding rows exist ─────────
+// Two valid CPI events under one wrapper instruction share (signature,
+// instruction_index=0) and differ only in inner_index. Once such rows are
+// durable, replaying init_schema must never rebuild the two-part index, which
+// would collide on those rows and brick every restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_init_schema_idempotent_after_cpi_colliding_rows() {
+    let (db, url, _container) = start_postgres("c1_cpi_collide_replay").await;
+    let storage = Storage::Postgres(db.clone());
+    // First init creates the three-part index (the final schema shape).
+    storage.init_schema().await.unwrap();
+
+    let signature = Signature::new_unique().to_string();
+    let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+    let recipient = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+
+    let build = |inner_index: Option<i32>, amount: u64| {
+        DbTransactionBuilder::new(signature.clone(), 1, mint.clone(), amount)
+            .initiator(recipient.clone())
+            .recipient(recipient.clone())
+            .transaction_type(TransactionType::Deposit)
+            .instruction_index(0)
+            .inner_index(inner_index)
+            .build()
+    };
+
+    // Two inner CPI events sharing (signature, instruction_index=0). This is the
+    // exact arming scenario: rows that collide under the two-part identity but
+    // are distinct under the three-part identity.
+    let batch = vec![build(Some(0), 100), build(Some(1), 200)];
+    let ids = storage
+        .insert_db_transactions_batch(&batch)
+        .await
+        .expect("batch insert ok");
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "both CPI rows are distinct");
+
+    let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
+
+    // Replaying init_schema must not rebuild the two-part index against the
+    // colliding rows. Before the fix this fails with a duplicate-key error.
+    storage
+        .init_schema()
+        .await
+        .expect("init_schema must stay idempotent with colliding CPI rows present");
+
+    let assert_state = |pool: sqlx::PgPool, signature: String| async move {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+                .bind(&signature)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 2, "both CPI rows survive the replay; got {count}");
+
+        let triple_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix_inner'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(triple_index, 1, "triple unique index must remain");
+
+        let two_part_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(two_part_index, 0, "two-part index must stay dropped");
+    };
+
+    assert_state(pool.clone(), signature.clone()).await;
+
+    // A third replay proves durability across repeated restarts, not just one.
+    storage
+        .init_schema()
+        .await
+        .expect("init_schema must stay idempotent across repeated restarts");
+    assert_state(pool.clone(), signature.clone()).await;
+}
+
 // ── 2. Duplicate-key race in insert_transaction ────────────────────────────
 // Both rows default to instruction_index 0, so this also covers the
 // same-signature SAME-index collision: (sig, 0) is still unique and the race

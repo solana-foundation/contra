@@ -410,6 +410,9 @@ impl MockStorage {
     }
 
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
+        // Inert unless a test opts in via set_fail_times/set_should_fail; lets
+        // the read-retry backoff around get_mint be unit-tested.
+        self.check_should_fail("get_mint")?;
         Ok(self.mints.lock().unwrap().get(mint_address).cloned())
     }
 

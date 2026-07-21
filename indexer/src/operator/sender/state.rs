@@ -1,4 +1,5 @@
 use crate::channel_utils::send_guaranteed;
+use crate::config::ProgramType;
 use crate::error::account::AccountError;
 use crate::error::OperatorError;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
@@ -243,6 +244,11 @@ impl SenderState {
         &mut self,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
+        // Deferred remints are Withdraw-only; other roles must never claim a shared PendingRemint row.
+        if self.program_type != ProgramType::Withdraw {
+            return Ok(());
+        }
+
         let transactions = self.storage.get_pending_remint_transactions().await?;
 
         if transactions.is_empty() {
@@ -420,6 +426,13 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_sender_state(mock: MockStorage) -> SenderState {
+        make_sender_state_with_role(mock, crate::config::ProgramType::Withdraw)
+    }
+
+    fn make_sender_state_with_role(
+        mock: MockStorage,
+        role: crate::config::ProgramType,
+    ) -> SenderState {
         let storage = Arc::new(Storage::Mock(mock));
         let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
             "http://localhost:8899".to_string(),
@@ -441,7 +454,7 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: role,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -911,6 +924,44 @@ mod tests {
 
         // No ManualReview sent — missing deadline is handled gracefully.
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// The deferred remint queue is a Withdraw-only responsibility. An Escrow
+    /// sender sharing the transactions DB must never claim a PendingRemint row:
+    /// it would classify the release signature on the wrong chain and could
+    /// flip the row to ManualReview, stranding it from the real Withdraw sender.
+    #[tokio::test]
+    async fn recover_pending_remints_noop_for_escrow_role() {
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        let deadline = Utc::now() - chrono::Duration::seconds(10);
+
+        // A matured PendingRemint withdrawal row is present in the shared DB.
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(make_pending_remint_row(70, &mint, &recipient, &sig, deadline));
+
+        let mut state =
+            make_sender_state_with_role(mock, crate::config::ProgramType::Escrow);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        // The Escrow sender must not hydrate the row into its queue.
+        assert!(
+            state.pending_remints.is_empty(),
+            "Escrow must not claim Withdraw remint rows"
+        );
+
+        // No status update emitted, especially no ManualReview: the row is left
+        // untouched for the real Withdraw sender.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "Escrow must not emit any status update for a remint row"
+        );
     }
 
     // ── SenderState construction tests ───────────────────────────────

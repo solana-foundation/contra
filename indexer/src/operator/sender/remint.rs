@@ -4,6 +4,7 @@ use super::types::SenderState;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::{
     channel_utils::send_guaranteed,
+    config::ProgramType,
     operator::{
         check_transaction_status, remint_idempotency_memo,
         sender::{
@@ -555,6 +556,11 @@ pub async fn process_pending_remints(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
+    // Deferred remints are a Withdraw-only responsibility; skip for any other role.
+    if state.program_type != ProgramType::Withdraw {
+        return;
+    }
+
     let now = Utc::now();
 
     // Drain the queue and split: due now vs. wait longer.
@@ -822,7 +828,7 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: crate::config::ProgramType::Withdraw,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -887,6 +893,13 @@ mod tests {
     }
 
     fn make_sender_state_with_rpc(rpc_url: &str) -> (SenderState, MockStorage) {
+        make_sender_state_with_role(rpc_url, crate::config::ProgramType::Withdraw)
+    }
+
+    fn make_sender_state_with_role(
+        rpc_url: &str,
+        role: crate::config::ProgramType,
+    ) -> (SenderState, MockStorage) {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
@@ -913,7 +926,7 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: role,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -985,7 +998,7 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: crate::config::ProgramType::Withdraw,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -1408,6 +1421,55 @@ mod tests {
         assert!(
             state.pending_remints.is_empty(),
             "entry should be removed from queue after Completed"
+        );
+    }
+
+    /// The deferred remint queue is a Withdraw-only responsibility. An Escrow
+    /// sender must never classify or remint a queued row: doing so would send
+    /// RPC on the wrong chain and could escalate the row to ManualReview.
+    #[tokio::test]
+    async fn process_pending_remints_noop_for_escrow_role() {
+        // No endpoints are mounted, so any RPC call would be an observable fault.
+        let mut rpc_server = mockito::Server::new_async().await;
+
+        // A catch-all set to expect zero hits: any request fails the assertion.
+        let no_calls = rpc_server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, _mock) =
+            make_sender_state_with_role(&rpc_server.url(), crate::config::ProgramType::Escrow);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(88),
+                withdrawal_nonce: Some(4),
+                trace_id: Some("trace-88".to_string()),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(88),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // No classify/send RPC reached the mock server.
+        no_calls.assert_async().await;
+
+        // No status update emitted for an Escrow sender.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "Escrow must not emit any status update from the remint processor"
         );
     }
 

@@ -102,7 +102,8 @@ impl MintCache {
 
         // Retry a transient DB blip before falling through to the RPC leg, so a
         // brief outage does not surface as Transient and strand the withdrawal.
-        let db_mint = with_storage_backoff("mint metadata read", 0, || {
+        // transaction_id=-1: no per-call txn context here; retries log by op name.
+        let db_mint = with_storage_backoff("mint metadata read", -1, || {
             self.storage.get_mint(&mint_str)
         })
         .await?;
@@ -148,7 +149,8 @@ impl MintCache {
             return Ok(*flags);
         }
 
-        let db_mint = with_storage_backoff("mint extension-flag read", 0, || {
+        // transaction_id=-1: no per-call txn context here; retries log by op name.
+        let db_mint = with_storage_backoff("mint extension-flag read", -1, || {
             self.storage.get_mint(&mint_str)
         })
         .await?;

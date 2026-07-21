@@ -17,7 +17,7 @@ use crate::operator::{
     sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, RpcClientWithRetry,
 };
 use crate::storage::common::models::TransactionStatus;
-use crate::storage::common::storage::Storage;
+use crate::storage::common::storage::{RequeueOutcome, Storage};
 use chrono::Utc;
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
@@ -941,12 +941,11 @@ fn leave_processing_for_recovery(
     );
 }
 
-/// Bounded pre-broadcast requeue for a withdrawal with no stashed signature
-/// (caller must confirm that first). Requeues Processing -> Pending for a retry,
-/// or fails permanently once the durable requeue cap is hit. The in-memory cap
-/// resets on restart, so `recovery_requeue_attempts` is the real bound. Fail open
-/// on a cap read error: if the requeue write then fails too, the row goes stale in
-/// Processing and recovery quarantines it.
+/// Bounded pre-broadcast requeue for a withdrawal with no stashed signature (caller
+/// confirms that). Rolls back the nonce's local SMT, then does one cap-gated write:
+/// requeue Processing → Pending under the cap, else escalate to ManualReview. The cap
+/// lives in the write, so no separate counter read can fail and loop the row forever.
+/// Keeps `retry_counts` so `send_and_confirm`'s attempt cap still bounds the loop.
 pub(super) async fn requeue_or_fail_prebroadcast(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -956,73 +955,59 @@ pub(super) async fn requeue_or_fail_prebroadcast(
     reason_at_cap: &str,
 ) {
     let pt = state.program_type.as_label();
-    let requeue_attempts = match state
-        .storage
-        .get_recovery_requeue_attempts(transaction_id)
-        .await
-    {
-        Ok(attempts) => attempts.unwrap_or(0),
-        Err(read_err) => {
-            warn!(
-                transaction_id,
-                "Requeue cap read failed, requeueing anyway: {read_err}"
-            );
-            0
-        }
-    };
-    if requeue_attempts >= MAX_RECOVERY_REQUEUE_ATTEMPTS {
-        metrics::OPERATOR_TRANSACTION_ERRORS
-            .with_label_values(&[pt, "prebroadcast_requeue_cap"])
-            .inc();
-        handle_permanent_failure(state, ctx, storage_tx, reason_at_cap).await;
-    } else {
-        requeue_prebroadcast_failure(state, nonce, transaction_id).await;
-    }
-}
 
-/// Requeue a withdrawal whose build/sign failed before any signature existed.
-/// Nothing was broadcast, so an automatic retry is safe: roll back the nonce's
-/// local SMT state and CAS the row Processing → Pending for the fetcher to
-/// re-claim. Keeps `retry_counts` so the attempt cap in `send_and_confirm`
-/// still bounds the loop across requeues. If the requeue write fails the row
-/// stays Processing and recovery quarantines it (no signatures recorded).
-pub(super) async fn requeue_prebroadcast_failure(
-    state: &mut SenderState,
-    nonce: u64,
-    transaction_id: i64,
-) {
+    // Nothing broadcast; the next attempt re-inserts the nonce. Runs regardless of outcome.
     if let Some(ref mut smt_state) = state.smt_state {
         if smt_state.smt_state.remove_nonce(nonce) {
             warn!("Rolled back SMT state for nonce {nonce} after pre-broadcast failure");
         } else {
-            // The builder inserted this nonce before build/sign ran, so a miss
-            // means the local SMT disagrees with the row being requeued.
+            // Builder inserted this nonce before build/sign ran, so a miss means
+            // the local SMT disagrees with the row being requeued.
             error!("Nonce {nonce} missing from local SMT during pre-broadcast rollback");
         }
         smt_state.nonce_to_builder.remove(&nonce);
     }
-    // Re-inserted by handle_transaction_builder on the next attempt.
-    state.remint_cache.remove(&nonce);
 
-    let pt = state.program_type.as_label();
-    match state.storage.try_requeue_prebroadcast(transaction_id).await {
-        Ok(true) => {
+    match state
+        .storage
+        .try_requeue_prebroadcast(transaction_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            // Re-inserted by handle_transaction_builder on the next attempt.
+            state.remint_cache.remove(&nonce);
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[pt, "prebroadcast_requeued"])
                 .inc();
             info!(
                 transaction_id,
-                nonce, "Requeued withdrawal to Pending after pre-broadcast build/sign failure"
+                nonce, attempts, "Requeued withdrawal to Pending after pre-broadcast failure"
             );
         }
-        Ok(false) => warn!(
-            transaction_id,
-            nonce, "Pre-broadcast requeue skipped: row no longer Processing"
-        ),
-        Err(e) => warn!(
-            transaction_id,
-            nonce, "Pre-broadcast requeue failed, row left Processing for recovery: {e}"
-        ),
+        Ok(RequeueOutcome::AtCap) => {
+            // Keep remint_cache: handle_permanent_failure consumes it to route a
+            // no-signature withdrawal to ManualReview, not a bare Failed.
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+                .inc();
+            handle_permanent_failure(state, ctx, storage_tx, reason_at_cap).await;
+        }
+        Ok(RequeueOutcome::NotProcessing) => {
+            state.remint_cache.remove(&nonce);
+            warn!(
+                transaction_id,
+                nonce, "Pre-broadcast requeue skipped: row no longer Processing"
+            );
+        }
+        Err(e) => {
+            // Write failed, nothing requeued: row stays Processing for recovery. No
+            // loop, since a loop needs a successful requeue.
+            state.remint_cache.remove(&nonce);
+            warn!(
+                transaction_id,
+                nonce, "Pre-broadcast requeue write failed, row left Processing for recovery: {e}"
+            );
+        }
     }
 }
 
@@ -3053,60 +3038,6 @@ mod tests {
             !smt.smt_state.contains_nonce(nonce),
             "permanent-failure cleanup rolls back the SMT nonce"
         );
-    }
-
-    /// A failed durable-cap read must not block the retry: fail open and
-    /// requeue, since recovery still quarantines the row via the same counter
-    /// if the requeue write fails too.
-    #[tokio::test]
-    async fn build_sign_failure_cap_read_error_still_requeues() {
-        let txn_id = 10;
-        let nonce = 5;
-        let mut server = mockito::Server::new_async().await;
-        let _hash = mock_blockhash_failure(&mut server);
-
-        let mut state = make_sender_state_with_server(&server.url());
-        let mut smt = SenderSMTState {
-            smt_state: SmtState::new(0),
-            nonce_to_builder: HashMap::new(),
-        };
-        smt.smt_state.insert_nonce(nonce);
-        state.smt_state = Some(smt);
-        state.remint_cache.insert(nonce, make_remint_info(txn_id));
-
-        let storage = state.storage.clone();
-        let Storage::Mock(ref mock) = *storage else {
-            panic!("expected mock storage");
-        };
-        mock.pending_transactions
-            .lock()
-            .unwrap()
-            .push(processing_withdrawal_row(txn_id, nonce));
-        mock.set_should_fail("get_recovery_requeue_attempts", true);
-
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-        send_and_confirm(
-            &mut state,
-            dummy_instruction(),
-            None,
-            &withdrawal_ctx(txn_id, nonce),
-            RetryPolicy::Idempotent,
-            &ExtraErrorCheckPolicy::None,
-            &storage_tx,
-        )
-        .await;
-
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "fail-open must not write a terminal status"
-        );
-        let row = mock.pending_transactions.lock().unwrap()[0].clone();
-        assert_eq!(
-            row.status,
-            TransactionStatus::Pending,
-            "requeued despite the cap read error"
-        );
-        assert_eq!(row.recovery_requeue_attempts, 1);
     }
 
     // ── set_pending_remint persistence ───────────────────────────────

@@ -942,10 +942,11 @@ mod tests {
         mock.pending_remint_transactions
             .lock()
             .unwrap()
-            .push(make_pending_remint_row(70, &mint, &recipient, &sig, deadline));
+            .push(make_pending_remint_row(
+                70, &mint, &recipient, &sig, deadline,
+            ));
 
-        let mut state =
-            make_sender_state_with_role(mock, crate::config::ProgramType::Escrow);
+        let mut state = make_sender_state_with_role(mock, crate::config::ProgramType::Escrow);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.recover_pending_remints(&storage_tx).await.unwrap();

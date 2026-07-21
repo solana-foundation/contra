@@ -208,7 +208,10 @@ impl TransactionProcessor {
                     .await
                     .is_err()
                     {
-                        error!("Regate send failed for {:?} target {}", program_type, target);
+                        error!(
+                            "Regate send failed for {:?} target {}",
+                            program_type, target
+                        );
                         return Err(IndexerError::CheckpointChannelClosed);
                     }
                 }

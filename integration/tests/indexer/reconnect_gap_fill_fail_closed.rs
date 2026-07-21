@@ -183,7 +183,11 @@ fn poller(server: &MockitoServer) -> Arc<RpcPoller> {
 /// from advancing over an unfilled window.
 fn spawn_pipeline(
     storage: Arc<Storage>,
-) -> (mpsc::Sender<ProcessorMessage>, JoinHandle<()>, JoinHandle<()>) {
+) -> (
+    mpsc::Sender<ProcessorMessage>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+) {
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel(256);
     let writer_handle = CheckpointWriter::new(storage.clone())
         .with_batch_interval(1)
@@ -197,9 +201,15 @@ fn spawn_pipeline(
 }
 
 fn make_source(ys_url: String, rpc: &MockitoServer, storage: Arc<Storage>) -> YellowstoneSource {
-    YellowstoneSource::new(ys_url, None, "confirmed".to_string(), ProgramType::Escrow, None)
-        .with_gap_detection(poller(rpc), 1_000, 16)
-        .with_storage(storage)
+    YellowstoneSource::new(
+        ys_url,
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_gap_detection(poller(rpc), 1_000, 16)
+    .with_storage(storage)
 }
 
 /// While the boundary slot stays pruned the gate holds the durable checkpoint at the

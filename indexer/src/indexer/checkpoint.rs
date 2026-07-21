@@ -46,7 +46,8 @@ struct CheckpointState {
     frontier: u64,
     // Processed-but-not-yet-contiguous slots in `(frontier, target]`, awaiting the fold.
     completed: HashSet<u64>,
-    // Backfill target `T0` while gated; `None` once handed off / ungated (plain max).
+    // Backfill/reconnect target while gated; `None` only when never gated. After the
+    // frontier reaches the target it stays `Some` but is inert (the plain-max path).
     gate: Option<u64>,
     // True when `frontier` advanced since the last successful flush (so flush has work).
     dirty: bool,
@@ -487,7 +488,11 @@ mod tests {
         // A later reconnect resumes LOWER; the target follows it down.
         state.regate(FROM, T0 + 5);
         let rest: Vec<u64> = (T0 + 1..=T0 + 5).collect();
-        assert_eq!(drive(&mut state, &rest), T0 + 5, "hands off at the latest target");
+        assert_eq!(
+            drive(&mut state, &rest),
+            T0 + 5,
+            "hands off at the latest target"
+        );
         assert_eq!(drive(&mut state, &[T0 + 500]), T0 + 500, "then plain max");
     }
 
@@ -499,10 +504,20 @@ mod tests {
         let mut state = CheckpointState::ungated();
         assert_eq!(state.frontier, 0);
         state.regate(5000, 5001);
-        assert_eq!(state.frontier, 5000, "fresh state anchors at the durable checkpoint");
-        assert_eq!(drive(&mut state, &[5001]), 5001, "folds to the target and hands off");
+        assert_eq!(
+            state.frontier, 5000,
+            "fresh state anchors at the durable checkpoint"
+        );
+        assert_eq!(
+            drive(&mut state, &[5001]),
+            5001,
+            "folds to the target and hands off"
+        );
         state.regate(10, 6000);
-        assert_eq!(state.frontier, 5001, "a lower from never rewinds the frontier");
+        assert_eq!(
+            state.frontier, 5001,
+            "a lower from never rewinds the frontier"
+        );
     }
 
     /// A target at or below the frontier is inert: the gap is already covered, so

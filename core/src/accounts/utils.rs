@@ -182,7 +182,8 @@ mod tests {
         };
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let legacy = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
-        let tx = SanitizedTransaction::try_from_legacy_transaction(legacy, &HashSet::new()).unwrap();
+        let tx =
+            SanitizedTransaction::try_from_legacy_transaction(legacy, &HashSet::new()).unwrap();
 
         // Full mirror: one slot per account key.
         let account_keys = tx.account_keys();

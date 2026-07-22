@@ -151,6 +151,17 @@ impl AdminVm {
                         INSTRUCTION_INITIALIZE_MINT => {
                             match Self::process_initialize_mint(callbacks, tx, instruction) {
                                 Ok((mint_index, pubkey, account)) => {
+                                    // Reject a second init of the same mint in one tx,
+                                    // like real SVM, instead of overwriting the first.
+                                    if created_mints.iter().any(|(i, _, _)| *i == mint_index) {
+                                        break 'tx Self::create_executed_transaction(
+                                            Err(TransactionError::InstructionError(
+                                                ix_idx_u8,
+                                                InstructionError::AccountAlreadyInitialized,
+                                            )),
+                                            vec![],
+                                        );
+                                    }
                                     created_mints.push((mint_index, pubkey, account))
                                 }
                                 Err(err) => {
@@ -187,10 +198,13 @@ impl AdminVm {
                             .get(i)
                             .copied()
                             .expect("index is within account_keys length");
-                        (
-                            key,
-                            callbacks.get_account_shared_data(&key).unwrap_or_default(),
-                        )
+                        // Mint slots are overwritten below
+                        let account = if created_mints.iter().any(|(mi, _, _)| *mi == i) {
+                            AccountSharedData::default()
+                        } else {
+                            callbacks.get_account_shared_data(&key).unwrap_or_default()
+                        };
+                        (key, account)
                     })
                     .collect();
                 for (mint_index, pubkey, account) in created_mints {
@@ -524,7 +538,11 @@ mod tests {
     fn make_two_instruction_spl_tx(
         ix1_data: Vec<u8>,
         ix2_data: Vec<u8>,
-    ) -> (solana_sdk::transaction::SanitizedTransaction, Pubkey, Pubkey) {
+    ) -> (
+        solana_sdk::transaction::SanitizedTransaction,
+        Pubkey,
+        Pubkey,
+    ) {
         use solana_sdk::{
             instruction::{AccountMeta, Instruction},
             message::Message,
@@ -678,7 +696,10 @@ mod tests {
         let executed = assert_executed_with_status(run_admin_vm(std::slice::from_ref(&tx)), Ok(()));
 
         let account_keys = tx.account_keys();
-        assert_eq!(executed.loaded_transaction.accounts.len(), account_keys.len());
+        assert_eq!(
+            executed.loaded_transaction.accounts.len(),
+            account_keys.len()
+        );
 
         let idx_a = index_of(&tx, &mint_a);
         let idx_b = index_of(&tx, &mint_b);
@@ -702,6 +723,54 @@ mod tests {
         assert!(persisted.iter().any(|(k, _)| *k == mint_b));
     }
 
+    /// Two InitializeMint instructions on the SAME mint in one tx: the second
+    /// is rejected with AccountAlreadyInitialized, matching real SVM, and no
+    /// accounts persist.
+    #[test]
+    fn test_admin_duplicate_mint_same_tx_rejected() {
+        use solana_sdk::{
+            instruction::{AccountMeta, Instruction},
+            message::Message,
+            signature::{Keypair, Signer},
+            transaction::Transaction,
+        };
+        use std::collections::HashSet;
+
+        let authority = Pubkey::new_unique();
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ix = |data: Vec<u8>| Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data,
+        };
+        let msg = Message::new(
+            &[
+                ix(valid_init_mint_data(6, authority)),
+                ix(valid_init_mint_data(6, authority)),
+            ],
+            Some(&payer.pubkey()),
+        );
+        let legacy = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
+        let tx = solana_sdk::transaction::SanitizedTransaction::try_from_legacy_transaction(
+            legacy,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let executed = assert_executed_with_status(
+            run_admin_vm(std::slice::from_ref(&tx)),
+            Err(TransactionError::InstructionError(
+                1,
+                InstructionError::AccountAlreadyInitialized,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
     /// A non-mint slot (the fee payer) is filled from the callback: the mirror
     /// carries the exact account the callback returned, and it is persisted
     /// unchanged (proves slots are filled from the callback, not defaulted).
@@ -721,12 +790,17 @@ mod tests {
             account: payer_account.clone(),
         };
 
-        let executed =
-            assert_executed_with_status(run_admin_vm_with_cb(std::slice::from_ref(&tx), &cb), Ok(()));
+        let executed = assert_executed_with_status(
+            run_admin_vm_with_cb(std::slice::from_ref(&tx), &cb),
+            Ok(()),
+        );
 
         let (pubkey, account) = &executed.loaded_transaction.accounts[0];
         assert_eq!(*pubkey, fee_payer);
-        assert_eq!(*account, payer_account, "fee-payer slot must carry callback account");
+        assert_eq!(
+            *account, payer_account,
+            "fee-payer slot must carry callback account"
+        );
 
         let persisted = persisted_by_consumer(&executed, &tx);
         assert!(
@@ -885,8 +959,10 @@ mod tests {
         let (tx, mint_pubkey) = make_spl_tx_with_mint(spl_token::id(), data);
         let cb = StubCbWithUninitialized { mint: mint_pubkey };
 
-        let executed =
-            assert_executed_with_status(run_admin_vm_with_cb(std::slice::from_ref(&tx), &cb), Ok(()));
+        let executed = assert_executed_with_status(
+            run_admin_vm_with_cb(std::slice::from_ref(&tx), &cb),
+            Ok(()),
+        );
         assert_eq!(
             executed.loaded_transaction.accounts.len(),
             tx.account_keys().len()

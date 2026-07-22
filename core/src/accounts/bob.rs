@@ -898,9 +898,7 @@ mod tests {
             solana_svm::{
                 account_loader::LoadedTransaction,
                 transaction_error_metrics::TransactionErrorMetrics,
-                transaction_execution_result::{
-                    ExecutedTransaction, TransactionExecutionDetails,
-                },
+                transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
             },
             solana_timings::ExecuteTimings,
         };

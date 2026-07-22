@@ -785,7 +785,11 @@ async fn pre_broadcast_remint_failure_below_cap_defers() {
             .any(|t| t.id == txn_id && t.status == TransactionStatus::PendingRemint),
         "a pre-broadcast failure must leave the row recoverable across restarts"
     );
-    assert_eq!(mock.call_count("sendTransaction"), 0, "no broadcast expected");
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        0,
+        "no broadcast expected"
+    );
     mock.shutdown().await;
 }
 
@@ -835,6 +839,10 @@ async fn pre_broadcast_remint_failure_at_cap_escalates_to_manual_review() {
         state.pending_remints.is_empty(),
         "entry must not be re-queued past the cap"
     );
-    assert_eq!(mock.call_count("sendTransaction"), 0, "no broadcast expected");
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        0,
+        "no broadcast expected"
+    );
     mock.shutdown().await;
 }

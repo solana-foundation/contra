@@ -11,7 +11,7 @@ use private_channel_indexer::{
     storage::{
         common::amount::TokenAmount,
         common::models::{DbMint, DbMintStatus, MintStatusAtSlot},
-        DbTransaction, PostgresDb, Storage, TransactionStatus, TransactionType,
+        DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
     },
     PostgresConfig,
 };
@@ -1325,6 +1325,70 @@ async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
         0,
         "no-op CAS must NOT bump the counter"
     );
+    Ok(())
+}
+
+// ── try_requeue_prebroadcast: cap-gated requeue ──────────────────────────────
+
+/// Under the cap the write flips Processing → Pending and increments the counter
+/// (Requeued); at the cap it leaves the row Processing (AtCap). The cap is enforced
+/// inside the single write, so no separate counter read is involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_prebroadcast_requeues_under_cap_then_caps(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut txn = make_db_transaction("prebroadcast_cap", TransactionType::Withdrawal);
+    txn.withdrawal_nonce = Some(0);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    // Under the cap (max 1, attempts 0): requeue to Pending, counter → 1.
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    assert_eq!(
+        storage.try_requeue_prebroadcast(id, 1).await?,
+        RequeueOutcome::Requeued { attempts: 1 }
+    );
+    assert_eq!(status_of(&pool, id).await, "pending");
+    assert_eq!(requeue_attempts_of(&pool, id).await, 1);
+
+    // At the cap (max 1, attempts 1): leave Processing, counter unchanged.
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    assert_eq!(
+        storage.try_requeue_prebroadcast(id, 1).await?,
+        RequeueOutcome::AtCap
+    );
+    assert_eq!(
+        status_of(&pool, id).await,
+        "processing",
+        "at cap must not requeue"
+    );
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        1,
+        "at cap must not increment"
+    );
+    Ok(())
+}
+
+/// A row that is not Processing (still Pending) yields NotProcessing and is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_prebroadcast_not_processing_is_noop() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut txn = make_db_transaction("prebroadcast_pending", TransactionType::Withdrawal);
+    txn.withdrawal_nonce = Some(0);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    // Never locked, so still Pending: the WHERE status = 'processing' finds no row.
+    assert_eq!(
+        storage.try_requeue_prebroadcast(id, 3).await?,
+        RequeueOutcome::NotProcessing
+    );
+    assert_eq!(status_of(&pool, id).await, "pending");
+    assert_eq!(requeue_attempts_of(&pool, id).await, 0);
     Ok(())
 }
 

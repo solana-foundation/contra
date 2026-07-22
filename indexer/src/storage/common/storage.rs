@@ -1,4 +1,5 @@
 pub use super::models::*;
+pub use try_requeue_prebroadcast::RequeueOutcome;
 
 pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_deposit_signature;
@@ -21,7 +22,6 @@ pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
-pub mod get_recovery_requeue_attempts;
 pub mod get_release_signatures;
 pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
@@ -402,21 +402,15 @@ impl Storage {
             .await
     }
 
-    /// Status-only CAS `Processing` → `Pending`; `Ok(false)` if the row is not `Processing`.
-    /// For sender-side pre-broadcast failures where the sender owns the Processing row.
+    /// Cap-gated CAS `Processing` → `Pending` for sender-side pre-broadcast failures
+    /// where the sender owns the Processing row. Enforces the requeue cap inside the
+    /// write; see `RequeueOutcome`.
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, StorageError> {
-        try_requeue_prebroadcast::try_requeue_prebroadcast(self, transaction_id).await
-    }
-
-    /// Read a row's durable requeue counter; `None` if the row does not exist.
-    pub async fn get_recovery_requeue_attempts(
-        &self,
-        transaction_id: i64,
-    ) -> Result<Option<i32>, StorageError> {
-        get_recovery_requeue_attempts::get_recovery_requeue_attempts(self, transaction_id).await
+        max_attempts: i32,
+    ) -> Result<RequeueOutcome, StorageError> {
+        try_requeue_prebroadcast::try_requeue_prebroadcast(self, transaction_id, max_attempts).await
     }
 
     /// CAS `Processing`/`Parked` → `Parked`; `Ok(false)` if the row is neither.

@@ -3,6 +3,7 @@ use crate::storage::common::models::{
     DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
     MintStatusAtSlot, TransactionStatus, TransactionType,
 };
+use crate::storage::common::storage::RequeueOutcome;
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -773,30 +774,24 @@ impl MockStorage {
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, StorageError> {
+        max_attempts: i32,
+    ) -> Result<RequeueOutcome, StorageError> {
         self.check_should_fail("try_requeue_prebroadcast")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         for txn in pending.iter_mut() {
             if txn.id == transaction_id && txn.status == TransactionStatus::Processing {
+                if txn.recovery_requeue_attempts >= max_attempts {
+                    return Ok(RequeueOutcome::AtCap);
+                }
                 txn.status = TransactionStatus::Pending;
                 txn.recovery_requeue_attempts += 1;
                 txn.updated_at = Utc::now();
-                return Ok(true);
+                return Ok(RequeueOutcome::Requeued {
+                    attempts: txn.recovery_requeue_attempts,
+                });
             }
         }
-        Ok(false)
-    }
-
-    pub async fn get_recovery_requeue_attempts(
-        &self,
-        transaction_id: i64,
-    ) -> Result<Option<i32>, StorageError> {
-        self.check_should_fail("get_recovery_requeue_attempts")?;
-        let pending = self.pending_transactions.lock().unwrap();
-        Ok(pending
-            .iter()
-            .find(|txn| txn.id == transaction_id)
-            .map(|txn| txn.recovery_requeue_attempts))
+        Ok(RequeueOutcome::NotProcessing)
     }
 
     pub async fn try_park_processing(&self, transaction_id: i64) -> Result<bool, StorageError> {

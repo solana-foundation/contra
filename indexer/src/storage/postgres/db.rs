@@ -8,6 +8,7 @@ use crate::{
         DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
         MintStatusAtSlot, TransactionStatus, TransactionType,
     },
+    storage::common::storage::RequeueOutcome,
     PostgresConfig,
 };
 
@@ -1372,32 +1373,35 @@ impl PostgresDb {
     pub async fn try_requeue_prebroadcast_internal(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
+        max_attempts: i32,
+    ) -> Result<RequeueOutcome, sqlx::Error> {
+        // One atomic write enforces the cap: the CASE requeues (and increments) only
+        // while under max_attempts, otherwise leaves the row Processing. RETURNING the
+        // post-update count plus whether the row is now Pending distinguishes the
+        // three outcomes without a separate counter read that could fail.
+        let row: Option<(i32, bool)> = sqlx::query_as(
             r#"
             UPDATE transactions
-            SET status = 'pending',
-                recovery_requeue_attempts = recovery_requeue_attempts + 1
+            SET status = CASE WHEN recovery_requeue_attempts < $2
+                              THEN 'pending'::transaction_status ELSE status END,
+                recovery_requeue_attempts = CASE WHEN recovery_requeue_attempts < $2
+                              THEN recovery_requeue_attempts + 1
+                              ELSE recovery_requeue_attempts END
             WHERE id = $1
               AND status = 'processing'
+            RETURNING recovery_requeue_attempts, (status = 'pending') AS requeued
             "#,
         )
         .bind(transaction_id)
-        .execute(&self.pool)
+        .bind(max_attempts)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
-    }
-
-    /// Read a row's durable requeue counter; `None` if the row does not exist.
-    pub async fn get_recovery_requeue_attempts_internal(
-        &self,
-        transaction_id: i64,
-    ) -> Result<Option<i32>, sqlx::Error> {
-        sqlx::query_scalar("SELECT recovery_requeue_attempts FROM transactions WHERE id = $1")
-            .bind(transaction_id)
-            .fetch_optional(&self.pool)
-            .await
+        Ok(match row {
+            None => RequeueOutcome::NotProcessing,
+            Some((attempts, true)) => RequeueOutcome::Requeued { attempts },
+            Some((_, false)) => RequeueOutcome::AtCap,
+        })
     }
 
     /// CAS `Processing`/`Parked` → `Parked`. Accepts an already-parked row so the

@@ -642,8 +642,8 @@ mod tests {
         let account_keys = tx.account_keys();
         let accounts = &executed.loaded_transaction.accounts;
         assert_eq!(accounts.len(), account_keys.len());
-        for i in 0..account_keys.len() {
-            assert_eq!(accounts[i].0, account_keys.get(i).copied().unwrap());
+        for (index, (pubkey, _)) in accounts.iter().enumerate() {
+            assert_eq!(*pubkey, account_keys.get(index).copied().unwrap());
         }
     }
 
@@ -872,15 +872,21 @@ mod tests {
         let authority = Pubkey::new_unique();
         let mut data = valid_init_mint_data(9, authority);
         data[0] = INSTRUCTION_INITIALIZE_MINT2;
-        let tx = make_spl_tx(spl_token::id(), &[1], data);
+        let (tx, mint) = make_spl_tx_with_mint(spl_token::id(), data);
 
-        let executed = assert_executed_with_status(run_admin_vm(&[tx]), Ok(()));
+        let executed = assert_executed_with_status(run_admin_vm(std::slice::from_ref(&tx)), Ok(()));
 
-        assert_eq!(executed.loaded_transaction.accounts.len(), 1);
-        let (_, account) = &executed.loaded_transaction.accounts[0];
-        let mint = Mint::unpack(account.data()).unwrap();
-        assert_eq!(mint.decimals, 9);
-        assert_eq!(mint.mint_authority, COption::Some(authority));
+        // Accounts mirror account_keys, and the mint lands at its own index.
+        assert_eq!(
+            executed.loaded_transaction.accounts.len(),
+            tx.account_keys().len()
+        );
+        let mint_index = index_of(&tx, &mint);
+        let (pubkey, account) = &executed.loaded_transaction.accounts[mint_index];
+        assert_eq!(*pubkey, mint);
+        let mint_state = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint_state.decimals, 9);
+        assert_eq!(mint_state.mint_authority, COption::Some(authority));
     }
 
     // ─── Failure paths ──────────────────────────────────────────────────────

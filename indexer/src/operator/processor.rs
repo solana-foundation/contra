@@ -4,7 +4,9 @@ use crate::metrics;
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawalRemintInfo,
 };
-use crate::operator::recovery::{classify_deposit_signatures, DepositOutcome};
+use crate::operator::recovery::{
+    classify_deposit_signatures, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS,
+};
 use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
 use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::{
@@ -249,6 +251,95 @@ async fn halt_withdrawal_pipeline(
                 "quarantine_all_active_withdrawals failed: {}", e
             );
         }
+    }
+}
+
+/// CAS one owned, unsent withdrawal `Processing -> Pending` so the fetcher can
+/// re-claim it. Safe because a transient error before any send proves nothing
+/// was broadcast and no signature was recorded. Mirrors the sender's
+/// pre-broadcast requeue: `Ok(false)` (CAS missed - row no longer `Processing`)
+/// and `Err` (write failed) are logged and the row is left `Processing` for
+/// recovery to reconcile.
+async fn requeue_single_prebroadcast(
+    storage: &Storage,
+    pt_label: &str,
+    transaction: &DbTransaction,
+) {
+    match storage.try_requeue_prebroadcast(transaction.id).await {
+        Ok(true) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt_label, "prebroadcast_requeued"])
+                .inc();
+            info!(
+                txn_id = transaction.id,
+                trace_id = %transaction.trace_id,
+                "Requeued withdrawal to Pending after pre-broadcast transient error"
+            );
+        }
+        Ok(false) => warn!(
+            txn_id = transaction.id,
+            trace_id = %transaction.trace_id,
+            "Pre-broadcast requeue skipped: row no longer Processing"
+        ),
+        Err(e) => warn!(
+            txn_id = transaction.id,
+            trace_id = %transaction.trace_id,
+            "Pre-broadcast requeue failed, row left Processing for recovery: {e}"
+        ),
+    }
+}
+
+/// Rescue the head withdrawal after a transient error that occurred before its
+/// own rotation was dispatched, so nothing reached the sender. Requeue it
+/// `Processing -> Pending` for the fetcher to re-claim, instead of dropping it
+/// stranded on `return Err`. No DB sweep: a blanket flip could hit an in-flight
+/// sender row whose signature is not yet persisted; only this owned row and the
+/// channel-buffered rows are provably safe.
+///
+/// Capped on the durable requeue counter (carried on the fetched row, so no
+/// extra read): once it has already been requeued `MAX_RECOVERY_REQUEUE_ATTEMPTS`
+/// times without building, it is quarantined to ManualReview instead of
+/// requeued, so a deterministic error misclassified as transient cannot loop the
+/// operator in a restart storm. This mirrors the sender's pre-broadcast requeue
+/// cap; the nonce frontier then holds later withdrawals behind the quarantined
+/// row until an operator resolves it.
+async fn requeue_or_quarantine_head(
+    storage: &Storage,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
+    transaction: &DbTransaction,
+    reason: String,
+) {
+    if transaction.recovery_requeue_attempts >= MAX_RECOVERY_REQUEUE_ATTEMPTS {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt_label, "prebroadcast_requeue_cap"])
+            .inc();
+        warn!(
+            txn_id = transaction.id,
+            trace_id = %transaction.trace_id,
+            attempts = transaction.recovery_requeue_attempts,
+            "Withdrawal build failed after max pre-broadcast requeues; quarantining"
+        );
+        quarantine_single(storage_tx, transaction, reason).await;
+    } else {
+        requeue_single_prebroadcast(storage, pt_label, transaction).await;
+    }
+}
+
+/// Drain rows still buffered in `fetcher_rx` and requeue each `Processing ->
+/// Pending`. They were flipped to `Processing` by the fetcher but never handed
+/// on, and no rotation was dispatched for them, so requeuing is always safe -
+/// even after a boundary rotation on the head, since their post-boundary nonces
+/// cannot re-fire it. Draining them prevents a stranded higher nonce from
+/// wedging the tree frontier. Mirrors the drain in `halt_withdrawal_pipeline`
+/// but requeues rather than quarantines.
+async fn drain_and_requeue_buffered(
+    storage: &Storage,
+    fetcher_rx: &mut mpsc::Receiver<DbTransaction>,
+    pt_label: &str,
+) {
+    while let Ok(buffered) = fetcher_rx.try_recv() {
+        requeue_single_prebroadcast(storage, pt_label, &buffered).await;
     }
 }
 
@@ -530,6 +621,11 @@ pub async fn process_release_funds(
     while let Some(transaction) = fetcher_rx.recv().await {
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
+        // Gates the transient rescue: once a boundary rotation is dispatched we
+        // must not requeue, or the reprocess could fire a second rotation and
+        // skip a tree generation. Read after the non-move async block completes.
+        let mut rotation_dispatched = false;
+
         let outcome: Result<(), OperatorError> = async {
             // Build the withdrawal first so (a) rotation + withdrawal dispatch
             // are atomic from the sender's perspective, and (b) row-data
@@ -584,6 +680,7 @@ pub async fn process_release_funds(
                         send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
                             .await
                             .map_err(OperatorError::ChannelSend)?;
+                        rotation_dispatched = true;
                     } else {
                         info!(
                             nonce,
@@ -646,8 +743,23 @@ pub async fn process_release_funds(
                     return Ok(());
                 }
                 ErrorDisposition::Transient => {
-                    // Transient: surface the error so the supervisor can
-                    // restart us cleanly.
+                    // The head row is safe to rescue only before its own rotation
+                    // dispatch; after that a reprocess could re-fire an unconfirmed
+                    // rotation, so leave it for recovery. Buffered siblings never
+                    // had a rotation dispatched for them, so drain and requeue them
+                    // either way rather than strand them Processing.
+                    if !rotation_dispatched {
+                        requeue_or_quarantine_head(
+                            &storage,
+                            &storage_tx,
+                            pt_label,
+                            &transaction,
+                            err.to_string(),
+                        )
+                        .await;
+                    }
+                    drain_and_requeue_buffered(&storage, &mut fetcher_rx, pt_label).await;
+                    // Surface the error so the supervisor can restart us cleanly.
                     return Err(err);
                 }
                 ErrorDisposition::Fatal => {
@@ -1838,6 +1950,504 @@ mod tests {
 
         let update = storage_rx.recv().await.expect("quarantine update sent");
         assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    // ── transient pre-broadcast requeue ─────────────────────────────────
+
+    /// Seed a Processing withdrawal into the mock's pending set. When
+    /// `mint_seeded` is false the mint is left out of `mock.mints`, so the
+    /// no-RPC MintCache surfaces the build-phase transient (RpcError) that the
+    /// fix rescues. Returns the row to feed through the fetcher channel.
+    fn seed_processing_withdrawal(
+        mock: &MockStorage,
+        id: i64,
+        nonce: i64,
+        mint: &Pubkey,
+        recipient: &Pubkey,
+        mint_seeded: bool,
+    ) -> DbTransaction {
+        if mint_seeded {
+            mock.mints.lock().unwrap().insert(
+                mint.to_string(),
+                DbMint {
+                    mint_address: mint.to_string(),
+                    decimals: 6,
+                    token_program: spl_token::id().to_string(),
+                    created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
+                    is_pausable: Some(false),
+                    has_permanent_delegate: Some(false),
+                },
+            );
+        }
+        let txn = make_db_transaction(
+            id,
+            &mint.to_string(),
+            &recipient.to_string(),
+            Some(nonce),
+            TransactionType::Withdrawal,
+        );
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+        txn
+    }
+
+    /// Core fix: a build-phase transient (unknown mint, no RPC) requeues the
+    /// current row Processing -> Pending instead of stranding it, and does not
+    /// quarantine it. The error still bubbles so the supervisor restarts.
+    #[tokio::test]
+    async fn process_release_funds_transient_requeues_row_to_pending() {
+        let mock = MockStorage::new();
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let txn = seed_processing_withdrawal(&mock, 1, 5, &mint_pubkey, &recipient, false);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OperatorError::RpcError(_))),
+            "expected a transient RpcError, got: {result:?}"
+        );
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Pending,
+            "row must be requeued to Pending"
+        );
+        assert_eq!(
+            after[0].recovery_requeue_attempts, 1,
+            "requeue must bump the counter once"
+        );
+        drop(after);
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "nothing was handed to the sender"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "row is rescued, not quarantined"
+        );
+    }
+
+    /// Durable cap: a row that has already been requeued the maximum number of
+    /// times is quarantined to ManualReview instead of requeued again, so a
+    /// deterministic error misclassified as transient cannot loop forever.
+    #[tokio::test]
+    async fn process_release_funds_transient_requeue_cap_quarantines() {
+        let mock = MockStorage::new();
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let mut txn = seed_processing_withdrawal(&mock, 1, 5, &mint_pubkey, &recipient, false);
+        // Fetched row already at the cap: the next transient must quarantine.
+        txn.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OperatorError::RpcError(_))),
+            "got: {result:?}"
+        );
+
+        // A ManualReview update was emitted; the row was not requeued.
+        let update = storage_rx.try_recv().expect("expected a quarantine update");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(update.transaction_id, 1);
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "nothing was handed to the sender"
+        );
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "quarantine rides the writer channel, not a direct requeue"
+        );
+    }
+
+    /// A transient on the head row also drains and requeues every row still
+    /// buffered behind it in the fetcher channel, so a stranded higher nonce
+    /// cannot wedge the tree frontier.
+    #[tokio::test]
+    async fn process_release_funds_transient_drains_and_requeues_buffered_rows() {
+        let mock = MockStorage::new();
+        let bad_mint = Pubkey::new_unique();
+        let good_mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        // Row 1 triggers the transient; 2 and 3 are valid but buffered behind it.
+        let t1 = seed_processing_withdrawal(&mock, 1, 5, &bad_mint, &recipient, false);
+        let t2 = seed_processing_withdrawal(&mock, 2, 6, &good_mint, &recipient, true);
+        let t3 = seed_processing_withdrawal(&mock, 3, 7, &good_mint, &recipient, true);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(t1).await.unwrap();
+        fetcher_tx.send(t2).await.unwrap();
+        fetcher_tx.send(t3).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let after = mock.pending_transactions.lock().unwrap();
+        for id in [1, 2, 3] {
+            let row = after.iter().find(|t| t.id == id).unwrap();
+            assert_eq!(
+                row.status,
+                TransactionStatus::Pending,
+                "row {id} must be requeued"
+            );
+            assert_eq!(
+                row.recovery_requeue_attempts, 1,
+                "row {id} counter bumped once"
+            );
+        }
+    }
+
+    /// Fallback path: if the requeue CAS write itself fails, the row is left
+    /// Processing for the recovery sweep to reconcile (no counter bump).
+    #[tokio::test]
+    async fn process_release_funds_transient_requeue_write_failure_left_for_recovery() {
+        let mock = MockStorage::new();
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let txn = seed_processing_withdrawal(&mock, 1, 5, &mint_pubkey, &recipient, false);
+        mock.set_should_fail("try_requeue_prebroadcast", true);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(result.is_err());
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "requeue write failed -> left for recovery"
+        );
+        assert_eq!(
+            after[0].recovery_requeue_attempts, 0,
+            "no counter bump on a failed requeue"
+        );
+    }
+
+    /// Once a boundary rotation is dispatched, a later transient (here a
+    /// preflight RPC blip) must NOT requeue the head, or the reprocess could
+    /// re-fire the rotation; it is left Processing for recovery. Buffered siblings
+    /// carry post-boundary nonces that cannot re-fire the rotation, so they are
+    /// still drained and requeued rather than stranded. The ResetSmtRoot goes out.
+    #[tokio::test]
+    async fn process_release_funds_boundary_after_rotation_drains_siblings_not_head() {
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        // Token-2022 with unresolved extension flags forces the preflight onto
+        // the RPC leg; the mocked getAccountInfo is an Instance account, so the
+        // mint parse fails transiently after the rotation was already sent.
+        mock.mints.lock().unwrap().insert(
+            mint_pubkey.to_string(),
+            DbMint {
+                mint_address: mint_pubkey.to_string(),
+                decimals: 6,
+                token_program: spl_token_2022::id().to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: None,
+                has_permanent_delegate: None,
+            },
+        );
+        let boundary = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(MAX_TREE_LEAVES as i64),
+            TransactionType::Withdrawal,
+        );
+        // A sibling buffered behind the boundary head (higher, post-boundary nonce).
+        let sibling = make_db_transaction(
+            2,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(MAX_TREE_LEAVES as i64 + 1),
+            TransactionType::Withdrawal,
+        );
+        {
+            let mut rows = mock.pending_transactions.lock().unwrap();
+            rows.push(boundary.clone());
+            rows.push(sibling.clone());
+        }
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        // On-chain tree index 0 < target 1, so the rotation fires first.
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(boundary).await.unwrap();
+        fetcher_tx.send(sibling).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "preflight blip after rotation must surface as an error"
+        );
+
+        let msg = sender_rx.recv().await.unwrap();
+        assert!(
+            matches!(msg, TransactionBuilder::ResetSmtRoot(_)),
+            "the rotation must have been dispatched before the transient"
+        );
+
+        let after = mock.pending_transactions.lock().unwrap();
+        let head = after.iter().find(|t| t.id == 1).unwrap();
+        assert_eq!(
+            head.status,
+            TransactionStatus::Processing,
+            "post-rotation head must not be requeued"
+        );
+        assert_eq!(head.recovery_requeue_attempts, 0);
+        let sib = after.iter().find(|t| t.id == 2).unwrap();
+        assert_eq!(
+            sib.status,
+            TransactionStatus::Pending,
+            "buffered sibling must be drained and requeued, not stranded"
+        );
+        assert_eq!(sib.recovery_requeue_attempts, 1);
+    }
+
+    /// Integration: transient-requeue a row to Pending, then heal the transient
+    /// (seed the mint) and feed the same row back Processing; it must now build
+    /// and reach the sender. Proves the rescued row is genuinely re-fetchable.
+    #[tokio::test]
+    async fn transient_then_recovery_end_to_end() {
+        let mock = MockStorage::new();
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let txn = seed_processing_withdrawal(&mock, 1, 5, &mint_pubkey, &recipient, false);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        // Pass 1: unknown mint -> transient -> requeue to Pending.
+        let (ftx1, frx1) = mpsc::channel::<DbTransaction>(4);
+        let (stx1, _srx1) = mpsc::channel(10);
+        let (gtx1, _grx1) = mpsc::channel(10);
+        ftx1.send(txn).await.unwrap();
+        drop(ftx1);
+        let r1 = process_release_funds(
+            &mut ps,
+            frx1,
+            stx1,
+            gtx1,
+            storage.clone(),
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(r1.is_err());
+
+        let requeued = {
+            let after = mock.pending_transactions.lock().unwrap();
+            assert_eq!(after[0].status, TransactionStatus::Pending);
+            after[0].clone()
+        };
+
+        // Heal the transient: the mint is now known in the DB.
+        mock.mints.lock().unwrap().insert(
+            mint_pubkey.to_string(),
+            DbMint {
+                mint_address: mint_pubkey.to_string(),
+                decimals: 6,
+                token_program: spl_token::id().to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(false),
+            },
+        );
+
+        // Pass 2: the fetcher re-locks the row (Processing); it must now be sent.
+        let mut relocked = requeued;
+        relocked.status = TransactionStatus::Processing;
+        let (ftx2, frx2) = mpsc::channel::<DbTransaction>(4);
+        let (stx2, mut srx2) = mpsc::channel(10);
+        let (gtx2, _grx2) = mpsc::channel(10);
+        ftx2.send(relocked).await.unwrap();
+        drop(ftx2);
+        let r2 = process_release_funds(
+            &mut ps,
+            frx2,
+            stx2,
+            gtx2,
+            storage.clone(),
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(r2.is_ok(), "healed row must process cleanly: {r2:?}");
+
+        let msg = srx2.recv().await.unwrap();
+        let TransactionBuilder::ReleaseFunds(b) = msg else {
+            panic!("expected ReleaseFunds after the transient healed");
+        };
+        assert_eq!(b.nonce, 5);
+        assert_eq!(b.transaction_id, 1);
+    }
+
+    /// Phase 2: a single transient DB blip on the metadata read is absorbed by
+    /// the read backoff, so the row is built and sent normally and never
+    /// requeued.
+    #[tokio::test]
+    async fn process_release_funds_single_db_blip_does_not_strand() {
+        let mock = MockStorage::new();
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let txn = seed_processing_withdrawal(&mock, 1, 5, &mint_pubkey, &recipient, true);
+        // One transient blip on get_mint; the backoff rides it out.
+        mock.set_fail_times("get_mint", 1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "backoff must absorb the single blip: {result:?}"
+        );
+
+        let msg = sender_rx.recv().await.unwrap();
+        let TransactionBuilder::ReleaseFunds(b) = msg else {
+            panic!("expected ReleaseFunds, blip should have been absorbed");
+        };
+        assert_eq!(b.nonce, 5);
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "row must not be requeued"
+        );
+        assert_eq!(after[0].recovery_requeue_attempts, 0);
     }
 
     // ── classify_processor_error ────────────────────────────────────────

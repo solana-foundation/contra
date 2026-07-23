@@ -28,6 +28,7 @@ const SPL_TOKEN_ID: Pubkey = spl_token::id();
 
 // SPL Token instruction types
 const INSTRUCTION_INITIALIZE_MINT: u8 = 0;
+const INSTRUCTION_INITIALIZE_MINT2: u8 = 20;
 
 /// This VM is used to execute admin transactions
 #[derive(Default)]
@@ -148,7 +149,10 @@ impl AdminVm {
                     };
 
                     match instruction_type {
-                        INSTRUCTION_INITIALIZE_MINT => {
+                        // InitializeMint2 shares InitializeMint's data layout;
+                        // only its account list differs (no rent sysvar), which
+                        // process_initialize_mint does not read.
+                        INSTRUCTION_INITIALIZE_MINT | INSTRUCTION_INITIALIZE_MINT2 => {
                             match Self::process_initialize_mint(callbacks, tx, instruction) {
                                 Ok((mint_index, pubkey, account)) => {
                                     // Reject a second init of the same mint in one tx,
@@ -638,8 +642,8 @@ mod tests {
         let account_keys = tx.account_keys();
         let accounts = &executed.loaded_transaction.accounts;
         assert_eq!(accounts.len(), account_keys.len());
-        for i in 0..account_keys.len() {
-            assert_eq!(accounts[i].0, account_keys.get(i).copied().unwrap());
+        for (index, (pubkey, _)) in accounts.iter().enumerate() {
+            assert_eq!(*pubkey, account_keys.get(index).copied().unwrap());
         }
     }
 
@@ -858,6 +862,31 @@ mod tests {
         assert_eq!(*pubkey, fee_payer);
         // lamports == 0 and empty data is exactly how the consumer detects a delete.
         assert!(account.lamports() == 0 && account.data().is_empty());
+    }
+
+    /// InitializeMint2 (type byte 20) shares InitializeMint's data layout and
+    /// routes to the same handler: a well-formed tx succeeds and produces a
+    /// Mint with the declared decimals and mint authority.
+    #[test]
+    fn test_spl_valid_initialize_mint2() {
+        let authority = Pubkey::new_unique();
+        let mut data = valid_init_mint_data(9, authority);
+        data[0] = INSTRUCTION_INITIALIZE_MINT2;
+        let (tx, mint) = make_spl_tx_with_mint(spl_token::id(), data);
+
+        let executed = assert_executed_with_status(run_admin_vm(std::slice::from_ref(&tx)), Ok(()));
+
+        // Accounts mirror account_keys, and the mint lands at its own index.
+        assert_eq!(
+            executed.loaded_transaction.accounts.len(),
+            tx.account_keys().len()
+        );
+        let mint_index = index_of(&tx, &mint);
+        let (pubkey, account) = &executed.loaded_transaction.accounts[mint_index];
+        assert_eq!(*pubkey, mint);
+        let mint_state = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint_state.decimals, 9);
+        assert_eq!(mint_state.mint_authority, COption::Some(authority));
     }
 
     // ─── Failure paths ──────────────────────────────────────────────────────

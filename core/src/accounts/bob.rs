@@ -855,4 +855,108 @@ mod tests {
             "Live account must be returned to SVM"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Admin-mirror alignment: update_accounts must gate on is_writable(index)
+    // over an account_keys()-aligned mirror (the AdminVm output shape).
+    // -----------------------------------------------------------------------
+
+    /// Build an admin-shaped tx whose account_keys are
+    /// [payer(0, writable), mint(1, writable), spl_token(2, read-only)].
+    fn build_admin_shaped_tx() -> (SanitizedTransaction, Pubkey) {
+        use {
+            solana_sdk::{
+                instruction::{AccountMeta, Instruction},
+                message::Message,
+                signature::{Keypair, Signer},
+                transaction::Transaction,
+            },
+            std::collections::HashSet,
+        };
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data: vec![0u8; 35],
+        };
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        (sanitized, mint)
+    }
+
+    /// Wrap a mirror account vec in a single-tx Executed SVM output.
+    fn executed_output_with_mirror(
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        use {
+            solana_svm::{
+                account_loader::LoadedTransaction,
+                transaction_error_metrics::TransactionErrorMetrics,
+                transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+            },
+            solana_timings::ExecuteTimings,
+        };
+        let executed = ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts,
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        };
+        LoadAndExecuteSanitizedTransactionsOutput {
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+            processing_results: vec![Ok(ProcessedTransaction::Executed(Box::new(executed)))],
+        }
+    }
+
+    #[tokio::test]
+    async fn update_accounts_mirror_persists_writable_skips_readonly() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let (tx, mint) = build_admin_shaped_tx();
+
+        // Hand-build a mirror aligned to account_keys with a read-only spl_token slot.
+        let account_keys = tx.account_keys();
+        let mint_account = make_account(1, &[9u8; 82], &spl_token::id());
+        let program_account = make_account(1, &[1], &Pubkey::new_unique());
+        let mut accounts = Vec::new();
+        for i in 0..account_keys.len() {
+            let key = account_keys.get(i).copied().unwrap();
+            let acct = if key == mint {
+                mint_account.clone()
+            } else if key == spl_token::id() {
+                program_account.clone()
+            } else {
+                make_account(500, &[7], &Pubkey::default())
+            };
+            accounts.push((key, acct));
+        }
+
+        let output = executed_output_with_mirror(accounts);
+        bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        assert!(
+            bob.accounts.contains_key(&mint),
+            "writable mint slot must be inserted"
+        );
+        assert!(
+            !bob.accounts.contains_key(&spl_token::id()),
+            "read-only spl_token program slot must be skipped"
+        );
+    }
 }

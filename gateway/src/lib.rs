@@ -323,13 +323,20 @@ impl Gateway {
             }
         }
 
+        // Stamp the check time before the query so a slow lookup can't cache a
+        // stale role under a fresh timestamp; staleness stays bounded by the TTL
+        // even when concurrent requests race on the same user.
+        let checked_at = Instant::now();
         let is_operator = matches!(get_user_role(auth_db, user_id).await?, Some(Role::Operator));
 
-        self.role_cache.lock().unwrap().insert(
+        let mut cache = self.role_cache.lock().unwrap();
+        // Evict expired entries so the map stays bounded to recently-active operators.
+        cache.retain(|_, entry| entry.checked_at.elapsed() < ROLE_CACHE_TTL);
+        cache.insert(
             user_id,
             CachedRole {
                 is_operator,
-                checked_at: Instant::now(),
+                checked_at,
             },
         );
         Ok(is_operator)

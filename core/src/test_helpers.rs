@@ -170,6 +170,53 @@ pub(crate) async fn start_test_redis() -> (
     (db, container)
 }
 
+/// A Postgres-backed AccountsDB whose pool points at a closed port with a short
+/// acquire timeout, so any query fails fast. Used to exercise the transient
+/// (fatal) load path without a 30s wait.
+#[cfg(test)]
+pub(crate) fn dead_postgres_db() -> crate::accounts::AccountsDB {
+    use crate::accounts::{AccountsDB, PostgresAccountsDB};
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(200))
+        .connect_lazy("postgres://user:pass@127.0.0.1:1/db")
+        .expect("connect_lazy should not fail");
+    AccountsDB::Postgres(PostgresAccountsDB {
+        pool: Arc::new(pool),
+        read_only: true,
+    })
+}
+
+/// A Redis-backed AccountsDB whose server has been stopped. Built with a
+/// low-retry connection manager so a command fails fast rather than spending
+/// seconds on reconnect backoff.
+#[cfg(test)]
+pub(crate) async fn dead_redis_db() -> crate::accounts::RedisAccountsDB {
+    use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+
+    let (_raw, container) = start_test_redis().await;
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(6379).await.unwrap();
+    let url = format!("redis://{}:{}", host, port);
+
+    let client = redis::Client::open(url).unwrap();
+    let config = ConnectionManagerConfig::new()
+        .set_number_of_retries(1)
+        .set_factor(1)
+        .set_max_delay(5);
+    let connection = ConnectionManager::new_with_config(client, config)
+        .await
+        .unwrap();
+    let db = crate::accounts::RedisAccountsDB { connection };
+
+    // Stop the server; subsequent commands fail after a single short reconnect.
+    drop(container);
+    db
+}
+
 /// Create a BOB with empty state and a dummy (non-connecting) Postgres pool.
 /// The pool uses a bogus URL — any accidental DB call will fail with a
 /// connection timeout. Only for unit tests that stay in-memory.

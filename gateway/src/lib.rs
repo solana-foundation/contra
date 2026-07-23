@@ -4,8 +4,9 @@ pub mod metrics;
 
 use crate::auth::{
     check_account_data_ownership, check_request_auth, decode_account_data, forbidden_body,
-    AuthDecision,
+    is_gated, role_check_error_body, verify_bearer, AuthDecision, Role,
 };
+use crate::db::get_user_role;
 use clap::Parser;
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -20,12 +21,14 @@ use jsonwebtoken::DecodingKey;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
@@ -111,6 +114,9 @@ pub struct Gateway {
     auth_db: Option<PgPool>,
     /// Cached result of the last upstream readiness probe, refreshed on demand.
     ready_cache: Arc<AsyncMutex<Option<ReadyCache>>>,
+    /// Cached auth-DB role confirmations, keyed by user id. Lets a token's
+    /// Operator claim be re-checked without a DB lookup on every request.
+    role_cache: Arc<Mutex<HashMap<Uuid, CachedRole>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -119,8 +125,18 @@ struct ReadyCache {
     healthy: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CachedRole {
+    is_operator: bool,
+    checked_at: Instant,
+}
+
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a DB role confirmation is trusted before re-checking. Bounds the
+/// window a demoted operator keeps access to at most this duration.
+const ROLE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// A `JWT_SECRET` counts as "configured" only if non-empty after trimming, mirroring the
 /// auth service so a whitespace-only secret doesn't enable gateway RBAC while auth refuses
@@ -155,6 +171,7 @@ impl Gateway {
             jwt_secret,
             auth_db,
             ready_cache: Arc::new(AsyncMutex::new(None)),
+            role_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -290,10 +307,58 @@ impl Gateway {
         }
     }
 
+    /// Confirms whether `user_id` currently holds the Operator role in the auth
+    /// DB, caching the result for `ROLE_CACHE_TTL`. A JWT can outlive a demotion
+    /// by up to 24h, so an Operator claim is only honored when this returns
+    /// `true`.
+    ///
+    /// Returns `Err` if the DB is unreachable; the caller fails closed (denies
+    /// the operator elevation) rather than trusting a stale claim.
+    async fn confirm_operator(&self, auth_db: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+        // Fast path: a fresh cached confirmation avoids the DB round-trip.
+        // The lock is never held across the await below.
+        if let Some(entry) = self.role_cache.lock().unwrap().get(&user_id) {
+            if entry.checked_at.elapsed() < ROLE_CACHE_TTL {
+                return Ok(entry.is_operator);
+            }
+        }
+
+        let is_operator = matches!(get_user_role(auth_db, user_id).await?, Some(Role::Operator));
+
+        self.role_cache.lock().unwrap().insert(
+            user_id,
+            CachedRole {
+                is_operator,
+                checked_at: Instant::now(),
+            },
+        );
+        Ok(is_operator)
+    }
+
+    /// Records an auth-rejection metric and builds the error response.
+    fn reject_with_metrics(
+        &self,
+        method_label: &str,
+        status: StatusCode,
+        body: Bytes,
+        start: Instant,
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+        Self::record_metrics(
+            Some("auth_rejected"),
+            method_label,
+            "none",
+            &status.as_u16().to_string(),
+            start.elapsed().as_secs_f64(),
+        );
+        self.error_response(status, Some(body))
+    }
+
     /// Enforces RBAC on gated methods.
     ///
-    /// Returns `Some(response)` if the request must be rejected, `None` if it
-    /// may proceed. No-ops immediately when auth is not configured.
+    /// Returns `Some(response)` if the request must be rejected, `None` if it may
+    /// proceed. No-ops immediately when auth is not configured. Operator claims
+    /// are re-checked against the auth DB (cached), so a demoted operator loses
+    /// access within `ROLE_CACHE_TTL` rather than when their 24h token expires.
     async fn enforce_auth(
         &self,
         auth_header: Option<&str>,
@@ -307,7 +372,38 @@ impl Gateway {
             _ => return None,
         };
 
-        let decision = check_request_auth(auth_header, decoding_key, method, params);
+        // Public methods need neither a token nor a role check.
+        if !is_gated(method) {
+            return None;
+        }
+
+        let mut claims = verify_bearer(auth_header, decoding_key);
+
+        // Re-check an Operator claim against the DB and downgrade to User when
+        // the role was revoked. Fail closed if the DB can't be reached.
+        if let Some(caller) = claims.as_mut() {
+            if caller.role == Role::Operator {
+                let confirmed = match Uuid::parse_str(&caller.sub) {
+                    Ok(user_id) => self.confirm_operator(auth_db, user_id).await,
+                    // A malformed sub can't map to an operator row.
+                    Err(_) => Ok(false),
+                };
+                match confirmed {
+                    Ok(true) => {}                         // still an operator
+                    Ok(false) => caller.role = Role::User, // demoted -> effective User
+                    Err(_) => {
+                        return Some(self.reject_with_metrics(
+                            method_label,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            role_check_error_body(),
+                            start,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let decision = check_request_auth(claims.as_ref(), method, params);
 
         let (status, body) = match decision {
             AuthDecision::Proceed => return None,
@@ -334,14 +430,7 @@ impl Gateway {
             }
         };
 
-        Self::record_metrics(
-            Some("auth_rejected"),
-            method_label,
-            "none",
-            &status.as_u16().to_string(),
-            start.elapsed().as_secs_f64(),
-        );
-        Some(self.error_response(status, Some(body)))
+        Some(self.reject_with_metrics(method_label, status, body, start))
     }
 
     /// Build a JSON-RPC–style error body for 413 responses.

@@ -257,6 +257,10 @@ struct ReconnectGapCtx {
 /// the fold at the durable checkpoint, then spawn a bounded backfill (one in-flight; any
 /// prior is aborted). Sent before the first live block so the gate wins the FIFO race.
 #[cfg(feature = "datasource-rpc")]
+/// Returns whether it is safe to forward the block that triggered this arm. `false`
+/// means cancellation interrupted the checkpoint read before the gate was armed, so the
+/// caller must NOT forward the block: its SlotComplete would advance the checkpoint over
+/// the still-unfilled gap. `true` means the gate is armed, or a fresh system needs none.
 async fn arm_reconnect_gap(
     t_sub: u64,
     ctx: &ReconnectGapCtx,
@@ -264,10 +268,10 @@ async fn arm_reconnect_gap(
     cancel: &CancellationToken,
     backoff: Duration,
     prev: &mut Option<tokio::task::JoinHandle<()>>,
-) -> Result<(), DataSourceRpcError> {
+) -> Result<bool, DataSourceRpcError> {
     // Resolve the anchor before arming: the gate must seed the frontier to the durable
-    // checkpoint, so a wrong/zero `from` would freeze it. Retry a failed read (fail
-    // closed: the first block is not forwarded yet) until cancellation.
+    // checkpoint, so a wrong/zero `from` would freeze it. Retry a failed read until it
+    // succeeds or cancellation ends it (returning false so the block is not forwarded).
     let checkpoint = loop {
         match get_last_checkpoint(&ctx.storage, ctx.program_type).await {
             Ok(slot) => break slot,
@@ -275,7 +279,7 @@ async fn arm_reconnect_gap(
                 warn!("Reconnect gap: checkpoint read failed, retrying: {}", e);
                 record_gap_fill_error(ctx.program_type);
                 if backoff_cancelled(cancel, backoff).await {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -284,7 +288,7 @@ async fn arm_reconnect_gap(
     // Fresh system: startup backfill owns initial catch-up and there is no residual
     // window; arming would freeze the frontier on a range the fill never emits.
     if checkpoint == 0 {
-        return Ok(());
+        return Ok(true);
     }
 
     send_guaranteed(
@@ -331,7 +335,7 @@ async fn arm_reconnect_gap(
         .await;
     });
     *prev = Some(handle);
-    Ok(())
+    Ok(true)
 }
 
 /// Waits one backoff period; true means cancellation fired first.
@@ -612,7 +616,7 @@ async fn connect_and_stream(
                     if let Some(ctx) = gap_ctx {
                         if !armed {
                             armed = true;
-                            arm_reconnect_gap(
+                            let safe_to_forward = arm_reconnect_gap(
                                 block.slot,
                                 ctx,
                                 &tx,
@@ -622,6 +626,12 @@ async fn connect_and_stream(
                             )
                             .await
                             .map_err(DataSourceError::Rpc)?;
+                            // Cancelled mid-arm before the gate was set: stop instead of
+                            // forwarding this block, whose SlotComplete would leapfrog the
+                            // unfilled gap. Shutdown proceeds; a restart replays the slot.
+                            if !safe_to_forward {
+                                break;
+                            }
                         }
                     }
 
@@ -1124,6 +1134,47 @@ mod tests {
         assert!(
             rx.recv().await.is_none(),
             "a fresh system must emit no Regate and no SlotComplete"
+        );
+        no_blocks.assert_async().await;
+    }
+
+    /// Cancellation while the checkpoint read is failing reports the block unsafe to
+    /// forward, so its SlotComplete cannot leapfrog the still-unfilled gap on shutdown.
+    #[tokio::test]
+    async fn arm_reconnect_gap_cancelled_during_read_withholds_block() {
+        use crate::storage::common::storage::mock::MockStorage;
+        let mut server = Server::new_async().await;
+        let no_blocks = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({"method": "getBlock"})))
+            .expect(0)
+            .create_async()
+            .await;
+
+        // The checkpoint read fails, so arm loops; a pre-cancelled token ends it at once.
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", 100);
+        mock.set_should_fail("get_committed_checkpoint", true);
+        let ctx = test_gap_ctx(&server, Arc::new(Storage::Mock(mock)), 1000);
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut prev: Option<tokio::task::JoinHandle<()>> = None;
+
+        let safe = arm_reconnect_gap(103, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+            .await
+            .unwrap();
+        drop(tx);
+
+        assert!(
+            !safe,
+            "cancellation before arming must report the block unsafe to forward"
+        );
+        assert!(prev.is_none(), "no backfill is spawned on a cancelled arm");
+        assert!(
+            rx.recv().await.is_none(),
+            "no Regate is emitted on a cancelled arm"
         );
         no_blocks.assert_async().await;
     }

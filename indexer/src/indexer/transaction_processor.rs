@@ -1828,11 +1828,11 @@ mod tests {
         assert!(committed >= DEPOSIT_SLOT);
     }
 
-    /// The exact issue #251 reproduction, end-to-end through the real pipeline: the
-    /// reconnect residual window (T_gf, T_sub] must be indexed, never leapfrogged by
-    /// the live tip that resumes above it. Removing the writer's Regate arm makes
-    /// this drive the checkpoint straight to the tip and skip the window, so it is
-    /// the authoritative guard that value-bearing events there are never lost.
+    /// The exact reconnect residual-gap reproduction, end-to-end through the real
+    /// pipeline: the residual window (T_gf, T_sub] must be indexed, never leapfrogged by
+    /// the live tip that resumes above it. Removing the writer's Regate arm makes this
+    /// drive the checkpoint straight to the tip and skip the window, so it is the
+    /// authoritative guard that value-bearing events there are never lost.
     #[tokio::test]
     async fn reconnect_residual_gap_is_not_leapfrogged() {
         const T_GF: u64 = 100; // stale tip the old gap-fill stopped at

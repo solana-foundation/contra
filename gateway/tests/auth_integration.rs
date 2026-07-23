@@ -69,9 +69,9 @@ async fn start_postgres() -> (PgPool, String, testcontainers::ContainerAsync<Pos
 }
 
 /// Insert a bare-minimum user row with the given role and return its UUID.
-/// We only need the user to exist so verified_wallets can reference it —
-/// the gateway reads the role from the JWT, not from this row. But keeping
-/// the DB role consistent with the token makes tests easier to reason about.
+/// The gateway confirms Operator JWTs against this row, so operator tests keep
+/// the DB role matching the token. The revocation tests deliberately mismatch
+/// them (operator token, `user` row) to prove a demoted operator loses access.
 async fn insert_user(pool: &PgPool, role: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -951,6 +951,79 @@ async fn test_operator_only_methods_enforce_role() {
             "{method}: expected 200 for operator role"
         );
     }
+}
+
+/// A JWT claiming Operator whose DB role has since been downgraded to `user`
+/// must lose operator access. The gateway re-checks the role against the auth
+/// DB instead of trusting the 24h token, so an operator-only method returns 403
+/// just as it would for any User-role caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_demoted_operator_loses_operator_access() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    // DB says `user`, but the token still claims `operator` (issued pre-demotion).
+    let user_id = insert_user(&pool, "user").await;
+    let stale_operator_token = generate_token(user_id, "operator");
+
+    let generic_response = json!({"jsonrpc":"2.0","id":1,"result":null}).to_string();
+    let backend = start_mock_backend_with_body(generic_response).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(&stale_operator_token)
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "getBlock", "params": [] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
+/// The Operator bypass of the ownership check is revoked the same way: a stale
+/// operator token querying an account it does not own is subject to the normal
+/// ownership check and denied. Contrast with
+/// `test_get_account_info_operator_bypasses_ownership_check`, where a live
+/// operator is allowed through.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_demoted_operator_loses_ownership_bypass() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    // DB says `user` with no registered wallets; token still claims `operator`.
+    let user_id = insert_user(&pool, "user").await;
+    let stale_operator_token = generate_token(user_id, "operator");
+
+    // A System Program account triggers the pubkey-ownership fallback, which
+    // fails because the user has no verified wallets.
+    let backend = start_mock_backend_with_body(system_account_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(&stale_operator_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": ["So11111111111111111111111111111111111111112"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
 }
 
 /// Public methods like `sendTransaction` and `getSlot` must pass through

@@ -145,6 +145,12 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             ).await {
                                 Ok(result) => result,
                                 Err(e) => {
+                                    // Fatal on purpose. Breaking ends the executor task, which the
+                                    // node supervisor (wait_for_any_worker_quit) turns into a clean
+                                    // full shutdown and a non-zero process exit for the supervisor to
+                                    // restart. Nothing in this batch was settled, and restart rebuilds
+                                    // the dedup cache from settled blocks only, so the dropped txs are
+                                    // not deduped and remain resubmittable.
                                     error!("Fatal account load error, aborting executor: {:?}", e);
                                     break;
                                 }

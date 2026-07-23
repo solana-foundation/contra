@@ -140,56 +140,19 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
-        // Durable identity for an indexed economic event is the pair
-        // (signature, instruction_index): one Solana transaction can carry several
-        // deposit or withdraw instructions, so each must persist as its own row.
-        // This runs right after the table is ensured, so the composite unique index
-        // exists before the table is exposed to any writer (init_schema completes
-        // before the pipeline starts). The column is added first so an in-place
-        // upgrade of a table that predates it does not reference a missing column,
-        // then the composite index is built while the old single-signature
-        // uniqueness is still in force, so signature is never left unprotected, and
-        // only then is the old single-signature constraint dropped. Existing rows
-        // backfill to instruction_index 0, and that old uniqueness guaranteed each
-        // signature mapped to one row, so every (signature, 0) pair is already
-        // unique and the build is clean. signature stays the leading column, so
-        // existing WHERE signature = $1 lookups remain index-served.
-        info!("Running instruction_index migration if needed...");
+        // Durable identity is the triple (signature, instruction_index, inner_index):
+        // a transaction can carry several instructions and each can emit more via CPI.
+        // Add the columns, then build the triple index directly (skipping the obsolete
+        // two-part index older schemas used) while any old single-signature uniqueness
+        // is still in force, so signature is never unprotected; backfilled rows stay
+        // unique so the build is clean. signature leads the index, so existing
+        // WHERE signature = $1 lookups remain index-served.
+        info!("Running transaction identity migration if needed...");
         sqlx::query(
             r#"
             DO $$ BEGIN
                 ALTER TABLE transactions
                 ADD COLUMN IF NOT EXISTS instruction_index INTEGER NOT NULL DEFAULT 0;
-            END $$;
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_signature_ix ON transactions (signature, instruction_index)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            r#"
-            DO $$ BEGIN
-                ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_signature_key;
-                DROP INDEX IF EXISTS idx_transactions_signature;
-            END $$;
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-        info!("instruction_index migration complete");
-
-        // Extend the unique identity to (signature, instruction_index, inner_index)
-        // so a CPI deposit/withdraw gets its own row. Build-before-drop: add the
-        // nullable column, build the new index (NULL inner_index coalesced to -1
-        // since unique indexes treat NULLs as distinct), then drop the old one.
-        info!("Running inner_index migration if needed...");
-        sqlx::query(
-            r#"
-            DO $$ BEGIN
                 ALTER TABLE transactions
                 ADD COLUMN IF NOT EXISTS inner_index INTEGER;
             END $$;
@@ -203,10 +166,22 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
-        sqlx::query("DROP INDEX IF EXISTS idx_transactions_signature_ix")
-            .execute(&self.pool)
-            .await?;
-        info!("inner_index migration complete");
+        // Drop the old single-signature and two-part uniqueness now that the triple
+        // index is in force. The two-part index is cleaned up for older databases that
+        // carry it but is never rebuilt: valid CPI rows sharing (signature,
+        // instruction_index) would make a rebuild collide and abort startup.
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_signature_key;
+                DROP INDEX IF EXISTS idx_transactions_signature;
+                DROP INDEX IF EXISTS idx_transactions_signature_ix;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("transaction identity migration complete");
 
         // Create indexes for transactions
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions (status)")

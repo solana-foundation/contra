@@ -132,6 +132,15 @@ impl AccountsDB {
         super::get_accounts::get_accounts(self, accounts).await
     }
 
+    /// Load used by preload: `Some` per found account, `None` for an absent one,
+    /// and a typed `Err` for a fatal failure (transient outage or a corrupt row).
+    pub async fn load_accounts(
+        &self,
+        accounts: &[Pubkey],
+    ) -> Result<Vec<Option<AccountSharedData>>, super::get_accounts::AccountLoadError> {
+        super::get_accounts::load_accounts(self, accounts).await
+    }
+
     pub async fn store_performance_sample(
         &mut self,
         sample: solana_rpc_client_types::response::RpcPerfSample,

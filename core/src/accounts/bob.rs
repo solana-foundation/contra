@@ -29,7 +29,7 @@
 /// evict less frequently accessed accounts.
 use {
     crate::{
-        accounts::{precompiles::PRECOMPILES, AccountsDB},
+        accounts::{get_accounts::AccountLoadError, precompiles::PRECOMPILES, AccountsDB},
         stages::AccountSettlement,
     },
     solana_sdk::{
@@ -103,14 +103,21 @@ impl BOB {
 
     /// Preloads accounts into BOB from the database.
     ///
-    /// Returns `(fetched, cached)` where:
-    /// - `fetched` = accounts that were missing from BOB and loaded from the DB.
-    /// - `cached`  = accounts that were already warm in BOB (no DB round-trip needed).
+    /// Returns `(fetched, cached)`: `fetched` accounts were loaded from the DB,
+    /// `cached` were already warm in BOB. An account that is not in the DB is
+    /// simply left uncached so the SVM sees it as absent. Any load failure
+    /// returns `Err`: the caller must treat it as fatal rather than persist over
+    /// live state, because a masked failure would let the SVM see a real account
+    /// as absent, and a corrupt account is an integrity fault that cannot be
+    /// safely executed against.
     ///
     /// Only queries the database for accounts that are actual cache misses
     /// (not in BOB's HashMap and not a precompile). Once the working set is
     /// warm, most batches will skip the DB entirely.
-    pub async fn preload_accounts(&mut self, pubkeys: &[Pubkey]) -> (usize, usize) {
+    pub async fn preload_accounts(
+        &mut self,
+        pubkeys: &[Pubkey],
+    ) -> Result<(usize, usize), AccountLoadError> {
         // Drain settled_accounts channel to keep dirty/clean tracking current.
         // The expensive eviction sweep only runs every GC_EVICTION_INTERVAL batches.
         self.garbage_collect();
@@ -133,18 +140,21 @@ impl BOB {
 
         // If everything is warm, skip the DB round-trip entirely.
         if miss_keys.is_empty() {
-            return (0, already_cached);
+            return Ok((0, already_cached));
         }
 
-        // Only fetch the cache-miss keys from the database.
-        let accounts = self.accounts_db.get_accounts(&miss_keys).await;
+        // Only fetch the cache-miss keys. A transient outage or a corrupt row
+        // propagates as Err and is handled as fatal by the caller.
+        let loads = self.accounts_db.load_accounts(&miss_keys).await?;
         let mut fetched = 0usize;
-        for (index, account_opt) in accounts.iter().enumerate() {
-            if let Some(account) = account_opt {
+        for (index, load) in loads.into_iter().enumerate() {
+            // A None means the account is not in the DB: leave it uncached so the
+            // SVM sees it as absent. Only found accounts are cached.
+            if let Some(account) = load {
                 self.accounts.insert(
                     miss_keys[index],
                     AccountWithMeta {
-                        account: account.clone(),
+                        account,
                         synced_since: None,
                         deleted: false,
                     },
@@ -153,7 +163,7 @@ impl BOB {
             }
         }
 
-        (fetched, already_cached)
+        Ok((fetched, already_cached))
     }
 
     // TODO: Merge this implementation with the one in the settlement stage
@@ -957,6 +967,99 @@ mod tests {
         assert!(
             !bob.accounts.contains_key(&spl_token::id()),
             "read-only spl_token program slot must be skipped"
+        );
+    }
+
+    // ── preload_accounts against a real backing store ──
+
+    /// Overwrite the `data` column for `pubkey` with bytes that cannot
+    /// deserialize into an AccountSharedData.
+    async fn insert_corrupt_pg(db: &AccountsDB, pubkey: Pubkey) {
+        if let AccountsDB::Postgres(pg) = db {
+            sqlx::query(
+                "INSERT INTO accounts (pubkey, data) VALUES ($1, $2)
+                 ON CONFLICT (pubkey) DO UPDATE SET data = EXCLUDED.data",
+            )
+            .bind(pubkey.to_bytes().to_vec())
+            .bind(vec![0xAAu8; 5])
+            .execute(pg.pool.as_ref())
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_found_caches_account() {
+        let (db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let mut writer = db.clone();
+        let pk = Pubkey::new_unique();
+        writer
+            .set_account(pk, make_account(7, &[1], &Pubkey::default()))
+            .await;
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new(db, rx).await;
+        let (fetched, _cached) = bob.preload_accounts(&[pk]).await.unwrap();
+
+        assert_eq!(fetched, 1);
+        assert!(
+            TransactionProcessingCallback::get_account_shared_data(&bob, &pk).is_some(),
+            "Found account must be cached"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_missing_is_noop() {
+        let (db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new(db, rx).await;
+        let pk = Pubkey::new_unique();
+
+        let (fetched, _cached) = bob.preload_accounts(&[pk]).await.unwrap();
+
+        assert_eq!(fetched, 0);
+        assert!(
+            TransactionProcessingCallback::get_account_shared_data(&bob, &pk).is_none(),
+            "Missing account must not be cached"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_corrupt_is_fatal() {
+        let (db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let bad = Pubkey::new_unique();
+        insert_corrupt_pg(&db, bad).await;
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new(db, rx).await;
+        let result = bob.preload_accounts(&[bad]).await;
+
+        // A corrupt account is an integrity fault, not a cache miss.
+        assert!(
+            matches!(result, Err(AccountLoadError::Corrupt(k)) if k == bad),
+            "corrupt account must propagate as a fatal error"
+        );
+        assert!(
+            TransactionProcessingCallback::get_account_shared_data(&bob, &bad).is_none(),
+            "corrupt account must not be cached"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn preload_transient_error_propagates() {
+        // Dead backend: preload must propagate Err (fatal), not report success.
+        let db = crate::test_helpers::dead_postgres_db();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new(db, rx).await;
+
+        crate::accounts::get_accounts::set_test_retry(2, 1);
+        let result = bob.preload_accounts(&[Pubkey::new_unique()]).await;
+        crate::accounts::get_accounts::reset_test_retry();
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Backend(_))),
+            "a dead backend must propagate as a fatal error"
         );
     }
 }

@@ -1,6 +1,6 @@
 use {
     crate::{
-        accounts::{bob::BOB, AccountsDB},
+        accounts::{bob::BOB, get_accounts::AccountLoadError, AccountsDB},
         nodes::node::WorkerHandle,
         processor::{
             create_transaction_batch_processor, get_transaction_check_results,
@@ -135,11 +135,26 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             let batch_size = batch.transactions.len();
                             debug!("Executor received batch with {} transactions", batch_size);
 
-                            let execution_result = execute_batch(
+                            // A fatal preload error (transient DB failure that
+                            // survived retries) aborts the loop without settling:
+                            // nothing is recorded, so the txs stay resubmittable.
+                            let execution_result = match execute_batch(
                                 batch,
                                 &mut execution_deps,
                                 &metrics,
-                            ).await;
+                            ).await {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    // Fatal on purpose. Breaking ends the executor task, which the
+                                    // node supervisor (wait_for_any_worker_quit) turns into a clean
+                                    // full shutdown and a non-zero process exit for the supervisor to
+                                    // restart. Nothing in this batch was settled, and restart rebuilds
+                                    // the dedup cache from settled blocks only, so the dropped txs are
+                                    // not deduped and remain resubmittable.
+                                    error!("Fatal account load error, aborting executor: {:?}", e);
+                                    break;
+                                }
+                            };
 
                             let num_transactions_executed = execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
                             heartbeat.record_progress();
@@ -428,7 +443,7 @@ pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
     metrics: &SharedMetrics,
-) -> ExecutionResult {
+) -> Result<ExecutionResult, AccountLoadError> {
     let t_batch = Instant::now();
     let batch_size = batch.transactions.len();
     debug!("Executing batch with {} transactions", batch_size);
@@ -517,10 +532,30 @@ pub async fn execute_batch(
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
     let t_op = Instant::now();
-    let (preload_fetched, preload_cached) = execution_deps
+    // Both fatal cases abort the batch without settling, so nothing is recorded
+    // and the txs stay resubmittable. A transient outage would otherwise record
+    // default state over a live account; a corrupt account is an integrity fault
+    // that must not be executed against.
+    let (preload_fetched, preload_cached) = match execution_deps
         .bob
         .preload_accounts(&accounts_to_preload)
-        .await;
+        .await
+    {
+        Ok(counts) => counts,
+        Err(e) => {
+            match &e {
+                AccountLoadError::Corrupt(pubkey) => {
+                    metrics.executor_corrupt_account();
+                    error!("aborting batch: account {} is corrupt in the store", pubkey);
+                }
+                AccountLoadError::Backend(msg) => {
+                    metrics.executor_preload_fatal();
+                    error!("aborting batch: account load failed after retries: {}", msg);
+                }
+            }
+            return Err(e);
+        }
+    };
     let t_preload = t_op.elapsed();
     debug!(
         "preload: {} accounts ({} fetched, {} cached) in {:?}",
@@ -701,12 +736,12 @@ pub async fn execute_batch(
     );
     metrics.executor_batch_duration_ms(t_total.as_secs_f64() * 1000.0);
 
-    ExecutionResult {
+    Ok(ExecutionResult {
         admin_transactions,
         regular_transactions,
         admin_results,
         regular_results,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -808,7 +843,9 @@ mod tests {
                 index: i,
             })
             .collect();
-        execute_batch(ConflictFreeBatch { transactions }, deps, metrics).await
+        execute_batch(ConflictFreeBatch { transactions }, deps, metrics)
+            .await
+            .expect("execute_batch should not fail in this test")
     }
 
     fn regular_result(
@@ -1189,7 +1226,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         assert_eq!(result.regular_transactions.len(), n);
         assert!(result.admin_transactions.is_empty());
@@ -1220,7 +1257,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let results = result.regular_results.unwrap();
         assert_eq!(results.processing_results.len(), n);
@@ -1292,7 +1329,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(empty_batch, &mut deps, &noop).await;
+        let result = execute_batch(empty_batch, &mut deps, &noop).await.unwrap();
         assert!(result.admin_transactions.is_empty());
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_none());
@@ -1314,7 +1351,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert!(!result.regular_transactions.is_empty());
         assert!(result.admin_transactions.is_empty());
         assert!(
@@ -1349,7 +1386,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.regular_transactions.len(), 2);
         assert!(result.admin_transactions.is_empty());
         let results = result.regular_results.unwrap();
@@ -1393,7 +1430,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         assert_eq!(
             result.regular_transactions.len(),
@@ -1439,7 +1476,9 @@ mod tests {
         };
 
         // Pass 1: bh is in the live window — all 3 must execute.
-        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop)
+            .await
+            .unwrap();
         assert_eq!(
             r1.regular_transactions.len(),
             3,
@@ -1450,7 +1489,9 @@ mod tests {
         live.write().unwrap().clear();
 
         // Pass 2: same blockhash, now expired — all 3 must be filtered.
-        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop)
+            .await
+            .unwrap();
         assert_eq!(
             r2.regular_transactions.len(),
             0,
@@ -1534,7 +1575,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -1585,7 +1626,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -1639,7 +1680,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -1844,7 +1885,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.admin_transactions.len(), 1);
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_some());
@@ -1870,7 +1911,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert!(
             result.admin_transactions.is_empty(),
             "mixed tx must not be admin-routed"
@@ -1904,7 +1945,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.admin_transactions.len(), 1);
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());
@@ -2012,5 +2053,99 @@ mod tests {
             "executor must exit promptly even with a full results channel"
         );
         drop(execution_results_rx);
+    }
+
+    // ─── Corrupt-account handling ───
+
+    /// Overwrite the `data` column for `pubkey` with bytes that cannot
+    /// deserialize into an AccountSharedData.
+    async fn insert_corrupt_pg(db: &AccountsDB, pubkey: Pubkey) {
+        if let AccountsDB::Postgres(pg) = db {
+            sqlx::query(
+                "INSERT INTO accounts (pubkey, data) VALUES ($1, $2)
+                 ON CONFLICT (pubkey) DO UPDATE SET data = EXCLUDED.data",
+            )
+            .bind(pubkey.to_bytes().to_vec())
+            .bind(vec![0xAAu8; 5])
+            .execute(pg.pool.as_ref())
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A corrupt account is a fatal integrity fault: execute_batch aborts the
+    /// whole batch so nothing is settled, rather than failing single txs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn corrupt_account_aborts_batch() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let corrupt = Pubkey::new_unique();
+        insert_corrupt_pg(&accounts_db, corrupt).await;
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(transfer(&Keypair::new(), &corrupt, 10)),
+                index: 0,
+            }],
+        };
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Corrupt(k)) if k == corrupt),
+            "a referenced corrupt account must abort the batch fatally"
+        );
+    }
+
+    /// A corrupt account referenced by no transaction has no effect: it is never
+    /// loaded, so the batch executes normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreferenced_corrupt_account_has_no_effect() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let unref = Pubkey::new_unique();
+        insert_corrupt_pg(&accounts_db, unref).await;
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let result = run_batch(
+            &mut deps,
+            &metrics,
+            vec![transfer(&Keypair::new(), &Pubkey::new_unique(), 10)],
+        )
+        .await;
+
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(is_executed(regular_result(&result, 0)));
+    }
+
+    /// A transient preload failure that survives retries is fatal: execute_batch
+    /// returns Err and produces nothing to settle.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn preload_fatal_aborts_batch() {
+        let accounts_db = crate::test_helpers::dead_postgres_db();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        // Dead backend; shrink retries so the fatal error returns fast.
+        crate::accounts::get_accounts::set_test_retry(2, 1);
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(transfer(&Keypair::new(), &Pubkey::new_unique(), 10)),
+                index: 0,
+            }],
+        };
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        crate::accounts::get_accounts::reset_test_retry();
+
+        assert!(
+            result.is_err(),
+            "a dead backend must abort the batch fatally"
+        );
     }
 }

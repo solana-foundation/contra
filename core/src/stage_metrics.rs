@@ -25,6 +25,8 @@ pub trait StageMetrics: Send + Sync {
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
     fn executor_dropped_expired_blockhash(&self, count: usize);
+    fn executor_preload_fatal(&self);
+    fn executor_corrupt_account(&self);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -93,6 +95,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_dropped_expired_blockhash(&self, count: usize) {
         debug!("executor: dropped {} expired blockhash txs", count);
+    }
+    fn executor_preload_fatal(&self) {
+        debug!("executor: fatal preload error");
+    }
+    fn executor_corrupt_account(&self) {
+        debug!("executor: aborted batch on corrupt account");
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -218,6 +226,18 @@ counter_vec!(
     EXECUTOR_DROPPED_EXPIRED_BH,
     "private_channel_executor_dropped_expired_bh_total",
     "Transactions dropped at execution due to expired blockhash",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_PRELOAD_FATAL,
+    "private_channel_executor_preload_fatal_total",
+    "Fatal account preload errors that aborted the executor",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_CORRUPT_ACCOUNT,
+    "private_channel_executor_corrupt_account_total",
+    "Batches aborted because a referenced account was corrupt in the store",
     &[]
 );
 counter_vec!(
@@ -359,6 +379,16 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc_by(count as f64);
     }
+    fn executor_preload_fatal(&self) {
+        EXECUTOR_PRELOAD_FATAL
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn executor_corrupt_account(&self) {
+        EXECUTOR_CORRUPT_ACCOUNT
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -440,6 +470,8 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_RESULTS_SEND_FAILED,
         EXECUTOR_MISSING_RESULTS,
         EXECUTOR_DROPPED_EXPIRED_BH,
+        EXECUTOR_PRELOAD_FATAL,
+        EXECUTOR_CORRUPT_ACCOUNT,
         SETTLER_TXS_SETTLED,
         // Executor latency histograms
         EXECUTOR_BATCH_DURATION,

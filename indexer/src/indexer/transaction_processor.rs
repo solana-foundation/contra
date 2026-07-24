@@ -4,7 +4,7 @@ use crate::{
     config::ProgramType,
     error::{IndexerError, StorageError},
     indexer::{
-        checkpoint::CheckpointUpdate,
+        checkpoint::{CheckpointMsg, CheckpointUpdate},
         datasource::common::{
             parser::{escrow_instance_of, EscrowInstruction, WithdrawInstruction},
             types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
@@ -69,7 +69,7 @@ impl WriteRetryPolicy {
 /// Current implementation: Sequential slot processing with batch inserts per slot (Option 3)
 pub struct TransactionProcessor {
     storage: Arc<Storage>,
-    checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
 
     // Per-slot instruction buffers, so a foreign SlotComplete finalizes only its own slot's rows.
     slot_buffers: HashMap<u64, Vec<InstructionWithMetadata>>,
@@ -90,7 +90,7 @@ pub struct TransactionProcessor {
 }
 
 impl TransactionProcessor {
-    pub fn new(storage: Arc<Storage>, checkpoint_tx: mpsc::Sender<CheckpointUpdate>) -> Self {
+    pub fn new(storage: Arc<Storage>, checkpoint_tx: mpsc::Sender<CheckpointMsg>) -> Self {
         Self {
             storage,
             checkpoint_tx,
@@ -186,6 +186,33 @@ impl TransactionProcessor {
                         .observe(start.elapsed().as_secs_f64());
                     if let Some(h) = &self.health {
                         h.record_progress();
+                    }
+                }
+                ProcessorMessage::Regate {
+                    program_type,
+                    from,
+                    target,
+                } => {
+                    // Forward the gate re-arm in-band, ahead of the slot it precedes. No
+                    // DB write and no health bump: it is a control signal, not slot
+                    // progress. A send failure means the writer is gone, so exit.
+                    if send_guaranteed(
+                        &self.checkpoint_tx,
+                        CheckpointMsg::Regate {
+                            program_type,
+                            from,
+                            target,
+                        },
+                        "regate",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        error!(
+                            "Regate send failed for {:?} target {}",
+                            program_type, target
+                        );
+                        return Err(IndexerError::CheckpointChannelClosed);
                     }
                 }
             }
@@ -286,7 +313,7 @@ impl TransactionProcessor {
         // pipeline instead of retrying a closed channel.
         match send_guaranteed(
             &self.checkpoint_tx,
-            CheckpointUpdate { program_type, slot },
+            CheckpointMsg::Slot(CheckpointUpdate { program_type, slot }),
             "checkpoint",
         )
         .await
@@ -935,11 +962,34 @@ mod tests {
         }
     }
 
+    /// Unwrap the next message as a slot checkpoint, panicking on a Regate; keeps
+    /// the slot-oriented recv sites terse now that the channel carries CheckpointMsg.
+    async fn recv_slot(rx: &mut mpsc::Receiver<CheckpointMsg>) -> CheckpointUpdate {
+        match rx.recv().await.expect("expected a checkpoint message") {
+            CheckpointMsg::Slot(update) => update,
+            CheckpointMsg::Regate { target, .. } => {
+                panic!("expected a Slot checkpoint, got Regate(target={target})")
+            }
+        }
+    }
+
+    /// Poll the committed checkpoint until it reaches `want`, so a test can await a
+    /// durable flush without racing the writer's batch timer.
+    async fn wait_for_checkpoint(mock: &MockStorage, program: &str, want: u64) {
+        for _ in 0..200 {
+            if mock.get_committed_checkpoint(program).await.unwrap() == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("checkpoint for {program} never reached {want}");
+    }
+
     fn make_processor_and_rx(
         escrow_instance_id: Pubkey,
     ) -> (
         TransactionProcessor,
-        tokio::sync::mpsc::Receiver<CheckpointUpdate>,
+        tokio::sync::mpsc::Receiver<CheckpointMsg>,
     ) {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
@@ -954,7 +1004,7 @@ mod tests {
         escrow_instance_id: Pubkey,
     ) -> (
         TransactionProcessor,
-        tokio::sync::mpsc::Receiver<CheckpointUpdate>,
+        tokio::sync::mpsc::Receiver<CheckpointMsg>,
         MockStorage,
     ) {
         let mock = MockStorage::new();
@@ -973,7 +1023,7 @@ mod tests {
             .finalize_and_checkpoint(42, ProgramType::Escrow)
             .await
             .unwrap();
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 42);
         assert_eq!(cp.program_type, ProgramType::Escrow);
         assert!(processor.slot_buffers.is_empty());
@@ -994,7 +1044,7 @@ mod tests {
             assert_eq!(inserted[0].len(), 1);
         }
 
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 100);
     }
 
@@ -1014,7 +1064,7 @@ mod tests {
             assert!(mints.contains_key(&make_pubkey(2).to_string()));
         }
 
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 200);
     }
 
@@ -1040,7 +1090,7 @@ mod tests {
             assert_eq!(rows[0].signature, "sig-allow-1");
         }
 
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 200);
     }
 
@@ -1080,7 +1130,7 @@ mod tests {
             );
         }
 
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 250);
     }
 
@@ -1107,7 +1157,7 @@ mod tests {
             assert_eq!(inserted.len(), 1, "row lands once after the retry");
             assert_eq!(inserted[0][0].slot, 401);
         }
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 401);
         // Exactly one checkpoint - the failed attempt did not also send one.
         assert!(checkpoint_rx.try_recv().is_err());
@@ -1214,8 +1264,61 @@ mod tests {
             assert_eq!(inserted.len(), 1);
         }
 
-        let cp = checkpoint_rx.recv().await.unwrap();
+        let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 500);
+    }
+
+    /// The processor forwards a Regate in-band ahead of the slot it precedes and
+    /// does no DB write for it, locking the FIFO ordering the gate re-arm depends on.
+    #[tokio::test]
+    async fn processor_forwards_regate_before_slot_in_order() {
+        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            500,
+            Some("s5".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::Regate {
+            program_type: ProgramType::Escrow,
+            from: 100,
+            target: 110,
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: 500,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        processor.start(rx).await.unwrap();
+
+        // Regate is forwarded first, ahead of slot 500's checkpoint.
+        match checkpoint_rx.recv().await.unwrap() {
+            CheckpointMsg::Regate {
+                program_type,
+                from,
+                target,
+            } => {
+                assert_eq!(program_type, ProgramType::Escrow);
+                assert_eq!(from, 100);
+                assert_eq!(target, 110);
+            }
+            other => panic!("expected Regate first, got {other:?}"),
+        }
+        let cp = recv_slot(&mut checkpoint_rx).await;
+        assert_eq!(cp.slot, 500);
+
+        // No DB write for the Regate: only slot 500's deposit row landed.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0][0].slot, 500);
     }
 
     /// Finalizing slot A inserts only A's rows and leaves B buffered until B's own SlotComplete.
@@ -1266,8 +1369,8 @@ mod tests {
             assert_eq!(batches[1][0].slot, SLOT_B as i64);
         }
 
-        let first = checkpoint_rx.recv().await.unwrap();
-        let second = checkpoint_rx.recv().await.unwrap();
+        let first = recv_slot(&mut checkpoint_rx).await;
+        let second = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(first.slot, SLOT_A);
         assert_eq!(second.slot, SLOT_B);
     }
@@ -1320,8 +1423,10 @@ mod tests {
         );
 
         let mut checkpointed = Vec::new();
-        while let Ok(cp) = checkpoint_rx.try_recv() {
-            checkpointed.push(cp.slot);
+        while let Ok(msg) = checkpoint_rx.try_recv() {
+            if let CheckpointMsg::Slot(cp) = msg {
+                checkpointed.push(cp.slot);
+            }
         }
         assert_eq!(
             checkpointed,
@@ -1349,7 +1454,7 @@ mod tests {
         consumed: ConsumedSet,
     ) -> (
         TransactionProcessor,
-        tokio::sync::mpsc::Receiver<CheckpointUpdate>,
+        tokio::sync::mpsc::Receiver<CheckpointMsg>,
         MockStorage,
     ) {
         let mock = MockStorage::new();
@@ -1617,8 +1722,8 @@ mod tests {
         let result = processor.start(rx).await;
         assert!(result.is_ok(), "retry self-heal keeps the loop running");
 
-        let first = checkpoint_rx.recv().await.unwrap();
-        let second = checkpoint_rx.recv().await.unwrap();
+        let first = recv_slot(&mut checkpoint_rx).await;
+        let second = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(first.slot, N);
         assert_eq!(second.slot, N_NEXT);
     }
@@ -1721,6 +1826,115 @@ mod tests {
         assert_eq!(inserted.len(), 1);
         assert_eq!(inserted[0][0].slot, DEPOSIT_SLOT as i64);
         assert!(committed >= DEPOSIT_SLOT);
+    }
+
+    /// The exact reconnect residual-gap reproduction, end-to-end through the real
+    /// pipeline: the residual window (T_gf, T_sub] must be indexed, never leapfrogged by
+    /// the live tip that resumes above it. Removing the writer's Regate arm makes this
+    /// drive the checkpoint straight to the tip and skip the window, so it is the
+    /// authoritative guard that value-bearing events there are never lost.
+    #[tokio::test]
+    async fn reconnect_residual_gap_is_not_leapfrogged() {
+        const T_GF: u64 = 100; // stale tip the old gap-fill stopped at
+        const T_SUB: u64 = 110; // real live resume slot observed on reconnect
+        const RESIDUAL_DEPOSIT: u64 = 105; // a value-bearing event inside the window
+        const LIVE_TIP: u64 = 9_000_000;
+        let (tx, processor_handle, checkpoint_handle, mock) =
+            spawn_pipeline(deposit_instance(), None);
+
+        // Steady state before the reconnect: durable checkpoint and in-memory
+        // frontier both sit at T_gf.
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: T_GF,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        wait_for_checkpoint(&mock, "escrow", T_GF).await;
+
+        // Reconnect: arm the gate to the observed resume slot, then the live tip and
+        // the live resume slot arrive BEFORE the residual (100, 110] is backfilled.
+        tx.send(ProcessorMessage::Regate {
+            program_type: ProgramType::Escrow,
+            from: T_GF,
+            target: T_SUB,
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: LIVE_TIP,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: T_SUB,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+
+        // The durable checkpoint must stay frozen at T_gf even though slot 9_000_000
+        // was processed - this is the leapfrog the ungated code commits.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed, T_GF,
+            "checkpoint must not leapfrog the unfilled residual window"
+        );
+
+        // Backfill closes (100, 110] contiguously, including a real deposit at 105.
+        for slot in (T_GF + 1)..=T_SUB {
+            if slot == RESIDUAL_DEPOSIT {
+                tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+                    RESIDUAL_DEPOSIT,
+                    Some("dep-105".to_string()),
+                    None,
+                )))
+                .await
+                .unwrap();
+            }
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+        // A later live slot advances the checkpoint past the now-contiguous window.
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: LIVE_TIP + 1,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        processor_handle.await.unwrap();
+        checkpoint_handle.await.unwrap();
+
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            committed > T_SUB,
+            "checkpoint advances past the window once it is contiguous"
+        );
+        // The residual-window deposit was indexed, not silently lost.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert!(
+            inserted
+                .iter()
+                .flatten()
+                .any(|t| t.slot == RESIDUAL_DEPOSIT as i64),
+            "the residual-window deposit must be indexed"
+        );
     }
 
     /// A crash mid-backfill persists the contiguous frontier, not the tip, so resume re-backfills with no tail skipped.

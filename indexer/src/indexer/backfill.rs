@@ -590,6 +590,9 @@ mod tests {
                     ProcessorMessage::Instruction(_) => {
                         panic!("Expected no Instruction messages for empty blocks");
                     }
+                    ProcessorMessage::Regate { .. } => {
+                        panic!("Expected no Regate messages from backfill");
+                    }
                 }
             }
         }
@@ -933,6 +936,7 @@ mod tests {
                 .map(|m| match m {
                     ProcessorMessage::SlotComplete { slot, .. } => *slot,
                     ProcessorMessage::Instruction(_) => panic!("unexpected Instruction message"),
+                    ProcessorMessage::Regate { .. } => panic!("unexpected Regate message"),
                 })
                 .collect();
             assert_eq!(slots, vec![101, 102, 103]);

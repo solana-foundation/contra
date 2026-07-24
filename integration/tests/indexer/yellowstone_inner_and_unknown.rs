@@ -102,6 +102,8 @@ async fn yellowstone_handles_inner_instructions_and_unknown_discriminator() {
                     other_instructions += 1;
                 }
             },
+            // No reconnect in this test, so no gate re-arm is expected.
+            Ok(Some(ProcessorMessage::Regate { .. })) => {}
             Ok(None) | Err(_) => break,
         }
     }

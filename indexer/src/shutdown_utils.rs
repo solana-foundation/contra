@@ -8,7 +8,7 @@
 //! - Buffer time before storage closure
 
 use crate::error::IndexerError;
-use crate::indexer::checkpoint::CheckpointUpdate;
+use crate::indexer::checkpoint::CheckpointMsg;
 use crate::indexer::datasource::common::datasource::DataSource;
 use crate::indexer::datasource::common::types::ProcessorMessage;
 use crate::storage::Storage;
@@ -105,7 +105,7 @@ pub async fn shutdown_indexer(
     datasource: Box<dyn DataSource>,
     datasource_handle: tokio::task::JoinHandle<()>,
     instruction_tx: mpsc::Sender<ProcessorMessage>,
-    checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
     checkpoint_handle: tokio::task::JoinHandle<()>,
     processor_handle: tokio::task::JoinHandle<Result<(), IndexerError>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -171,7 +171,7 @@ async fn perform_indexer_shutdown_stages(
     mut datasource: Box<dyn DataSource>,
     datasource_handle: tokio::task::JoinHandle<()>,
     instruction_tx: mpsc::Sender<ProcessorMessage>,
-    checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
     checkpoint_handle: tokio::task::JoinHandle<()>,
     processor_handle: tokio::task::JoinHandle<Result<(), IndexerError>>,
     config: &ShutdownConfig,
@@ -528,7 +528,7 @@ async fn perform_operator_shutdown_stages(
 /// Graceful cleanup after backfill completion
 pub async fn cleanup_after_backfill(
     checkpoint_handle: tokio::task::JoinHandle<()>,
-    checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
     storage: Arc<Storage>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Cleaning up after backfill completion...");
@@ -673,7 +673,7 @@ mod tests {
     async fn cleanup_after_backfill_ok() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
-        let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointUpdate>(10);
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointMsg>(10);
 
         // Start a simple checkpoint writer that just drains
         let checkpoint_handle = tokio::spawn(async move {

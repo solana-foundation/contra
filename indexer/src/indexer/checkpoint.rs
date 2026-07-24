@@ -20,6 +20,19 @@ pub struct CheckpointUpdate {
     pub slot: u64,
 }
 
+/// In-band message on the checkpoint channel. `Slot` advances the durable frontier;
+/// `Regate` re-arms the per-program gate on reconnect. Both ride one FIFO channel so
+/// a re-arm always applies before the slot it precedes (no cross-channel race).
+#[derive(Debug, Clone)]
+pub enum CheckpointMsg {
+    Slot(CheckpointUpdate),
+    Regate {
+        program_type: ProgramType,
+        from: u64,
+        target: u64,
+    },
+}
+
 /// Per-program-type checkpoint progress.
 ///
 /// `frontier` is the contiguous, fully-processed prefix and equals the value
@@ -33,7 +46,8 @@ struct CheckpointState {
     frontier: u64,
     // Processed-but-not-yet-contiguous slots in `(frontier, target]`, awaiting the fold.
     completed: HashSet<u64>,
-    // Backfill target `T0` while gated; `None` once handed off / ungated (plain max).
+    // Backfill/reconnect target while gated; `None` only when never gated. After the
+    // frontier reaches the target it stays `Some` but is inert (the plain-max path).
     gate: Option<u64>,
     // True when `frontier` advanced since the last successful flush (so flush has work).
     dirty: bool,
@@ -110,6 +124,15 @@ impl CheckpointState {
         }
     }
 
+    /// Re-arm the gate to hold the checkpoint until slots `(from, target]` are filled.
+    /// `from` is the durable checkpoint: pulling the frontier up to it stops a brand-new
+    /// state from gating at 0 and never folding. The frontier never moves backward, and
+    /// the newest reconnect sets the target so a lower resume slot can still hand off.
+    fn regate(&mut self, from: u64, target: u64) {
+        self.frontier = self.frontier.max(from);
+        self.gate = Some(target);
+    }
+
     /// Slots left to fill while gated (`target - frontier`), saturating to 0 post-handoff.
     fn lag(&self) -> u64 {
         match self.gate {
@@ -163,7 +186,7 @@ impl CheckpointWriter {
 
     /// Start the checkpoint writer service
     /// Spawns a background task that listens for checkpoint updates and batches writes to DB
-    pub fn start(self, mut rx: mpsc::Receiver<CheckpointUpdate>) -> JoinHandle<()> {
+    pub fn start(self, mut rx: mpsc::Receiver<CheckpointMsg>) -> JoinHandle<()> {
         tokio::spawn(async move {
             info!(
                 "Starting CheckpointWriter service (batch interval: {}s, max batch size: {}, gated: {})",
@@ -182,7 +205,12 @@ impl CheckpointWriter {
                 tokio::select! {
                     update = rx.recv() => {
                         match update {
-                            Some(update) => {
+                            // A Regate is a control signal, not slot progress: re-arm the
+                            // gate and do not count it toward a batch flush.
+                            Some(CheckpointMsg::Regate { program_type, from, target }) => {
+                                self.record_regate(&mut states, program_type, from, target);
+                            }
+                            Some(CheckpointMsg::Slot(update)) => {
                                 self.record_update(&mut states, update);
 
                                 update_count += 1;
@@ -223,6 +251,25 @@ impl CheckpointWriter {
         state.apply(update.slot);
         metrics::INDEXER_CHECKPOINT_FRONTIER_LAG
             .with_label_values(&[update.program_type.as_label()])
+            .set(state.lag() as f64);
+    }
+
+    /// Handle a reconnect Regate for one program: re-arm its gate over `(from, target]`
+    /// and refresh the lag gauge. Just in-memory state, no DB write. The gate then holds
+    /// the checkpoint until the backfill fills every slot in that window.
+    fn record_regate(
+        &self,
+        states: &mut HashMap<ProgramType, CheckpointState>,
+        program_type: ProgramType,
+        from: u64,
+        target: u64,
+    ) {
+        let state = states
+            .entry(program_type)
+            .or_insert_with(|| self.new_state());
+        state.regate(from, target);
+        metrics::INDEXER_CHECKPOINT_FRONTIER_LAG
+            .with_label_values(&[program_type.as_label()])
             .set(state.lag() as f64);
     }
 
@@ -400,6 +447,130 @@ mod tests {
     }
 
     // ============================================================================
+    // Regate (reconnect re-arm) Tests
+    // ============================================================================
+
+    /// After a hand-off, a reconnect re-arms the gate to a new target; a hole plus
+    /// a live tip must not leapfrog the frontier, and once the residual window fills
+    /// contiguously it folds up to the new target and hands off again.
+    #[test]
+    fn regate_rearms_after_handoff_and_blocks_leapfrog() {
+        let mut state = CheckpointState::gated(FROM, T0);
+        let full: Vec<u64> = (FROM + 1..=T0).collect();
+        assert_eq!(drive(&mut state, &full), T0);
+        // Hand off to plain-max with a live slot above T0.
+        assert_eq!(drive(&mut state, &[T0 + 50]), T0 + 50);
+
+        // Reconnect observes a later resume slot and re-arms the gate.
+        state.regate(T0 + 50, T0 + 100);
+
+        // A hole (T0+51 skipped) plus a live tip cannot move the durable frontier.
+        assert_eq!(drive(&mut state, &[T0 + 52, 9_000_000]), T0 + 50);
+
+        // Filling the residual window contiguously folds to the new target.
+        let residual: Vec<u64> = (T0 + 51..=T0 + 100).collect();
+        assert_eq!(drive(&mut state, &residual), T0 + 100);
+
+        // Handed off again: a later live tip advances via plain max.
+        assert_eq!(drive(&mut state, &[9_000_001]), 9_000_001);
+    }
+
+    /// The gate target tracks the latest reconnect: a lower resume slot after a higher
+    /// one lowers the target so the fold can hand off, instead of stalling above what the
+    /// source will emit.
+    #[test]
+    fn regate_latest_target_wins() {
+        let mut state = CheckpointState::gated(FROM, T0);
+        // A first reconnect raises the target above T0.
+        state.regate(FROM, T0 + 20);
+        let upto_t0: Vec<u64> = (FROM + 1..=T0).collect();
+        assert_eq!(drive(&mut state, &upto_t0), T0, "still gated below T0+20");
+        // A later reconnect resumes LOWER; the target follows it down.
+        state.regate(FROM, T0 + 5);
+        let rest: Vec<u64> = (T0 + 1..=T0 + 5).collect();
+        assert_eq!(
+            drive(&mut state, &rest),
+            T0 + 5,
+            "hands off at the latest target"
+        );
+        assert_eq!(drive(&mut state, &[T0 + 500]), T0 + 500, "then plain max");
+    }
+
+    /// A reconnect on a fresh state seeds the frontier to the durable checkpoint, so a
+    /// Regate arriving before any Slot cannot freeze the fold at 0; a later lower `from`
+    /// never rewinds it.
+    #[test]
+    fn regate_seeds_frontier_from_durable_checkpoint() {
+        let mut state = CheckpointState::ungated();
+        assert_eq!(state.frontier, 0);
+        state.regate(5000, 5001);
+        assert_eq!(
+            state.frontier, 5000,
+            "fresh state anchors at the durable checkpoint"
+        );
+        assert_eq!(
+            drive(&mut state, &[5001]),
+            5001,
+            "folds to the target and hands off"
+        );
+        state.regate(10, 6000);
+        assert_eq!(
+            state.frontier, 5001,
+            "a lower from never rewinds the frontier"
+        );
+    }
+
+    /// A target at or below the frontier is inert: the gap is already covered, so
+    /// plain-max progress continues with no stall.
+    #[test]
+    fn regate_below_frontier_is_inert() {
+        let mut state = CheckpointState::ungated();
+        assert_eq!(drive(&mut state, &[500]), 500);
+        state.regate(400, 400);
+        assert_eq!(drive(&mut state, &[600]), 600);
+        assert_eq!(state.lag(), 0);
+    }
+
+    /// The writer's Regate handling re-gates the correct per-program state: after
+    /// record_regate the gated frontier stays put and lag reflects the new target.
+    #[test]
+    fn record_regate_arms_gate_for_program() {
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = CheckpointWriter::new(storage);
+        let mut states: HashMap<ProgramType, CheckpointState> = HashMap::new();
+
+        // Seed the program at frontier 100 the way the writer loop would.
+        writer.record_update(
+            &mut states,
+            CheckpointUpdate {
+                program_type: ProgramType::Escrow,
+                slot: 100,
+            },
+        );
+        writer.record_regate(&mut states, ProgramType::Escrow, 100, 110);
+
+        // A live tip and an in-gap slot must not move the gated frontier.
+        writer.record_update(
+            &mut states,
+            CheckpointUpdate {
+                program_type: ProgramType::Escrow,
+                slot: 105,
+            },
+        );
+        writer.record_update(
+            &mut states,
+            CheckpointUpdate {
+                program_type: ProgramType::Escrow,
+                slot: 2_000_000,
+            },
+        );
+
+        let state = states.get(&ProgramType::Escrow).unwrap();
+        assert_eq!(state.frontier, 100);
+        assert_eq!(state.lag(), 10);
+    }
+
+    // ============================================================================
     // Builder Tests
     // ============================================================================
 
@@ -567,10 +738,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let handle = writer.start(rx);
 
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 500,
-        })
+        }))
         .await
         .unwrap();
 
@@ -597,16 +768,16 @@ mod tests {
         let handle = writer.start(rx);
 
         // Send 2 updates to trigger batch flush
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 100,
-        })
+        }))
         .await
         .unwrap();
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 200,
-        })
+        }))
         .await
         .unwrap();
 
@@ -633,16 +804,16 @@ mod tests {
         let handle = writer.start(rx);
 
         // Send updates with decreasing slots - highest should win
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 300,
-        })
+        }))
         .await
         .unwrap();
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 100, // lower slot, should be ignored
-        })
+        }))
         .await
         .unwrap();
 
@@ -664,10 +835,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let handle = writer.start(rx);
 
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Withdraw,
             slot: 42,
-        })
+        }))
         .await
         .unwrap();
 

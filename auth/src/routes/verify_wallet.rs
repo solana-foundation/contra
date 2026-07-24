@@ -16,16 +16,17 @@ pub async fn verify_wallet(
     claims: Claims,
     Json(req): Json<VerifyWalletRequest>,
 ) -> AppResult<Json<WalletResponse>> {
+    // Look up the account name before consuming the challenge, so a transient lookup
+    // failure cannot burn an otherwise valid one-time challenge.
+    let username_result = db::find_username_by_id(&state.pool, claims.sub).await;
+    state.pool_status.observe_app(&username_result);
+    let username = username_result?.ok_or(AppError::Unauthorized)?;
+
     // Consume the challenge atomically so it cannot be replayed.
     let challenge_result = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
     state.pool_status.observe_app(&challenge_result);
     let challenge =
         challenge_result?.ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
-
-    // Same username the challenge endpoint used, so this matches what the client signed.
-    let username_result = db::find_username_by_id(&state.pool, claims.sub).await;
-    state.pool_status.observe_app(&username_result);
-    let username = username_result?.ok_or(AppError::Unauthorized)?;
 
     // Rebuild the exact message the client was asked to sign.
     let message = wallet_verification_message(

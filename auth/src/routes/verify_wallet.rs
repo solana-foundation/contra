@@ -7,7 +7,7 @@ use crate::{
     db,
     error::{AppError, AppResult},
     jwt::Claims,
-    models::{VerifyWalletRequest, WalletResponse},
+    models::{wallet_verification_message, VerifyWalletRequest, WalletResponse},
     AppState,
 };
 
@@ -16,18 +16,23 @@ pub async fn verify_wallet(
     claims: Claims,
     Json(req): Json<VerifyWalletRequest>,
 ) -> AppResult<Json<WalletResponse>> {
-    // Consume the challenge atomically — marks it used so it cannot be replayed.
-    let r = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
-    state.pool_status.observe_app(&r);
-    let challenge = r?.ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
+    // Consume the challenge atomically so it cannot be replayed.
+    let challenge_result = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
+    state.pool_status.observe_app(&challenge_result);
+    let challenge =
+        challenge_result?.ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
 
-    // Reconstruct the exact message the client was asked to sign.
-    // Must match the format returned by /auth/challenge-wallet.
-    let message = format!(
-        "PrivateChannel wallet verification\nuser: {}\nnonce: {}\nexpires: {}",
-        claims.sub,
+    // Same username the challenge endpoint used, so this matches what the client signed.
+    let username_result = db::find_username_by_id(&state.pool, claims.sub).await;
+    state.pool_status.observe_app(&username_result);
+    let username = username_result?.ok_or(AppError::Unauthorized)?;
+
+    // Rebuild the exact message the client was asked to sign.
+    let message = wallet_verification_message(
+        &username,
+        &req.pubkey,
         challenge.nonce,
-        challenge.expires_at.timestamp()
+        challenge.expires_at,
     );
 
     let pubkey =
@@ -41,9 +46,9 @@ pub async fn verify_wallet(
         return Err(AppError::Unauthorized);
     }
 
-    let raw = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey).await;
-    state.pool_status.observe_app(&raw);
-    let wallet = raw.map_err(|e| match e {
+    let insert_result = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey).await;
+    state.pool_status.observe_app(&insert_result);
+    let wallet = insert_result.map_err(|e| match e {
         // Unique constraint on (user_id, pubkey) — wallet already verified.
         AppError::Db(sqlx::Error::Database(ref db_err))
             if db_err.constraint() == Some("verified_wallets_user_id_pubkey_key") =>

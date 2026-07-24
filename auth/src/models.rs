@@ -57,12 +57,39 @@ pub struct LoginResponse {
     pub token: String,
 }
 
+#[derive(Deserialize)]
+pub struct ChallengeRequest {
+    /// The wallet the caller wants to link. Bound into the signed message.
+    pub pubkey: String,
+}
+
 #[derive(Serialize)]
 pub struct ChallengeResponse {
     /// The exact message the client must sign with their wallet.
     pub message: String,
     pub nonce: Uuid,
     pub expires_at: DateTime<Utc>,
+}
+
+/// Builds the message a user signs to prove wallet ownership.
+/// The challenge and verify endpoints both call this so their messages always match.
+/// The account name and wallet are spelled out so a signer can tell they are
+/// linking their own wallet to their own account, not someone else's.
+pub fn wallet_verification_message(
+    username: &str,
+    pubkey: &str,
+    nonce: Uuid,
+    expires_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "PrivateChannel wallet verification\n\n\
+         Account: {username}\n\
+         Wallet: {pubkey}\n\n\
+         Only sign this if \"{username}\" is YOUR PrivateChannel account.\n\n\
+         nonce: {nonce}\n\
+         expires: {expires}",
+        expires = expires_at.timestamp(),
+    )
 }
 
 #[derive(Deserialize)]

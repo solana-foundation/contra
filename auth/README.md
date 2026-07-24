@@ -46,13 +46,15 @@ Returns `{ "token": "<jwt>" }`. Both wrong username and wrong password return `4
 
 ### `POST /auth/challenge-wallet` 🔒
 
-Request a sign challenge to prove ownership of a Solana wallet. Requires a valid JWT.
+Request a sign challenge to prove ownership of a Solana wallet. Requires a valid JWT. Send the wallet you want to link, so it can be named in the message the user signs.
 
-Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes.
+Request: `{ "pubkey": "<base58 pubkey>" }`
+
+Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes. The message names both the account and the wallet so a signer only ever consents to linking their own wallet to their own account.
 
 ```json
 {
-  "message": "Solana Private Channels wallet verification\nuser: <uuid>\nnonce: <uuid>\nexpires: <unix>",
+  "message": "PrivateChannel wallet verification\n\nAccount: <username>\nWallet: <base58 pubkey>\n\nOnly sign this if \"<username>\" is YOUR PrivateChannel account.\n\nnonce: <uuid>\nexpires: <unix>",
   "nonce": "<uuid>",
   "expires_at": "<iso8601>"
 }
@@ -118,7 +120,7 @@ AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin admin -- attach-wallet 
 Wallets are not trusted on assertion — the user must cryptographically prove they control the private key.
 
 ```
-1. POST /auth/challenge-wallet
+1. POST /auth/challenge-wallet  { pubkey }
    ← { message, nonce, expires_at }
 
 2. Sign `message` with the wallet's private key (Ed25519)

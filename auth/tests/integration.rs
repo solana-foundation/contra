@@ -377,10 +377,14 @@ async fn test_verify_wallet_full_flow() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    // Create the keypair first so its pubkey can go in the challenge request.
+    let keypair = Keypair::new();
+
     // Get challenge
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -391,8 +395,7 @@ async fn test_verify_wallet_full_flow() {
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
 
-    // Sign the challenge message with a Solana keypair
-    let keypair = Keypair::new();
+    // Sign the challenge message with the wallet keypair.
     let signature = keypair.sign_message(message.as_bytes());
 
     // Verify wallet
@@ -411,6 +414,53 @@ async fn test_verify_wallet_full_flow() {
     assert_eq!(verify_res.status(), 200);
     let body: Value = verify_res.json().await.unwrap();
     assert_eq!(body["pubkey"], keypair.pubkey().to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_challenge_message_names_account_and_wallet() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    let username = "alice";
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey().to_string();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({ "pubkey": pubkey }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // The message must name the account and the wallet so a signer can give informed
+    // consent. This is the property whose absence let an opaque challenge be phished
+    // onto a victim wallet under someone else's account.
+    let message = challenge_res["message"].as_str().unwrap();
+    assert!(message.contains(username), "message must name the account");
+    assert!(message.contains(&pubkey), "message must name the wallet");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -438,9 +488,13 @@ async fn test_verify_wallet_replay_rejected() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    // Create the keypair first so its pubkey can go in the challenge request.
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -451,7 +505,6 @@ async fn test_verify_wallet_replay_rejected() {
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
 
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(message.as_bytes());
 
     let payload = json!({
@@ -506,9 +559,12 @@ async fn test_verify_wallet_invalid_pubkey() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -517,7 +573,6 @@ async fn test_verify_wallet_invalid_pubkey() {
         .unwrap();
 
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(challenge_res["message"].as_str().unwrap().as_bytes());
 
     let res = client
@@ -560,9 +615,12 @@ async fn test_verify_wallet_invalid_signature_format() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -571,7 +629,6 @@ async fn test_verify_wallet_invalid_signature_format() {
         .unwrap();
 
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
 
     let res = client
         .post(format!("{}/auth/verify-wallet", base_url(addr)))
@@ -613,9 +670,13 @@ async fn test_verify_wallet_wrong_signature() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    // Create the keypair first so its pubkey can go in the challenge request.
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -626,8 +687,7 @@ async fn test_verify_wallet_wrong_signature() {
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
 
-    let keypair = Keypair::new();
-    // Sign with a different keypair — signature won't verify against the pubkey we submit.
+    // Sign with a different keypair so the signature won't match the submitted pubkey.
     let wrong_keypair = Keypair::new();
     let signature = wrong_keypair.sign_message(message.as_bytes());
 
@@ -686,6 +746,7 @@ async fn test_verify_wallet_duplicate() {
     let challenge1: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -712,6 +773,7 @@ async fn test_verify_wallet_duplicate() {
     let challenge2: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -774,9 +836,11 @@ async fn test_list_wallets() {
     assert_eq!(wallets.as_array().unwrap().len(), 0);
 
     // Verify a wallet
+    let keypair = Keypair::new();
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -786,7 +850,6 @@ async fn test_list_wallets() {
 
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(message.as_bytes());
 
     client
@@ -970,9 +1033,11 @@ async fn setup_user_with_wallet(addr: SocketAddr, username: &str) -> (String, St
 
     let token = login_res["token"].as_str().unwrap().to_string();
 
+    let keypair = Keypair::new();
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(&token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -982,7 +1047,6 @@ async fn setup_user_with_wallet(addr: SocketAddr, username: &str) -> (String, St
 
     let message = challenge_res["message"].as_str().unwrap().to_string();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(message.as_bytes());
 
     client

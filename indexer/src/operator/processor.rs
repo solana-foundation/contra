@@ -16,6 +16,7 @@ use crate::operator::{
 };
 use crate::operator::{utils::mint_util::MintCache, RpcClientWithRetry};
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
+use crate::storage::common::storage::RequeueOutcome;
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
@@ -257,26 +258,40 @@ async fn halt_withdrawal_pipeline(
 /// CAS one owned, unsent withdrawal `Processing -> Pending` so the fetcher can
 /// re-claim it. Safe because a transient error before any send proves nothing
 /// was broadcast and no signature was recorded. Mirrors the sender's
-/// pre-broadcast requeue: `Ok(false)` (CAS missed - row no longer `Processing`)
-/// and `Err` (write failed) are logged and the row is left `Processing` for
-/// recovery to reconcile.
+/// pre-broadcast requeue: only `Requeued` flips the row. `AtCap` (recovery cap
+/// reached), `NotProcessing` (row already advanced) and `Err` (write failed)
+/// all leave the row `Processing` for recovery to reconcile.
 async fn requeue_single_prebroadcast(
     storage: &Storage,
     pt_label: &str,
     transaction: &DbTransaction,
 ) {
-    match storage.try_requeue_prebroadcast(transaction.id).await {
-        Ok(true) => {
+    match storage
+        .try_requeue_prebroadcast(transaction.id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[pt_label, "prebroadcast_requeued"])
                 .inc();
             info!(
                 txn_id = transaction.id,
                 trace_id = %transaction.trace_id,
+                attempts,
                 "Requeued withdrawal to Pending after pre-broadcast transient error"
             );
         }
-        Ok(false) => warn!(
+        Ok(RequeueOutcome::AtCap) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt_label, "prebroadcast_requeue_cap"])
+                .inc();
+            warn!(
+                txn_id = transaction.id,
+                trace_id = %transaction.trace_id,
+                "Pre-broadcast requeue skipped: recovery cap reached, row left Processing"
+            );
+        }
+        Ok(RequeueOutcome::NotProcessing) => warn!(
             txn_id = transaction.id,
             trace_id = %transaction.trace_id,
             "Pre-broadcast requeue skipped: row no longer Processing"

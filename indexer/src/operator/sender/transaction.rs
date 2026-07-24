@@ -4652,11 +4652,11 @@ mod tests {
         .to_string()
     }
 
-    // A getSignatureStatuses response body with `count` confirmed-success slots.
-    fn confirmed_value_body(count: usize) -> String {
+    // A getSignatureStatuses response body with `count` finalized-success slots.
+    fn finalized_value_body(count: usize) -> String {
         let one = serde_json::json!({
-            "confirmationStatus": "confirmed",
-            "confirmations": 1,
+            "confirmationStatus": "finalized",
+            "confirmations": null,
             "err": null,
             "slot": 100,
             "status": {"Ok": null}
@@ -4748,7 +4748,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _m = mock_status_bodies(&mut server, |idx, req| {
             if idx == 0 {
-                confirmed_value_body(req)
+                finalized_value_body(req)
             } else {
                 null_value_body(req)
             }
@@ -4761,7 +4761,7 @@ mod tests {
             .await
             .expect("all-exact multi-chunk must be Ok");
         assert_eq!(statuses.len(), 600);
-        // First chunk confirmed, remaining chunks null: proves concatenation order.
+        // First chunk finalized, remaining chunks null: proves concatenation order.
         assert!(statuses[0].is_some());
         assert!(statuses[255].is_some());
         assert!(statuses[256].is_none());
@@ -4922,10 +4922,10 @@ mod tests {
     #[tokio::test]
     async fn poll_in_flight_cross_chunk_short_no_misattribution() {
         let mut server = mockito::Server::new_async().await;
-        // Chunk 0 (256 sigs) all confirmed; chunk 1 (1 sig) returns an empty value.
+        // Chunk 0 (256 sigs) all finalized; chunk 1 (1 sig) returns an empty value.
         let _m = mock_status_bodies(&mut server, |idx, req| {
             if idx == 0 {
-                confirmed_value_body(req)
+                finalized_value_body(req)
             } else {
                 null_value_body(0)
             }
@@ -4959,10 +4959,10 @@ mod tests {
     #[tokio::test]
     async fn poll_in_flight_oversized_chunk_full_reinsert_no_settlement() {
         let mut server = mockito::Server::new_async().await;
-        // Chunk 0 (256) confirmed; chunk 1 (1 sig) returns two statuses (oversized).
+        // Chunk 0 (256) finalized; chunk 1 (1 sig) returns two statuses (oversized).
         let _m = mock_status_bodies(&mut server, |idx, req| {
             if idx == 0 {
-                confirmed_value_body(req)
+                finalized_value_body(req)
             } else {
                 null_value_body(req + 1)
             }
@@ -4983,11 +4983,11 @@ mod tests {
         assert!(storage_rx.try_recv().is_err(), "no Completed emitted");
     }
 
-    // Happy-path multi-chunk: every chunk returns correctly-sized confirmed statuses, so all entries settle with one Completed each.
+    // Happy-path multi-chunk: every chunk returns correctly-sized finalized statuses, so all entries settle with one Completed each.
     #[tokio::test]
     async fn poll_in_flight_multi_chunk_confirmed_settles_with_correct_pairing() {
         let mut server = mockito::Server::new_async().await;
-        let _m = mock_status_bodies(&mut server, |_idx, req| confirmed_value_body(req));
+        let _m = mock_status_bodies(&mut server, |_idx, req| finalized_value_body(req));
 
         let mut state = make_sender_state_with_server(&server.url());
         let total = 300usize;
@@ -5074,11 +5074,11 @@ mod tests {
         _m.assert();
     }
 
-    // Happy-path confirmed multi-chunk on the production task settles every entry and emits a Completed for each.
+    // Happy-path finalized multi-chunk on the production task settles every entry and emits a Completed for each.
     #[tokio::test]
     async fn run_poll_task_multi_chunk_confirmed_settles() {
         let mut server = mockito::Server::new_async().await;
-        let _m = mock_status_bodies(&mut server, |_idx, req| confirmed_value_body(req));
+        let _m = mock_status_bodies(&mut server, |_idx, req| finalized_value_body(req));
 
         let in_flight = InFlightQueue::new();
         let (result_tx, _result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);

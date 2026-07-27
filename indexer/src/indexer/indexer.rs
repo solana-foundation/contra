@@ -124,6 +124,12 @@ pub async fn run(
     //    no live-tip slot can slip past it and push the checkpoint over the gap.
     let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
 
+    // First slot the live RPC source must request, captured from the backfill range so
+    // both producers share one boundary. None when backfill is disabled or resolves no
+    // range, in which case step 6 falls back to the configured from_slot.
+    #[cfg(feature = "datasource-rpc")]
+    let mut rpc_live_start_slot: Option<u64> = None;
+
     if indexer_config.backfill.enabled {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -159,12 +165,12 @@ pub async fn run(
                 // leapfrogged by a later one. No live stream, so a resolve failure
                 // fails closed rather than falling back to ungated.
                 let range = backfill_service.resolve_range().await?;
-                if let Some((from_slot, target)) = range {
+                if let Some((from_slot, target)) = range.gap {
                     checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
                 }
                 let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
                 info!("CheckpointWriter service started");
-                if let Some((from_slot, target)) = range {
+                if let Some((from_slot, target)) = range.gap {
                     backfill_service
                         .run_range(from_slot, target, instruction_tx.clone())
                         .await?;
@@ -181,22 +187,26 @@ pub async fn run(
                 // Gate the writer to the range backfill will fill. resolve_range retries
                 // transient RPC failures; a persistent failure fails closed (see below).
                 match backfill_service.resolve_range().await {
-                    Ok(Some((from_slot, target))) => {
-                        checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
-                        let instruction_tx_clone = instruction_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = backfill_service
-                                .run_range(from_slot, target, instruction_tx_clone)
-                                .await
-                            {
-                                error!("Backfill failed: {}", e);
-                            } else {
-                                info!("Backfill completed successfully");
-                            }
-                        });
-                    }
-                    Ok(None) => {
-                        info!("No backfill gap; checkpoint writer left ungated");
+                    Ok(range) => {
+                        // Pin the live source to backfill's boundary so it resumes with
+                        // no hole and no overlap, whether or not there is a gap to fill.
+                        rpc_live_start_slot = Some(range.live_start_slot);
+                        if let Some((from_slot, target)) = range.gap {
+                            checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
+                            let instruction_tx_clone = instruction_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backfill_service
+                                    .run_range(from_slot, target, instruction_tx_clone)
+                                    .await
+                                {
+                                    error!("Backfill failed: {}", e);
+                                } else {
+                                    info!("Backfill completed successfully");
+                                }
+                            });
+                        } else {
+                            info!("No backfill gap; checkpoint writer left ungated");
+                        }
                     }
                     Err(e) => {
                         error!(
@@ -226,7 +236,8 @@ pub async fn run(
 
             let mut source = RpcPollingSource::new(
                 common_config.rpc_url.clone(),
-                rpc_config.from_slot,
+                // Resume on backfill's boundary when it ran; otherwise the configured start.
+                rpc_live_start_slot.or(rpc_config.from_slot),
                 rpc_config.poll_interval_ms,
                 rpc_config.error_retry_interval_ms,
                 rpc_config.batch_size,

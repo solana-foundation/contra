@@ -32,6 +32,7 @@ pub async fn challenge(
     // The client must sign this exact string with the wallet's private key.
     let message = wallet_verification_message(
         &username,
+        claims.sub,
         &request.pubkey,
         challenge.nonce,
         challenge.expires_at,

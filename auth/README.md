@@ -24,7 +24,7 @@ Create a new account. All users are registered with the `user` role.
 { "username": "alice", "password": "hunter2" }
 ```
 
-Username requirements: 5–32 characters, alphanumeric plus underscores and hyphens only.
+Username requirements: 5–32 characters, ASCII alphanumeric plus underscores and hyphens only.
 
 Password requirements: 6–72 characters (Argon2's input limit — inputs beyond 72 bytes are silently truncated, so longer passwords are rejected outright).
 
@@ -54,7 +54,7 @@ Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minu
 
 ```json
 {
-  "message": "PrivateChannel wallet verification\n\nAccount: <username>\nWallet: <base58 pubkey>\n\nOnly sign this if \"<username>\" is YOUR PrivateChannel account.\n\nnonce: <uuid>\nexpires: <unix>",
+  "message": "PrivateChannel wallet verification\n\nAccount: <username> (id: <uuid>)\nWallet: <base58 pubkey>\n\nOnly sign this if \"<username>\" is YOUR PrivateChannel account.\n\nnonce: <uuid>\nexpires: <unix>",
   "nonce": "<uuid>",
   "expires_at": "<iso8601>"
 }

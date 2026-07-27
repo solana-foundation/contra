@@ -22,6 +22,14 @@ pub async fn verify_wallet(
     state.pool_status.observe_app(&username_result);
     let username = username_result?.ok_or(AppError::Unauthorized)?;
 
+    // Parse both inputs before consuming the challenge, so malformed input cannot
+    // burn an otherwise valid one-time challenge.
+    let pubkey =
+        Pubkey::from_str(&req.pubkey).map_err(|_| AppError::BadRequest("invalid pubkey".into()))?;
+
+    let signature = Signature::from_str(&req.signature)
+        .map_err(|_| AppError::BadRequest("invalid signature".into()))?;
+
     // Consume the challenge atomically so it cannot be replayed.
     let challenge_result = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
     state.pool_status.observe_app(&challenge_result);
@@ -31,16 +39,11 @@ pub async fn verify_wallet(
     // Rebuild the exact message the client was asked to sign.
     let message = wallet_verification_message(
         &username,
+        claims.sub,
         &req.pubkey,
         challenge.nonce,
         challenge.expires_at,
     );
-
-    let pubkey =
-        Pubkey::from_str(&req.pubkey).map_err(|_| AppError::BadRequest("invalid pubkey".into()))?;
-
-    let signature = Signature::from_str(&req.signature)
-        .map_err(|_| AppError::BadRequest("invalid signature".into()))?;
 
     if !signature.verify(pubkey.as_ref(), message.as_bytes()) {
         warn!(user_id = %claims.sub, pubkey = %req.pubkey, "wallet verification failed: invalid signature");

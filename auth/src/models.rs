@@ -75,15 +75,18 @@ pub struct ChallengeResponse {
 /// The challenge and verify endpoints both call this so their messages always match.
 /// The account name and wallet are spelled out so a signer can tell they are
 /// linking their own wallet to their own account, not someone else's.
+/// The id is the unforgeable half: a lookalike username can be registered, a uuid cannot,
+/// so a client can check the id against the session it is connected to.
 pub fn wallet_verification_message(
     username: &str,
+    user_id: Uuid,
     pubkey: &str,
     nonce: Uuid,
     expires_at: DateTime<Utc>,
 ) -> String {
     format!(
         "PrivateChannel wallet verification\n\n\
-         Account: {username}\n\
+         Account: {username} (id: {user_id})\n\
          Wallet: {pubkey}\n\n\
          Only sign this if \"{username}\" is YOUR PrivateChannel account.\n\n\
          nonce: {nonce}\n\

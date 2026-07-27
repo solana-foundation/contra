@@ -187,8 +187,9 @@ pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppR
 
 /// Mark the challenge as used and return it. Returns None if not found, already used, or expired.
 /// The atomic UPDATE prevents the same challenge from being consumed twice.
-pub async fn consume_challenge(
-    pool: &PgPool,
+/// Takes any executor so the caller can run it inside a transaction alongside the wallet insert.
+pub async fn consume_challenge<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     user_id: Uuid,
     nonce: Uuid,
 ) -> AppResult<Option<Challenge>> {
@@ -201,14 +202,16 @@ pub async fn consume_challenge(
     )
     .bind(user_id)
     .bind(nonce)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     Ok(row.map(|(nonce, expires_at)| Challenge { nonce, expires_at }))
 }
 
-pub async fn insert_verified_wallet(
-    pool: &PgPool,
+/// Takes any executor so the caller can run it inside a transaction alongside the
+/// challenge consume, keeping the nonce spent only if the wallet is actually linked.
+pub async fn insert_verified_wallet<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     user_id: Uuid,
     pubkey: &str,
 ) -> AppResult<VerifiedWallet> {
@@ -222,7 +225,7 @@ pub async fn insert_verified_wallet(
     .bind(Uuid::new_v4())
     .bind(user_id)
     .bind(pubkey)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(VerifiedWallet {

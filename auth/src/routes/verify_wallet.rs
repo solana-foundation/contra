@@ -30,8 +30,16 @@ pub async fn verify_wallet(
     let signature = Signature::from_str(&req.signature)
         .map_err(|_| AppError::BadRequest("invalid signature".into()))?;
 
-    // Consume the challenge atomically so it cannot be replayed.
-    let challenge_result = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
+    // Consume the challenge and link the wallet in one transaction. Both statements land
+    // or neither does, so a failed insert cannot leave the nonce spent with no wallet
+    // attached, which would force the user to sign a fresh challenge.
+    let tx_result = state.pool.begin().await;
+    state.pool_status.observe_sqlx(&tx_result);
+    let mut tx = tx_result?;
+
+    // The atomic UPDATE means a concurrent request for the same nonce blocks here and
+    // then finds it used, so it still cannot be replayed.
+    let challenge_result = db::consume_challenge(&mut *tx, claims.sub, req.nonce).await;
     state.pool_status.observe_app(&challenge_result);
     let challenge =
         challenge_result?.ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
@@ -46,11 +54,14 @@ pub async fn verify_wallet(
     );
 
     if !signature.verify(pubkey.as_ref(), message.as_bytes()) {
+        // Commit so a bad signature still burns the challenge: one attempt per nonce.
+        tx.commit().await?;
         warn!(user_id = %claims.sub, pubkey = %req.pubkey, "wallet verification failed: invalid signature");
         return Err(AppError::Unauthorized);
     }
 
-    let insert_result = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey).await;
+    // On error the transaction is dropped and rolls back, leaving the nonce usable.
+    let insert_result = db::insert_verified_wallet(&mut *tx, claims.sub, &req.pubkey).await;
     state.pool_status.observe_app(&insert_result);
     let wallet = insert_result.map_err(|e| match e {
         // Unique constraint on (user_id, pubkey) — wallet already verified.
@@ -61,6 +72,8 @@ pub async fn verify_wallet(
         }
         other => other,
     })?;
+
+    tx.commit().await?;
 
     info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
 

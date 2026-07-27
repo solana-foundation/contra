@@ -15,7 +15,7 @@ The Solana Private Channels Escrow Program manages token deposits to and withdra
 
 ### Program Address
 ```
-GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU
 ```
 
 ### Installation

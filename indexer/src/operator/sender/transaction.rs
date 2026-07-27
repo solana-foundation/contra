@@ -1596,13 +1596,32 @@ pub(super) async fn route_poll_results(
     }
 }
 
+/// Why a chunked status fetch was rejected. Both variants make the caller reinsert
+/// the batch and retry; the split only picks the metric reason label.
+#[derive(Debug)]
+enum StatusFetchError {
+    /// A chunk response length did not equal the request (short or oversized).
+    MalformedLength,
+    /// The RPC call itself failed after retries.
+    Rpc,
+}
+
+impl StatusFetchError {
+    fn reason(&self) -> &'static str {
+        match self {
+            StatusFetchError::MalformedLength => "malformed_status_response",
+            StatusFetchError::Rpc => "status_poll_rpc_error",
+        }
+    }
+}
+
 /// Fetch statuses in `MAX_SIGS_PER_CALL` chunks. `getSignatureStatuses` is positional, so a
 /// chunk whose length differs from the request would misalign every later status; reject it.
 /// Returns `Err` on any RPC error or length mismatch so the caller reinserts the batch and retries.
 async fn fetch_statuses_checked(
     rpc_client: &RpcClientWithRetry,
     signatures: &[Signature],
-) -> Result<Vec<Option<solana_transaction_status::TransactionStatus>>, ()> {
+) -> Result<Vec<Option<solana_transaction_status::TransactionStatus>>, StatusFetchError> {
     let mut statuses = Vec::with_capacity(signatures.len());
     for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
         match rpc_client.get_signature_statuses(chunk).await {
@@ -1615,7 +1634,7 @@ async fn fetch_statuses_checked(
                     chunk.len(),
                     signatures.len()
                 );
-                return Err(());
+                return Err(StatusFetchError::MalformedLength);
             }
             Err(e) => {
                 warn!(
@@ -1623,7 +1642,7 @@ async fn fetch_statuses_checked(
                     signatures.len(),
                     e
                 );
-                return Err(());
+                return Err(StatusFetchError::Rpc);
             }
         }
     }
@@ -1647,7 +1666,10 @@ pub(super) async fn poll_in_flight(
 
     let statuses = match fetch_statuses_checked(&state.rpc_client, &signatures).await {
         Ok(s) => s,
-        Err(()) => {
+        Err(e) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), e.reason()])
+                .inc();
             // Reinsert the full batch so the next drain_in_flight iteration retries.
             state.in_flight.push_all(batch);
             return;
@@ -1718,7 +1740,10 @@ pub(super) async fn run_poll_task(
 
         let statuses = match fetch_statuses_checked(&rpc_client, &signatures).await {
             Ok(s) => s,
-            Err(()) => {
+            Err(e) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), e.reason()])
+                    .inc();
                 // Put everything back in one lock acquisition and retry next tick.
                 in_flight.push_all(batch);
                 continue;

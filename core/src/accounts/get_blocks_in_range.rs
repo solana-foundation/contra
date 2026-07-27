@@ -7,7 +7,6 @@ use {
     anyhow::{Context, Result},
     redis::AsyncCommands,
     sqlx::Row,
-    tracing::warn,
 };
 
 pub async fn get_blocks_in_range(
@@ -90,10 +89,14 @@ async fn get_blocks_in_range_redis(
             let Some(bytes) = maybe_bytes else {
                 continue;
             };
-            match bincode::deserialize::<BlockInfo>(&bytes) {
-                Ok(block) => blocks.push(block),
-                Err(e) => warn!("Failed to deserialize block {} from Redis: {}", slot, e),
-            }
+            // A trailing field was added to BlockInfo, so a decode failure here most
+            // likely means pre-upgrade block data. This path feeds the dedup rebuild,
+            // so we fail closed (propagate) rather than silently drop the block and
+            // seed an incomplete cache; wipe the DB or add a migration shim to recover.
+            let block = bincode::deserialize::<BlockInfo>(&bytes).with_context(|| {
+                format!("Failed to deserialize block {slot} from Redis (likely pre-upgrade block data; wipe the DB or add a migration shim)")
+            })?;
+            blocks.push(block);
         }
 
         chunk_start = chunk_end + 1;

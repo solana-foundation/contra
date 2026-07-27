@@ -95,6 +95,7 @@ mod tests {
             block_time: Some(1_700_000_000 + slot as i64),
             transaction_signatures: vec![],
             transaction_recent_blockhashes: vec![],
+            transaction_message_hashes: vec![],
         }
     }
 

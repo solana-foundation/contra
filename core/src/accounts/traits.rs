@@ -25,6 +25,10 @@ pub struct BlockInfo {
     /// The recent_blockhash each transaction referenced, parallel to transaction_signatures.
     /// Used to rebuild the dedup cache on restart.
     pub transaction_recent_blockhashes: Vec<Hash>,
+    /// The message hash of each transaction, parallel to transaction_signatures.
+    /// This is the dedup replay identity, rebuilt into the cache on restart so a
+    /// bounce cannot reopen the replay window within blockhash validity.
+    pub transaction_message_hashes: Vec<Hash>,
 }
 
 /// AccountsDB enum supporting multiple backend storage options

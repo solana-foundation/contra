@@ -138,6 +138,7 @@ fn slot_block_info(slot: u64) -> BlockInfo {
         block_time: Some(0),
         transaction_signatures: vec![],
         transaction_recent_blockhashes: vec![],
+        transaction_message_hashes: vec![],
     }
 }
 

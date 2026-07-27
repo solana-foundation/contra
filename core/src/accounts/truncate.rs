@@ -672,6 +672,7 @@ mod tests {
                 block_time: Some(1_700_000_000 + slot as i64),
                 transaction_signatures: vec![solana_sdk::signature::Signature::new_unique()],
                 transaction_recent_blockhashes: vec![solana_sdk::hash::Hash::new_unique()],
+                transaction_message_hashes: vec![solana_sdk::hash::Hash::new_unique()],
             };
             let data = bincode::serialize(&block).unwrap();
             sqlx::query("INSERT INTO blocks (slot, data) VALUES ($1, $2) ON CONFLICT (slot) DO UPDATE SET data = $2")

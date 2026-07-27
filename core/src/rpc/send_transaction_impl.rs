@@ -13,7 +13,6 @@ use solana_sdk::{
     transaction::{MessageHash, VersionedTransaction},
 };
 use std::collections::HashSet;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub async fn send_transaction_impl(
@@ -114,14 +113,14 @@ pub async fn send_transaction_impl(
             debug!("Transaction {} sent to dedup stage", signature);
             Ok(signature)
         }
-        Err(mpsc::error::TrySendError::Full(_)) => {
+        Err(async_channel::TrySendError::Full(_)) => {
             write_deps.metrics.rpc_ingress_shed();
             warn!("Shed transaction {}: ingress queue full", signature);
             Err(node_at_capacity())
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => Err(custom_error(
+        Err(async_channel::TrySendError::Closed(_)) => Err(custom_error(
             JSON_RPC_SERVER_ERROR,
-            "Internal error: dedup channel closed",
+            "Internal error: ingress channel closed",
         )),
     }
 }
@@ -148,14 +147,14 @@ mod tests {
     }
 
     /// Returns WriteDeps and the receiver (must be held alive for happy-path tests).
-    fn make_write_deps() -> (WriteDeps, mpsc::Receiver<SanitizedTransaction>) {
+    fn make_write_deps() -> (WriteDeps, async_channel::Receiver<SanitizedTransaction>) {
         make_write_deps_with(Arc::new(NoopMetrics))
     }
 
     fn make_write_deps_with(
         metrics: SharedMetrics,
-    ) -> (WriteDeps, mpsc::Receiver<SanitizedTransaction>) {
-        let (dedup_tx, rx) = mpsc::channel(TEST_INGRESS_CAP);
+    ) -> (WriteDeps, async_channel::Receiver<SanitizedTransaction>) {
+        let (dedup_tx, rx) = async_channel::bounded(TEST_INGRESS_CAP);
         (WriteDeps { dedup_tx, metrics }, rx)
     }
 
@@ -220,7 +219,7 @@ mod tests {
     // a duplicate). Proves the shed-before-dedup client-retry contract.
     #[tokio::test]
     async fn shed_tx_can_be_resubmitted() {
-        let (deps, mut rx) = make_write_deps();
+        let (deps, rx) = make_write_deps();
         for _ in 0..TEST_INGRESS_CAP {
             send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
                 .await
@@ -324,5 +323,25 @@ mod tests {
 
         let result = send_transaction_impl(&deps, encoded, None).await;
         assert!(result.is_ok(), "Memo tx should pass allowlist");
+    }
+
+    // A closed ingress channel (receiver dropped) must surface the closed error,
+    // not the retryable capacity shed. Guards the async_channel error mapping.
+    #[tokio::test]
+    async fn ingress_closed_yields_error() {
+        let (deps, rx) = make_write_deps();
+        drop(rx);
+
+        let result = send_transaction_impl(&deps, encode_tx(&spl_tx()), None).await;
+        let err = result.expect_err("a closed ingress channel must error");
+        assert_ne!(
+            err.code(),
+            NODE_AT_CAPACITY_CODE,
+            "closed is not a retryable capacity shed"
+        );
+        assert!(
+            err.to_string().contains("ingress channel closed"),
+            "expected closed-channel error, got: {err}"
+        );
     }
 }

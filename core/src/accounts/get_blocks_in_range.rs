@@ -43,8 +43,12 @@ async fn get_blocks_in_range_postgres(
     let mut blocks = Vec::with_capacity(rows.len());
     for row in rows {
         let data: Vec<u8> = row.get("data");
+        // A trailing field was added to BlockInfo, so a decode failure here most
+        // likely means pre-upgrade block data. This path feeds the dedup rebuild,
+        // so we fail closed (propagate) rather than silently seed an empty cache;
+        // wipe the DB or add a migration shim to recover.
         let block = bincode::deserialize::<BlockInfo>(&data)
-            .context("Failed to deserialize block in range query")?;
+            .context("Failed to deserialize block in range query (likely pre-upgrade block data; wipe the DB or add a migration shim)")?;
         blocks.push(block);
     }
 

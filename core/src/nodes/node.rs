@@ -164,14 +164,15 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
         if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-            // Create the bounded dedup channel (receives from RPC, sends to sigverify);
-            // a full queue sheds load at RPC ingress.
-            let (dedup_tx, dedup_rx) =
-                crate::stages::create_dedup_channel(config.ingress_queue_capacity);
+            // RPC ingress channel (receives from RPC, feeds the sigverify worker
+            // pool). MPMC so many sigverify workers can pull; a full queue sheds
+            // load at RPC ingress.
+            let (ingress_tx, ingress_rx) =
+                crate::stages::create_ingress_channel(config.ingress_queue_capacity);
 
-            // Create the sigverify channel (needed for NodeHandles in all modes)
-            let (sigverify_tx, sigverify_rx) =
-                async_channel::bounded::<SanitizedTransaction>(config.sigverify_queue_size);
+            // sigverify to dedup channel: dedup is a single consumer, so mpsc.
+            let (dedup_tx, dedup_rx) =
+                mpsc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
 
             // Create sequencer channel (bounded so backpressure chains upstream)
             let (sequencer_tx, sequencer_rx) =
@@ -228,12 +229,27 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             heartbeats.settler = Some(Arc::clone(&settler_hb));
             heartbeats.address_index_writer = Some(Arc::clone(&addr_index_writer_hb));
 
-            // Start dedup stage (filters duplicate transactions before sigverify)
+            // Start sigverify worker pool (first stage). Verification runs before
+            // dedup so only verified transactions ever reach the dedup cache.
+            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
+                num_workers: config.sigverify_workers,
+                admin_keys: config.admin_keys.clone(),
+                rx: ingress_rx,
+                output_tx: dedup_tx,
+                shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
+                heartbeat: sigverify_hb,
+            })
+            .await;
+            write_workers.extend(sigverify_workers);
+
+            // Start dedup stage (drops replays after verification, keyed on the
+            // message hash so signature variants of one message collapse to one).
             let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
                 max_blockhashes: config.max_blockhashes(),
                 input_rx: dedup_rx,
                 settled_blockhashes_rx,
-                output_tx: sigverify_tx.clone(),
+                output_tx: sequencer_tx,
                 shutdown_token: shutdown_token.clone(),
                 initial_live_blockhashes,
                 initial_dedup_cache,
@@ -242,19 +258,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             })
             .await;
             write_workers.push(dedup);
-
-            // Start sigverify worker pool
-            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
-                num_workers: config.sigverify_workers,
-                admin_keys: config.admin_keys.clone(),
-                rx: sigverify_rx,
-                sequencer_tx,
-                shutdown_token: shutdown_token.clone(),
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: sigverify_hb,
-            })
-            .await;
-            write_workers.extend(sigverify_workers);
 
             // Start sequencer (produces conflict-free batches)
             let sequence = start_sequence_worker(crate::stages::SequencerArgs {
@@ -323,7 +326,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
             (
                 Some(WriteDeps {
-                    dedup_tx: dedup_tx.clone(),
+                    dedup_tx: ingress_tx,
                     metrics: Arc::clone(&config.metrics),
                 }),
                 live_blockhashes,

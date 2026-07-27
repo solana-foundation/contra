@@ -53,7 +53,6 @@ use {
         collections::LinkedList,
         sync::{Arc, RwLock},
     },
-    tokio::sync::mpsc,
 };
 
 pub struct ReadDeps {
@@ -65,7 +64,8 @@ pub struct ReadDeps {
 }
 
 pub struct WriteDeps {
-    pub dedup_tx: mpsc::Sender<SanitizedTransaction>,
+    /// RPC ingress sender feeding the sigverify worker pool (the first stage).
+    pub dedup_tx: async_channel::Sender<SanitizedTransaction>,
     pub metrics: SharedMetrics,
 }
 

@@ -36,20 +36,18 @@ pub mod rpc_blocks {
         instructions: Vec<CompiledInstruction>,
         is_failed: bool,
     ) -> RpcTransactionWithMeta {
-        // A complete block reports an empty inner-instruction list, not a null one;
-        // null means the node had not written them yet, which must fail closed.
         let meta = if is_failed {
             Some(TransactionMeta {
                 err: Some(serde_json::json!({"InstructionError": [0, "Custom(1)"]})),
                 log_messages: None,
-                inner_instructions: Some(vec![]),
+                inner_instructions: None,
                 loaded_addresses: None,
             })
         } else {
             Some(TransactionMeta {
                 err: None,
                 log_messages: None,
-                inner_instructions: Some(vec![]),
+                inner_instructions: None,
                 loaded_addresses: None,
             })
         };
@@ -102,8 +100,8 @@ pub mod rpc_blocks {
         }
     }
 
-    /// Create a transaction whose meta is present but whose innerInstructions the
-    /// node has not written yet: the incomplete-block case the guard must reject.
+    /// Create a transaction whose meta is present but carries a null
+    /// innerInstructions list, the shape a chain that records none returns.
     pub fn create_transaction_incomplete_meta(
         signature: String,
         account_keys: Vec<String>,

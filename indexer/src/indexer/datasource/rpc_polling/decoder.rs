@@ -24,21 +24,22 @@ type ParseInstructionFn<T> = fn(
     location: InstructionLocation,
 ) -> Result<Option<T>, ParserError>;
 
-/// Returns a label for the first transaction in `block` whose metadata is unusable,
-/// or `None` if every transaction carries metadata this parser can read.
+/// Returns a label for the first `meta`-less
+/// transaction in `block`, or `None` if all carry metadata; a single `meta: null`
+/// tx makes the slot unverifiable, so callers MUST fail closed on `Some(_)`.
 ///
-/// Two shapes fail closed. `meta: null` is the obvious one. The subtler one is meta
-/// that is present but carries no `innerInstructions` list at all: the events this
-/// indexer extracts are emitted by self-CPI, so a null list is indistinguishable
-/// from "no events" while actually meaning the node had not written them yet.
-/// An empty list is complete and fine; only a missing one is rejected.
+/// A null `innerInstructions` list is deliberately NOT rejected here. Chains that
+/// record no inner instructions at all (the private-channel node among them) return
+/// null legitimately for every transaction, so rejecting it wedges them on every
+/// block.
+///
+/// This leaves a known gap on Solana: an escrow deposit whose event self-CPI has not
+/// been written yet passes this guard, decodes to no event, and the parser drops it
+/// with a warning. Distinguishing that from a chain with no inner instructions needs
+/// the parser, not this guard, and is deliberately not fixed here.
 pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
     for (index, tx_with_meta) in block.transactions.iter().enumerate() {
-        let meta_is_unusable = match &tx_with_meta.meta {
-            None => true,
-            Some(meta) => meta.inner_instructions.is_none(),
-        };
-        if meta_is_unusable {
+        if tx_with_meta.meta.is_none() {
             return Some(
                 tx_with_meta
                     .transaction
@@ -646,32 +647,16 @@ mod tests {
         assert_eq!(first_missing_meta(&block), Some("tx#1".to_string()));
     }
 
-    /// Meta that arrives without its innerInstructions list cannot be checked for
-    /// the self-CPI events the parser extracts, so it fails closed like a null meta.
-    /// This is the live-node race that keeps the RPC-polling acceptance test ignored.
+    /// A chain that records no inner instructions returns a null list on every
+    /// transaction. That is complete, not incomplete: rejecting it here would wedge
+    /// the private-channel indexer on its very first block.
     #[test]
-    fn first_missing_meta_reports_meta_without_inner_instructions() {
+    fn first_missing_meta_null_inner_instructions_is_not_missing_meta() {
         let mut block = create_test_block();
         let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
         let ix = create_instruction(0, vec![], "data".to_string());
         block.transactions.push(create_transaction_incomplete_meta(
             "sig_no_inner".to_string(),
-            keys,
-            vec![ix],
-        ));
-
-        assert_eq!(first_missing_meta(&block), Some("sig_no_inner".to_string()));
-    }
-
-    /// An empty inner-instruction list means the node wrote the list and there was
-    /// nothing in it, which is complete and must not be confused with a null list.
-    #[test]
-    fn first_missing_meta_empty_inner_instructions_is_complete() {
-        let mut block = create_test_block();
-        let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
-        let ix = create_instruction(0, vec![], "data".to_string());
-        block.transactions.push(create_successful_transaction(
-            "sig_ok".to_string(),
             keys,
             vec![ix],
         ));

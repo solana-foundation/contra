@@ -541,11 +541,10 @@ mod tests {
         blockhash: &str,
         expect_at_least: usize,
     ) -> mockito::Mock {
-        // A complete block reports an empty inner-instruction list, not a null one.
         let meta = json!({
             "err": null,
             "logMessages": null,
-            "innerInstructions": [],
+            "innerInstructions": null,
             "loadedAddresses": null
         });
         server

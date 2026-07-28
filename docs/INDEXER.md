@@ -16,7 +16,7 @@ Real-time block streaming via gRPC (requires a gRPC endpoint). Handles both Escr
 
 **2. RPC Polling (Mainnet or Solana Private Channels)**
 
-Polls `getBlock` RPC sequentially with higher latency (~1-5 seconds) and no special infrastructure required.
+Enumerates the producing slots in each batch with `getBlocks`, then fetches only those blocks in parallel with `getBlock`. Higher latency (~1-5 seconds) but no special infrastructure required.
 
 **Location**: [`indexer/src/indexer/datasource/rpc_polling/`](../indexer/src/indexer/datasource/rpc_polling/)
 
@@ -32,8 +32,11 @@ Alternative datasource using the Vixen parsing framework for instruction decodin
 Recovers missed slots on indexer restart or network issues:
 1. Read last processed slot from database (`indexer_state` table)
 2. Query RPC for current slot
-3. If gap > threshold:
-   - Parallelize RPC batch fetching (configurable batch size)
+3. If gap > threshold, for each batch of slots:
+   - Enumerate which slots in the batch produced a block (`getBlocks`)
+   - Fetch only those blocks in parallel (configurable batch size)
+   - Walk their `parentSlot` links to prove the remaining slots empty; a slot that
+     cannot be proven empty aborts the batch rather than being checkpointed past
    - Process blocks in order
    - Update checkpoint per slot via `CheckpointWriter` (driven by `SlotComplete` events)
 4. Switch to real-time mode (Yellowstone or polling)

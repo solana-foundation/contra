@@ -101,7 +101,7 @@ pub enum BackfillError {
     #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
     MissingMeta { slot: u64, signature: String },
 
-    #[error("Slot {slot} is unavailable (pruned or snapshot-jumped); block contents are unknown")]
+    #[error("Slot {slot} is unavailable: a block exists here that this endpoint will not serve, so its contents are unknown")]
     SlotUnavailable { slot: u64 },
 
     // Channel errors

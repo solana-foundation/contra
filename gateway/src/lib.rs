@@ -49,6 +49,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getTransactionCount",
     "getFirstAvailableBlock",
     "getBlocks",
+    "getBlocksWithLimit",
     "getEpochInfo",
     "getEpochSchedule",
     "getRecentPerformanceSamples",
@@ -1330,6 +1331,18 @@ mod tests {
         // Both URLs point to a closed port — gateway must attempt forwarding and return 502
         let response = send_raw(addr, req.as_bytes()).await;
         assert_status(&response, 502);
+    }
+
+    /// A method missing from KNOWN_RPC_METHODS still routes, but its RPC metrics
+    /// land in the "unknown" bucket and disappear from the per-method panels.
+    #[test]
+    fn slot_enumeration_methods_have_their_own_metric_label() {
+        for method in ["getBlocks", "getBlocksWithLimit"] {
+            assert!(
+                KNOWN_RPC_METHODS.contains(&method),
+                "{method} would be recorded under the \"unknown\" metric label"
+            );
+        }
     }
 
     #[tokio::test]

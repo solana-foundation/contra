@@ -18,7 +18,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+#[cfg(not(test))]
 const BACKFILL_RETRY_DELAY_MS: u64 = 5000;
+/// Tests exercise all three attempts, so the real backoff would cost 15s per case.
+#[cfg(test)]
+const BACKFILL_RETRY_DELAY_MS: u64 = 5;
 const BACKFILL_MAX_RETRIES: usize = 3;
 
 /// Validate gap between current slot and a reference slot.
@@ -62,7 +66,7 @@ async fn fetch_blocks_with_retry(
     rpc_poller: &RpcPoller,
     slots: &[u64],
     retry_count: usize,
-) -> Result<Vec<(u64, Result<BlockFetch, BackfillError>)>, IndexerError> {
+) -> Result<Vec<(u64, BlockFetch)>, IndexerError> {
     if retry_count > 0 {
         tokio::time::sleep(Duration::from_millis(
             BACKFILL_RETRY_DELAY_MS * retry_count as u64,
@@ -70,17 +74,18 @@ async fn fetch_blocks_with_retry(
         .await;
     }
 
-    Ok(rpc_poller
-        .get_blocks_batch(slots.to_vec())
-        .await
-        .into_iter()
-        .map(|(slot, result)| {
-            (
-                slot,
-                result.map_err(|e| BackfillError::SlotFetchFailed { slot, source: e }),
-            )
-        })
-        .collect::<Vec<(u64, Result<BlockFetch, BackfillError>)>>())
+    // A batch-level RPC failure lands as Err on every slot, so burying it per-slot
+    // left the caller's retry loop unreachable. Surfacing the first one as a batch
+    // error fires before any slot here has been processed, so a retry cannot
+    // double-send instructions for the slots that did resolve.
+    let mut fetched = Vec::with_capacity(slots.len());
+    for (slot, result) in rpc_poller.get_blocks_batch(slots.to_vec()).await {
+        match result {
+            Ok(block) => fetched.push((slot, block)),
+            Err(source) => return Err(BackfillError::SlotFetchFailed { slot, source }.into()),
+        }
+    }
+    Ok(fetched)
 }
 
 /// Fill a range of slots by fetching blocks via RPC and sending parsed instructions.
@@ -118,21 +123,19 @@ pub async fn fill_slot_range(
                         );
                         return Err(e);
                     }
+                    // The backoff itself lives in `fetch_blocks_with_retry`, keyed to
+                    // `retry_count`; sleeping again here would double every wait.
                     warn!(
                         "Retry {}/{} after error: {}",
                         retry_count, BACKFILL_MAX_RETRIES, e
                     );
-                    tokio::time::sleep(Duration::from_millis(
-                        BACKFILL_RETRY_DELAY_MS * retry_count as u64,
-                    ))
-                    .await;
                 }
             }
         };
 
-        for (slot, block_result) in blocks {
-            match block_result {
-                Ok(BlockFetch::Present(block)) => {
+        for (slot, block_fetch) in blocks {
+            match block_fetch {
+                BlockFetch::Present(block) => {
                     // A missing-meta block is unverifiable: abort before the SlotComplete send so the
                     // checkpoint never advances past it; the caller surfaces the error and retries.
                     if let Some(signature) = decoder::first_missing_meta(&block) {
@@ -164,22 +167,18 @@ pub async fn fill_slot_range(
                     }
                     processed_count += 1;
                 }
-                Ok(BlockFetch::Skipped) => {
+                BlockFetch::Skipped => {
                     processed_count += 1;
                 }
-                Ok(BlockFetch::Unavailable) => {
+                BlockFetch::Unavailable => {
                     error!(
-                        "Backfill slot {} is unavailable (pruned/snapshot-jumped); aborting before checkpoint",
+                        "Backfill slot {} is unavailable: a block exists here that this endpoint will not serve; aborting before checkpoint",
                         slot
                     );
                     metrics::INDEXER_RPC_ERRORS
                         .with_label_values(&[program_type.as_label(), "block_unavailable"])
                         .inc();
                     return Err(BackfillError::SlotUnavailable { slot }.into());
-                }
-                Err(e) => {
-                    warn!("Error fetching block {}: {}", slot, e);
-                    return Err(DataSourceError::from(e).into());
                 }
             }
 
@@ -475,57 +474,21 @@ mod tests {
     mod fill_slot_range_tests {
         use super::*;
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
-        use crate::test_utils::rpc_mocks::mock_first_available_block;
+        use crate::test_utils::rpc_mocks::{
+            chain, mock_get_block_at, mock_get_blocks, mock_get_blocks_with_limit,
+        };
         use mockito::Server;
         use serde_json::json;
         use solana_sdk::commitment_config::CommitmentLevel;
         use solana_transaction_status::UiTransactionEncoding;
         use tokio::sync::mpsc;
 
-        fn empty_block_json() -> serde_json::Value {
-            json!({
-                "blockhash": "TestBlockHash11111111111111111111111111111",
-                "parentSlot": 0,
-                "transactions": []
-            })
-        }
-
-        fn mock_get_block_success(server: &mut Server, slot: u64) -> mockito::Mock {
-            server
-                .mock("POST", "/")
-                .match_body(mockito::Matcher::PartialJson(json!({
-                    "method": "getBlock",
-                    "params": [slot]
-                })))
-                .with_status(200)
-                .with_body(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "result": empty_block_json(),
-                        "id": 1
-                    })
-                    .to_string(),
-                )
-                .create()
-        }
-
-        fn mock_get_block_skipped(server: &mut Server, slot: u64) -> mockito::Mock {
-            server
-                .mock("POST", "/")
-                .match_body(mockito::Matcher::PartialJson(json!({
-                    "method": "getBlock",
-                    "params": [slot]
-                })))
-                .with_status(200)
-                .with_body(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "error": { "code": -32009, "message": "Slot was skipped" },
-                        "id": 1
-                    })
-                    .to_string(),
-                )
-                .create()
+        fn poller(server: &Server) -> RpcPoller {
+            RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            )
         }
 
         fn mock_get_block_error(server: &mut Server, slot: u64) -> mockito::Mock {
@@ -582,15 +545,9 @@ mod tests {
         async fn fill_slot_range_empty_blocks() {
             let mut server = Server::new_async().await;
 
-            let _m1 = mock_get_block_success(&mut server, 101);
-            let _m2 = mock_get_block_success(&mut server, 102);
-            let _m3 = mock_get_block_success(&mut server, 103);
+            let _c = chain(&mut server, 101, 103, &[(101, 100), (102, 101), (103, 102)]);
 
-            let poller = RpcPoller::new(
-                server.url(),
-                UiTransactionEncoding::Json,
-                CommitmentLevel::Finalized,
-            );
+            let poller = poller(&server);
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
@@ -624,16 +581,13 @@ mod tests {
         async fn fill_slot_range_skipped_slots() {
             let mut server = Server::new_async().await;
 
-            let _m1 = mock_get_block_skipped(&mut server, 101);
-            let _m2 = mock_get_block_skipped(&mut server, 102);
-            // Floor 0 so both absent slots (>= 0) resolve as proven Skipped.
-            let _floor = mock_first_available_block(&mut server, 0);
+            // Neither slot produced a block, and the first producer past the range
+            // links straight back to the anchor, proving both empty.
+            let _blocks = mock_get_blocks(&mut server, 101, 102, &[]);
+            let _witness = mock_get_blocks_with_limit(&mut server, 103, &[103]);
+            let _witness_block = mock_get_block_at(&mut server, 103, 100);
 
-            let poller = RpcPoller::new(
-                server.url(),
-                UiTransactionEncoding::Json,
-                CommitmentLevel::Finalized,
-            );
+            let poller = poller(&server);
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
@@ -653,24 +607,21 @@ mod tests {
             }
         }
 
-        /// A batch where slot N is absent below the ledger floor (Unavailable) must
-        /// abort with `SlotUnavailable { slot: N }` before sending SlotComplete{N}
+        /// A batch where a later block's parent link proves slot N holds a block the
+        /// endpoint will not serve (Unavailable) must abort with
+        /// `SlotUnavailable { slot: N }` before sending SlotComplete{N}
         /// (and before any later slot's SlotComplete), so the checkpoint never
         /// advances past a slot whose contents are unknown.
         #[tokio::test]
         async fn fill_slot_range_unavailable_aborts_before_slot_complete() {
             let mut server = Server::new_async().await;
 
-            // Batch over (100, 102] = [101, 102]; slot 101 is absent below the floor.
-            let _m1 = mock_get_block_skipped(&mut server, 101);
-            let _m2 = mock_get_block_success(&mut server, 102);
-            let _floor = mock_first_available_block(&mut server, 500);
+            // Batch over (100, 102] = [101, 102]. Slot 102 names 101 as its parent,
+            // so a real block sits at 101 that the enumeration did not list and this
+            // endpoint will not serve.
+            let _c = chain(&mut server, 101, 102, &[(102, 101)]);
 
-            let poller = RpcPoller::new(
-                server.url(),
-                UiTransactionEncoding::Json,
-                CommitmentLevel::Finalized,
-            );
+            let poller = poller(&server);
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
@@ -696,19 +647,70 @@ mod tests {
         async fn fill_slot_range_block_fetch_error() {
             let mut server = Server::new_async().await;
 
+            let _blocks = mock_get_blocks(&mut server, 101, 101, &[101]);
             let _m1 = mock_get_block_error(&mut server, 101);
 
-            let poller = RpcPoller::new(
-                server.url(),
-                UiTransactionEncoding::Json,
-                CommitmentLevel::Finalized,
-            );
+            let poller = poller(&server);
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
                 fill_slot_range(&poller, 100, 101, 10, ProgramType::Escrow, None, &tx).await;
 
             assert!(result.is_err());
+        }
+
+        /// A batch-level RPC failure has to reach the retry loop. It used to be
+        /// buried in the per-slot results, so the loop saw `Ok` every time and a
+        /// single transient blip aborted the whole backfill on the first attempt.
+        #[tokio::test]
+        async fn fill_slot_range_retries_a_batch_level_failure() {
+            let mut server = Server::new_async().await;
+
+            // The enumeration fails, which fails every slot in the batch at once.
+            let enumeration = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(
+                    serde_json::json!({"method": "getBlocks"}),
+                ))
+                .with_status(500)
+                .expect(BACKFILL_MAX_RETRIES)
+                .create();
+
+            let poller = poller(&server);
+
+            let (tx, _rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            assert!(result.is_err());
+            // Every attempt was made, not just the first.
+            enumeration.assert();
+        }
+
+        /// A trailing run of non-producers with no witness is undetermined, so
+        /// backfill must abort and retry rather than treat it as proven empty.
+        #[tokio::test]
+        async fn fill_slot_range_unwitnessed_tail_aborts_before_slot_complete() {
+            let mut server = Server::new_async().await;
+
+            let _blocks = mock_get_blocks(&mut server, 101, 102, &[]);
+            let _witness = mock_get_blocks_with_limit(&mut server, 103, &[]);
+
+            let poller = poller(&server);
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("unwitnessed"), "unexpected error: {msg}");
+
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert!(
+                messages.is_empty(),
+                "an unwitnessed tail must not emit any SlotComplete"
+            );
         }
 
         /// A batch where slot N's block has a `meta: null` transaction must
@@ -720,14 +722,11 @@ mod tests {
             let mut server = Server::new_async().await;
 
             // Batch over (100, 102] = [101, 102]; slot 101 is incomplete.
+            let _blocks = mock_get_blocks(&mut server, 101, 102, &[101, 102]);
             let _m1 = mock_get_block_missing_meta(&mut server, 101);
-            let _m2 = mock_get_block_success(&mut server, 102);
+            let _m2 = mock_get_block_at(&mut server, 102, 101);
 
-            let poller = RpcPoller::new(
-                server.url(),
-                UiTransactionEncoding::Json,
-                CommitmentLevel::Finalized,
-            );
+            let poller = poller(&server);
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
@@ -751,19 +750,17 @@ mod tests {
 
         #[tokio::test]
         async fn fill_slot_range_no_slots_in_range() {
-            let server = Server::new_async().await;
+            let mut server = Server::new_async().await;
+            let untouched = server.mock("POST", "/").expect(0).create();
 
-            let poller = RpcPoller::new(
-                server.url(),
-                UiTransactionEncoding::Json,
-                CommitmentLevel::Finalized,
-            );
+            let poller = poller(&server);
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
                 fill_slot_range(&poller, 100, 100, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 0);
+            untouched.assert();
         }
     }
 
@@ -777,6 +774,7 @@ mod tests {
         use crate::config::BackfillConfig;
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
         use crate::storage::common::storage::mock::MockStorage;
+        use crate::test_utils::rpc_mocks::mock_get_blocks;
         use mockito::Server;
         use serde_json::json;
         use solana_sdk::commitment_config::CommitmentLevel;
@@ -936,6 +934,7 @@ mod tests {
         async fn run_fills_gap_sends_slot_complete_per_slot() {
             let mut server = Server::new_async().await;
             let _m_slot = mock_get_slot(&mut server, 103);
+            let _m_blocks = mock_get_blocks(&mut server, 101, 103, &[101, 102, 103]);
             let _m_b101 = mock_get_block_empty(&mut server, 101);
             let _m_b102 = mock_get_block_empty(&mut server, 102);
             let _m_b103 = mock_get_block_empty(&mut server, 103);

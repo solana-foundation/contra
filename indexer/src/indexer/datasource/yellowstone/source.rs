@@ -677,21 +677,15 @@ async fn connect_and_stream(
 mod tests {
     use super::*;
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
-    use crate::test_utils::rpc_mocks::mock_first_available_block;
+    use crate::test_utils::rpc_mocks::mock_get_blocks;
     use mockito::Server;
     use serde_json::json;
     use solana_sdk::commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
     use tokio::sync::mpsc;
 
-    fn empty_block_json() -> serde_json::Value {
-        json!({
-            "blockhash": "TestBlockHash11111111111111111111111111111",
-            "parentSlot": 0,
-            "transactions": []
-        })
-    }
-
+    /// An empty block whose parent link names the previous slot, so a run of these
+    /// forms the unbroken chain the classifier proves absence against.
     fn mock_get_block_success(server: &mut Server, slot: u64) -> mockito::Mock {
         server
             .mock("POST", "/")
@@ -703,12 +697,22 @@ mod tests {
             .with_body(
                 json!({
                     "jsonrpc": "2.0",
-                    "result": empty_block_json(),
+                    "result": {
+                        "blockhash": "TestBlockHash11111111111111111111111111111",
+                        "parentSlot": slot.saturating_sub(1),
+                        "transactions": []
+                    },
                     "id": 1
                 })
                 .to_string(),
             )
             .create()
+    }
+
+    /// Every slot in `[start, end]` produced a block, the dense case.
+    fn mock_dense_range(server: &mut Server, start: u64, end: u64) -> mockito::Mock {
+        let produced: Vec<u64> = (start..=end).collect();
+        mock_get_blocks(server, start, end, &produced)
     }
 
     /// A short backoff keeps the retry-loop tests fast; prod uses RECONNECT_GAP_RETRY_BACKOFF.
@@ -790,6 +794,7 @@ mod tests {
     #[tokio::test]
     async fn gap_fill_fills_gap_and_replays_boundary_slot() {
         let mut server = Server::new_async().await;
+        let _enum = mock_dense_range(&mut server, 100, 103);
         let _blocks: Vec<_> = (100..=103)
             .map(|s| mock_get_block_success(&mut server, s))
             .collect();
@@ -901,7 +906,8 @@ mod tests {
     #[tokio::test]
     async fn gap_fill_unavailable_slot_stalls_without_slot_complete() {
         let mut server = Server::new_async().await;
-        // Slot 100 is absent below the floor (100 < 500) => Unavailable.
+        // Slot 100 is listed as a producer but cannot be served => Unavailable.
+        let _enum = mock_dense_range(&mut server, 100, 103);
         let absent = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -920,7 +926,6 @@ mod tests {
             .expect_at_least(2)
             .create_async()
             .await;
-        let _floor = mock_first_available_block(&mut server, 500);
         let _rest: Vec<_> = (101..=103)
             .map(|s| mock_get_block_success(&mut server, s))
             .collect();
@@ -1074,6 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn arm_reconnect_gap_emits_regate_then_fills_to_target() {
         let mut server = Server::new_async().await;
+        let _enum = mock_dense_range(&mut server, 100, 103);
         let _blocks: Vec<_> = (100..=103)
             .map(|s| mock_get_block_success(&mut server, s))
             .collect();

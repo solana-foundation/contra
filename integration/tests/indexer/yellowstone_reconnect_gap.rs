@@ -51,6 +51,23 @@ async fn gap_fill_runs_after_drop_stream() {
     // no getSlot mock is needed. Anchor = checkpoint-1 = 100 => backfill 101..=106.
     // Empty blocks => only SlotComplete markers. Slot 101 was also streamed;
     // replay is harmless thanks to idempotent inserts in prod.
+    // v2 enumerates the batch before fetching it, so this mock is required even
+    // though nothing here is absent. Unmocked, mockito answers 501 with an empty
+    // body, which becomes a decode error the gap-fill retry loop swallows.
+    let _enumeration = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [101, 106]}),
+        ))
+        .with_status(200)
+        .with_body(
+            json!({"jsonrpc": "2.0", "result": [101, 102, 103, 104, 105, 106], "id": 1})
+                .to_string(),
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
     let mut block_mocks = Vec::new();
     for slot in 101u64..=106u64 {
         let m = rpc_mock

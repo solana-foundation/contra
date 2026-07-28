@@ -161,7 +161,7 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Max transactions per batch | 64 (configurable) | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` |
 | Max loaded accounts data | 64 MB | [`core/src/processor.rs`](../core/src/processor.rs) |
 | Max signatures per `getSignatureStatuses` | 256 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
-| Max slot range for `getBlocks` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max slot range for `getBlocks`, max limit for `getBlocksWithLimit` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max RPC response size | 10 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Gateway max request body | 64 KB | [`gateway/src/lib.rs`](../gateway/src/lib.rs) |
 

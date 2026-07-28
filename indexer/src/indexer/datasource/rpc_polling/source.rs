@@ -2,7 +2,7 @@ use super::rpc::RpcPoller;
 use super::types::{BlockFetch, RpcBlock};
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
-use crate::error::DataSourceError;
+use crate::error::{DataSourceError, DataSourceRpcError};
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
 use crate::indexer::datasource::rpc_polling::decoder;
 use crate::metrics;
@@ -73,14 +73,15 @@ impl RpcPollingSource {
 /// primary's). The blockhash check prevents a misconfigured (wrong-cluster, pruned) or
 /// compromised fallback from substituting a divergent-fork or fabricated block for the
 /// same slot number. Any error, absent slot, hash mismatch, or still-missing meta yields None.
+/// Uses the single-block entry point, not the batch classifier: one arbitrary slot has
+/// no anchor to prove absence from, and this caller only ever wanted contents or nothing.
 async fn refetch_missing_meta_via_fallback(
     fallback: &RpcPoller,
     slot: u64,
     expected_blockhash: &str,
 ) -> Option<RpcBlock> {
-    let (_slot, result) = fallback.get_blocks_batch(vec![slot]).await.pop()?;
-    match result {
-        Ok(BlockFetch::Present(block))
+    match fallback.get_block_present(slot).await {
+        Ok(Some(block))
             if block.blockhash == expected_blockhash
                 && decoder::first_missing_meta(&block).is_none() =>
         {
@@ -257,11 +258,11 @@ impl DataSource for RpcPollingSource {
                             }
                         }
                         Ok(BlockFetch::Skipped) => {
-                            debug!("Slot {} proven skipped (>= first_available_block)", slot);
+                            debug!("Slot {} proven empty by a later block's parent link", slot);
                         }
                         Ok(BlockFetch::Unavailable) => {
                             error!(
-                                "Slot {} is unavailable (pruned/snapshot-jumped); refusing to checkpoint past unknown contents",
+                                "Slot {} is unavailable: a block exists here that this endpoint will not serve; refusing to checkpoint past unknown contents",
                                 slot
                             );
                             metrics::INDEXER_RPC_ERRORS
@@ -273,9 +274,17 @@ impl DataSource for RpcPollingSource {
                             break;
                         }
                         Err(e) => {
+                            // An unproven slot wedges the checkpoint exactly like an
+                            // unavailable one and needs an operator, while a transport
+                            // failure is an ordinary retry. Separate labels so the
+                            // page can tell the two apart.
+                            let error_type = match e {
+                                DataSourceRpcError::Unproven { .. } => "block_unproven",
+                                _ => "get_block",
+                            };
                             error!("Failed to fetch block {}: {}", slot, e);
                             metrics::INDEXER_RPC_ERRORS
-                                .with_label_values(&[program_type.as_label(), "get_block"])
+                                .with_label_values(&[program_type.as_label(), error_type])
                                 .inc();
                             // Don't emit SlotComplete or advance — that would
                             // checkpoint past an unparsed slot and lose anything in it.
@@ -328,7 +337,7 @@ impl DataSource for RpcPollingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::rpc_mocks::mock_first_available_block;
+    use crate::test_utils::rpc_mocks::mock_get_blocks;
     use mockito::Server;
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -373,8 +382,34 @@ mod tests {
             .create()
     }
 
-    /// getBlock returns a `-32009` skipped-or-missing response for `slot`, which the
-    /// classifier resolves against the ledger floor.
+    /// As `mock_get_block_success` but with a caller-chosen parent slot, so a test
+    /// can build or break the chain link deliberately.
+    fn mock_get_block_at_parent(server: &mut Server, slot: u64, parent_slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": "TestBlockHash11111111111111111111111111111",
+                        "parentSlot": parent_slot,
+                        "transactions": []
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// getBlock answers `-32009` for a slot the enumeration listed as a producer,
+    /// so the classifier can prove nothing about it.
     fn mock_get_block_absent(
         server: &mut Server,
         slot: u64,
@@ -506,10 +541,11 @@ mod tests {
         blockhash: &str,
         expect_at_least: usize,
     ) -> mockito::Mock {
+        // A complete block reports an empty inner-instruction list, not a null one.
         let meta = json!({
             "err": null,
             "logMessages": null,
-            "innerInstructions": null,
+            "innerInstructions": [],
             "loadedAddresses": null
         });
         server
@@ -535,24 +571,24 @@ mod tests {
             .create()
     }
 
-    /// An Unavailable slot (absent below the ledger floor) must fail closed exactly
-    /// like a transport error: no SlotComplete, and the slot is re-fetched.
+    /// An Unavailable slot must fail closed exactly like a transport error:
+    /// no SlotComplete, and the slot is re-fetched.
     #[tokio::test]
     async fn unavailable_does_not_emit_slot_complete_and_retries() {
         let mut server = Server::new_async().await;
 
-        // Chain tip ahead so get_slots_to_process always returns [100].
+        // Chain tip ahead and batch size 1 so each poll asks for exactly [100].
         let _m_slot = mock_get_slot(&mut server, 105);
-        // Slot 100 is absent; floor 200 > 100 => Unavailable. Expect >=2 retries.
+        // Slot 100 is listed as a producer but cannot be served => Unavailable.
+        let _m_enum = mock_get_blocks(&mut server, 100, 100, &[100]);
         let m_block = mock_get_block_absent(&mut server, 100, 2);
-        let _floor = mock_first_available_block(&mut server, 200);
 
         let mut source = RpcPollingSource::new(
             server.url(),
             Some(100),
             10,
             10,
-            10,
+            1,
             solana_transaction_status::UiTransactionEncoding::Json,
             solana_sdk::commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
@@ -584,19 +620,19 @@ mod tests {
         );
     }
 
-    /// A proven skip (absent at or above the ledger floor) keeps the old behavior:
-    /// SlotComplete is emitted and polling advances past the slot.
+    /// A proven skip keeps the old behavior: SlotComplete is emitted and polling
+    /// advances past the slot.
     #[tokio::test]
     async fn proven_skip_emits_slot_complete_and_advances() {
         let mut server = Server::new_async().await;
 
         // Chain tip 103 => get_slots_to_process(100, 10) returns [100,101,102].
         let _m_slot = mock_get_slot(&mut server, 103);
-        // Slot 100 is absent; floor 0 <= 100 => proven Skipped, so it must advance.
-        let _m100 = mock_get_block_absent(&mut server, 100, 1);
-        let _floor = mock_first_available_block(&mut server, 0);
-        let _m101 = mock_get_block_success(&mut server, 101, 1);
-        let _m102 = mock_get_block_success(&mut server, 102, 1);
+        // Slot 100 produced nothing and 101's parent link names the anchor 99,
+        // which proves it empty, so polling must advance past it.
+        let _m_enum = mock_get_blocks(&mut server, 100, 102, &[101, 102]);
+        let _m101 = mock_get_block_at_parent(&mut server, 101, 99);
+        let _m102 = mock_get_block_at_parent(&mut server, 102, 101);
 
         let mut source = RpcPollingSource::new(
             server.url(),
@@ -643,17 +679,18 @@ mod tests {
     async fn fetch_error_does_not_emit_slot_complete_and_retries() {
         let mut server = Server::new_async().await;
 
-        // Chain tip stays ahead so get_slots_to_process always returns [100].
+        // Chain tip ahead and batch size 1 so each poll asks for exactly [100].
         let _m_slot = mock_get_slot(&mut server, 105);
-        // Slot 100 always fails; expect ≥2 retries proving no advance past it.
+        let _m_enum = mock_get_blocks(&mut server, 100, 100, &[100]);
+        // Slot 100 always fails; expect >=2 retries proving no advance past it.
         let m_block_err = mock_get_block_error(&mut server, 100, 2);
 
         let mut source = RpcPollingSource::new(
             server.url(),
-            Some(100), // from_slot — start exactly at the failing slot
-            10,        // poll_interval_ms — tight loop for the test
-            10,        // error_retry_interval_ms — quick retry on error
-            10,
+            Some(100), // from_slot, start exactly at the failing slot
+            10,        // poll_interval_ms, tight loop for the test
+            10,        // error_retry_interval_ms, quick retry on error
+            1,
             solana_transaction_status::UiTransactionEncoding::Json,
             solana_sdk::commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
@@ -696,8 +733,9 @@ mod tests {
     async fn fetch_success_emits_slot_complete_and_advances() {
         let mut server = Server::new_async().await;
 
-        // Chain tip 103 → get_slots_to_process(100, 10) returns [100,101,102].
+        // Chain tip 103 => get_slots_to_process(100, 10) returns [100,101,102].
         let _m_slot = mock_get_slot(&mut server, 103);
+        let _m_enum = mock_get_blocks(&mut server, 100, 102, &[100, 101, 102]);
         let _m_b100 = mock_get_block_success(&mut server, 100, 1);
         let _m_b101 = mock_get_block_success(&mut server, 101, 1);
         let _m_b102 = mock_get_block_success(&mut server, 102, 1);
@@ -748,8 +786,9 @@ mod tests {
     async fn missing_meta_does_not_emit_slot_complete_or_instruction() {
         let mut server = Server::new_async().await;
 
-        // Chain tip stays ahead so get_slots_to_process always returns slot 100 first.
+        // Chain tip ahead and batch size 1 so each poll asks for exactly [100].
         let _m_slot = mock_get_slot(&mut server, 105);
+        let _m_enum = mock_get_blocks(&mut server, 100, 100, &[100]);
         // Slot 100 always returns missing meta; expect >=2 fetches proving no advance.
         let m_block = mock_get_block_missing_meta(&mut server, 100, 2);
 
@@ -758,7 +797,7 @@ mod tests {
             Some(100),
             10,
             10,
-            10,
+            1,
             solana_transaction_status::UiTransactionEncoding::Json,
             solana_sdk::commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
@@ -806,10 +845,20 @@ mod tests {
         let mut fallback = Server::new_async().await;
 
         let _m_slot = mock_get_slot(&mut primary, 103);
+        let _m_enum = mock_get_blocks(&mut primary, 100, 102, &[100, 101, 102]);
         let _m_primary = mock_get_block_missing_meta(&mut primary, 100, 1);
         // Later slots resolve cleanly so the loop can advance past 100.
         let _m_p101 = mock_get_block_success(&mut primary, 101, 1);
         let _m_p102 = mock_get_block_success(&mut primary, 102, 1);
+        // The fallback path asks for one slot's contents, so it must issue only a
+        // getBlock: attempting a chain proof there would have no anchor to prove from.
+        let fallback_enum = fallback
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlocks"
+            })))
+            .expect(0)
+            .create();
         let m_fallback = mock_get_block_complete_withdraw(&mut fallback, 100, 1);
 
         let mut source = RpcPollingSource::new(
@@ -844,6 +893,7 @@ mod tests {
         let _ = handle.await;
 
         m_fallback.assert();
+        fallback_enum.assert();
         assert!(
             saw_slot_100,
             "SlotComplete{{slot:100}} must be emitted after fallback recovery"
@@ -862,6 +912,7 @@ mod tests {
         let mut fallback = Server::new_async().await;
 
         let _m_slot = mock_get_slot(&mut primary, 105);
+        let _m_enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
         let m_primary = mock_get_block_missing_meta(&mut primary, 100, 2);
         let m_fallback = mock_get_block_missing_meta(&mut fallback, 100, 1);
 
@@ -870,7 +921,7 @@ mod tests {
             Some(100),
             10,
             10,
-            10,
+            1,
             solana_transaction_status::UiTransactionEncoding::Json,
             solana_sdk::commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
@@ -912,6 +963,7 @@ mod tests {
         let mut fallback = Server::new_async().await;
 
         let _m_slot = mock_get_slot(&mut primary, 105);
+        let _m_enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
         let m_primary = mock_get_block_missing_meta(&mut primary, 100, 2);
         let m_fallback = mock_get_block_complete_withdraw_with_hash(
             &mut fallback,
@@ -925,7 +977,7 @@ mod tests {
             Some(100),
             10,
             10,
-            10,
+            1,
             solana_transaction_status::UiTransactionEncoding::Json,
             solana_sdk::commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
@@ -962,6 +1014,82 @@ mod tests {
         assert!(
             !emitted_instruction,
             "a fallback block with a mismatched blockhash must not be indexed"
+        );
+    }
+
+    /// A trailing run the endpoint cannot witness is undetermined, so live polling
+    /// must fail closed and retry it rather than emit SlotComplete over it.
+    #[tokio::test]
+    async fn unwitnessed_tail_does_not_emit_slot_complete_and_retries() {
+        let mut server = Server::new_async().await;
+
+        // Chain tip 105 => get_slots_to_process(100, 10) returns [100..=104].
+        let _m_slot = mock_get_slot(&mut server, 105);
+        // Nothing produced in the range and nothing listed past it: no witness exists.
+        // Expect >=2 of each, proving the range is retried rather than advanced past.
+        let m_enum = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlocks",
+                "params": [100, 104]
+            })))
+            .with_status(200)
+            .with_body(json!({ "jsonrpc": "2.0", "result": [], "id": 1 }).to_string())
+            .expect_at_least(2)
+            .create();
+        let m_witness = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlocksWithLimit",
+                "params": [105]
+            })))
+            .with_status(200)
+            .with_body(json!({ "jsonrpc": "2.0", "result": [], "id": 1 }).to_string())
+            .expect_at_least(2)
+            .create();
+        let no_fetch = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [100]
+            })))
+            .expect(0)
+            .create();
+
+        let mut source = RpcPollingSource::new(
+            server.url(),
+            Some(100),
+            10,
+            10,
+            10,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Escrow,
+            None,
+            None,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        m_enum.assert();
+        m_witness.assert();
+        no_fetch.assert();
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, ProcessorMessage::SlotComplete { .. })),
+            "no SlotComplete may be emitted for an unwitnessed tail"
         );
     }
 }

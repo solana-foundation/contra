@@ -110,6 +110,17 @@ pub async fn find_user_by_username(pool: &PgPool, username: &str) -> AppResult<O
     )
 }
 
+/// Look up a user's username by id. Used to name the account in the wallet challenge message.
+pub async fn find_username_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as(r#"SELECT username FROM private_channel_auth.users WHERE id = $1"#)
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row.map(|(username,)| username))
+}
+
 pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> AppResult<User> {
     let row: (Uuid, String, String, String, DateTime<Utc>) = sqlx::query_as(
         r#"
@@ -176,8 +187,9 @@ pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppR
 
 /// Mark the challenge as used and return it. Returns None if not found, already used, or expired.
 /// The atomic UPDATE prevents the same challenge from being consumed twice.
-pub async fn consume_challenge(
-    pool: &PgPool,
+/// Takes any executor so the caller can run it inside a transaction alongside the wallet insert.
+pub async fn consume_challenge<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     user_id: Uuid,
     nonce: Uuid,
 ) -> AppResult<Option<Challenge>> {
@@ -190,14 +202,16 @@ pub async fn consume_challenge(
     )
     .bind(user_id)
     .bind(nonce)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     Ok(row.map(|(nonce, expires_at)| Challenge { nonce, expires_at }))
 }
 
-pub async fn insert_verified_wallet(
-    pool: &PgPool,
+/// Takes any executor so the caller can run it inside a transaction alongside the
+/// challenge consume, keeping the nonce spent only if the wallet is actually linked.
+pub async fn insert_verified_wallet<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     user_id: Uuid,
     pubkey: &str,
 ) -> AppResult<VerifiedWallet> {
@@ -211,7 +225,7 @@ pub async fn insert_verified_wallet(
     .bind(Uuid::new_v4())
     .bind(user_id)
     .bind(pubkey)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(VerifiedWallet {

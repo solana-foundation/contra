@@ -159,6 +159,36 @@ async fn test_register_username_invalid_chars() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_register_rejects_non_ascii_username() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    // Written as escapes because the whole point is that these render like "alice".
+    // Cyrillic ie, Cyrillic a, and fullwidth latin are all Unicode-alphanumeric, so
+    // they would otherwise register alongside the real account and be signed for.
+    for username in [
+        "alic\u{0435}",
+        "\u{0430}lice",
+        "\u{ff41}\u{ff4c}\u{ff49}\u{ff43}\u{ff45}",
+    ] {
+        let res = client
+            .post(format!("{}/auth/register", base_url(addr)))
+            .json(&json!({ "username": username, "password": "password123" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            400,
+            "expected 400 for username {:?}",
+            username
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_register_username_valid_formats() {
     let (db_url, _container) = start_postgres().await;
     let addr = start_app(&db_url).await;
@@ -377,10 +407,14 @@ async fn test_verify_wallet_full_flow() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    // Create the keypair first so its pubkey can go in the challenge request.
+    let keypair = Keypair::new();
+
     // Get challenge
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -391,8 +425,7 @@ async fn test_verify_wallet_full_flow() {
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
 
-    // Sign the challenge message with a Solana keypair
-    let keypair = Keypair::new();
+    // Sign the challenge message with the wallet keypair.
     let signature = keypair.sign_message(message.as_bytes());
 
     // Verify wallet
@@ -411,6 +444,64 @@ async fn test_verify_wallet_full_flow() {
     assert_eq!(verify_res.status(), 200);
     let body: Value = verify_res.json().await.unwrap();
     assert_eq!(body["pubkey"], keypair.pubkey().to_string());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_challenge_message_names_account_and_wallet() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    let username = "alice";
+    let register_res: Value = client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let user_id = register_res["id"].as_str().unwrap().to_string();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": username, "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey().to_string();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({ "pubkey": pubkey }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // The message must name the account and the wallet so a signer can give informed
+    // consent. This is the property whose absence let an opaque challenge be phished
+    // onto a victim wallet under someone else's account. The id is there because a
+    // username can be impersonated by a lookalike, so a client has something exact
+    // to check against its own session.
+    let message = challenge_res["message"].as_str().unwrap();
+    assert!(message.contains(username), "message must name the account");
+    assert!(
+        message.contains(&user_id),
+        "message must carry the account id"
+    );
+    assert!(message.contains(&pubkey), "message must name the wallet");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -438,9 +529,13 @@ async fn test_verify_wallet_replay_rejected() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    // Create the keypair first so its pubkey can go in the challenge request.
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -451,7 +546,6 @@ async fn test_verify_wallet_replay_rejected() {
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
 
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(message.as_bytes());
 
     let payload = json!({
@@ -506,9 +600,12 @@ async fn test_verify_wallet_invalid_pubkey() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -517,7 +614,6 @@ async fn test_verify_wallet_invalid_pubkey() {
         .unwrap();
 
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(challenge_res["message"].as_str().unwrap().as_bytes());
 
     let res = client
@@ -533,6 +629,22 @@ async fn test_verify_wallet_invalid_pubkey() {
         .unwrap();
 
     assert_eq!(res.status(), 400);
+
+    // The rejected pubkey must not have consumed the challenge — retrying the same
+    // nonce with the real pubkey still succeeds.
+    let res = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": keypair.pubkey().to_string(),
+            "nonce": nonce,
+            "signature": signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -560,9 +672,12 @@ async fn test_verify_wallet_invalid_signature_format() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -571,7 +686,6 @@ async fn test_verify_wallet_invalid_signature_format() {
         .unwrap();
 
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
 
     let res = client
         .post(format!("{}/auth/verify-wallet", base_url(addr)))
@@ -613,9 +727,13 @@ async fn test_verify_wallet_wrong_signature() {
 
     let token = login_res["token"].as_str().unwrap();
 
+    // Create the keypair first so its pubkey can go in the challenge request.
+    let keypair = Keypair::new();
+
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -626,8 +744,7 @@ async fn test_verify_wallet_wrong_signature() {
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
 
-    let keypair = Keypair::new();
-    // Sign with a different keypair — signature won't verify against the pubkey we submit.
+    // Sign with a different keypair so the signature won't match the submitted pubkey.
     let wrong_keypair = Keypair::new();
     let signature = wrong_keypair.sign_message(message.as_bytes());
 
@@ -636,6 +753,69 @@ async fn test_verify_wallet_wrong_signature() {
         .bearer_auth(token)
         .json(&json!({
             "pubkey": keypair.pubkey().to_string(),
+            "nonce": nonce,
+            "signature": signature.to_string(),
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_verify_wallet_substituted_pubkey_rejected() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let login_res: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "alice", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let token = login_res["token"].as_str().unwrap();
+
+    let challenge_wallet = Keypair::new();
+
+    let challenge_res: Value = client
+        .post(format!("{}/auth/challenge-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({ "pubkey": challenge_wallet.pubkey().to_string() }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let message = challenge_res["message"].as_str().unwrap();
+    let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
+
+    // Sign the challenge with a second wallet and submit that wallet's pubkey. The
+    // signature is genuine for the submitted pubkey, but the message named the wallet
+    // the challenge was issued for, so verification must rebuild a different message
+    // and reject. This is what keeps a challenge from being redeemed for any wallet.
+    let submitted_wallet = Keypair::new();
+    let signature = submitted_wallet.sign_message(message.as_bytes());
+
+    let res = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
+        .bearer_auth(token)
+        .json(&json!({
+            "pubkey": submitted_wallet.pubkey().to_string(),
             "nonce": nonce,
             "signature": signature.to_string(),
         }))
@@ -686,6 +866,7 @@ async fn test_verify_wallet_duplicate() {
     let challenge1: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -712,6 +893,7 @@ async fn test_verify_wallet_duplicate() {
     let challenge2: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -774,9 +956,11 @@ async fn test_list_wallets() {
     assert_eq!(wallets.as_array().unwrap().len(), 0);
 
     // Verify a wallet
+    let keypair = Keypair::new();
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -786,7 +970,6 @@ async fn test_list_wallets() {
 
     let message = challenge_res["message"].as_str().unwrap();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(message.as_bytes());
 
     client
@@ -970,9 +1153,11 @@ async fn setup_user_with_wallet(addr: SocketAddr, username: &str) -> (String, St
 
     let token = login_res["token"].as_str().unwrap().to_string();
 
+    let keypair = Keypair::new();
     let challenge_res: Value = client
         .post(format!("{}/auth/challenge-wallet", base_url(addr)))
         .bearer_auth(&token)
+        .json(&json!({ "pubkey": keypair.pubkey().to_string() }))
         .send()
         .await
         .unwrap()
@@ -982,7 +1167,6 @@ async fn setup_user_with_wallet(addr: SocketAddr, username: &str) -> (String, St
 
     let message = challenge_res["message"].as_str().unwrap().to_string();
     let nonce: Uuid = challenge_res["nonce"].as_str().unwrap().parse().unwrap();
-    let keypair = Keypair::new();
     let signature = keypair.sign_message(message.as_bytes());
 
     client

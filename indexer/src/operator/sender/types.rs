@@ -120,6 +120,9 @@ pub struct TransactionStatusUpdate {
     /// True when a remint was attempted but failed (ManualReview). Lets consumers
     /// distinguish "remint tried and failed" from "remint never attempted".
     pub remint_attempted: bool,
+    /// Full broadcast release-attempt list, set on an SMT-confirmed Completed so
+    /// the writer can durably record provenance. COALESCE-guarded downstream.
+    pub release_signatures: Option<Vec<String>>,
 }
 
 /// A Mint or InitializeMint transaction that has been sent but not yet confirmed.
@@ -225,6 +228,12 @@ impl SenderState {
 
     /// Finality oracle for the source `source_rpc_client`, single-endpoint: the
     /// PrivateChannel gateway is single-provider, with no second node to check.
+    ///
+    /// The source (remint MintTo) path deliberately stays absence-authoritative
+    /// and is NOT downgraded by an on-chain SMT check the way the destination
+    /// (release) path is. The self-hosted PrivateChannel node is the canonical
+    /// source of truth, so an absent status there is genuine non-inclusion, not a
+    /// prune or lag. Do not "fix" this into a symmetric SMT gate.
     pub(crate) fn source_finality(&self) -> FinalityRpc<'_> {
         FinalityRpc::single(&self.source_rpc_client)
     }

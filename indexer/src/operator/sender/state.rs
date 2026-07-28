@@ -131,17 +131,7 @@ pub(crate) async fn validate_smt_root(
         })?;
 
     let tree_index = instance.current_tree_index;
-    let min_nonce = tree_index * MAX_TREE_LEAVES as u64;
-    let max_nonce = (tree_index + 1) * MAX_TREE_LEAVES as u64;
-
-    let nonces = storage
-        .get_completed_withdrawal_nonces(min_nonce, max_nonce)
-        .await?;
-
-    let mut smt_state = SmtState::new(tree_index);
-    for nonce in &nonces {
-        smt_state.insert_nonce(*nonce);
-    }
+    let smt_state = rebuild_completed_tree(storage, tree_index).await?;
 
     let computed_root = smt_state.current_root();
     let onchain_root = instance.withdrawal_transactions_root;
@@ -152,7 +142,7 @@ pub(crate) async fn validate_smt_root(
             tree_index,
             local_root = ?computed_root,
             onchain_root = ?onchain_root,
-            nonces = ?nonces,
+            nonces = ?smt_state.get_nonces(),
             "SMT root mismatch: database out of sync with on-chain state. \
              A release likely landed on-chain but its Completed write was lost; \
              resync the database from on-chain events to reconcile."
@@ -167,11 +157,151 @@ pub(crate) async fn validate_smt_root(
 
     info!(
         tree_index,
-        nonces = nonces.len(),
+        nonces = smt_state.nonce_count(),
         "SMT root verification passed"
     );
 
     Ok(smt_state)
+}
+
+/// Rebuild the local SMT for `tree_index` from the DB-completed withdrawal
+/// nonces in that tree's window. Shared by `validate_smt_root` and the release
+/// verifier so both reason from the identical window math and insert path.
+async fn rebuild_completed_tree(
+    storage: &Storage,
+    tree_index: u64,
+) -> Result<SmtState, OperatorError> {
+    let leaves = MAX_TREE_LEAVES as u64;
+    // Window is [tree_index*leaves, (tree_index+1)*leaves). Checked math so a
+    // corrupt tree_index cannot wrap into the wrong window.
+    let min_nonce =
+        tree_index
+            .checked_mul(leaves)
+            .ok_or(AccountError::AccountIndexOutOfBounds {
+                index: tree_index as usize,
+            })?;
+    let max_nonce = tree_index
+        .checked_add(1)
+        .and_then(|t| t.checked_mul(leaves))
+        .ok_or(AccountError::AccountIndexOutOfBounds {
+            index: tree_index as usize,
+        })?;
+
+    let nonces = storage
+        .get_completed_withdrawal_nonces(min_nonce, max_nonce)
+        .await?;
+
+    let mut smt_state = SmtState::new(tree_index);
+    for nonce in &nonces {
+        smt_state.insert_nonce(*nonce);
+    }
+    Ok(smt_state)
+}
+
+/// Three-way outcome of confirming a release from the on-chain SMT root.
+/// `Uncertain` fails closed: every read/parse/window/staleness ambiguity maps
+/// here, never to `NotLanded`, so a demote or remint never fires on doubt.
+pub(crate) enum ReleaseVerdict {
+    /// The on-chain root matches the completed set WITH the candidate nonce.
+    Landed,
+    /// The on-chain root matches the completed set WITHOUT the candidate nonce.
+    NotLanded,
+    /// Could not prove either way; treat as still-pending.
+    Uncertain(String),
+}
+
+/// Check whether the withdrawal `nonce` actually released on-chain, so recovery
+/// never re-pays a release that a pruned or lagging RPC endpoint is hiding.
+///
+/// The escrow instance holds a Merkle root over every released nonce. We read it
+/// at finalized commitment, rebuild the same tree from our own DB, and compare.
+/// Any doubt returns `Uncertain`, never a false `NotLanded`: the nonce must
+/// belong to the tree the instance currently holds; the finalized snapshot must
+/// be newer than the release's expiry window (a stale one could predate a real
+/// release and look absent); and the rebuilt root must equal the on-chain root
+/// either with the nonce (`Landed`) or without it (`NotLanded`).
+pub(crate) async fn verify_release_landed(
+    rpc: &RpcClientWithRetry,
+    storage: &Storage,
+    instance_pda: Option<Pubkey>,
+    nonce: u64,
+    max_lvbh: u64,
+) -> ReleaseVerdict {
+    let Some(instance_pda) = instance_pda else {
+        return ReleaseVerdict::Uncertain("no instance pda configured".to_string());
+    };
+
+    // Read the finalized height before the account, so the account snapshot is at
+    // least this height. Then finalized_height > max_lvbh proves the snapshot
+    // already reflects every release that could have landed in its validity window.
+    let finalized_height = match rpc
+        .get_block_height_with_commitment(CommitmentConfig::finalized())
+        .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            return ReleaseVerdict::Uncertain(format!("finalized block height read failed: {e}"))
+        }
+    };
+
+    let response = match rpc
+        .get_account_with_context(&instance_pda, CommitmentConfig::finalized())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("instance read failed: {e}")),
+    };
+    let Some(account) = response.value else {
+        return ReleaseVerdict::Uncertain(format!(
+            "instance {instance_pda} absent at finalized commitment"
+        ));
+    };
+    let instance = match parse_instance(&account.data) {
+        Ok(i) => i,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("instance parse failed: {e}")),
+    };
+
+    // Tree-window check: membership can only be proven against the tree currently
+    // on-chain; a rotated-away nonce needs a historical root we do not fetch.
+    let expected_tree = nonce / MAX_TREE_LEAVES as u64;
+    if expected_tree != instance.current_tree_index {
+        return ReleaseVerdict::Uncertain(format!(
+            "nonce {nonce} maps to tree {expected_tree}, on-chain tree is {}",
+            instance.current_tree_index
+        ));
+    }
+
+    // Freshness check: the finalized height must be strictly past every attempt's
+    // lvbh. At height == lvbh a release can still land, so require strictly greater;
+    // a stale snapshot that predates the validity window could miss an edge-of-window
+    // release and wrongly report NotLanded, risking a double-pay.
+    if finalized_height <= max_lvbh {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized block height {finalized_height} not past max lvbh {max_lvbh}; too stale to prove non-inclusion"
+        ));
+    }
+
+    // Root-membership check: root equality is proof because the SMT is
+    // order-independent and collision-correct. Compare against the completed set
+    // without, then with, the candidate nonce.
+    let mut tree = match rebuild_completed_tree(storage, instance.current_tree_index).await {
+        Ok(t) => t,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("completed-tree rebuild failed: {e}")),
+    };
+    let onchain_root = instance.withdrawal_transactions_root;
+
+    // Drop the candidate so `tree` is the completed set WITHOUT it.
+    tree.remove_nonce(nonce);
+    if tree.current_root() == onchain_root {
+        return ReleaseVerdict::NotLanded;
+    }
+    tree.insert_nonce(nonce);
+    if tree.current_root() == onchain_root {
+        return ReleaseVerdict::Landed;
+    }
+    ReleaseVerdict::Uncertain(format!(
+        "on-chain root matches neither completed set (with nor without nonce {nonce})"
+    ))
 }
 
 impl SenderState {
@@ -215,6 +345,7 @@ impl SenderState {
                 error_message: Some(format!("recovery failed: {}", reason)),
                 remint_signature: None,
                 remint_attempted: false,
+                release_signatures: None,
             },
             "transaction status update",
         )
@@ -1227,5 +1358,296 @@ mod tests {
             }
             other => panic!("expected SmtRootMismatch, got: {other}"),
         }
+    }
+
+    // verify_release_landed (SMT confirmation gate)
+    //
+    // These run under the `test-tree` feature so MAX_TREE_LEAVES = 8 keeps the
+    // tree windows small: tree 0 covers nonces [0,8), tree 1 covers [8,16).
+    use super::{verify_release_landed, ReleaseVerdict};
+    use solana_client::nonblocking::rpc_client::RpcClient;
+
+    /// Borsh-serialize an Instance carrying `root` and `tree_index`.
+    fn instance_bytes(root: [u8; 32], tree_index: u64) -> Vec<u8> {
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index: tree_index,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Mock RPC whose finalized getBlockHeight returns `finalized_height` and whose
+    /// getAccountInfo returns an Instance account with the given root and tree_index.
+    /// The verifier reads the height first, so both mocks are required.
+    fn mock_instance_rpc(
+        root: [u8; 32],
+        tree_index: u64,
+        finalized_height: u64,
+    ) -> RpcClientWithRetry {
+        let bytes = instance_bytes(root, tree_index);
+        let account_response = serde_json::json!({
+            // Context slot is no longer read by the gate; height drives freshness.
+            "context": {"slot": finalized_height},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        mocks.insert(
+            RpcRequest::GetBlockHeight,
+            serde_json::json!(finalized_height),
+        );
+        RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Mock RPC whose getAccountInfo returns a null value (account absent), with a
+    /// fresh finalized getBlockHeight so the gate reaches the absent-account check.
+    fn mock_absent_instance_rpc(finalized_height: u64) -> RpcClientWithRetry {
+        let account_response =
+            serde_json::json!({"context": {"slot": finalized_height}, "value": null});
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        mocks.insert(
+            RpcRequest::GetBlockHeight,
+            serde_json::json!(finalized_height),
+        );
+        RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// A completed withdrawal row so `get_completed_withdrawal_nonces` sees `nonce`.
+    fn completed_withdrawal_row(id: i64, nonce: u64) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id,
+            signature: Signature::new_unique().to_string(),
+            trace_id: format!("trace-{id}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(5_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce as i64),
+            status: TransactionStatus::Completed,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
+    /// Build a mock storage seeded with the given completed nonces.
+    fn storage_with_completed(nonces: &[u64]) -> Arc<Storage> {
+        let mock = MockStorage::new();
+        for (i, n) in nonces.iter().enumerate() {
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .push(completed_withdrawal_row(i as i64 + 1, *n));
+        }
+        Arc::new(Storage::Mock(mock))
+    }
+
+    /// Root of a fresh tree_index-0 tree containing `nonces`.
+    fn tree_root(tree_index: u64, nonces: &[u64]) -> [u8; 32] {
+        let mut smt = SmtState::new(tree_index);
+        for n in nonces {
+            smt.insert_nonce(*n);
+        }
+        smt.current_root()
+    }
+
+    /// V1: on-chain root includes N which the DB has not recorded, fresh height, yields Landed.
+    #[tokio::test]
+    async fn verify_release_landed_v1_with_candidate_match() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1, 3]);
+        // Finalized height 100 > max_lvbh 50, so the freshness check passes.
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(matches!(verdict, ReleaseVerdict::Landed), "expected Landed");
+    }
+
+    /// V2: on-chain root equals the completed set without N, fresh height, yields NotLanded.
+    #[tokio::test]
+    async fn verify_release_landed_v2_without_candidate_match() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1]);
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::NotLanded),
+            "expected NotLanded"
+        );
+    }
+
+    /// V3: nonce belongs to a different tree window than on-chain, yields Uncertain
+    /// (tree-window check).
+    #[tokio::test]
+    async fn verify_release_landed_v3_wrong_tree_window() {
+        let storage = storage_with_completed(&[]);
+        // nonce 3 maps to tree 0, but the on-chain instance is on tree 1.
+        let onchain = tree_root(1, &[]);
+        let rpc = mock_instance_rpc(onchain, 1, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "tree-window check must fail closed"
+        );
+    }
+
+    /// V4: root would say NotLanded but the finalized height is not past max_lvbh,
+    /// yields Uncertain (freshness check).
+    #[tokio::test]
+    async fn verify_release_landed_v4_stale_snapshot() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1]);
+        // Finalized height 50 == max_lvbh 50, so height <= max_lvbh fails the gate.
+        let rpc = mock_instance_rpc(onchain, 0, 50);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "freshness check must fail closed on a stale snapshot"
+        );
+    }
+
+    /// V4b regression: a large account context slot that WOULD have passed the old
+    /// slot-based check is still Uncertain when the finalized height is not past
+    /// max_lvbh, proving the old slot-vs-height confusion is closed.
+    #[tokio::test]
+    async fn verify_release_landed_v4b_large_slot_stale_height_uncertain() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1]);
+        // Account context slot is huge (would pass a slot > lvbh test), but the
+        // finalized height 100 == max_lvbh 100 is not strictly past it.
+        let bytes = instance_bytes(onchain, 0);
+        let account_response = serde_json::json!({
+            "context": {"slot": 20_000_000u64},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        mocks.insert(RpcRequest::GetBlockHeight, serde_json::json!(100u64));
+        let rpc = RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        };
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 100).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "a large slot must not paper over a stale finalized height"
+        );
+    }
+
+    /// V5: on-chain root reflects a nonce beyond completed set plus or minus N,
+    /// yields Uncertain (matches-neither).
+    #[tokio::test]
+    async fn verify_release_landed_v5_matches_neither() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1, 3, 5]);
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "matches-neither must be Uncertain"
+        );
+    }
+
+    /// V6: getAccountInfo value null yields Uncertain (absent is not NotLanded).
+    #[tokio::test]
+    async fn verify_release_landed_v6_absent_instance() {
+        let storage = storage_with_completed(&[1]);
+        let rpc = mock_absent_instance_rpc(100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "absent instance must be Uncertain"
+        );
+    }
+
+    /// V7: getAccountInfo RPC error yields Uncertain (read error is not NotLanded).
+    #[tokio::test]
+    async fn verify_release_landed_v7_rpc_error() {
+        let storage = storage_with_completed(&[1]);
+        // Unreachable endpoint, single attempt, so the read fails fast.
+        let rpc = RpcClientWithRetry::with_retry_config(
+            "http://127.0.0.1:1".to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "RPC error must be Uncertain"
+        );
+    }
+
+    /// V8: DB already records N as Completed and on-chain includes it, yields Landed
+    /// via the remove_nonce base path.
+    #[tokio::test]
+    async fn verify_release_landed_v8_db_has_candidate() {
+        let storage = storage_with_completed(&[1, 3]);
+        let onchain = tree_root(0, &[1, 3]);
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Landed),
+            "remove_nonce base path must still resolve Landed"
+        );
     }
 }

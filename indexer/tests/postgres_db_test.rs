@@ -517,6 +517,7 @@ async fn update_transaction_status_updates_fields() -> Result<(), Box<dyn std::e
             TransactionStatus::Completed,
             Some("counter_sig".to_string()),
             now,
+            None,
         )
         .await?;
     assert!(

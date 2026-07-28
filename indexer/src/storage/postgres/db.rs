@@ -243,6 +243,20 @@ impl PostgresDb {
         .await?;
         info!("remint_signatures migration complete");
 
+        // Idempotent migration: durable full release-attempt list recorded on an
+        // SMT-confirmed completion. Mirrors the remint_signatures column shape.
+        info!("Running release_signatures migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS release_signatures TEXT[];
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("release_signatures migration complete");
+
         // Idempotent migration: add pending_remint_deadline_at to existing databases
         info!("Running pending_remint_deadline_at migration if needed...");
         sqlx::query(
@@ -1236,15 +1250,18 @@ impl PostgresDb {
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, sqlx::Error> {
         // Only write non-terminal source states — blocks late writes after recovery.
+        // release_signatures is COALESCE-guarded so a None never wipes provenance.
         let result = sqlx::query(
             r#"
             UPDATE transactions
             SET
                 status = $2,
                 counterpart_signature = $3,
-                processed_at = $4
+                processed_at = $4,
+                release_signatures = COALESCE($5, release_signatures)
             WHERE id = $1
               AND status IN ('processing', 'pending_remint')
             "#,
@@ -1253,6 +1270,7 @@ impl PostgresDb {
         .bind(status)
         .bind(counterpart_signature)
         .bind(processed_at)
+        .bind(release_signatures)
         .execute(&self.pool)
         .await?;
 
@@ -1504,17 +1522,20 @@ impl PostgresDb {
     }
 
     /// CAS `Processing` → `Completed` keyed on `updated_at`; sig may be `None`.
+    /// `release_signatures` is COALESCE-guarded so `None` never clobbers a value.
     pub async fn try_complete_processing_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         counterpart_signature: Option<String>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE transactions
             SET status = 'completed',
                 counterpart_signature = COALESCE($3, counterpart_signature),
+                release_signatures = COALESCE($4, release_signatures),
                 processed_at = NOW()
             WHERE id = $1
               AND status = 'processing'
@@ -1524,6 +1545,7 @@ impl PostgresDb {
         .bind(transaction_id)
         .bind(expected_updated_at)
         .bind(counterpart_signature)
+        .bind(release_signatures)
         .execute(&self.pool)
         .await?;
 

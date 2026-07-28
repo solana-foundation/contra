@@ -152,6 +152,7 @@ impl Storage {
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, StorageError> {
         update_transaction_status::update_transaction_status(
             self,
@@ -159,6 +160,7 @@ impl Storage {
             status,
             counterpart_signature,
             processed_at,
+            release_signatures,
         )
         .await
     }
@@ -452,17 +454,21 @@ impl Storage {
     }
 
     /// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.
+    /// `release_signatures` durably records the full broadcast attempt list on an
+    /// SMT-confirmed release; `None` leaves any existing value intact (COALESCE).
     pub async fn try_complete_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         counterpart_signature: Option<String>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, StorageError> {
         try_complete_processing::try_complete_processing(
             self,
             transaction_id,
             expected_updated_at,
             counterpart_signature,
+            release_signatures,
         )
         .await
     }
@@ -847,6 +853,7 @@ mod tests {
                 TransactionStatus::Completed,
                 Some("sig_abc".to_string()),
                 now,
+                None,
             )
             .await
             .unwrap();
@@ -863,9 +870,80 @@ mod tests {
         let (storage, mock) = make_mock_storage();
         mock.set_should_fail("update_transaction_status", true);
         assert!(storage
-            .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now())
+            .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now(), None)
             .await
             .is_err());
+    }
+
+    // Durable release_signatures on completion
+
+    /// try_complete_processing with a release-signature list persists the
+    /// array alongside the single counterpart_signature.
+    #[tokio::test]
+    async fn try_complete_processing_persists_release_signatures() {
+        let (storage, mock) = make_mock_storage();
+        let now = Utc::now();
+        {
+            let mut txn = make_db_transaction();
+            txn.id = 1;
+            txn.status = TransactionStatus::Processing;
+            txn.updated_at = now;
+            mock.pending_transactions.lock().unwrap().push(txn);
+        }
+
+        let ok = storage
+            .try_complete_processing(
+                1,
+                now,
+                Some("s1".to_string()),
+                Some(vec!["s1".to_string(), "s2".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+
+        assert_eq!(
+            mock.completed_release_signatures.lock().unwrap().get(&1),
+            Some(&vec!["s1".to_string(), "s2".to_string()])
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0]
+                .counterpart_signature
+                .as_deref(),
+            Some("s1")
+        );
+    }
+
+    /// A None release-signature list is COALESCE-guarded and never wipes an
+    /// existing array.
+    #[tokio::test]
+    async fn try_complete_processing_none_preserves_existing_release_signatures() {
+        let (storage, mock) = make_mock_storage();
+        let now = Utc::now();
+        {
+            let mut txn = make_db_transaction();
+            txn.id = 2;
+            txn.status = TransactionStatus::Processing;
+            txn.updated_at = now;
+            mock.pending_transactions.lock().unwrap().push(txn);
+        }
+        // An array already recorded (e.g. a prior write).
+        mock.completed_release_signatures
+            .lock()
+            .unwrap()
+            .insert(2, vec!["old1".to_string(), "old2".to_string()]);
+
+        let ok = storage
+            .try_complete_processing(2, now, Some("cp".to_string()), None)
+            .await
+            .unwrap();
+        assert!(ok);
+
+        assert_eq!(
+            mock.completed_release_signatures.lock().unwrap().get(&2),
+            Some(&vec!["old1".to_string(), "old2".to_string()]),
+            "None must not clobber an existing array"
+        );
     }
 
     // ── storage dispatch coverage ────────────────────────────────────

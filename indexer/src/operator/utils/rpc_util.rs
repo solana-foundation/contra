@@ -1,5 +1,6 @@
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_response::Response;
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::config::RpcTransactionConfig;
@@ -163,6 +164,25 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get the block height at an explicit commitment with retry. The release
+    /// verifier reads this at finalized before its account snapshot so a lagging
+    /// finalized root cannot masquerade as a fresh one.
+    pub async fn get_block_height_with_commitment(
+        &self,
+        commitment: CommitmentConfig,
+    ) -> Result<u64, Box<client_error::Error>> {
+        self.with_retry(
+            "get_block_height_with_commitment",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .get_block_height_with_commitment(commitment)
+                    .await
+            },
+        )
+        .await
+    }
+
     /// Get the node's lowest retained slot with retry. An absence-based `Dead`
     /// finality verdict consults this to prove the endpoint still retains the
     /// attempt's slot range.
@@ -226,6 +246,26 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Read an account at the given commitment, returning the response context
+    /// (its `slot`) with the account. An absent account is `Ok(None)`, kept
+    /// distinct from a read error (`Err`).
+    pub async fn get_account_with_context(
+        &self,
+        pubkey: &Pubkey,
+        commitment: CommitmentConfig,
+    ) -> Result<Response<Option<Account>>, Box<client_error::Error>> {
+        self.with_retry(
+            "get_account_with_context",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .get_account_with_commitment(pubkey, commitment)
+                    .await
+            },
+        )
+        .await
+    }
+
     /// Get token account balance with retry (read-only, safe to retry)
     pub async fn get_token_account_balance(
         &self,
@@ -245,9 +285,7 @@ impl RpcClientWithRetry {
         &self,
         signatures: &[Signature],
     ) -> Result<
-        solana_client::rpc_response::Response<
-            Vec<Option<solana_transaction_status::TransactionStatus>>,
-        >,
+        Response<Vec<Option<solana_transaction_status::TransactionStatus>>>,
         Box<client_error::Error>,
     > {
         self.with_retry(
@@ -267,9 +305,7 @@ impl RpcClientWithRetry {
         &self,
         signatures: &[Signature],
     ) -> Result<
-        solana_client::rpc_response::Response<
-            Vec<Option<solana_transaction_status::TransactionStatus>>,
-        >,
+        Response<Vec<Option<solana_transaction_status::TransactionStatus>>>,
         Box<client_error::Error>,
     > {
         self.with_retry(
@@ -756,6 +792,55 @@ mod tests {
             .await;
         let client = make_client_at(&server.url());
         assert!(client.get_first_available_block().await.is_err());
+    }
+
+    /// R1: a present account is returned as `Some`, and the response context
+    /// exposes the finalized snapshot slot.
+    #[tokio::test]
+    async fn get_account_with_context_some_exposes_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":4242},"value":{"owner":"11111111111111111111111111111111","lamports":1000000,"data":["","base64"],"executable":false,"rentEpoch":0}},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let resp = client
+            .get_account_with_context(&Pubkey::default(), CommitmentConfig::finalized())
+            .await
+            .unwrap();
+        assert_eq!(resp.context.slot, 4242);
+        assert!(resp.value.is_some());
+    }
+
+    /// R2: an absent account (`value: null`) is `Ok(None)`, kept distinct from a
+    /// read error so the caller reads absence as uncertainty, never non-inclusion.
+    #[tokio::test]
+    async fn get_account_with_context_null_is_none() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":7},"value":null},"id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let resp = client
+            .get_account_with_context(&Pubkey::default(), CommitmentConfig::finalized())
+            .await
+            .unwrap();
+        assert!(resp.value.is_none());
     }
 
     #[tokio::test]

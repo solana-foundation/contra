@@ -752,6 +752,7 @@ pub(super) fn handle_confirmation_result<'a>(
                                 error_message: Some(reason),
                                 remint_signature: None,
                                 remint_attempted: false,
+                                release_signatures: None,
                             },
                             "transaction status update",
                         )
@@ -877,6 +878,7 @@ pub(super) async fn handle_success(
                     error_message: None,
                     remint_signature: None,
                     remint_attempted: false,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -905,6 +907,7 @@ pub(super) async fn handle_success(
                 error_message: None,
                 remint_signature: None,
                 remint_attempted: false,
+                release_signatures: None,
             },
             "transaction status update",
         )
@@ -1066,6 +1069,7 @@ pub(super) async fn handle_permanent_failure(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -1114,6 +1118,7 @@ pub(super) async fn handle_permanent_failure(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -1773,6 +1778,7 @@ pub(super) async fn run_poll_task(
                                     error_message: None,
                                     remint_signature: None,
                                     remint_attempted: false,
+                                    release_signatures: None,
                                 })
                                 .await
                                 .is_err()
@@ -1832,6 +1838,7 @@ pub(super) async fn send_fatal_error(
                 error_message: Some(error_msg.to_string()),
                 remint_signature: None,
                 remint_attempted: false,
+                release_signatures: None,
             },
             "transaction status update",
         )

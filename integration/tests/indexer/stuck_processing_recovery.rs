@@ -59,7 +59,7 @@ fn assert_recovered_increment(
     );
 }
 
-// ── fixture helpers ─────────────────────────────────────────────────────────
+// -- fixture helpers ---------------------------------------------------------
 
 async fn start_pg(
     db_name: &str,
@@ -186,12 +186,54 @@ fn test_client(url: String) -> RpcClientWithRetry {
     )
 }
 
-// IT-1 / IT-D1: deposit whose persisted broadcast signature finalized to Completed,
+/// SMT root of a fresh tree carrying `nonces`, computed with the same lib helper
+/// the release-verify gate rebuilds from, so the crafted on-chain root is exact.
+fn smt_root(tree_index: u64, nonces: &[u64]) -> [u8; 32] {
+    use private_channel_indexer::operator::utils::smt_util::SmtState;
+    let mut smt = SmtState::new(tree_index);
+    for n in nonces {
+        smt.insert_nonce(*n);
+    }
+    smt.current_root()
+}
+
+/// A `getAccountInfo` reply carrying a borsh-serialized escrow `Instance` with the
+/// given SMT root and tree index. The verify gate reads this to prove/deny a release.
+fn instance_account_reply(root: [u8; 32], tree_index: u64) -> Reply {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use borsh::BorshSerialize;
+    use private_channel_escrow_program_client::Instance;
+    use solana_pubkey::Pubkey as EscrowPubkey;
+
+    let instance = Instance {
+        discriminator: 0,
+        bump: 0,
+        version: 0,
+        instance_seed: EscrowPubkey::new_unique(),
+        admin: EscrowPubkey::new_unique(),
+        withdrawal_transactions_root: root,
+        current_tree_index: tree_index,
+    };
+    let mut bytes = Vec::new();
+    instance.serialize(&mut bytes).expect("serialize instance");
+    Reply::result(json!({
+        "context": {"slot": 1000},
+        "value": {
+            "owner": EscrowPubkey::new_unique().to_string(),
+            "lamports": 1_000_000u64,
+            "data": [STANDARD.encode(&bytes), "base64"],
+            "executable": false,
+            "rentEpoch": 0
+        }
+    }))
+}
+
+// Deposit whose persisted broadcast signature finalized to Completed,
 // recovered from the durable signature with no double-mint (no sendTransaction).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it1_deposit_landed_promoted_to_completed() {
-    let (db, url, _container) = start_pg("it1_landed").await;
+async fn deposit_landed_promoted_to_completed() {
+    let (db, url, _container) = start_pg("dep_landed").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -232,7 +274,7 @@ async fn it1_deposit_landed_promoted_to_completed() {
 
     let metric_before = snapshot_recovered("escrow", "completed", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -243,16 +285,22 @@ async fn it1_deposit_landed_promoted_to_completed() {
     );
     // Recovery never re-mints a landed deposit (no double-mint).
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("escrow", "completed", "deposit", metric_before, "IT-1");
+    assert_recovered_increment(
+        "escrow",
+        "completed",
+        "deposit",
+        metric_before,
+        "deposit landed completed",
+    );
     mock.shutdown().await;
 }
 
-// IT-2 / IT-D2: deposit with no persisted signature, provably never broadcast,
+// Deposit with no persisted signature, provably never broadcast,
 // demoted to Pending for a safe re-mint, consulting no RPC.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it2_deposit_not_landed_demoted_to_pending() {
-    let (db, url, _container) = start_pg("it2_demote").await;
+async fn deposit_not_landed_demoted_to_pending() {
+    let (db, url, _container) = start_pg("dep_demote").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -270,7 +318,7 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -282,18 +330,24 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
     );
     // Live fetcher picks it up on the next tick (out of scope here).
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-2");
+    assert_recovered_increment(
+        "escrow",
+        "requeued",
+        "deposit",
+        metric_before,
+        "deposit not landed requeued",
+    );
     mock.shutdown().await;
 }
 
-// IT-2b: deposit that WAS broadcast (persisted signature present) but whose mint is
+// Deposit that WAS broadcast (persisted signature present) but whose mint is
 // provably dead (null status, blockhash expired) is demoted for a safe re-mint. Unlike
-// IT-2 (no signature, no RPC), this exercises the RPC finality classification driving
+// the no-signature case above, this exercises the RPC finality classification driving
 // the re-mint decision, the case-(B)-dead double-mint boundary for deposits.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it2b_deposit_dead_signature_demoted() {
-    let (db, url, _container) = start_pg("it2b_dep_dead").await;
+async fn deposit_dead_signature_demoted() {
+    let (db, url, _container) = start_pg("dep_dead_sig").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -309,7 +363,7 @@ async fn it2b_deposit_dead_signature_demoted() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // Status null + current height (1000) > lvbh (100) → expired/dead.
+    // Status null + current height (1000) > lvbh (100) -> expired/dead.
     mock.enqueue(
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
@@ -322,22 +376,28 @@ async fn it2b_deposit_dead_signature_demoted() {
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
     // Recovery classifies the dead signature but never re-mints itself (the fetcher does).
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-2b");
+    assert_recovered_increment(
+        "escrow",
+        "requeued",
+        "deposit",
+        metric_before,
+        "deposit dead signature requeued",
+    );
     mock.shutdown().await;
 }
 
-// IT-3: withdrawal whose recorded release signature is dead (null status, blockhash expired) → demote.
+// Withdrawal whose recorded release signature is dead (null status, blockhash expired) -> demote.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it3_withdrawal_dead_signature_demoted() {
-    let (db, url, _container) = start_pg("it3_wd_demote").await;
+async fn withdrawal_dead_signature_demoted() {
+    let (db, url, _container) = start_pg("wd_demote").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -349,8 +409,9 @@ async fn it3_withdrawal_dead_signature_demoted() {
         .await
         .unwrap();
 
+    let instance_pda = Pubkey::new_unique();
     let mock = MockRpcServer::start().await;
-    // Status null + current height (1000) > lvbh (100) → expired/dead.
+    // Status null + current height (1000) > lvbh (100) -> expired/dead.
     mock.enqueue(
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
@@ -358,14 +419,29 @@ async fn it3_withdrawal_dead_signature_demoted() {
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
+    // Release-verify gate on the Dead arm: a finalized height (1000) past the
+    // attempt lvbh (100) plus an on-chain root that excludes nonce 7 prove
+    // NotLanded, so the withdrawal is safe to demote. This getBlockHeight is the
+    // verifier's second read after the classifier's expiry check consumed the first.
+    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    mock.enqueue(
+        "getAccountInfo",
+        instance_account_reply(smt_root(0, &[]), 0),
+    );
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(instance_pda),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
     let fresh = updated_at_of(&pool, tx_id).await;
@@ -374,15 +450,101 @@ async fn it3_withdrawal_dead_signature_demoted() {
         "updated_at should be fresh"
     );
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("withdraw", "requeued", "withdrawal", metric_before, "IT-3");
+    assert_recovered_increment(
+        "withdraw",
+        "requeued",
+        "withdrawal",
+        metric_before,
+        "withdrawal dead signature requeued",
+    );
     mock.shutdown().await;
 }
 
-// IT-4: withdrawal whose recorded release signature finalized → Completed, no re-send.
+/// The original issue-15 double-pay bug, closed: a pruned/lagging endpoint hides a
+/// release that actually landed on-chain, so the classifier says Dead; the SMT-root
+/// verifier proves Landed and we complete the row instead of re-paying it.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_dead_but_landed_completes_without_double_pay() {
+    let (db, url, _container) = start_pg("wd_dead_but_landed").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let nonce = 7i64;
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), nonce);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // insert_transaction_internal does not persist the nonce column, so set it
+    // explicitly: the SMT gate keys the on-chain membership proof off this value.
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = $1 WHERE id = $2")
+        .bind(nonce)
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    // The release write-ahead that actually landed, though the endpoint hides it.
+    let landed_sig = Signature::new_unique();
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+        .await
+        .unwrap();
+
+    let instance_pda = Pubkey::new_unique();
+    let mock = MockRpcServer::start().await;
+    // Classifier says Dead: null status + current height (1000) > lvbh (100),
+    // ledger floor 0 covers the attempt window (coverage-proven absence).
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+    );
+    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
+    // Release-verify gate: a finalized height (1000) past the attempt lvbh (100)
+    // plus an on-chain root that INCLUDES nonce 7 prove the release Landed, so the
+    // withdrawal is completed, not re-paid. This getBlockHeight is the verifier's
+    // second read after the classifier's expiry check consumed the first.
+    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    mock.enqueue(
+        "getAccountInfo",
+        instance_account_reply(smt_root(0, &[nonce as u64]), 0),
+    );
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("withdraw", "completed", "withdrawal");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(instance_pda),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    // Landed-but-hidden release completes the row from its recorded signature.
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(landed_sig.to_string())
+    );
+    // The whole point: nothing is re-broadcast, so no double-pay.
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment(
+        "withdraw",
+        "completed",
+        "withdrawal",
+        metric_before,
+        "withdrawal dead but landed completed",
+    );
+    mock.shutdown().await;
+}
+
+// Withdrawal whose recorded release signature finalized -> Completed, no re-send.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it4_withdrawal_landed_signature_completed_no_resend() {
-    let (db, url, _container) = start_pg("it4_landed").await;
+async fn withdrawal_landed_signature_completed_no_resend() {
+    let (db, url, _container) = start_pg("wd_landed").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -414,7 +576,7 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
 
     let metric_before = snapshot_recovered("withdraw", "completed", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -424,15 +586,21 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
         Some(landed_sig.to_string())
     );
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("withdraw", "completed", "withdrawal", metric_before, "IT-4");
+    assert_recovered_increment(
+        "withdraw",
+        "completed",
+        "withdrawal",
+        metric_before,
+        "withdrawal landed completed",
+    );
     mock.shutdown().await;
 }
 
-// IT-4b: withdrawal whose recorded signature is still live → left in Processing (no CAS write).
+// Withdrawal whose recorded signature is still live -> left in Processing (no CAS write).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it4b_withdrawal_live_signature_left_processing() {
-    let (db, url, _container) = start_pg("it4b_live").await;
+async fn withdrawal_live_signature_left_processing() {
+    let (db, url, _container) = start_pg("wd_live").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -445,7 +613,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // Status null + current height (50) <= lvbh (1000) → still live.
+    // Status null + current height (50) <= lvbh (1000) -> still live.
     mock.enqueue(
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
@@ -454,7 +622,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -463,7 +631,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
         "processing",
         "live signature must leave the row in Processing for the next sweep"
     );
-    // No CAS write → updated_at stays backdated, not refreshed to "now".
+    // No CAS write -> updated_at stays backdated, not refreshed to "now".
     assert!(
         updated_at_of(&pool, tx_id).await < Utc::now() - ChronoDuration::minutes(5),
         "no CAS write means updated_at must stay backdated, not refreshed"
@@ -472,11 +640,11 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     mock.shutdown().await;
 }
 
-// IT-4c: withdrawal with no recorded signatures → quarantine (can't verify, double-payout risk).
+// Withdrawal with no recorded signatures -> quarantine (can't verify, double-payout risk).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it4c_withdrawal_no_signatures_quarantined() {
-    let (db, url, _container) = start_pg("it4c_no_sigs").await;
+async fn withdrawal_no_signatures_quarantined() {
+    let (db, url, _container) = start_pg("wd_no_sigs").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -491,12 +659,12 @@ async fn it4c_withdrawal_no_signatures_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "manual_review");
-    // No RPC needed — empty signature set short-circuits before classification.
+    // No RPC needed - empty signature set short-circuits before classification.
     assert_eq!(mock.call_count("getSignatureStatuses"), 0);
     assert_eq!(mock.call_count("sendTransaction"), 0);
     let update = storage_rx
@@ -512,16 +680,16 @@ async fn it4c_withdrawal_no_signatures_quarantined() {
         "quarantined",
         "withdrawal",
         metric_before,
-        "IT-4c",
+        "withdrawal no signatures quarantined",
     );
     mock.shutdown().await;
 }
 
-// IT-4d: RPC uncertainty during classification → quarantine, never demote.
+// RPC uncertainty during classification -> quarantine, never demote.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it4d_withdrawal_rpc_uncertain_quarantined() {
-    let (db, url, _container) = start_pg("it4d_uncertain").await;
+async fn withdrawal_rpc_uncertain_quarantined() {
+    let (db, url, _container) = start_pg("wd_uncertain").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -534,7 +702,7 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // getSignatureStatuses fails on every retry → Uncertain.
+    // getSignatureStatuses fails on every retry -> Uncertain.
     mock.enqueue_sequence(
         "getSignatureStatuses",
         vec![
@@ -548,7 +716,7 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -571,16 +739,16 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
         "quarantined",
         "withdrawal",
         metric_before,
-        "IT-4d",
+        "withdrawal rpc uncertain quarantined",
     );
     mock.shutdown().await;
 }
 
-// IT-4e: GC backstop reclaims release sigs whose parent left Processing.
+// GC backstop reclaims release sigs whose parent left Processing.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it4e_gc_reclaims_non_processing_release_sigs() {
-    let (db, url, _container) = start_pg("it4e_gc").await;
+async fn gc_reclaims_non_processing_release_sigs() {
+    let (db, url, _container) = start_pg("gc_reclaim").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -612,7 +780,7 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // recover_once runs gc_stale_release_signatures at the top of the sweep.
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -635,12 +803,12 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     mock.shutdown().await;
 }
 
-// IT-5 / IT-D5: deposit with a persisted signature but an RPC that cannot classify it.
+// Deposit with a persisted signature but an RPC that cannot classify it.
 // ManualReview (never a silent demote, which would risk a double-mint).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
-    let (db, url, _container) = start_pg("it5_rpc_down").await;
+async fn rpc_failure_deposit_quarantines_to_manual_review() {
+    let (db, url, _container) = start_pg("dep_rpc_down").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -669,7 +837,7 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -687,16 +855,22 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
         err.contains("could not verify mint landed"),
         "reason should match runbook substring: {err}"
     );
-    assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-5");
+    assert_recovered_increment(
+        "escrow",
+        "quarantined",
+        "deposit",
+        metric_before,
+        "deposit rpc failure quarantined",
+    );
     mock.shutdown().await;
 }
 
-// IT-6: a malformed persisted signature is uncertainty (never read as "dead"),
+// A malformed persisted signature is uncertainty (never read as "dead"),
 // quarantine via the shared load_pending_sigs path, with no RPC consulted.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it6_malformed_stored_sig_quarantines_deposit() {
-    let (db, url, _container) = start_pg("it6_malformed_sig").await;
+async fn malformed_stored_sig_quarantines_deposit() {
+    let (db, url, _container) = start_pg("dep_malformed_sig").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -716,7 +890,7 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -739,15 +913,21 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
         err.contains("malformed stored release signature"),
         "reason should name the malformed signature: {err}"
     );
-    assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-6");
+    assert_recovered_increment(
+        "escrow",
+        "quarantined",
+        "deposit",
+        metric_before,
+        "deposit malformed signature quarantined",
+    );
     mock.shutdown().await;
 }
 
-// IT-7: fresh row is untouched (no RPC, no DB write).
+// A fresh row is untouched (no RPC, no DB write).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it7_fresh_processing_row_untouched() {
-    let (db, url, _container) = start_pg("it7_fresh").await;
+async fn fresh_processing_row_untouched() {
+    let (db, url, _container) = start_pg("fresh_row").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -756,7 +936,7 @@ async fn it7_fresh_processing_row_untouched() {
     let recipient = Pubkey::new_unique();
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
-    // Flip to processing without backdating — updated_at is "now".
+    // Flip to processing without backdating - updated_at is "now".
     sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
         .bind(tx_id)
         .execute(&pool)
@@ -768,7 +948,7 @@ async fn it7_fresh_processing_row_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -792,11 +972,11 @@ async fn it7_fresh_processing_row_untouched() {
     mock.shutdown().await;
 }
 
-// IT-8: conditional write is a no-op if the row moved between SELECT and write.
+// The conditional write is a no-op if the row moved between SELECT and write.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it8_conditional_write_noops_when_row_moved() {
-    let (db, url, _container) = start_pg("it8_cond").await;
+async fn conditional_write_noops_when_row_moved() {
+    let (db, url, _container) = start_pg("cond_write").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
 
@@ -807,7 +987,7 @@ async fn it8_conditional_write_noops_when_row_moved() {
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
     let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
-    // Race: row already moved off Processing → try_requeue returns false.
+    // Race: row already moved off Processing -> try_requeue returns false.
     sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
         .bind(tx_id)
         .execute(&pool)
@@ -830,11 +1010,11 @@ async fn it8_conditional_write_noops_when_row_moved() {
     );
 }
 
-// IT-9: lagging terminal write cannot stomp a recovery demote.
+// A lagging terminal write cannot stomp a recovery demote.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
-    let (db, url, _container) = start_pg("it9_lagging").await;
+async fn lagging_terminal_write_no_ops_after_recovery_demote() {
+    let (db, url, _container) = start_pg("lagging_write").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -850,17 +1030,18 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
 
-    // Lagging in-flight write from dead operator — must no-op.
+    // Lagging in-flight write from dead operator - must no-op.
     db.update_transaction_status_internal(
         tx_id,
         private_channel_indexer::storage::common::models::TransactionStatus::Completed,
         Some("lagging-sig".to_string()),
         Utc::now(),
+        None,
     )
     .await
     .unwrap();
@@ -877,11 +1058,11 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     mock.shutdown().await;
 }
 
-// IT-10: 250-row backlog drained across multiple ticks.
+// A 250-row backlog drained across multiple ticks.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it10_backlog_batched_across_ticks() {
-    let (db, url, _container) = start_pg("it10_batched").await;
+async fn backlog_batched_across_ticks() {
+    let (db, url, _container) = start_pg("backlog_batched").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -924,7 +1105,7 @@ async fn it10_backlog_batched_across_ticks() {
 
     // Tick 1: should heal exactly RECOVERY_BATCH_LIMIT (100) rows.
     let t0 = std::time::Instant::now();
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     assert!(
@@ -939,10 +1120,10 @@ async fn it10_backlog_batched_across_ticks() {
     assert_eq!(pending_count, 100, "tick 1 must heal exactly the batch cap");
 
     // Ticks 2-3: drain the rest. Healed rows are excluded (trigger bumped updated_at).
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     let pending_count: i64 =
@@ -957,11 +1138,11 @@ async fn it10_backlog_batched_across_ticks() {
     mock.shutdown().await;
 }
 
-// IT-11: PendingRemint rows are NOT touched by recovery.
+// PendingRemint rows are NOT touched by recovery.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it11_pending_remint_rows_untouched() {
-    let (db, url, _container) = start_pg("it11_pending_remint").await;
+async fn pending_remint_rows_untouched() {
+    let (db, url, _container) = start_pg("pending_remint_db").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -1002,7 +1183,7 @@ async fn it11_pending_remint_rows_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1014,11 +1195,11 @@ async fn it11_pending_remint_rows_untouched() {
     mock.shutdown().await;
 }
 
-// IT-12: withdrawal with NULL nonce → ManualReview (runbook reason string).
+// Withdrawal with NULL nonce -> ManualReview (runbook reason string).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it12_withdrawal_missing_nonce_quarantines() {
-    let (db, url, _container) = start_pg("it12_missing_nonce").await;
+async fn withdrawal_missing_nonce_quarantines() {
+    let (db, url, _container) = start_pg("missing_nonce").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -1039,7 +1220,7 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1056,17 +1237,17 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
         "quarantined",
         "withdrawal",
         metric_before,
-        "IT-12",
+        "withdrawal missing nonce quarantined",
     );
     mock.shutdown().await;
 }
 
-// IT-13: a deposit that keeps coming back NotLanded is quarantined once it hits
-// the requeue cap instead of looping pending→processing→pending forever.
+// A deposit that keeps coming back NotLanded is quarantined once it hits
+// the requeue cap instead of looping pending->processing->pending forever.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it13_recovery_requeue_cap_quarantines_after_max() {
-    let (db, url, _container) = start_pg("it13_requeue_cap").await;
+async fn recovery_requeue_cap_quarantines_after_max() {
+    let (db, url, _container) = start_pg("requeue_cap").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -1100,7 +1281,7 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1120,7 +1301,13 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
         "alert must name the requeue cap and its count: {err}"
     );
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-13");
+    assert_recovered_increment(
+        "escrow",
+        "quarantined",
+        "deposit",
+        metric_before,
+        "deposit requeue cap quarantined",
+    );
     mock.shutdown().await;
 }
 
@@ -1190,7 +1377,7 @@ async fn threshold_boundary_returns_only_strictly_older_rows() {
     );
 }
 
-// ── ownership-checked deposit claim: the double-mint invariant end-to-end ─────
+// -- ownership-checked deposit claim: the double-mint invariant end-to-end -----
 //
 // One escrow deposit must produce at most one channel mint even when the
 // recovery worker demotes a row while a live in-memory Mint builder still
@@ -1243,7 +1430,7 @@ async fn drive_first_fire(
     .await;
 }
 
-// IT1: a stale sender-owned builder whose row recovery already demoted must NOT
+// A stale sender-owned builder whose row recovery already demoted must NOT
 // broadcast. This is the exact reported bug, closed.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_owned_builder_does_not_double_mint() {
@@ -1270,9 +1457,15 @@ async fn stale_owned_builder_does_not_double_mint() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // Recovery sees empty sigs and demotes the row to Pending (bumping updated_at).
-    test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &recovery_client,
+        ProgramType::Escrow,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
 
     let metric = OPERATOR_TRANSACTION_ERRORS.with_label_values(&["escrow", OWNERSHIP_LOST_REASON]);
@@ -1354,9 +1547,15 @@ async fn stale_jit_refire_does_not_double_mint() {
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let recovery_client = test_client(mock.url());
-    test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &recovery_client,
+        ProgramType::Escrow,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
     let sigs_after_demote = db.get_release_signatures_internal(tx_id).await.unwrap();
 
@@ -1412,7 +1611,7 @@ async fn stale_jit_refire_does_not_double_mint() {
     mock.shutdown().await;
 }
 
-// IT2: an owned deposit mints exactly once. The happy-path oracle proving the
+// An owned deposit mints exactly once. The happy-path oracle proving the
 // guard does not strangle a legitimate mint.
 #[tokio::test(flavor = "multi_thread")]
 async fn owned_deposit_mints_once() {
@@ -1472,7 +1671,7 @@ async fn owned_deposit_mints_once() {
     mock.shutdown().await;
 }
 
-// IT3: demote then re-fetch, then drive BOTH the stale first builder and the
+// Demote then re-fetch, then drive BOTH the stale first builder and the
 // second builder. Exactly one mint broadcasts across the whole sequence.
 #[tokio::test(flavor = "multi_thread")]
 async fn demote_then_refetch_mints_exactly_once() {
@@ -1501,9 +1700,15 @@ async fn demote_then_refetch_mints_exactly_once() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // Recovery demotes B1's row to Pending.
-    test_hooks::run_recovery_once(&storage, &recovery_client, ProgramType::Escrow, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &recovery_client,
+        ProgramType::Escrow,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     // A fresh fetch re-locks the row as a new incarnation B2 with token T_lock2.
     let relocked = storage
@@ -1537,7 +1742,7 @@ async fn demote_then_refetch_mints_exactly_once() {
     mock.shutdown().await;
 }
 
-// ── cross-operator recovery and the reopened-row gate ───────────────────────
+// -- cross-operator recovery and the reopened-row gate -----------------------
 
 // The reported exploit end-to-end: a stale Processing deposit whose mint landed
 // on the channel is invisible to the withdraw operator's sweep (whose Solana
@@ -1575,9 +1780,15 @@ async fn cross_operator_recovery_does_not_replay_deposit_mint() {
     let solana_client = test_client(solana.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &solana_client, ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &solana_client,
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         status_of(&pool, tx_id).await,
         "processing",
@@ -1605,9 +1816,15 @@ async fn cross_operator_recovery_does_not_replay_deposit_mint() {
         })),
     );
     let channel_client = test_client(channel.url());
-    test_hooks::run_recovery_once(&storage, &channel_client, ProgramType::Escrow, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &channel_client,
+        ProgramType::Escrow,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "completed");
     assert_eq!(
         counterpart_sig_of(&pool, tx_id).await,

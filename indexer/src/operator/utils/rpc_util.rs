@@ -1,10 +1,11 @@
+use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-use solana_client::rpc_response::Response;
+use solana_client::rpc_response::{Response, RpcBlockhash};
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
-use solana_rpc_client_api::config::RpcTransactionConfig;
-use solana_rpc_client_api::request::RpcError;
+use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcTransactionConfig};
+use solana_rpc_client_api::request::{RpcError, RpcRequest};
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
@@ -164,20 +165,26 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get the block height at an explicit commitment with retry. The release
-    /// verifier reads this at finalized before its account snapshot so a lagging
-    /// finalized root cannot masquerade as a fresh one.
-    pub async fn get_block_height_with_commitment(
+    /// Read the latest blockhash at `commitment` together with the response
+    /// context slot, returning `(context_slot, last_valid_block_height)`. One RPC
+    /// call so the slot and height come from the same backend and are mutually
+    /// consistent. The release verifier reads this at finalized to anchor a
+    /// freshness point it can then bind an account snapshot to via min_context_slot.
+    pub async fn get_latest_blockhash_with_context(
         &self,
         commitment: CommitmentConfig,
-    ) -> Result<u64, Box<client_error::Error>> {
+    ) -> Result<(u64, u64), Box<client_error::Error>> {
         self.with_retry(
-            "get_block_height_with_commitment",
+            "get_latest_blockhash_with_context",
             RetryPolicy::Idempotent,
             || async {
                 self.rpc_client
-                    .get_block_height_with_commitment(commitment)
+                    .send::<Response<RpcBlockhash>>(
+                        RpcRequest::GetLatestBlockhash,
+                        serde_json::json!([commitment]),
+                    )
                     .await
+                    .map(|resp| (resp.context.slot, resp.value.last_valid_block_height))
             },
         )
         .await
@@ -260,6 +267,35 @@ impl RpcClientWithRetry {
             || async {
                 self.rpc_client
                     .get_account_with_commitment(pubkey, commitment)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Like `get_account_with_context`, but requires the node to answer from a
+    /// snapshot whose context slot is at least `min_context_slot`. If the node
+    /// cannot serve at that slot (a lagging or load-balanced backend) it returns
+    /// an RPC error rather than an older snapshot, letting the caller fail closed.
+    /// This binds the returned account to a slot the caller has already proven fresh.
+    pub async fn get_account_with_context_min_slot(
+        &self,
+        pubkey: &Pubkey,
+        commitment: CommitmentConfig,
+        min_context_slot: Option<u64>,
+    ) -> Result<Response<Option<Account>>, Box<client_error::Error>> {
+        self.with_retry(
+            "get_account_with_context_min_slot",
+            RetryPolicy::Idempotent,
+            || async {
+                let config = RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    data_slice: None,
+                    commitment: Some(commitment),
+                    min_context_slot,
+                };
+                self.rpc_client
+                    .get_account_with_config(pubkey, config)
                     .await
             },
         )

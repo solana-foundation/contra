@@ -419,11 +419,17 @@ async fn withdrawal_dead_signature_demoted() {
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
-    // Release-verify gate on the Dead arm: a finalized height (1000) past the
-    // attempt lvbh (100) plus an on-chain root that excludes nonce 7 prove
-    // NotLanded, so the withdrawal is safe to demote. This getBlockHeight is the
-    // verifier's second read after the classifier's expiry check consumed the first.
-    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Release-verify gate on the Dead arm: a finalized blockhash whose tip height
+    // (1000 - 150 = 850) is past the attempt lvbh (100), plus an on-chain root that
+    // excludes nonce 7, prove NotLanded, so the withdrawal is safe to demote. The
+    // verifier binds the account read to this blockhash's context slot.
+    mock.enqueue(
+        "getLatestBlockhash",
+        Reply::result(json!({
+            "context": {"slot": 500},
+            "value": {"blockhash": "11111111111111111111111111111111", "lastValidBlockHeight": 1000}
+        })),
+    );
     mock.enqueue(
         "getAccountInfo",
         instance_account_reply(smt_root(0, &[]), 0),
@@ -498,11 +504,17 @@ async fn withdrawal_dead_but_landed_completes_without_double_pay() {
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
-    // Release-verify gate: a finalized height (1000) past the attempt lvbh (100)
-    // plus an on-chain root that INCLUDES nonce 7 prove the release Landed, so the
-    // withdrawal is completed, not re-paid. This getBlockHeight is the verifier's
-    // second read after the classifier's expiry check consumed the first.
-    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Release-verify gate: a finalized blockhash whose tip height (1000 - 150 = 850)
+    // is past the attempt lvbh (100), plus an on-chain root that INCLUDES nonce 7,
+    // prove the release Landed, so the withdrawal is completed, not re-paid. The
+    // verifier binds the account read to this blockhash's context slot.
+    mock.enqueue(
+        "getLatestBlockhash",
+        Reply::result(json!({
+            "context": {"slot": 500},
+            "value": {"blockhash": "11111111111111111111111111111111", "lastValidBlockHeight": 1000}
+        })),
+    );
     mock.enqueue(
         "getAccountInfo",
         instance_account_reply(smt_root(0, &[nonce as u64]), 0),

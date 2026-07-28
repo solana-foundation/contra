@@ -1113,23 +1113,25 @@ mod tests {
     /// getAccountInfo returning an escrow instance whose root proves `nonce` did
     /// NOT land (empty completed set), fresh enough to pass the freshness gate, so
     /// the SMT verify resolves NotLanded and the Dead branch remints exactly as it
-    /// did before the gate existed. Also registers a fresh finalized getBlockHeight
-    /// (read first by the verifier) so the freshness check passes. Feature-proof: tree_index is
-    /// derived from the same MAX_TREE_LEAVES the verifier uses.
+    /// did before the gate existed. Also registers a fresh finalized getLatestBlockhash
+    /// (the verifier's freshness anchor). It matches only the finalized commitment so
+    /// the remint's own confirmed getLatestBlockhash on the source path is untouched.
+    /// Feature-proof: tree_index is derived from the same MAX_TREE_LEAVES the verifier uses.
     fn mock_instance_not_landed(server: &mut mockito::Server, nonce: u64) -> mockito::Mock {
         use crate::operator::utils::smt_util::SmtState;
         use base64::{engine::general_purpose::STANDARD, Engine};
         use borsh::BorshSerialize;
         use private_channel_escrow_program_client::Instance;
-        // Finalized height well above any lvbh in these tests, so the freshness check passes.
+        // Finalized tip well above any lvbh in these tests, so the freshness check passes.
         server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getBlockHeight""#.into(),
-            ))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getLatestBlockhash""#.into()),
+                mockito::Matcher::Regex(r#""finalized""#.into()),
+            ]))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"jsonrpc":"2.0","result":1000000000,"id":0}"#)
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":1000000000},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000000000}},"id":0}"#)
             .create();
         let tree_index = nonce / MAX_TREE_LEAVES as u64;
         let root = SmtState::new(tree_index).current_root();
@@ -1670,11 +1672,11 @@ mod tests {
             r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":0}"#,
         )
         .await;
-        // Finalized height 1_000_000 > max_lvbh 100 so the freshness check passes.
+        // Finalized tip 1_000_000 - 150 > max_lvbh 100 so the freshness check passes.
         mock_rpc(
             &mut rpc_server,
-            "getBlockHeight",
-            r#"{"jsonrpc":"2.0","result":1000000,"id":0}"#,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1000000},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000000}},"id":0}"#,
         )
         .await;
         // On-chain root includes nonce 3 so the verifier resolves Landed.
@@ -1765,11 +1767,11 @@ mod tests {
             r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":0}"#,
         )
         .await;
-        // Finalized height 100 == max_lvbh 100, so the freshness check fails closed to Uncertain.
+        // Finalized tip 250 - 150 = 100 == max_lvbh 100, so freshness fails closed to Uncertain.
         mock_rpc(
             &mut rpc_server,
-            "getBlockHeight",
-            r#"{"jsonrpc":"2.0","result":100,"id":0}"#,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":500},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":250}},"id":0}"#,
         )
         .await;
         {

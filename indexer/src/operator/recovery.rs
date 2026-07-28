@@ -766,6 +766,27 @@ mod tests {
             .create()
     }
 
+    /// Finalized getLatestBlockhash carrying `context_slot` and `lvbh`, the verifier's
+    /// freshness anchor: it derives tip = lvbh - MAX_PROCESSING_AGE and binds the
+    /// instance account read to `context_slot`. Pick lvbh so tip is above (fresh) or
+    /// at/below (stale) the attempt's lvbh.
+    fn mock_latest_blockhash(
+        server: &mut mockito::ServerGuard,
+        context_slot: u64,
+        lvbh: u64,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{context_slot}}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{lvbh}}}}},"id":1}}"#
+            ))
+            .create()
+    }
+
     /// Covered ledger floor so an absence-Dead resolves to Dead, not a prune.
     fn mock_first_available_block(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
         server
@@ -1088,7 +1109,9 @@ mod tests {
     async fn check_withdrawal_demotes_when_signature_dead() {
         let mut server = mockito::Server::new_async().await;
         mock_dead_by_absence(&mut server);
-        // On-chain tree 0 has no completed nonces; snapshot slot 1000 > lvbh 100.
+        // Fresh finalized tip (1000 - 150 = 850 > lvbh 100) binds the account read.
+        let _bh = mock_latest_blockhash(&mut server, 500, 1000);
+        // On-chain tree 0 has no completed nonces; snapshot slot 1000 >= bound slot.
         let _account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 1000, 1);
 
         let mock = MockStorage::new();
@@ -1119,7 +1142,9 @@ mod tests {
     async fn check_withdrawal_completes_when_smt_proves_landed() {
         let mut server = mockito::Server::new_async().await;
         mock_dead_by_absence(&mut server);
-        // On-chain tree 0 includes nonce 3; snapshot slot 1000 > lvbh 100.
+        // Fresh finalized tip (1000 - 150 = 850 > lvbh 100) binds the account read.
+        let _bh = mock_latest_blockhash(&mut server, 500, 1000);
+        // On-chain tree 0 includes nonce 3; snapshot slot 1000 >= bound slot.
         let _account = mock_instance_at_slot(&mut server, smt_root(0, &[3]), 0, 1000, 1);
 
         let mock = MockStorage::new();
@@ -1157,7 +1182,8 @@ mod tests {
     /// IR3: a Dead release whose finalized snapshot is not past the validity window
     /// is Uncertain, so it Quarantines (fails closed, never demotes). The release is
     /// finalized-failed so the classifier returns Dead without a block-height read,
-    /// leaving the verifier's finalized getBlockHeight the only one, mocked stale.
+    /// leaving the verifier's finalized getLatestBlockhash the only freshness read,
+    /// mocked stale. The stale gate short-circuits before the bound account read.
     #[tokio::test]
     async fn check_withdrawal_quarantines_when_snapshot_stale() {
         let mut server = mockito::Server::new_async().await;
@@ -1171,17 +1197,10 @@ mod tests {
                 r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":1}"#,
             )
             .create();
-        // Finalized height 100 == lvbh 100, so the freshness check fails closed to Uncertain.
-        server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getBlockHeight""#.into(),
-            ))
-            .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","result":100,"id":1}"#)
-            .create();
-        // Root would say NotLanded, but the stale height gates it to Uncertain.
-        let _account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 999, 1);
+        // Finalized tip 250 - 150 = 100 == lvbh 100, so freshness fails closed to Uncertain.
+        let _bh = mock_latest_blockhash(&mut server, 500, 250);
+        // The stale gate returns before the account read, so this must never fire.
+        let account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 999, 0);
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(3));
@@ -1202,6 +1221,7 @@ mod tests {
             matches!(action, WithdrawalAction::Quarantine { .. }),
             "stale snapshot must Quarantine, never Demote"
         );
+        account.assert(); // stale gate short-circuits before the bound account read
     }
 
     /// F1: the classifier's finalized-success fast path completes WITHOUT the

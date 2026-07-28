@@ -216,6 +216,17 @@ pub async fn fill_slot_range(
     Ok(processed_count)
 }
 
+/// Resolved startup boundary shared by both producers. Backfill fills `gap` and the
+/// live RPC source resumes at `live_start_slot`, so the two meet with no hole and no
+/// overlap: `live_start_slot` is one past the highest slot backfill covers (or one past
+/// the durable checkpoint when there is no gap).
+pub struct StartupRange {
+    /// Range backfill must fill `(from_slot, target]`, or `None` when there's no gap.
+    pub gap: Option<(u64, u64)>,
+    /// First slot the live RPC source must request.
+    pub live_start_slot: u64,
+}
+
 /// Backfill service for recovering missed slots on startup
 pub struct BackfillService {
     storage: Arc<Storage>,
@@ -250,7 +261,9 @@ impl BackfillService {
     ///
     /// The caller resolves the range once and uses it for two things — gating the
     /// checkpoint writer and driving the fill — so both see the exact same bounds.
-    pub async fn resolve_range(&self) -> Result<Option<(u64, u64)>, IndexerError> {
+    /// It also carries `live_start_slot` so the live source resumes on the same
+    /// boundary and no slot is skipped between backfill and the live stream.
+    pub async fn resolve_range(&self) -> Result<StartupRange, IndexerError> {
         info!(
             "Checking for gaps in indexed data for {:?}...",
             self.program_type
@@ -312,6 +325,10 @@ impl BackfillService {
             }
         };
 
+        // One past the highest slot backfill covers (gap) or the durable checkpoint
+        // (no gap); max guards against an RPC node lagging behind the checkpoint.
+        let live_start_slot = std::cmp::max(from_slot, current_slot) + 1;
+
         match validate_gap(current_slot, from_slot, self.config.max_gap_slots)
             .map_err(DataSourceError::from)?
         {
@@ -320,14 +337,20 @@ impl BackfillService {
                     "No gap detected for {:?}. Current slot: {}, From slot: {}",
                     self.program_type, current_slot, from_slot
                 );
-                Ok(None)
+                Ok(StartupRange {
+                    gap: None,
+                    live_start_slot,
+                })
             }
             Some(gap) => {
                 info!(
                     "Gap detected for {:?}: {} slots (from {} to {}). Starting backfill...",
                     self.program_type, gap, from_slot, current_slot
                 );
-                Ok(Some((from_slot, current_slot)))
+                Ok(StartupRange {
+                    gap: Some((from_slot, current_slot)),
+                    live_start_slot,
+                })
             }
         }
     }
@@ -357,7 +380,7 @@ impl BackfillService {
     /// Run the backfill process
     /// Returns Ok(()) if no gap or backfill successful, Err if gap too large or backfill failed
     pub async fn run(&self, instruction_tx: InstructionSender) -> Result<(), IndexerError> {
-        match self.resolve_range().await? {
+        match self.resolve_range().await?.gap {
             None => Ok(()),
             Some((from_slot, to_slot)) => self.run_range(from_slot, to_slot, instruction_tx).await,
         }
@@ -1015,6 +1038,89 @@ mod tests {
                 rx.try_recv().is_err(),
                 "no messages expected for zero-slot no-gap case"
             );
+        }
+
+        // ---- BackfillService::resolve_range — shared startup boundary ----
+
+        /// With a gap, the live source's first slot is exactly one past backfill's
+        /// target, so the two producers meet with no hole and no overlap.
+        #[tokio::test]
+        async fn resolve_range_gap_sets_live_start_to_target_plus_one() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 110);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            let range = service.resolve_range().await.unwrap();
+
+            assert_eq!(range.gap, Some((100, 110)));
+            assert_eq!(range.live_start_slot, 111);
+        }
+
+        /// No gap (tip == checkpoint): the live boundary is pinned one past the
+        /// durable checkpoint, not a freshly sampled tip.
+        #[tokio::test]
+        async fn resolve_range_no_gap_sets_live_start_to_checkpoint_plus_one() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 100);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            let range = service.resolve_range().await.unwrap();
+
+            assert_eq!(range.gap, None);
+            assert_eq!(range.live_start_slot, 101);
+        }
+
+        /// RPC node lagging behind the checkpoint: max guard keeps the live boundary
+        /// at checkpoint+1, never rewinding below the durable checkpoint.
+        #[tokio::test]
+        async fn resolve_range_no_gap_rpc_behind_uses_checkpoint_plus_one() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 50);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let config = make_config(&server.url(), 1000);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            let range = service.resolve_range().await.unwrap();
+
+            assert_eq!(range.gap, None);
+            assert_eq!(range.live_start_slot, 101);
+        }
+
+        /// A configured start_slot ahead of the tip flows through from_slot, so the
+        /// live source begins at start_slot, preserving operator intent.
+        #[tokio::test]
+        async fn resolve_range_start_slot_ahead_sets_live_start_to_start_slot() {
+            let mut server = Server::new_async().await;
+            let _m_slot = mock_get_slot(&mut server, 150);
+
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage = Arc::new(Storage::Mock(mock));
+            let poller = make_poller(&server.url());
+            let mut config = make_config(&server.url(), 10_000);
+            config.start_slot = Some(200);
+
+            let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
+            let range = service.resolve_range().await.unwrap();
+
+            assert_eq!(range.gap, None);
+            assert_eq!(range.live_start_slot, 200);
         }
     }
 }

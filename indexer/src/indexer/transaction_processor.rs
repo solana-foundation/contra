@@ -1828,6 +1828,71 @@ mod tests {
         assert!(committed >= DEPOSIT_SLOT);
     }
 
+    /// With the shared startup boundary the live source resumes at target+1, so the
+    /// frontier folds through the gap and continues into the live slots with no hole:
+    /// gate `(100, 105]`, backfill fills 101..=105, live sends 106 and 107.
+    #[tokio::test]
+    async fn concurrent_backfill_hands_off_contiguously_to_live_start() {
+        const FROM: u64 = 100;
+        const T0: u64 = 105;
+        const DEPOSIT_SLOT: u64 = 103;
+        const LIVE_START: u64 = T0 + 1; // live source begins one past backfill's target
+        const LIVE_END: u64 = 107;
+        let (tx, processor_handle, checkpoint_handle, mock) =
+            spawn_pipeline(deposit_instance(), Some((FROM, T0)));
+
+        // A historical deposit inside the gap, then backfill closes the gap.
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            DEPOSIT_SLOT,
+            Some("dep-103".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        for slot in (FROM + 1)..=T0 {
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+
+        // The live source, starting at target+1, continues contiguously.
+        for slot in LIVE_START..=LIVE_END {
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+
+        drop(tx);
+        processor_handle.await.unwrap();
+        checkpoint_handle.await.unwrap();
+
+        // The checkpoint advances through the gap into the live slots with no hole.
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed, LIVE_END,
+            "checkpoint hands off from backfill's target into the live slots"
+        );
+
+        // The historical deposit row exists and every slot 101..=107 was covered.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0][0].slot, DEPOSIT_SLOT as i64);
+        assert!(
+            committed >= LIVE_END,
+            "no slot in 101..=107 is skipped between backfill and live"
+        );
+    }
+
     /// The exact reconnect residual-gap reproduction, end-to-end through the real
     /// pipeline: the residual window (T_gf, T_sub] must be indexed, never leapfrogged by
     /// the live tip that resumes above it. Removing the writer's Regate arm makes this

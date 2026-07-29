@@ -12,15 +12,17 @@ pub struct RpcBlock {
 
 /// Outcome of fetching one slot's block. The domain has three states:
 /// a proven-empty slot is safe to checkpoint past, but a slot the endpoint
-/// cannot serve (pruned or snapshot-jumped) has unknown contents and must never
+/// cannot serve has unknown contents and must never
 /// be checkpointed past. Transport and protocol failures stay on the outer
 /// `Result::Err` so existing error handling is untouched.
 #[derive(Debug, Clone)]
 pub enum BlockFetch {
     Present(RpcBlock),
-    /// Node retains the ledger region and reports no block: safe to advance.
+    /// A later block's `parentSlot` names the previous proven slot, which proves
+    /// nothing was produced here: safe to advance.
     Skipped,
-    /// Pruned or snapshot-jumped past: contents unknown, must not advance.
+    /// A block exists at this slot and this endpoint will not serve it, so its
+    /// contents are unknown: must not advance.
     Unavailable,
 }
 

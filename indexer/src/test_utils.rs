@@ -100,6 +100,20 @@ pub mod rpc_blocks {
         }
     }
 
+    /// Create a transaction whose meta is present but carries a null
+    /// innerInstructions list, the shape a chain that records none returns.
+    pub fn create_transaction_incomplete_meta(
+        signature: String,
+        account_keys: Vec<String>,
+        instructions: Vec<CompiledInstruction>,
+    ) -> RpcTransactionWithMeta {
+        let mut tx = create_successful_transaction(signature, account_keys, instructions);
+        if let Some(meta) = tx.meta.as_mut() {
+            meta.inner_instructions = None;
+        }
+        tx
+    }
+
     /// Create a compiled instruction
     pub fn create_instruction(
         program_id_index: u8,
@@ -173,17 +187,108 @@ pub mod rpc_mocks {
     use mockito::{Mock, Server};
     use serde_json::json;
 
-    /// Mock `getFirstAvailableBlock` replying with `floor`. Body-matched so it only
-    /// answers the floor call and coexists with the getBlock mocks in the same test.
-    pub fn mock_first_available_block(server: &mut Server, floor: u64) -> Mock {
+    /// Mock `getBlocks(start, end)` replying with the slots that produced a block.
+    /// Body-matched on method and range so it coexists with the getBlock mocks.
+    pub fn mock_get_blocks(server: &mut Server, start: u64, end: u64, produced: &[u64]) -> Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
-                "method": "getFirstAvailableBlock"
+                "method": "getBlocks",
+                "params": [start, end]
             })))
             .with_status(200)
-            .with_body(json!({ "jsonrpc": "2.0", "result": floor, "id": 1 }).to_string())
+            .with_body(json!({ "jsonrpc": "2.0", "result": produced, "id": 1 }).to_string())
             .create()
+    }
+
+    /// Mock `getBlocks` failing with a JSON-RPC error, for the enumeration-failure path.
+    pub fn mock_get_blocks_error(server: &mut Server, code: i32, message: &str) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlocks"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": code, "message": message },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Mock `getBlocksWithLimit(start, ..)`, the lookup that finds the tail witness.
+    /// An empty `produced` is the "no witness listed" case.
+    pub fn mock_get_blocks_with_limit(server: &mut Server, start: u64, produced: &[u64]) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlocksWithLimit",
+                "params": [start]
+            })))
+            .with_status(200)
+            .with_body(json!({ "jsonrpc": "2.0", "result": produced, "id": 1 }).to_string())
+            .create()
+    }
+
+    /// Mock `getBlock(slot)` returning an empty block whose header names `parent_slot`.
+    /// The parent link is what the classifier proves absence with.
+    pub fn mock_get_block_at(server: &mut Server, slot: u64, parent_slot: u64) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": format!("TestBlockHash{slot}"),
+                        "parentSlot": parent_slot,
+                        "transactions": []
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Mock `getBlock(slot)` answering one of the skipped-or-missing error codes
+    /// (-32004 / -32007 / -32009) that a node returns when it cannot serve a slot.
+    pub fn mock_get_block_absent(server: &mut Server, slot: u64, code: i32) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": code, "message": "Slot skipped or missing" },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Register a whole scenario in one line: the `getBlocks` enumeration over
+    /// `[start, end]` plus one `getBlock` per `(slot, parent_slot)` producer.
+    pub fn chain(server: &mut Server, start: u64, end: u64, producers: &[(u64, u64)]) -> Vec<Mock> {
+        let slots: Vec<u64> = producers.iter().map(|(slot, _)| *slot).collect();
+        let mut mocks = vec![mock_get_blocks(server, start, end, &slots)];
+        for (slot, parent) in producers {
+            mocks.push(mock_get_block_at(server, *slot, *parent));
+        }
+        mocks
     }
 
     /// Create a mock JSON-RPC response with a successful result

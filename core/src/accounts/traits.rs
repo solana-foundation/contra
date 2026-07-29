@@ -105,6 +105,10 @@ impl AccountsDB {
         super::get_blocks::get_blocks(self, start_slot, end_slot).await
     }
 
+    pub async fn get_blocks_with_limit(&self, start_slot: u64, limit: u64) -> Result<Vec<u64>> {
+        super::get_blocks_with_limit::get_blocks_with_limit(self, start_slot, limit).await
+    }
+
     pub async fn get_blocks_in_range(
         &self,
         start_slot: u64,
@@ -339,6 +343,54 @@ mod tests {
 
         let slots = db.get_blocks(0, Some(20)).await.unwrap();
         assert_eq!(slots, vec![1, 3, 7, 10]);
+    }
+
+    /// Postgres and Redis must agree exactly here: they are two hand-written
+    /// queries against different index structures, which is where they can
+    /// silently diverge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_blocks_with_limit_returns_slots_in_order() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        for slot in [3, 7, 1, 10] {
+            db.store_block(create_test_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.get_blocks_with_limit(0, 10).await.unwrap(),
+            vec![1, 3, 7, 10]
+        );
+        assert_eq!(db.get_blocks_with_limit(0, 2).await.unwrap(), vec![1, 3]);
+        assert_eq!(db.get_blocks_with_limit(4, 10).await.unwrap(), vec![7, 10]);
+        assert!(db.get_blocks_with_limit(0, 0).await.unwrap().is_empty());
+        assert!(db.get_blocks_with_limit(11, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_blocks_with_limit_redis_returns_slots_in_order() {
+        let (redis_raw, _redis) = start_test_redis().await;
+        let mut db = AccountsDB::Redis(redis_raw);
+
+        for slot in [3u64, 7, 1, 10] {
+            db.write_batch(
+                &[],
+                vec![],
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.get_blocks_with_limit(0, 10).await.unwrap(),
+            vec![1, 3, 7, 10]
+        );
+        assert_eq!(db.get_blocks_with_limit(0, 2).await.unwrap(), vec![1, 3]);
+        assert_eq!(db.get_blocks_with_limit(4, 10).await.unwrap(), vec![7, 10]);
+        assert!(db.get_blocks_with_limit(0, 0).await.unwrap().is_empty());
+        assert!(db.get_blocks_with_limit(11, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

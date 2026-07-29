@@ -185,7 +185,7 @@ Within the payment channel, transactions are processed through a **five-stage pi
 
 The indexer monitors Solana Mainnet and your payment channel for deposits and withdrawals. It supports **two datasource strategies**:
 
-1. **RPC Polling**: Fetches blocks sequentially via `getBlock` RPC calls
+1. **RPC Polling**: Enumerates producing slots with `getBlocks`, then fetches those blocks in parallel via `getBlock`
 2. **Yellowstone gRPC**: Real-time block streaming via gRPC (Yellowstone protocol)
 
 Both strategies parse Escrow/Withdraw Program instructions and write to PostgreSQL. The indexer automatically **backfills missing slots** on restart using parallel RPC batch fetching. An Operator service monitors new transactions in the database to trigger new mints in the channel or withdrawals back to Mainnet, ensuring synchronization.

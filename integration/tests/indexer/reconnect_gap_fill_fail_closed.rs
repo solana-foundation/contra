@@ -86,8 +86,8 @@ async fn mock_block_ok(server: &mut MockitoServer, slot: u64) -> mockito::Mock {
         .await
 }
 
-/// Slot answers -32009 below the retention floor, so the poller reports it
-/// Unavailable and the fill aborts before any SlotComplete.
+/// The enumeration lists this slot as a producer but getBlock will not serve it,
+/// so the poller reports it Unavailable and the fill aborts before any SlotComplete.
 async fn mock_block_pruned(
     server: &mut MockitoServer,
     slot: u64,
@@ -112,17 +112,28 @@ async fn mock_block_pruned(
         .await
 }
 
-async fn mock_retention_floor(server: &mut MockitoServer, floor: u64) -> mockito::Mock {
+/// The `getBlocks` enumeration over the gap-fill range. Every slot in it produced
+/// a block, so the chain proof turns entirely on whether each one can be fetched.
+async fn mock_produced_slots(
+    server: &mut MockitoServer,
+    start: u64,
+    end: u64,
+    produced: &[u64],
+) -> mockito::Mock {
     server
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(
-            json!({"method": "getFirstAvailableBlock"}),
+            json!({"method": "getBlocks", "params": [start, end]}),
         ))
         .with_status(200)
-        .with_body(json!({"jsonrpc": "2.0", "result": floor, "id": 1}).to_string())
+        .with_body(json!({"jsonrpc": "2.0", "result": produced, "id": 1}).to_string())
         .create_async()
         .await
 }
+
+/// The range the reconnect gap-fill covers in every test here: the checkpoint is
+/// replayed as the batch's first slot, so the batch is `[CHECKPOINT, TIP]`.
+const GAP_FILL_SLOTS: [u64; 4] = [CHECKPOINT, CHECKPOINT + 1, CHECKPOINT + 2, TIP];
 
 async fn wait_for_subscribes(ys: &MockYellowstoneServer, n: usize, secs: u64) {
     tokio::time::timeout(Duration::from_secs(secs), async {
@@ -226,8 +237,8 @@ async fn stalled_gap_fill_gates_checkpoint_then_recovers() {
     }
     // The boundary slot blocks: expect the initial attempt plus at least one retry,
     // proving the fill loops instead of resolving over the gap.
+    let _produced = mock_produced_slots(&mut rpc, CHECKPOINT, TIP, &GAP_FILL_SLOTS).await;
     let pruned = mock_block_pruned(&mut rpc, CHECKPOINT, 2).await;
-    let _floor = mock_retention_floor(&mut rpc, 500).await;
 
     let ys = MockYellowstoneServer::start().await;
     let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
@@ -297,8 +308,8 @@ async fn shutdown_while_gap_fill_stalled_joins_promptly() {
     for s in (CHECKPOINT + 1)..=TIP {
         let _m = mock_block_ok(&mut rpc, s).await;
     }
+    let _produced = mock_produced_slots(&mut rpc, CHECKPOINT, TIP, &GAP_FILL_SLOTS).await;
     let pruned = mock_block_pruned(&mut rpc, CHECKPOINT, 1).await;
-    let _floor = mock_retention_floor(&mut rpc, 500).await;
 
     let ys = MockYellowstoneServer::start().await;
     // Keep the receiver alive so the source's sends never fail on a closed channel.
@@ -349,8 +360,8 @@ async fn stalled_gap_fill_never_advances_checkpoint_over_live_tip() {
         let _m = mock_block_ok(&mut rpc, s).await;
     }
     // Never healed: the gap stays open for the whole test.
+    let _produced = mock_produced_slots(&mut rpc, CHECKPOINT, TIP, &GAP_FILL_SLOTS).await;
     let pruned = mock_block_pruned(&mut rpc, CHECKPOINT, 1).await;
-    let _floor = mock_retention_floor(&mut rpc, 500).await;
 
     let ys = MockYellowstoneServer::start().await;
     let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());

@@ -8,6 +8,11 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
+> **Two conditions are not webhook-routed.** The indexer's
+> **`block_unavailable`** wedge pages through Grafana instead, because it changes
+> no transaction row; see
+> [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
+>
 > **One halt has no dedicated alert.** The **SMT-root-mismatch boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
 > The common cause is auto-reconciled at boot; an unforeseen divergence the
@@ -83,6 +88,10 @@ The runbooks call this out at every relevant site.
   Every "escalate" call-site in the recovery runbooks links here.
 - [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
   the SMT-root-mismatch startup halt (log-discovered, not paged).
+- [`indexer_block_unavailable.md`](indexer_block_unavailable.md) - the indexer
+  refusing to checkpoint past a slot whose block the RPC endpoint will not serve.
+  Paged by the `indexer-block-unavailable` Grafana alert, not by the webhook
+  dispatch table above (no transaction row changes status).
 
 ## Drills
 

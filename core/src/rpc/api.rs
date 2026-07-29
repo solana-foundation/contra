@@ -105,6 +105,15 @@ pub trait PrivateChannelRpc {
         config: Option<RpcContextConfig>,
     ) -> RpcResult<Vec<u64>>;
 
+    /// Get the first `limit` confirmed blocks at or after `start_slot`
+    #[method(name = "getBlocksWithLimit")]
+    async fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: u64,
+        config: Option<RpcContextConfig>,
+    ) -> RpcResult<Vec<u64>>;
+
     /// Get information about the current epoch
     #[method(name = "getEpochInfo")]
     async fn get_epoch_info(&self, config: Option<RpcEpochConfig>) -> RpcResult<EpochInfo>;

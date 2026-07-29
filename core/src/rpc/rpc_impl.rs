@@ -8,6 +8,7 @@ use {
             get_block_impl::get_block_impl,
             get_block_time_impl::get_block_time_impl,
             get_blocks_impl::get_blocks_impl,
+            get_blocks_with_limit_impl::get_blocks_with_limit_impl,
             get_epoch_info_impl::get_epoch_info_impl,
             get_epoch_schedule_impl::get_epoch_schedule_impl,
             get_first_available_block_impl::get_first_available_block_impl,
@@ -179,6 +180,16 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     ) -> RpcResult<Vec<u64>> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_blocks_impl(read_deps, start_slot, end_slot, _config).await
+    }
+
+    async fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: u64,
+        _config: Option<RpcContextConfig>,
+    ) -> RpcResult<Vec<u64>> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_blocks_with_limit_impl(read_deps, start_slot, limit, _config).await
     }
 
     async fn get_epoch_info(&self, _config: Option<RpcEpochConfig>) -> RpcResult<EpochInfo> {

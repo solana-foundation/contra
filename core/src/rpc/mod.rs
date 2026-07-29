@@ -5,6 +5,7 @@ mod get_account_info_impl;
 mod get_block_impl;
 mod get_block_time_impl;
 mod get_blocks_impl;
+mod get_blocks_with_limit_impl;
 mod get_epoch_info_impl;
 mod get_epoch_schedule_impl;
 mod get_first_available_block_impl;
@@ -179,6 +180,45 @@ mod tests {
         let (db, _pg) = start_pg().await;
         let deps = make_read_deps(db);
         let result = get_blocks_impl::get_blocks_impl(&deps, 10, Some(5), None).await;
+        assert!(result.is_err());
+    }
+
+    // ── get_blocks_with_limit ─────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_with_limit_impl() {
+        let (mut db, _pg) = start_pg().await;
+        for slot in [5, 10, 15] {
+            db.store_block(make_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+        let deps = make_read_deps(db);
+        let blocks = get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 5, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(blocks, vec![5, 10]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_with_limit_zero_limit() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(5, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+        let blocks = get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 0, None)
+            .await
+            .unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_with_limit_exceeds_max() {
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+        let result =
+            get_blocks_with_limit_impl::get_blocks_with_limit_impl(&deps, 0, 500_001, None).await;
         assert!(result.is_err());
     }
 

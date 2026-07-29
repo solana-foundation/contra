@@ -6,7 +6,7 @@ The JSON-RPC *API surface* SPC exposes is consistent with Solana's. Every implem
 
 That said, divergence shows up in three distinct buckets:
 
-1. **Coverage gaps.** SPC implements 22 of Solana's ~50 methods. See [section 5](#5-appendix-solana-rpc-methods-missing-from-spc) for the full list.
+1. **Coverage gaps.** SPC implements 23 of Solana's ~50 methods. See [section 5](#5-appendix-solana-rpc-methods-missing-from-spc) for the full list.
 2. **Internal functionality gaps in implemented methods.** Same wire shape, less behavior - `minContextSlot` accepted-and-ignored, `searchTransactionHistory` accepted-and-ignored, `simulateTransaction` not decoding base58 input etc.
 3. **Semantic contract divergences** `getRecentBlockhash` returns the Solana-legacy constant `lamports_per_signature = 5000` that doesn't reflect SPC's gasless model.
 
@@ -22,7 +22,7 @@ The gateway enforces RBAC on a fixed list of methods (`gateway/src/auth.rs`):
 
 - **Operator-only methods:** `getBlock`, `getTransaction`, `simulateTransaction`. Missing/invalid JWT → 401 with JSON-RPC body `{"error":{"code":-32001,"message":"Unauthorized: valid JWT required"}}`. User-role JWT → 403 with `-32003` ("operator role required").
 - **Account-gated methods:** `getAccountInfo`, `getTokenAccountBalance`, `getSignaturesForAddress`. JWT required. Operator role → pass through. User role → the gateway fetches the target account via an internal `getAccountInfo` and inspects bytes for the SPL Token owner field and looks the pubkey up in the auth service's Postgres `verified_wallets` table. Mismatch → 403, `-32002` ("account not owned by caller"). DB error → 500, `-32603`. Missing pubkey in params → 400, `-32602`.
-- **All other methods (16 of them) are unauthenticated** even with auth on - they pass straight through to the read or write node.
+- **All other methods (17 of them) are unauthenticated** even with auth on - they pass straight through to the read or write node.
 
 ---
 
@@ -45,6 +45,7 @@ Ordered from most divergent → closest match.
 | `getSignaturesForAddress` **[auth]** | `limit`, `before`, `until` honoured. `minContextSlot` ignored. Default/max 1000 (matches Solana). |
 | `getAccountInfo` **[auth]** | `encoding`, `dataSlice` honoured. `minContextSlot` ignored. |
 | `getBlocks` | Max range 500_000 (matches Solana). When `end_slot` is omitted, SPC defaults to `start_slot + 500_000`; Solana defaults to latest slot. |
+| `getBlocksWithLimit` | Max limit 500_000 (matches Solana). `limit = 0` returns `[]`. Unauthenticated, like `getBlocks`: it discloses only which slots produced a block, never transaction contents. |
 | `getSlot` | `minContextSlot` ignored. Returns latest stored slot or 0. |
 | `getEpochSchedule` | SPC's actual schedule (one infinite epoch): `slotsPerEpoch = u64::MAX`, `leaderScheduleSlotOffset = 0`, `warmup = false`, `firstNormalEpoch = 0`, `firstNormalSlot = 0`. Same wire shape as Solana; explorers doing epoch math will overflow. |
 | `getEpochInfo` | Reflects SPC's schedule faithfully - epoch always 0, `slotsInEpoch = u64::MAX`, `slotIndex` = current slot. |
@@ -152,7 +153,6 @@ The list below enumerates the Solana JSON-RPC methods that have no SPC implement
 
 - `getBlockProduction`
 - `getBlockCommitment`
-- `getBlocksWithLimit`
 - `getSlotLeader` (singular; SPC has `getSlotLeaders` plural)
 - `getConfirmedBlock` (deprecated alias of `getBlock`)
 - `getConfirmedBlocks`

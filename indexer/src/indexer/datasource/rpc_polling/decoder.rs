@@ -27,6 +27,16 @@ type ParseInstructionFn<T> = fn(
 /// Returns a label for the first `meta`-less
 /// transaction in `block`, or `None` if all carry metadata; a single `meta: null`
 /// tx makes the slot unverifiable, so callers MUST fail closed on `Some(_)`.
+///
+/// A null `innerInstructions` list is deliberately NOT rejected here. Chains that
+/// record no inner instructions at all (the private-channel node among them) return
+/// null legitimately for every transaction, so rejecting it wedges them on every
+/// block.
+///
+/// This leaves a known gap on Solana: an escrow deposit whose event self-CPI has not
+/// been written yet passes this guard, decodes to no event, and the parser drops it
+/// with a warning. Distinguishing that from a chain with no inner instructions needs
+/// the parser, not this guard, and is deliberately not fixed here.
 pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
     for (index, tx_with_meta) in block.transactions.iter().enumerate() {
         if tx_with_meta.meta.is_none() {
@@ -635,6 +645,23 @@ mod tests {
         block.transactions.push(no_meta);
 
         assert_eq!(first_missing_meta(&block), Some("tx#1".to_string()));
+    }
+
+    /// A chain that records no inner instructions returns a null list on every
+    /// transaction. That is complete, not incomplete: rejecting it here would wedge
+    /// the private-channel indexer on its very first block.
+    #[test]
+    fn first_missing_meta_null_inner_instructions_is_not_missing_meta() {
+        let mut block = create_test_block();
+        let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        let ix = create_instruction(0, vec![], "data".to_string());
+        block.transactions.push(create_transaction_incomplete_meta(
+            "sig_no_inner".to_string(),
+            keys,
+            vec![ix],
+        ));
+
+        assert_eq!(first_missing_meta(&block), None);
     }
 
     /// An empty block carries no missing-meta transaction.

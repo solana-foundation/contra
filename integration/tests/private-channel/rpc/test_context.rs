@@ -162,6 +162,13 @@ impl PrivateChannelContext {
             .map_err(anyhow::Error::from)
     }
 
+    pub async fn get_blocks_with_limit(&self, start_slot: Slot, limit: usize) -> Result<Vec<Slot>> {
+        self.read_client
+            .get_blocks_with_limit(start_slot, limit)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     pub async fn get_recent_performance_samples(
         &self,
         limit: Option<usize>,

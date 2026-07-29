@@ -28,7 +28,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 **Location**: [`core/`](../core/)
 
 **Key Features**:
-- Five-stage transaction pipeline: Dedup → SigVerify → Sequencer → Executor → Settler
+- Five-stage transaction pipeline: SigVerify → Dedup → Sequencer → Executor → Settler
 - PostgreSQL-backed state with replication support
 - Read/write node separation for horizontal scaling
 - GaslessCallback for zero-fee transactions

@@ -32,6 +32,7 @@ pub fn create_test_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
         block_time: Some(1_700_000_000 + slot as i64),
         transaction_signatures: vec![],
         transaction_recent_blockhashes: vec![],
+        transaction_message_hashes: vec![],
     }
 }
 

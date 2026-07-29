@@ -104,7 +104,9 @@ pub struct SigverifyArgs {
     pub num_workers: usize,
     pub admin_keys: Vec<Pubkey>,
     pub rx: async_channel::Receiver<SanitizedTransaction>,
-    pub sequencer_tx: mpsc::Sender<SanitizedTransaction>,
+    /// Verified transactions are forwarded here to the single dedup consumer.
+    /// Sigverify runs before dedup so only verified transactions are ever cached.
+    pub output_tx: mpsc::Sender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<crate::health::StageHeartbeat>,
@@ -143,7 +145,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
         num_workers,
         admin_keys,
         rx,
-        sequencer_tx,
+        output_tx,
         shutdown_token,
         metrics,
         heartbeat,
@@ -153,7 +155,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
     // metrics is already an Arc; clone it for each worker
     for worker_id in 0..num_workers {
         let rx = rx.clone();
-        let tx = sequencer_tx.clone();
+        let tx = output_tx.clone();
         let shutdown = shutdown_token.clone();
         let admin_keys = admin_keys.clone();
         let metrics = Arc::clone(&metrics);
@@ -176,16 +178,16 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                     SigverifyResult::Valid(_) => {
                                         metrics.sigverify_forwarded();
                                         // Bounded send applies backpressure; race shutdown so a
-                                        // full sequencer queue never wedges worker exit.
+                                        // full dedup queue never wedges worker exit.
                                         tokio::select! {
                                             send_result = tx.send(transaction) => {
                                                 match send_result {
                                                     Ok(_) => {
-                                                        debug!("Worker {} sent transaction to sequencer", worker_id);
+                                                        debug!("Worker {} sent transaction to dedup", worker_id);
                                                     }
                                                     Err(_) => {
                                                         warn!(
-                                                            "Worker {} failed to send to sequencer - channel closed",
+                                                            "Worker {} failed to send to dedup - channel closed",
                                                             worker_id
                                                         );
                                                         break;
@@ -193,7 +195,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                                 }
                                             }
                                             _ = shutdown.cancelled() => {
-                                                debug!("Worker {} shutdown while sending to sequencer", worker_id);
+                                                debug!("Worker {} shutdown while sending to dedup", worker_id);
                                                 break;
                                             }
                                         }
@@ -432,7 +434,7 @@ mod tests {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
+            output_tx: sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
@@ -468,7 +470,7 @@ mod tests {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
+            output_tx: sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
@@ -530,7 +532,7 @@ mod tests {
             num_workers: 2,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
+            output_tx: sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
@@ -656,7 +658,7 @@ mod tests {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
+            output_tx: sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
@@ -694,7 +696,7 @@ mod tests {
             num_workers,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
+            output_tx: sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
@@ -754,7 +756,7 @@ mod tests {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
+            output_tx: sequencer_tx,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),

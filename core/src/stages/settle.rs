@@ -506,11 +506,13 @@ async fn settle_transactions(
     let t_processing_start = tokio::time::Instant::now();
     let mut block_transaction_signatures = Vec::with_capacity(n);
     let mut block_transaction_recent_blockhashes = Vec::with_capacity(n);
+    let mut block_transaction_message_hashes = Vec::with_capacity(n);
     let mut transactions_for_db = Vec::with_capacity(n);
 
     for (processing_result, sanitized_transaction) in processing_results.iter() {
         let signature = sanitized_transaction.signature();
         let recent_blockhash = *sanitized_transaction.message().recent_blockhash();
+        let message_hash = *sanitized_transaction.message_hash();
 
         // Only collect successful transactions for batch write
         if let Ok(processed_tx) = processing_result {
@@ -551,6 +553,7 @@ async fn settle_transactions(
 
                 block_transaction_signatures.push(*signature);
                 block_transaction_recent_blockhashes.push(recent_blockhash);
+                block_transaction_message_hashes.push(message_hash);
             }
             Ok(ProcessedTransaction::FeesOnly(fees_only_transaction)) => {
                 warn!("FeesOnly transaction: {:?}", fees_only_transaction);
@@ -561,12 +564,14 @@ async fn settle_transactions(
 
                 block_transaction_signatures.push(*signature);
                 block_transaction_recent_blockhashes.push(recent_blockhash);
+                block_transaction_message_hashes.push(message_hash);
             }
             Err(e) => {
                 warn!("Transaction failed: {:?}, error: {:?}", signature, e);
                 // Failed transactions still get recorded
                 block_transaction_signatures.push(*signature);
                 block_transaction_recent_blockhashes.push(recent_blockhash);
+                block_transaction_message_hashes.push(message_hash);
             }
         }
     }
@@ -599,6 +604,7 @@ async fn settle_transactions(
         block_time: Some(block_time),
         transaction_signatures: block_transaction_signatures,
         transaction_recent_blockhashes: block_transaction_recent_blockhashes,
+        transaction_message_hashes: block_transaction_message_hashes,
     };
 
     // Phase 2: Postgres write (source of truth, fatal on failure)
@@ -1568,6 +1574,10 @@ mod tests {
             solana_sdk::instruction::InstructionError::Custom(42),
         );
 
+        let mh1 = *tx1.message_hash();
+        let mh2 = *tx2.message_hash();
+        let mh3 = *tx3.message_hash();
+
         let results: Vec<(TransactionProcessingResult, _)> =
             vec![(Ok(executed), tx1), (Ok(fees_only), tx2), (Err(err), tx3)];
 
@@ -1599,6 +1609,13 @@ mod tests {
             block.transaction_signatures.len(),
             3,
             "all three signatures recorded"
+        );
+        // Message hashes are recorded for every outcome (Executed, FeesOnly, Err),
+        // in order, so the restart cache can be rebuilt across all paths.
+        assert_eq!(
+            block.transaction_message_hashes,
+            vec![mh1, mh2, mh3],
+            "message hashes recorded in order across Executed/FeesOnly/Err"
         );
     }
 
@@ -1691,6 +1708,9 @@ mod tests {
         let sig1 = *tx1.signature();
         let sig2 = *tx2.signature();
         let sig3 = *tx3.signature();
+        let mh1 = *tx1.message_hash();
+        let mh2 = *tx2.message_hash();
+        let mh3 = *tx3.message_hash();
 
         let pk1 = Pubkey::new_unique();
         let executed1 = make_executed(vec![(
@@ -1737,6 +1757,17 @@ mod tests {
         assert_eq!(block.transaction_signatures[0], sig1);
         assert_eq!(block.transaction_signatures[1], sig2);
         assert_eq!(block.transaction_signatures[2], sig3);
+
+        // Message hashes are collected as a parallel array in the same order,
+        // one per signature. build_dedup_state relies on this invariant.
+        assert_eq!(
+            block.transaction_message_hashes.len(),
+            block.transaction_signatures.len(),
+            "message hashes must be parallel to signatures"
+        );
+        assert_eq!(block.transaction_message_hashes[0], mh1);
+        assert_eq!(block.transaction_message_hashes[1], mh2);
+        assert_eq!(block.transaction_message_hashes[2], mh3);
     }
 
     #[tokio::test(flavor = "multi_thread")]

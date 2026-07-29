@@ -4,43 +4,44 @@
 Solana Private Channels processes transactions through five sequential stages, each optimized for a specific concern.
 
 ```
-Transaction → [1:Dedup] → [2:SigVerify] → [3:Sequencer] → [4:Executor] → [5:Settler] → Database
+Transaction → [1:SigVerify] → [2:Dedup] → [3:Sequencer] → [4:Executor] → [5:Settler] → Database
 ```
 
-### Stage 1: Dedup
+### Stage 1: SigVerify
 
-Filter duplicate transactions before expensive signature verification:
+Parallelizes Ed25519 signature verification across configurable workers. Each worker independently validates transaction signatures before forwarding to dedup. Invalid signatures are dropped with error logging. Verification runs first so that only fully-verified transactions ever reach the dedup cache.
+
+**Location**: [`core/src/stages/sigverify.rs`](../core/src/stages/sigverify.rs)
+
+### Stage 2: Dedup
+
+Filter replayed transactions after signature verification:
 - Validates that a transaction's blockhash is in the set of live blockhashes (populated from settled blocks). Transactions referencing unknown or expired blockhashes are rejected.
-- Maintains a cache of recently seen transaction signatures keyed by blockhash.
-- Filters duplicate submissions before expensive signature verification.
+- Maintains a cache of recently seen transaction message hashes keyed by blockhash.
+- The replay identity is the message hash, not the first signature. The first signature is the fee payer's and is malleable: a signer can emit many valid signatures over one fixed message, so keying on it would let a sponsor replay a single victim authorization. The message hash commits to everything the victim signed and is invariant across those signature variants.
+- Dedup runs after sigverify, and the stage is a single task, so its check-and-insert is atomic with no lock: only verified transactions are cached, and two concurrently-verified variants are serialized so the first inserts and the second is dropped.
 - Invalidates blockhashes after a configurable duration, e.g., 15 seconds (150 blockhashes × 100ms block time).
 
 **Location**: [`core/src/stages/dedup.rs`](../core/src/stages/dedup.rs)
 
 **Code Snippet**:
 ```rust
-// Check for duplicate
-let is_duplicate = dedup_cache // HashMap<Hash, HashSet<Signature>>
+// Check for duplicate; the message hash is the replay identity.
+let is_duplicate = dedup_cache // HashMap<Hash, HashSet<Hash>>
     .get(&blockhash)
-    .map(|sigs| sigs.contains(&signature))
+    .map(|hashes| hashes.contains(&message_hash))
     .unwrap_or(false);
 
 if is_duplicate {
-    continue; // Drop duplicate
+    continue; // Drop replay
 }
 
 // Add to cache
 dedup_cache
     .entry(blockhash)
     .or_default()
-    .insert(signature);
+    .insert(message_hash);
 ```
-
-### Stage 2: SigVerify
-
-Parallelizes Ed25519 signature verification across configurable workers. Each worker independently validates transaction signatures before forwarding to sequencing. Invalid signatures are dropped with error logging.
-
-**Location**: [`core/src/stages/sigverify.rs`](../core/src/stages/sigverify.rs)
 
 ### Stage 3: Sequencer
 

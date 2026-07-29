@@ -106,6 +106,7 @@ fn build_block(slot: u64, previous_blockhash: Hash, signature: Signature) -> Blo
         block_time: Some(slot as i64),
         transaction_signatures: vec![signature],
         transaction_recent_blockhashes: vec![blockhash],
+        transaction_message_hashes: vec![Hash::new_unique()],
     }
 }
 

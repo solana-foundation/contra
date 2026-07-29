@@ -393,8 +393,15 @@ async fn build_release_funds(
     let private_channel_token_program = processor_state
         .mint_cache
         .get_private_channel_token_program();
+    // The burn debited the initiator, so the remint credits them, not `recipient`
+    // (the Solana destination, which only the release leg above uses).
+    let initiator =
+        Pubkey::from_str(&transaction.initiator).map_err(|e| OperatorError::InvalidPubkey {
+            pubkey: transaction.initiator.clone(),
+            reason: e.to_string(),
+        })?;
     let remint_user_ata = get_associated_token_address_with_program_id(
-        &recipient,
+        &initiator,
         &mint,
         &private_channel_token_program,
     );
@@ -402,7 +409,7 @@ async fn build_release_funds(
         transaction_id: transaction.id,
         trace_id: transaction.trace_id.clone(),
         mint,
-        user: recipient,
+        user: initiator,
         user_ata: remint_user_ata,
         token_program: private_channel_token_program,
         amount,
@@ -906,7 +913,7 @@ mod tests {
             signature: format!("sig_{id}"),
             trace_id: format!("trace-{id}"),
             slot: 100,
-            initiator: "initiator".to_string(),
+            initiator: Pubkey::new_unique().to_string(),
             recipient: recipient.to_string(),
             mint: mint.to_string(),
             amount: TokenAmount(1000),
@@ -927,6 +934,57 @@ mod tests {
             inner_index: None,
             landed_remint_signature: None,
         }
+    }
+
+    /// The remint reverses a burn on the private channel, so it must credit the
+    /// account that was debited (`initiator`), not the withdrawal's Solana
+    /// destination (`recipient`).
+    #[tokio::test]
+    async fn build_release_funds_remints_to_initiator_not_destination() {
+        let mint_pubkey = Pubkey::new_unique();
+        let initiator = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        insert_mint_row(&storage, &mint_pubkey);
+
+        let mut processor_state = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let mut txn = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &destination.to_string(),
+            Some(3),
+            TransactionType::Withdrawal,
+        );
+        txn.initiator = initiator.to_string();
+
+        let builder = build_release_funds(&mut processor_state, &txn)
+            .await
+            .expect("a valid withdrawal row must build");
+        let TransactionBuilder::ReleaseFunds(release) = builder else {
+            panic!("a withdrawal must build a ReleaseFunds builder");
+        };
+        let remint = release
+            .remint_info
+            .expect("a withdrawal must carry remint info");
+
+        assert_eq!(remint.user, initiator);
+        assert_ne!(remint.user, destination);
+        assert_eq!(
+            remint.user_ata,
+            get_associated_token_address_with_program_id(
+                &initiator,
+                &mint_pubkey,
+                &spl_token::id()
+            ),
+            "remint must mint into the initiator's private channel ATA"
+        );
     }
 
     #[tokio::test]
@@ -2390,7 +2448,7 @@ mod tests {
             signature: "test_sig".to_string(),
             trace_id: "trace-42".to_string(),
             slot: 100,
-            initiator: "initiator".to_string(),
+            initiator: Pubkey::new_unique().to_string(),
             recipient: recipient.to_string(),
             mint: mint_pubkey.to_string(),
             amount: TokenAmount(1000), // > on-chain balance of 500
@@ -2498,7 +2556,7 @@ mod tests {
             signature: "test_sig".to_string(),
             trace_id: "trace-7".to_string(),
             slot: 100,
-            initiator: "initiator".to_string(),
+            initiator: Pubkey::new_unique().to_string(),
             recipient: recipient.to_string(),
             mint: mint_pubkey.to_string(),
             amount: TokenAmount(1000), // < on-chain balance of 5000

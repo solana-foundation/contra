@@ -83,11 +83,14 @@ The runbooks call this out at every relevant site.
   Every "escalate" call-site in the recovery runbooks links here.
 - [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
   the SMT-root-mismatch startup halt (log-discovered, not paged).
+- [`admin_rotation_runbook.md`](admin_rotation_runbook.md) - replacing the admin
+  key. Planned procedure, not an alert response; `SetNewAdmin` alone leaves the
+  old key holding every channel mint's authority.
 
 ## Drills
 
 [`indexer/tests/runbook_drills.rs`](../../indexer/tests/runbook_drills.rs)
-contains seventeen `#[ignore]`-flagged drills that verify these runbooks'
+contains eighteen `#[ignore]`-flagged drills that verify these runbooks'
 commands actually do what the prose claims. Drills are **manually
 triggered, not in CI** - they exist so a human about to use a runbook
 (or about to publish an edit) can confirm the diagnostic and recovery
@@ -113,6 +116,7 @@ pins the relevant contract.
 | `drill_15_deposit_manual_review_recovery_idempotency_failure_flow` | deposit | `deposit_manual_review.md` § Path E: recovery-worker `deposit idempotency:` triage substring present in `recovery.rs`; re-arm SQL flips `manual_review` → `pending` and is row-scoped by id. |
 | `drill_16_withdrawal_manual_review_recovery_missing_nonce_flow` | withdrawal | `withdrawal_manual_review.md` § Path F: recovery-worker `withdrawal row missing nonce` triage substring present in `recovery.rs`; recovery branch SQL is row-scoped; no re-arm SQL exists for this path. |
 | `drill_17_deposit_manual_review_allowlist_gate_recovery_flows` | deposit | Allowlist-gate recovery flow in `deposit_manual_review.md` is in sync with source: triage strings still exist and recovery SQL is row-scoped. |
+| `drill_18_admin_rotation_contracts_present_in_source` | escrow | `reconciliation_halt_runbook.md` halt-reason dispatch substrings, both halt log lines and the startup authority line exist in `reconciliation.rs`; the authority halt routes through `freeze_pipelines`; `admin_rotation_runbook.md` § 4 classification labels exist in the migration binary; cross-links between both runbooks and `ESCROW_INTERACTION_GUIDE.md` hold. |
 
 Trigger (`make` shorthand, runs from repo root):
 
@@ -141,5 +145,7 @@ RUST_LOG=trace cargo test -p private-channel-indexer --test runbook_drills -- \
   (the `JitOutcome::ManualReview` reason strings live here — drill_14
   specifically), `sender/remint.rs`, `db_transaction_writer.rs`
   (including its webhook-payload serializer — drill_13 anchors on the
-  `"remint_signature"` JSON key string literal), or the indexer
-  schema.
+  `"remint_signature"` JSON key string literal), `reconciliation.rs`
+  (halt reason strings and the startup authority log line — drill_18),
+  `bin/migrate_mint_authority.rs` (its per-mint classification labels —
+  drill_18), or the indexer schema.

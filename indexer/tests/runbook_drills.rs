@@ -1742,3 +1742,167 @@ async fn drill_16_withdrawal_manual_review_recovery_missing_nonce_flow(
     eprintln!("Path F triage substring + terminal SQL verified.");
     Ok(())
 }
+
+// ── Drill 18: admin rotation + stale mint authority halt contracts ──────────
+//
+// Two runbooks dispatch on strings the operator emits at runtime:
+//
+//   reconciliation_halt_runbook.md routes by `reconciliation_halt.reason`
+//   substring, and names the log lines and the startup expectation line an
+//   on-call greps for.
+//
+//   admin_rotation_runbook.md § 4 documents the migration tool's per-mint
+//   classification labels, and § 8 tells the operator to verify the rotation by
+//   the startup line.
+//
+// None of these are compiler-checked. Reword a reason string or a label and both
+// runbooks silently stop matching reality, which for the authority halt means an
+// on-call reaches for the insolvency procedure on a halt that has nothing to do
+// with custody. Also pins the cross-links, since each runbook's recovery routes
+// into the other. No Postgres needed.
+
+#[test]
+#[ignore]
+fn drill_18_admin_rotation_contracts_present_in_source() {
+    drill_header(
+        "reconciliation_halt_runbook.md + admin_rotation_runbook.md",
+        "Halt reason: stale mint authority / rotation steps 4 and 8",
+    );
+
+    // Each entry: (substring the runbooks depend on, file expected to contain it).
+    let contracts: &[(&str, &str)] = &[
+        // Halt dispatch: the two reason substrings the Detection section routes on.
+        (
+            "names mint_authority",
+            "indexer/src/operator/reconciliation.rs",
+        ),
+        (
+            "short of supply by",
+            "indexer/src/operator/reconciliation.rs",
+        ),
+        // Symptom section: the log lines that distinguish the two halts.
+        (
+            "MINT AUTHORITY HALT tripped; freezing both pipelines",
+            "indexer/src/operator/reconciliation.rs",
+        ),
+        (
+            "RECONCILIATION HALT tripped; freezing both pipelines",
+            "indexer/src/operator/reconciliation.rs",
+        ),
+        // Startup expectation line. Both runbooks tell the operator to read it:
+        // the halt runbook to compare against the on-chain authority, the
+        // rotation runbook as the step-8 pass signal.
+        (
+            "Expected channel mint authority:",
+            "indexer/src/operator/reconciliation.rs",
+        ),
+        // Rotation § 4: the migration tool's classification labels. `OK` and
+        // `SKIP` are matched by their descriptive tails, which are unique;
+        // the bare labels are too generic to anchor.
+        ("WOULD MIGRATE", "indexer/src/bin/migrate_mint_authority.rs"),
+        ("FOREIGN", "indexer/src/bin/migrate_mint_authority.rs"),
+        (
+            "already on the new authority",
+            "indexer/src/bin/migrate_mint_authority.rs",
+        ),
+        (
+            "not initialized on the channel",
+            "indexer/src/bin/migrate_mint_authority.rs",
+        ),
+    ];
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+
+    let mut missing: Vec<String> = Vec::new();
+    for (substr, path) in contracts {
+        let full = workspace_root.join(path);
+        let content =
+            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}"));
+        if content.contains(substr) {
+            eprintln!("OK   {path}: {substr:?}");
+        } else {
+            eprintln!("MISS {path}: {substr:?}");
+            missing.push(format!("{path}: {substr:?}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "runbook contracts missing in source: {missing:#?}"
+    );
+
+    // The authority halt must fire the same freeze levers the halt runbook
+    // promises. `check_mint_authority` setting its own flag without calling
+    // `freeze_pipelines` would leave the bridge releasing funds while the runbook
+    // says it is frozen.
+    //
+    // Scoped to that function's body on purpose: `freeze_pipelines` also appears
+    // at its definition and in `trip_halt`, so a whole-file `contains` would pass
+    // even with the call deleted.
+    let reconciliation =
+        std::fs::read_to_string(workspace_root.join("indexer/src/operator/reconciliation.rs"))
+            .expect("read reconciliation.rs");
+    let body_start = reconciliation
+        .find("async fn check_mint_authority")
+        .expect("check_mint_authority must exist — the authority halt lives there");
+    let body = &reconciliation[body_start..];
+    let body_end = body[1..]
+        .find("\nasync fn ")
+        .or_else(|| body[1..].find("\nfn "))
+        .map(|i| i + 1)
+        .unwrap_or(body.len());
+    assert!(
+        body[..body_end].contains("freeze_pipelines("),
+        "`check_mint_authority` must call `freeze_pipelines` — the halt runbook \
+         promises the durable flag, quarantine and forced-unhealthy"
+    );
+    eprintln!("OK   reconciliation.rs: check_mint_authority body calls freeze_pipelines");
+
+    // Cross-links. Each runbook's recovery routes into the other, and the
+    // interaction guide points at the rotation procedure instead of implying
+    // SetNewAdmin is sufficient on its own.
+    let links: &[(&str, &str, &str)] = &[
+        (
+            "docs/runbooks/reconciliation_halt_runbook.md",
+            "admin_rotation_runbook.md",
+            "the stale-authority cause table routes to the rotation runbook",
+        ),
+        (
+            "docs/runbooks/admin_rotation_runbook.md",
+            "migrate_mint_authority",
+            "rotation § 4 and § 5 invoke the migration tool by name",
+        ),
+        (
+            "docs/runbooks/admin_rotation_runbook.md",
+            "reconciliation_halt_runbook.md",
+            "rotation § 4 routes FOREIGN mints to the halt runbook's cause table",
+        ),
+        (
+            "docs/ESCROW_INTERACTION_GUIDE.md",
+            "admin_rotation_runbook.md",
+            "SetNewAdmin is documented as one step of a rotation, not the whole",
+        ),
+    ];
+    for (path, needle, why) in links {
+        let full = workspace_root.join(path);
+        let content =
+            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}"));
+        assert!(
+            content.contains(needle),
+            "{path} must reference {needle:?}: {why}"
+        );
+        eprintln!("OK   {path}: references {needle:?}");
+    }
+
+    // The command in rotation § 4 has to name a binary that exists.
+    assert!(
+        workspace_root
+            .join("indexer/src/bin/migrate_mint_authority.rs")
+            .exists(),
+        "rotation § 4 runs `cargo run --bin migrate_mint_authority`; the binary \
+         source must exist at that name"
+    );
+    eprintln!("OK   migrate_mint_authority binary present");
+}

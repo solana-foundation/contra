@@ -1033,6 +1033,11 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
         .await?,
     ));
 
+    // `generate_mint` gave the mint this admin as both its mint and freeze
+    // authority, so the authority check stays quiet and the supply gap is what
+    // trips the halt asserted below.
+    let recon_authority = admin.pubkey();
+
     let cancellation_token = CancellationToken::new();
     let recon_token_clone = cancellation_token.clone();
     let recon_handle: JoinHandle<()> = tokio::spawn(async move {
@@ -1042,6 +1047,7 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
             rpc_client,
             channel_rpc_client,
             instance,
+            recon_authority,
             health_for_task,
             recon_token_clone,
         )

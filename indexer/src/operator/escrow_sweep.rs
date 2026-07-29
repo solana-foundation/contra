@@ -123,18 +123,58 @@ pub async fn fetch_escrow_balances_by_mint(
     Ok(balances)
 }
 
-/// Read the channel-token supply for `mint` on the PrivateChannel chain. An
-/// absent mint account (nothing minted yet) reads as supply 0; any other RPC or
-/// decode failure is surfaced so a bad read never silently looks like 0 supply.
-pub async fn fetch_channel_supply(
+/// The state of one channel mint: how much of it exists, and who controls it.
+///
+/// Both authority fields read `None` for an uninitialized mint and for a live
+/// mint whose authority was cleared. Check `initialized` to tell those apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelMintState {
+    pub supply: u64,
+    pub mint_authority: Option<Pubkey>,
+    pub freeze_authority: Option<Pubkey>,
+    pub initialized: bool,
+}
+
+/// Render an authority for an operator-facing message. A cleared authority reads
+/// as "none" rather than Debug's `None`.
+pub fn describe_authority(authority: Option<Pubkey>) -> String {
+    match authority {
+        Some(key) => key.to_string(),
+        None => "none".to_string(),
+    }
+}
+
+impl ChannelMintState {
+    /// The state of a channel mint that does not exist yet.
+    fn absent() -> Self {
+        Self {
+            supply: 0,
+            mint_authority: None,
+            freeze_authority: None,
+            initialized: false,
+        }
+    }
+}
+
+/// Read the channel-side state of `mint` on the PrivateChannel chain. An absent
+/// mint account (nothing minted yet) reads as `ChannelMintState::absent()`; any
+/// other RPC or decode failure is surfaced so a bad read never silently looks
+/// like 0 supply.
+///
+/// `commitment` is explicit rather than taken from the client because the two
+/// callers need different levels. The solvency and authority invariants read
+/// `finalized`, since a halt must not fire on state that can still be rolled back.
+/// The authority migration reads `confirmed`, because it has to see and act on the
+/// mint it just wrote, and finalized lags too far behind for that.
+pub async fn fetch_channel_mint_state(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
-) -> Result<u64, EscrowSweepError> {
+    commitment: CommitmentConfig,
+) -> Result<ChannelMintState, EscrowSweepError> {
     // get_account_with_commitment cleanly separates a truly-absent account
     // (Ok(value = None)) from a transport/node error (Err). The plain get_account
     // convenience formats BOTH as an "AccountNotFound" error, which would let an
     // RPC outage masquerade as zero supply and blind the supply invariant.
-    let commitment = CommitmentConfig::finalized();
     let response = channel_rpc
         .with_retry(
             "get_channel_mint_account",
@@ -154,14 +194,28 @@ pub async fn fetch_channel_supply(
     // Absent account = nothing minted yet.
     let account = match response.value {
         Some(account) => account,
-        None => return Ok(0),
+        None => return Ok(ChannelMintState::absent()),
     };
 
     // The channel program mints classic SPL tokens (not Token-2022).
-    let mint_state = Mint::unpack(&account.data).map_err(|e| EscrowSweepError {
+    // `unpack_unchecked` skips only the is_initialized check, so a wrong length
+    // or an invalid COption discriminant still errors here. Inspecting
+    // is_initialized ourselves keeps "allocated but not a mint" out of the
+    // corruption bucket.
+    let mint_state = Mint::unpack_unchecked(&account.data).map_err(|e| EscrowSweepError {
         reason: format!("Failed to parse channel mint account {mint}: {e}"),
     })?;
-    Ok(mint_state.supply)
+
+    if !mint_state.is_initialized {
+        return Ok(ChannelMintState::absent());
+    }
+
+    Ok(ChannelMintState {
+        supply: mint_state.supply,
+        mint_authority: mint_state.mint_authority.into(),
+        freeze_authority: mint_state.freeze_authority.into(),
+        initialized: true,
+    })
 }
 
 #[cfg(test)]
@@ -328,14 +382,19 @@ mod tests {
         assert!(balances.is_empty());
     }
 
-    /// getAccountInfo response wrapping an 82-byte SPL Mint blob with `supply`.
-    fn mint_account_body(supply: u64) -> String {
+    /// getAccountInfo response wrapping an 82-byte SPL Mint blob.
+    fn mint_account_body(
+        supply: u64,
+        mint_authority: COption<Pubkey>,
+        freeze_authority: COption<Pubkey>,
+        is_initialized: bool,
+    ) -> String {
         let mint = Mint {
-            mint_authority: COption::Some(Pubkey::new_unique()),
+            mint_authority,
             supply,
             decimals: 6,
-            is_initialized: true,
-            freeze_authority: COption::None,
+            is_initialized,
+            freeze_authority,
         };
         let mut buf = vec![0u8; Mint::LEN];
         mint.pack_into_slice(&mut buf);
@@ -346,41 +405,113 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn fetch_channel_supply_decodes_supply() {
-        let mut server = mockito::Server::new_async().await;
+    /// An initialized mint with both authorities set to the same pubkey, which
+    /// is how `InitializeMintBuilder` creates every channel mint.
+    fn initialized_mint_body(supply: u64, authority: Pubkey) -> String {
+        mint_account_body(
+            supply,
+            COption::Some(authority),
+            COption::Some(authority),
+            true,
+        )
+    }
+
+    async fn mock_account_response(server: &mut mockito::ServerGuard, body: String) {
         server
             .mock("POST", "/")
             .with_status(200)
-            .with_body(mint_account_body(1_234_567))
+            .with_body(body)
             .create_async()
             .await;
-
-        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
-            .await
-            .unwrap();
-        assert_eq!(supply, 1_234_567);
     }
 
     #[tokio::test]
-    async fn fetch_channel_supply_absent_mint_is_zero() {
+    async fn fetch_channel_mint_state_decodes_supply_and_authorities() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        mock_account_response(&mut server, initialized_mint_body(1_234_567, authority)).await;
+
+        let state = fetch_channel_mint_state(
+            &client(&server.url()),
+            &Pubkey::new_unique(),
+            CommitmentConfig::finalized(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.supply, 1_234_567);
+        assert_eq!(state.mint_authority, Some(authority));
+        assert_eq!(state.freeze_authority, Some(authority));
+        assert!(state.initialized);
+    }
+
+    /// A live mint whose authority was cleared via SetAuthority. `initialized`
+    /// stays true so callers can separate this from a mint that was never
+    /// created.
+    #[tokio::test]
+    async fn fetch_channel_mint_state_cleared_authority_is_initialized() {
+        let mut server = mockito::Server::new_async().await;
+        let body = mint_account_body(500, COption::None, COption::None, true);
+        mock_account_response(&mut server, body).await;
+
+        let state = fetch_channel_mint_state(
+            &client(&server.url()),
+            &Pubkey::new_unique(),
+            CommitmentConfig::finalized(),
+        )
+        .await
+        .unwrap();
+
+        assert!(state.initialized);
+        assert_eq!(state.mint_authority, None);
+        assert_eq!(state.freeze_authority, None);
+        assert_eq!(state.supply, 500);
+    }
+
+    /// SPL-Token-owned bytes that decode but carry `is_initialized = false`
+    /// are not corruption, they are a mint that does not exist yet.
+    #[tokio::test]
+    async fn fetch_channel_mint_state_uninitialized_bytes_are_not_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        let body = mint_account_body(0, COption::None, COption::None, false);
+        mock_account_response(&mut server, body).await;
+
+        let state = fetch_channel_mint_state(
+            &client(&server.url()),
+            &Pubkey::new_unique(),
+            CommitmentConfig::finalized(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!state.initialized);
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_mint_state_absent_mint_is_zero() {
         let mut server = mockito::Server::new_async().await;
         // A null account value: the channel mint does not exist yet -> 0 supply.
-        server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#)
-            .create_async()
-            .await;
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#.to_string();
+        mock_account_response(&mut server, body).await;
 
-        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
-            .await
-            .unwrap();
-        assert_eq!(supply, 0, "absent mint account must read as zero supply");
+        let state = fetch_channel_mint_state(
+            &client(&server.url()),
+            &Pubkey::new_unique(),
+            CommitmentConfig::finalized(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state.supply, 0,
+            "absent mint account must read as zero supply"
+        );
+        assert!(!state.initialized);
     }
 
     #[tokio::test]
-    async fn fetch_channel_supply_rpc_error_is_err() {
+    async fn fetch_channel_mint_state_rpc_error_is_err() {
         // A transport/node error must surface as Err, never Ok(0): the plain
         // get_account convenience formats a 503 with the same AccountNotFound
         // prefix as a genuinely-absent mint, which would let an RPC outage
@@ -401,7 +532,9 @@ mod tests {
             },
             CommitmentConfig::finalized(),
         );
-        let result = fetch_channel_supply(&fast, &Pubkey::new_unique()).await;
+        let result =
+            fetch_channel_mint_state(&fast, &Pubkey::new_unique(), CommitmentConfig::finalized())
+                .await;
         assert!(result.is_err(), "an RPC outage must be Err, not Ok(0)");
     }
 

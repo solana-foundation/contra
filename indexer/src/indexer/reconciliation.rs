@@ -23,7 +23,7 @@ use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
     operator::{
-        escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint},
+        escrow_sweep::{fetch_channel_mint_state, fetch_escrow_balances_by_mint},
         rpc_util::RpcClientWithRetry,
         RetryConfig,
     },
@@ -173,8 +173,14 @@ async fn check_channel_supply_invariant(
                 pubkey: r.mint.clone(),
                 reason: e.to_string(),
             })?;
-        let supply = match fetch_channel_supply(&channel_rpc, &mint).await {
-            Ok(s) => s,
+        let supply = match fetch_channel_mint_state(
+            &channel_rpc,
+            &mint,
+            CommitmentConfig::finalized(),
+        )
+        .await
+        {
+            Ok(state) => state.supply,
             Err(e) => {
                 warn!(
                     mint = %r.mint,

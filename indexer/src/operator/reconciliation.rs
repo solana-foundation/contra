@@ -13,12 +13,15 @@
 
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
-use crate::operator::escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint};
+use crate::operator::escrow_sweep::{
+    describe_authority, fetch_channel_mint_state, fetch_escrow_balances_by_mint, ChannelMintState,
+};
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::Storage;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
 use private_channel_metrics::HealthState;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,17 +41,20 @@ const HALT_CONFIRM_TICKS: u32 = 3;
 
 /// Runs periodic escrow balance reconciliation checks
 ///
-/// Each tick reads escrow custody on-chain and channel supply per mint, then
-/// halts (durable flag + quarantine + forced-unhealthy + webhook) when supply
-/// exceeds custody beyond the in-flight envelope for `HALT_CONFIRM_TICKS`
-/// consecutive ticks. Reads are lock-free since reconciliation never mutates
+/// Each tick reads escrow custody on-chain plus the supply and SPL authorities of
+/// every channel mint, then halts (durable flag + quarantine + forced-unhealthy +
+/// webhook) when supply exceeds custody beyond the in-flight envelope for
+/// `HALT_CONFIRM_TICKS` consecutive ticks, or when any mint stops naming
+/// `expected_authority`. Reads are lock-free since reconciliation never mutates
 /// transaction state outside the halt path.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reconciliation(
     storage: Arc<Storage>,
     config: OperatorConfig,
     rpc_client: Arc<RpcClientWithRetry>,
     channel_rpc: Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
+    expected_authority: Pubkey,
     health: Option<Arc<HealthState>>,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
@@ -61,6 +67,10 @@ pub async fn run_reconciliation(
         "Tolerance threshold: {} basis points",
         config.reconciliation_tolerance_bps
     );
+
+    // Every channel mint must name this key as its mint and freeze authority.
+    // Logged so an operator can match a halt against the key they configured.
+    info!("Expected channel mint authority: {}", expected_authority);
 
     let webhook_client = WebhookClient::new(
         WEBHOOK_TIMEOUT,
@@ -100,6 +110,7 @@ pub async fn run_reconciliation(
             escrow_instance_id,
             &webhook_client,
             &health,
+            &expected_authority,
             &mut previously_alerted_orphans,
             &mut breach_counters,
             &mut halted,
@@ -161,6 +172,51 @@ fn evaluate_insolvency(
     }
 }
 
+/// The authorities a channel mint actually carries, when they are not the ones
+/// the operator expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleAuthority {
+    pub mint_authority: Option<Pubkey>,
+    pub freeze_authority: Option<Pubkey>,
+}
+
+/// Decide whether one channel mint is still controlled by `expected`.
+/// `InitializeMintBuilder` sets both authorities to the operator's admin, so a
+/// departure means the mint outlived a key change or was initialized by someone
+/// else.
+///
+/// The two authorities are judged differently, because a cleared one means
+/// opposite things for each:
+///
+/// - `mint_authority` must be exactly `expected`. Another key can issue channel
+///   tokens against live escrow custody, and no key at all bricks the mint, since
+///   no deposit for it can be serviced again.
+/// - `freeze_authority` may be `expected` or absent. A foreign key there can
+///   freeze any holder's account, but an absent one means the capability does not
+///   exist, which is safer than holding it. Halting on absent would also be
+///   unclearable, since a freeze authority cannot be reinstalled once cleared.
+///
+/// An uninitialized mint has no authority to be wrong; the JIT path creates it
+/// with the current admin on the next deposit.
+fn find_stale_authority(state: &ChannelMintState, expected: &Pubkey) -> Option<StaleAuthority> {
+    if !state.initialized {
+        return None;
+    }
+    let mint_authority_ok = state.mint_authority == Some(*expected);
+    let freeze_authority_ok = match state.freeze_authority {
+        None => true,
+        Some(key) => key == *expected,
+    };
+
+    if mint_authority_ok && freeze_authority_ok {
+        return None;
+    }
+    Some(StaleAuthority {
+        mint_authority: state.mint_authority,
+        freeze_authority: state.freeze_authority,
+    })
+}
+
 /// Convert an in-flight envelope BigDecimal into u64. The sum is non-negative by
 /// construction; an over-u64 sum reports u64::MAX, which only ever enlarges the
 /// envelope (delays a halt), never fabricates one.
@@ -210,6 +266,7 @@ async fn perform_reconciliation_check(
     escrow_instance_id: Pubkey,
     webhook_client: &WebhookClient,
     health: &Option<Arc<HealthState>>,
+    expected_authority: &Pubkey,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
     breach_counters: &mut HashMap<Pubkey, u32>,
     halted: &mut bool,
@@ -236,11 +293,11 @@ async fn perform_reconciliation_check(
     let mut mints: HashSet<Pubkey> = custody.keys().copied().collect();
     mints.extend(fetch_db_mint_set(storage).await?);
 
-    // Envelope (DB) and channel supply (PrivateChannel RPC) are the remaining
+    // Envelope (DB) and channel mint state (PrivateChannel RPC) are the remaining
     // halt inputs. A failure of either holds the breach counters and skips the
     // tick, so a transient glitch cannot reset a building breach.
     match load_halt_inputs(storage, channel_rpc, &mints).await {
-        Ok((supply, envelope)) => {
+        Ok((mint_states, envelope)) => {
             evaluate_and_maybe_halt(
                 storage,
                 config,
@@ -248,8 +305,9 @@ async fn perform_reconciliation_check(
                 webhook_client,
                 &custody,
                 &mints,
-                &supply,
+                &mint_states,
                 &envelope,
+                expected_authority,
                 breach_counters,
                 halted,
             )
@@ -292,31 +350,34 @@ async fn fetch_in_flight_envelope(
     Ok(out)
 }
 
-/// Load the halt inputs: the in-flight envelope (DB) and per-mint channel supply
-/// (PrivateChannel RPC) for the given mint set. An envelope-query failure skips
-/// the whole tick (one DB read), but a single mint's supply read failing must not
-/// blind the others: that mint is omitted from the returned map and held in
-/// `evaluate_and_maybe_halt`, so a flaky read on one mint cannot suppress
-/// detection on a genuinely over-issued one.
+/// Load the halt inputs: the in-flight envelope (DB) and per-mint channel state
+/// (PrivateChannel RPC) for the given mint set. One read per mint serves both
+/// halt checks, since supply and the SPL authorities live in the same account.
+///
+/// An envelope-query failure skips the whole tick (one DB read), but a single
+/// mint's read failing must not blind the others: that mint is omitted from the
+/// returned map and held in `evaluate_and_maybe_halt`, so a flaky read on one
+/// mint cannot suppress detection on a genuinely over-issued one.
 async fn load_halt_inputs(
     storage: &Arc<Storage>,
     channel_rpc: &Arc<RpcClientWithRetry>,
     mints: &HashSet<Pubkey>,
-) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), OperatorError> {
+) -> Result<(HashMap<Pubkey, ChannelMintState>, HashMap<Pubkey, u64>), OperatorError> {
     let envelope = fetch_in_flight_envelope(storage).await?;
-    let mut supply = HashMap::new();
+    let mut mint_states = HashMap::new();
     for mint in mints {
-        match fetch_channel_supply(channel_rpc, mint).await {
-            Ok(s) => {
-                supply.insert(*mint, s);
+        // Finalized: a halt must not fire on state that can still be rolled back.
+        match fetch_channel_mint_state(channel_rpc, mint, CommitmentConfig::finalized()).await {
+            Ok(state) => {
+                mint_states.insert(*mint, state);
             }
             Err(e) => warn!(
                 mint = %mint,
-                "Channel supply read failed; skipping this mint this tick: {}", e.reason
+                "Channel mint read failed; skipping this mint this tick: {}", e.reason
             ),
         }
     }
-    Ok((supply, envelope))
+    Ok((mint_states, envelope))
 }
 
 fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
@@ -328,12 +389,16 @@ fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
         })
 }
 
-/// Halt path: per mint, decide insolvency, advance/reset the breach counter, and
-/// on the `HALT_CONFIRM_TICKS`-th consecutive breach freeze the pipelines once
-/// (durable flag + quarantine + forced-unhealthy + webhook). Every action is
-/// best-effort and logged, so one failing action never skips the others.
-/// `mints` is the shared custody-plus-DB enumeration set; the DB net is never
-/// compared, only the addresses widen the set.
+/// Halt path: per mint, check the SPL authorities and decide insolvency, then
+/// freeze the pipelines once (durable flag + quarantine + forced-unhealthy +
+/// webhook). Every action is best-effort and logged, so one failing action never
+/// skips the others. `mints` is the shared custody-plus-DB enumeration set; the
+/// DB net is never compared, only the addresses widen the set.
+///
+/// The two conditions confirm differently. A supply gap can be an artifact of
+/// reads taken at different moments, so it needs `HALT_CONFIRM_TICKS`
+/// consecutive breaches. An authority is one pubkey compared against another, so
+/// a mismatch halts on the first observation.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_and_maybe_halt(
     storage: &Arc<Storage>,
@@ -342,8 +407,9 @@ async fn evaluate_and_maybe_halt(
     webhook_client: &WebhookClient,
     custody: &HashMap<Pubkey, u64>,
     mints: &HashSet<Pubkey>,
-    supply: &HashMap<Pubkey, u64>,
+    mint_states: &HashMap<Pubkey, ChannelMintState>,
     envelope: &HashMap<Pubkey, u64>,
+    expected_authority: &Pubkey,
     breach_counters: &mut HashMap<Pubkey, u32>,
     halted: &mut bool,
 ) {
@@ -351,21 +417,41 @@ async fn evaluate_and_maybe_halt(
     // disappears) resets to zero rather than lingering.
     let mut next_counters: HashMap<Pubkey, u32> = HashMap::new();
     for &mint in mints {
-        // A mint absent from `supply` had its read fail this tick (an absent
-        // account reads as Ok(0), not a miss). Hold its counter rather than
+        // A mint absent from `mint_states` had its read fail this tick. Both a
+        // missing account and an uninitialized one read as Ok(absent) with supply
+        // 0, so only a genuine read error lands here. Hold its counter rather than
         // resetting, so a transient per-mint glitch neither halts it nor erases
         // its evidence, and never blocks the other mints.
-        let Some(&s) = supply.get(&mint) else {
+        let Some(state) = mint_states.get(&mint) else {
             if let Some(&held) = breach_counters.get(&mint) {
                 next_counters.insert(mint, held);
             }
             continue;
         };
+
+        // Runs before the insolvency check, which means a stale authority claims
+        // the halt reason when both conditions hold on the same tick, and the
+        // set-once guard then suppresses the insolvency webhook. `mints` is a
+        // HashSet, so with several mints breaching it is already unspecified which
+        // one's reason is recorded; investigating a halt means checking both
+        // invariants regardless of which reason it carries.
+        check_mint_authority(
+            storage,
+            config,
+            health,
+            webhook_client,
+            &mint,
+            state,
+            expected_authority,
+            halted,
+        )
+        .await;
+
         let c = *custody.get(&mint).unwrap_or(&0);
         let env = *envelope.get(&mint).unwrap_or(&0);
         let tolerance = insolvency_tolerance_raw(c, config.reconciliation_tolerance_bps);
 
-        let Some(breach) = evaluate_insolvency(c, s, env, tolerance) else {
+        let Some(breach) = evaluate_insolvency(c, state.supply, env, tolerance) else {
             continue;
         };
 
@@ -408,10 +494,24 @@ async fn evaluate_and_maybe_halt(
     *breach_counters = next_counters;
 }
 
-/// Fire every fail-closed lever for a confirmed insolvency. Each is best-effort
+/// Fire the fail-closed levers every halt condition shares. Each is best-effort
 /// and independently logged: the durable flag is the cross-process freeze,
-/// quarantine flips rows active right now, forced-unhealthy pages orchestration,
-/// and the webhook notifies operators. None of them gate the others.
+/// quarantine flips rows active right now, and forced-unhealthy pages
+/// orchestration. None of them gate the others. Callers send their own webhook.
+async fn freeze_pipelines(storage: &Arc<Storage>, health: &Option<Arc<HealthState>>, reason: &str) {
+    if let Err(e) = storage.set_reconciliation_halt(reason).await {
+        error!("Failed to set durable reconciliation halt flag: {}", e);
+    }
+    match storage.quarantine_all_active_withdrawals(None).await {
+        Ok(n) => info!(rows = n, "Quarantined active withdrawals on halt"),
+        Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
+    }
+    if let Some(h) = health {
+        h.force_unhealthy(reason.to_string());
+    }
+}
+
+/// Freeze the pipelines for a confirmed insolvency and alert operators.
 #[allow(clippy::too_many_arguments)]
 async fn trip_halt(
     storage: &Arc<Storage>,
@@ -423,16 +523,7 @@ async fn trip_halt(
     breach: &InsolvencyBreach,
     reason: &str,
 ) {
-    if let Err(e) = storage.set_reconciliation_halt(reason).await {
-        error!("Failed to set durable reconciliation halt flag: {}", e);
-    }
-    match storage.quarantine_all_active_withdrawals(None).await {
-        Ok(n) => info!(rows = n, "Quarantined active withdrawals on halt"),
-        Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
-    }
-    if let Some(h) = health {
-        h.force_unhealthy(reason.to_string());
-    }
+    freeze_pipelines(storage, health, reason).await;
     // Payload carries real custody and the supply the escrow could not honor;
     // delta_bps stays in basis points to match every other reconciliation alert
     // (u64::MAX when custody is 0).
@@ -448,6 +539,69 @@ async fn trip_halt(
         send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await
     {
         error!("Failed to send reconciliation halt webhook: {}", e);
+    }
+}
+
+/// Freeze the pipelines when `mint` no longer names the configured admin as both
+/// its mint and freeze authority.
+///
+/// A stale authority means a key other than the configured admin can issue
+/// channel tokens for a mint the escrow still backs. The insolvency check
+/// catches the result of that, but only once the tokens have been burned and
+/// custody has actually left, so it reports a loss already taken. This check
+/// fires on the precondition instead, before any of it happens.
+///
+/// It also covers the benign case: after a key change the operator can no longer
+/// mint for this mint, and every deposit would fail one at a time instead of
+/// once, loudly, here.
+///
+/// Trips only once, matching the insolvency halt: a still-set flag keeps
+/// re-firing suppressed until an operator clears it.
+#[allow(clippy::too_many_arguments)]
+async fn check_mint_authority(
+    storage: &Arc<Storage>,
+    config: &OperatorConfig,
+    health: &Option<Arc<HealthState>>,
+    webhook_client: &WebhookClient,
+    mint: &Pubkey,
+    state: &ChannelMintState,
+    expected_authority: &Pubkey,
+    halted: &mut bool,
+) {
+    let Some(stale) = find_stale_authority(state, expected_authority) else {
+        return;
+    };
+
+    if *halted {
+        warn!(
+            mint = %mint,
+            "Channel mint authority is not the configured admin; already halted"
+        );
+        return;
+    }
+
+    *halted = true;
+    let reason = format!(
+        "reconciliation halt: channel mint {} names mint_authority {} and freeze_authority {}, \
+         expected the configured admin {}",
+        mint,
+        describe_authority(stale.mint_authority),
+        describe_authority(stale.freeze_authority),
+        expected_authority
+    );
+    error!(reason = %reason, "MINT AUTHORITY HALT tripped; freezing both pipelines");
+    freeze_pipelines(storage, health, &reason).await;
+
+    if let Err(e) = send_mint_authority_alert(
+        &config.reconciliation_webhook_url,
+        mint,
+        &stale,
+        expected_authority,
+        webhook_client,
+    )
+    .await
+    {
+        error!("Failed to send mint authority halt webhook: {}", e);
     }
 }
 
@@ -708,6 +862,62 @@ pub async fn send_orphan_deposit_alert(
     Ok(())
 }
 
+/// Posts a stale channel-mint authority to `webhook_url` as
+/// `{ mint, expected_authority, mint_authority, freeze_authority, timestamp }`.
+///
+/// Retries up to 3 times with exponential backoff on transient HTTP errors.
+/// A `None` URL logs a `warn!` and returns `Ok`. Returns
+/// `Err(OperatorError::WebhookError)` if delivery fails after retries.
+pub async fn send_mint_authority_alert(
+    webhook_url: &Option<String>,
+    mint: &Pubkey,
+    stale: &StaleAuthority,
+    expected_authority: &Pubkey,
+    webhook_client: &WebhookClient,
+) -> Result<(), OperatorError> {
+    // If no webhook URL configured, log and return early
+    let url = match webhook_url {
+        Some(url) => url,
+        None => {
+            warn!(
+                mint = %mint,
+                "Stale channel mint authority detected but no webhook URL configured"
+            );
+            return Ok(());
+        }
+    };
+
+    let payload = serde_json::json!({
+        "mint": mint.to_string(),
+        "expected_authority": expected_authority.to_string(),
+        "mint_authority": describe_authority(stale.mint_authority),
+        "freeze_authority": describe_authority(stale.freeze_authority),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let context = format!("stale mint authority: mint {}", mint);
+
+    webhook_client
+        .post_json(url, &payload, &context)
+        .await
+        .map_err(|error| {
+            error!(
+                "Failed to send mint authority webhook alert after {} attempts: {}",
+                error.attempts(),
+                error.message()
+            );
+            OperatorError::WebhookError(format!(
+                "Failed to send mint authority webhook alert after {} attempts: {}",
+                error.attempts(),
+                error.message()
+            ))
+        })?;
+
+    info!(mint = %mint, "Mint authority webhook alert sent");
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +970,7 @@ mod tests {
             config,
             rpc_client,
             channel_rpc,
+            solana_sdk::pubkey::Pubkey::new_unique(),
             solana_sdk::pubkey::Pubkey::new_unique(),
             None,
             ct,
@@ -888,11 +1099,27 @@ mod tests {
             });
     }
 
-    // (custody, db_mints, supply, envelope, mint) for the halt-path tests.
+    /// The configured admin every halt-path test compares against. The insolvency
+    /// tests give their mints this same authority so only the supply gap can halt.
+    fn test_authority() -> Pubkey {
+        Pubkey::new_from_array([7u8; 32])
+    }
+
+    /// A live channel mint holding `supply`, controlled by `test_authority()`.
+    fn mint_state(supply: u64) -> ChannelMintState {
+        ChannelMintState {
+            supply,
+            mint_authority: Some(test_authority()),
+            freeze_authority: Some(test_authority()),
+            initialized: true,
+        }
+    }
+
+    // (custody, db_mints, mint_states, envelope, mint) for the halt-path tests.
     type BreachMaps = (
         HashMap<Pubkey, u64>,
         HashSet<Pubkey>,
-        HashMap<Pubkey, u64>,
+        HashMap<Pubkey, ChannelMintState>,
         HashMap<Pubkey, u64>,
         Pubkey,
     );
@@ -902,9 +1129,9 @@ mod tests {
         let mint = Pubkey::new_unique();
         let custody = HashMap::from([(mint, 900u64)]);
         let db_mints = HashSet::from([mint]);
-        let supply = HashMap::from([(mint, 1200u64)]);
+        let mint_states = HashMap::from([(mint, mint_state(1200))]);
         let envelope = HashMap::from([(mint, 100u64)]);
-        (custody, db_mints, supply, envelope, mint)
+        (custody, db_mints, mint_states, envelope, mint)
     }
 
     #[tokio::test]
@@ -924,6 +1151,7 @@ mod tests {
             &db_mints,
             &supply,
             &envelope,
+            &test_authority(),
             &mut counters,
             &mut halted,
         )
@@ -956,6 +1184,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -981,7 +1210,7 @@ mod tests {
         let config = recon_config_zero_tolerance();
         let (custody, db_mints, supply, envelope, mint) = breach_maps();
         // A clean map: supply matches custody, no gap.
-        let clean_supply = HashMap::from([(mint, 900u64)]);
+        let clean_supply = HashMap::from([(mint, mint_state(900))]);
         let mut counters = HashMap::new();
         let mut halted = false;
         let webhook = test_webhook_client();
@@ -997,6 +1226,7 @@ mod tests {
                 &db_mints,
                 supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -1031,6 +1261,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -1047,6 +1278,7 @@ mod tests {
             &db_mints,
             &supply,
             &envelope,
+            &test_authority(),
             &mut counters,
             &mut halted,
         )
@@ -1073,6 +1305,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -1092,6 +1325,7 @@ mod tests {
             &db_mints,
             &supply,
             &envelope,
+            &test_authority(),
             &mut counters,
             &mut halted,
         )
@@ -1116,7 +1350,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let custody: HashMap<Pubkey, u64> = HashMap::new();
         let db_mints = HashSet::from([mint]);
-        let supply = HashMap::from([(mint, 500u64)]);
+        let supply = HashMap::from([(mint, mint_state(500))]);
         let envelope = HashMap::from([(mint, 100u64)]);
         let mut counters = HashMap::new();
         let mut halted = false;
@@ -1132,6 +1366,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -1162,9 +1397,9 @@ mod tests {
         let mut halted = false;
         let webhook = test_webhook_client();
 
-        let t1 = HashMap::from([(a, 1200u64), (b, 900u64)]); // A breaches, B clean
-        let t2 = HashMap::from([(a, 1200u64), (b, 900u64)]); // A breaches, B clean
-        let t3 = HashMap::from([(a, 900u64), (b, 1200u64)]); // A clean (reset), B breaches
+        let t1 = HashMap::from([(a, mint_state(1200)), (b, mint_state(900))]); // A breaches, B clean
+        let t2 = HashMap::from([(a, mint_state(1200)), (b, mint_state(900))]); // A breaches, B clean
+        let t3 = HashMap::from([(a, mint_state(900)), (b, mint_state(1200))]); // A clean (reset), B breaches
         for supply in [&t1, &t2, &t3] {
             evaluate_and_maybe_halt(
                 &storage,
@@ -1175,6 +1410,7 @@ mod tests {
                 &db_mints,
                 supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -1198,7 +1434,7 @@ mod tests {
         let custody = HashMap::from([(a, 900u64), (b, 900u64)]);
         let db_mints = HashSet::from([a, b]);
         let envelope = HashMap::from([(a, 100u64), (b, 100u64)]);
-        let supply = HashMap::from([(b, 1200u64)]); // A absent: read failed
+        let supply = HashMap::from([(b, mint_state(1200))]); // A absent: read failed
         let mut counters = HashMap::new();
         let mut halted = false;
         let webhook = test_webhook_client();
@@ -1213,6 +1449,7 @@ mod tests {
                 &db_mints,
                 &supply,
                 &envelope,
+                &test_authority(),
                 &mut counters,
                 &mut halted,
             )
@@ -1224,6 +1461,161 @@ mod tests {
             "a failed supply read on one mint must not block another"
         );
         assert_eq!(counters.get(&b).copied(), Some(3));
+    }
+
+    /// Run one tick against a single mint whose supply equals its custody, so the
+    /// insolvency check stays quiet and only the authority check can halt.
+    /// Returns whether the halt tripped.
+    async fn authority_tick(state: ChannelMintState) -> bool {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = Pubkey::new_unique();
+        let custody = HashMap::from([(mint, state.supply)]);
+        let db_mints = HashSet::from([mint]);
+        let mint_states = HashMap::from([(mint, state)]);
+        let envelope = HashMap::new();
+        let mut counters = HashMap::new();
+        let mut halted = false;
+
+        evaluate_and_maybe_halt(
+            &storage,
+            &recon_config_zero_tolerance(),
+            &None,
+            &test_webhook_client(),
+            &custody,
+            &db_mints,
+            &mint_states,
+            &envelope,
+            &test_authority(),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        halted
+    }
+
+    #[tokio::test]
+    async fn mint_owned_by_configured_admin_does_not_halt() {
+        assert!(!authority_tick(mint_state(500)).await);
+    }
+
+    /// One tick is enough: an authority is a pubkey comparison, so unlike a supply
+    /// gap it needs no confirmation ticks.
+    #[tokio::test]
+    async fn foreign_mint_authority_halts_on_first_tick() {
+        let state = ChannelMintState {
+            supply: 500,
+            mint_authority: Some(Pubkey::new_unique()),
+            freeze_authority: Some(test_authority()),
+            initialized: true,
+        };
+
+        assert!(
+            authority_tick(state).await,
+            "a mint authority other than the configured admin must halt"
+        );
+    }
+
+    /// The freeze authority matters on its own: it cannot mint, but it can freeze
+    /// any holder's token account.
+    #[tokio::test]
+    async fn foreign_freeze_authority_halts() {
+        let state = ChannelMintState {
+            supply: 500,
+            mint_authority: Some(test_authority()),
+            freeze_authority: Some(Pubkey::new_unique()),
+            initialized: true,
+        };
+
+        assert!(authority_tick(state).await);
+    }
+
+    /// A cleared mint authority is irreversible: nobody can ever mint this token
+    /// again, so it must halt rather than read as "unreachable, therefore
+    /// harmless". Matches `decode_and_check_authority`, which treats a cleared
+    /// mint authority as a mismatch for the same reason.
+    #[tokio::test]
+    async fn cleared_mint_authority_halts() {
+        let state = ChannelMintState {
+            supply: 500,
+            mint_authority: None,
+            freeze_authority: Some(test_authority()),
+            initialized: true,
+        };
+
+        assert!(authority_tick(state).await);
+    }
+
+    /// A cleared freeze authority removes the freeze capability rather than handing
+    /// it to anyone, so it is safe. Halting would also be unclearable, since a
+    /// freeze authority cannot be reinstalled.
+    #[tokio::test]
+    async fn cleared_freeze_authority_does_not_halt() {
+        let state = ChannelMintState {
+            supply: 500,
+            mint_authority: Some(test_authority()),
+            freeze_authority: None,
+            initialized: true,
+        };
+
+        assert!(!authority_tick(state).await);
+    }
+
+    /// A mint that does not exist on the channel yet has no authority to be wrong.
+    /// The JIT path creates it with the current admin on the next deposit.
+    #[tokio::test]
+    async fn uninitialized_mint_does_not_halt() {
+        let state = ChannelMintState {
+            supply: 0,
+            mint_authority: None,
+            freeze_authority: None,
+            initialized: false,
+        };
+
+        assert!(!authority_tick(state).await);
+    }
+
+    /// The `halted` bool alone stops nothing. Assert the three side effects that
+    /// actually freeze the bridge, so dropping the `freeze_pipelines` call from the
+    /// authority path cannot pass silently.
+    #[tokio::test]
+    async fn authority_halt_freezes_the_withdrawal_pipeline() {
+        use private_channel_metrics::{HealthConfig, HealthState};
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock, 1, 1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let health_state = HealthState::new(HealthConfig::operator());
+        let mint = Pubkey::new_unique();
+        let state = ChannelMintState {
+            supply: 500,
+            mint_authority: Some(Pubkey::new_unique()),
+            freeze_authority: Some(test_authority()),
+            initialized: true,
+        };
+        let mut counters = HashMap::new();
+        let mut halted = false;
+
+        evaluate_and_maybe_halt(
+            &storage,
+            &recon_config_zero_tolerance(),
+            &Some(health_state.clone()),
+            &test_webhook_client(),
+            &HashMap::from([(mint, 500u64)]),
+            &HashSet::from([mint]),
+            &HashMap::from([(mint, state)]),
+            &HashMap::new(),
+            &test_authority(),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_some());
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            crate::storage::common::models::TransactionStatus::ManualReview
+        );
+        assert!(!health_state.is_healthy());
     }
 
     /// Mock the escrow custody sweep on a mockito server: the SPL Token program
@@ -1321,6 +1713,7 @@ mod tests {
             Pubkey::new_unique(),
             &webhook_client,
             &None,
+            &test_authority(),
             &mut orphans,
             &mut counters,
             &mut halted,
@@ -1373,6 +1766,7 @@ mod tests {
             Pubkey::new_unique(),
             &webhook,
             &None,
+            &test_authority(),
             &mut orphans,
             &mut counters,
             &mut halted,
@@ -1391,6 +1785,7 @@ mod tests {
             Pubkey::new_unique(),
             &webhook,
             &None,
+            &test_authority(),
             &mut orphans,
             &mut counters,
             &mut halted,

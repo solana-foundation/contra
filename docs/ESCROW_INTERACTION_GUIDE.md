@@ -204,7 +204,7 @@ const removeOperatorIx = await getRemoveOperatorInstructionAsync({
 
 ## SetNewAdmin
 
-Transfers admin control to a new address. Useful for key rotation, organizational changes, or upgrading to multisig governance.
+Transfers admin control to a new address. This is one step of a key rotation, not the whole of it: follow [the admin rotation runbook](runbooks/admin_rotation_runbook.md).
 
 ### TypeScript Example
 
@@ -226,7 +226,7 @@ const setAdminIx = getSetNewAdminInstruction({
 **Important:**
 - Both current admin and new admin must sign the transaction
 - Change is immediate and irreversible
-- Old admin loses all privileges once confirmed
+- Old admin loses all escrow admin privileges once confirmed, but keeps the mint and freeze authority on every existing channel mint until those are migrated separately
 - Verify new admin address carefully (typos = permanent loss of control)
 
 

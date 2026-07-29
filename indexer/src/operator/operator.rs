@@ -291,6 +291,7 @@ pub async fn run(
                         reconciliation_rpc,
                         reconciliation_channel_rpc,
                         reconciliation_escrow,
+                        crate::operator::SignerUtil::get_admin_pubkey(),
                         reconciliation_health,
                         reconciliation_token,
                     )

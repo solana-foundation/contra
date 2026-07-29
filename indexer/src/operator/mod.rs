@@ -3,6 +3,7 @@ pub mod db_transaction_writer;
 pub mod escrow_sweep;
 pub mod feepayer_monitor;
 pub mod fetcher;
+pub mod mint_authority_migration;
 #[allow(clippy::module_inception)]
 pub mod operator;
 pub mod processor;

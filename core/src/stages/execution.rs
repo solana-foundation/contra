@@ -385,16 +385,16 @@ fn execute_parallel(
     merge_svm_outputs(chunk_outputs)
 }
 
-/// The lamports the gasless callback invents for an unknown fee payer are the
-/// only lamports here that were never deposited. Treat them as a loan every
-/// successful transaction must repay, minus one lamport per account it creates.
+/// The lamports the gasless callback makes up for an unknown fee payer are the
+/// only money here that nobody deposited. Treat them as a loan the transaction
+/// has to pay back, less one lamport for each account it creates.
 ///
-/// The SVM already conserves lamports per instruction, so blocking that one
-/// source means every other balance is made of lamports that already existed
-/// and needs no checking. An unpaid loan fails the transaction instead of
-/// editing accounts, because editing accounts is what corrupts bystanders.
+/// The SVM already makes every instruction balance, so once this one source is
+/// blocked, every other balance is made of money that was already here and does
+/// not need checking. A loan that is not paid back fails the transaction rather
+/// than editing accounts, because editing accounts is what corrupts bystanders.
 ///
-/// Regular path only: admin execution never invents fee payers.
+/// Regular path only: admin execution never makes up fee payers.
 fn enforce_lamport_conservation(
     output: &mut LoadAndExecuteSanitizedTransactionsOutput,
     transactions: &[SanitizedTransaction],
@@ -418,51 +418,54 @@ fn enforce_lamport_conservation(
         }
 
         fabricated.clear();
-        // How much of the invented float went missing, how many brand new
-        // accounts exist to justify it, and whether any account that already
-        // existed ended up richer than it started.
+        // How much of the made-up money is gone, how many new accounts exist to
+        // explain it, and whether any older account ended up richer.
         let mut shortfall = 0u64;
         let mut created = 0u64;
         let mut credited = false;
         for (index, (pubkey, acct)) in executed.loaded_transaction.accounts.iter().enumerate() {
-            // Read-only accounts are never persisted, so they are never touched
-            // or counted.
+            // Read-only accounts are never saved, so never touch or count them.
             if !tx.is_writable(index) {
                 continue;
             }
             if let Some(before) = bob.account_lamports(pubkey) {
-                // Already existed, so its balance is real money this check must
-                // never rewrite. Only note whether it grew.
+                // This account already existed, so its balance is real money we
+                // must never rewrite. Just note whether it grew.
                 credited |= acct.lamports() > before;
             } else if fee_payers.contains(pubkey) {
-                // An invented payer: whatever it no longer holds has escaped.
-                // The set is batch-wide, so draining one payer into another
-                // still registers as a shortfall rather than as repayment.
+                // A made-up payer, so anything it no longer holds has escaped.
+                // The set covers the whole batch, so moving money from one
+                // made-up payer to another still counts as escaped.
                 fabricated.push(index);
                 shortfall += DEFAULT_FEE_PAYER_LAMPORTS.saturating_sub(acct.lamports());
             } else if acct.lamports() > 0 {
-                // Unknown to BOB but funded, so this transaction created it.
+                // BOB never saw it, but it has money, so this tx just made it.
                 created += 1;
             }
         }
 
-        // Lamports against a count, because the rate is exactly one: the SVM
-        // deletes a 0-lamport account, and with rent at zero every creation
-        // path funds a single lamport. So `created` is also the allowance.
+        // Comparing money to a count works because the rate is one each: the SVM
+        // deletes an account holding nothing, and with no rent every way of
+        // making an account gives it exactly one lamport.
         //
-        // The second clause closes an attribution gap. Counting creations does
-        // not prove the float paid for them, so a creation funded by real money
-        // could licence a float lamport that actually landed somewhere durable.
-        // While any float is missing, no pre-existing balance may grow.
+        // Counting new accounts does not prove the made-up money paid for them,
+        // so a new account paid for with real money could excuse a made-up
+        // lamport that went elsewhere. Hence no older account may grow while any
+        // made-up money is missing.
         if shortfall > created || (shortfall > 0 && credited) {
-            // Reject rather than claw back, which would mean rewriting accounts
-            // the transaction legitimately owns. Downstream skips failed txs.
+            // Fail the tx instead of taking the money back, which would mean
+            // rewriting accounts it owns. Later stages skip failed txs.
             executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
             continue;
         }
-        // Loan settled. Erase the invented payers to the empty zero-lamport
-        // shape BOB and the settler already treat as deleted, and touch nothing
-        // else: an address that never existed must not become durable state.
+        // Nothing is missing, so wipe the made-up payers. BOB and the settler
+        // already read an empty account with no money as deleted, so wiping is
+        // how they disappear. Nothing else is touched.
+        //
+        // Always wipe, which burns any real money sent to the payer. Keeping it
+        // would turn an address we made up into a real one, paying the sender
+        // back would rewrite an innocent account, and failing the tx would break
+        // CancelDvp, which sends the closed escrows' leftover money here.
         for index in &fabricated {
             executed.loaded_transaction.accounts[*index].1 = AccountSharedData::default();
         }

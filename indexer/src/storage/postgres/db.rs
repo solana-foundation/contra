@@ -1578,6 +1578,10 @@ impl PostgresDb {
 
     /// Transitions a withdrawal to PendingRemint status, storing the
     /// withdrawal signatures needed for the finality check on restart.
+    ///
+    /// Idempotent for an identical payload: a row already PendingRemint with the
+    /// same signatures is re-written, so a retry after a lost acknowledgement
+    /// succeeds. A different payload still fails, and no other status matches.
     pub async fn set_pending_remint_internal(
         &self,
         transaction_id: i64,
@@ -1595,7 +1599,8 @@ impl PostgresDb {
                 pending_remint_deadline_at = $5,
                 updated_at = NOW()
             WHERE id = $1
-                AND status = 'processing'
+                AND (status = 'processing'
+                     OR (status = 'pending_remint' AND remint_signatures = $3))
             "#,
         )
         .bind(transaction_id)
@@ -1646,6 +1651,17 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Current status of one row, or `None` if it does not exist.
+    pub async fn get_transaction_status_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<TransactionStatus>, sqlx::Error> {
+        sqlx::query_scalar::<_, TransactionStatus>("SELECT status FROM transactions WHERE id = $1")
+            .bind(transaction_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     /// Durably record a confirmed remint: flip status to FailedReminted and
     /// store the signature in one UPDATE, before the async writer runs. The
     /// `pending_remint` guard makes it a no-op on an already-terminal row, so
@@ -1679,16 +1695,11 @@ impl PostgresDb {
             // PendingRemint row), a non-pending_remint status is expected on an
             // idempotent replay. Both still signal RowNotFound so the caller
             // falls back to the async writer.
-            let current: Option<String> =
-                sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
-                    .bind(transaction_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            match current.as_deref() {
+            match self.get_transaction_status_internal(transaction_id).await? {
                 None => warn!("record_remint_result: transaction {transaction_id} not found"),
                 Some(status) => info!(
                     "record_remint_result: transaction {transaction_id} not pending_remint \
-                     (status {status}); skipping"
+                     (status {status:?}); skipping"
                 ),
             }
             return Err(sqlx::Error::RowNotFound);

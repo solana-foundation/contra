@@ -26,6 +26,7 @@ pub mod get_release_signatures;
 pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
+pub mod get_transaction_status;
 pub mod has_active_withdrawal_below;
 pub mod init_schema;
 pub mod insert_db_transaction;
@@ -350,6 +351,15 @@ impl Storage {
         &self,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         get_pending_remint_transactions::get_pending_remint_transactions(self).await
+    }
+
+    /// Current status of one row, or `None` if it does not exist. Used to
+    /// resolve which state a guarded write committed when its result was lost.
+    pub async fn get_transaction_status(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<TransactionStatus>, StorageError> {
+        get_transaction_status::get_transaction_status(self, transaction_id).await
     }
 
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means

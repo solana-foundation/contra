@@ -105,6 +105,18 @@ This eliminates the operational overhead of funding user accounts for off-chain 
 
 **Location**: [`core/src/vm/gasless_callback.rs`](../core/src/vm/gasless_callback.rs)
 
+##### Lamport conservation
+
+These synthesized lamports are the only lamports in the channel that were never deposited, so the execution stage treats them as a loan the transaction must repay. After a successful regular transaction, every writable account the SVM loaded that BOB had never seen is examined:
+
+- A synthesized fee payer must end holding the same amount it was handed. Whatever it is short by is the unrepaid part of the loan.
+- Each account the transaction created may keep one lamport of that shortfall, because the SVM requires a live account to hold at least one and, with rent at zero, every creation path funds exactly one.
+- If the shortfall exceeds that allowance the transaction is failed with `UnbalancedTransaction` and nothing it wrote is persisted. Otherwise the synthesized payers are erased and every other account is persisted exactly as executed.
+
+Because the SVM already enforces per-instruction lamport conservation, blocking the fabricated lamports at their source means every other balance is made of lamports that already existed, so no other account needs inspecting. Accounts a transaction merely carries as writable keys are never rewritten.
+
+**Location**: [`enforce_lamport_conservation` in `core/src/stages/execution.rs`](../core/src/stages/execution.rs)
+
 #### GaslessRentCollector
 
 Intercepts rent collection to prevent the runtime from debiting lamports from synthesized fee payer accounts. Works alongside GaslessCallback to maintain the zero-fee model.

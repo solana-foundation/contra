@@ -21,6 +21,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | C11 | Solana Private Channels SHOULD support transaction/slot truncation | SHOULD | Done | #51 |
 | C12 | If truncation is supported, Solana Private Channels MUST have a valid cold storage backup before truncating DB rows | MUST | Done | #60 |
 | C13 | Solana Private Channels DB SHOULD use database backup and recovery | SHOULD | Done | #60 |
+| C14 | A regular transaction MUST NOT increase the durable lamport supply beyond one lamport per account it creates, and MUST NOT alter any account it did not touch | MUST | Done | #115, #131 |
 
 ## On-chain Programs
 

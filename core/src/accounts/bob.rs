@@ -134,6 +134,16 @@ impl BOB {
         &self.precompiles
     }
 
+    /// Whether BOB would hand this account to the SVM. Mirrors
+    /// `get_account_shared_data`'s presence rules without cloning the account.
+    pub fn knows_account(&self, pubkey: &Pubkey) -> bool {
+        self.precompiles.contains_key(pubkey)
+            || self
+                .accounts
+                .get(pubkey)
+                .is_some_and(|entry| !entry.deleted)
+    }
+
     /// Preloads accounts into BOB from the database.
     ///
     /// Returns `(fetched, cached)` where:
@@ -1446,5 +1456,45 @@ mod tests {
             !bob.accounts.contains_key(&pubkey),
             "a clean DB-loaded account is age-evictable, no longer pinned in memory"
         );
+    }
+
+    /// `knows_account` must answer exactly what `get_account_shared_data`
+    /// answers, for every entry shape: precompile, live, deleted, absent.
+    /// The conservation check keys "this account is new" off it, so a drift
+    /// would silently reclassify accounts the SVM did load.
+    #[tokio::test]
+    async fn bob_knows_account_matches_loader_semantics() {
+        let (mut bob, _settled_tx) = create_test_bob();
+
+        let precompile = Pubkey::new_unique();
+        bob.precompiles
+            .insert(precompile, make_account(1, b"elf", &Pubkey::new_unique()));
+
+        let live = Pubkey::new_unique();
+        bob.insert_account_for_test(live, token_like(10));
+
+        // Build the deleted entry the production way: a successful tx writing
+        // a zero-lamport, empty-data account tombstones it.
+        let from = Keypair::new();
+        let deleted = from.pubkey();
+        bob.insert_account_for_test(deleted, token_like(10));
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+        let output = svm_output(executed_with_status(
+            Ok(()),
+            vec![(deleted, AccountSharedData::default())],
+        ));
+        bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        let absent = Pubkey::new_unique();
+
+        for pubkey in [precompile, live, deleted, absent] {
+            assert_eq!(
+                bob.knows_account(&pubkey),
+                bob.get_account_shared_data(&pubkey).is_some(),
+                "knows_account disagrees with the loader for {pubkey}"
+            );
+        }
+        assert!(bob.knows_account(&precompile) && bob.knows_account(&live));
+        assert!(!bob.knows_account(&deleted) && !bob.knows_account(&absent));
     }
 }

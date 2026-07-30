@@ -32,10 +32,11 @@ fn system_discriminant(data: &[u8]) -> Option<u32> {
 
 /// Admission policy for a single top-level instruction.
 ///
-/// System is restricted to Transfer, the only variant that cannot allocate
-/// account data: with zero fees, allocating is free permanent state for anyone.
-/// We match the raw variant tag rather than deserialize, so no decoder runs on
-/// attacker bytes at ingress, and bincode reads that same tag first anyway.
+/// System is restricted to Transfer because it is all any flow here needs, and
+/// because CreateAccount, Allocate, and their seeded forms let a caller allocate
+/// permanent state that the gasless model never charges for. We match the raw
+/// variant tag rather than deserialize, so no decoder runs on attacker bytes at
+/// ingress, and bincode reads that same tag first anyway.
 pub fn is_allowed_program_instruction(program_id: &Pubkey, data: &[u8]) -> bool {
     if *program_id == solana_sdk_ids::system_program::ID {
         return system_discriminant(data) == Some(SYSTEM_TRANSFER_DISCRIMINANT);
@@ -95,7 +96,7 @@ mod tests {
         bincode::serialize(ix).unwrap()
     }
 
-    /// A1: Transfer is the only System variant that cannot allocate account data.
+    /// A1: Transfer is the only System variant any flow here needs.
     #[test]
     fn system_transfer_is_admitted() {
         let data = encode(&SystemInstruction::Transfer { lamports: 1 });

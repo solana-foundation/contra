@@ -38,7 +38,7 @@ Ordered from most divergent → closest match.
 
 | Method | Notes |
 |---|---|
-| `sendTransaction` | Program allowlist: SPL Token, ATA, Memo, System, Withdraw. Any other program will return `-32602`. `RpcSendTransactionConfig` accepted but ignored - no preflight (so failures surface at submit without sim logs / CU info), no `maxRetries`. Only `base64` input. |
+| `sendTransaction` | Program allowlist: SPL Token, ATA, Memo, Withdraw, Swap. System is admitted for `Transfer` only - every other System instruction allocates account data that the gasless model never charges for. Any other program, or a non-`Transfer` System instruction, returns `-32602`. `RpcSendTransactionConfig` accepted but ignored - no preflight (so failures surface at submit without sim logs / CU info), no `maxRetries`. Only `base64` input. |
 | `simulateTransaction` **[auth]** | `sigVerify`, `accounts`, `accounts.encoding` honoured. `replaceRecentBlockhash`, `minContextSlot`, `innerInstructions` ignored. Only base64. Operator-only under auth - wallets can't preview tx effects. |
 | `getRecentBlockhash` | Solana-deprecated. Always returns `lamports_per_signature = 5000` - Solana-legacy constant, not SPC's gasless reality. |
 | `getTokenAccountBalance` **[auth]** | Only SPL Token; Token-2022 rejected with `"Account is not a token account"`. Missing-mint/missing-account errors use `-32602` where Solana uses other codes. |

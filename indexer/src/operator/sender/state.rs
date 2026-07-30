@@ -255,8 +255,11 @@ impl SenderState {
                 continue;
             };
 
-            let Some(user) = Self::or_manual_review(
-                Pubkey::from_str(&tx.recipient).map_err(|e| format!("invalid user pubkey: {e}")),
+            // The burn debited the initiator, so the remint credits them, not
+            // `recipient` (the Solana destination of the failed release).
+            let Some(initiator) = Self::or_manual_review(
+                Pubkey::from_str(&tx.initiator)
+                    .map_err(|e| format!("invalid initiator pubkey: {e}")),
                 storage_tx,
                 tx.id,
                 &tx.trace_id,
@@ -266,8 +269,8 @@ impl SenderState {
                 continue;
             };
 
-            let user_ata = get_associated_token_address_with_program_id(
-                &user,
+            let initiator_ata = get_associated_token_address_with_program_id(
+                &initiator,
                 &mint,
                 &private_channel_token_program,
             );
@@ -328,8 +331,8 @@ impl SenderState {
                 transaction_id: tx.id,
                 trace_id: tx.trace_id.clone(),
                 mint,
-                user,
-                user_ata,
+                user: initiator,
+                user_ata: initiator_ata,
                 token_program: private_channel_token_program,
                 amount,
             };
@@ -430,6 +433,7 @@ mod tests {
     fn make_pending_remint_row(
         id: i64,
         mint: &Pubkey,
+        initiator: &Pubkey,
         recipient: &Pubkey,
         sig: &Signature,
         deadline: chrono::DateTime<Utc>,
@@ -440,7 +444,7 @@ mod tests {
             signature: Signature::new_unique().to_string(),
             trace_id: format!("trace-{id}"),
             slot: 100,
-            initiator: Pubkey::new_unique().to_string(),
+            initiator: initiator.to_string(),
             recipient: recipient.to_string(),
             mint: mint.to_string(),
             amount: TokenAmount(5_000),
@@ -470,7 +474,7 @@ mod tests {
     /// operator can continue where it left off before the crash.
     ///
     /// This test verifies that every field is correctly restored:
-    /// - transaction_id, trace_id, amount, mint, recipient
+    /// - transaction_id, trace_id, amount, mint, initiator
     /// - withdrawal signatures (needed for the finality check)
     /// - the original deadline (not a fresh 32s window — the clock keeps
     ///   ticking across restarts)
@@ -483,6 +487,9 @@ mod tests {
     async fn recover_pending_remints_rehydrates_queue() {
         let mock = MockStorage::new();
         let mint = Pubkey::new_unique();
+        // Distinct from `recipient`: the burn debited the initiator, so the
+        // remint must target them, not the withdrawal's Solana destination.
+        let initiator = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
         let sig = Signature::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
@@ -490,7 +497,7 @@ mod tests {
         // Mid-budget value so the round-trip assertion is meaningful: a reset
         // to 0 on recovery would re-arm the cap and let an ambiguous row
         // outlive the intended ManualReview escalation.
-        let mut row = make_pending_remint_row(42, &mint, &recipient, &sig, deadline);
+        let mut row = make_pending_remint_row(42, &mint, &initiator, &recipient, &sig, deadline);
         row.finality_check_attempts = 2;
         mock.pending_remint_transactions.lock().unwrap().push(row);
 
@@ -512,7 +519,16 @@ mod tests {
 
         // Pubkeys must be correctly parsed from their string representation.
         assert_eq!(entry.remint_info.mint, mint);
-        assert_eq!(entry.remint_info.user, recipient);
+
+        // The remint reverses a burn, so it must credit the account that was
+        // debited (initiator), not the withdrawal's Solana destination.
+        assert_eq!(entry.remint_info.user, initiator);
+        assert_ne!(entry.remint_info.user, recipient);
+        assert_eq!(
+            entry.remint_info.user_ata,
+            get_associated_token_address_with_program_id(&initiator, &mint, &spl_token::id()),
+            "remint must mint into the initiator's private channel ATA"
+        );
 
         // Signatures must be parsed back — they drive the finality check.
         // lvbh must round-trip too: the gate needs it to prove a broadcast
@@ -555,7 +571,8 @@ mod tests {
         let sig = Signature::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        let mut row = make_pending_remint_row(7, &mint, &recipient, &sig, deadline);
+        let mut row =
+            make_pending_remint_row(7, &mint, &Pubkey::new_unique(), &recipient, &sig, deadline);
         row.finality_check_attempts = -1;
         mock.pending_remint_transactions.lock().unwrap().push(row);
 
@@ -592,13 +609,26 @@ mod tests {
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
         // Row 1: invalid mint — should escalate to ManualReview and be skipped.
-        let mut bad_row =
-            make_pending_remint_row(10, &Pubkey::new_unique(), &recipient, &sig, deadline);
+        let mut bad_row = make_pending_remint_row(
+            10,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &recipient,
+            &sig,
+            deadline,
+        );
         bad_row.mint = "not-a-valid-pubkey".to_string();
 
         // Row 2: valid — must still be recovered despite the bad row above.
         let good_mint = Pubkey::new_unique();
-        let good_row = make_pending_remint_row(11, &good_mint, &recipient, &sig, deadline);
+        let good_row = make_pending_remint_row(
+            11,
+            &good_mint,
+            &Pubkey::new_unique(),
+            &recipient,
+            &sig,
+            deadline,
+        );
 
         mock.pending_remint_transactions
             .lock()
@@ -630,21 +660,28 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
-    /// A corrupted recipient pubkey cannot be parsed into a `Pubkey`, so the
-    /// operator cannot compute the user's ATA and has no valid destination
+    /// A corrupted initiator pubkey cannot be parsed into a `Pubkey`, so the
+    /// operator cannot compute the burner's ATA and has no valid destination
     /// for the remint.
     ///
     /// Same escalation rule as invalid mint: ManualReview immediately, do not
     /// skip silently, do not block other rows.
     #[tokio::test]
-    async fn recover_pending_remints_escalates_invalid_recipient_to_manual_review() {
+    async fn recover_pending_remints_escalates_invalid_initiator_to_manual_review() {
         let mock = MockStorage::new();
         let mint = Pubkey::new_unique();
         let sig = Signature::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        let mut bad_row = make_pending_remint_row(20, &mint, &Pubkey::new_unique(), &sig, deadline);
-        bad_row.recipient = "not-a-valid-pubkey".to_string();
+        let mut bad_row = make_pending_remint_row(
+            20,
+            &mint,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &sig,
+            deadline,
+        );
+        bad_row.initiator = "not-a-valid-pubkey".to_string();
 
         mock.pending_remint_transactions
             .lock()
@@ -658,12 +695,12 @@ mod tests {
 
         let update = storage_rx
             .try_recv()
-            .expect("should receive ManualReview for bad recipient");
+            .expect("should receive ManualReview for bad initiator");
         assert_eq!(update.transaction_id, 20);
         assert_eq!(update.status, TransactionStatus::ManualReview);
         let err = update.error_message.as_deref().unwrap_or("");
         assert!(
-            err.contains("invalid user pubkey"),
+            err.contains("invalid initiator pubkey"),
             "error message should describe the parse failure: {err}"
         );
 
@@ -691,8 +728,14 @@ mod tests {
         let recipient = Pubkey::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        let mut bad_row =
-            make_pending_remint_row(40, &mint, &recipient, &Signature::new_unique(), deadline);
+        let mut bad_row = make_pending_remint_row(
+            40,
+            &mint,
+            &Pubkey::new_unique(),
+            &recipient,
+            &Signature::new_unique(),
+            deadline,
+        );
         // Replace the valid signature with garbage.
         bad_row.remint_signatures = Some(vec!["not-a-valid-signature".to_string()]);
 
@@ -737,8 +780,14 @@ mod tests {
         let recipient = Pubkey::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        let mut bad_row =
-            make_pending_remint_row(50, &mint, &recipient, &Signature::new_unique(), deadline);
+        let mut bad_row = make_pending_remint_row(
+            50,
+            &mint,
+            &Pubkey::new_unique(),
+            &recipient,
+            &Signature::new_unique(),
+            deadline,
+        );
         bad_row.remint_signatures = Some(vec![
             Signature::new_unique().to_string(),
             Signature::new_unique().to_string(),
@@ -815,6 +864,7 @@ mod tests {
             .push(make_pending_remint_row(
                 50,
                 &mint,
+                &Pubkey::new_unique(),
                 &recipient,
                 &sig,
                 past_deadline,
@@ -855,6 +905,7 @@ mod tests {
         let mut row = make_pending_remint_row(
             60,
             &mint,
+            &Pubkey::new_unique(),
             &recipient,
             &sig,
             Utc::now() + chrono::Duration::seconds(30),

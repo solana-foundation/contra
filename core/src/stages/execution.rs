@@ -418,17 +418,23 @@ fn enforce_lamport_conservation(
         }
 
         fabricated.clear();
-        // How much of the invented float went missing, and how many brand new
-        // accounts exist to justify it.
+        // How much of the invented float went missing, how many brand new
+        // accounts exist to justify it, and whether any account that already
+        // existed ended up richer than it started.
         let mut shortfall = 0u64;
         let mut created = 0u64;
+        let mut credited = false;
         for (index, (pubkey, acct)) in executed.loaded_transaction.accounts.iter().enumerate() {
-            // Read-only accounts are never persisted, and anything BOB already
-            // knew is real money this check must not touch or count.
-            if !tx.is_writable(index) || bob.knows_account(pubkey) {
+            // Read-only accounts are never persisted, so they are never touched
+            // or counted.
+            if !tx.is_writable(index) {
                 continue;
             }
-            if fee_payers.contains(pubkey) {
+            if let Some(before) = bob.account_lamports(pubkey) {
+                // Already existed, so its balance is real money this check must
+                // never rewrite. Only note whether it grew.
+                credited |= acct.lamports() > before;
+            } else if fee_payers.contains(pubkey) {
                 // An invented payer: whatever it no longer holds has escaped.
                 // The set is batch-wide, so draining one payer into another
                 // still registers as a shortfall rather than as repayment.
@@ -443,7 +449,12 @@ fn enforce_lamport_conservation(
         // Lamports against a count, because the rate is exactly one: the SVM
         // deletes a 0-lamport account, and with rent at zero every creation
         // path funds a single lamport. So `created` is also the allowance.
-        if shortfall > created {
+        //
+        // The second clause closes an attribution gap. Counting creations does
+        // not prove the float paid for them, so a creation funded by real money
+        // could licence a float lamport that actually landed somewhere durable.
+        // While any float is missing, no pre-existing balance may grow.
+        if shortfall > created || (shortfall > 0 && credited) {
             // Reject rather than claw back, which would mean rewriting accounts
             // the transaction legitimately owns. Downstream skips failed txs.
             executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
@@ -1145,6 +1156,62 @@ mod tests {
             data_account(6000),
             "the credited side keeps the credit"
         );
+    }
+
+    /// Counting creations does not prove the float paid for them. Here a new
+    /// account is funded by real money while one float lamport lands in an
+    /// account that already existed, so the count would licence a fabricated
+    /// lamport becoming durable. The credit clause rejects it instead.
+    #[tokio::test]
+    async fn credited_pre_existing_account_rejects_when_float_is_missing() {
+        let payer = Pubkey::new_unique();
+        let funder = Pubkey::new_unique();
+        let escrow = Pubkey::new_unique();
+        let fresh = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(funder, dataless_account(2)), (escrow, data_account(5000))],
+            vec![
+                // One lamport of the float is gone.
+                (payer, dataless_account(FLOAT - 1)),
+                // A real account paid for the new one, not the payer.
+                (funder, dataless_account(1)),
+                (fresh, data_account(1)),
+                // The float lamport ended up here, in durable state.
+                (escrow, data_account(5001)),
+            ],
+            &[payer],
+        );
+        assert!(
+            out.rejected(),
+            "a credited pre-existing account must not be licenced by an unrelated creation, status was {:?}",
+            out.status
+        );
+        assert_eq!(
+            out.accounts[3],
+            data_account(5001),
+            "a rejected transaction must still not rewrite the account that gained"
+        );
+    }
+
+    /// The credit clause is conditional, not blanket: with the float intact,
+    /// pre-existing accounts may move real lamports between themselves. A
+    /// creation funded entirely by real money is still allowed to persist.
+    #[tokio::test]
+    async fn credited_pre_existing_account_is_fine_when_float_is_intact() {
+        let payer = Pubkey::new_unique();
+        let funder = Pubkey::new_unique();
+        let escrow = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(funder, dataless_account(5000)), (escrow, data_account(10))],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (funder, dataless_account(4000)),
+                (escrow, data_account(1010)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[2], data_account(1010), "the credit stands");
     }
 
     /// An ordinary wallet (lamports, no data) is neither zeroed nor deleted.

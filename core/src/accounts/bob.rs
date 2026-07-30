@@ -134,14 +134,18 @@ impl BOB {
         &self.precompiles
     }
 
-    /// Whether BOB would hand this account to the SVM. Mirrors
-    /// `get_account_shared_data`'s presence rules without cloning the account.
-    pub fn knows_account(&self, pubkey: &Pubkey) -> bool {
-        self.precompiles.contains_key(pubkey)
-            || self
-                .accounts
-                .get(pubkey)
-                .is_some_and(|entry| !entry.deleted)
+    /// Lamports BOB would hand the SVM for this account, or `None` if it would
+    /// hand nothing. Mirrors `get_account_shared_data`'s presence rules without
+    /// cloning the account, so callers get both presence and balance in one
+    /// lookup.
+    pub fn account_lamports(&self, pubkey: &Pubkey) -> Option<u64> {
+        if let Some(account) = self.precompiles.get(pubkey) {
+            return Some(account.lamports());
+        }
+        self.accounts
+            .get(pubkey)
+            .filter(|entry| !entry.deleted)
+            .map(|entry| entry.account.lamports())
     }
 
     /// Preloads accounts into BOB from the database.
@@ -1458,12 +1462,13 @@ mod tests {
         );
     }
 
-    /// `knows_account` must answer exactly what `get_account_shared_data`
-    /// answers, for every entry shape: precompile, live, deleted, absent.
-    /// The conservation check keys "this account is new" off it, so a drift
-    /// would silently reclassify accounts the SVM did load.
+    /// `account_lamports` must report exactly what `get_account_shared_data`
+    /// reports, for every entry shape: precompile, live, deleted, absent. The
+    /// conservation check reads both "this account is new" and "this is what it
+    /// held before" off it, so a drift would misclassify accounts the SVM loaded
+    /// or misjudge whether a balance grew.
     #[tokio::test]
-    async fn bob_knows_account_matches_loader_semantics() {
+    async fn bob_account_lamports_matches_loader_semantics() {
         let (mut bob, _settled_tx) = create_test_bob();
 
         let precompile = Pubkey::new_unique();
@@ -1489,12 +1494,17 @@ mod tests {
 
         for pubkey in [precompile, live, deleted, absent] {
             assert_eq!(
-                bob.knows_account(&pubkey),
-                bob.get_account_shared_data(&pubkey).is_some(),
-                "knows_account disagrees with the loader for {pubkey}"
+                bob.account_lamports(&pubkey),
+                bob.get_account_shared_data(&pubkey)
+                    .map(|account| account.lamports()),
+                "account_lamports disagrees with the loader for {pubkey}"
             );
         }
-        assert!(bob.knows_account(&precompile) && bob.knows_account(&live));
-        assert!(!bob.knows_account(&deleted) && !bob.knows_account(&absent));
+        // `token_like` carries its balance in data and sits on the 1-lamport
+        // existence floor, so 1 is the lamport figure the check must see.
+        assert_eq!(bob.account_lamports(&precompile), Some(1));
+        assert_eq!(bob.account_lamports(&live), Some(1));
+        assert_eq!(bob.account_lamports(&deleted), None);
+        assert_eq!(bob.account_lamports(&absent), None);
     }
 }

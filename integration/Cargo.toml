@@ -203,6 +203,7 @@ test-tree = ["private-channel-indexer/test-tree"]
 [dependencies]
 anyhow = "1.0.100"
 base64 = { workspace = true }
+borsh = { workspace = true }
 bs58 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }

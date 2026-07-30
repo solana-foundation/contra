@@ -187,6 +187,17 @@ counter_vec!(
     &["program_type", "outcome"]
 );
 
+// Release-side SMT confirmation gate: the on-chain root verdict on the terminal
+// Dead branch of a release consumer. `site` is one of {recovery, remint}; `verdict`
+// is one of {landed, not_landed, uncertain}. A rising `uncertain` rate is a stuck
+// DB-vs-chain divergence worth alerting on.
+counter_vec!(
+    OPERATOR_RELEASE_VERIFY,
+    "private_channel_operator_release_verify_total",
+    "Release-side SMT confirmation verdicts on the Dead branch",
+    &["site", "verdict"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -285,6 +296,14 @@ pub fn init_labels(program_type: &str) {
             ]);
         }
     }
+
+    // Release-verify gate labels are program-independent (site, verdict); the
+    // idempotent pre-registration is harmless across repeated init_labels calls.
+    for site in &["recovery", "remint"] {
+        for verdict in &["landed", "not_landed", "uncertain"] {
+            OPERATOR_RELEASE_VERIFY.with_label_values(&[site, verdict]);
+        }
+    }
 }
 
 pub fn init() {
@@ -312,6 +331,7 @@ pub fn init() {
         OPERATOR_TASK_EXIT,
         OPERATOR_STALE_PROCESSING_RECOVERED,
         OPERATOR_REOPENED_DEPOSIT_GATE,
+        OPERATOR_RELEASE_VERIFY,
     );
 }
 

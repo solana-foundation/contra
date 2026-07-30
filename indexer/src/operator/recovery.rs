@@ -3,15 +3,18 @@
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::OperatorError;
-use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
+use crate::metrics::{OPERATOR_RELEASE_VERIFY, OPERATOR_STALE_PROCESSING_RECOVERED};
 use crate::operator::sender::types::PendingSig;
-use crate::operator::sender::{classify_signatures, FinalityRpc, SigFinality};
+use crate::operator::sender::{
+    classify_signatures, verify_release_landed, FinalityRpc, ReleaseVerdict, SigFinality,
+};
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::TransactionStatusUpdate;
 use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
 use crate::storage::common::storage::Storage;
 use chrono::{DateTime, Utc};
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -47,7 +50,12 @@ pub(crate) enum DepositOutcome {
 /// a release that already landed is never re-sent.
 enum WithdrawalAction {
     /// Release finalized on-chain → mark Completed with that signature.
-    Complete { signature: String },
+    /// `release_signatures` carries the full attempt list for durable provenance
+    /// when an SMT-confirmed release supplies it; `None` otherwise.
+    Complete {
+        signature: String,
+        release_signatures: Option<Vec<String>>,
+    },
     /// Every recorded signature is dead → safe to requeue.
     Demote,
     /// A recorded signature could still land → re-evaluate next sweep.
@@ -60,6 +68,7 @@ enum WithdrawalAction {
 enum RecoveryAction {
     Complete {
         signature: String,
+        release_signatures: Option<Vec<String>>,
     },
     Demote,
     /// Leave the row in Processing this tick (no CAS write).
@@ -77,6 +86,7 @@ pub async fn run_recovery_worker(
     rpc_client: Arc<RpcClientWithRetry>,
     fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
+    instance_pda: Option<Pubkey>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
@@ -99,6 +109,7 @@ pub async fn run_recovery_worker(
                     &storage,
                     &finality,
                     program_type,
+                    instance_pda,
                     &storage_tx,
                     &cancellation_token,
                     STALE_THRESHOLD,
@@ -128,6 +139,7 @@ async fn recover_once(
     storage: &Storage,
     finality: &FinalityRpc<'_>,
     program_type: ProgramType,
+    instance_pda: Option<Pubkey>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     threshold: Duration,
@@ -166,7 +178,7 @@ async fn recover_once(
         }
         // Capture `updated_at` before the RPC so the write below CAS-checks it.
         let captured = row.updated_at;
-        let action = decide_action(&row, storage, finality).await;
+        let action = decide_action(&row, storage, finality, instance_pda).await;
         route_outcome(storage, &row, captured, action, program_type, storage_tx).await;
     }
 
@@ -194,23 +206,35 @@ async fn decide_action(
     row: &DbTransaction,
     storage: &Storage,
     finality: &FinalityRpc<'_>,
+    instance_pda: Option<Pubkey>,
 ) -> RecoveryAction {
     // Recovery is same-type by construction: the sweep queries filter on the
     // operator's own row type, so `finality` is always the chain the row's
     // signatures were broadcast to.
     let action = match row.transaction_type {
         TransactionType::Deposit => match check_deposit(row, storage, finality).await {
-            DepositOutcome::Landed { signature } => RecoveryAction::Complete { signature },
+            DepositOutcome::Landed { signature } => RecoveryAction::Complete {
+                signature,
+                release_signatures: None,
+            },
             DepositOutcome::NotLanded => RecoveryAction::Demote,
             DepositOutcome::Live { reason } => RecoveryAction::NoAction { reason },
             DepositOutcome::Ambiguous { reason } => RecoveryAction::Quarantine { reason },
         },
-        TransactionType::Withdrawal => match check_withdrawal(row, storage, finality).await {
-            WithdrawalAction::Complete { signature } => RecoveryAction::Complete { signature },
-            WithdrawalAction::Demote => RecoveryAction::Demote,
-            WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
-            WithdrawalAction::Quarantine { reason } => RecoveryAction::Quarantine { reason },
-        },
+        TransactionType::Withdrawal => {
+            match check_withdrawal(row, storage, finality, instance_pda).await {
+                WithdrawalAction::Complete {
+                    signature,
+                    release_signatures,
+                } => RecoveryAction::Complete {
+                    signature,
+                    release_signatures,
+                },
+                WithdrawalAction::Demote => RecoveryAction::Demote,
+                WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
+                WithdrawalAction::Quarantine { reason } => RecoveryAction::Quarantine { reason },
+            }
+        }
     };
     // Cap recovery requeue attempts. Rows that fail to make progress after
     // MAX_RECOVERY_REQUEUE_ATTEMPTS are quarantined (and paged) rather than
@@ -306,12 +330,14 @@ async fn check_withdrawal(
     row: &DbTransaction,
     storage: &Storage,
     finality: &FinalityRpc<'_>,
+    instance_pda: Option<Pubkey>,
 ) -> WithdrawalAction {
-    if row.withdrawal_nonce.is_none() {
+    let Some(nonce) = row.withdrawal_nonce else {
         return WithdrawalAction::Quarantine {
             reason: "withdrawal row missing nonce".to_string(),
         };
-    }
+    };
+    let nonce = nonce as u64;
 
     let pending = match load_pending_sigs(storage, row.id).await {
         Ok(p) => p,
@@ -329,8 +355,52 @@ async fn check_withdrawal(
     match classify_signatures(finality, &pending).await {
         SigFinality::Landed(sig) => WithdrawalAction::Complete {
             signature: sig.to_string(),
+            release_signatures: None,
         },
-        SigFinality::Dead => WithdrawalAction::Demote,
+        // The classifier calls the release dead by absence. Confirm it against the
+        // on-chain SMT root before demoting, since a pruned/lagging endpoint can
+        // report absence for a release that actually landed.
+        SigFinality::Dead => {
+            // pending is non-empty here, so max() is always Some.
+            let max_lvbh = pending
+                .iter()
+                .map(|p| p.last_valid_block_height)
+                .max()
+                .unwrap_or(0);
+            match verify_release_landed(finality.primary, storage, instance_pda, nonce, max_lvbh)
+                .await
+            {
+                ReleaseVerdict::Landed => {
+                    OPERATOR_RELEASE_VERIFY
+                        .with_label_values(&["recovery", "landed"])
+                        .inc();
+                    // The SMT proves the nonce released but not which attempt landed.
+                    // On-chain exclusion-proof insertion means only the earliest attempt
+                    // can consume the nonce, so the first recorded signature is the
+                    // correct single-value provenance; the full list is kept durably.
+                    WithdrawalAction::Complete {
+                        signature: pending[0].signature.to_string(),
+                        release_signatures: Some(
+                            pending.iter().map(|p| p.signature.to_string()).collect(),
+                        ),
+                    }
+                }
+                ReleaseVerdict::NotLanded => {
+                    OPERATOR_RELEASE_VERIFY
+                        .with_label_values(&["recovery", "not_landed"])
+                        .inc();
+                    WithdrawalAction::Demote
+                }
+                ReleaseVerdict::Uncertain(reason) => {
+                    OPERATOR_RELEASE_VERIFY
+                        .with_label_values(&["recovery", "uncertain"])
+                        .inc();
+                    WithdrawalAction::Quarantine {
+                        reason: format!("release verification uncertain ({reason})"),
+                    }
+                }
+            }
+        }
         SigFinality::Live(reason) => WithdrawalAction::LeaveProcessing { reason },
         SigFinality::Uncertain(reason) => WithdrawalAction::Quarantine {
             reason: format!(
@@ -410,9 +480,17 @@ async fn route_outcome(
     };
 
     match action {
-        RecoveryAction::Complete { signature } => {
+        RecoveryAction::Complete {
+            signature,
+            release_signatures,
+        } => {
             match storage
-                .try_complete_processing(row.id, captured_updated_at, Some(signature.clone()))
+                .try_complete_processing(
+                    row.id,
+                    captured_updated_at,
+                    Some(signature.clone()),
+                    release_signatures,
+                )
                 .await
             {
                 Ok(true) => {
@@ -490,6 +568,7 @@ async fn route_outcome(
                         error_message: Some(reason),
                         remint_signature: None,
                         remint_attempted: false,
+                        release_signatures: None,
                     };
                     // Closed channel = on-call alert lost; surface it loudly.
                     if let Err(e) =
@@ -520,11 +599,13 @@ async fn route_outcome(
 /// is no live sibling whose not-yet-stale work this could disrupt. Exhausting
 /// `max_passes` with rows still `Processing` returns `Ok`: the caller's
 /// `validate_smt_root` is the terminal gate that refuses to start on a real mismatch.
+#[allow(clippy::too_many_arguments)]
 pub async fn boot_reconcile_processing(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
     fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
+    instance_pda: Option<Pubkey>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     max_passes: u32,
@@ -539,6 +620,7 @@ pub async fn boot_reconcile_processing(
             storage,
             &finality,
             program_type,
+            instance_pda,
             storage_tx,
             cancellation_token,
             Duration::ZERO,
@@ -577,6 +659,7 @@ pub mod test_hooks {
         storage: &Storage,
         rpc_client: &RpcClientWithRetry,
         program_type: ProgramType,
+        instance_pda: Option<Pubkey>,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
         // Fresh, never-cancelled token; tests run to completion. Uses the periodic
@@ -590,6 +673,7 @@ pub mod test_hooks {
             storage,
             &finality,
             program_type,
+            instance_pda,
             storage_tx,
             &token,
             STALE_THRESHOLD,
@@ -682,6 +766,27 @@ mod tests {
             .create()
     }
 
+    /// Finalized getLatestBlockhash carrying `context_slot` and `lvbh`, the verifier's
+    /// freshness anchor: it derives tip = lvbh - MAX_PROCESSING_AGE and binds the
+    /// instance account read to `context_slot`. Pick lvbh so tip is above (fresh) or
+    /// at/below (stale) the attempt's lvbh.
+    fn mock_latest_blockhash(
+        server: &mut mockito::ServerGuard,
+        context_slot: u64,
+        lvbh: u64,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{context_slot}}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{lvbh}}}}},"id":1}}"#
+            ))
+            .create()
+    }
+
     /// Covered ledger floor so an absence-Dead resolves to Dead, not a prune.
     fn mock_first_available_block(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
         server
@@ -691,6 +796,67 @@ mod tests {
             ))
             .with_status(200)
             .with_body(format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":1}}"#))
+            .create()
+    }
+
+    /// Root of a fresh tree carrying `nonces` (used to craft an on-chain instance).
+    fn smt_root(tree_index: u64, nonces: &[u64]) -> [u8; 32] {
+        use crate::operator::utils::smt_util::SmtState;
+        let mut smt = SmtState::new(tree_index);
+        for n in nonces {
+            smt.insert_nonce(*n);
+        }
+        smt.current_root()
+    }
+
+    /// getAccountInfo mock returning an escrow Instance with `root`/`tree_index`
+    /// at response context `slot`. `expect` bounds how many calls are allowed so a
+    /// fast-path test can assert the finalized read never fired (expect 0).
+    fn mock_instance_at_slot(
+        server: &mut mockito::ServerGuard,
+        root: [u8; 32],
+        tree_index: u64,
+        slot: u64,
+        expect: usize,
+    ) -> mockito::Mock {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use borsh::BorshSerialize;
+        use private_channel_escrow_program_client::Instance;
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index: tree_index,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": slot},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect(expect)
             .create()
     }
 
@@ -709,7 +875,7 @@ mod tests {
         );
         // Same state on the withdrawal side Quarantines; assert the difference.
         let wrow = make_withdrawal_row(2, Some(42));
-        let waction = check_withdrawal(&wrow, &storage, &FinalityRpc::single(&client)).await;
+        let waction = check_withdrawal(&wrow, &storage, &FinalityRpc::single(&client), None).await;
         assert!(
             matches!(waction, WithdrawalAction::Quarantine { .. }),
             "withdrawal with no sigs must Quarantine - the deliberate deposit divergence"
@@ -877,7 +1043,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, None);
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(reason.contains("withdrawal row missing nonce"));
@@ -893,7 +1059,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, Some(42));
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -905,11 +1071,10 @@ mod tests {
         }
     }
 
-    /// Null-status signature past blockhash validity is dead → demote.
-    #[tokio::test]
-    async fn check_withdrawal_demotes_when_signature_dead() {
-        let mut server = mockito::Server::new_async().await;
-        let _status = server
+    /// Register the Dead-by-absence classifier mocks (null status + expired height
+    /// + covered floor) on `server`. The withdrawal then routes through the SMT gate.
+    fn mock_dead_by_absence(server: &mut mockito::ServerGuard) {
+        server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
                 r#""method"\s*:\s*"getSignatureStatuses""#.into(),
@@ -919,7 +1084,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
             )
             .create();
-        let _height = server
+        server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
                 r#""method"\s*:\s*"getBlockHeight""#.into(),
@@ -928,22 +1093,218 @@ mod tests {
             .with_body(r#"{"jsonrpc":"2.0","result":1000,"id":1}"#)
             .create();
         // Covered floor (0) so the single-endpoint absence is proven Dead.
-        let _floor = mock_first_available_block(&mut server, 0);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":0,"id":1}"#)
+            .create();
+    }
+
+    /// IR2: a Dead-by-absence release whose nonce is NOT in the fresh on-chain root
+    /// resolves NotLanded, so it Demotes (preserves the old behavior under the SMT gate).
+    #[tokio::test]
+    async fn check_withdrawal_demotes_when_signature_dead() {
+        let mut server = mockito::Server::new_async().await;
+        mock_dead_by_absence(&mut server);
+        // Fresh finalized tip (1000 - 150 = 850 > lvbh 100) binds the account read.
+        let _bh = mock_latest_blockhash(&mut server, 500, 1000);
+        // On-chain tree 0 has no completed nonces; snapshot slot 1000 >= bound slot.
+        let _account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 1000, 1);
 
         let mock = MockStorage::new();
-        let row = make_withdrawal_row(1, Some(42));
-        // current_height (1000) > lvbh (100) means expired/dead.
+        // Small nonce so tree_index is 0 under both prod and test-tree sizes.
+        let row = make_withdrawal_row(1, Some(3));
         mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
+        let action = check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await;
         assert!(
             matches!(action, WithdrawalAction::Demote),
-            "expected Demote"
+            "root excludes nonce + fresh snapshot must Demote"
         );
+    }
+
+    /// IR1: a Dead-by-absence release whose nonce IS in the fresh on-chain root is
+    /// proven landed, so it Completes (not Demote), never re-sending a released withdrawal.
+    #[tokio::test]
+    async fn check_withdrawal_completes_when_smt_proves_landed() {
+        let mut server = mockito::Server::new_async().await;
+        mock_dead_by_absence(&mut server);
+        // Fresh finalized tip (1000 - 150 = 850 > lvbh 100) binds the account read.
+        let _bh = mock_latest_blockhash(&mut server, 500, 1000);
+        // On-chain tree 0 includes nonce 3; snapshot slot 1000 >= bound slot.
+        let _account = mock_instance_at_slot(&mut server, smt_root(0, &[3]), 0, 1000, 1);
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(3));
+        let recorded = Signature::new_unique().to_string();
+        mock.insert_release_signature(row.id, recorded.clone(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await;
+        match action {
+            WithdrawalAction::Complete {
+                signature,
+                release_signatures,
+            } => {
+                // The earliest recorded signature is the provenance pointer.
+                assert_eq!(signature, recorded, "earliest recorded sig is provenance");
+                assert_eq!(release_signatures, Some(vec![recorded]));
+            }
+            other => panic!(
+                "expected Complete, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// IR3: a Dead release whose finalized snapshot is not past the validity window
+    /// is Uncertain, so it Quarantines (fails closed, never demotes). The release is
+    /// finalized-failed so the classifier returns Dead without a block-height read,
+    /// leaving the verifier's finalized getLatestBlockhash the only freshness read,
+    /// mocked stale. The stale gate short-circuits before the bound account read.
+    #[tokio::test]
+    async fn check_withdrawal_quarantines_when_snapshot_stale() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .create();
+        // Finalized tip 250 - 150 = 100 == lvbh 100, so freshness fails closed to Uncertain.
+        let _bh = mock_latest_blockhash(&mut server, 500, 250);
+        // The stale gate returns before the account read, so this must never fire.
+        let account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 999, 0);
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(3));
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await;
+        assert!(
+            matches!(action, WithdrawalAction::Quarantine { .. }),
+            "stale snapshot must Quarantine, never Demote"
+        );
+        account.assert(); // stale gate short-circuits before the bound account read
+    }
+
+    /// F1: the classifier's finalized-success fast path completes WITHOUT the
+    /// finalized getAccountInfo read; the SMT gate is paid only on the Dead branch.
+    #[tokio::test]
+    async fn check_withdrawal_landed_fast_path_skips_account_read() {
+        let landed_sig = Signature::new_unique();
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .create();
+        // Must never be hit on the fast path.
+        let account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 1000, 0);
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(3));
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await;
+        assert!(matches!(action, WithdrawalAction::Complete { .. }));
+        account.assert(); // no getAccountInfo request fired
+    }
+
+    /// F2: a live (still within validity) signature leaves the row Processing
+    /// without any finalized getAccountInfo read.
+    #[tokio::test]
+    async fn check_withdrawal_live_fast_path_skips_account_read() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
+            )
+            .create();
+        // current_height (50) <= lvbh (1000) means still live.
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":50,"id":1}"#)
+            .create();
+        let account = mock_instance_at_slot(&mut server, smt_root(0, &[]), 0, 1000, 0);
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(3));
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await;
+        assert!(matches!(action, WithdrawalAction::LeaveProcessing { .. }));
+        account.assert(); // no getAccountInfo request fired
     }
 
     /// Finalized-success signature → Complete with that sig.
@@ -970,9 +1331,9 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
         match action {
-            WithdrawalAction::Complete { signature } => {
+            WithdrawalAction::Complete { signature, .. } => {
                 assert_eq!(signature, landed_sig.to_string());
             }
             _ => panic!("expected Complete"),
@@ -1011,7 +1372,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
         assert!(
             matches!(action, WithdrawalAction::LeaveProcessing { .. }),
             "expected LeaveProcessing"
@@ -1037,7 +1398,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client)).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -1076,6 +1437,7 @@ mod tests {
             captured,
             RecoveryAction::Complete {
                 signature: "sig-abc".to_string(),
+                release_signatures: None,
             },
             ProgramType::Escrow,
             &storage_tx,
@@ -1164,7 +1526,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1197,7 +1559,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, _rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1225,7 +1587,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1256,7 +1618,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1286,7 +1648,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, _rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1316,6 +1678,7 @@ mod tests {
             &client,
             None,
             ProgramType::Withdraw,
+            None,
             &storage_tx,
             &CancellationToken::new(),
             5,
@@ -1357,7 +1720,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, _rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1390,7 +1753,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
             .await
             .unwrap();
 
@@ -1425,14 +1788,14 @@ mod tests {
         let mut row = make_deposit_row(52);
         // One below the cap still demotes (requeues) - pins the off-by-one boundary.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
-        let below = decide_action(&row, &storage, &FinalityRpc::single(&client)).await;
+        let below = decide_action(&row, &storage, &FinalityRpc::single(&client), None).await;
         assert!(
             matches!(below, RecoveryAction::Demote),
             "one below the cap must still Demote (requeue)"
         );
         // At the cap, the demote is converted to Quarantine.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let at_cap = decide_action(&row, &storage, &FinalityRpc::single(&client)).await;
+        let at_cap = decide_action(&row, &storage, &FinalityRpc::single(&client), None).await;
         assert!(
             matches!(at_cap, RecoveryAction::Quarantine { .. }),
             "demote at the cap must become Quarantine"
@@ -1555,6 +1918,7 @@ mod tests {
             &storage,
             &FinalityRpc::single(&client),
             ProgramType::Withdraw,
+            None,
             &storage_tx,
             &CancellationToken::new(),
             Duration::ZERO,
@@ -1601,6 +1965,7 @@ mod tests {
             &client,
             None,
             ProgramType::Withdraw,
+            None,
             &storage_tx,
             &token,
             5,
@@ -1649,6 +2014,7 @@ mod tests {
             &client,
             None,
             ProgramType::Withdraw,
+            None,
             &storage_tx,
             &token,
             5,
@@ -1726,6 +2092,7 @@ mod tests {
             &storage,
             &finality,
             ProgramType::Withdraw,
+            None,
             &storage_tx,
             &CancellationToken::new(),
             Duration::ZERO,

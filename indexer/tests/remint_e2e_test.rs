@@ -273,6 +273,7 @@ async fn test_resolved_remint_not_returned_by_recovery_query(
             TransactionStatus::Completed,
             Some(sig.to_string()),
             Utc::now(),
+            None,
         )
         .await?;
 
@@ -316,7 +317,13 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
     //    (counterpart_signature is None for FailedReminted — the withdrawal never
     //    landed, so there is no release_funds sig to record.)
     storage
-        .update_transaction_status(tx_id, TransactionStatus::FailedReminted, None, Utc::now())
+        .update_transaction_status(
+            tx_id,
+            TransactionStatus::FailedReminted,
+            None,
+            Utc::now(),
+            None,
+        )
         .await?;
 
     // 3. Row must not appear in recovery — a second remint would double-credit the user.
@@ -394,7 +401,13 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
 
     // Step 4: finality check passes (no sig finalized), remint succeeds.
     storage
-        .update_transaction_status(tx_id, TransactionStatus::FailedReminted, None, Utc::now())
+        .update_transaction_status(
+            tx_id,
+            TransactionStatus::FailedReminted,
+            None,
+            Utc::now(),
+            None,
+        )
         .await?;
 
     // Step 5a: resolved row must not surface in recovery — prevents duplicate remint.
@@ -513,7 +526,13 @@ async fn test_manual_review_not_returned_by_recovery_query(
 
     // Simulate exhausted finality check retries escalating to ManualReview.
     storage
-        .update_transaction_status(tx_id, TransactionStatus::ManualReview, None, Utc::now())
+        .update_transaction_status(
+            tx_id,
+            TransactionStatus::ManualReview,
+            None,
+            Utc::now(),
+            None,
+        )
         .await?;
 
     // Must not appear in recovery — would loop re-queueing on every restart.

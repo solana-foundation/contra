@@ -318,6 +318,7 @@ pub async fn run(
         let recovery_rpc = rpc_client.clone();
         let recovery_fallback = fallback_rpc_client.clone();
         let recovery_program_type = common_config.program_type;
+        let recovery_instance_pda = instance_pda;
         let recovery_token = cancellation_token.clone();
         tokio::spawn(async move {
             if let Err(e) = recovery::run_recovery_worker(
@@ -325,6 +326,7 @@ pub async fn run(
                 recovery_rpc,
                 recovery_fallback,
                 recovery_program_type,
+                recovery_instance_pda,
                 recovery_storage_tx,
                 recovery_token,
             )
@@ -453,6 +455,7 @@ async fn run_withdraw_preflight(
         rpc_client,
         fallback_rpc_client,
         crate::config::ProgramType::Withdraw,
+        Some(instance_pda),
         storage_tx,
         cancellation_token,
         MAX_RECONCILE_PASSES,
@@ -487,8 +490,9 @@ async fn run_withdraw_preflight(
     }
 }
 
-/// Withdraw-only gate for the mandatory Solana fallback: require a second endpoint that is independent, same-cluster
-/// (equal genesis hash), and reachable, or refuse to start. Archival depth is left to the per-attempt ledger-floor check.
+/// Withdraw-only gate for the Solana fallback: a missing fallback only warns (the on-chain SMT gate is the release-side
+/// authority), but a configured fallback must be independent, same-cluster (equal genesis hash), and reachable, else
+/// refuse to start. Archival depth is left to the per-attempt ledger-floor check.
 async fn validate_withdraw_fallback(
     program_type: crate::config::ProgramType,
     rpc_client: &RpcClientWithRetry,
@@ -500,12 +504,16 @@ async fn validate_withdraw_fallback(
         return Ok(());
     }
 
+    // A missing fallback is no longer refuse-to-start: the on-chain SMT gate is
+    // now the authority for a release-side Dead, so a second corroborating
+    // endpoint is defense-in-depth, not a correctness precondition. Warn so a
+    // single-endpoint deploy is visible, then start.
     let (Some(fallback), Some(fallback_url)) = (fallback, fallback_url) else {
-        return Err(OperatorError::RpcError(
-            "fallback_rpc_url is required for the withdraw operator: a lone Solana endpoint's \
-             absent status is not proof of non-inclusion"
-                .to_string(),
-        ));
+        warn!(
+            "withdraw operator started without a fallback_rpc_url: release-side Dead is gated by \
+             the on-chain SMT root; a second endpoint is recommended defense-in-depth"
+        );
+        return Ok(());
     };
 
     if fallback_url == rpc_url {
@@ -704,9 +712,10 @@ mod tests {
             .create()
     }
 
-    /// A withdraw operator with no fallback configured must refuse to start.
+    /// S1: a withdraw operator with no fallback now warns and starts (previously
+    /// refused). The SMT gate is the authority for a release-side Dead.
     #[tokio::test]
-    async fn withdraw_missing_fallback_refuses_start() {
+    async fn withdraw_missing_fallback_warns_and_starts() {
         let primary = make_rpc_client("http://localhost:8899");
         let result = validate_withdraw_fallback(
             ProgramType::Withdraw,
@@ -716,7 +725,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+        assert!(
+            result.is_ok(),
+            "missing fallback must now warn and start: {result:?}"
+        );
     }
 
     /// A fallback whose URL equals rpc_url is not independent; refuse to start.

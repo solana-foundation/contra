@@ -1,6 +1,8 @@
 #[cfg(test)]
 use super::types::InFlightQueue;
 use super::types::SenderState;
+use super::{verify_release_landed, ReleaseVerdict};
+use crate::metrics::OPERATOR_RELEASE_VERIFY;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::{
     channel_utils::send_guaranteed,
@@ -296,6 +298,7 @@ pub async fn execute_deferred_remint(
                     error_message: Some(entry.original_error.clone()),
                     remint_signature: Some(signature.to_string()),
                     remint_attempted: true,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -329,6 +332,7 @@ pub async fn execute_deferred_remint(
                         error_message: Some(combined),
                         remint_signature: None,
                         remint_attempted: true,
+                        release_signatures: None,
                     },
                     "transaction status update",
                 )
@@ -614,22 +618,7 @@ pub async fn process_pending_remints(
         match classify_signatures(&state.dest_finality(), &entry.signatures).await {
             // Case 1: a sig finalized successfully, the withdrawal landed.
             SigFinality::Landed(sig) => {
-                // Chain root now includes this nonce. handle_permanent_failure
-                // removed it from the local SMT assuming the tx failed; put it
-                // back so local matches chain. Skip if the tree already rotated
-                // past this nonce's window.
-                if let Some(nonce) = entry.ctx.withdrawal_nonce {
-                    if let Some(smt) = state.smt_state.as_mut() {
-                        if smt.smt_state.tree_index() == nonce / MAX_TREE_LEAVES as u64 {
-                            if smt.smt_state.insert_nonce(nonce) {
-                                info!("Re-inserted landed nonce {nonce} into local SMT");
-                            } else {
-                                debug!("Landed nonce {nonce} already present in local SMT, no divergence");
-                            }
-                        }
-                    }
-                }
-                send_completed(storage_tx, &entry, &nonce_label, sig).await;
+                handle_release_landed(state, &entry, &nonce_label, sig, storage_tx).await;
             }
             // Case 2: could still land or unclassifiable → defer, don't remint.
             SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
@@ -643,32 +632,108 @@ pub async fn process_pending_remints(
                 )
                 .await;
             }
-            // Case 3: every sig is finalized-failed or expired, safe to remint.
+            // Case 3: the classifier calls every sig dead by absence. Before
+            // reminting (which moves value), confirm non-inclusion against the
+            // on-chain SMT root; a pruned/lagging endpoint can report absence for
+            // a release that actually landed. Only a proven NotLanded remints.
             SigFinality::Dead => {
-                info!(
-                    "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
-                    nonce_label
-                );
-                match execute_deferred_remint(state, entry, storage_tx).await {
-                    DeferredRemintOutcome::Resolved => {}
-                    // Nothing was broadcast: bounded retry, then ManualReview. Safe
-                    // because no signature can land.
-                    DeferredRemintOutcome::DeferPreBroadcast(entry, reason) => {
+                let verdict = match entry.ctx.withdrawal_nonce {
+                    Some(nonce) => {
+                        let max_lvbh = entry
+                            .signatures
+                            .iter()
+                            .map(|p| p.last_valid_block_height)
+                            .max()
+                            .unwrap_or(0);
+                        let v = verify_release_landed(
+                            &state.rpc_client,
+                            &state.storage,
+                            state.instance_pda,
+                            nonce,
+                            max_lvbh,
+                        )
+                        .await;
+                        // Count only real verifications so the None short-circuit
+                        // below is not mislabeled as a verified non-landing.
+                        let label = match &v {
+                            ReleaseVerdict::Landed => "landed",
+                            ReleaseVerdict::NotLanded => "not_landed",
+                            ReleaseVerdict::Uncertain(_) => "uncertain",
+                        };
+                        OPERATOR_RELEASE_VERIFY
+                            .with_label_values(&["remint", label])
+                            .inc();
+                        v
+                    }
+                    // No nonce to prove membership; fall through to the remint path,
+                    // which re-checks remint idempotency before broadcasting. No
+                    // verification ran, so no release-verify metric is emitted here.
+                    None => ReleaseVerdict::NotLanded,
+                };
+
+                match verdict {
+                    // Proven landed on-chain: skip the remint, mark Completed.
+                    ReleaseVerdict::Landed => {
+                        match entry.signatures.first().map(|p| p.signature) {
+                            Some(sig) => {
+                                handle_release_landed(state, &entry, &nonce_label, sig, storage_tx)
+                                    .await;
+                            }
+                            // Landed but nothing recorded to attribute it to; defer
+                            // rather than complete with no provenance.
+                            None => {
+                                defer_or_escalate(
+                                    &mut remaining,
+                                    entry,
+                                    &nonce_label,
+                                    "release verified landed but no signature recorded",
+                                    &state.storage,
+                                    storage_tx,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    // Proven not landed: remint is safe.
+                    ReleaseVerdict::NotLanded => {
+                        info!(
+                            "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
+                            nonce_label
+                        );
+                        match execute_deferred_remint(state, entry, storage_tx).await {
+                            DeferredRemintOutcome::Resolved => {}
+                            // Nothing was broadcast: bounded retry, then ManualReview.
+                            // Safe because no signature can land.
+                            DeferredRemintOutcome::DeferPreBroadcast(entry, reason) => {
+                                defer_or_escalate(
+                                    &mut remaining,
+                                    *entry,
+                                    &nonce_label,
+                                    &reason,
+                                    &state.storage,
+                                    storage_tx,
+                                )
+                                .await;
+                            }
+                            // A signature is (or might be) persisted: re-queue without
+                            // the cap so it keeps reclassifying. Terminalizing here would
+                            // abandon a possibly-live sig and invite a double-mint.
+                            DeferredRemintOutcome::DeferInFlight(entry, reason) => {
+                                requeue_in_flight(&mut remaining, *entry, &nonce_label, &reason);
+                            }
+                        }
+                    }
+                    // Uncertain: fail closed. Defer to a later tick or escalate.
+                    ReleaseVerdict::Uncertain(reason) => {
                         defer_or_escalate(
                             &mut remaining,
-                            *entry,
+                            entry,
                             &nonce_label,
-                            &reason,
+                            &format!("release verification uncertain ({reason})"),
                             &state.storage,
                             storage_tx,
                         )
                         .await;
-                    }
-                    // A signature is (or might be) persisted: re-queue without the
-                    // cap so it keeps reclassifying. Terminalizing here would abandon
-                    // a possibly-live sig and invite an operator double-mint.
-                    DeferredRemintOutcome::DeferInFlight(entry, reason) => {
-                        requeue_in_flight(&mut remaining, *entry, &nonce_label, &reason);
                     }
                 }
             }
@@ -678,6 +743,31 @@ pub async fn process_pending_remints(
     // `remaining` = entries not yet due + entries re-queued by `defer_or_escalate`
     // or `requeue_in_flight`.
     state.pending_remints = remaining;
+}
+
+/// Shared handling for a release confirmed landed (by the classifier fast path
+/// or the SMT verify gate): re-insert the nonce into the local SMT, which
+/// handle_permanent_failure had removed assuming failure, then mark Completed.
+/// Skips the SMT touch if the tree already rotated past this nonce's window.
+async fn handle_release_landed(
+    state: &mut SenderState,
+    entry: &PendingRemint,
+    nonce_label: &str,
+    sig: Signature,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    if let Some(nonce) = entry.ctx.withdrawal_nonce {
+        if let Some(smt) = state.smt_state.as_mut() {
+            if smt.smt_state.tree_index() == nonce / MAX_TREE_LEAVES as u64 {
+                if smt.smt_state.insert_nonce(nonce) {
+                    info!("Re-inserted landed nonce {nonce} into local SMT");
+                } else {
+                    debug!("Landed nonce {nonce} already present in local SMT, no divergence");
+                }
+            }
+        }
+    }
+    send_completed(storage_tx, entry, nonce_label, sig).await;
 }
 
 /// Report a pending-remint entry as Completed because one of its withdrawal
@@ -713,6 +803,15 @@ async fn send_completed(
             error_message: None,
             remint_signature: None,
             remint_attempted: false,
+            // Durable provenance of every broadcast attempt. counterpart_signature
+            // stays the single landed sig; this keeps the full list.
+            release_signatures: Some(
+                entry
+                    .signatures
+                    .iter()
+                    .map(|p| p.signature.to_string())
+                    .collect(),
+            ),
         },
         "transaction status update",
     )
@@ -755,6 +854,7 @@ async fn defer_or_escalate(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -792,6 +892,7 @@ async fn defer_or_escalate(
                     )),
                     remint_signature: None,
                     remint_attempted: false,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -876,7 +977,7 @@ mod tests {
             source_rpc_client: rpc,
             fallback_rpc_client: None,
             storage: storage.clone(),
-            instance_pda: None,
+            instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
             retry_counts: HashMap::new(),
             mint_builders: HashMap::new(),
@@ -974,7 +1075,7 @@ mod tests {
             source_rpc_client: rpc,
             fallback_rpc_client: None,
             storage: storage.clone(),
-            instance_pda: None,
+            instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
             retry_counts: HashMap::new(),
             mint_builders: HashMap::new(),
@@ -1007,6 +1108,70 @@ mod tests {
             .with_body(body)
             .create_async()
             .await
+    }
+
+    /// getAccountInfo returning an escrow instance whose root proves `nonce` did
+    /// NOT land (empty completed set), fresh enough to pass the freshness gate, so
+    /// the SMT verify resolves NotLanded and the Dead branch remints exactly as it
+    /// did before the gate existed. Also registers a fresh finalized getLatestBlockhash
+    /// (the verifier's freshness anchor). It matches only the finalized commitment so
+    /// the remint's own confirmed getLatestBlockhash on the source path is untouched.
+    /// Feature-proof: tree_index is derived from the same MAX_TREE_LEAVES the verifier uses.
+    fn mock_instance_not_landed(server: &mut mockito::Server, nonce: u64) -> mockito::Mock {
+        use crate::operator::utils::smt_util::SmtState;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use borsh::BorshSerialize;
+        use private_channel_escrow_program_client::Instance;
+        // Finalized tip well above any lvbh in these tests, so the freshness check passes.
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getLatestBlockhash""#.into()),
+                mockito::Matcher::Regex(r#""finalized""#.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":1000000000},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000000000}},"id":0}"#)
+            .create();
+        let tree_index = nonce / MAX_TREE_LEAVES as u64;
+        let root = SmtState::new(tree_index).current_root();
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index: tree_index,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        // Context slot is no longer read by the gate; freshness uses height.
+                        "context": {"slot": 1_000_000_000u64},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
     }
 
     /// Builds a SenderState with distinct rpc_client and source_rpc_client
@@ -1046,7 +1211,7 @@ mod tests {
             source_rpc_client,
             fallback_rpc_client,
             storage: storage.clone(),
-            instance_pda: None,
+            instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
             retry_counts: HashMap::new(),
             mint_builders: HashMap::new(),
@@ -1097,6 +1262,8 @@ mod tests {
             )
             .create_async()
             .await;
+        // Dead branch now SMT-verifies before reminting; prove nonce 5 NotLanded.
+        let _dest_account = mock_instance_not_landed(&mut dest, 5);
 
         // Source: backs the remint blockhash and broadcast. With no stored
         // remint signatures the idempotency classification is skipped entirely.
@@ -1472,6 +1639,12 @@ mod tests {
             Some(sig.to_string().as_str()),
             "counterpart_signature must be the finalized withdrawal sig"
         );
+        // The full attempt list rides on the Completed update for durable provenance.
+        assert_eq!(
+            update.release_signatures,
+            Some(vec![sig.to_string()]),
+            "release_signatures must carry the broadcast attempt list"
+        );
         assert!(
             storage_rx.try_recv().is_err(),
             "should send exactly one status update — no remint attempted"
@@ -1480,6 +1653,199 @@ mod tests {
             state.pending_remints.is_empty(),
             "entry should be removed from queue after Completed"
         );
+    }
+
+    /// IM1: a Dead-by-absence release whose nonce IS in the fresh on-chain SMT
+    /// root is proven landed by the verify gate, so Completed is sent with the
+    /// attempt list, and no remint is broadcast.
+    #[tokio::test]
+    async fn process_pending_remints_smt_verify_landed_marks_completed() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let recorded = Signature::new_unique();
+        // Release classified Dead (finalized-failed).
+        mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+        // Finalized tip 1_000_000 - 150 > max_lvbh 100 so the freshness check passes.
+        mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1000000},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000000}},"id":0}"#,
+        )
+        .await;
+        // On-chain root includes nonce 3 so the verifier resolves Landed.
+        {
+            use crate::operator::utils::smt_util::SmtState;
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            use borsh::BorshSerialize;
+            use private_channel_escrow_program_client::Instance;
+            let tree_index = 3u64 / MAX_TREE_LEAVES as u64;
+            let mut smt = SmtState::new(tree_index);
+            smt.insert_nonce(3);
+            let instance = Instance {
+                discriminator: 0,
+                bump: 0,
+                version: 0,
+                instance_seed: Pubkey::new_unique(),
+                admin: Pubkey::new_unique(),
+                withdrawal_transactions_root: smt.current_root(),
+                current_tree_index: tree_index,
+            };
+            let mut bytes = Vec::new();
+            instance.serialize(&mut bytes).unwrap();
+            rpc_server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getAccountInfo""#.into(),
+                ))
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {"context": {"slot": 1_000_000u64}, "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false, "rentEpoch": 0
+                        }}
+                    })
+                    .to_string(),
+                )
+                .create();
+        }
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(300),
+                withdrawal_nonce: Some(3),
+                trace_id: Some("trace-300".to_string()),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(300),
+            signatures: vec![PendingSig {
+                signature: recorded,
+                last_valid_block_height: 100,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx.try_recv().expect("Completed expected");
+        assert_eq!(update.status, TransactionStatus::Completed);
+        assert_eq!(
+            update.counterpart_signature.as_deref(),
+            Some(recorded.to_string().as_str())
+        );
+        assert_eq!(update.release_signatures, Some(vec![recorded.to_string()]));
+        assert!(
+            state.pending_remints.is_empty(),
+            "no remint, entry resolved"
+        );
+    }
+
+    /// IM3: a Dead-by-absence release whose finalized snapshot is too stale to
+    /// prove non-inclusion is Uncertain, so the entry defers (no remint broadcast).
+    #[tokio::test]
+    async fn process_pending_remints_smt_verify_uncertain_defers() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        seed_pending_remint_row(&mock, 301, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+        // Finalized tip 250 - 150 = 100 == max_lvbh 100, so freshness fails closed to Uncertain.
+        mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":500},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":250}},"id":0}"#,
+        )
+        .await;
+        {
+            use crate::operator::utils::smt_util::SmtState;
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            use borsh::BorshSerialize;
+            use private_channel_escrow_program_client::Instance;
+            let tree_index = 3u64 / MAX_TREE_LEAVES as u64;
+            let instance = Instance {
+                discriminator: 0,
+                bump: 0,
+                version: 0,
+                instance_seed: Pubkey::new_unique(),
+                admin: Pubkey::new_unique(),
+                withdrawal_transactions_root: SmtState::new(tree_index).current_root(),
+                current_tree_index: tree_index,
+            };
+            let mut bytes = Vec::new();
+            instance.serialize(&mut bytes).unwrap();
+            rpc_server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getAccountInfo""#.into(),
+                ))
+                .with_status(200)
+                .with_body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {"context": {"slot": 100u64}, "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false, "rentEpoch": 0
+                        }}
+                    })
+                    .to_string(),
+                )
+                .create();
+        }
+        // A remint broadcast here would be a double-pay bug; forbid it.
+        let no_send = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .expect(0)
+            .create();
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(301),
+                withdrawal_nonce: Some(3),
+                trace_id: Some("trace-301".to_string()),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(301),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 100,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Uncertain fails closed: deferred, no terminal status, no remint.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update on Uncertain"
+        );
+        assert_eq!(state.pending_remints.len(), 1, "entry re-queued");
+        no_send.assert();
     }
 
     /// The deferred remint queue is a Withdraw-only responsibility. An Escrow
@@ -1743,6 +2109,7 @@ mod tests {
 
         // The defer path persists the bumped counter, so the row must exist.
         seed_pending_remint_row(&mock, 77, 0);
+        mock_instance_not_landed(&mut rpc_server, 11);
 
         let sig = Signature::new_unique();
 
@@ -1830,6 +2197,7 @@ mod tests {
         // The remint proceeds and defers on the (unmocked) blockhash, which
         // persists the bumped counter, so the row must exist.
         seed_pending_remint_row(&mock, 88, 0);
+        mock_instance_not_landed(&mut rpc_server, 12);
 
         let sig = Signature::new_unique();
 
@@ -1897,6 +2265,7 @@ mod tests {
 
         // The defer path persists the bumped counter, so the row must exist.
         seed_pending_remint_row(&mock, 89, 0);
+        mock_instance_not_landed(&mut rpc_server, 13);
 
         let sig = Signature::new_unique();
 
@@ -2692,6 +3061,7 @@ mod tests {
 
         // The defer path persists the bumped counter, so the row must exist.
         seed_pending_remint_row(&mock, 100, 0);
+        mock_instance_not_landed(&mut rpc_server, 20);
 
         let sig = Signature::new_unique();
 
@@ -2992,7 +3362,10 @@ mod tests {
     // ── write-ahead remint signature classification (classify #2) ────
 
     /// Finalized-failed release on the dest server so the gate proceeds to remint.
-    async fn mock_release_dead(server: &mut mockito::Server) -> mockito::Mock {
+    /// Also registers the SMT-verify NotLanded read the Dead branch now performs
+    /// before reminting; `nonce` must match the entry so the tree-window check passes.
+    async fn mock_release_dead(server: &mut mockito::Server, nonce: u64) -> mockito::Mock {
+        mock_instance_not_landed(server, nonce);
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::AllOf(vec![
@@ -3020,7 +3393,7 @@ mod tests {
         let mut dest = mockito::Server::new_async().await;
         let mut source = mockito::Server::new_async().await;
         // Release is dead, so the gate reaches the remint step.
-        let _dest_status = mock_release_dead(&mut dest).await;
+        let _dest_status = mock_release_dead(&mut dest, 9).await;
 
         // The stored attempt is on-chain but not yet finalized (still live).
         let _src_status = mock_rpc(
@@ -3108,7 +3481,7 @@ mod tests {
         let mut dest = mockito::Server::new_async().await;
         let mut source = mockito::Server::new_async().await;
         // Release is dead, so the gate reaches the remint step.
-        let _dest_status = mock_release_dead(&mut dest).await;
+        let _dest_status = mock_release_dead(&mut dest, 9).await;
 
         // The stored attempt is on-chain but not yet finalized (still live).
         let _src_status = mock_rpc(
@@ -3186,7 +3559,7 @@ mod tests {
         let mut dest = mockito::Server::new_async().await;
         let mut source = mockito::Server::new_async().await;
         // Release is dead, so the gate reaches the remint step.
-        let _dest_status = mock_release_dead(&mut dest).await;
+        let _dest_status = mock_release_dead(&mut dest, 9).await;
 
         // Blockhash present so build_and_sign succeeds and we reach the persist step.
         let _src_bh = mock_rpc(
@@ -3255,7 +3628,7 @@ mod tests {
         let mut dest = mockito::Server::new_async().await;
         let mut source = mockito::Server::new_async().await;
         // Release is dead, so the gate reaches the remint step.
-        let _dest_status = mock_release_dead(&mut dest).await;
+        let _dest_status = mock_release_dead(&mut dest, 9).await;
 
         // No stored attempt, so we sign and broadcast.
         let _src_bh = mock_rpc(
@@ -3337,7 +3710,7 @@ mod tests {
         let landed_remint = Signature::new_unique();
 
         // Release classifies dead, so the gate reaches the remint step.
-        let _dest_status = mock_release_dead(&mut dest).await;
+        let _dest_status = mock_release_dead(&mut dest, 905).await;
         // The stored remint attempt finalized on the source chain.
         let _src_status = mock_rpc(
             &mut source,
@@ -3415,7 +3788,7 @@ mod tests {
         ensure_test_signer();
         let mut dest = mockito::Server::new_async().await;
         let mut source = mockito::Server::new_async().await;
-        let _dest_status = mock_release_dead(&mut dest).await;
+        let _dest_status = mock_release_dead(&mut dest, 9).await;
 
         // Stored attempt already finalized, so the gate confirms via short-circuit.
         let landed_sig = Signature::new_unique();
@@ -3517,6 +3890,8 @@ mod tests {
 
         let (mut state, _mock) =
             make_sender_state_split_rpc(&dest.url(), &source.url(), Some(&dest_fb.url()));
+        // Dead branch SMT-verifies on the dest primary before reminting.
+        let _dest_account = mock_instance_not_landed(&mut dest, 15);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {

@@ -7,7 +7,7 @@ pub mod types;
 
 pub use mint::{enumerate_consumed_mints, ConsumedMintKind, ConsumedSet, JitOutcome};
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
-pub(crate) use state::validate_smt_root;
+pub(crate) use state::{validate_smt_root, verify_release_landed, ReleaseVerdict};
 pub use types::TransactionStatusUpdate;
 
 #[cfg(any(test, feature = "test-mock-storage"))]
@@ -472,6 +472,7 @@ pub(super) async fn drain_rotation_retry_queue(
                         )),
                         remint_signature: None,
                         remint_attempted: false,
+                        release_signatures: None,
                     },
                     "transaction status update",
                 )

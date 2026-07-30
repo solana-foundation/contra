@@ -42,6 +42,9 @@ pub struct MockStorage {
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `pending_remint_signatures` write-ahead table.
     pub remint_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the durable `transactions.release_signatures` column: the full
+    /// attempt list written on an SMT-confirmed completion. COALESCE-guarded.
+    pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Mirrors the single-row `reconciliation_halt` table; `None` = not halted.
     pub reconciliation_halt: Arc<Mutex<Option<HaltInfo>>>,
 }
@@ -324,8 +327,16 @@ impl MockStorage {
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: DateTime<Utc>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("update_transaction_status")?;
+        // COALESCE mirror: only overwrite the durable list when one is supplied.
+        if let Some(sigs) = release_signatures {
+            self.completed_release_signatures
+                .lock()
+                .unwrap()
+                .insert(transaction_id, sigs);
+        }
         // Mirror the Postgres status filter (Processing or PendingRemint only).
         let mut pending = self.pending_transactions.lock().unwrap();
         let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
@@ -884,6 +895,7 @@ impl MockStorage {
         transaction_id: i64,
         expected_updated_at: DateTime<Utc>,
         counterpart_signature: Option<String>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_complete_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();
@@ -895,6 +907,13 @@ impl MockStorage {
                 txn.status = TransactionStatus::Completed;
                 if counterpart_signature.is_some() {
                     txn.counterpart_signature = counterpart_signature;
+                }
+                // COALESCE: only overwrite when a list is supplied, never wipe.
+                if let Some(sigs) = release_signatures {
+                    self.completed_release_signatures
+                        .lock()
+                        .unwrap()
+                        .insert(transaction_id, sigs);
                 }
                 let now = Utc::now();
                 txn.processed_at = Some(now);

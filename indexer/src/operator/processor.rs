@@ -179,6 +179,7 @@ async fn quarantine_single(
         error_message: Some(error_message),
         remint_signature: None,
         remint_attempted: false,
+        release_signatures: None,
     };
     // send_guaranteed: losing a quarantine update is worse than blocking briefly —
     // the DB row would stay `Processing` and never alert.
@@ -838,6 +839,8 @@ pub async fn process_deposit_funds(
                                 transaction.id,
                                 transaction.updated_at,
                                 Some(signature.clone()),
+                                // Deposit completion carries no release-attempt list.
+                                None,
                             )
                         },
                     )

@@ -825,8 +825,12 @@ async fn try_escalate_manual_review_spares_pending_remint() -> Result<(), Box<dy
 {
     let (pool, storage, _pg) = start_postgres().await?;
 
+    // One dequeue has to lock both rows: once the first is PendingRemint its
+    // nonce is the frontier, and the higher nonce stays Pending.
     let txn = make_db_transaction("escalate_guard", TransactionType::Withdrawal);
     let id = storage.insert_db_transaction(&txn).await?;
+    let other = make_db_transaction("escalate_processing", TransactionType::Withdrawal);
+    let other_id = storage.insert_db_transaction(&other).await?;
     storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
@@ -840,27 +844,18 @@ async fn try_escalate_manual_review_spares_pending_remint() -> Result<(), Box<dy
         !storage.try_escalate_manual_review(id).await?,
         "a PendingRemint row must not be escalated"
     );
-    let status: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
-        .bind(id)
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(status, "pending_remint", "the handoff must survive");
+    assert_eq!(
+        status_of(&pool, id).await,
+        "pending_remint",
+        "the handoff must survive"
+    );
 
     // A row that never left Processing is the escalation's to take.
-    let other = make_db_transaction("escalate_processing", TransactionType::Withdrawal);
-    let other_id = storage.insert_db_transaction(&other).await?;
-    storage
-        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
-        .await?;
     assert!(
         storage.try_escalate_manual_review(other_id).await?,
         "a Processing row must be escalated"
     );
-    let status: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
-        .bind(other_id)
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(status, "manual_review");
+    assert_eq!(status_of(&pool, other_id).await, "manual_review");
     Ok(())
 }
 

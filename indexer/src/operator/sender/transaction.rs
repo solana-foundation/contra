@@ -1198,32 +1198,60 @@ pub(super) async fn handle_permanent_failure(
                 return;
             }
             // Neither state can be established, so nothing automatic can be
-            // trusted to finish this. Escalate loudly instead.
+            // trusted to finish this. Escalate loudly instead — but only a row
+            // that is provably still Processing. This branch also runs when the
+            // write did commit and every read-back failed, and the generic status
+            // writer accepts a `pending_remint` source, so an unguarded fallback
+            // would overwrite that committed handoff and strand the withdrawal
+            // where no sweep looks. A guard miss leaves the row to the startup
+            // reload, which owns every PendingRemint row.
             unresolved => {
                 error!(
-                    "Failed to persist PendingRemint for transaction {} and could not read it back ({:?}) - sending to manual review: {}",
+                    "Failed to persist PendingRemint for transaction {} and could not read it back ({:?}): {}",
                     transaction_id, unresolved, e
                 );
-                send_guaranteed(
-                    storage_tx,
-                    TransactionStatusUpdate {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[
+                        state.program_type.as_label(),
+                        "pending_remint_state_unknown",
+                    ])
+                    .inc();
+                match state.storage.try_escalate_manual_review(transaction_id).await {
+                    // The row was still Processing, so nothing committed and this
+                    // escalation owns it. The status is already durable; the queued
+                    // update drives the webhook alert and no-ops on the row, whose
+                    // status is now outside the writer's source set.
+                    Ok(true) => {
+                        send_guaranteed(
+                            storage_tx,
+                            TransactionStatusUpdate {
+                                transaction_id,
+                                trace_id: ctx.trace_id.clone(),
+                                status: TransactionStatus::ManualReview,
+                                counterpart_signature: None,
+                                processed_at: Some(Utc::now()),
+                                error_message: Some(format!(
+                                    "{} | failed to persist pending remint: {}",
+                                    error_msg, e
+                                )),
+                                remint_signature: None,
+                                remint_attempted: false,
+                                release_signatures: None,
+                            },
+                            "transaction status update",
+                        )
+                        .await
+                        .ok();
+                    }
+                    Ok(false) => warn!(
                         transaction_id,
-                        trace_id: ctx.trace_id.clone(),
-                        status: TransactionStatus::ManualReview,
-                        counterpart_signature: None,
-                        processed_at: Some(Utc::now()),
-                        error_message: Some(format!(
-                            "{} | failed to persist pending remint: {}",
-                            error_msg, e
-                        )),
-                        remint_signature: None,
-                        remint_attempted: false,
-                        release_signatures: None,
-                    },
-                    "transaction status update",
-                )
-                .await
-                .ok();
+                        "Row is no longer Processing, so the PendingRemint write did commit; leaving it to the startup reload"
+                    ),
+                    Err(escalate_err) => error!(
+                        transaction_id,
+                        "Could not escalate to ManualReview, leaving the row untouched: {escalate_err}"
+                    ),
+                }
                 return;
             }
         }
@@ -3517,6 +3545,65 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "must not overwrite a committed PendingRemint with a terminal status"
+        );
+    }
+
+    /// The write can commit while every read-back also fails. The escalation is
+    /// guarded on a Processing row, so it finds the committed PendingRemint,
+    /// writes nothing and leaves the withdrawal to the startup reload. An
+    /// unguarded fallback would be accepted by the status writer, whose source
+    /// set includes `pending_remint`, and strand a row no sweep selects.
+    #[tokio::test]
+    async fn permanent_failure_does_not_escalate_over_committed_pending_remint() {
+        let txn_id = 13;
+        let nonce = 8;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("set_pending_remint", true);
+        mock.set_should_fail("get_transaction_status", true);
+        // The handoff committed; only the acknowledgement and the read-backs were lost.
+        let mut committed = processing_withdrawal_row(txn_id, nonce);
+        committed.status = TransactionStatus::PendingRemint;
+        mock.pending_transactions.lock().unwrap().push(committed);
+
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not queue a terminal status the writer would apply to a committed PendingRemint"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            rows[0].status,
+            TransactionStatus::PendingRemint,
+            "the committed handoff must survive"
         );
     }
 

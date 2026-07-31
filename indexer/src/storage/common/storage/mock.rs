@@ -697,6 +697,27 @@ impl MockStorage {
         Ok(())
     }
 
+    /// Mirror `try_escalate_manual_review_internal`: flip a Processing row to
+    /// ManualReview, returning whether it matched. Any other status is a guard
+    /// miss that writes nothing. Honors `should_fail("try_escalate_manual_review")`.
+    pub async fn try_escalate_manual_review(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_escalate_manual_review")?;
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let Some(row) = rows
+            .iter_mut()
+            .find(|t| t.id == transaction_id && t.status == TransactionStatus::Processing)
+        else {
+            return Ok(false);
+        };
+        row.status = TransactionStatus::ManualReview;
+        row.processed_at = Some(Utc::now());
+        row.updated_at = Utc::now();
+        Ok(true)
+    }
+
     /// Status of one row. `pending_transactions` is the live mirror of the
     /// table, so it wins; `pending_remint_transactions` is the fallback for
     /// tests that only seeded the rehydration list.

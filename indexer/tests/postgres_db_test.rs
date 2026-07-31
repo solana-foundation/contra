@@ -816,6 +816,54 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// The ManualReview fallback must only terminalize a row it can prove is still
+/// Processing. A committed PendingRemint has to survive it: the generic status
+/// writer accepts `pending_remint` as a source, so an unguarded escalation would
+/// overwrite the handoff and leave the withdrawal in a status no sweep selects.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_escalate_manual_review_spares_pending_remint() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let txn = make_db_transaction("escalate_guard", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    storage
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![10], deadline)
+        .await?;
+
+    assert!(
+        !storage.try_escalate_manual_review(id).await?,
+        "a PendingRemint row must not be escalated"
+    );
+    let status: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "pending_remint", "the handoff must survive");
+
+    // A row that never left Processing is the escalation's to take.
+    let other = make_db_transaction("escalate_processing", TransactionType::Withdrawal);
+    let other_id = storage.insert_db_transaction(&other).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    assert!(
+        storage.try_escalate_manual_review(other_id).await?,
+        "a Processing row must be escalated"
+    );
+    let status: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(other_id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(status, "manual_review");
+    Ok(())
+}
+
 /// A retry whose first attempt committed but whose acknowledgement was lost must
 /// succeed, so the sender can tell a durable handoff from a failed one. Replaying
 /// the same payload is accepted; a different payload is not, so a second caller

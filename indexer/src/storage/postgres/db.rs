@@ -1662,6 +1662,33 @@ impl PostgresDb {
             .await
     }
 
+    /// Escalate a row to ManualReview, but only while it is still `processing`.
+    /// `Ok(false)` means the row moved on and this escalation must not apply:
+    /// the generic status writer accepts `pending_remint` as a source, so an
+    /// unguarded fallback could overwrite a committed PendingRemint handoff and
+    /// strand the withdrawal, which no sweep would pick up again.
+    pub async fn try_escalate_manual_review_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET
+                status = $2,
+                processed_at = NOW()
+            WHERE id = $1
+                AND status = 'processing'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(TransactionStatus::ManualReview)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Durably record a confirmed remint: flip status to FailedReminted and
     /// store the signature in one UPDATE, before the async writer runs. The
     /// `pending_remint` guard makes it a no-op on an already-terminal row, so

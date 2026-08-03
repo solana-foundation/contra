@@ -3,6 +3,7 @@ use crate::rpc::{
     error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     WriteDeps,
 };
+use crate::transactions::is_allowed_program_instruction;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bincode::Options;
 use jsonrpsee::core::RpcResult;
@@ -68,36 +69,32 @@ pub async fn send_transaction_impl(
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
 
-    // Filter: only accept SPL token, ATA, System Program, Memo, Withdraw, and Swap Program transactions
-    let is_allowed_transaction =
-        sanitized_tx
-            .message()
-            .program_instructions_iter()
-            .all(|(program_id, _)| {
-                *program_id == spl_token::id()
-                || *program_id == spl_associated_token_account::id()
-                || *program_id == spl_memo::id()
-                || *program_id == solana_sdk::system_program::id()
-                || *program_id
-                    == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
-                || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
-            });
+    // Admission is per instruction, not per program: System is limited to Transfer.
+    let is_allowed_transaction = sanitized_tx
+        .message()
+        .program_instructions_iter()
+        .all(|(program_id, ix)| is_allowed_program_instruction(program_id, &ix.data));
 
     if !is_allowed_transaction {
-        // Log which programs were found in the transaction
-        let program_ids: Vec<String> = sanitized_tx
+        // Name the program and its leading tag bytes so the log identifies the
+        // offending instruction, not just the transaction.
+        let offenders: Vec<String> = sanitized_tx
             .message()
             .program_instructions_iter()
-            .map(|(program_id, _)| program_id.to_string())
+            .map(|(program_id, ix)| {
+                let tag = &ix.data[..ix.data.len().min(4)];
+                let allowed = is_allowed_program_instruction(program_id, &ix.data);
+                format!("{program_id} tag={tag:02x?} allowed={allowed}")
+            })
             .collect();
         warn!(
-            "Rejected transaction {}: programs used: {:?}",
+            "Rejected transaction {}: instructions: {:?}",
             sanitized_tx.signature(),
-            program_ids
+            offenders
         );
         return Err(custom_error(
             INVALID_PARAMS_CODE,
-            "Only SPL token, ATA, Memo, System, Withdraw, and Swap program transactions are accepted",
+            "Only SPL token, ATA, Memo, Withdraw, and Swap program transactions are accepted; System is limited to Transfer",
         ));
     }
 
@@ -137,6 +134,7 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::{SanitizedTransaction, Transaction},
     };
+    use solana_system_interface::instruction as system_instruction;
     use std::sync::Arc;
 
     const TEST_INGRESS_CAP: usize = 4;
@@ -323,6 +321,101 @@ mod tests {
 
         let result = send_transaction_impl(&deps, encoded, None).await;
         assert!(result.is_ok(), "Memo tx should pass allowlist");
+    }
+
+    // B1: CreateAccount allocates permanent account data that nothing charges
+    // for and the tombstone rule never reclaims, so it must not reach ingress.
+    #[tokio::test]
+    async fn system_create_account_rejected() {
+        let payer = Keypair::new();
+        let fresh = Keypair::new();
+        let ix = system_instruction::create_account(
+            &payer.pubkey(),
+            &fresh.pubkey(),
+            0,
+            10 * 1024 * 1024,
+            &solana_sdk_ids::system_program::ID,
+        );
+        // create_account marks the new account as a signer, so both keys sign
+        // or sanitization would reject the tx before the allowlist runs.
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &fresh],
+            Hash::default(),
+        );
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+            .await
+            .expect_err("System CreateAccount must be rejected");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert!(
+            err.to_string().contains("Only SPL token"),
+            "expected allowlist error, got: {err}"
+        );
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
+        );
+    }
+
+    // B2: Allocate is the cheapest shape of the same attack: one signer, no
+    // lamport source, and the resulting 0-lamport account has non-empty data so
+    // it can never be tombstoned.
+    #[tokio::test]
+    async fn system_allocate_rejected() {
+        let payer = Keypair::new();
+        let fresh = Keypair::new();
+        let ix = system_instruction::allocate(&fresh.pubkey(), 10 * 1024 * 1024);
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &fresh],
+            Hash::default(),
+        );
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+            .await
+            .expect_err("System Allocate must be rejected");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert!(
+            err.to_string().contains("Only SPL token"),
+            "expected allowlist error, got: {err}"
+        );
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
+        );
+    }
+
+    // B3: System Transfer stays admitted, including alongside another allowed
+    // program. Guards against an over-broad rewrite of the `.all(..)` filter.
+    #[tokio::test]
+    async fn system_transfer_with_memo_accepted() {
+        let payer = Keypair::new();
+        let transfer_ix =
+            system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000);
+        let memo_ix = Instruction {
+            program_id: spl_memo::id(),
+            accounts: vec![],
+            data: b"private_channel:transfer".to_vec(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[transfer_ix, memo_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::default(),
+        );
+        let (deps, rx) = make_write_deps();
+
+        let result = send_transaction_impl(&deps, encode_tx(&tx), None).await;
+        assert!(
+            result.is_ok(),
+            "System Transfer + Memo must pass: {result:?}"
+        );
+        assert_eq!(rx.len(), 1, "the accepted tx must reach the ingress queue");
     }
 
     // A closed ingress channel (receiver dropped) must surface the closed error,

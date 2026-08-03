@@ -1022,7 +1022,8 @@ pub(super) async fn requeue_or_fail_prebroadcast(
 /// remint that will execute after the Solana finality window passes. This prevents
 /// double-spend if the original withdrawal lands on-chain after our polling window.
 /// If the PendingRemint write cannot be confirmed, the cache entries go back and
-/// the row is left to recovery; only an undeterminable row goes to ManualReview.
+/// the row is left to recovery; only a still-Processing undeterminable row goes to
+/// ManualReview, and a row that reads back PendingRemint is driven from here.
 ///
 /// For non-withdrawal transactions: delegates to send_fatal_error.
 pub(super) async fn handle_permanent_failure(
@@ -1203,8 +1204,8 @@ pub(super) async fn handle_permanent_failure(
             // write did commit and every read-back failed, and the generic status
             // writer accepts a `pending_remint` source, so an unguarded fallback
             // would overwrite that committed handoff and strand the withdrawal
-            // where no sweep looks. A guard miss leaves the row to the startup
-            // reload, which owns every PendingRemint row.
+            // where no sweep looks. A guard miss means the row left Processing,
+            // so read it back: only a committed PendingRemint is ours to drive.
             unresolved => {
                 error!(
                     "Failed to persist PendingRemint for transaction {} and could not read it back ({:?}): {}",
@@ -1242,17 +1243,37 @@ pub(super) async fn handle_permanent_failure(
                         )
                         .await
                         .ok();
+                        return;
                     }
-                    Ok(false) => warn!(
-                        transaction_id,
-                        "Row is no longer Processing, so the PendingRemint write did commit; leaving it to the startup reload"
-                    ),
-                    Err(escalate_err) => error!(
-                        transaction_id,
-                        "Could not escalate to ManualReview, leaving the row untouched: {escalate_err}"
-                    ),
+                    // The guard missed, so the row is not Processing. The escalation
+                    // reached the DB, so this read-back is the first reliable one on
+                    // this path: a PendingRemint row is the committed handoff and only
+                    // this queue drives it, since no sweep selects that status. Any
+                    // other status belongs to another writer, and queuing over it would
+                    // let the recovery GC drop the remint write-ahead rows and re-mint.
+                    Ok(false) => {
+                        match state.storage.get_transaction_status(transaction_id).await {
+                            Ok(Some(TransactionStatus::PendingRemint)) => warn!(
+                                transaction_id,
+                                "Row is PendingRemint, so the write did commit; driving the remint from this sender"
+                            ),
+                            observed => {
+                                warn!(
+                                    transaction_id,
+                                    "Row is no longer Processing ({:?}), leaving it alone", observed
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(escalate_err) => {
+                        error!(
+                            transaction_id,
+                            "Could not escalate to ManualReview, leaving the row untouched: {escalate_err}"
+                        );
+                        return;
+                    }
                 }
-                return;
             }
         }
     }
@@ -3548,11 +3569,12 @@ mod tests {
         );
     }
 
-    /// The write can commit while every read-back also fails. The escalation is
-    /// guarded on a Processing row, so it finds the committed PendingRemint,
-    /// writes nothing and leaves the withdrawal to the startup reload. An
-    /// unguarded fallback would be accepted by the status writer, whose source
-    /// set includes `pending_remint`, and strand a row no sweep selects.
+    /// The write can commit while the read-back also fails. The escalation is
+    /// guarded on a Processing row, so it finds the committed PendingRemint and
+    /// writes nothing. An unguarded fallback would be accepted by the status
+    /// writer, whose source set includes `pending_remint`, and strand a row no
+    /// sweep selects. The guard miss then reads the row back, and a PendingRemint
+    /// is adopted here: nothing else drives that status until a restart.
     #[tokio::test]
     async fn permanent_failure_does_not_escalate_over_committed_pending_remint() {
         let txn_id = 13;
@@ -3564,7 +3586,9 @@ mod tests {
             panic!("expected mock storage");
         };
         mock.set_should_fail("set_pending_remint", true);
-        mock.set_should_fail("get_transaction_status", true);
+        // The three read-back attempts fail; the read after the escalation, which
+        // proved the DB reachable, succeeds.
+        mock.set_fail_times("get_transaction_status", 3);
         // The handoff committed; only the acknowledgement and the read-backs were lost.
         let mut committed = processing_withdrawal_row(txn_id, nonce);
         committed.status = TransactionStatus::PendingRemint;
@@ -3596,6 +3620,11 @@ mod tests {
             storage_rx.try_recv().is_err(),
             "must not queue a terminal status the writer would apply to a committed PendingRemint"
         );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "a committed PendingRemint has no other driver until a restart, so it must be queued here"
+        );
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
@@ -3604,6 +3633,70 @@ mod tests {
             rows[0].status,
             TransactionStatus::PendingRemint,
             "the committed handoff must survive"
+        );
+    }
+
+    /// The escalation guard can also miss because another writer moved the row:
+    /// a recovery demote leaves it Pending. Adopting it would drive a remint the
+    /// processor is about to re-release against, and the recovery GC drops the
+    /// remint write-ahead rows for any row that is not PendingRemint, so a
+    /// deferred attempt would re-mint. The read-back must leave it alone.
+    #[tokio::test]
+    async fn permanent_failure_does_not_adopt_row_moved_by_another_writer() {
+        let txn_id = 14;
+        let nonce = 9;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("set_pending_remint", true);
+        mock.set_fail_times("get_transaction_status", 3);
+        // Recovery demoted the row while the handoff was being retried, so the
+        // PendingRemint write never committed and the escalation guard misses.
+        let mut demoted = processing_withdrawal_row(txn_id, nonce);
+        demoted.status = TransactionStatus::Pending;
+        mock.pending_transactions.lock().unwrap().push(demoted);
+
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "must not drive a remint for a row another writer owns"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status over another writer's row"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            rows[0].status,
+            TransactionStatus::Pending,
+            "the other writer's status must survive"
         );
     }
 

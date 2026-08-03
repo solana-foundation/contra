@@ -8,7 +8,7 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::AccountSettlement,
+        stages::{AccountSettlements, ExecutedBatch},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
@@ -21,7 +21,6 @@ use {
     solana_sdk::{
         account::{ReadableAccount, WritableAccount},
         hash::Hash,
-        pubkey::Pubkey,
         transaction::SanitizedTransaction,
     },
     solana_svm::{
@@ -54,11 +53,8 @@ const MIN_PARALLEL_BATCH_FACTOR: usize = 4;
 
 pub struct ExecutionArgs {
     pub batch_rx: mpsc::Receiver<ConflictFreeBatch>,
-    pub settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
-    pub execution_results_tx: mpsc::Sender<(
-        LoadAndExecuteSanitizedTransactionsOutput,
-        Vec<SanitizedTransaction>,
-    )>,
+    pub settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    pub execution_results_tx: mpsc::Sender<ExecutedBatch>,
     pub accountsdb_connection_url: String,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
@@ -91,6 +87,13 @@ pub struct ExecutionResult {
     pub regular_transactions: Vec<SanitizedTransaction>,
     pub admin_results: Option<LoadAndExecuteSanitizedTransactionsOutput>,
     pub regular_results: Option<LoadAndExecuteSanitizedTransactionsOutput>,
+    /// BOB generation stamped on the admin path's account writes, 0 when the
+    /// path was skipped. A plain field rather than part of `admin_results` so
+    /// that reading the results does not force callers to unwrap a pair.
+    pub admin_generation: u64,
+    /// BOB generation stamped on the regular path's account writes, 0 when the
+    /// path was skipped.
+    pub regular_generation: u64,
 }
 
 pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
@@ -150,7 +153,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                                     // settler queue never wedges executor exit. Owned values only,
                                     // no lock guard is held across this await.
                                     tokio::select! {
-                                        send_result = execution_results_tx.send((admin_results, execution_result.admin_transactions)) => {
+                                        send_result = execution_results_tx.send((admin_results, execution_result.admin_transactions, execution_result.admin_generation)) => {
                                             if let Err(e) = send_result {
                                                 metrics.executor_results_send_failed("admin");
                                                 error!("Failed to send admin results: {:?}", e);
@@ -173,7 +176,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                                 if let Some(regular_results) = execution_result.regular_results {
                                     let len = execution_result.regular_transactions.len();
                                     tokio::select! {
-                                        send_result = execution_results_tx.send((regular_results, execution_result.regular_transactions)) => {
+                                        send_result = execution_results_tx.send((regular_results, execution_result.regular_transactions, execution_result.regular_generation)) => {
                                             if let Err(e) = send_result {
                                                 metrics.executor_results_send_failed("regular");
                                                 error!("Failed to send regular results: {:?}", e);
@@ -224,7 +227,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
 
 pub async fn get_execution_deps(
     accounts_db: AccountsDB,
-    settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
+    settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
     max_svm_workers: usize,
     live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 ) -> ExecutionDeps {
@@ -581,6 +584,12 @@ pub async fn execute_batch(
     let mut t_svm_reg = Duration::ZERO;
     let mut t_bob_reg = Duration::ZERO;
 
+    // Generations stamped by each path's BOB update. They stay 0 when that path
+    // is skipped, which the settler's max() fold and BOB's high-water comparison
+    // both treat as "acknowledges nothing".
+    let mut admin_generation = 0u64;
+    let mut regular_generation = 0u64;
+
     // Settle admin transactions immediately so regular transactions see the updates
     let admin_results = if !admin_transactions.is_empty() {
         let t_op = Instant::now();
@@ -602,7 +611,7 @@ pub async fn execute_batch(
 
         // Update BOB's in-memory accounts with the execution results
         let t_op = Instant::now();
-        execution_deps
+        admin_generation = execution_deps
             .bob
             .update_accounts(&admin_results, &admin_transactions);
         t_bob_admin = t_op.elapsed();
@@ -684,7 +693,7 @@ pub async fn execute_batch(
 
         // Update BOB's in-memory accounts with the execution results
         let t_op = Instant::now();
-        execution_deps
+        regular_generation = execution_deps
             .bob
             .update_accounts(&regular_results, &regular_transactions);
         t_bob_reg = t_op.elapsed();
@@ -718,6 +727,8 @@ pub async fn execute_batch(
         regular_transactions,
         admin_results,
         regular_results,
+        admin_generation,
+        regular_generation,
     }
 }
 
@@ -1092,6 +1103,15 @@ mod tests {
         let spend = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 10)]).await;
         assert!(is_executed(regular_result(&spend, 0)));
         assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
+
+        // Monotonicity survives the trip through ExecutionResult: a later batch
+        // always reports a strictly higher generation than an earlier one.
+        assert!(
+            spend.regular_generation > setup.regular_generation,
+            "generation must strictly increase across batches ({} then {})",
+            setup.regular_generation,
+            spend.regular_generation
+        );
     }
 
     /// Synthetic fee payer is dropped: any synthetic-payer system transfer →
@@ -1585,10 +1605,8 @@ mod tests {
 
         let (_batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, _execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(RESULTS_CAP);
+        let (execution_results_tx, _execution_results_rx) =
+            mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
         let shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
@@ -1913,10 +1931,8 @@ mod tests {
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, _execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(RESULTS_CAP);
+        let (execution_results_tx, _execution_results_rx) =
+            mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
         let shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
@@ -2025,6 +2041,17 @@ mod tests {
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());
         assert!(result.regular_results.is_some());
+        // Each path gets its own BOB write, so each gets its own generation.
+        // Exact values, because the admin path must be settled before the
+        // regular path so regular transactions observe the admin updates.
+        assert_eq!(
+            result.admin_generation, 1,
+            "the admin BOB update must come first"
+        );
+        assert_eq!(
+            result.regular_generation, 2,
+            "the regular BOB update must follow the admin one"
+        );
     }
 
     // A full results channel blocks the executor's send (backpressure) without
@@ -2037,10 +2064,7 @@ mod tests {
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(1);
+        let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let shutdown = CancellationToken::new();
 
         let _handle = start_execution_worker(ExecutionArgs {
@@ -2090,10 +2114,7 @@ mod tests {
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(1);
+        let (execution_results_tx, execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {

@@ -177,9 +177,7 @@ pub(crate) async fn start_test_redis() -> (
 #[cfg(test)]
 pub(crate) fn create_test_bob() -> (
     crate::accounts::bob::BOB,
-    tokio::sync::mpsc::UnboundedSender<
-        Vec<(solana_sdk::pubkey::Pubkey, crate::stages::AccountSettlement)>,
-    >,
+    tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
 ) {
     use crate::accounts::{AccountsDB, PostgresAccountsDB};
     use sqlx::postgres::PgPoolOptions;
@@ -195,4 +193,19 @@ pub(crate) fn create_test_bob() -> (
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let bob = crate::accounts::bob::BOB::new_test(rx, db);
     (bob, tx)
+}
+
+/// Same as `create_test_bob` but backed by a real throwaway Postgres container,
+/// so tests can exercise BOB's cache-miss path against an actual database.
+/// The container handle is returned so the caller keeps it alive.
+#[cfg(test)]
+pub(crate) async fn create_test_bob_with_postgres() -> (
+    crate::accounts::bob::BOB,
+    tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+) {
+    let (db, container) = start_test_postgres().await;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let bob = crate::accounts::bob::BOB::new_test(rx, db);
+    (bob, tx, container)
 }

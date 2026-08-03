@@ -634,6 +634,51 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Two senders sign the same remint against different blockhashes, so they
+        // produce different signatures and a signature-keyed insert accepts both.
+        // Retiring a beaten attempt instead of deleting it keeps it classifiable,
+        // which matters because a superseded attempt can still land late.
+        info!("Running pending_remint_signatures superseded migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE pending_remint_signatures
+                ADD COLUMN IF NOT EXISTS superseded BOOLEAN NOT NULL DEFAULT FALSE;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Rows written before the column existed all default to live, so retire
+        // every attempt but the newest per transaction first. Building the partial
+        // unique index against those duplicates would fail and brick startup.
+        sqlx::query(
+            r#"
+            UPDATE pending_remint_signatures p
+            SET superseded = TRUE
+            WHERE NOT p.superseded
+              AND p.id < (
+                  SELECT MAX(q.id) FROM pending_remint_signatures q
+                  WHERE q.transaction_id = p.transaction_id
+              )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // The arbiter: at most one live attempt per transaction. Only a unique
+        // index actually serializes two senders; under READ COMMITTED a
+        // check-then-insert lets both pass because neither sees the other's
+        // uncommitted row.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_prms_one_live
+             ON pending_remint_signatures(transaction_id) WHERE NOT superseded",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("pending_remint_signatures superseded migration complete");
+
         // Durable single-row reconciliation halt flag. The CHECK(id) plus the
         // fixed TRUE default pins the table to at most one row, so both operators'
         // fetchers read the same flag. Absent row (fresh deploy) means not halted.
@@ -1864,28 +1909,57 @@ impl PostgresDb {
     }
 
     /// Write-ahead record of a remint MintTo signature, persisted before the
-    /// broadcast so restart recovery can classify it instead of reminting
-    /// blind. Idempotent on `signature`.
-    pub async fn insert_remint_signature_internal(
+    /// broadcast so restart recovery can classify it instead of reminting blind,
+    /// and in the same step the exclusive claim on that broadcast.
+    ///
+    /// The claim is keyed on the transaction, not the signature: two senders sign
+    /// against different blockhashes, so a signature-keyed insert accepts both and
+    /// both mint. `superseded_signatures` must contain only attempts the caller has
+    /// already proven dead on-chain, and retiring them is scoped to exactly that
+    /// observed set, so a claim another sender took in the meantime is never
+    /// cleared. `ON CONFLICT DO NOTHING` does not abort the surrounding
+    /// transaction, so a lost claim still retires the attempts it proved dead.
+    ///
+    /// Returns true when the caller owns the attempt and may broadcast.
+    pub async fn claim_remint_attempt_internal(
         &self,
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<(), sqlx::Error> {
+        superseded_signatures: &[String],
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
+            r#"
+            UPDATE pending_remint_signatures
+            SET superseded = TRUE
+            WHERE transaction_id = $1
+              AND signature = ANY($2)
+              AND NOT superseded
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(superseded_signatures)
+        .execute(&mut *tx)
+        .await?;
+
+        let claimed = sqlx::query(
             r#"
             INSERT INTO pending_remint_signatures
                 (transaction_id, signature, last_valid_block_height)
             VALUES ($1, $2, $3)
-            ON CONFLICT (signature) DO NOTHING
+            ON CONFLICT (transaction_id) WHERE NOT superseded DO NOTHING
             "#,
         )
         .bind(transaction_id)
         .bind(signature)
         .bind(last_valid_block_height)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+
+        tx.commit().await?;
+        Ok(claimed.rows_affected() == 1)
     }
 
     /// Return a transaction's remint signatures as (signature, lvbh).

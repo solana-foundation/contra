@@ -42,6 +42,13 @@ pub struct MockStorage {
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `pending_remint_signatures` write-ahead table.
     pub remint_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `superseded` column: attempts retired after being proven dead.
+    pub superseded_remint_signatures: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Transactions whose live remint claim is held by a second sender process.
+    /// A single in-process mock is the shared database, so this is the only way
+    /// to represent the other operator's row that the partial unique index
+    /// arbitrates against. The real arbiter is covered against Postgres.
+    pub foreign_remint_claims: Arc<Mutex<std::collections::HashSet<i64>>>,
     /// Mirrors the durable `transactions.release_signatures` column: the full
     /// attempt list written on an SMT-confirmed completion. COALESCE-guarded.
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
@@ -1155,22 +1162,50 @@ impl MockStorage {
         Ok(removed)
     }
 
-    pub async fn insert_remint_signature(
+    /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
+    /// attempts, then take the one live slot the partial unique index allows.
+    /// `Ok(false)` means another sender already owns it, so nothing is written.
+    pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<(), StorageError> {
-        self.check_should_fail("insert_remint_signature")?;
+        superseded_signatures: &[String],
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("claim_remint_attempt")?;
         let mut map = self.remint_signatures.lock().unwrap();
-        // Mirror Postgres `ON CONFLICT (signature) DO NOTHING`.
-        if map_contains_signature(&map, &signature) {
-            return Ok(());
+        let mut superseded = self.superseded_remint_signatures.lock().unwrap();
+
+        // Compare-and-swap scoped to the observed attempts: a slot another
+        // sender took in the meantime carries a signature we never classified,
+        // so it can never be retired here.
+        for (sig, _) in map.get(&transaction_id).into_iter().flatten() {
+            if superseded_signatures.contains(sig) {
+                superseded.insert(sig.clone());
+            }
         }
+
+        // A lost claim still commits the supersedes above, matching Postgres:
+        // `ON CONFLICT DO NOTHING` does not abort the surrounding transaction.
+        let live = map
+            .get(&transaction_id)
+            .into_iter()
+            .flatten()
+            .any(|(sig, _)| !superseded.contains(sig));
+        if live
+            || self
+                .foreign_remint_claims
+                .lock()
+                .unwrap()
+                .contains(&transaction_id)
+        {
+            return Ok(false);
+        }
+
         map.entry(transaction_id)
             .or_default()
             .push((signature, last_valid_block_height));
-        Ok(())
+        Ok(true)
     }
 
     pub async fn get_remint_signatures(
@@ -1189,10 +1224,16 @@ impl MockStorage {
 
     pub async fn delete_remint_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
         self.check_should_fail("delete_remint_signatures")?;
-        self.remint_signatures
+        let removed = self
+            .remint_signatures
             .lock()
             .unwrap()
             .remove(&transaction_id);
+        // Deleting the rows drops their `superseded` column values with them.
+        let mut superseded = self.superseded_remint_signatures.lock().unwrap();
+        for (sig, _) in removed.into_iter().flatten() {
+            superseded.remove(&sig);
+        }
         Ok(())
     }
 

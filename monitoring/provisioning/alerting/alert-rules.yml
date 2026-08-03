@@ -301,3 +301,42 @@ groups:
                     type: gt
                     params: [0]
               refId: C
+
+  - orgId: 1
+    name: remint-claim-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: remint-claim-lost
+        title: "Remint pre-send claim lost (second sender detected)"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) lost a remint claim, which is only possible if a second sender is running against the same database. The loser refused to broadcast, so no double mint happened yet; stop the duplicate operator and re-check the sender advisory lock before the next pending remint matures."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_remint_claim_lost_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C

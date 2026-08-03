@@ -2,7 +2,7 @@
 use super::types::InFlightQueue;
 use super::types::SenderState;
 use super::{verify_release_landed, ReleaseVerdict};
-use crate::metrics::OPERATOR_RELEASE_VERIFY;
+use crate::metrics::{OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::{
     channel_utils::send_guaranteed,
@@ -21,6 +21,7 @@ use crate::{
     storage::TransactionStatus,
 };
 use chrono::Utc;
+use private_channel_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
 use solana_sdk::{
     clock::MAX_PROCESSING_AGE, commitment_config::CommitmentConfig, signature::Signature,
@@ -75,6 +76,10 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         }
     };
 
+    // Prior attempts the classifier proves dead. Only these may be retired by the
+    // claim below; an Uncertain or Live verdict returns before it is populated.
+    let mut proven_dead: Vec<String> = Vec::new();
+
     if !stored.is_empty() {
         let prior_attempts: Vec<PendingSig> = match stored
             .iter()
@@ -121,7 +126,9 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
                 ));
             }
             // All prior attempts finalized-failed or expired: safe to resend.
-            SigFinality::Dead => {}
+            SigFinality::Dead => {
+                proven_dead = stored.iter().map(|(sig, _)| sig.clone()).collect();
+            }
         }
     }
 
@@ -173,18 +180,44 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
             }
         };
 
-    // Write-ahead persist before broadcast. Failure here means nothing was sent, so defer.
+    // Write-ahead persist before broadcast, and the exclusive claim in the same step.
     // Checked cast keeps the round-trip symmetric with the u64::try_from read-back.
     let lvbh_i64 = i64::try_from(last_valid_block_height).unwrap_or(i64::MAX);
-    if let Err(e) = state
+    match state
         .storage
-        .insert_remint_signature(info.transaction_id, signature.to_string(), lvbh_i64)
+        .claim_remint_attempt(
+            info.transaction_id,
+            signature.to_string(),
+            lvbh_i64,
+            &proven_dead,
+        )
         .await
     {
-        return RemintAttempt::DeferPreBroadcast(format!(
-            "pre-send remint persist failed for transaction {}: {}; will retry",
-            info.transaction_id, e
-        ));
+        Ok(true) => {}
+        Ok(false) => {
+            // Nothing else can hold the claim, so a second sender is running and
+            // the advisory lock is gone. Emit no status of any kind: ManualReview
+            // here would move the row off pending_remint and permanently block the
+            // winner's remint record, stranding a mint that did land. Re-queue
+            // uncapped instead; the next tick classifies the winner's signature.
+            OPERATOR_REMINT_CLAIM_LOST
+                .with_label_values(&[state.program_type.as_label()])
+                .inc();
+            error!(
+                "Remint claim lost for transaction {} (trace {}): another sender owns the live attempt; refusing to broadcast",
+                info.transaction_id, info.trace_id
+            );
+            return RemintAttempt::DeferInFlight(format!(
+                "remint claim for transaction {} is held by another sender",
+                info.transaction_id
+            ));
+        }
+        Err(e) => {
+            return RemintAttempt::DeferPreBroadcast(format!(
+                "pre-send remint claim failed for transaction {}: {}; will retry",
+                info.transaction_id, e
+            ));
+        }
     }
 
     if let Err(e) = send_signed(&state.source_rpc_client, &transaction, RetryPolicy::None).await {
@@ -1985,10 +2018,11 @@ mod tests {
 
         // A prior remint attempt is on record, so classification must run before
         // any resend — and the source backend errors, making it unverifiable.
+        let unverifiable = Signature::new_unique().to_string();
         mock.remint_signatures
             .lock()
             .unwrap()
-            .insert(700, vec![(Signature::new_unique().to_string(), 0)]);
+            .insert(700, vec![(unverifiable.clone(), 0)]);
         let _status = mock_rpc(
             &mut rpc_server,
             "getSignatureStatuses",
@@ -2030,6 +2064,21 @@ mod tests {
         assert!(
             err.contains("release_funds failed"),
             "must preserve the original withdrawal error: {err}"
+        );
+        // Uncertain is an RPC failure, not proof of death, so the attempt keeps
+        // the live slot and no replacement may be claimed against it.
+        assert!(
+            !mock
+                .superseded_remint_signatures
+                .lock()
+                .unwrap()
+                .contains(&unverifiable),
+            "an unclassifiable attempt must never be superseded"
+        );
+        assert_eq!(
+            mock.get_remint_signatures(700).await.unwrap().len(),
+            1,
+            "no replacement attempt may be claimed on an Uncertain verdict"
         );
     }
 
@@ -3423,10 +3472,11 @@ mod tests {
         let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 901, 0);
         // A prior attempt is on record, so classification runs before any resend.
+        let live_attempt = Signature::new_unique().to_string();
         mock.remint_signatures
             .lock()
             .unwrap()
-            .insert(901, vec![(Signature::new_unique().to_string(), 0)]);
+            .insert(901, vec![(live_attempt.clone(), 0)]);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {
@@ -3467,6 +3517,16 @@ mod tests {
                 .get(&901)
                 .is_some_and(|sigs| !sigs.is_empty()),
             "the persisted remint signature must not be deleted"
+        );
+        // A live attempt still owns the claim; superseding it would let a second
+        // MintTo be broadcast alongside one that can still land.
+        assert!(
+            !mock
+                .superseded_remint_signatures
+                .lock()
+                .unwrap()
+                .contains(&live_attempt),
+            "a live attempt must never be superseded"
         );
         src_send.assert_async().await;
     }
@@ -3587,7 +3647,7 @@ mod tests {
         let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 902, 0);
         // The write-ahead persist fails.
-        mock.set_should_fail("insert_remint_signature", true);
+        mock.set_should_fail("claim_remint_attempt", true);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {
@@ -3616,6 +3676,85 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        src_send.assert_async().await;
+    }
+
+    /// Losing the pre-send claim proves a second sender is running. The loser must
+    /// not broadcast and must emit no status at all: a ManualReview here would move
+    /// the row off pending_remint and permanently block the winner's remint record,
+    /// stranding a mint that did land. It re-queues uncapped instead.
+    #[tokio::test]
+    async fn remint_claim_lost_emits_no_status_and_never_broadcasts() {
+        ensure_test_signer();
+        let txn_id = 904;
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        // Release is dead, so the gate reaches the remint step.
+        let _dest_status = mock_release_dead(&mut dest, 9).await;
+
+        // Blockhash present so build_and_sign succeeds and we reach the claim.
+        let _src_bh = mock_rpc(
+            &mut source,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        // The whole point: the loser must not put a second MintTo on the wire.
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
+        seed_pending_remint_row(&mock, txn_id, 0);
+        // The other sender already owns the live attempt for this transaction.
+        mock.foreign_remint_claims.lock().unwrap().insert(txn_id);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let metric = crate::metrics::OPERATOR_REMINT_CLAIM_LOST
+            .with_label_values(&[state.program_type.as_label()]);
+        let before_metric = metric.get();
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(txn_id),
+                withdrawal_nonce: Some(9),
+                trace_id: Some(format!("trace-{txn_id}")),
+                deposit_claim_lease: None,
+            },
+            remint_info: make_remint_info(txn_id),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lost claim must emit no status update of any kind"
+        );
+        // Re-queued uncapped: the winner's signature resolves it on a later tick.
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(
+            state.pending_remints[0].finality_check_attempts, 0,
+            "a lost claim must not consume the finality budget"
+        );
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "a lost claim must increment the claim-lost counter"
+        );
+        // The loser wrote nothing, so the winner's attempt stays the only one.
+        assert!(mock.get_remint_signatures(txn_id).await.unwrap().is_empty());
         src_send.assert_async().await;
     }
 
@@ -4163,10 +4302,11 @@ mod tests {
         let (state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
+        let dead_attempt = Signature::new_unique().to_string();
         mock.remint_signatures
             .lock()
             .unwrap()
-            .insert(720, vec![(Signature::new_unique().to_string(), 0)]);
+            .insert(720, vec![(dead_attempt.clone(), 0)]);
         // Source: expired absence with a covered floor, so classification is Dead.
         mock_rpc(
             &mut source,
@@ -4229,5 +4369,20 @@ mod tests {
         // stays unconfirmed here, so the entry defers; the broadcast is the point).
         let _ = execute_deferred_remint(&state, entry, &storage_tx).await;
         send.assert_async().await;
+
+        // The proven-dead attempt is retired, not deleted: it stays classifiable
+        // in case it lands late, and the fresh attempt now owns the claim.
+        assert!(mock
+            .superseded_remint_signatures
+            .lock()
+            .unwrap()
+            .contains(&dead_attempt));
+        let stored = mock.get_remint_signatures(720).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            2,
+            "history kept plus the new claim: {stored:?}"
+        );
+        assert_eq!(stored[0].0, dead_attempt);
     }
 }

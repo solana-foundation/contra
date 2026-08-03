@@ -198,6 +198,18 @@ counter_vec!(
     &["site", "verdict"]
 );
 
+// A sender signed a remint but lost the pre-send claim on its transaction, which
+// is only possible if a second sender is running against the same database. Zero
+// under correct single-sender operation, so any increment is proof the sender's
+// advisory lock was lost and is the detection mechanism for that whole class of
+// problem. Alert-routed as critical.
+counter_vec!(
+    OPERATOR_REMINT_CLAIM_LOST,
+    "private_channel_operator_remint_claim_lost_total",
+    "Remint broadcasts abandoned because another sender owned the claim",
+    &["program_type"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -225,6 +237,7 @@ pub fn init_labels(program_type: &str) {
     OPERATOR_TRANSACTIONS_FETCHED.with_label_values(&[program_type]);
     OPERATOR_MINTS_SENT.with_label_values(&[program_type]);
     OPERATOR_DB_UPDATE_ERRORS.with_label_values(&[program_type]);
+    OPERATOR_REMINT_CLAIM_LOST.with_label_values(&[program_type]);
 
     for status in &["Pending", "Processing", "Completed", "Failed"] {
         OPERATOR_DB_UPDATES.with_label_values(&[program_type, status]);
@@ -332,6 +345,7 @@ pub fn init() {
         OPERATOR_STALE_PROCESSING_RECOVERED,
         OPERATOR_REOPENED_DEPOSIT_GATE,
         OPERATOR_RELEASE_VERIFY,
+        OPERATOR_REMINT_CLAIM_LOST,
     );
 }
 
@@ -381,6 +395,7 @@ mod tests {
             "private_channel_operator_mints_sent_total",
             "private_channel_operator_backlog_depth",
             "private_channel_feepayer_balance_lamports",
+            "private_channel_operator_remint_claim_lost_total",
         ];
 
         for name in single_label_metrics {
@@ -422,6 +437,7 @@ mod tests {
             "private_channel_operator_task_exit_total",
             "private_channel_operator_stale_processing_recovered_total",
             "private_channel_operator_reopened_deposit_gate_total",
+            "private_channel_operator_remint_claim_lost_total",
         ];
 
         let families = prometheus::gather();

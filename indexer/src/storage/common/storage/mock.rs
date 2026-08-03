@@ -629,6 +629,11 @@ impl MockStorage {
         Ok(nonces)
     }
 
+    /// Mirror `set_pending_remint_internal`: transition a Processing row to
+    /// PendingRemint and store the finality-check payload. Replaying an
+    /// identical payload on an already-PendingRemint row succeeds; any other
+    /// status, a different payload, or a missing row is a guard miss, matching
+    /// the Postgres semantics. Honors `should_fail("set_pending_remint")`.
     pub async fn set_pending_remint(
         &self,
         transaction_id: i64,
@@ -648,6 +653,41 @@ impl MockStorage {
                 message: "Simulated set_pending_remint failure".to_string(),
             });
         }
+
+        {
+            let mut rows = self.pending_transactions.lock().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|t| t.id == transaction_id)
+                .ok_or_else(|| StorageError::DatabaseError {
+                    message: format!("no row for id {transaction_id}"),
+                })?;
+            let replay = row.status == TransactionStatus::PendingRemint
+                && row.remint_signatures.as_ref() == Some(&remint_signatures);
+            if row.status != TransactionStatus::Processing && !replay {
+                return Err(StorageError::DatabaseError {
+                    message: format!(
+                        "id {transaction_id} is {:?}, not a PendingRemint transition",
+                        row.status
+                    ),
+                });
+            }
+            row.status = TransactionStatus::PendingRemint;
+            row.remint_signatures = Some(remint_signatures.clone());
+            row.remint_last_valid_block_heights = Some(remint_last_valid_block_heights.clone());
+            row.pending_remint_deadline_at = Some(deadline_at);
+            row.updated_at = Utc::now();
+
+            // Keep the rehydration list in step, so `get_pending_remint_transactions`
+            // sees the row exactly as a restart would.
+            let transitioned = row.clone();
+            let mut rehydrate = self.pending_remint_transactions.lock().unwrap();
+            match rehydrate.iter_mut().find(|t| t.id == transaction_id) {
+                Some(existing) => *existing = transitioned,
+                None => rehydrate.push(transitioned),
+            }
+        }
+
         self.pending_remint_signatures.lock().unwrap().push((
             transaction_id,
             remint_signatures,
@@ -655,6 +695,53 @@ impl MockStorage {
             deadline_at,
         ));
         Ok(())
+    }
+
+    /// Mirror `try_escalate_manual_review_internal`: flip a Processing row to
+    /// ManualReview, returning whether it matched. Any other status is a guard
+    /// miss that writes nothing. Honors `should_fail("try_escalate_manual_review")`.
+    pub async fn try_escalate_manual_review(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_escalate_manual_review")?;
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let Some(row) = rows
+            .iter_mut()
+            .find(|t| t.id == transaction_id && t.status == TransactionStatus::Processing)
+        else {
+            return Ok(false);
+        };
+        row.status = TransactionStatus::ManualReview;
+        row.processed_at = Some(Utc::now());
+        row.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    /// Status of one row. `pending_transactions` is the live mirror of the
+    /// table, so it wins; `pending_remint_transactions` is the fallback for
+    /// tests that only seeded the rehydration list.
+    pub async fn get_transaction_status(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<TransactionStatus>, StorageError> {
+        self.check_should_fail("get_transaction_status")?;
+        if let Some(txn) = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+        {
+            return Ok(Some(txn.status));
+        }
+        Ok(self
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+            .map(|t| t.status))
     }
 
     /// Update the in-memory pending_remint row for `transaction_id` with the

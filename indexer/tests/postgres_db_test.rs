@@ -816,6 +816,102 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// The ManualReview fallback must only terminalize a row it can prove is still
+/// Processing. A committed PendingRemint has to survive it: the generic status
+/// writer accepts `pending_remint` as a source, so an unguarded escalation would
+/// overwrite the handoff and leave the withdrawal in a status no sweep selects.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_escalate_manual_review_spares_pending_remint() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // One dequeue has to lock both rows: once the first is PendingRemint its
+    // nonce is the frontier, and the higher nonce stays Pending.
+    let txn = make_db_transaction("escalate_guard", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    let other = make_db_transaction("escalate_processing", TransactionType::Withdrawal);
+    let other_id = storage.insert_db_transaction(&other).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    storage
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![10], deadline)
+        .await?;
+
+    assert!(
+        !storage.try_escalate_manual_review(id).await?,
+        "a PendingRemint row must not be escalated"
+    );
+    assert_eq!(
+        status_of(&pool, id).await,
+        "pending_remint",
+        "the handoff must survive"
+    );
+
+    // A row that never left Processing is the escalation's to take.
+    assert!(
+        storage.try_escalate_manual_review(other_id).await?,
+        "a Processing row must be escalated"
+    );
+    assert_eq!(status_of(&pool, other_id).await, "manual_review");
+    Ok(())
+}
+
+/// A retry whose first attempt committed but whose acknowledgement was lost must
+/// succeed, so the sender can tell a durable handoff from a failed one. Replaying
+/// the same payload is accepted; a different payload is not, so a second caller
+/// can never silently overwrite the signatures a live remint depends on.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_pending_remint_replays_identical_payload_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let txn = make_db_transaction("remint_replay", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    let signatures = vec!["sig1".to_string(), "sig2".to_string()];
+    storage
+        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline)
+        .await?;
+
+    // The row is already PendingRemint; the same payload must still be accepted.
+    storage
+        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline)
+        .await?;
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT remint_signatures FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(stored, signatures, "replay must preserve the signatures");
+
+    let other = storage
+        .set_pending_remint(id, vec!["different".to_string()], vec![30], deadline)
+        .await;
+    assert!(
+        other.is_err(),
+        "a different payload must not overwrite a live PendingRemint"
+    );
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT remint_signatures FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        stored, signatures,
+        "the rejected payload must leave the signatures untouched"
+    );
+    Ok(())
+}
+
 // ── set_mint_extension_flags row-exists guard ────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

@@ -400,6 +400,7 @@ fn enforce_lamport_conservation(
     transactions: &[SanitizedTransaction],
     bob: &BOB,
     fee_payers: &HashSet<Pubkey>,
+    metrics: &SharedMetrics,
 ) {
     // Reused across transactions so the whole batch allocates at most once.
     let mut fabricated: Vec<usize> = Vec::new();
@@ -453,6 +454,15 @@ fn enforce_lamport_conservation(
         // lamport that went elsewhere. Hence no older account may grow while any
         // made-up money is missing.
         if shortfall > created || (shortfall > 0 && credited) {
+            // Nothing legitimate trips this, so every hit is worth an alert.
+            warn!(
+                sig = %tx.signature(),
+                shortfall,
+                created,
+                credited,
+                "execution: failing tx that does not account for its fabricated fee-payer lamports"
+            );
+            metrics.executor_conservation_rejected();
             // Fail the tx instead of taking the money back, which would mean
             // rewriting accounts it owns. Later stages skip failed txs.
             executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
@@ -732,6 +742,7 @@ pub async fn execute_batch(
             &regular_transactions,
             &execution_deps.bob,
             &fee_payers,
+            metrics,
         );
 
         // Update BOB's in-memory accounts with the execution results
@@ -1019,6 +1030,7 @@ mod tests {
             std::slice::from_ref(&tx),
             &bob,
             &fee_payers.iter().copied().collect(),
+            &(Arc::new(NoopMetrics) as SharedMetrics),
         );
         let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
             panic!("expected executed");
@@ -1217,6 +1229,42 @@ mod tests {
         assert_eq!(out.accounts[2], data_account(1010), "the credit stands");
     }
 
+    /// Routing the float through an account that ends where it started, so it
+    /// pays a new account's floor for it, is accepted. This is the allowance
+    /// doing its job, not a way around it: the relay ends no richer, and total
+    /// lamports still rise by exactly one per account created. Rejecting it
+    /// would also reject an ordinary creation, which spends the float the same
+    /// way in one hop instead of two.
+    #[tokio::test]
+    async fn float_relayed_through_a_flat_account_stays_within_the_allowance() {
+        let payer = Pubkey::new_unique();
+        let relay = Pubkey::new_unique();
+        let fresh = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(relay, data_account(5000))],
+            vec![
+                // One lamport of the float is gone.
+                (payer, dataless_account(FLOAT - 1)),
+                // It passed through here and left again, so this ends flat.
+                (relay, data_account(5000)),
+                // And it came to rest as the new account's existence floor.
+                (fresh, data_account(1)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(
+            out.accounts[1],
+            data_account(5000),
+            "the relay must end exactly where it started, so it gained nothing"
+        );
+        assert_eq!(
+            out.accounts[2],
+            data_account(1),
+            "the new account keeps the single lamport the allowance covers"
+        );
+    }
+
     /// An ordinary wallet (lamports, no data) is neither zeroed nor deleted.
     /// Force-deleting it was the documented divergence from Agave.
     #[tokio::test]
@@ -1315,6 +1363,7 @@ mod tests {
             std::slice::from_ref(&tx),
             &bob,
             &HashSet::from([payer]),
+            &(Arc::new(NoopMetrics) as SharedMetrics),
         );
         let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
             panic!("expected executed");

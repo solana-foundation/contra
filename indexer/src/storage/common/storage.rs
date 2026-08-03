@@ -375,12 +375,24 @@ impl Storage {
     }
 
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means
-    /// another sender holds it, so the caller must refuse to start.
+    /// another sender holds it, so the caller must refuse to start. The guard
+    /// heartbeats the lock and cancels `operator_token` if ownership stops being
+    /// provable; a zero `heartbeat_interval` disables probing.
     pub async fn try_acquire_sender_lock(
         &self,
         key: i64,
+        program_type: &'static str,
+        operator_token: tokio_util::sync::CancellationToken,
+        heartbeat_interval: std::time::Duration,
     ) -> Result<Option<sender_lock::SenderLockGuard>, StorageError> {
-        sender_lock::try_acquire_sender_lock(self, key).await
+        sender_lock::try_acquire_sender_lock(
+            self,
+            key,
+            program_type,
+            operator_token,
+            heartbeat_interval,
+        )
+        .await
     }
 
     /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.

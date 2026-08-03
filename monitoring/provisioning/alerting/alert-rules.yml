@@ -314,7 +314,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) lost a remint claim, which is only possible if a second sender is running against the same database. The loser refused to broadcast, so no double mint happened yet; stop the duplicate operator and re-check the sender advisory lock before the next pending remint matures."
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) lost a remint claim, which is only possible if a second sender is running against the same database. The loser refused to broadcast, so no double mint happened yet; stop the duplicate operator and re-check the sender advisory lock before the next pending remint matures. With the sender lock heartbeat enabled a second sender should be killed within about 7s, so this firing means the heartbeat is disabled or misconfigured, or the two senders are on different databases."
         labels:
           severity: critical
         data:
@@ -325,6 +325,40 @@ groups:
             datasourceUid: prometheus
             model:
               expr: increase(private_channel_operator_remint_claim_lost_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: sender-lock-lost
+        title: "Sender advisory lock ownership could not be proven"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) could not prove it still owns its sender advisory lock (reason {{ $labels.reason }}) and shut itself down. Runbook: docs/runbooks/sender_lock_lost_runbook.md. Confirm the operator restarted and that exactly one sender holds each role key; note that OPERATOR_TASK_EXIT will normally be labelled fetcher, not sender, on this shutdown."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_sender_lock_lost_total[5m])
               instant: true
               refId: A
           - refId: C

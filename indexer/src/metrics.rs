@@ -210,6 +210,20 @@ counter_vec!(
     &["program_type"]
 );
 
+// The sender could not prove it still owns its advisory lock, so it cancelled
+// the whole operator. `reason` is one of {not_held, probe_error, probe_timeout,
+// fenced_write}: `not_held` is a successful probe that proved the lock is gone,
+// `probe_error` and `probe_timeout` are a heartbeat probe that failed or hung on
+// the pinned session, and `fenced_write` is a sender-owned write that could not
+// be proven to have run inside the lock's own session. Zero in steady state, so
+// any increment means the singleton guarantee was broken.
+counter_vec!(
+    OPERATOR_SENDER_LOCK_LOST,
+    "private_channel_operator_sender_lock_lost_total",
+    "Sender shutdowns triggered by unprovable advisory-lock ownership",
+    &["program_type", "reason"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -317,6 +331,11 @@ pub fn init_labels(program_type: &str) {
             OPERATOR_RELEASE_VERIFY.with_label_values(&[site, verdict]);
         }
     }
+
+    // Pre-register every reason so the alert query sees a zero series, not nothing.
+    for reason in &["not_held", "probe_error", "probe_timeout", "fenced_write"] {
+        OPERATOR_SENDER_LOCK_LOST.with_label_values(&[program_type, reason]);
+    }
 }
 
 pub fn init() {
@@ -346,6 +365,7 @@ pub fn init() {
         OPERATOR_REOPENED_DEPOSIT_GATE,
         OPERATOR_RELEASE_VERIFY,
         OPERATOR_REMINT_CLAIM_LOST,
+        OPERATOR_SENDER_LOCK_LOST,
     );
 }
 
@@ -438,6 +458,7 @@ mod tests {
             "private_channel_operator_stale_processing_recovered_total",
             "private_channel_operator_reopened_deposit_gate_total",
             "private_channel_operator_remint_claim_lost_total",
+            "private_channel_operator_sender_lock_lost_total",
         ];
 
         let families = prometheus::gather();

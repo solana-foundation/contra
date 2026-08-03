@@ -211,12 +211,13 @@ use solana_sdk::commitment_config::CommitmentLevel;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-use proof::{cleanup_failed_transaction, take_pending_rotation_if_ready};
+use proof::cleanup_failed_transaction;
 use transaction::{
-    handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
+    drive_pending_rotation, handle_transaction_submission, poll_in_flight, route_poll_results,
+    run_poll_task,
 };
 use types::{PollTaskResult, SenderState};
 
@@ -291,8 +292,17 @@ pub async fn run_sender(
     // next tick
     state.recover_pending_remints(&storage_tx).await?;
 
-    // Periodic check for pending rotation (every 500ms)
-    let mut rotation_check_interval = interval(Duration::from_millis(500));
+    // Deferred remints and the two retry queues (every 500ms)
+    let mut queue_check_interval = interval(Duration::from_millis(500));
+
+    // Rotation cadence, deliberately slower than the queue tick: an owed reset is
+    // retried until the tree advances, and 500ms would hammer a failing RPC. A
+    // rotation with no in-flight releases is submitted straight off the processor
+    // arm, so this paces one queued behind in-flight work, plus its retries.
+    let mut rotation_interval = interval(Duration::from_secs(5));
+    // Never burst through missed ticks: after the loop blocks in a long send, a
+    // catch-up burst would collapse the pacing back to a spin.
+    rotation_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     // Channel for the poll task to deliver batched confirmation results back to the sender loop.
     let (poll_result_tx, mut poll_result_rx) = mpsc::channel(32);
@@ -372,14 +382,12 @@ pub async fn run_sender(
                 }
             }
 
-            _ = rotation_check_interval.tick() => {
-                // Check if pending rotation can now be executed
-                if let Some(rotation_builder) = take_pending_rotation_if_ready(&mut state) {
-                    info!("Executing queued ResetSmtRoot transaction");
-                    let tx_builder = TransactionBuilder::ResetSmtRoot(rotation_builder);
-                    handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
-                }
+            _ = rotation_interval.tick() => {
+                // Submit or retry the rotation the sender owes the chain
+                drive_pending_rotation(&mut state, &storage_tx).await;
+            }
 
+            _ = queue_check_interval.tick() => {
                 // Process matured deferred remints
                 remint::process_pending_remints(&mut state, &storage_tx).await;
 

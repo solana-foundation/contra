@@ -28,7 +28,9 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use super::mint::{cleanup_mint_builder, try_jit_mint_initialization, JitOutcome};
-use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
+use super::proof::{
+    cleanup_failed_transaction, pending_rotation_due, rebuild_with_regenerated_proof,
+};
 use super::types::{
     InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
     SendDurability, SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
@@ -126,10 +128,13 @@ impl SenderState {
                     compute_budget,
                 })
             }
-            TransactionBuilder::ResetSmtRoot(mut builder) => {
-                // Bind the reset to our local tree index so the on-chain program
-                // rejects a replay. Initialize SMT state first in case a reset is
-                // the first thing we process after a restart.
+            TransactionBuilder::ResetSmtRoot(builder) => {
+                // Arm first: nothing below is infallible, and a dropped builder is a
+                // lost rotation. Cleared only where the sender proves the tree advanced.
+                self.pending_rotation = Some(builder);
+
+                // Initialize SMT state in case a reset is the first thing we process
+                // after a restart.
                 if self.smt_state.is_none() {
                     self.initialize_smt_state().await?;
                 }
@@ -146,15 +151,19 @@ impl SenderState {
                         in_flight_count
                     );
 
-                    self.pending_rotation = Some(builder);
-
                     return Err(ProgramError::RotationPending { in_flight_count }.into());
                 }
 
-                // No in-flight transactions - process immediately
-                builder.expected_current_tree_index(expected_current_tree_index);
+                // Bind the reset to our local tree index so the on-chain program
+                // rejects a replay. Rebound on every attempt, so a retry after a
+                // sync targets the current index.
+                let rotation = self
+                    .pending_rotation
+                    .as_mut()
+                    .expect("armed at the top of this arm");
+                rotation.expected_current_tree_index(expected_current_tree_index);
                 Ok(InstructionWithSigners {
-                    instructions: vec![builder.instruction()],
+                    instructions: vec![rotation.instruction()],
                     fee_payer,
                     signers,
                     compute_budget,
@@ -271,6 +280,83 @@ pub async fn handle_transaction_submission(
     }
     .instrument(span)
     .await;
+}
+
+/// Drive the rotation the sender owes the chain. Called on the rotation tick.
+///
+/// The reset has no DB row and no nonce, so `pending_rotation` is its only record.
+/// It stays armed across the whole submission, which is what makes a pre-broadcast
+/// or pre-confirmation failure retry here instead of dropping the rotation and
+/// stranding the boundary withdrawal.
+pub(super) async fn drive_pending_rotation(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    if !pending_rotation_due(state) {
+        return;
+    }
+    let Some(builder) = state.pending_rotation.clone() else {
+        return;
+    };
+
+    // An earlier attempt may have landed with its confirmation lost, so settle that
+    // against the chain before spending another. No local SMT means no index to
+    // compare against; the submission below initializes it.
+    if let Some(bound) = state
+        .smt_state
+        .as_ref()
+        .map(|smt_state| smt_state.smt_state.tree_index())
+    {
+        if tree_advanced_past(state, bound).await {
+            info!("Tree already advanced past {bound}, rotation no longer owed");
+            state.pending_rotation = None;
+            return;
+        }
+    }
+
+    info!("Submitting owed ResetSmtRoot");
+    handle_transaction_submission(state, TransactionBuilder::ResetSmtRoot(builder), storage_tx)
+        .await;
+
+    // Still armed means this attempt did not prove the tree advanced. Kept armed so
+    // the next tick retries, and logged because a reset has no row to escalate.
+    if state.pending_rotation.is_some() {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "rotation_not_landed"])
+            .inc();
+        warn!("ResetSmtRoot did not land, rotation stays armed for retry");
+    }
+}
+
+/// Re-read the on-chain tree index and report whether it is past `bound`, syncing
+/// the local SMT forward when it is. Short of a confirmed reset, that is the only
+/// proof the rotation owed at `bound` already landed.
+///
+/// Only ever moves the local index forward. Callers pass their local tree index, so
+/// a past-bound answer is a forward move; a lagging backend behind a load-balanced
+/// endpoint can answer with an older index, and rewinding on that would clear the
+/// current tree's nonces, since reset() empties the tree. A not-advanced answer and
+/// a read failure both report false: the rotation stays owed, and the program's
+/// expected_current_tree_index check rejects a redundant retry instead of advancing
+/// the tree twice.
+async fn tree_advanced_past(state: &mut SenderState, bound: u64) -> bool {
+    match state.fetch_onchain_tree_index().await {
+        Ok(onchain_index) if onchain_index > bound => {
+            if let Some(ref mut smt_state) = state.smt_state {
+                warn!("Synced local SMT forward to on-chain tree_index {onchain_index}");
+                smt_state.smt_state.reset(onchain_index);
+            }
+            true
+        }
+        Ok(onchain_index) => {
+            debug!("On-chain tree_index {onchain_index} not past {bound}, rotation still owed");
+            false
+        }
+        Err(e) => {
+            error!("Tree index re-fetch failed: {e}, local SMT left unchanged");
+            false
+        }
+    }
 }
 
 /// Route a `handle_transaction_builder` error to its non-success path; separate from `handle_transaction_submission` so it is testable without real signers.
@@ -789,6 +875,14 @@ pub(super) fn handle_confirmation_result<'a>(
                     metrics::OPERATOR_TRANSACTION_ERRORS
                         .with_label_values(&[pt, "confirmation_timeout"])
                         .inc();
+                    // A reset has no nonce, so send_and_confirm's attempt cap does not
+                    // apply and re-sending here would loop unpaced until it lands. The
+                    // armed rotation is retried on the rotation tick instead, which
+                    // re-reads the on-chain tree index before each attempt.
+                    if ctx.withdrawal_nonce.is_none() {
+                        warn!("Confirmation timed out for reset, leaving it to the rotation tick");
+                        return;
+                    }
                     warn!("Confirmation failed for idempotent operation - retrying (nonce protects against duplicates)");
                     send_and_confirm(
                         state,
@@ -808,21 +902,21 @@ pub(super) fn handle_confirmation_result<'a>(
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "reset_tree_already_advanced"])
                     .inc();
-                // Rejected because a reset already advanced the tree on-chain. Sync
-                // local SMT to the authoritative index. On fetch failure, leave it
-                // unchanged rather than guess; a restart re-syncs from chain.
+                // Rejected because the on-chain index is not the one this attempt
+                // bound, normally because a reset already landed. Only an index past
+                // the bound one proves that, and it is the only case the helper syncs;
+                // anything else (including a lagging read) leaves the local SMT alone
+                // and keeps the rotation armed to rebind on the next attempt.
                 // smt_state is always Some here: the reset submit path initializes
                 // it before sending, and nothing clears it back to None.
-                match state.fetch_onchain_tree_index().await {
-                    Ok(idx) => {
-                        if let Some(ref mut smt_state) = state.smt_state {
-                            smt_state.smt_state.reset(idx);
-                            warn!("ResetSmtRoot rejected - synced local SMT to on-chain tree_index {idx}");
-                        }
+                if let Some(bound) = state
+                    .smt_state
+                    .as_ref()
+                    .map(|smt_state| smt_state.smt_state.tree_index())
+                {
+                    if tree_advanced_past(state, bound).await {
+                        state.pending_rotation = None;
                     }
-                    Err(e) => error!(
-                        "ResetSmtRoot rejected but tree index re-fetch failed: {e} - local SMT left unchanged"
-                    ),
                 }
             }
             Ok(ConfirmationResult::Failed(program_error)) => {
@@ -914,10 +1008,12 @@ pub(super) async fn handle_success(
         .await
         .ok();
     }
-    // Handle ResetSmtRoot (no transaction_id) - update local SMT tree index
+    // Handle ResetSmtRoot (no transaction_id) - the owed rotation landed, so advance
+    // the local SMT and disarm it. One of the two places a rotation is cleared.
     else if let Some(ref mut smt_state) = state.smt_state {
         let new_tree_index = smt_state.smt_state.tree_index() + 1;
         smt_state.smt_state.reset(new_tree_index);
+        state.pending_rotation = None;
         info!(
             "Tree rotation complete! Updated local SMT to tree_index {}",
             new_tree_index
@@ -1864,7 +1960,9 @@ mod tests {
     use base64::Engine;
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
-    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::instructions::{
+        ReleaseFundsBuilder, ResetSmtRootBuilder,
+    };
     use private_channel_escrow_program_client::Instance;
     use solana_client::nonblocking::rpc_client::RpcClient;
     use solana_client::rpc_request::RpcRequest;
@@ -3311,8 +3409,9 @@ mod tests {
         );
     }
 
-    /// A confirmed ResetSmtRoot transaction (no transaction_id, no nonce) must advance the
-    /// tree index and send no status update to the storage channel.
+    /// A confirmed ResetSmtRoot transaction (no transaction_id, no nonce) must advance
+    /// the tree index, disarm the rotation it just proved landed, and send no status
+    /// update to the storage channel.
     #[tokio::test]
     async fn handle_success_reset_smt_root_increments_tree_index() {
         let mut state = make_sender_state();
@@ -3321,6 +3420,7 @@ mod tests {
             smt_state: crate::operator::utils::smt_util::SmtState::new(0),
             nonce_to_builder: HashMap::new(),
         });
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
 
         let (tx, mut rx) = mpsc::channel(10);
         // No transaction_id, no withdrawal_nonce = ResetSmtRoot context
@@ -3340,6 +3440,10 @@ mod tests {
 
         // Tree index should be incremented
         assert_eq!(state.smt_state.as_ref().unwrap().smt_state.tree_index(), 1);
+        assert!(
+            state.pending_rotation.is_none(),
+            "a confirmed reset proves the tree advanced, so the rotation is disarmed"
+        );
     }
 
     /// After a successful withdrawal, the per-nonce retry counter must be removed so that
@@ -3447,8 +3551,9 @@ mod tests {
     }
 
     /// A reset rejected with UnexpectedTreeIndex means a reset already landed on-chain.
-    /// The sender must re-fetch the authoritative tree index, sync local SMT to it, and
-    /// write nothing to the storage channel (a reset has no DB row).
+    /// The sender must re-fetch the tree index, sync local SMT to it, disarm the
+    /// rotation now that the chain is past the bound index, and write nothing to the
+    /// storage channel (a reset has no DB row).
     #[tokio::test]
     async fn confirmation_result_unexpected_tree_index_resyncs_local_smt() {
         let local_index = 4u64;
@@ -3492,6 +3597,7 @@ mod tests {
             smt_state: SmtState::new(local_index),
             nonce_to_builder: HashMap::new(),
         });
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
@@ -3520,6 +3626,10 @@ mod tests {
             state.smt_state.as_ref().unwrap().smt_state.tree_index(),
             onchain_index
         );
+        assert!(
+            state.pending_rotation.is_none(),
+            "chain is past the bound index, so the rotation is no longer owed"
+        );
         drop(tx);
         assert!(
             rx.recv().await.is_none(),
@@ -3528,7 +3638,8 @@ mod tests {
     }
 
     /// If the on-chain re-fetch fails (here: an undeserializable instance account), the
-    /// sender must leave local SMT unchanged (fail-closed) rather than guessing the index.
+    /// sender must leave local SMT unchanged (fail-closed) rather than guessing the
+    /// index, and keep the rotation armed since nothing proved the tree advanced.
     #[tokio::test]
     async fn confirmation_result_unexpected_tree_index_fetch_failure_leaves_smt_unchanged() {
         let local_index = 4u64;
@@ -3560,6 +3671,7 @@ mod tests {
             smt_state: SmtState::new(local_index),
             nonce_to_builder: HashMap::new(),
         });
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
@@ -3589,8 +3701,180 @@ mod tests {
             local_index,
             "local SMT must be unchanged when re-fetch fails"
         );
+        assert!(
+            state.pending_rotation.is_some(),
+            "nothing proved the tree advanced, so the rotation stays armed"
+        );
         drop(tx);
         assert!(rx.recv().await.is_none());
+    }
+
+    /// A re-fetch that returns the index we are already on proves nothing advanced.
+    /// Syncing anyway would call reset(), which clears the tree and would drop the
+    /// nonces already inserted for it, so the sync must be skipped and the rotation
+    /// stay armed.
+    #[tokio::test]
+    async fn confirmation_result_unexpected_tree_index_same_index_keeps_tree_and_rotation() {
+        let tree_index = 0u64;
+        let nonce = 1u64;
+
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: [0u8; 32],
+            current_tree_index: tree_index,
+        };
+        let mut instance_bytes = Vec::new();
+        instance.serialize(&mut instance_bytes).unwrap();
+
+        let account_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&instance_bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rpc_client = Arc::new(RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        });
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(tree_index),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::UnexpectedTreeIndex,
+            ))),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert_eq!(smt.smt_state.tree_index(), tree_index);
+        assert!(
+            smt.smt_state.contains_nonce(nonce),
+            "a same-index sync must not clear the current tree"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "chain is not past the bound index, so the rotation stays armed"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// A reset that times out in confirmation must not re-send inline: it has no
+    /// nonce, so send_and_confirm's attempt cap does not apply. The armed rotation is
+    /// left for the rotation tick, so no RPC call is made from this path.
+    #[tokio::test]
+    async fn confirmation_timeout_for_reset_does_not_resend_inline() {
+        let mut server = mockito::Server::new_async().await;
+        // A resend starts with build_and_sign, so a blockhash read proves it happened.
+        let blockhash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Retry),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        blockhash.assert();
+        assert!(
+            state.pending_rotation.is_some(),
+            "rotation stays armed for the tick to retry"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "a reset has no row to update");
+    }
+
+    // ── rotation arming ──────────────────────────────────────────────
+
+    /// The rotation must be armed before the fallible SMT init, or an init failure
+    /// drops it: a reset has no DB row and the fail-closed init arm writes no status,
+    /// so the armed slot is the only thing that keeps the rotation owed.
+    #[tokio::test]
+    async fn reset_arms_rotation_before_smt_init_failure() {
+        ensure_test_signer();
+
+        // make_sender_state leaves instance_pda None, so validate_smt_root fails with
+        // InstanceNotFound: init fails before the in-flight check and before any
+        // instruction is built.
+        let mut state = make_sender_state();
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        handle_transaction_submission(
+            &mut state,
+            TransactionBuilder::ResetSmtRoot(Box::new(ResetSmtRootBuilder::new())),
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            state.pending_rotation.is_some(),
+            "rotation must survive an init failure so the tick can retry it"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a reset has no row, so no status update"
+        );
     }
 
     /// A `Retry` result with `RetryPolicy::None` (non-idempotent operation) cannot be safely

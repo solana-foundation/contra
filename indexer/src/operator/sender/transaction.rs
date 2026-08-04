@@ -875,11 +875,13 @@ pub(super) fn handle_confirmation_result<'a>(
                     metrics::OPERATOR_TRANSACTION_ERRORS
                         .with_label_values(&[pt, "confirmation_timeout"])
                         .inc();
-                    // A reset has no nonce, so send_and_confirm's attempt cap does not
-                    // apply and re-sending here would loop unpaced until it lands. The
-                    // armed rotation is retried on the rotation tick instead, which
-                    // re-reads the on-chain tree index before each attempt.
-                    if ctx.withdrawal_nonce.is_none() {
+                    // A reset carries neither id nor nonce, so send_and_confirm's
+                    // per-nonce attempt cap does not apply and re-sending here would loop
+                    // unpaced until it lands. The armed rotation is retried on the
+                    // rotation tick instead, which re-reads the on-chain tree index
+                    // before each attempt. Both fields must be None: a deposit also has
+                    // no nonce, and its retry does belong on this path.
+                    if ctx.transaction_id.is_none() && ctx.withdrawal_nonce.is_none() {
                         warn!("Confirmation timed out for reset, leaving it to the rotation tick");
                         return;
                     }

@@ -544,3 +544,156 @@ async fn test_manual_review_not_returned_by_recovery_query(
 
     Ok(())
 }
+
+/// The core mutual-exclusion invariant: two senders that each sign a MintTo with
+/// a different blockhash produce different signatures, so a signature-keyed
+/// write-ahead insert accepts both and both broadcast. The claim must be keyed on
+/// the transaction instead, so exactly one racer may broadcast.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_concurrent_remint_claims_exactly_one_wins() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let tx_id =
+        insert_withdrawal(&pool, &Pubkey::new_unique(), &Pubkey::new_unique(), 5_000).await?;
+
+    let sig_a = Signature::new_unique().to_string();
+    let sig_b = Signature::new_unique().to_string();
+
+    let storage_a = storage.clone();
+    let storage_b = storage.clone();
+    let (won_a, won_b) = tokio::join!(
+        tokio::spawn(async move { storage_a.claim_remint_attempt(tx_id, sig_a, 100, &[]).await }),
+        tokio::spawn(async move { storage_b.claim_remint_attempt(tx_id, sig_b, 200, &[]).await }),
+    );
+    let won_a = won_a.expect("racer a not panic").expect("claim a ok");
+    let won_b = won_b.expect("racer b not panic").expect("claim b ok");
+
+    assert!(
+        won_a ^ won_b,
+        "exactly one racer may own the live remint claim (a={won_a} b={won_b})"
+    );
+
+    // Only the winner's attempt is persisted, so the loser has nothing to broadcast.
+    let stored = storage.get_remint_signatures(tx_id).await?;
+    assert_eq!(
+        stored.len(),
+        1,
+        "one live attempt persisted; got {stored:?}"
+    );
+
+    Ok(())
+}
+
+/// Superseding is a compare-and-swap on the attempt the caller actually
+/// classified. Two racers that observed the same dead attempt must not both
+/// retire it and take the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_concurrent_supersede_of_same_dead_attempt_exactly_one_wins(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let tx_id =
+        insert_withdrawal(&pool, &Pubkey::new_unique(), &Pubkey::new_unique(), 5_000).await?;
+
+    // A first attempt takes the slot; both racers later prove it dead.
+    let dead = Signature::new_unique().to_string();
+    assert!(
+        storage
+            .claim_remint_attempt(tx_id, dead.clone(), 100, &[])
+            .await?
+    );
+
+    let observed = vec![dead.clone()];
+    let (storage_a, storage_b) = (storage.clone(), storage.clone());
+    let (obs_a, obs_b) = (observed.clone(), observed.clone());
+    let (sig_a, sig_b) = (
+        Signature::new_unique().to_string(),
+        Signature::new_unique().to_string(),
+    );
+    let (won_a, won_b) = tokio::join!(
+        tokio::spawn(async move {
+            storage_a
+                .claim_remint_attempt(tx_id, sig_a, 300, &obs_a)
+                .await
+        }),
+        tokio::spawn(async move {
+            storage_b
+                .claim_remint_attempt(tx_id, sig_b, 400, &obs_b)
+                .await
+        }),
+    );
+    let won_a = won_a.expect("racer a not panic").expect("claim a ok");
+    let won_b = won_b.expect("racer b not panic").expect("claim b ok");
+
+    assert!(
+        won_a ^ won_b,
+        "exactly one racer may retire the dead attempt and reclaim (a={won_a} b={won_b})"
+    );
+
+    // History is preserved: the dead attempt is still classifiable in case it
+    // lands late, and exactly one new attempt joined it.
+    let stored = storage.get_remint_signatures(tx_id).await?;
+    assert_eq!(
+        stored.len(),
+        2,
+        "dead attempt kept plus one winner; got {stored:?}"
+    );
+    assert!(
+        stored.iter().any(|(sig, _)| sig == &dead),
+        "the superseded attempt must remain readable for classification"
+    );
+
+    Ok(())
+}
+
+/// A proven-dead prior attempt can be retired and the slot reclaimed, but only
+/// by a caller that names it. A caller that observed nothing (the shape of an
+/// Uncertain or Live verdict, which must never supersede) is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_claim_without_naming_the_live_attempt_is_refused(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let tx_id =
+        insert_withdrawal(&pool, &Pubkey::new_unique(), &Pubkey::new_unique(), 5_000).await?;
+
+    let first = Signature::new_unique().to_string();
+    assert!(
+        storage
+            .claim_remint_attempt(tx_id, first.clone(), 100, &[])
+            .await?
+    );
+
+    // Nothing named: the live attempt stands and the claim is refused.
+    assert!(
+        !storage
+            .claim_remint_attempt(tx_id, Signature::new_unique().to_string(), 200, &[])
+            .await?,
+        "a claim that supersedes nothing must not displace a live attempt"
+    );
+    assert_eq!(storage.get_remint_signatures(tx_id).await?.len(), 1);
+
+    // Naming the proven-dead attempt retires it and the slot is reclaimed.
+    let second = Signature::new_unique().to_string();
+    assert!(
+        storage
+            .claim_remint_attempt(tx_id, second.clone(), 300, std::slice::from_ref(&first))
+            .await?,
+        "a proven-dead attempt must be supersedable"
+    );
+
+    // Naming the same now-superseded attempt again wins nothing.
+    assert!(
+        !storage
+            .claim_remint_attempt(tx_id, Signature::new_unique().to_string(), 400, &[first])
+            .await?,
+        "a second supersede of an already-retired attempt must not take the slot"
+    );
+
+    let stored = storage.get_remint_signatures(tx_id).await?;
+    assert_eq!(stored.len(), 2, "history kept, one live; got {stored:?}");
+    assert!(stored.iter().any(|(sig, _)| sig == &second));
+
+    Ok(())
+}

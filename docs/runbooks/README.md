@@ -8,10 +8,17 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
-> **Two conditions are not webhook-routed.** The indexer's
+> **Three conditions are not webhook-routed.** The indexer's
 > **`block_unavailable`** wedge pages through Grafana instead, because it changes
 > no transaction row; see
 > [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
+>
+> **A third condition pages through Grafana, not the webhook.** The
+> **`sender-lock-lost`** alert fires when a sender cannot prove it still owns
+> its Postgres advisory lock and shuts the whole operator down to stop two
+> senders running at once. It changes no transaction row, so it is not in the
+> dispatch table; see
+> [`sender_lock_lost_runbook.md`](sender_lock_lost_runbook.md).
 >
 > **One halt has no dedicated alert.** The **SMT-root-mismatch boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.

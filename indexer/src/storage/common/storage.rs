@@ -3,6 +3,7 @@ pub use try_requeue_prebroadcast::RequeueOutcome;
 
 pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_deposit_signature;
+pub mod claim_remint_attempt;
 pub mod close;
 pub mod count_pending_transactions;
 pub mod delete_release_signatures;
@@ -33,7 +34,6 @@ pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
-pub mod insert_remint_signature;
 pub mod quarantine_all_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
@@ -375,12 +375,24 @@ impl Storage {
     }
 
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means
-    /// another sender holds it, so the caller must refuse to start.
+    /// another sender holds it, so the caller must refuse to start. The guard
+    /// heartbeats the lock and cancels `operator_token` if ownership stops being
+    /// provable; a zero `heartbeat_interval` disables probing.
     pub async fn try_acquire_sender_lock(
         &self,
         key: i64,
+        program_type: &'static str,
+        operator_token: tokio_util::sync::CancellationToken,
+        heartbeat_interval: std::time::Duration,
     ) -> Result<Option<sender_lock::SenderLockGuard>, StorageError> {
-        sender_lock::try_acquire_sender_lock(self, key).await
+        sender_lock::try_acquire_sender_lock(
+            self,
+            key,
+            program_type,
+            operator_token,
+            heartbeat_interval,
+        )
+        .await
     }
 
     /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.
@@ -569,19 +581,24 @@ impl Storage {
         gc_stale_release_signatures::gc_stale_release_signatures(self).await
     }
 
-    /// Write-ahead record of a remint MintTo signature, persisted before the
-    /// broadcast. Idempotent on `signature`.
-    pub async fn insert_remint_signature(
+    /// Claim the exclusive right to broadcast one remint attempt for a
+    /// transaction, persisting the signature write-ahead in the same step.
+    /// `superseded_signatures` are prior attempts the caller has already proven
+    /// dead on-chain. `Ok(false)` means another sender owns the live attempt,
+    /// so the caller must not broadcast.
+    pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<(), StorageError> {
-        insert_remint_signature::insert_remint_signature(
+        superseded_signatures: &[String],
+    ) -> Result<bool, StorageError> {
+        claim_remint_attempt::claim_remint_attempt(
             self,
             transaction_id,
             signature,
             last_valid_block_height,
+            superseded_signatures,
         )
         .await
     }

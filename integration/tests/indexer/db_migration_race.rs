@@ -566,3 +566,106 @@ async fn insert_batch_same_signature_distinct_index_persists_all_rows() {
         "re-insert does not create new rows; got {count_after}"
     );
 }
+
+// ── 4. Remint claim migration over pre-existing multi-attempt rows ──────────
+// A database written before the one-live-attempt claim existed can hold several
+// remint attempts for one transaction, all of them live by default. init_schema
+// must retire all but the newest before building the partial unique index; a
+// duplicate-key failure there would brick every startup.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_init_schema_backfills_pre_existing_remint_attempts() {
+    let (db, url, _container) = start_postgres("c1_remint_claim_backfill").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
+
+    // Rewind to the pre-claim shape: no superseded column, no partial index.
+    sqlx::query("DROP INDEX IF EXISTS idx_prms_one_live")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE pending_remint_signatures DROP COLUMN superseded")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let withdrawal = DbTransactionBuilder::new(
+        Signature::new_unique().to_string(),
+        1,
+        solana_sdk::pubkey::Pubkey::new_unique().to_string(),
+        100u64,
+    )
+    .initiator(solana_sdk::pubkey::Pubkey::new_unique().to_string())
+    .recipient(solana_sdk::pubkey::Pubkey::new_unique().to_string())
+    .transaction_type(TransactionType::Withdrawal)
+    .build();
+    let tx_id = db.insert_transaction_internal(&withdrawal).await.unwrap();
+
+    // Three legacy attempts for one transaction, the exact shape the old
+    // signature-keyed insert produced when the sender lock was lost.
+    let mut attempts = Vec::new();
+    for lvbh in [100i64, 200, 300] {
+        let sig = Signature::new_unique().to_string();
+        sqlx::query(
+            "INSERT INTO pending_remint_signatures
+             (transaction_id, signature, last_valid_block_height) VALUES ($1, $2, $3)",
+        )
+        .bind(tx_id)
+        .bind(&sig)
+        .bind(lvbh)
+        .execute(&pool)
+        .await
+        .unwrap();
+        attempts.push(sig);
+    }
+
+    storage
+        .init_schema()
+        .await
+        .expect("init_schema must migrate a table holding several live attempts");
+
+    let assert_state = |pool: sqlx::PgPool, newest: String| async move {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_remint_signatures WHERE transaction_id = $1",
+        )
+        .bind(tx_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 3, "attempt history must survive the migration");
+
+        let live: Vec<String> = sqlx::query_scalar(
+            "SELECT signature FROM pending_remint_signatures
+             WHERE transaction_id = $1 AND NOT superseded",
+        )
+        .bind(tx_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live, vec![newest], "only the newest attempt may stay live");
+    };
+
+    assert_state(pool.clone(), attempts[2].clone()).await;
+
+    // Replaying init_schema must stay a no-op over the already-migrated rows.
+    storage
+        .init_schema()
+        .await
+        .expect("init_schema must stay idempotent after the backfill");
+    assert_state(pool.clone(), attempts[2].clone()).await;
+
+    // The index is real: a second live attempt for the same transaction is refused.
+    let duplicate = sqlx::query(
+        "INSERT INTO pending_remint_signatures
+         (transaction_id, signature, last_valid_block_height) VALUES ($1, $2, $3)",
+    )
+    .bind(tx_id)
+    .bind(Signature::new_unique().to_string())
+    .bind(400i64)
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the partial unique index must reject a second live attempt"
+    );
+}

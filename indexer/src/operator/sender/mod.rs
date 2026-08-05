@@ -214,6 +214,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
+use private_channel_metrics::MetricLabel;
 use proof::{cleanup_failed_transaction, take_pending_rotation_if_ready};
 use transaction::{
     handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
@@ -227,9 +228,17 @@ use types::{PollTaskResult, SenderState};
 const ESCROW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_45_53_43_52; // "SND_ESCR"
 const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
 
+/// How often the sender re-proves it owns its advisory lock.
+///
+/// Well under the 32s finality delay and the 60s recovery tick, so a sender that
+/// loses its lock is gone before anything it still holds matures. Deliberately
+/// not operator-configurable: the value only makes sense alongside the probe and
+/// fenced-write timeouts it is tuned against, and tests inject their own.
+pub const SENDER_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Advisory-lock key per operator role. Distinct keys so an escrow and a
 /// withdraw sender never contend on the same lock if they share a database.
-fn sender_lock_key(program_type: ProgramType) -> i64 {
+pub fn sender_lock_key(program_type: ProgramType) -> i64 {
     match program_type {
         ProgramType::Escrow => ESCROW_SENDER_LOCK_KEY,
         ProgramType::Withdraw => WITHDRAW_SENDER_LOCK_KEY,
@@ -251,6 +260,7 @@ pub async fn run_sender(
     retry_max_attempts: u32,
     confirmation_poll_interval_ms: u64,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+    sender_lock_heartbeat_interval: Duration,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
 
@@ -273,9 +283,19 @@ pub async fn run_sender(
     // Held for the rest of run_sender; released on drop or process crash. Stops
     // two overlapping senders (e.g. a rolling restart) from both reminting the
     // same row before either confirms on-chain.
+    //
+    // Declared after `state` on purpose. Locals drop in reverse declaration
+    // order, so the guard drops first and the storage Arc carrying the pool is
+    // still alive for the release query. Moving it above `state` would invert
+    // that and must not be done.
     let _sender_lock = match state
         .storage
-        .try_acquire_sender_lock(sender_lock_key(config.program_type))
+        .try_acquire_sender_lock(
+            sender_lock_key(config.program_type),
+            config.program_type.as_label(),
+            cancellation_token.clone(),
+            sender_lock_heartbeat_interval,
+        )
         .await?
     {
         Some(guard) => guard,
@@ -748,6 +768,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
+            Duration::from_secs(5),
         )
         .await;
 
@@ -781,6 +802,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
+            Duration::from_secs(5),
         )
         .await;
 

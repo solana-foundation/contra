@@ -18,6 +18,7 @@ pub use operator::run;
 pub use processor::run_processor;
 pub use recovery::run_recovery_worker;
 pub use sender::{
-    enumerate_consumed_mints, run_sender, ConsumedMintKind, ConsumedSet, TransactionStatusUpdate,
+    enumerate_consumed_mints, run_sender, sender_lock_key, ConsumedMintKind, ConsumedSet,
+    TransactionStatusUpdate,
 };
 pub use utils::*;

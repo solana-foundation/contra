@@ -600,6 +600,7 @@ pub async fn execute_batch(
     metrics.bob_cache_dirty_entries(cache_stats.dirty_entries);
     metrics.bob_cache_bytes(cache_stats.bytes);
     metrics.bob_cache_evicted(cache_stats.evicted);
+    metrics.bob_settlement_divergences(cache_stats.settlement_divergences);
 
     // Refresh the SVM's cached Clock sysvar from wall time. Contra has no
     // real Clock source (see `crate::vm::clock`); without this, programs

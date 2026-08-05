@@ -28,8 +28,8 @@
 /// have their `synced_since` updated frequently, so this is a good heuristic to
 /// evict less frequently accessed accounts.
 ///
-/// What decides whether `synced_since` may be set at all is the second field,
-/// `generation`. Every account BOB writes is stamped with the ordinal of that
+/// What decides whether `synced_since` may be set at all is `generation`. Every
+/// account BOB writes is stamped with the ordinal of that
 /// write, and settlement feedback carries a high-water generation meaning
 /// "everything up to here is durable". An entry is only ever marked
 /// synchronized, or dropped if it is a tombstone, when its own generation is
@@ -81,6 +81,12 @@ pub struct BobCacheStats {
     pub bytes: usize,
     /// Entries evicted (age + cap) since the previous read; drained on read.
     pub evicted: usize,
+    /// Settlement acknowledgements whose generation was covered but whose bytes
+    /// disagreed with the in-memory entry, since the previous read; drained on
+    /// read. Always zero unless BOB's and the settler's independent derivations
+    /// of account state have diverged, so any non-zero value is a bug worth
+    /// alerting on rather than a condition to tune.
+    pub settlement_divergences: usize,
 }
 
 struct AccountWithMeta {
@@ -123,6 +129,8 @@ pub struct BOB {
     dirty_entries: usize,
     /// Running sum of resident account-data bytes; maintained like dirty_entries.
     cache_bytes: usize,
+    /// Byte divergences seen since the last cache_stats read; drained on read.
+    settlement_divergences: usize,
     /// Ordinal of the next executor write. Needs no synchronization: the
     /// executor is a single task owning BOB through `&mut self`, so the
     /// counter is strictly monotonic.
@@ -147,6 +155,7 @@ impl BOB {
             evicted_delta: 0,
             dirty_entries: 0,
             cache_bytes: 0,
+            settlement_divergences: 0,
             next_generation: 0,
         }
     }
@@ -387,6 +396,9 @@ impl BOB {
                                 "Account {} settled under high-water generation {} but its bytes differ from in-memory (entry generation {:?}); leaving it dirty",
                                 pubkey, generation, entry_generation
                             );
+                            // Counted as well as logged so the divergence is
+                            // alertable, since a log line alone is not.
+                            self.settlement_divergences += 1;
                         }
                     }
                 } else {
@@ -500,8 +512,10 @@ impl BOB {
             dirty_entries: self.dirty_entries,
             bytes: self.cache_bytes,
             evicted: self.evicted_delta,
+            settlement_divergences: self.settlement_divergences,
         };
         self.evicted_delta = 0;
+        self.settlement_divergences = 0;
         stats
     }
 }
@@ -524,6 +538,7 @@ impl BOB {
             evicted_delta: 0,
             dirty_entries: 0,
             cache_bytes: 0,
+            settlement_divergences: 0,
             next_generation: 0,
         }
     }
@@ -754,10 +769,6 @@ mod tests {
     fn executed_output(
         accounts: Vec<(Pubkey, AccountSharedData)>,
     ) -> LoadAndExecuteSanitizedTransactionsOutput {
-        use solana_svm::{
-            account_loader::LoadedTransaction,
-            transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
-        };
         LoadAndExecuteSanitizedTransactionsOutput {
             processing_results: vec![Ok(ProcessedTransaction::Executed(Box::new(
                 ExecutedTransaction {
@@ -1075,6 +1086,18 @@ mod tests {
             bob.accounts.get(&pubkey).unwrap().synced_since.is_none(),
             "divergent bytes under a passing generation must leave the entry dirty"
         );
+
+        // The divergence is counted, not only logged, so it can be alerted on.
+        let stats = bob.cache_stats();
+        assert_eq!(
+            stats.settlement_divergences, 1,
+            "a byte divergence must be counted"
+        );
+        assert_eq!(
+            bob.cache_stats().settlement_divergences,
+            0,
+            "the counter drains on read, like the eviction counter"
+        );
     }
 
     /// Live feedback must never mark a tombstone synchronized, even when the
@@ -1228,8 +1251,6 @@ mod tests {
     /// and every account written in a call carries the returned generation.
     #[tokio::test]
     async fn update_accounts_returns_monotonic_generations_starting_at_one() {
-        use solana_sdk::signature::{Keypair, Signer};
-
         let (mut bob, _settled_tx) = create_test_bob();
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();

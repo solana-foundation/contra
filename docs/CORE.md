@@ -105,6 +105,21 @@ This eliminates the operational overhead of funding user accounts for off-chain 
 
 **Location**: [`core/src/vm/gasless_callback.rs`](../core/src/vm/gasless_callback.rs)
 
+##### Lamport conservation
+
+These synthesized lamports are the only lamports in the channel that were never deposited, so the execution stage treats them as a loan the transaction must repay. After a successful regular transaction, every writable account the SVM loaded that BOB had never seen is examined:
+
+- A synthesized fee payer must end holding the same amount it was handed. Whatever it is short by is the unrepaid part of the loan.
+- Each account the transaction created may keep one lamport of that shortfall, because the SVM requires a live account to hold at least one and, with rent at zero, every creation path funds exactly one.
+- While any of the float is missing, no account that already existed may end richer than it started. Counting creations does not prove the float paid for them, so without this a creation funded by real money could licence a fabricated lamport landing somewhere durable. With the float intact, pre-existing accounts move real lamports freely.
+- If the shortfall exceeds the allowance, or a pre-existing balance grew while the float was short, the transaction is failed with `UnbalancedTransaction` and nothing it wrote is persisted. Otherwise the synthesized payers are erased and every other account is persisted exactly as executed.
+
+Lamports sent *to* a synthesized payer are burned with it. Persisting the payer would graduate an address the channel invented into durable state, and returning them would mean rewriting the sender, so neither is safe. This is not a loss of deposited value: deposits mint tokens, never lamports, so every lamport in the channel began as a float or an admin mint's existence floor. It is also load-bearing for `CancelDvp`, where the settlement authority signs, pays, and receives the closed escrows' rent, ending above its float.
+
+Because the SVM already enforces per-instruction lamport conservation, blocking the fabricated lamports at their source means every other balance is made of lamports that already existed, so no other account needs inspecting. Accounts a transaction merely carries as writable keys are never rewritten.
+
+**Location**: [`enforce_lamport_conservation` in `core/src/stages/execution.rs`](../core/src/stages/execution.rs)
+
 #### GaslessRentCollector
 
 Intercepts rent collection to prevent the runtime from debiting lamports from synthesized fee payer accounts. Works alongside GaslessCallback to maintain the zero-fee model.

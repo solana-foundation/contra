@@ -419,7 +419,10 @@ async fn check_withdrawal(
 /// finality classifier. Shared by deposit and withdrawal recovery. A read error or a
 /// malformed stored signature returns a quarantine reason (uncertainty, never "dead"),
 /// so callers never demote a row whose signatures could not be read or parsed.
-async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>, String> {
+pub(crate) async fn load_pending_sigs(
+    storage: &Storage,
+    id: i64,
+) -> Result<Vec<PendingSig>, String> {
     // Retry a transient DB blip before quarantining; matches the deposit gate so
     // a momentary read failure never pages ops for a healthy withdrawal.
     let stored = with_storage_backoff("journal read", id, || storage.get_release_signatures(id))

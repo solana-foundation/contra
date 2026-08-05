@@ -4,9 +4,23 @@
 # Required env vars:
 #   DEVNET_RPC_URL          - Solana devnet RPC URL (e.g. https://api.devnet.solana.com)
 #
+# Two separate admin keys, which must never be the same keypair:
+#
+#   ESCROW_ADMIN_KEYPAIR  Instance.admin on Solana. Signs CreateInstance, AddOperator
+#                         and AllowMint here, plus SetNewAdmin in production. Needs SOL
+#                         to pay for those three transactions. Never loaded by a service.
+#   ADMIN_KEYPAIR         The channel admin the containers run as: SPL mint+freeze
+#                         authority on receipt mints, operator fee payer, and the wallet
+#                         registered as the escrow Operator by step 2.
+#
+# Sharing one keypair across both roles means SetNewAdmin does not revoke anything:
+# the rotated-out key keeps its receipt-mint authority and its Operator PDA, and can
+# still drain escrow custody afterwards.
+#
 # Optional env vars:
 #   PRIVATE_CHANNEL_GATEWAY_URL      - Solana Private Channels gateway URL (default: http://localhost:8899)
-#   ADMIN_KEYPAIR           - Path to admin keypair (default: ./keypairs/admin.json)
+#   ESCROW_ADMIN_KEYPAIR    - Path to escrow admin keypair (default: ./keypairs/escrow-admin.json)
+#   ADMIN_KEYPAIR           - Path to channel admin keypair (default: ./keypairs/admin.json)
 #   MINT_KEYPAIR            - Path to mint keypair (default: ./keypairs/mint.json)
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
 
@@ -21,9 +35,18 @@ fi
 
 RPC_URL="${DEVNET_RPC_URL:?DEVNET_RPC_URL is required}"
 PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:8899}"
+ESCROW_ADMIN_KEYPAIR="${ESCROW_ADMIN_KEYPAIR:-./keypairs/escrow-admin.json}"
 ADMIN_KEYPAIR="${ADMIN_KEYPAIR:-./keypairs/admin.json}"
 MINT_KEYPAIR="${MINT_KEYPAIR:-./keypairs/mint.json}"
 USER_KEYPAIR="${USER_KEYPAIR:-./keypairs/user.json}"
+
+if [ ! -f "$ESCROW_ADMIN_KEYPAIR" ]; then
+  echo "ERROR: escrow admin keypair not found: $ESCROW_ADMIN_KEYPAIR" >&2
+  echo "       It must be a different keypair from ADMIN_KEYPAIR ($ADMIN_KEYPAIR)." >&2
+  echo "       Create one: solana-keygen new --no-bip39-passphrase -o $ESCROW_ADMIN_KEYPAIR" >&2
+  echo "       Then fund it on devnet so it can pay for CreateInstance/AddOperator/AllowMint." >&2
+  exit 1
+fi
 
 # Portable sed -i (macOS vs Linux)
 sedi() {
@@ -35,8 +58,17 @@ sedi() {
 }
 
 MINT=$(solana-keygen pubkey "$MINT_KEYPAIR")
+ESCROW_ADMIN=$(solana-keygen pubkey "$ESCROW_ADMIN_KEYPAIR")
 OPERATOR=$(solana-keygen pubkey "$ADMIN_KEYPAIR")
 USER=$(solana-keygen pubkey "$USER_KEYPAIR")
+
+# Fail closed on the collapsed-key configuration this script used to ship with.
+if [ "$ESCROW_ADMIN" = "$OPERATOR" ]; then
+  echo "ERROR: the escrow admin and the channel admin are the same key ($ESCROW_ADMIN)." >&2
+  echo "       SetNewAdmin cannot revoke a key that also holds receipt-mint authority" >&2
+  echo "       and an Operator PDA. Use two distinct keypairs." >&2
+  exit 1
+fi
 
 # Function to get token balance for a wallet (raw amount, no decimals)
 get_token_balance() {
@@ -45,7 +77,8 @@ get_token_balance() {
   spl-token balance --owner "$wallet" "$mint" -u "$RPC_URL" --output json 2>/dev/null | jq -r '.amount' || echo "0"
 }
 
-echo "Admin/Operator: $OPERATOR"
+echo "Escrow admin (Instance.admin): $ESCROW_ADMIN"
+echo "Channel admin / operator: $OPERATOR"
 echo "Mint: $MINT"
 echo "User: $USER"
 
@@ -61,7 +94,7 @@ echo "User token balance (before): $USER_BALANCE_BEFORE"
 echo "=== Step 1: Create Instance ==="
 OUTPUT=$(cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin create_instance -- \
   "$RPC_URL" \
-  "$ADMIN_KEYPAIR")
+  "$ESCROW_ADMIN_KEYPAIR")
 echo "$OUTPUT"
 
 # Parse instance ID from output (line: escrow_instance_id = "...")
@@ -80,7 +113,7 @@ echo ""
 echo "=== Step 2: Add Operator ==="
 cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin add_operator -- \
   "$RPC_URL" \
-  "$ADMIN_KEYPAIR" \
+  "$ESCROW_ADMIN_KEYPAIR" \
   "$INSTANCE_ID" \
   "$OPERATOR"
 
@@ -88,7 +121,7 @@ echo ""
 echo "=== Step 3: Allow Mint ==="
 cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin allow_mint -- \
   "$RPC_URL" \
-  "$ADMIN_KEYPAIR" \
+  "$ESCROW_ADMIN_KEYPAIR" \
   "$INSTANCE_ID" \
   "$MINT"
 

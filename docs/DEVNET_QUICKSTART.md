@@ -135,6 +135,8 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 
 The operator keypair signs transactions for minting on the Solana Private Channels payment channel and releasing from escrow.
 
+Generate a **new** keypair here. It must not be the wallet that created the instance in Step 3, which is the escrow `Instance.admin`. `SetNewAdmin` only rewrites `Instance.admin`, so a key that is also the operator keeps its receipt-mint authority and its Operator PDA after a handover and can still drain escrow custody.
+
 ```shell
 # Generate a new keypair
 solana-keygen new -o operator-keypair.json -s --no-bip39-passphrase

@@ -77,10 +77,18 @@ withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # crash the indexer's Pubkey::from_str at boot.)
 # escrow_instance_id: "<your_instance_address>"
 
-# === Admin keypair ==========================================================
+# === Channel admin keypair ==================================================
 # Path on the control node to a funded Solana keypair (JSON byte array).
-# Used to derive the operator services' ADMIN_PRIVATE_KEY at runtime, and by
-# any post-deploy admin tooling that signs on-chain transactions.
+# Used to derive the operator services' ADMIN_PRIVATE_KEY and
+# PRIVATE_CHANNEL_ADMIN_KEYS at runtime. This is the channel admin: SPL
+# mint+freeze authority on every receipt mint, and the operator fee payer.
+#
+# It is NOT the escrow Instance.admin. That key signs CreateInstance, AllowMint,
+# Add/RemoveOperator and SetNewAdmin, is never rendered into any env file and
+# never reaches the target host. Keep it a separate offline keypair: SetNewAdmin
+# only rewrites Instance.admin, so a rotated-out key that is also the channel
+# admin keeps its receipt-mint authority and its Operator PDA, and can still
+# drain escrow custody after the handover.
 admin_keypair_path: "{{ repo_root }}/keypairs/admin.json"
 
 # === Public surface ========================================================

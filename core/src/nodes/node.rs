@@ -14,13 +14,12 @@ use {
             sequencer::start_sequence_worker,
             settle::start_settle_worker,
             sigverify::start_sigverify_workerpool,
-            AccountSettlement,
+            AccountSettlements, ExecutedBatch,
         },
     },
     futures::future::FutureExt,
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
-    solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput,
     std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, task::JoinHandle},
     tokio_util::sync::CancellationToken,
@@ -184,14 +183,11 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
             // Create execution results channel between executor and settler (bounded for back-pressure)
             let (execution_results_tx, execution_results_rx) =
-                mpsc::channel::<(
-                    LoadAndExecuteSanitizedTransactionsOutput,
-                    Vec<SanitizedTransaction>,
-                )>(config.execution_results_capacity);
+                mpsc::channel::<ExecutedBatch>(config.execution_results_capacity);
 
             // Create settled accounts channel between settler and executor
             let (settled_accounts_tx, settled_accounts_rx) =
-                mpsc::unbounded_channel::<Vec<(Pubkey, AccountSettlement)>>();
+                mpsc::unbounded_channel::<AccountSettlements>();
 
             // Create settled blockhashes channel between settler and dedup
             let (settled_blockhashes_tx, settled_blockhashes_rx) =

@@ -38,6 +38,9 @@ pub trait StageMetrics: Send + Sync {
     fn bob_cache_dirty_entries(&self, count: usize);
     fn bob_cache_bytes(&self, bytes: usize);
     fn bob_cache_evicted(&self, count: usize);
+    /// Settlement acknowledgements whose generation matched but whose bytes did
+    /// not. Non-zero means BOB and the settler have diverged; alert on any.
+    fn bob_settlement_divergences(&self, count: usize);
 
     // Settler
     fn settler_txs_settled(&self, count: usize);
@@ -127,6 +130,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn bob_cache_evicted(&self, count: usize) {
         debug!("bob: cache_evicted={}", count);
+    }
+    fn bob_settlement_divergences(&self, count: usize) {
+        debug!("bob: settlement_divergences={}", count);
     }
     fn settler_txs_settled(&self, n: usize) {
         debug!("settler: settled {}", n);
@@ -276,6 +282,12 @@ counter_vec!(
     BOB_CACHE_EVICTED,
     "private_channel_bob_cache_evicted_total",
     "BOB account-cache entries evicted (age sweep + hard cap)",
+    &[]
+);
+counter_vec!(
+    BOB_SETTLEMENT_DIVERGENCES,
+    "private_channel_bob_settlement_divergences_total",
+    "Settled accounts whose generation was covered but whose bytes differed from BOB (always 0 unless the executor and settler have diverged)",
     &[]
 );
 gauge_vec!(
@@ -451,6 +463,11 @@ impl StageMetrics for PrometheusMetrics {
     }
     fn bob_cache_evicted(&self, count: usize) {
         BOB_CACHE_EVICTED
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
+    }
+    fn bob_settlement_divergences(&self, count: usize) {
+        BOB_SETTLEMENT_DIVERGENCES
             .with_label_values(&[] as &[&str])
             .inc_by(count as f64);
     }

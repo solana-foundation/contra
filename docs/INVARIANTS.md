@@ -9,7 +9,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | ID | Invariant | Level | Status | Ref |
 |----|-----------|-------|--------|-----|
 | C1 | A slot and all of its transactions + account changes MUST be written to DB as a single transaction | MUST | Done | #16 |
-| C2 | The in-memory accounts DB MUST be in sync or ahead of the accounts DB on disk | MUST | Done | #20 |
+| C2 | The in-memory accounts DB MUST be in sync or ahead of the accounts DB on disk | MUST | Done | #20, #277 |
 | C3 | Solana Private Channels MUST NOT allow two transactions with the same signature to both execute | MUST | Done | #15 |
 | C4 | Solana Private Channels MUST NOT allow a transaction with an expired blockhash to execute | MUST | Done | #22 |
 | C5 | Solana Private Channels MUST require all transactions to be signed | MUST | Done | #22 |

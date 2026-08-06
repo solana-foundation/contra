@@ -42,6 +42,24 @@ pub struct AccountSettlement {
     pub deleted: bool,
 }
 
+/// One executed batch on its way from the executor to the settler. The third
+/// element is the executor's generation for the account writes in this batch.
+pub type ExecutedBatch = (
+    LoadAndExecuteSanitizedTransactionsOutput,
+    Vec<SanitizedTransaction>,
+    u64,
+);
+
+/// Settlement acknowledgement sent back to BOB after a commit.
+///
+/// `generation` is a high-water mark: every executor write with a generation
+/// <= this one is now durable in the accounts database. One number describes
+/// the whole tick because the settler commits its buffer atomically.
+pub struct AccountSettlements {
+    pub generation: u64,
+    pub accounts: Vec<(Pubkey, AccountSettlement)>,
+}
+
 struct SettleResult {
     slot: u64,
     blockhash: Hash,
@@ -138,11 +156,8 @@ pub async fn warm_redis_cache(
 }
 
 pub struct SettleArgs {
-    pub execution_results_rx: mpsc::Receiver<(
-        LoadAndExecuteSanitizedTransactionsOutput,
-        Vec<SanitizedTransaction>,
-    )>,
-    pub settled_accounts_tx: mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>,
+    pub execution_results_rx: mpsc::Receiver<ExecutedBatch>,
+    pub settled_accounts_tx: mpsc::UnboundedSender<AccountSettlements>,
     pub settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
     /// Bounded channel to the background `address_index_writer`.
     pub address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
@@ -170,11 +185,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
         async fn run_settle_worker(
-            mut execution_results_rx: mpsc::Receiver<(
-                LoadAndExecuteSanitizedTransactionsOutput,
-                Vec<SanitizedTransaction>,
-            )>,
-            settled_accounts_tx: mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>,
+            mut execution_results_rx: mpsc::Receiver<ExecutedBatch>,
+            settled_accounts_tx: mpsc::UnboundedSender<AccountSettlements>,
             settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
             address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
             accountsdb_connection_url: String,
@@ -247,6 +259,11 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 _ => None,
             };
             let mut processing_results = Vec::new();
+
+            // High-water mark of executor generations buffered so far. It is
+            // worker-loop state rather than settle state because it describes
+            // what the next commit will make durable, not one settle call.
+            let mut highest_generation = 0u64;
 
             // Tick-driven block production: the blocktime tick is the sole
             // trigger for producing blocks.  Between ticks, execution results
@@ -321,7 +338,10 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     settle_result.blockhash
                                 );
                                 if let Err(e) =
-                                    settled_accounts_tx.send(settle_result.account_settlements)
+                                    settled_accounts_tx.send(AccountSettlements {
+                                        generation: highest_generation,
+                                        accounts: settle_result.account_settlements,
+                                    })
                                 {
                                     warn!("Failed to send settled accounts: {:?}", e);
                                     break;
@@ -376,7 +396,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     // Accumulate execution results — never flush here, just buffer.
                     result = execution_results_rx.recv() => {
                         match result {
-                            Some((svm_output, transactions)) => {
+                            Some((svm_output, transactions, generation)) => {
                                 heartbeat.record_input();
                                 debug!("Settle worker received output with {} transactions", transactions.len());
                                 if svm_output.processing_results.len() != transactions.len() {
@@ -385,6 +405,11 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 }
                                 debug!("Extending {} processing results", svm_output.processing_results.len());
                                 processing_results.extend(svm_output.processing_results.into_iter().zip(transactions.into_iter()));
+                                // Fold only once the batch is buffered, so the watermark can
+                                // never cover a batch that was rejected above and therefore
+                                // never committed. max() and not assignment so a producer
+                                // that ever regresses cannot pull the watermark backwards.
+                                highest_generation = highest_generation.max(generation);
                             }
                             None => {
                                 info!("Settle worker stopped - channel closed");
@@ -414,7 +439,10 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         if num_results > 0 {
                             metrics.settler_txs_settled(num_results);
                         }
-                        let _ = settled_accounts_tx.send(settle_result.account_settlements);
+                        let _ = settled_accounts_tx.send(AccountSettlements {
+                            generation: highest_generation,
+                            accounts: settle_result.account_settlements,
+                        });
                         let _ = settled_blockhashes_tx.send(settle_result.blockhash);
                         info!(
                             "Final flush settled {} buffered transactions in slot {}",
@@ -1484,7 +1512,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).await.unwrap();
+        exec_tx.send((output, vec![tx], 1)).await.unwrap();
 
         // Wait for the blocktime tick to process and emit settlements
         let settlements =
@@ -1497,6 +1525,137 @@ mod tests {
         let blockhash =
             tokio::time::timeout(Duration::from_secs(1), settled_blockhashes_rx.recv()).await;
         assert!(blockhash.is_ok(), "should receive blockhash within timeout");
+
+        shutdown.cancel();
+    }
+
+    /// Drain feedback until a message actually carries settled accounts. The
+    /// settler emits feedback on every blocktime tick, including ticks with an
+    /// empty buffer, so a single `recv()` can legitimately return generation 0.
+    async fn recv_nonempty_settlements(
+        rx: &mut mpsc::UnboundedReceiver<AccountSettlements>,
+    ) -> AccountSettlements {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let settlements = rx.recv().await.expect("settler feedback channel closed");
+                if !settlements.accounts.is_empty() {
+                    return settlements;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for non-empty settler feedback")
+    }
+
+    /// Build a one-transaction execution output writing a fresh account. The
+    /// caller supplies the generation, so this returns the output and the
+    /// transactions rather than a whole `ExecutedBatch`.
+    fn one_account_batch() -> (
+        LoadAndExecuteSanitizedTransactionsOutput,
+        Vec<SanitizedTransaction>,
+    ) {
+        let tx = create_test_sanitized_transaction(&Keypair::new(), &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(executed)],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        (output, vec![tx])
+    }
+
+    /// The generation the executor sent must come back on the acknowledgement,
+    /// alongside the accounts the tick made durable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_worker_feedback_carries_received_generation() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 50,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        let (output, transactions) = one_account_batch();
+        exec_tx.send((output, transactions, 7)).await.unwrap();
+
+        let settlements = recv_nonempty_settlements(&mut settled_accounts_rx).await;
+        assert_eq!(
+            settlements.generation, 7,
+            "feedback must report the generation the executor sent"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// The high-water mark folds with max(), so a producer that regresses cannot
+    /// pull the durable watermark backwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_worker_feedback_generation_never_regresses() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 50,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        let (output_a, transactions_a) = one_account_batch();
+        exec_tx.send((output_a, transactions_a, 9)).await.unwrap();
+        let (output_b, transactions_b) = one_account_batch();
+        exec_tx.send((output_b, transactions_b, 7)).await.unwrap();
+
+        let settlements = recv_nonempty_settlements(&mut settled_accounts_rx).await;
+        assert_eq!(
+            settlements.generation, 9,
+            "a stale generation must not lower the high-water mark"
+        );
+
+        // Assert a later tick too. Under plain assignment the stale 7 shows up in
+        // whichever tick receives it, so checking only the first non-empty
+        // acknowledgement would pass even without the max() fold.
+        let later = tokio::time::timeout(Duration::from_secs(10), settled_accounts_rx.recv())
+            .await
+            .expect("timed out waiting for a later acknowledgement")
+            .expect("settler feedback channel closed");
+        assert_eq!(
+            later.generation, 9,
+            "the high-water mark must stay at 9 on every later tick"
+        );
 
         shutdown.cancel();
     }
@@ -1935,7 +2094,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).await.unwrap();
+        exec_tx.send((output, vec![tx], 1)).await.unwrap();
 
         // Poll for perf sample with deadline instead of fixed sleep.
         // Perf tick fires after ~1s; poll every 100ms for up to 5s.
@@ -1999,7 +2158,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).await.unwrap();
+        exec_tx.send((output, vec![tx], 1)).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
         assert!(

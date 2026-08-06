@@ -3,15 +3,18 @@
 #
 # Required env vars:
 #   DEVNET_RPC_URL          - Solana devnet RPC URL (e.g. https://api.devnet.solana.com)
+#   ADMIN_PRIVATE_KEY       - Channel admin key, read from the .env sourced below
 #
 # Two separate admin keys, which must never be the same keypair:
 #
 #   ESCROW_ADMIN_KEYPAIR  Instance.admin on Solana. Signs CreateInstance, AddOperator
 #                         and AllowMint here, plus SetNewAdmin in production. Needs SOL
 #                         to pay for those three transactions. Never loaded by a service.
-#   ADMIN_KEYPAIR         The channel admin the containers run as: SPL mint+freeze
+#   ADMIN_PRIVATE_KEY     The channel admin the containers run as: SPL mint+freeze
 #                         authority on receipt mints, operator fee payer, and the wallet
-#                         registered as the escrow Operator by step 2.
+#                         registered as the escrow Operator by step 2. Read from the same
+#                         .env the containers load, so the Operator registered here is
+#                         always the key they sign with.
 #
 # Sharing one keypair across both roles means SetNewAdmin does not revoke anything:
 # the rotated-out key keeps its receipt-mint authority and its Operator PDA, and can
@@ -20,7 +23,6 @@
 # Optional env vars:
 #   PRIVATE_CHANNEL_GATEWAY_URL      - Solana Private Channels gateway URL (default: http://localhost:8899)
 #   ESCROW_ADMIN_KEYPAIR    - Path to escrow admin keypair (default: ./keypairs/escrow-admin.json)
-#   ADMIN_KEYPAIR           - Path to channel admin keypair (default: ./keypairs/admin.json)
 #   MINT_KEYPAIR            - Path to mint keypair (default: ./keypairs/mint.json)
 #   USER_KEYPAIR            - Path to user keypair (default: ./keypairs/user.json)
 
@@ -36,13 +38,13 @@ fi
 RPC_URL="${DEVNET_RPC_URL:?DEVNET_RPC_URL is required}"
 PRIVATE_CHANNEL_GATEWAY_URL="${PRIVATE_CHANNEL_GATEWAY_URL:-http://localhost:8899}"
 ESCROW_ADMIN_KEYPAIR="${ESCROW_ADMIN_KEYPAIR:-./keypairs/escrow-admin.json}"
-ADMIN_KEYPAIR="${ADMIN_KEYPAIR:-./keypairs/admin.json}"
 MINT_KEYPAIR="${MINT_KEYPAIR:-./keypairs/mint.json}"
 USER_KEYPAIR="${USER_KEYPAIR:-./keypairs/user.json}"
+: "${ADMIN_PRIVATE_KEY:?ADMIN_PRIVATE_KEY is required; \`make build-devnet\` writes it to .env}"
 
 if [ ! -f "$ESCROW_ADMIN_KEYPAIR" ]; then
   echo "ERROR: escrow admin keypair not found: $ESCROW_ADMIN_KEYPAIR" >&2
-  echo "       It must be a different keypair from ADMIN_KEYPAIR ($ADMIN_KEYPAIR)." >&2
+  echo "       It must be a different keypair from the channel admin in ADMIN_PRIVATE_KEY." >&2
   echo "       Create one: solana-keygen new --no-bip39-passphrase -o $ESCROW_ADMIN_KEYPAIR" >&2
   echo "       Then fund it on devnet so it can pay for CreateInstance/AddOperator/AllowMint." >&2
   exit 1
@@ -59,8 +61,16 @@ sedi() {
 
 MINT=$(solana-keygen pubkey "$MINT_KEYPAIR")
 ESCROW_ADMIN=$(solana-keygen pubkey "$ESCROW_ADMIN_KEYPAIR")
-OPERATOR=$(solana-keygen pubkey "$ADMIN_KEYPAIR")
 USER=$(solana-keygen pubkey "$USER_KEYPAIR")
+
+# Derived from the secret itself, not from a keypair path: a path could name a key the
+# containers never load, which would both defeat the check below and register an Operator
+# that cannot sign ReleaseFunds.
+if ! OPERATOR=$(printf '%s\n' "$ADMIN_PRIVATE_KEY" | solana-keygen pubkey -); then
+  echo "ERROR: could not derive a pubkey from ADMIN_PRIVATE_KEY." >&2
+  echo "       Expected the JSON byte array that \`make build-devnet\` writes to .env." >&2
+  exit 1
+fi
 
 # Fail closed on the collapsed-key configuration this script used to ship with.
 if [ "$ESCROW_ADMIN" = "$OPERATOR" ]; then

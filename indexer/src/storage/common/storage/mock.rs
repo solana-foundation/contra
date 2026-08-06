@@ -42,6 +42,13 @@ pub struct MockStorage {
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `pending_remint_signatures` write-ahead table.
     pub remint_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `superseded` column: attempts retired after being proven dead.
+    pub superseded_remint_signatures: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Transactions whose live remint claim is held by a second sender process.
+    /// A single in-process mock is the shared database, so this is the only way
+    /// to represent the other operator's row that the partial unique index
+    /// arbitrates against. The real arbiter is covered against Postgres.
+    pub foreign_remint_claims: Arc<Mutex<std::collections::HashSet<i64>>>,
     /// Mirrors the durable `transactions.release_signatures` column: the full
     /// attempt list written on an SMT-confirmed completion. COALESCE-guarded.
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
@@ -629,6 +636,11 @@ impl MockStorage {
         Ok(nonces)
     }
 
+    /// Mirror `set_pending_remint_internal`: transition a Processing row to
+    /// PendingRemint and store the finality-check payload. Replaying an
+    /// identical payload on an already-PendingRemint row succeeds; any other
+    /// status, a different payload, or a missing row is a guard miss, matching
+    /// the Postgres semantics. Honors `should_fail("set_pending_remint")`.
     pub async fn set_pending_remint(
         &self,
         transaction_id: i64,
@@ -648,6 +660,41 @@ impl MockStorage {
                 message: "Simulated set_pending_remint failure".to_string(),
             });
         }
+
+        {
+            let mut rows = self.pending_transactions.lock().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|t| t.id == transaction_id)
+                .ok_or_else(|| StorageError::DatabaseError {
+                    message: format!("no row for id {transaction_id}"),
+                })?;
+            let replay = row.status == TransactionStatus::PendingRemint
+                && row.remint_signatures.as_ref() == Some(&remint_signatures);
+            if row.status != TransactionStatus::Processing && !replay {
+                return Err(StorageError::DatabaseError {
+                    message: format!(
+                        "id {transaction_id} is {:?}, not a PendingRemint transition",
+                        row.status
+                    ),
+                });
+            }
+            row.status = TransactionStatus::PendingRemint;
+            row.remint_signatures = Some(remint_signatures.clone());
+            row.remint_last_valid_block_heights = Some(remint_last_valid_block_heights.clone());
+            row.pending_remint_deadline_at = Some(deadline_at);
+            row.updated_at = Utc::now();
+
+            // Keep the rehydration list in step, so `get_pending_remint_transactions`
+            // sees the row exactly as a restart would.
+            let transitioned = row.clone();
+            let mut rehydrate = self.pending_remint_transactions.lock().unwrap();
+            match rehydrate.iter_mut().find(|t| t.id == transaction_id) {
+                Some(existing) => *existing = transitioned,
+                None => rehydrate.push(transitioned),
+            }
+        }
+
         self.pending_remint_signatures.lock().unwrap().push((
             transaction_id,
             remint_signatures,
@@ -655,6 +702,53 @@ impl MockStorage {
             deadline_at,
         ));
         Ok(())
+    }
+
+    /// Mirror `try_escalate_manual_review_internal`: flip a Processing row to
+    /// ManualReview, returning whether it matched. Any other status is a guard
+    /// miss that writes nothing. Honors `should_fail("try_escalate_manual_review")`.
+    pub async fn try_escalate_manual_review(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_escalate_manual_review")?;
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let Some(row) = rows
+            .iter_mut()
+            .find(|t| t.id == transaction_id && t.status == TransactionStatus::Processing)
+        else {
+            return Ok(false);
+        };
+        row.status = TransactionStatus::ManualReview;
+        row.processed_at = Some(Utc::now());
+        row.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    /// Status of one row. `pending_transactions` is the live mirror of the
+    /// table, so it wins; `pending_remint_transactions` is the fallback for
+    /// tests that only seeded the rehydration list.
+    pub async fn get_transaction_status(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<TransactionStatus>, StorageError> {
+        self.check_should_fail("get_transaction_status")?;
+        if let Some(txn) = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+        {
+            return Ok(Some(txn.status));
+        }
+        Ok(self
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == transaction_id)
+            .map(|t| t.status))
     }
 
     /// Update the in-memory pending_remint row for `transaction_id` with the
@@ -1068,22 +1162,50 @@ impl MockStorage {
         Ok(removed)
     }
 
-    pub async fn insert_remint_signature(
+    /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
+    /// attempts, then take the one live slot the partial unique index allows.
+    /// `Ok(false)` means another sender already owns it, so nothing is written.
+    pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
-    ) -> Result<(), StorageError> {
-        self.check_should_fail("insert_remint_signature")?;
+        superseded_signatures: &[String],
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("claim_remint_attempt")?;
         let mut map = self.remint_signatures.lock().unwrap();
-        // Mirror Postgres `ON CONFLICT (signature) DO NOTHING`.
-        if map_contains_signature(&map, &signature) {
-            return Ok(());
+        let mut superseded = self.superseded_remint_signatures.lock().unwrap();
+
+        // Compare-and-swap scoped to the observed attempts: a slot another
+        // sender took in the meantime carries a signature we never classified,
+        // so it can never be retired here.
+        for (sig, _) in map.get(&transaction_id).into_iter().flatten() {
+            if superseded_signatures.contains(sig) {
+                superseded.insert(sig.clone());
+            }
         }
+
+        // A lost claim still commits the supersedes above, matching Postgres:
+        // `ON CONFLICT DO NOTHING` does not abort the surrounding transaction.
+        let live = map
+            .get(&transaction_id)
+            .into_iter()
+            .flatten()
+            .any(|(sig, _)| !superseded.contains(sig));
+        if live
+            || self
+                .foreign_remint_claims
+                .lock()
+                .unwrap()
+                .contains(&transaction_id)
+        {
+            return Ok(false);
+        }
+
         map.entry(transaction_id)
             .or_default()
             .push((signature, last_valid_block_height));
-        Ok(())
+        Ok(true)
     }
 
     pub async fn get_remint_signatures(
@@ -1102,10 +1224,16 @@ impl MockStorage {
 
     pub async fn delete_remint_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
         self.check_should_fail("delete_remint_signatures")?;
-        self.remint_signatures
+        let removed = self
+            .remint_signatures
             .lock()
             .unwrap()
             .remove(&transaction_id);
+        // Deleting the rows drops their `superseded` column values with them.
+        let mut superseded = self.superseded_remint_signatures.lock().unwrap();
+        for (sig, _) in removed.into_iter().flatten() {
+            superseded.remove(&sig);
+        }
         Ok(())
     }
 

@@ -258,6 +258,7 @@ pub async fn run(
             config.retry_max_attempts,
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
+            sender::SENDER_LOCK_HEARTBEAT_INTERVAL,
         )
         .await
         {

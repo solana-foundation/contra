@@ -8,16 +8,22 @@
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use private_channel_indexer::{
+    config::ProgramType,
+    operator::sender_lock_key,
     storage::{
         common::amount::TokenAmount,
         common::models::{DbMint, DbMintStatus, MintStatusAtSlot},
+        common::storage::sender_lock::SenderLockGuard,
+        postgres::db::{probe_advisory_lock_held, release_advisory_lock},
         DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
     },
     PostgresConfig,
 };
 use sqlx::PgPool;
+use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+use tokio_util::sync::CancellationToken;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -816,6 +822,102 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// The ManualReview fallback must only terminalize a row it can prove is still
+/// Processing. A committed PendingRemint has to survive it: the generic status
+/// writer accepts `pending_remint` as a source, so an unguarded escalation would
+/// overwrite the handoff and leave the withdrawal in a status no sweep selects.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_escalate_manual_review_spares_pending_remint() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // One dequeue has to lock both rows: once the first is PendingRemint its
+    // nonce is the frontier, and the higher nonce stays Pending.
+    let txn = make_db_transaction("escalate_guard", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    let other = make_db_transaction("escalate_processing", TransactionType::Withdrawal);
+    let other_id = storage.insert_db_transaction(&other).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    storage
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![10], deadline)
+        .await?;
+
+    assert!(
+        !storage.try_escalate_manual_review(id).await?,
+        "a PendingRemint row must not be escalated"
+    );
+    assert_eq!(
+        status_of(&pool, id).await,
+        "pending_remint",
+        "the handoff must survive"
+    );
+
+    // A row that never left Processing is the escalation's to take.
+    assert!(
+        storage.try_escalate_manual_review(other_id).await?,
+        "a Processing row must be escalated"
+    );
+    assert_eq!(status_of(&pool, other_id).await, "manual_review");
+    Ok(())
+}
+
+/// A retry whose first attempt committed but whose acknowledgement was lost must
+/// succeed, so the sender can tell a durable handoff from a failed one. Replaying
+/// the same payload is accepted; a different payload is not, so a second caller
+/// can never silently overwrite the signatures a live remint depends on.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_pending_remint_replays_identical_payload_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let txn = make_db_transaction("remint_replay", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+
+    let deadline = Utc::now() + chrono::Duration::seconds(32);
+    let signatures = vec!["sig1".to_string(), "sig2".to_string()];
+    storage
+        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline)
+        .await?;
+
+    // The row is already PendingRemint; the same payload must still be accepted.
+    storage
+        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline)
+        .await?;
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT remint_signatures FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(stored, signatures, "replay must preserve the signatures");
+
+    let other = storage
+        .set_pending_remint(id, vec!["different".to_string()], vec![30], deadline)
+        .await;
+    assert!(
+        other.is_err(),
+        "a different payload must not overwrite a live PendingRemint"
+    );
+
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT remint_signatures FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        stored, signatures,
+        "the rejected payload must leave the signatures untouched"
+    );
+    Ok(())
+}
+
 // ── set_mint_extension_flags row-exists guard ────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1509,6 +1611,320 @@ async fn claim_dedups_signature_on_conflict() -> Result<(), Box<dyn std::error::
         storage.get_release_signatures(id).await?.len(),
         1,
         "a duplicate signature must persist only once"
+    );
+    Ok(())
+}
+
+// ── Sender lock: ownership probe and the connection fence ────────────────────
+//
+// The heartbeat and the write fence both rest on one claim: for a sender key,
+// the session is alive if and only if the lock is held. These tests exercise
+// that against a real backend, including the case the whole design exists for,
+// a session terminated underneath a running sender.
+
+/// Mirrors the truncate lock id, used only to prove the probe cannot confuse it for ours.
+const TRUNCATE_ADVISORY_LOCK_ID: i64 = 0x0043_4F4E_5452_5543;
+
+async fn container_url(container: &testcontainers::ContainerAsync<Postgres>) -> String {
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    format!("postgres://postgres:password@{host}:{port}/db_test")
+}
+
+async fn pg_connect(url: &str) -> sqlx::PgConnection {
+    use sqlx::Connection;
+    sqlx::PgConnection::connect(url).await.unwrap()
+}
+
+/// I1. The `(classid << 32) | objid` reassembly plus `objsubid = 1` plus the
+/// `pid` filter is the entire correctness of the heartbeat, and the two sender
+/// keys share a `classid`, so a `classid`-only filter would pass hand review and
+/// fail here. The final clause records executably why `pg_try_advisory_lock`
+/// cannot be substituted, so a future simplification cannot land silently.
+#[tokio::test]
+async fn probe_distinguishes_held_from_free_and_from_other_keys(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let escrow = sender_lock_key(ProgramType::Escrow);
+    let withdraw = sender_lock_key(ProgramType::Withdraw);
+    assert_ne!(escrow, withdraw);
+
+    let mut holder = pg_connect(&url).await;
+    let mut bystander = pg_connect(&url).await;
+
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(escrow)
+        .fetch_one(&mut holder)
+        .await?;
+    assert!(acquired);
+
+    assert!(probe_advisory_lock_held(&mut holder, escrow).await?);
+    assert!(
+        !probe_advisory_lock_held(&mut holder, withdraw).await?,
+        "the two sender keys share a classid, so objid must be part of the match"
+    );
+    assert!(!probe_advisory_lock_held(&mut holder, TRUNCATE_ADVISORY_LOCK_ID).await?);
+
+    for key in [escrow, withdraw, TRUNCATE_ADVISORY_LOCK_ID] {
+        assert!(
+            !probe_advisory_lock_held(&mut bystander, key).await?,
+            "a session holding nothing must see nothing, even for a key another session holds"
+        );
+    }
+
+    release_advisory_lock(&mut holder, escrow).await?;
+    assert!(
+        !probe_advisory_lock_held(&mut holder, escrow).await?,
+        "the probe must observe the release"
+    );
+    let reacquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(escrow)
+        .fetch_one(&mut holder)
+        .await?;
+    assert!(
+        reacquired,
+        "pg_try_advisory_lock returns true on a free lock, which is exactly why it \
+         cannot be used as the ownership probe"
+    );
+    Ok(())
+}
+
+/// A fenced write on a killed session must fail, not apply, and must cancel the operator.
+#[tokio::test]
+async fn fenced_write_on_a_killed_session_fails_and_does_not_apply(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    let operator = CancellationToken::new();
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "fence-kill",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'processing' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let key = sender_lock_key(ProgramType::Escrow);
+    let _guard = storage
+        .try_acquire_sender_lock(key, "escrow", operator.clone(), Duration::from_secs(3600))
+        .await?
+        .expect("the lock must be free");
+
+    // Kill the backend that holds the lock, from a different session.
+    let mut killer = pg_connect(&url).await;
+    let pid: i32 = sqlx::query_scalar(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+         AND granted AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(key)
+    .fetch_one(&mut killer)
+    .await?;
+    let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&mut killer)
+        .await?;
+
+    let result = storage.try_park_processing(id).await;
+    assert!(
+        result.is_err(),
+        "a fenced write on a dead session must fail, got {result:?}"
+    );
+    assert!(
+        operator.is_cancelled(),
+        "an unprovable fenced write must cancel the operator"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        status, "processing",
+        "the refused write must not have applied"
+    );
+    Ok(())
+}
+
+/// A constraint violation means the server answered, so it must not read as lock loss.
+#[tokio::test]
+async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _container) = start_postgres().await?;
+    let operator = CancellationToken::new();
+
+    let first = storage
+        .insert_db_transaction(&make_db_transaction(
+            "fence-dup-a",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    let second = storage
+        .insert_db_transaction(&make_db_transaction(
+            "fence-dup-b",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    for id in [first, second] {
+        sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+    }
+
+    let _guard = storage
+        .try_acquire_sender_lock(
+            sender_lock_key(ProgramType::Escrow),
+            "escrow",
+            operator.clone(),
+            Duration::from_secs(3600),
+        )
+        .await?
+        .expect("the lock must be free");
+
+    // The signature column is globally unique, so re-using one is a plain 23505 from a live backend.
+    assert!(
+        storage
+            .claim_remint_attempt(first, "shared-signature".to_string(), 10, &[])
+            .await?
+    );
+    let err = storage
+        .claim_remint_attempt(second, "shared-signature".to_string(), 20, &[])
+        .await
+        .expect_err("the duplicate signature must surface the constraint violation");
+
+    assert!(
+        !operator.is_cancelled(),
+        "an application error must not cancel the operator; got {err}"
+    );
+    // The session is still healthy, so the next fenced write still works.
+    assert!(
+        storage
+            .claim_remint_attempt(second, "distinct-signature".to_string(), 20, &[])
+            .await?
+    );
+    Ok(())
+}
+
+/// Graceful release must really unlock, and only a separate pool taking the key proves it.
+#[tokio::test]
+async fn graceful_release_frees_the_lock_for_a_different_pool(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    let operator = CancellationToken::new();
+    let key = sender_lock_key(ProgramType::Escrow);
+
+    let guard = storage
+        .try_acquire_sender_lock(key, "escrow", operator.clone(), Duration::from_secs(3600))
+        .await?
+        .expect("the lock must be free");
+
+    let other = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: url.clone(),
+            max_connections: 2,
+        })
+        .await?,
+    );
+    assert!(
+        other
+            .try_acquire_sender_lock(key, "escrow", CancellationToken::new(), Duration::ZERO)
+            .await?
+            .is_none(),
+        "a second holder must be refused while the first holds the lock"
+    );
+
+    // The Noop arm only exists under the mock-storage feature.
+    #[allow(unreachable_patterns)]
+    match guard {
+        SenderLockGuard::Postgres(handle) => handle.stop_and_wait().await,
+        _ => panic!("postgres storage must yield the Postgres guard"),
+    }
+
+    assert!(
+        other
+            .try_acquire_sender_lock(key, "escrow", CancellationToken::new(), Duration::ZERO)
+            .await?
+            .is_some(),
+        "an explicit release must hand the lock to a different pool"
+    );
+    assert!(
+        !operator.is_cancelled(),
+        "a graceful release must never look like a lock loss"
+    );
+    Ok(())
+}
+
+/// A fenced write queued behind a row lock a pool connection holds must lose to
+/// the server-side `lock_timeout`, not to the client-side write timeout. The
+/// server error is re-probed, found to be an ordinary application error on a
+/// live session, and must leave both the operator and the connection intact.
+/// Losing this race the other way would discard the connection and shut the
+/// operator down for nothing more than contention.
+#[tokio::test]
+async fn fenced_write_blocked_on_a_row_lock_does_not_cancel_the_operator(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let operator = CancellationToken::new();
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "fence-rowlock",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'processing' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let _guard = storage
+        .try_acquire_sender_lock(
+            sender_lock_key(ProgramType::Escrow),
+            "escrow",
+            operator.clone(),
+            Duration::from_secs(3600),
+        )
+        .await?
+        .expect("the lock must be free");
+
+    // Hold the row from another session for longer than lock_timeout but under the write timeout.
+    let mut blocker = pg_connect(&container_url(&container).await).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT 1 FROM transactions WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut blocker)
+        .await?;
+
+    let started = std::time::Instant::now();
+    let blocked = storage.try_park_processing(id).await;
+    let elapsed = started.elapsed();
+
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+
+    assert!(blocked.is_err(), "the blocked write must fail, not hang");
+    // A margin, not just "under 5s". At 5s the client timeout fires instead and
+    // the operator dies, so any lock_timeout raised into the gap below it has to
+    // fail here rather than pass by a tenth of a second. This bound plus the
+    // no-cancel assertion is what pins the two settings in the right order.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "lock_timeout must fire well before the client write timeout; took {elapsed:?}"
+    );
+    assert!(
+        !operator.is_cancelled(),
+        "row-lock contention is not lock loss and must not cancel the operator"
+    );
+    // The connection was never discarded, so the fence still works afterwards.
+    assert!(
+        storage.try_park_processing(id).await?,
+        "the lock connection must survive a contended write"
     );
     Ok(())
 }

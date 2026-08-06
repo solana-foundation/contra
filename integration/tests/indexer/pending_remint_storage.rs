@@ -21,9 +21,9 @@
 //!      rows are filtered out by `get_pending_remint_transactions`).
 //!   C. Multiple pending remints are all returned; ordering does not
 //!      matter for correctness but set equivalence must hold.
-//!   E. Write-ahead `pending_remint_signatures` round-trip: insert is
-//!      idempotent on signature, reads back in order, and GC keeps rows
-//!      while PendingRemint but sweeps them once the parent is terminal.
+//!   E. Write-ahead `pending_remint_signatures` round-trip: one live attempt
+//!      per transaction, reads back in order, and GC keeps rows while
+//!      PendingRemint but sweeps them once the parent is terminal.
 
 use {
     chrono::{Duration as ChronoDuration, Utc},
@@ -256,9 +256,9 @@ async fn test_finality_check_attempts_persisted_across_restart() {
 }
 
 // ── Case E ──────────────────────────────────────────────────────────────────
-/// The write-ahead `pending_remint_signatures` table: insert is idempotent on
-/// signature, reads back in insertion order, and GC keeps rows while the parent
-/// is PendingRemint but sweeps them once it goes terminal.
+/// The write-ahead `pending_remint_signatures` table: one live attempt per
+/// transaction, reads back in insertion order including superseded attempts, and
+/// GC keeps rows while the parent is PendingRemint but sweeps them once terminal.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_remint_signatures_round_trip_and_gc() {
     let (db, url, _container) = start_pg("t12_remint_sigs").await;
@@ -285,25 +285,33 @@ async fn test_remint_signatures_round_trip_and_gc() {
     .await
     .unwrap();
 
-    // Two write-ahead attempts persisted in order.
+    // First attempt takes the one live slot.
     let attempt_a = Signature::new_unique().to_string();
     let attempt_b = Signature::new_unique().to_string();
-    db.insert_remint_signature_internal(tx_id, attempt_a.clone(), 100)
+    assert!(db
+        .claim_remint_attempt_internal(tx_id, attempt_a.clone(), 100, &[])
         .await
-        .unwrap();
-    db.insert_remint_signature_internal(tx_id, attempt_b.clone(), 200)
+        .unwrap());
+    // A second attempt only takes it by naming the one it proved dead.
+    assert!(!db
+        .claim_remint_attempt_internal(tx_id, attempt_b.clone(), 200, &[])
         .await
-        .unwrap();
-    // Re-inserting the same signature is a no-op (ON CONFLICT DO NOTHING).
-    db.insert_remint_signature_internal(tx_id, attempt_a.clone(), 100)
+        .unwrap());
+    assert!(db
+        .claim_remint_attempt_internal(
+            tx_id,
+            attempt_b.clone(),
+            200,
+            std::slice::from_ref(&attempt_a)
+        )
         .await
-        .unwrap();
+        .unwrap());
 
     let stored = db.get_remint_signatures_internal(tx_id).await.unwrap();
     assert_eq!(
         stored,
         vec![(attempt_a.clone(), 100), (attempt_b.clone(), 200)],
-        "remint signatures must round-trip in insertion order with no duplicate"
+        "both attempts must round-trip in insertion order; a superseded one stays classifiable"
     );
 
     // GC keeps rows whose parent is still PendingRemint.

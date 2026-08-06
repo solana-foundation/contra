@@ -25,6 +25,7 @@ pub trait StageMetrics: Send + Sync {
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
     fn executor_dropped_expired_blockhash(&self, count: usize);
+    fn executor_conservation_rejected(&self);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -99,6 +100,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_dropped_expired_blockhash(&self, count: usize) {
         debug!("executor: dropped {} expired blockhash txs", count);
+    }
+    fn executor_conservation_rejected(&self) {
+        debug!("executor: rejected tx failing lamport conservation");
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -236,6 +240,12 @@ counter_vec!(
     EXECUTOR_DROPPED_EXPIRED_BH,
     "private_channel_executor_dropped_expired_bh_total",
     "Transactions dropped at execution due to expired blockhash",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_CONSERVATION_REJECTED,
+    "private_channel_executor_conservation_rejected_total",
+    "Transactions failed at execution for leaking fabricated fee-payer lamports",
     &[]
 );
 counter_vec!(
@@ -401,6 +411,11 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc_by(count as f64);
     }
+    fn executor_conservation_rejected(&self) {
+        EXECUTOR_CONSERVATION_REJECTED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -502,6 +517,7 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_RESULTS_SEND_FAILED,
         EXECUTOR_MISSING_RESULTS,
         EXECUTOR_DROPPED_EXPIRED_BH,
+        EXECUTOR_CONSERVATION_REJECTED,
         SETTLER_TXS_SETTLED,
         BOB_CACHE_EVICTED,
         BOB_CACHE_ENTRIES,

@@ -93,11 +93,12 @@ impl SenderSMTState {
 }
 
 /// Check if the armed rotation can be submitted now: no in-flight release can
-/// still change the tree under it.
+/// still change the tree under it. Purely local; whether the chain still needs the
+/// rotation is a separate unconditional read on the submit path.
 ///
 /// Not a take. The reset carries no DB row and no withdrawal nonce, so
 /// `pending_rotation` is the only record that the tree still owes a rotation. It
-/// is cleared only where the sender proves the tree advanced.
+/// is cleared only where the chain shows it landed.
 pub(super) fn pending_rotation_due(state: &SenderState) -> bool {
     if state.pending_rotation.is_none() {
         return false;
@@ -201,6 +202,7 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::utils::instruction_util::ResetSmtRootBuilderWithTarget;
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
@@ -303,7 +305,10 @@ mod tests {
     #[test]
     fn rotation_due_and_stays_armed_without_smt_state() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
         // No smt_state means no in-flight
         assert!(pending_rotation_due(&state));
         assert!(state.pending_rotation.is_some(), "must stay armed");
@@ -312,7 +317,10 @@ mod tests {
     #[test]
     fn rotation_not_due_while_inflight() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
 
         // Add smt_state with an in-flight nonce
         let mut smt = make_smt_state(0);
@@ -333,7 +341,10 @@ mod tests {
     #[test]
     fn rotation_due_after_inflight_cleared() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
         state.smt_state = Some(make_smt_state(0)); // empty nonce_to_builder
 
         assert!(pending_rotation_due(&state));

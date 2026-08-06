@@ -12,7 +12,7 @@ use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::{
     fetch_current_tree_index, find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
     tree_constants::MAX_TREE_LEAVES, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce,
-    SignerUtil,
+    ResetSmtRootBuilderWithTarget, SignerUtil,
 };
 use crate::operator::{utils::mint_util::MintCache, RpcClientWithRetry};
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
@@ -542,6 +542,7 @@ async fn build_release_funds(
 fn build_scheduled_rotation(
     admin_pubkey: Pubkey,
     release_funds_state: &ReleaseFundsState,
+    target_tree_index: u64,
 ) -> TransactionBuilder {
     let mut rotation_builder = ResetSmtRootBuilder::new();
     rotation_builder
@@ -550,7 +551,12 @@ fn build_scheduled_rotation(
         .instance(release_funds_state.instance_pda)
         .operator_pda(release_funds_state.operator_pda)
         .event_authority(release_funds_state.event_authority_pda);
-    TransactionBuilder::ResetSmtRoot(Box::new(rotation_builder))
+    // The target travels with the builder: the sender re-checks it against chain before
+    // every attempt, and cannot re-derive it once the boundary row is out of scope.
+    TransactionBuilder::ResetSmtRoot(Box::new(ResetSmtRootBuilderWithTarget {
+        builder: rotation_builder,
+        target_tree_index,
+    }))
 }
 
 /// Token-2022 pre-flight for a withdrawal.
@@ -692,6 +698,7 @@ pub async fn process_release_funds(
                         let rotation_tx = build_scheduled_rotation(
                             processor_state.admin_pubkey,
                             release_funds_state,
+                            target_tree_index,
                         );
                         send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
                             .await
@@ -1370,11 +1377,12 @@ mod tests {
 
         // First message must be ResetSmtRoot — rotation happens before the boundary withdrawal
         let msg1 = sender_rx.recv().await.unwrap();
-        assert!(
-            matches!(msg1, TransactionBuilder::ResetSmtRoot(_)),
-            "expected ResetSmtRoot first, got: {:?}",
-            std::mem::discriminant(&msg1)
-        );
+        let TransactionBuilder::ResetSmtRoot(rotation) = msg1 else {
+            panic!("expected ResetSmtRoot first, got a different variant");
+        };
+        // The target travels with the builder: it is the sender's only reference for
+        // re-checking against chain, and it cannot be re-derived there.
+        assert_eq!(rotation.target_tree_index, 1);
 
         // Second message must be the ReleaseFunds for the boundary nonce itself
         let msg2 = sender_rx.recv().await.unwrap();

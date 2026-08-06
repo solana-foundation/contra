@@ -138,7 +138,7 @@ pub enum TransactionBuilder {
     /// Mint transaction (Solana → PrivateChannel) - simple SPL mint, no proof needed
     Mint(Box<MintToBuilderWithTxnId>),
     /// Reset SMT root transaction - rotates to new tree
-    ResetSmtRoot(Box<ResetSmtRootBuilder>),
+    ResetSmtRoot(Box<ResetSmtRootBuilderWithTarget>),
 }
 
 impl TransactionBuilder {
@@ -149,7 +149,7 @@ impl TransactionBuilder {
             }
             Self::InitializeMint(builder) => Ok(vec![builder.instruction()?]),
             Self::Mint(builder_with_txn_id) => builder_with_txn_id.builder.instructions(),
-            Self::ResetSmtRoot(builder) => Ok(vec![builder.instruction()]),
+            Self::ResetSmtRoot(rotation) => Ok(vec![rotation.builder.instruction()]),
         }
     }
 
@@ -211,9 +211,9 @@ impl TransactionBuilder {
     ///   verification to prevent duplicate issuance.
     /// - **ReleaseFunds**: Idempotent retry - Uses transaction nonce to prevent duplicates.
     ///   Safe to retry on transient network failures.
-    /// - **ResetSmtRoot**: Idempotent retry - carries expected_current_tree_index, so a
-    ///   replay after the first reset lands is rejected on-chain (UnexpectedTreeIndex)
-    ///   rather than advancing the tree twice; the sender then syncs local SMT.
+    /// - **ResetSmtRoot**: Idempotent retry - binds expected_current_tree_index from its
+    ///   target, a value not read from chain, so a replay after the first reset lands is
+    ///   rejected on-chain (UnexpectedTreeIndex) rather than advancing the tree twice.
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
             Self::Mint(_) => RetryPolicy::None,
@@ -238,6 +238,18 @@ impl TransactionBuilder {
 // Rebuilt on demand because the policy holds boxed closures and is not Clone.
 pub(crate) fn mint_extra_error_checks_policy() -> ExtraErrorCheckPolicy {
     ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
+}
+
+/// A tree rotation paired with the generation it must produce.
+///
+/// The target is derived from the boundary withdrawal's nonce, never from chain, so it
+/// is the only value the sender can check a fresh on-chain read against and the only
+/// value that gives the program's replay guard content.
+#[derive(Clone, Debug)]
+pub struct ResetSmtRootBuilderWithTarget {
+    pub builder: ResetSmtRootBuilder,
+    /// Tree index this rotation must leave on-chain: `nonce / MAX_TREE_LEAVES`.
+    pub target_tree_index: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -596,7 +608,10 @@ mod tests {
             .operator_pda(pk(4))
             .event_authority(pk(5))
             .private_channel_escrow_program(pk(6));
-        TransactionBuilder::ResetSmtRoot(Box::new(inner.clone()))
+        TransactionBuilder::ResetSmtRoot(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: inner,
+            target_tree_index: 1,
+        }))
     }
 
     #[test]

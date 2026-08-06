@@ -296,9 +296,10 @@ pub async fn run_sender(
     let mut queue_check_interval = interval(Duration::from_millis(500));
 
     // Rotation cadence, deliberately slower than the queue tick: an owed reset is
-    // retried until the tree advances, and 500ms would hammer a failing RPC. A
-    // rotation with no in-flight releases is submitted straight off the processor
-    // arm, so this paces one queued behind in-flight work, plus its retries.
+    // retried until the chain reaches its target, each attempt costs an on-chain tree
+    // index read, and 500ms would hammer a failing RPC. A rotation with no in-flight
+    // releases is submitted straight off the processor arm, so this paces one queued
+    // behind in-flight work, plus its retries.
     let mut rotation_interval = interval(Duration::from_secs(5));
     // Never burst through missed ticks: after the loop blocks in a long send, a
     // catch-up burst would collapse the pacing back to a spin.

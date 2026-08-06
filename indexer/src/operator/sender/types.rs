@@ -1,17 +1,15 @@
 use super::remint::FinalityRpc;
 use crate::config::ProgramType;
 use crate::operator::utils::instruction_util::{
-    ExtraErrorCheckPolicy, MintToBuilder, ReleaseFundsBuilderWithNonce, RetryPolicy,
-    WithdrawalRemintInfo,
+    ExtraErrorCheckPolicy, MintToBuilder, ReleaseFundsBuilderWithNonce,
+    ResetSmtRootBuilderWithTarget, RetryPolicy, WithdrawalRemintInfo,
 };
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
 use crate::{operator::utils::smt_util::SmtState, operator::MintCache};
 use chrono::{DateTime, Utc};
-use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, ResetSmtRootBuilder,
-};
+use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -195,8 +193,10 @@ pub struct SenderState {
     /// after process_pending_remints. Stores the full builder so remint_info
     /// travels with the parked withdrawal.
     pub ambiguous_retry_queue: Vec<Box<ReleaseFundsBuilderWithNonce>>,
-    /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
-    pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,
+    /// The tree rotation the sender owes the chain, with the generation it owes.
+    /// A reset has no DB row and no nonce, so this is its only record; it is cleared
+    /// only where a fresh on-chain read shows the chain reached the target.
+    pub pending_rotation: Option<Box<ResetSmtRootBuilderWithTarget>>,
     pub program_type: ProgramType,
     /// Cached remint info for withdrawal transactions, keyed by nonce.
     /// Extracted before cleanup_failed_transaction removes builder from SMT cache.

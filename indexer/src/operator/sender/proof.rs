@@ -2,7 +2,6 @@ use crate::error::{OperatorError, ProgramError};
 use crate::operator::sender::mint;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::{ReleaseFundsBuilderWithNonce, SIBLING_PROOF_SIZE};
-use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{error, info, warn};
@@ -93,24 +92,23 @@ impl SenderSMTState {
     }
 }
 
-/// Check if pending rotation can now be processed
-/// Returns the ResetSmtRoot builder if ready to execute
-pub fn take_pending_rotation_if_ready(state: &mut SenderState) -> Option<Box<ResetSmtRootBuilder>> {
-    state.pending_rotation.as_ref()?;
-
-    // Check if all in-flight transactions are settled
-    let has_in_flight = if let Some(ref smt_state) = state.smt_state {
-        !smt_state.nonce_to_builder.is_empty()
-    } else {
-        false
-    };
-
-    if !has_in_flight {
-        info!("All in-flight transactions settled, rotation ready to execute");
-        state.pending_rotation.take()
-    } else {
-        None
+/// Check if the armed rotation can be submitted now: no in-flight release can
+/// still change the tree under it. Purely local; whether the chain still needs the
+/// rotation is a separate unconditional read on the submit path.
+///
+/// Not a take. The reset carries no DB row and no withdrawal nonce, so
+/// `pending_rotation` is the only record that the tree still owes a rotation. It
+/// is cleared only where the chain shows it landed.
+pub(super) fn pending_rotation_due(state: &SenderState) -> bool {
+    if state.pending_rotation.is_none() {
+        return false;
     }
+
+    let has_in_flight = state
+        .smt_state
+        .as_ref()
+        .is_some_and(|smt_state| !smt_state.nonce_to_builder.is_empty());
+    !has_in_flight
 }
 
 /// Rebuild transaction with regenerated SMT proof and retry
@@ -204,11 +202,14 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::utils::instruction_util::ResetSmtRootBuilderWithTarget;
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
-    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::instructions::{
+        ReleaseFundsBuilder, ResetSmtRootBuilder,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -291,28 +292,35 @@ mod tests {
         b
     }
 
-    // ── take_pending_rotation_if_ready ────────────────────────────────
+    // ── pending_rotation_due ──────────────────────────────────────────
 
     #[test]
-    fn rotation_returns_none_when_no_pending() {
-        let mut state = make_sender_state();
-        assert!(take_pending_rotation_if_ready(&mut state).is_none());
+    fn rotation_not_due_when_none_armed() {
+        let state = make_sender_state();
+        assert!(!pending_rotation_due(&state));
     }
 
+    /// Due, and still armed afterwards: the check must not consume the rotation,
+    /// or a failed submission would leave nothing to retry.
     #[test]
-    fn rotation_returns_builder_when_no_inflight() {
+    fn rotation_due_and_stays_armed_without_smt_state() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
         // No smt_state means no in-flight
-        let result = take_pending_rotation_if_ready(&mut state);
-        assert!(result.is_some());
-        assert!(state.pending_rotation.is_none(), "should be taken");
+        assert!(pending_rotation_due(&state));
+        assert!(state.pending_rotation.is_some(), "must stay armed");
     }
 
     #[test]
-    fn rotation_blocked_by_inflight_transactions() {
+    fn rotation_not_due_while_inflight() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
 
         // Add smt_state with an in-flight nonce
         let mut smt = make_smt_state(0);
@@ -326,17 +334,20 @@ mod tests {
             .insert(0, (ctx, ReleaseFundsBuilder::new()));
         state.smt_state = Some(smt);
 
-        assert!(take_pending_rotation_if_ready(&mut state).is_none());
-        assert!(state.pending_rotation.is_some(), "should NOT be taken yet");
+        assert!(!pending_rotation_due(&state));
+        assert!(state.pending_rotation.is_some(), "must stay armed");
     }
 
     #[test]
-    fn rotation_ready_after_inflight_cleared() {
+    fn rotation_due_after_inflight_cleared() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
         state.smt_state = Some(make_smt_state(0)); // empty nonce_to_builder
 
-        assert!(take_pending_rotation_if_ready(&mut state).is_some());
+        assert!(pending_rotation_due(&state));
     }
 
     // ── cleanup_failed_transaction ───────────────────────────────────

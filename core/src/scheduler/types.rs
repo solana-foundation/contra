@@ -80,6 +80,30 @@ mod tests {
         assert_eq!(read_accounts, vec![spl_memo::id(), spl_memo::id()]);
     }
 
+    // The write-lock path is the one a repeated key can actually corrupt, so prove
+    // extraction reports it and the scheduler still emits the transaction instead
+    // of dropping it or spinning on a dependency it can never satisfy.
+    #[test]
+    fn duplicate_writable_key_still_schedules() {
+        use crate::scheduler::{Scheduler, SchedulerTrait};
+
+        let payer = Keypair::new();
+        let tx = crate::test_helpers::duplicate_writable_account_keys_transaction(
+            &payer,
+            Hash::default(),
+        );
+        let sanitized = SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("a writable duplicate-key message still sanitizes");
+
+        let (read_accounts, write_accounts) = extract_accounts(&sanitized);
+        assert_eq!(write_accounts, vec![payer.pubkey(), payer.pubkey()]);
+        assert_eq!(read_accounts, vec![spl_memo::id()]);
+
+        let batches = Scheduler::new_dag().schedule(vec![sanitized]);
+        assert_eq!(batches.len(), 1, "the transaction must still be scheduled");
+        assert_eq!(batches[0].len(), 1);
+    }
+
     // Pins the read/write split so the unchecked accessor cannot quietly change what gets locked.
     #[test]
     fn extract_accounts_splits_read_and_write() {

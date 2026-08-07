@@ -126,9 +126,10 @@ async fn case_d_duplicate_account_keys(ctx: &PrivateChannelContext) {
         )
         .await
         .expect_err("duplicate account keys must be rejected by simulation");
+    // Cases B and C already return this code, so only the reason pins this arm.
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("account loaded twice") || msg.contains("-32602"),
-        "error must name the duplicate cause or invalid-params; got {msg}"
+        msg.contains("account loaded twice"),
+        "error must name the duplicate cause; got {msg}"
     );
 }

@@ -4,7 +4,7 @@
 //! Binary: `private_channel_integration` (existing).
 //! Fixture: reuses `PrivateChannelContext`.
 //!
-//! Covers the two non-SDK-duplication branches in `send_transaction_impl`:
+//! Covers the non-SDK-duplication branches in `send_transaction_impl`:
 //!
 //!   A. **Base64 decode failure** — SDK `send_transaction` does client-side
 //!      pre-encoding, so an entirely-invalid-base64 case doesn't reach the
@@ -20,8 +20,11 @@
 //!   C. **Duplicate account keys**: a hand-assembled legacy message whose
 //!      `account_keys` repeat a pubkey. It clears sanitization, the allowlist
 //!      and sigverify, so without the ingress lock-validation guard it reaches
-//!      the sequencer and aborts the write node. Asserts the rejection and
-//!      then probes the write node for liveness.
+//!      the sequencer and aborts the write node. The assertion names the
+//!      duplicate-key reason specifically, because every other rejection arm
+//!      in this handler also returns `INVALID_PARAMS_CODE` and would otherwise
+//!      satisfy it. A memo transaction must then land, which only happens if
+//!      the sequencer survived.
 //!
 //! "Program not in allowlist" is out of scope here because the allowlist
 //! enforcement lives in a separate later stage and requires configuration
@@ -35,14 +38,17 @@ use {
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{
+        instruction::Instruction,
         signature::{Keypair, Signer},
         transaction::Transaction,
     },
-    solana_system_interface::instruction as system_instruction,
     std::time::Duration,
 };
 
 const INVALID_PARAMS_CODE: i64 = -32_602;
+
+/// Generous because it only bounds the failure case; a healthy pipeline returns in well under a second.
+const LIVENESS_PROBE_SECONDS: u64 = 15;
 
 pub async fn run_send_transaction_errors_test(ctx: &PrivateChannelContext) {
     println!("\n=== sendTransaction — Error Classification ===");
@@ -102,10 +108,9 @@ async fn case_b_oversized_transaction(ctx: &PrivateChannelContext) {
 
 // ── Case C ──────────────────────────────────────────────────────────────────
 async fn case_c_duplicate_account_keys(ctx: &PrivateChannelContext) {
-    // A live blockhash is mandatory here. With a stale one the dedup stage
-    // drops the transaction before the sequencer ever sees it, so the case
-    // would pass for a reason that has nothing to do with the guard under
-    // test, and it would keep passing if the guard were removed again.
+    // A live blockhash keeps the transaction on the path the guard protects:
+    // without the guard a stale one would be dropped by dedup instead of
+    // reaching the sequencer, so the case would no longer describe the bug.
     let blockhash = ctx
         .get_blockhash()
         .await
@@ -123,31 +128,46 @@ async fn case_c_duplicate_account_keys(ctx: &PrivateChannelContext) {
         .await
         .expect_err("duplicate account keys must be rejected");
 
+    // Naming the reason matters: the base64, size, sanitize and allowlist arms
+    // all return the same code, so accepting a bare code would let this case
+    // stay green even if the guard under test were deleted.
     let msg = err.to_string().to_lowercase();
     assert!(
-        msg.contains("account loaded twice") || msg.contains(&INVALID_PARAMS_CODE.to_string()),
-        "error must name the duplicate-key cause or invalid-params; got: {msg}"
+        msg.contains("account loaded twice"),
+        "error must name the duplicate-key cause; got: {msg}"
+    );
+    assert!(
+        msg.contains(&INVALID_PARAMS_CODE.to_string()),
+        "duplicate keys are a client error; got: {msg}"
     );
 
-    // Liveness probe. The sequencer runs inside the write node's process, so a
-    // transfer that is still accepted here proves the rejected transaction did
-    // not take the node down. It needs no funding; acceptance only requires the
-    // allowlist, sigverify and a live blockhash.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let probe_payer = Keypair::new();
+    // The probe has to wait for the memo to land, not merely be accepted.
+    // sendTransaction returns as soon as the tx is queued, three stages ahead of
+    // the sequencer, and this harness never polls wait_for_any_worker_quit, so
+    // an acceptance-only check would still pass with the write pipeline dead.
+    // A landed transaction is proof the sequencer survived the rejected one.
     let probe_blockhash = ctx
         .get_blockhash()
         .await
         .expect("live blockhash for the liveness probe");
-    let ix = system_instruction::transfer(&probe_payer.pubkey(), &Keypair::new().pubkey(), 1);
-    let probe = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&probe_payer.pubkey()),
-        &[&probe_payer],
-        probe_blockhash,
-    );
-    ctx.write_client
-        .send_transaction(&probe)
+    let probe = memo_tx(probe_blockhash, "ottersec-14-liveness");
+    let landed = ctx
+        .send_and_check(&probe, Duration::from_secs(LIVENESS_PROBE_SECONDS))
         .await
-        .expect("write node must still accept transactions after the rejection");
+        .expect("liveness probe must not error");
+    assert!(
+        landed.is_some(),
+        "sequencer must still land transactions after the duplicate-key rejection"
+    );
+}
+
+/// Unique allowlisted memo tx; the memo program is loaded in the node VM so this lands.
+fn memo_tx(blockhash: solana_sdk::hash::Hash, tag: &str) -> Transaction {
+    let payer = Keypair::new();
+    let memo = Instruction {
+        program_id: spl_memo::id(),
+        accounts: vec![],
+        data: tag.as_bytes().to_vec(),
+    };
+    Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[&payer], blockhash)
 }

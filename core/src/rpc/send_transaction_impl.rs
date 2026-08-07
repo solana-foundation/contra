@@ -69,11 +69,11 @@ pub async fn send_transaction_impl(
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
 
-    // Sanitization never looks for repeated account keys, so this is the first
-    // and only place a transaction the scheduler cannot lock gets caught while
-    // there is still a caller to report a reason to. Passing the real limit
-    // instead of usize::MAX also keeps the account-count bound in force. Agave
-    // rejects the same shape when it admits packets into its banking buffer.
+    // Sanitization never looks for repeated account keys, so a duplicate would
+    // otherwise reach the sequencer, which has no way to report a per-transaction
+    // error. Catching it here is what lets the caller be told why. Passing the
+    // real limit rather than usize::MAX also keeps the account-count bound in
+    // force. Agave rejects the same shape when admitting packets to its buffer.
     SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
         .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
 

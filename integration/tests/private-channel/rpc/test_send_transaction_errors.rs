@@ -17,17 +17,29 @@
 //!      server must reject with `INVALID_PARAMS_CODE` before the pipeline
 //!      is entered. Hits the size-check arm.
 //!
-//! Case C ("program not in allowlist") is out of scope here because the
-//! allowlist enforcement lives in a separate later stage and requires
-//! configuration plumbing not part of the default `PrivateChannelContext`. That
-//! branch can be a follow-up test when the context exposes a runtime
-//! allowlist toggle.
+//!   C. **Duplicate account keys**: a hand-assembled legacy message whose
+//!      `account_keys` repeat a pubkey. It clears sanitization, the allowlist
+//!      and sigverify, so without the ingress lock-validation guard it reaches
+//!      the sequencer and aborts the write node. Asserts the rejection and
+//!      then probes the write node for liveness.
+//!
+//! "Program not in allowlist" is out of scope here because the allowlist
+//! enforcement lives in a separate later stage and requires configuration
+//! plumbing not part of the default `PrivateChannelContext`. That branch can be
+//! a follow-up test when the context exposes a runtime allowlist toggle.
 
 use {
     super::test_context::PrivateChannelContext,
     base64::{engine::general_purpose::STANDARD, Engine as _},
+    private_channel_core::test_helpers::duplicate_account_keys_transaction,
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
+    solana_sdk::{
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    },
+    solana_system_interface::instruction as system_instruction,
+    std::time::Duration,
 };
 
 const INVALID_PARAMS_CODE: i64 = -32_602;
@@ -37,8 +49,9 @@ pub async fn run_send_transaction_errors_test(ctx: &PrivateChannelContext) {
 
     case_a_base64_decode_failure(ctx).await;
     case_b_oversized_transaction(ctx).await;
+    case_c_duplicate_account_keys(ctx).await;
 
-    println!("✓ base64-decode + oversized branches passed");
+    println!("✓ base64-decode + oversized + duplicate-key branches passed");
 }
 
 // ── Case A ──────────────────────────────────────────────────────────────────
@@ -85,4 +98,56 @@ async fn case_b_oversized_transaction(ctx: &PrivateChannelContext) {
         msg.contains("too large") || msg.contains("1232") || msg.contains("1233"),
         "error must identify size as the cause; got: {msg}"
     );
+}
+
+// ── Case C ──────────────────────────────────────────────────────────────────
+async fn case_c_duplicate_account_keys(ctx: &PrivateChannelContext) {
+    // A live blockhash is mandatory here. With a stale one the dedup stage
+    // drops the transaction before the sequencer ever sees it, so the case
+    // would pass for a reason that has nothing to do with the guard under
+    // test, and it would keep passing if the guard were removed again.
+    let blockhash = ctx
+        .get_blockhash()
+        .await
+        .expect("live blockhash for the duplicate-key tx");
+    let payer = Keypair::new();
+    let tx = duplicate_account_keys_transaction(&payer, blockhash);
+    let encoded = STANDARD.encode(bincode::serialize(&tx).expect("serialize duplicate-key tx"));
+
+    let err = ctx
+        .write_client
+        .send::<serde_json::Value>(
+            RpcRequest::SendTransaction,
+            json!([encoded, {"skipPreflight": true, "encoding": "base64"}]),
+        )
+        .await
+        .expect_err("duplicate account keys must be rejected");
+
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("account loaded twice") || msg.contains(&INVALID_PARAMS_CODE.to_string()),
+        "error must name the duplicate-key cause or invalid-params; got: {msg}"
+    );
+
+    // Liveness probe. The sequencer runs inside the write node's process, so a
+    // transfer that is still accepted here proves the rejected transaction did
+    // not take the node down. It needs no funding; acceptance only requires the
+    // allowlist, sigverify and a live blockhash.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let probe_payer = Keypair::new();
+    let probe_blockhash = ctx
+        .get_blockhash()
+        .await
+        .expect("live blockhash for the liveness probe");
+    let ix = system_instruction::transfer(&probe_payer.pubkey(), &Keypair::new().pubkey(), 1);
+    let probe = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&probe_payer.pubkey()),
+        &[&probe_payer],
+        probe_blockhash,
+    );
+    ctx.write_client
+        .send_transaction(&probe)
+        .await
+        .expect("write node must still accept transactions after the rejection");
 }

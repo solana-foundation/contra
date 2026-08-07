@@ -1,7 +1,8 @@
 use crate::accounts::traits::BlockInfo;
 use solana_sdk::{
     hash::Hash,
-    message::Message,
+    instruction::CompiledInstruction,
+    message::{Message, MessageHeader},
     signature::{Keypair, Signer},
     transaction::{SanitizedTransaction, Transaction},
 };
@@ -19,6 +20,27 @@ pub fn create_test_sanitized_transaction(
     let transaction = Transaction::new(&[from], message, Hash::default());
     SanitizedTransaction::try_from_legacy_transaction(transaction, &HashSet::new())
         .expect("failed to create SanitizedTransaction from test legacy transaction")
+}
+
+/// Legacy transaction with a repeated account key, built field by field because the SDK dedupes.
+pub fn duplicate_account_keys_transaction(payer: &Keypair, recent_blockhash: Hash) -> Transaction {
+    let message = Message {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 2,
+        },
+        account_keys: vec![payer.pubkey(), spl_memo::id(), spl_memo::id()],
+        recent_blockhash,
+        instructions: vec![CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: b"dup".to_vec(),
+        }],
+    };
+    let mut transaction = Transaction::new_unsigned(message);
+    transaction.sign(&[payer], recent_blockhash);
+    transaction
 }
 
 /// Create a BlockInfo with sensible defaults for a given slot.

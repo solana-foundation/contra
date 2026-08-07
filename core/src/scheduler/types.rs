@@ -41,14 +41,55 @@ impl ConflictFreeBatch {
 }
 
 pub fn extract_accounts(transaction: &SanitizedTransaction) -> (Vec<Pubkey>, Vec<Pubkey>) {
-    // Use Solana's built-in account locking mechanism
-    // We use usize::MAX as the limit to avoid artificial restrictions
-    let account_locks = transaction
-        .get_account_locks(usize::MAX)
-        .expect("Failed to get account locks");
+    // The unchecked accessor is the same account_keys walk as the checked one,
+    // minus a validation step that can fail. Keeping the scheduler total means
+    // a malformed transaction can never abort the sequencer task; structural
+    // validation happens once at RPC ingress, where a rejection reason can
+    // actually be returned to the caller.
+    let account_locks = transaction.get_account_locks_unchecked();
 
     let read_accounts = account_locks.readonly.into_iter().copied().collect();
     let write_accounts = account_locks.writable.into_iter().copied().collect();
 
     (read_accounts, write_accounts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{
+        create_test_sanitized_transaction, duplicate_account_keys_transaction,
+    };
+    use solana_sdk::{
+        hash::Hash,
+        signature::{Keypair, Signer},
+    };
+    use std::collections::HashSet;
+
+    // A repeated account key is attacker reachable, so lock extraction must stay total.
+    #[test]
+    fn extract_accounts_handles_duplicate_keys() {
+        let payer = Keypair::new();
+        let tx = duplicate_account_keys_transaction(&payer, Hash::default());
+        let sanitized = SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("a duplicate-key message still sanitizes");
+
+        let (read_accounts, write_accounts) = extract_accounts(&sanitized);
+
+        assert_eq!(write_accounts, vec![payer.pubkey()]);
+        assert_eq!(read_accounts, vec![spl_memo::id(), spl_memo::id()]);
+    }
+
+    // Pins the read/write split so the unchecked accessor cannot quietly change what gets locked.
+    #[test]
+    fn extract_accounts_splits_read_and_write() {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let sanitized = create_test_sanitized_transaction(&from, &to, 1_000);
+
+        let (read_accounts, write_accounts) = extract_accounts(&sanitized);
+
+        assert_eq!(write_accounts, vec![from.pubkey(), to]);
+        assert_eq!(read_accounts, vec![solana_sdk::system_program::id()]);
+    }
 }

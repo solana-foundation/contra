@@ -10,9 +10,7 @@ use crate::{
     },
 };
 
-use private_channel_escrow_program_client::{
-    instructions::RotateBitmapBuilder, WithdrawalBitmap,
-};
+use private_channel_escrow_program_client::{instructions::RotateBitmapBuilder, WithdrawalBitmap};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     signature::{Keypair, Signer},

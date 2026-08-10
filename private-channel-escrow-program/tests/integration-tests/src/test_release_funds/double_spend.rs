@@ -4,8 +4,8 @@ use crate::{
         assert_get_or_release_funds, assert_get_or_rotate_bitmap,
     },
     utils::{
-        assert_program_error, set_mint, setup_test_balances, TestContext,
-        NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
+        assert_program_error, set_mint, setup_test_balances, TestContext, NONCE_ALREADY_USED_ERROR,
+        NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
     },
 };
 

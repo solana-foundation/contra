@@ -15,7 +15,7 @@ use crate::{
         get_or_create_associated_token_account_2022, get_token_balance, set_mint,
         setup_test_balances, TestContext, ATA_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR,
         INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR, NONCES_PER_GENERATION,
+        NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
@@ -1364,7 +1364,12 @@ fn test_release_funds_foreign_bitmap_rejected() {
 
     // Neither bitmap may record the nonce, and no funds may move.
     let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
-    assert_nonce_consumed(&mut context, &withdrawal_bitmap_pda, TRANSACTION_NONCE, false);
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        false,
+    );
     assert_nonce_consumed(&mut context, &other_bitmap_pda, TRANSACTION_NONCE, false);
     assert_eq!(
         get_token_balance(&mut context, &instance_ata),

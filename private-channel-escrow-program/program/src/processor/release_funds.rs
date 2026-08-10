@@ -116,7 +116,11 @@ pub fn process_release_funds(
     }
 
     let mut bitmap_data = withdrawal_bitmap_info.try_borrow_mut()?;
-    WithdrawalBitmap::validate(&bitmap_data, instance_info.address(), withdrawal_bitmap_info)?;
+    WithdrawalBitmap::validate(
+        &bitmap_data,
+        instance_info.address(),
+        withdrawal_bitmap_info,
+    )?;
     WithdrawalBitmap::validate_generation(&bitmap_data, args.transaction_nonce)?;
     WithdrawalBitmap::consume_nonce(&mut bitmap_data, args.transaction_nonce)?;
     drop(bitmap_data);

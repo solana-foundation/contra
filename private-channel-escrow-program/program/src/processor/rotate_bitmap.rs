@@ -69,7 +69,11 @@ pub fn process_rotate_bitmap(
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidOperatorPda)?;
 
     let mut bitmap_data = withdrawal_bitmap_info.try_borrow_mut()?;
-    WithdrawalBitmap::validate(&bitmap_data, instance_info.address(), withdrawal_bitmap_info)?;
+    WithdrawalBitmap::validate(
+        &bitmap_data,
+        instance_info.address(),
+        withdrawal_bitmap_info,
+    )?;
     WithdrawalBitmap::rotate(&mut bitmap_data, expected_generation)?;
     let new_generation = WithdrawalBitmap::generation(&bitmap_data)?;
     drop(bitmap_data);

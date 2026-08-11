@@ -388,7 +388,10 @@ async fn run_withdraw_preflight(
         storage,
         rpc_client,
         crate::storage::common::models::TransactionStatus::PendingRemint,
-        Some(recovery::BOOT_RECONCILE_BUDGET),
+        recovery::BOOT_RECONCILE_BUDGET,
+        // Boot runs once, so the cursor has nowhere to resume to. If the budget
+        // is spent the SMT check below decides whether the operator may start.
+        &mut 0,
         cancellation_token,
     )
     .await

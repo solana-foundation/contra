@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -31,6 +31,15 @@ pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 /// Stalled withdrawals examined in one sweep before the depth is worth a warning.
 /// Purely an observability threshold: the sweep never stops early on it.
 const RECONCILE_BACKLOG_WARN_AT: usize = 1_000;
+
+/// Wall-clock ceiling on the periodic reconcile.
+///
+/// Held below `RECOVERY_INTERVAL` so the worker still idles between ticks. The
+/// tick interval bursts on a missed deadline, so a sweep that outran it would
+/// leave the worker permanently busy and push the stale-`Processing` recovery
+/// at the top of the next tick behind it. The cursor makes stopping early cost
+/// nothing: the next sweep resumes rather than restarts.
+pub(crate) const RECONCILE_SWEEP_BUDGET: Duration = Duration::from_secs(45);
 
 /// Wall-clock ceiling on the boot pre-flight's reconcile.
 ///
@@ -92,6 +101,9 @@ pub async fn run_recovery_worker(
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
     let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
+    // Lives across ticks so a sweep that stops on its budget resumes where it
+    // left off, rather than rescanning the same prefix every minute.
+    let mut reconcile_cursor = 0i64;
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
@@ -106,6 +118,7 @@ pub async fn run_recovery_worker(
                     &storage_tx,
                     &cancellation_token,
                     STALE_THRESHOLD,
+                    &mut reconcile_cursor,
                 )
                 .await
                 {
@@ -125,6 +138,7 @@ async fn recover_once(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     threshold: Duration,
+    reconcile_cursor: &mut i64,
 ) -> Result<(), OperatorError> {
     // Best-effort GC of release signatures whose parent is no longer Processing;
     // a failure here must not block recovery.
@@ -191,9 +205,8 @@ async fn recover_once(
             storage,
             rpc_client,
             TransactionStatus::ManualReview,
-            // Blocks nothing, so it runs to exhaustion: only an exhaustive sweep
-            // guarantees no row is permanently hidden behind unclearable ones.
-            None,
+            RECONCILE_SWEEP_BUDGET,
+            reconcile_cursor,
             cancellation_token,
         )
         .await
@@ -242,7 +255,42 @@ pub(crate) async fn reconcile_landed_withdrawals(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
     from_status: TransactionStatus,
-    budget: Option<Duration>,
+    budget: Duration,
+    cursor: &mut i64,
+    cancellation_token: &CancellationToken,
+) -> Result<(), OperatorError> {
+    // The ceiling has to wrap the whole sweep, not gate entry to each row. A
+    // single classification retries five times, so a deadline consulted only
+    // between rows is overrun by whatever is already in flight when it passes.
+    // Dropping the future mid-flight is safe: the sole write is one CAS
+    // statement, so it either committed or it did not.
+    match tokio::time::timeout(
+        budget,
+        reconcile_sweep(storage, rpc_client, from_status, cursor, cancellation_token),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // The cursor keeps its position, so the next sweep resumes here
+            // instead of rescanning the prefix that just used up the budget.
+            warn!(
+                resume_after_id = *cursor,
+                ?from_status,
+                "Reconcile sweep hit its time budget; remainder deferred to the next sweep"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The sweep itself. Split out so the caller can impose a hard wall-clock
+/// ceiling on it as a whole.
+async fn reconcile_sweep(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+    from_status: TransactionStatus,
+    cursor: &mut i64,
     cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
     let outcome_label = match from_status {
@@ -257,27 +305,25 @@ pub(crate) async fn reconcile_landed_withdrawals(
         }
     };
 
-    // Page forward by id, in batches only to bound each query.
+    // Page forward by id from wherever the last sweep stopped.
     //
-    // There is no row-count cap. Rows that do not classify are left untouched
-    // by design, so nothing drains this set on its own; a count cap would be a
-    // permanent blind spot for every row behind it, since the cursor restarts
-    // at zero each sweep and rescans the same prefix forever. The one row that
-    // matters most, a landed release still wedging the boot gate, is exactly
-    // the row such a cap would hide.
-    let deadline = budget.map(|b| Instant::now() + b);
-    let mut after_id = 0i64;
+    // There is no row-count cap. Rows that do not classify are left untouched by
+    // design, so nothing drains this set on its own; a cap paired with a cursor
+    // that restarts at zero would rescan the same prefix forever and hide every
+    // row behind it, including a landed release still wedging the boot gate.
+    // The time ceiling bounds the work instead, and the cursor is what keeps
+    // that bound from turning into a permanent blind spot.
     let mut scanned = 0usize;
     loop {
         let batch = storage
-            .get_stalled_withdrawals_with_signatures(from_status, after_id, RECOVERY_BATCH_LIMIT)
+            .get_stalled_withdrawals_with_signatures(from_status, *cursor, RECOVERY_BATCH_LIMIT)
             .await?;
         if batch.is_empty() {
             break;
         }
         debug!(
             count = batch.len(),
-            after_id,
+            after_id = *cursor,
             ?from_status,
             "Reconcile sweep found stalled withdrawals with stored signatures"
         );
@@ -289,20 +335,9 @@ pub(crate) async fn reconcile_landed_withdrawals(
                 info!("Reconcile sweep cancelled; remaining stalled rows deferred");
                 return Ok(());
             }
-            // Checked per row, not per batch: one row against a degraded RPC
-            // costs five retries, so a batch can overrun the budget on its own.
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                warn!(
-                    scanned,
-                    ?from_status,
-                    "Reconcile sweep hit its time budget; \
-                     the SMT check below decides whether the operator can start"
-                );
-                return Ok(());
-            }
-            // The cursor advances even when a row is skipped, which is what stops
-            // an unclearable row from being re-fetched ahead of everything else.
-            after_id = row.id;
+            // Advances even when a row is skipped, which is what stops an
+            // unclearable row from being re-fetched ahead of everything else.
+            *cursor = row.id;
             // The query is withdrawal-only, so this is the same belt-and-braces gate
             // the other sweeps use: never classify a row against the wrong chain.
             if !role_owns(ProgramType::Withdraw, &row) {
@@ -323,6 +358,10 @@ pub(crate) async fn reconcile_landed_withdrawals(
             break;
         }
     }
+
+    // Reaching the end means every row was seen, so the next sweep starts over
+    // and picks up whatever stalled in the meantime.
+    *cursor = 0;
 
     // A backlog this deep is an incident of its own: every row in it is a
     // withdrawal that failed and could not be resolved, and each costs an RPC
@@ -759,6 +798,7 @@ pub async fn boot_reconcile_processing(
     cancellation_token: &CancellationToken,
     max_passes: u32,
 ) -> Result<(), OperatorError> {
+    let mut reconcile_cursor = 0i64;
     for pass in 0..max_passes {
         recover_once(
             storage,
@@ -767,6 +807,7 @@ pub async fn boot_reconcile_processing(
             storage_tx,
             cancellation_token,
             Duration::ZERO,
+            &mut reconcile_cursor,
         )
         .await?;
 
@@ -817,6 +858,7 @@ pub mod test_hooks {
             storage_tx,
             &token,
             STALE_THRESHOLD,
+            &mut 0,
         )
         .await
     }
@@ -830,7 +872,15 @@ pub mod test_hooks {
         from_status: TransactionStatus,
     ) -> Result<(), OperatorError> {
         let token = CancellationToken::new();
-        reconcile_landed_withdrawals(storage, rpc_client, from_status, None, &token).await
+        reconcile_landed_withdrawals(
+            storage,
+            rpc_client,
+            from_status,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &token,
+        )
+        .await
     }
 }
 
@@ -1449,7 +1499,8 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
-            None,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await
@@ -1503,20 +1554,25 @@ mod tests {
         let storage = Storage::Mock(mock.clone());
         let client = make_rpc_client(&server.url());
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         reconcile_landed_withdrawals(
             &storage,
             &client,
             TransactionStatus::PendingRemint,
-            Some(Duration::from_millis(150)),
+            Duration::from_millis(150),
+            &mut 0,
             &CancellationToken::new(),
         )
         .await
         .unwrap();
 
+        // The ceiling must hold even though a classification is mid-retry when it
+        // passes: a deadline consulted only between rows would overshoot by the
+        // whole in-flight retry chain, which is what the wrapping timeout stops.
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the boot sweep must return on its budget, not grind through the backlog"
+            started.elapsed() < Duration::from_secs(1),
+            "the boot sweep must return on its budget even mid-retry, took {:?}",
+            started.elapsed()
         );
         let after = mock.pending_transactions.lock().unwrap();
         assert!(
@@ -1524,6 +1580,72 @@ mod tests {
                 .iter()
                 .all(|t| t.status == TransactionStatus::PendingRemint),
             "giving up on time must never promote a row"
+        );
+    }
+
+    /// A sweep that stops on its budget must resume, not restart. Without a
+    /// cursor that survives the call, every sweep would rescan the same prefix
+    /// and the rows behind it would never be reached.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_cursor_resumes_after_a_spent_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let _slow = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_chunked_body(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(())
+            })
+            .expect_at_least(1)
+            .create();
+
+        let mock = MockStorage::new();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            for id in 1..=200 {
+                db.push(stalled_withdrawal(
+                    id,
+                    TransactionStatus::ManualReview,
+                    &[Signature::new_unique().to_string()],
+                ));
+            }
+        }
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let mut cursor = 0i64;
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            Duration::from_millis(200),
+            &mut cursor,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            cursor > 0,
+            "a sweep stopped by its budget must leave the cursor where it got to"
+        );
+        let first_stop = cursor;
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            Duration::from_millis(200),
+            &mut cursor,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            cursor > first_stop,
+            "the next sweep must carry on past {first_stop}, not restart at zero"
         );
     }
 
@@ -1573,7 +1695,8 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
-            None,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await
@@ -1616,7 +1739,8 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
-            None,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await
@@ -1692,7 +1816,8 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
-            None,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await
@@ -1728,7 +1853,8 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
-            None,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await
@@ -1759,6 +1885,7 @@ mod tests {
             &storage_tx,
             &CancellationToken::new(),
             Duration::ZERO,
+            &mut 0,
         )
         .await;
 
@@ -2178,6 +2305,7 @@ mod tests {
             &storage_tx,
             &CancellationToken::new(),
             Duration::ZERO,
+            &mut 0,
         )
         .await
         .unwrap();

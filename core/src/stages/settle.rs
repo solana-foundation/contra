@@ -569,13 +569,15 @@ async fn settle_transactions(
                             // Zero lamports means the account is gone, whatever its data
                             // holds. Must match BOB's rule or its entry never reconciles.
                             let deleted = account_data.lamports() == 0;
-                            final_accounts_actual.insert(
-                                *pubkey,
-                                AccountSettlement {
-                                    account: account_data.clone(),
-                                    deleted,
-                                },
-                            );
+                            // A delete carries no bytes to Postgres, Redis or BOB, so
+                            // don't pin the buffer in the unbounded feedback channel.
+                            let account = if deleted {
+                                AccountSharedData::default()
+                            } else {
+                                account_data.clone()
+                            };
+                            final_accounts_actual
+                                .insert(*pubkey, AccountSettlement { account, deleted });
                         }
                     }
                 }
@@ -1270,6 +1272,10 @@ mod tests {
         assert!(
             closed_settlement.1.deleted,
             "a zero-lamport account must settle as deleted whatever its data holds"
+        );
+        assert!(
+            closed_settlement.1.account.data().is_empty(),
+            "a delete settlement must not carry the closed account's buffer"
         );
 
         let floor_settlement = result

@@ -293,8 +293,15 @@ impl BOB {
                                 // Zero lamports means the SVM deallocated it, whatever the
                                 // data holds. Either way this write goes in dirty.
                                 let deleted = account_data.lamports() == 0;
+                                // A tombstone's bytes are never read, and it cannot be
+                                // evicted, so drop the buffer instead of pinning it.
+                                let account = if deleted {
+                                    AccountSharedData::default()
+                                } else {
+                                    account_data.clone()
+                                };
                                 let meta = AccountWithMeta {
-                                    account: account_data.clone(),
+                                    account,
                                     deleted,
                                     synced_since: None,
                                     generation: Some(generation),
@@ -779,6 +786,12 @@ mod tests {
         assert!(
             bob.get_account_shared_data(&closed).is_none(),
             "a tombstoned account must not be readable by the SVM"
+        );
+        assert!(
+            bob.accounts
+                .get(&closed)
+                .is_some_and(|meta| meta.account.data().is_empty()),
+            "a tombstone must not pin the closed account's data buffer"
         );
     }
 

@@ -382,10 +382,13 @@ async fn run_withdraw_preflight(
     // withdrawal and remint the burn. This returns before the sender is spawned.
     // Best-effort for the same reason as the reconcile above: validation is the
     // gate, and a transient error here must not crash-loop the operator.
+    // Time-bounded because startup waits on it: an unbounded pass over a large
+    // backlog on a degraded RPC would hold withdrawals down indefinitely.
     if let Err(e) = recovery::reconcile_landed_withdrawals(
         storage,
         rpc_client,
         crate::storage::common::models::TransactionStatus::PendingRemint,
+        Some(recovery::BOOT_RECONCILE_BUDGET),
         cancellation_token,
     )
     .await

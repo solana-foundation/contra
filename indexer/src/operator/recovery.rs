@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -31,6 +31,16 @@ pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 /// Stalled withdrawals examined in one sweep before the depth is worth a warning.
 /// Purely an observability threshold: the sweep never stops early on it.
 const RECONCILE_BACKLOG_WARN_AT: usize = 1_000;
+
+/// Wall-clock ceiling on the boot pre-flight's reconcile.
+///
+/// Startup waits on this sweep, and a degraded RPC turns each row into five
+/// retries, so an unbounded pass can hold withdrawals down for the better part
+/// of an hour with nothing paged. Giving up early costs nothing in that case:
+/// an RPC that cannot classify cannot promote either, so the sweep would not
+/// have cleared the row anyway. The SMT check still runs, and a mismatch that
+/// survives is the designed refuse-to-start, which is loud and has a runbook.
+pub(crate) const BOOT_RECONCILE_BUDGET: Duration = Duration::from_secs(120);
 
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
 const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
@@ -181,6 +191,9 @@ async fn recover_once(
             storage,
             rpc_client,
             TransactionStatus::ManualReview,
+            // Blocks nothing, so it runs to exhaustion: only an exhaustive sweep
+            // guarantees no row is permanently hidden behind unclearable ones.
+            None,
             cancellation_token,
         )
         .await
@@ -218,10 +231,18 @@ fn role_owns(program_type: ProgramType, row: &DbTransaction) -> bool {
 /// carry no signatures, are filtered out by the query, and stay for a human;
 /// rows quarantined on a transient one clear themselves once the chain catches
 /// up. That asymmetry is the whole reason this is safe to run unattended.
+///
+/// `budget` bounds the sweep in wall-clock time. The periodic worker passes
+/// `None` and runs to exhaustion: it blocks nothing, and only an exhaustive
+/// sweep guarantees a row is never permanently hidden behind rows that can
+/// never clear. The boot pre-flight passes `Some`, because it holds up startup
+/// and every row costs an RPC round trip that retries five times against a
+/// degraded endpoint.
 pub(crate) async fn reconcile_landed_withdrawals(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
     from_status: TransactionStatus,
+    budget: Option<Duration>,
     cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
     let outcome_label = match from_status {
@@ -236,16 +257,15 @@ pub(crate) async fn reconcile_landed_withdrawals(
         }
     };
 
-    // Page forward by id to exhaustion, in batches only to bound each query.
+    // Page forward by id, in batches only to bound each query.
     //
-    // Deliberately uncapped. Rows that do not classify are left untouched by
-    // design, so nothing ever drains this set on its own; any per-sweep cap is
-    // a permanent blind spot for every row behind it, and the cursor restarts
-    // at zero on the next sweep so the same prefix is rescanned forever. The
-    // one row that matters most, a landed release still wedging the boot gate,
-    // is exactly the row a cap would hide. Work is proportional to the stalled
-    // backlog, which is empty in steady state and is precisely the set that
-    // needs examining when it is not.
+    // There is no row-count cap. Rows that do not classify are left untouched
+    // by design, so nothing drains this set on its own; a count cap would be a
+    // permanent blind spot for every row behind it, since the cursor restarts
+    // at zero each sweep and rescans the same prefix forever. The one row that
+    // matters most, a landed release still wedging the boot gate, is exactly
+    // the row such a cap would hide.
+    let deadline = budget.map(|b| Instant::now() + b);
     let mut after_id = 0i64;
     let mut scanned = 0usize;
     loop {
@@ -267,6 +287,17 @@ pub(crate) async fn reconcile_landed_withdrawals(
         for row in batch {
             if cancellation_token.is_cancelled() {
                 info!("Reconcile sweep cancelled; remaining stalled rows deferred");
+                return Ok(());
+            }
+            // Checked per row, not per batch: one row against a degraded RPC
+            // costs five retries, so a batch can overrun the budget on its own.
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                warn!(
+                    scanned,
+                    ?from_status,
+                    "Reconcile sweep hit its time budget; \
+                     the SMT check below decides whether the operator can start"
+                );
                 return Ok(());
             }
             // The cursor advances even when a row is skipped, which is what stops
@@ -799,7 +830,7 @@ pub mod test_hooks {
         from_status: TransactionStatus,
     ) -> Result<(), OperatorError> {
         let token = CancellationToken::new();
-        reconcile_landed_withdrawals(storage, rpc_client, from_status, &token).await
+        reconcile_landed_withdrawals(storage, rpc_client, from_status, None, &token).await
     }
 }
 
@@ -1418,6 +1449,7 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -1436,6 +1468,62 @@ mod tests {
                 .filter(|t| t.id <= 1_200)
                 .all(|t| t.status == TransactionStatus::ManualReview),
             "rows that cannot classify stay exactly where they are"
+        );
+    }
+
+    /// Startup waits on the boot sweep, so a backlog it cannot get through must
+    /// hand control back rather than hold withdrawals down. The SMT check after
+    /// it is what decides whether the operator may start.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_returns_when_the_boot_budget_is_spent() {
+        let mut server = mockito::Server::new_async().await;
+        // Every classification stalls, so the budget expires before the backlog does.
+        let _slow = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_chunked_body(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(())
+            })
+            .expect_at_least(1)
+            .create();
+
+        let mock = MockStorage::new();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            for id in 1..=200 {
+                db.push(stalled_withdrawal(
+                    id,
+                    TransactionStatus::PendingRemint,
+                    &[Signature::new_unique().to_string()],
+                ));
+            }
+        }
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        let started = Instant::now();
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::PendingRemint,
+            Some(Duration::from_millis(150)),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the boot sweep must return on its budget, not grind through the backlog"
+        );
+        let after = mock.pending_transactions.lock().unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|t| t.status == TransactionStatus::PendingRemint),
+            "giving up on time must never promote a row"
         );
     }
 
@@ -1485,6 +1573,7 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -1527,6 +1616,7 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -1602,6 +1692,7 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -1637,6 +1728,7 @@ mod tests {
             &storage,
             &client,
             TransactionStatus::ManualReview,
+            None,
             &CancellationToken::new(),
         )
         .await

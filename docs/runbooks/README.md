@@ -87,7 +87,7 @@ The runbooks call this out at every relevant site.
 ## Drills
 
 [`indexer/tests/runbook_drills.rs`](../../indexer/tests/runbook_drills.rs)
-contains seventeen `#[ignore]`-flagged drills that verify these runbooks'
+contains eighteen `#[ignore]`-flagged drills that verify these runbooks'
 commands actually do what the prose claims. Drills are **manually
 triggered, not in CI** - they exist so a human about to use a runbook
 (or about to publish an edit) can confirm the diagnostic and recovery
@@ -100,7 +100,7 @@ pins the relevant contract.
 | `drill_2_path_a_data_error_recovery` | withdrawal | Triage SQL orders the trigger row first; recovery SQL reaches the documented end-state. |
 | `drill_3_path_b_landed_marks_completed_with_signature` | withdrawal | On `LANDED`, mark `completed` with the observed signature (prevents double-credit). |
 | `drill_4_path_c_not_landed_re_arms_with_same_nonce` | withdrawal | Re-arm preserves `withdrawal_nonce`; nonce-uniqueness index still enforces. |
-| `drill_5_halt_sweep_excludes_poison_only` | withdrawal | Bulk-quarantine flips every active withdrawal except the excluded poison id. |
+| `drill_5_halt_sweep_excludes_poison_only` | withdrawal | Bulk-quarantine flips every active withdrawal at or above the nonce floor except the excluded poison id. |
 | `drill_6_recovery_query_skips_terminal_statuses` | withdrawal | Recovery query skips rows already resolved to a terminal status. |
 | `drill_7_halt_sweep_does_not_touch_terminals` | withdrawal | Bulk-quarantine leaves terminal-status rows alone. |
 | `drill_8_alertable_set_matches_runbook_dispatch` | both | Webhook fires on exactly `Failed`, `FailedReminted`, `ManualReview`. |
@@ -113,6 +113,7 @@ pins the relevant contract.
 | `drill_15_deposit_manual_review_recovery_idempotency_failure_flow` | deposit | `deposit_manual_review.md` § Path E: recovery-worker `deposit idempotency:` triage substring present in `recovery.rs`; re-arm SQL flips `manual_review` → `pending` and is row-scoped by id. |
 | `drill_16_withdrawal_manual_review_recovery_missing_nonce_flow` | withdrawal | `withdrawal_manual_review.md` § Path F: recovery-worker `withdrawal row missing nonce` triage substring present in `recovery.rs`; recovery branch SQL is row-scoped; no re-arm SQL exists for this path. |
 | `drill_17_deposit_manual_review_allowlist_gate_recovery_flows` | deposit | Allowlist-gate recovery flow in `deposit_manual_review.md` is in sync with source: triage strings still exist and recovery SQL is row-scoped. |
+| `drill_18_halt_sweep_respects_nonce_floor` | withdrawal | Halt sweep is bounded below by the poison nonce: sub-poison `pending`/`processing`/`parked` rows survive; the poison and everything above it are quarantined. |
 
 Trigger (`make` shorthand, runs from repo root):
 

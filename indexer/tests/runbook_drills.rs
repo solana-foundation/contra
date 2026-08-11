@@ -568,17 +568,18 @@ async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
 // ── Drill 5: pipeline halt sweep ────────────────────────────────────────────
 //
 // Verifies the bulk sweep used in `withdrawal_manual_review.md § Path A.halting`:
-// the operator's `quarantine_all_active_withdrawals` flips every Pending
-// or Processing withdrawal to ManualReview, with one row excluded. Drives
-// it via the actual storage method (not raw SQL) so a future change to
-// the implementation is caught.
+// the operator's `quarantine_active_withdrawals` flips every active
+// withdrawal at or above the poison nonce to ManualReview, with one row
+// excluded. The poison sits at nonce 1 and every other row is above it, so
+// the floor changes nothing here. Drives it via the actual storage method
+// (not raw SQL) so a future change to the implementation is caught.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn drill_5_halt_sweep_excludes_poison_only() -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "withdrawal_manual_review.md",
-        "Path A.halting - quarantine_all_active_withdrawals semantics",
+        "Path A.halting - quarantine_active_withdrawals semantics",
     );
 
     let (pool, storage, _pg) = start_postgres().await?;
@@ -596,9 +597,10 @@ async fn drill_5_halt_sweep_excludes_poison_only() -> Result<(), Box<dyn std::er
     }
     let completed_id = seed_withdrawal(&pool, "completed", 7, None).await?;
 
-    // Run the actual sweep used by the operator's halt path.
+    // Run the actual sweep used by the operator's halt path, with the floor
+    // the processor would pass: the poison row's own nonce.
     let affected = storage
-        .quarantine_all_active_withdrawals(Some(poison_id))
+        .quarantine_active_withdrawals(Some(poison_id), Some(1))
         .await?;
 
     // Should affect exactly the 5 pending+processing rows.
@@ -701,9 +703,10 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
 //
 // The glossary marks `completed`, `failed`, `failed_reminted`, and
 // `manual_review` as terminal. The halt sweep must not touch any of them.
-// This drill confirms the WHERE clause `status IN ('pending', 'processing')`
-// is the actual gate — change it to `status NOT IN ('completed', ...)` and
-// the runbook's terminality claim breaks.
+// This drill confirms the WHERE clause
+// `status IN ('pending', 'processing', 'parked')` is the actual gate.
+// Change it to `status NOT IN ('completed', ...)` and the runbook's
+// terminality claim breaks.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -723,7 +726,7 @@ async fn drill_7_halt_sweep_does_not_touch_terminals() -> Result<(), Box<dyn std
     // Plus one active row so the sweep has *something* to do.
     let active = seed_withdrawal(&pool, "pending", 5, None).await?;
 
-    let affected = storage.quarantine_all_active_withdrawals(None).await?;
+    let affected = storage.quarantine_active_withdrawals(None, None).await?;
     assert_eq!(
         affected, 1,
         "sweep should only touch the one Pending row; terminals are immune"
@@ -1740,5 +1743,83 @@ async fn drill_16_withdrawal_manual_review_recovery_missing_nonce_flow(
     );
 
     eprintln!("Path F triage substring + terminal SQL verified.");
+    Ok(())
+}
+
+// ── Drill 18: halt sweep respects the nonce floor ───────────────────────────
+//
+// `withdrawal_manual_review.md § Path A.halting` tells the operator that the
+// halt only terminalizes rows at or above the poison nonce, and that lower
+// rows are deliberately left `processing`/`parked` for the recovery worker.
+// Those lower rows are the sender-owned ones: flipping one to a terminal
+// status drops its later `Completed` write, and the next boot then rebuilds
+// an SMT root that disagrees with chain. This drill pins the floor against
+// real Postgres, including the `parked` arm the mock only approximates.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_18_halt_sweep_respects_nonce_floor() -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "withdrawal_manual_review.md",
+        "Path A.halting - sweep is bounded below by the poison nonce",
+    );
+
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // Below the floor: one row per active status, all releasable.
+    let below_pending = seed_withdrawal(&pool, "pending", 0, None).await?;
+    let below_processing = seed_withdrawal(&pool, "processing", 1, None).await?;
+    let below_parked = seed_withdrawal(&pool, "parked", 2, None).await?;
+    // The poison, already flipped by the per-row quarantine (as drill_5 seeds it).
+    let poison_id = seed_withdrawal(&pool, "manual_review", 3, Some("invalid_pubkey")).await?;
+    // Above the floor: these are the rows the halt is meant to stop.
+    let above_a = seed_withdrawal(&pool, "pending", 4, None).await?;
+    let above_b = seed_withdrawal(&pool, "pending", 5, None).await?;
+    // Terminal, never touched.
+    let completed_id = seed_withdrawal(&pool, "completed", 6, None).await?;
+
+    let affected = storage
+        .quarantine_active_withdrawals(Some(poison_id), Some(3))
+        .await?;
+
+    eprintln!("sweep affected {affected} rows (floor = nonce 3)");
+    assert_eq!(
+        affected, 2,
+        "only the two active rows above the poison nonce may be swept"
+    );
+
+    // Pre-fix this sweep flipped these three as well, which is the whole bug.
+    assert_eq!(
+        status_of(&pool, below_pending).await?,
+        "pending",
+        "nonce 0 is below the floor and must stay dequeuable"
+    );
+    assert_eq!(
+        status_of(&pool, below_processing).await?,
+        "processing",
+        "nonce 1 is sender-owned; recovery must still be able to promote it"
+    );
+    assert_eq!(
+        status_of(&pool, below_parked).await?,
+        "parked",
+        "nonce 2 belongs to the stale-parked sweep, not the halt"
+    );
+
+    assert_eq!(status_of(&pool, poison_id).await?, "manual_review");
+    assert_eq!(status_of(&pool, above_a).await?, "manual_review");
+    assert_eq!(status_of(&pool, above_b).await?, "manual_review");
+    assert_eq!(status_of(&pool, completed_id).await?, "completed");
+
+    // Discriminates the fix: the unbounded sweep leaves zero pending rows.
+    assert_eq!(
+        count_status(&pool, "pending").await?,
+        1,
+        "the sub-poison pending row must survive the halt"
+    );
+    assert_eq!(count_status(&pool, "processing").await?, 1);
+    assert_eq!(count_status(&pool, "parked").await?, 1);
+    assert_eq!(count_status(&pool, "manual_review").await?, 3);
+
+    eprintln!("Nonce floor verified: sub-poison rows survive, poison and above are quarantined.");
     Ok(())
 }

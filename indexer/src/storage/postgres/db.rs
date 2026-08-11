@@ -1603,13 +1603,19 @@ impl PostgresDb {
         Ok(result.rows_affected())
     }
 
-    /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.
+    /// Flip active withdrawals at or above `min_nonce` to `ManualReview`.
     ///
     /// `exclude_id` is the poison row that the caller has already quarantined
     /// via the async `storage_tx` writer. That update may not have hit the DB
-    /// yet when this sweep runs, so the row's status is still
-    /// `Pending`/`Processing` here; excluding it prevents a second
-    /// `ManualReview` webhook for the same transaction.
+    /// yet when this sweep runs, so the row's status is still active here;
+    /// excluding it prevents a second `ManualReview` webhook for the same
+    /// transaction.
+    ///
+    /// `min_nonce` is the poison row's own nonce. Bounding the sweep keeps
+    /// lower-nonce rows out of it: such a row may already be signed or
+    /// broadcast by the sender, and terminalizing one drops its later
+    /// `Completed` write. A NULL `withdrawal_nonce` never satisfies the
+    /// comparison, so such a row is left alone. `None` sweeps everything.
     ///
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
@@ -1620,15 +1626,16 @@ impl PostgresDb {
     /// require an `instance_pda` column on `transactions` that does not exist
     /// today.
     // Coverage-ignore rationale (category b, defensive recovery):
-    //   `quarantine_all_active_withdrawals_internal` is only invoked by
+    //   `quarantine_active_withdrawals_internal` is only invoked by
     //   the poison-pill pipeline in `operator/processor.rs`
-    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded —
-    //   integration tests do not produce malformed rows that would trip
+    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded.
+    //   Integration tests do not produce malformed rows that would trip
     //   it. The SQL itself is trivial; the behavior is covered via the
-    //   `Storage::Mock` variant in in-crate tests.
-    pub async fn quarantine_all_active_withdrawals_internal(
+    //   `Storage::Mock` variant in in-crate tests and by the runbook drills.
+    pub async fn quarantine_active_withdrawals_internal(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -1637,9 +1644,11 @@ impl PostgresDb {
             WHERE transaction_type = 'withdrawal'
               AND status IN ('pending', 'processing', 'parked')
               AND ($1::BIGINT IS NULL OR id <> $1)
+              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
             "#,
         )
         .bind(exclude_id)
+        .bind(min_nonce)
         .execute(&self.pool)
         .await?;
 

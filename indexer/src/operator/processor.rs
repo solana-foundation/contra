@@ -190,25 +190,23 @@ async fn quarantine_single(
 
 /// Halt the withdrawal pipeline after a poison-pill is detected.
 ///
-/// A quarantined withdrawal leaves a permanent nonce gap that the on-chain
-/// program rejects for every subsequent nonce in the same tree. Rather
-/// than bleed errors downstream, we stop cleanly:
-///   1. Quarantine any rows the fetcher already handed us (drain the rx).
-///   2. Flip every other `Pending`/`Processing` withdrawal in the DB to
-///      `ManualReview` so the fetcher has nothing left to pull.
+/// The tree rotates on boundary nonces, so draining on while a row waits on
+/// a human could rotate past that row's generation. The program then rejects
+/// its nonce for good and the re-arm path dies. Halting keeps the tree still:
+/// drain the fetcher channel, then flip remaining active rows at or above the
+/// poison's nonce to `ManualReview`.
 ///
-/// `poison_id` is the row the caller has already individually quarantined
-/// via `storage_tx`; it is excluded from the DB sweep so we don't fire a
-/// second `ManualReview` webhook for the same transaction if the async
-/// status update has not yet committed.
+/// The floor spares lower rows: one may already be signed or broadcast, and
+/// terminalizing it discards its later `Completed` write. Those stay
+/// `Processing`/`Parked` for the recovery worker to pick up.
 ///
-/// Recovery is manual — see the
-/// runbook `withdrawal_pipeline_halt_runbook.md`.
+/// `poison` supplies both the excluded id (no duplicate webhook) and the
+/// floor. Recovery is manual, see `withdrawal_manual_review.md`.
 async fn halt_withdrawal_pipeline(
     storage: &Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     fetcher_rx: &mut mpsc::Receiver<DbTransaction>,
-    poison_id: Option<i64>,
+    poison: Option<&DbTransaction>,
 ) {
     // Drain anything already delivered by the fetcher.  These rows were
     // flipped to `Processing` by `get_and_lock_pending_transactions` but
@@ -225,15 +223,22 @@ async fn halt_withdrawal_pipeline(
         drained += 1;
     }
 
-    // Sweep the rest of the pipeline: any row still `Pending` (never
-    // fetched) or `Processing` (locked but unsent, e.g. a sibling was mid-
-    // flight in another instance) is flipped to `ManualReview`.
-    match storage.quarantine_all_active_withdrawals(poison_id).await {
+    // Sweep the rest of the pipeline: any row at or above the poison's nonce
+    // still `Pending` (never fetched), `Processing` (locked but unsent) or
+    // `Parked` is flipped to `ManualReview`. A poison row with no nonce
+    // yields no floor, so the sweep stays unbounded.
+    let poison_id = poison.map(|txn| txn.id);
+    let min_nonce = poison.and_then(|txn| txn.withdrawal_nonce);
+    match storage
+        .quarantine_active_withdrawals(poison_id, min_nonce)
+        .await
+    {
         Ok(affected) => {
             warn!(
                 drained_from_channel = drained,
                 db_rows_quarantined = affected,
-                "Halted withdrawal pipeline; all active rows moved to ManualReview"
+                nonce_floor = min_nonce,
+                "Halted withdrawal pipeline; active rows at or above the poison nonce moved to ManualReview"
             );
         }
         Err(e) => {
@@ -244,7 +249,7 @@ async fn halt_withdrawal_pipeline(
             // the runbook.
             error!(
                 drained_from_channel = drained,
-                "quarantine_all_active_withdrawals failed: {}", e
+                "quarantine_active_withdrawals failed: {}", e
             );
         }
     }
@@ -624,7 +629,7 @@ pub async fn process_release_funds(
                         &storage,
                         &storage_tx,
                         &mut fetcher_rx,
-                        Some(transaction.id),
+                        Some(&transaction),
                     )
                     .await;
                     return Ok(());
@@ -1878,7 +1883,7 @@ mod tests {
     #[tokio::test]
     async fn halt_withdrawal_pipeline_db_failure_still_drains_channel() {
         let mock = MockStorage::new();
-        mock.set_should_fail("quarantine_all_active_withdrawals", true);
+        mock.set_should_fail("quarantine_active_withdrawals", true);
         let storage = Storage::Mock(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(4);
         let (fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
@@ -1901,6 +1906,75 @@ mod tests {
         let update = storage_rx.recv().await.expect("buffered row quarantined");
         assert_eq!(update.transaction_id, 42);
         assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    /// Seed an active withdrawal into the mock at the given id and nonce.
+    fn seed_active_withdrawal(
+        mock: &MockStorage,
+        id: i64,
+        nonce: Option<i64>,
+        status: TransactionStatus,
+    ) -> DbTransaction {
+        let mut txn = make_db_transaction(
+            id,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            nonce,
+            TransactionType::Withdrawal,
+        );
+        txn.status = status;
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+        txn
+    }
+
+    /// Rows below the poison nonce are the ones the sender already signed or
+    /// broadcast. Terminalizing one drops its later `Completed` write and
+    /// leaves the local tree disagreeing with chain, so the halt sweep has to
+    /// stop at the poison's own nonce.
+    #[tokio::test]
+    async fn halt_sweep_spares_withdrawals_below_poison_nonce() {
+        let mock = MockStorage::new();
+        seed_active_withdrawal(&mock, 10, Some(4), TransactionStatus::Processing);
+        let poison = seed_active_withdrawal(&mock, 11, Some(5), TransactionStatus::Processing);
+        seed_active_withdrawal(&mock, 12, Some(6), TransactionStatus::Pending);
+
+        let storage = Storage::Mock(mock);
+        let (storage_tx, _storage_rx) = mpsc::channel(4);
+        let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+
+        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, Some(&poison)).await;
+
+        let rows = match &storage {
+            Storage::Mock(m) => m.pending_transactions.lock().unwrap().clone(),
+            _ => unreachable!(),
+        };
+        let status_of = |id: i64| rows.iter().find(|t| t.id == id).unwrap().status;
+        assert_eq!(status_of(10), TransactionStatus::Processing);
+        assert_eq!(status_of(11), TransactionStatus::Processing);
+        assert_eq!(status_of(12), TransactionStatus::ManualReview);
+    }
+
+    /// A withdrawal reaching the halt with no nonce means the assign-nonce
+    /// trigger was bypassed, so the queue cannot be reasoned about at all.
+    /// The sweep stays unbounded in that case, which is fail-closed.
+    #[tokio::test]
+    async fn halt_sweep_with_null_poison_nonce_sweeps_everything() {
+        let mock = MockStorage::new();
+        let poison = seed_active_withdrawal(&mock, 20, None, TransactionStatus::Processing);
+        seed_active_withdrawal(&mock, 21, Some(3), TransactionStatus::Processing);
+
+        let storage = Storage::Mock(mock);
+        let (storage_tx, _storage_rx) = mpsc::channel(4);
+        let (_fetcher_tx, mut fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+
+        halt_withdrawal_pipeline(&storage, &storage_tx, &mut fetcher_rx, Some(&poison)).await;
+
+        let rows = match &storage {
+            Storage::Mock(m) => m.pending_transactions.lock().unwrap().clone(),
+            _ => unreachable!(),
+        };
+        let sibling = rows.iter().find(|t| t.id == 21).unwrap();
+        assert_eq!(sibling.status, TransactionStatus::ManualReview);
     }
 
     // ── process_release_funds: happy paths ──────────────────────────────
@@ -2368,8 +2442,8 @@ mod tests {
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
 
-        // Every Pending/Processing withdrawal in the mock DB is flipped to
-        // ManualReview by quarantine_all_active_withdrawals.
+        // Every seeded DB row sits above the poison's nonce, so the bounded
+        // sweep in quarantine_active_withdrawals still flips all of them.
         let mock_ref = match storage.as_ref() {
             Storage::Mock(m) => m,
             _ => unreachable!(),

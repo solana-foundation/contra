@@ -516,20 +516,32 @@ impl MockStorage {
             .collect())
     }
 
-    pub async fn quarantine_all_active_withdrawals(
+    pub async fn quarantine_active_withdrawals(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, StorageError> {
-        self.check_should_fail("quarantine_all_active_withdrawals")?;
+        self.check_should_fail("quarantine_active_withdrawals")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         let mut affected = 0u64;
         for txn in pending.iter_mut() {
+            // Mirror the SQL's active-status set: pending, processing, parked.
             let quarantinable = matches!(
                 txn.status,
-                TransactionStatus::Pending | TransactionStatus::Processing
+                TransactionStatus::Pending
+                    | TransactionStatus::Processing
+                    | TransactionStatus::Parked
             );
             let excluded = exclude_id.is_some_and(|id| txn.id == id);
-            if txn.transaction_type == TransactionType::Withdrawal && quarantinable && !excluded {
+            // A NULL nonce fails the SQL comparison, so it is never swept
+            // once a floor is set.
+            let above_floor = min_nonce
+                .is_none_or(|floor| txn.withdrawal_nonce.is_some_and(|nonce| nonce >= floor));
+            if txn.transaction_type == TransactionType::Withdrawal
+                && quarantinable
+                && !excluded
+                && above_floor
+            {
                 txn.status = TransactionStatus::ManualReview;
                 affected += 1;
             }

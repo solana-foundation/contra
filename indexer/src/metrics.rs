@@ -106,6 +106,18 @@ counter_vec!(
     &["program_type"]
 );
 
+// A status write matched no row because the transaction had already moved
+// off Processing. That is routine for most statuses and is not counted here;
+// only a skipped `Completed` increments, because it means an on-chain release
+// the DB will never record, which wedges the next boot's SMT root check.
+// Any nonzero sample needs a human.
+counter_vec!(
+    OPERATOR_DB_UPDATE_SKIPPED,
+    "private_channel_operator_db_updates_skipped_total",
+    "Completed status DB updates that matched no row",
+    &["program_type", "status"]
+);
+
 histogram_vec!(
     OPERATOR_RPC_SEND_DURATION,
     "private_channel_operator_rpc_send_duration_seconds",
@@ -199,6 +211,11 @@ pub fn init_labels(program_type: &str) {
         OPERATOR_DB_UPDATES.with_label_values(&[program_type, status]);
     }
 
+    // Only Completed is ever counted here. Seeding the other statuses would
+    // publish series that are pinned at zero by construction, which reads on
+    // a dashboard as "no skips happened" rather than "never measured".
+    OPERATOR_DB_UPDATE_SKIPPED.with_label_values(&[program_type, "Completed"]);
+
     for result in &["success", "failure", "error"] {
         OPERATOR_RPC_SEND_DURATION.with_label_values(&[program_type, result]);
     }
@@ -268,6 +285,7 @@ pub fn init() {
         INDEXER_SLOT_PROCESSING_DURATION,
         OPERATOR_TRANSACTIONS_FETCHED,
         OPERATOR_DB_UPDATES,
+        OPERATOR_DB_UPDATE_SKIPPED,
         OPERATOR_DB_UPDATE_ERRORS,
         OPERATOR_RPC_SEND_DURATION,
         OPERATOR_TRANSACTION_ERRORS,

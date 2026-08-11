@@ -25,7 +25,7 @@ pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
-pub mod quarantine_all_active_withdrawals;
+pub mod quarantine_active_withdrawals;
 pub mod record_remint_result;
 pub mod sender_lock;
 pub mod set_mint_extension_flags;
@@ -321,19 +321,23 @@ impl Storage {
         sender_lock::try_acquire_sender_lock(self, key).await
     }
 
-    /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.
+    /// Mark active withdrawal rows at or above `min_nonce` as `ManualReview`.
     ///
-    /// Invoked by the processor when a single withdrawal is unprocessable:
-    /// the whole withdrawal pipeline halts so a human can inspect and
-    /// decide on rotation/reinsert before drains resume. `exclude_id` is
-    /// the poison row already quarantined through the async status-update
-    /// channel — excluding it here avoids a duplicate webhook. Returns the
-    /// number of rows flipped.
-    pub async fn quarantine_all_active_withdrawals(
+    /// Invoked by the processor when a single withdrawal is unprocessable.
+    /// The pipeline halts so the withdrawal tree cannot rotate past the
+    /// quarantined row's generation, which would make its nonce permanently
+    /// unreleasable and remove the operator's re-arm option. `min_nonce`
+    /// keeps the sweep off lower rows that are still releasable; `None`
+    /// sweeps every active row. `exclude_id` is the poison row already
+    /// quarantined through the async status-update channel, excluded here
+    /// to avoid a duplicate webhook. Returns the number of rows flipped.
+    pub async fn quarantine_active_withdrawals(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, StorageError> {
-        quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
+        quarantine_active_withdrawals::quarantine_active_withdrawals(self, exclude_id, min_nonce)
+            .await
     }
 
     /// Stale `Processing` rows of one type past the threshold (used by recovery).
@@ -969,13 +973,13 @@ mod tests {
         assert_eq!(mock.inserted_transactions.lock().unwrap().len(), 1);
     }
 
-    // ── quarantine_all_active_withdrawals ─────────────────────────────
+    // ── quarantine_active_withdrawals ─────────────────────────────
 
     /// Only Pending and Processing withdrawals flip to ManualReview.
     /// Returns the exact number of rows affected so the caller can log
     /// the blast radius.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_flips_pending_and_processing_only() {
+    async fn quarantine_active_withdrawals_flips_pending_and_processing_only() {
         let (storage, mock) = make_mock_storage();
         {
             let mut db = mock.pending_transactions.lock().unwrap();
@@ -992,7 +996,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 2);
@@ -1007,7 +1011,7 @@ mod tests {
     /// poisoned withdrawal must not strand deposits, which have no nonce
     /// and no gap semantics.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_leaves_deposits_untouched() {
+    async fn quarantine_active_withdrawals_leaves_deposits_untouched() {
         let (storage, mock) = make_mock_storage();
         {
             let mut db = mock.pending_transactions.lock().unwrap();
@@ -1023,7 +1027,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 1);
@@ -1046,7 +1050,7 @@ mod tests {
     /// are left alone so the webhook does not re-alert on already-handled
     /// rows.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_leaves_terminal_rows_untouched() {
+    async fn quarantine_active_withdrawals_leaves_terminal_rows_untouched() {
         let (storage, mock) = make_mock_storage();
         let terminal = [
             TransactionStatus::Completed,
@@ -1066,7 +1070,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 0);
@@ -1080,24 +1084,106 @@ mod tests {
     /// Storage-level failure surfaces as an `Err` so the processor can log
     /// and continue the channel drain without silent loss.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_propagates_mock_failure() {
+    async fn quarantine_active_withdrawals_propagates_mock_failure() {
         let (storage, mock) = make_mock_storage();
-        mock.set_should_fail("quarantine_all_active_withdrawals", true);
+        mock.set_should_fail("quarantine_active_withdrawals", true);
         assert!(storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .is_err());
     }
 
     /// The empty-DB case returns `0` — a successful no-op, not an error.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_empty_db_returns_zero() {
+    async fn quarantine_active_withdrawals_empty_db_returns_zero() {
         let (storage, _mock) = make_mock_storage();
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 0);
+    }
+
+    /// `Parked` is an active status the SQL sweeps alongside Pending and
+    /// Processing, so the mock has to sweep it too or every unit test in
+    /// this module pins a contract production does not implement.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_flips_parked_rows() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut parked = make_db_transaction();
+            parked.transaction_type = TransactionType::Withdrawal;
+            parked.status = TransactionStatus::Parked;
+            parked.withdrawal_nonce = Some(1);
+            db.push(parked);
+        }
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::ManualReview);
+    }
+
+    /// Seed three active withdrawals at nonces 1, 2 and 3.
+    fn seed_three_active_withdrawals(mock: &MockStorage) {
+        let mut db = mock.pending_transactions.lock().unwrap();
+        for nonce in 1..=3 {
+            let mut txn = make_db_transaction();
+            txn.id = nonce;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Pending;
+            txn.withdrawal_nonce = Some(nonce);
+            db.push(txn);
+        }
+    }
+
+    /// Rows below the poison nonce are releasable and sender-owned, so the
+    /// halt sweep must leave them alone.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_min_nonce_leaves_lower_rows_untouched() {
+        let (storage, mock) = make_mock_storage();
+        seed_three_active_withdrawals(&mock);
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(affected, 2);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        let low = rows.iter().find(|t| t.withdrawal_nonce == Some(1)).unwrap();
+        assert_eq!(low.status, TransactionStatus::Pending);
+        for nonce in [2, 3] {
+            let row = rows
+                .iter()
+                .find(|t| t.withdrawal_nonce == Some(nonce))
+                .unwrap();
+            assert_eq!(row.status, TransactionStatus::ManualReview);
+        }
+    }
+
+    /// A `None` floor keeps the original unbounded sweep, which is the
+    /// fail-closed fallback for a poison row that has no nonce at all.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_none_min_nonce_sweeps_all() {
+        let (storage, mock) = make_mock_storage();
+        seed_three_active_withdrawals(&mock);
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+        assert_eq!(affected, 3);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        for txn in rows.iter() {
+            assert_eq!(txn.status, TransactionStatus::ManualReview);
+        }
     }
 
     // ── insert_mint_statuses_batch ────────────────────────────────────
@@ -1404,7 +1490,7 @@ mod tests {
     /// the caller has already quarantined it via the async status-update
     /// channel and a second flip here would fire a duplicate webhook.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_exclude_id_skips_poison_row() {
+    async fn quarantine_active_withdrawals_exclude_id_skips_poison_row() {
         let (storage, mock) = make_mock_storage();
         {
             let mut db = mock.pending_transactions.lock().unwrap();
@@ -1423,7 +1509,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(Some(42))
+            .quarantine_active_withdrawals(Some(42), None)
             .await
             .unwrap();
         assert_eq!(affected, 1);

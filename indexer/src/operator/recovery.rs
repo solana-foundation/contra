@@ -28,9 +28,9 @@ pub(crate) const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// Per-tick batch cap; leftovers are picked up next tick.
 pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 
-/// Batches of `RECOVERY_BATCH_LIMIT` the stalled-withdrawal sweep will page
-/// through in one pass before deferring the rest to the next tick.
-const MAX_RECONCILE_BATCHES: usize = 10;
+/// Stalled withdrawals examined in one sweep before the depth is worth a warning.
+/// Purely an observability threshold: the sweep never stops early on it.
+const RECONCILE_BACKLOG_WARN_AT: usize = 1_000;
 
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
 const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
@@ -236,18 +236,24 @@ pub(crate) async fn reconcile_landed_withdrawals(
         }
     };
 
-    // Page forward by id instead of taking one capped batch. A row that does not
-    // classify is deliberately left untouched, so it stays in this set for good;
-    // a fixed window would hand back the same blocked rows every sweep and hide
-    // every row behind them, including a landed one still wedging the boot gate.
+    // Page forward by id to exhaustion, in batches only to bound each query.
+    //
+    // Deliberately uncapped. Rows that do not classify are left untouched by
+    // design, so nothing ever drains this set on its own; any per-sweep cap is
+    // a permanent blind spot for every row behind it, and the cursor restarts
+    // at zero on the next sweep so the same prefix is rescanned forever. The
+    // one row that matters most, a landed release still wedging the boot gate,
+    // is exactly the row a cap would hide. Work is proportional to the stalled
+    // backlog, which is empty in steady state and is precisely the set that
+    // needs examining when it is not.
     let mut after_id = 0i64;
     let mut scanned = 0usize;
-    for _ in 0..MAX_RECONCILE_BATCHES {
+    loop {
         let batch = storage
             .get_stalled_withdrawals_with_signatures(from_status, after_id, RECOVERY_BATCH_LIMIT)
             .await?;
         if batch.is_empty() {
-            return Ok(());
+            break;
         }
         debug!(
             count = batch.len(),
@@ -255,8 +261,8 @@ pub(crate) async fn reconcile_landed_withdrawals(
             ?from_status,
             "Reconcile sweep found stalled withdrawals with stored signatures"
         );
-        scanned += batch.len();
         let exhausted = batch.len() < RECOVERY_BATCH_LIMIT as usize;
+        scanned += batch.len();
 
         for row in batch {
             if cancellation_token.is_cancelled() {
@@ -283,17 +289,20 @@ pub(crate) async fn reconcile_landed_withdrawals(
         }
 
         if exhausted {
-            return Ok(());
+            break;
         }
     }
 
-    // Never truncate silently: at this depth the backlog is an incident of its
-    // own, and the operator needs to know the tail went unexamined this tick.
-    warn!(
-        scanned,
-        ?from_status,
-        "Reconcile sweep hit its batch budget; remaining stalled rows deferred to the next tick"
-    );
+    // A backlog this deep is an incident of its own: every row in it is a
+    // withdrawal that failed and could not be resolved, and each costs an RPC
+    // round trip per sweep. Surface it rather than let the cost stay invisible.
+    if scanned >= RECONCILE_BACKLOG_WARN_AT {
+        warn!(
+            scanned,
+            ?from_status,
+            "Reconcile sweep examined an unusually deep stalled-withdrawal backlog"
+        );
+    }
     Ok(())
 }
 
@@ -1371,6 +1380,63 @@ mod tests {
         row.remint_last_valid_block_heights = Some(vec![100; sigs.len()]);
         row.remint_signatures = Some(sigs.to_vec());
         row
+    }
+
+    /// A backlog of rows that can never classify must not hide the rows behind
+    /// it, at any depth. Nothing writes to them, so they stay in the set for
+    /// good and the cursor restarts at zero every sweep; a per-sweep cap would
+    /// leave the landed row below permanently unreachable.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_pages_past_a_backlog_larger_than_any_batch_budget() {
+        let landed_sig = Signature::new_unique().to_string();
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+
+        let mock = MockStorage::new();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            // Well past ten batches of RECOVERY_BATCH_LIMIT. Each parses to
+            // nothing, so it is fetched, skipped, and never costs an RPC.
+            for id in 1..=1_200 {
+                db.push(stalled_withdrawal(
+                    id,
+                    TransactionStatus::ManualReview,
+                    &["not-a-signature".to_string()],
+                ));
+            }
+            db.push(stalled_withdrawal(
+                9_999,
+                TransactionStatus::ManualReview,
+                std::slice::from_ref(&landed_sig),
+            ));
+        }
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        let target = after.iter().find(|t| t.id == 9_999).unwrap();
+        assert_eq!(
+            target.status,
+            TransactionStatus::Completed,
+            "the landed row must be reached however deep the unclearable backlog is"
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|t| t.id <= 1_200)
+                .all(|t| t.status == TransactionStatus::ManualReview),
+            "rows that cannot classify stay exactly where they are"
+        );
     }
 
     fn cleared_metric(outcome: &str) -> f64 {

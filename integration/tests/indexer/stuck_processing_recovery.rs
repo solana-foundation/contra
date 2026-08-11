@@ -1498,3 +1498,105 @@ async fn it15_manual_review_without_signatures_stays_quarantined() {
     );
     mock.shutdown().await;
 }
+
+// IT-16: the boot pre-flight's own path, against real Postgres. A PendingRemint
+// withdrawal whose release finalized is promoted, and the nonce then appears in
+// the completed set the SMT gate rebuilds from. That last assertion is the whole
+// point: it proves the promotion feeds the exact query that refuses the boot,
+// which the MockStorage unit test cannot show.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it16_pending_remint_landed_release_enters_completed_nonce_set() {
+    let (db, url, _container) = start_pg("it16_preflight").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 30);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // The insert omits withdrawal_nonce, so a trigger assigns it from a sequence.
+    // Read back the value the row actually holds rather than the seeded one.
+    let nonce_u64 =
+        sqlx::query_scalar::<_, i64>("SELECT withdrawal_nonce FROM transactions WHERE id = $1")
+            .bind(tx_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap() as u64;
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The release broadcast that could not be confirmed, parked for a later check.
+    let landed_sig = Signature::new_unique();
+    storage
+        .set_pending_remint(
+            tx_id,
+            vec![landed_sig.to_string()],
+            vec![100],
+            Utc::now() + ChronoDuration::seconds(32),
+        )
+        .await
+        .unwrap();
+
+    // The wedge: the chain has this nonce, the completed set the gate rebuilds
+    // from does not, so validate_smt_root would diverge and refuse to start.
+    assert!(
+        !storage
+            .get_completed_withdrawal_nonces(0, 1000)
+            .await
+            .unwrap()
+            .contains(&nonce_u64),
+        "a pending_remint row must start outside the completed set"
+    );
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
+    );
+    let client = test_client(mock.url());
+    let metric_before = snapshot_recovered("withdraw", "pending_remint_cleared", "withdrawal");
+
+    test_hooks::reconcile_stalled_withdrawals_once(
+        &storage,
+        &client,
+        private_channel_indexer::storage::TransactionStatus::PendingRemint,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(landed_sig.to_string())
+    );
+    assert!(
+        storage
+            .get_completed_withdrawal_nonces(0, 1000)
+            .await
+            .unwrap()
+            .contains(&nonce_u64),
+        "the promoted nonce must now be in the set the SMT gate rebuilds from, \
+         or the boot would still refuse to start"
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment(
+        "withdraw",
+        "pending_remint_cleared",
+        "withdrawal",
+        metric_before,
+        "IT-16",
+    );
+    mock.shutdown().await;
+}

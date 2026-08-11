@@ -750,6 +750,18 @@ pub mod test_hooks {
         )
         .await
     }
+
+    /// Drive one stalled-withdrawal reconcile pass, exactly as the boot
+    /// pre-flight does for `PendingRemint` and the periodic tick does for
+    /// `ManualReview`.
+    pub async fn reconcile_stalled_withdrawals_once(
+        storage: &Storage,
+        rpc_client: &RpcClientWithRetry,
+        from_status: TransactionStatus,
+    ) -> Result<(), OperatorError> {
+        let token = CancellationToken::new();
+        reconcile_landed_withdrawals(storage, rpc_client, from_status, &token).await
+    }
 }
 
 #[cfg(test)]

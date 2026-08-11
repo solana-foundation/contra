@@ -21,7 +21,7 @@ The gateway acts as a pure HTTP reverse proxy: it inspects the request body to f
 The gateway enforces RBAC on a fixed list of methods (`gateway/src/auth.rs`):
 
 - **Operator-only methods:** `getBlock`, `getTransaction`, `simulateTransaction`. Missing/invalid JWT → 401 with JSON-RPC body `{"error":{"code":-32001,"message":"Unauthorized: valid JWT required"}}`. User-role JWT → 403 with `-32003` ("operator role required").
-- **Account-gated methods:** `getAccountInfo`, `getTokenAccountBalance`, `getSignaturesForAddress`. JWT required. Operator role → pass through. User role → the gateway fetches the target account via an internal `getAccountInfo` and inspects bytes for the SPL Token owner field and looks the pubkey up in the auth service's Postgres `verified_wallets` table. Mismatch → 403, `-32002` ("account not owned by caller"). DB error → 500, `-32603`. Missing pubkey in params → 400, `-32602`.
+- **Account-gated methods:** `getAccountInfo`, `getTokenAccountBalance`, `getSignaturesForAddress`. JWT required. Operator role → pass through. User role → the gateway fetches the target account via an internal `getAccountInfo` and inspects bytes for the SPL Token owner field and looks the pubkey up in the auth service's Postgres `verified_wallets` table. Mismatch → 403, `-32002` ("account not owned by caller"). DB error → 500, `-32603`. Missing pubkey in params → 400, `-32602`. Read node unreachable, slow, or answering with an error → 503, `-32004`, which is retryable where 403 is not.
 - **All other methods (17 of them) are unauthenticated** even with auth on - they pass straight through to the read or write node.
 
 ---

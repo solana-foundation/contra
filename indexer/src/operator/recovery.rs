@@ -163,6 +163,27 @@ async fn recover_once(
         }
         requeue_parked(storage, &row, program_type).await;
     }
+
+    // `manual_review` has no owner, so re-checking it every tick is free of
+    // contention. `pending_remint` is deliberately absent here: the sender owns
+    // those rows and may have a remint in flight, so they are reconciled once at
+    // boot, before the sender exists.
+    //
+    // Best-effort: this runs at the tail of every tick, including inside the
+    // bounded boot-reconcile loop, so propagating an error here would cost the
+    // remaining passes of Processing reconciliation over a transient DB blip.
+    if program_type == ProgramType::Withdraw {
+        if let Err(e) = reconcile_landed_withdrawals(
+            storage,
+            rpc_client,
+            TransactionStatus::ManualReview,
+            cancellation_token,
+        )
+        .await
+        {
+            warn!("Stalled-withdrawal reconcile failed: {}", e);
+        }
+    }
     Ok(())
 }
 
@@ -184,6 +205,148 @@ fn role_owns(program_type: ProgramType, row: &DbTransaction) -> bool {
         );
     }
     owned
+}
+
+/// Clear withdrawals stalled in `from_status` whose stored release signatures
+/// prove the release finalized on-chain.
+///
+/// Only `SigFinality::Landed` writes. Rows quarantined on a structural problem
+/// carry no signatures, are filtered out by the query, and stay for a human;
+/// rows quarantined on a transient one clear themselves once the chain catches
+/// up. That asymmetry is the whole reason this is safe to run unattended.
+pub(crate) async fn reconcile_landed_withdrawals(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+    from_status: TransactionStatus,
+    cancellation_token: &CancellationToken,
+) -> Result<(), OperatorError> {
+    let outcome_label = match from_status {
+        TransactionStatus::ManualReview => "manual_review_cleared",
+        TransactionStatus::PendingRemint => "pending_remint_cleared",
+        other => {
+            warn!(
+                ?other,
+                "Stalled-withdrawal reconcile called with an unsupported status"
+            );
+            return Ok(());
+        }
+    };
+
+    let stalled = storage
+        .get_stalled_withdrawals_with_signatures(from_status, RECOVERY_BATCH_LIMIT)
+        .await?;
+    if stalled.is_empty() {
+        return Ok(());
+    }
+    debug!(
+        count = stalled.len(),
+        ?from_status,
+        "Reconcile sweep found stalled withdrawals with stored signatures"
+    );
+
+    for row in stalled {
+        if cancellation_token.is_cancelled() {
+            info!("Reconcile sweep cancelled; remaining stalled rows deferred");
+            return Ok(());
+        }
+        // The query is withdrawal-only, so this is the same belt-and-braces gate
+        // the other sweeps use: never classify a row against the wrong chain.
+        if !role_owns(ProgramType::Withdraw, &row) {
+            continue;
+        }
+        let Some(pending) = row_pending_sigs(&row) else {
+            continue;
+        };
+        let SigFinality::Landed(signature) =
+            classify_release_signatures(rpc_client, &pending).await
+        else {
+            continue;
+        };
+        promote_stalled_row(storage, &row, from_status, outcome_label, signature).await;
+    }
+    Ok(())
+}
+
+/// Parse a stalled row's stored signatures into `PendingSig`s. Corrupt or
+/// misaligned columns yield `None` so the row is skipped rather than promoted.
+fn row_pending_sigs(row: &DbTransaction) -> Option<Vec<PendingSig>> {
+    let sigs = row.remint_signatures.as_ref()?;
+    let heights = row.remint_last_valid_block_heights.as_ref()?;
+    if sigs.len() != heights.len() {
+        warn!(
+            transaction_id = row.id,
+            "Stalled withdrawal has mismatched signature and block-height columns; skipping"
+        );
+        return None;
+    }
+    let mut pending = Vec::with_capacity(sigs.len());
+    for (sig_str, lvbh) in sigs.iter().zip(heights) {
+        let signature = match Signature::from_str(sig_str) {
+            Ok(signature) => signature,
+            Err(e) => {
+                warn!(
+                    transaction_id = row.id,
+                    "Stalled withdrawal has a malformed stored signature {sig_str}: {e}"
+                );
+                return None;
+            }
+        };
+        // A negative height is corrupt, not a very large one; casting would
+        // wrap it into a height no chain ever reaches.
+        let Ok(last_valid_block_height) = u64::try_from(*lvbh) else {
+            warn!(
+                transaction_id = row.id,
+                "Stalled withdrawal has a negative stored block height {lvbh}; skipping"
+            );
+            return None;
+        };
+        pending.push(PendingSig {
+            signature,
+            last_valid_block_height,
+        });
+    }
+    Some(pending)
+}
+
+/// CAS a proven-landed stalled row to `Completed`, then log and count it.
+async fn promote_stalled_row(
+    storage: &Storage,
+    row: &DbTransaction,
+    from_status: TransactionStatus,
+    outcome_label: &str,
+    signature: Signature,
+) {
+    let signature = signature.to_string();
+    match storage
+        .try_complete_stalled_withdrawal(
+            row.id,
+            row.updated_at,
+            from_status,
+            Some(signature.clone()),
+        )
+        .await
+    {
+        // Loud on purpose: a status that means "a human decided this needs
+        // eyes" just cleared itself, and the on-call should see why.
+        Ok(true) => {
+            warn!(
+                transaction_id = row.id,
+                ?from_status,
+                signature,
+                "Reconcile promoted a stalled withdrawal to Completed on finalized on-chain proof"
+            );
+            // Both call sites gate on the withdraw operator, so the
+            // program-type label is fixed rather than threaded through.
+            OPERATOR_STALE_PROCESSING_RECOVERED
+                .with_label_values(&[pt_label(ProgramType::Withdraw), outcome_label, "withdrawal"])
+                .inc();
+        }
+        Ok(false) => debug!(
+            id = row.id,
+            "reconcile skipped, another writer touched the row first"
+        ),
+        Err(e) => warn!(id = row.id, "reconcile write error: {}", e),
+    }
 }
 
 async fn decide_action(
@@ -324,6 +487,34 @@ async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>
     Ok(pending)
 }
 
+/// Split a row's journalled release signatures into the two parallel arrays the
+/// quarantine CAS stores. The inner `(None, None)` means there was nothing worth
+/// recording, which leaves the columns untouched.
+///
+/// An outer `None` means the read failed and the caller must defer. Quarantining
+/// blind is irreversible: the journal is GC'd as soon as the row leaves
+/// `Processing`, so a transient read error would otherwise destroy the row's only
+/// evidence and make it permanently unreconcilable.
+async fn stored_release_signatures(
+    storage: &Storage,
+    id: i64,
+) -> Option<(Option<Vec<String>>, Option<Vec<i64>>)> {
+    match storage.get_release_signatures(id).await {
+        Ok(stored) if stored.is_empty() => Some((None, None)),
+        Ok(stored) => {
+            let (sigs, heights): (Vec<String>, Vec<i64>) = stored.into_iter().unzip();
+            Some((Some(sigs), Some(heights)))
+        }
+        Err(e) => {
+            warn!(
+                id,
+                "deferring quarantine, release signature read failed: {}", e
+            );
+            None
+        }
+    }
+}
+
 fn pt_label(program_type: ProgramType) -> &'static str {
     match program_type {
         ProgramType::Escrow => "escrow",
@@ -422,9 +613,22 @@ async fn route_outcome(
             );
         }
         RecoveryAction::Quarantine { reason } => {
+            // The journal these came from is GC'd as soon as the row leaves
+            // Processing, so a quarantined withdrawal keeps its own copy or the
+            // evidence is gone before anything can re-check it.
+            let (sigs, heights) = match row.transaction_type {
+                TransactionType::Withdrawal => {
+                    match stored_release_signatures(storage, row.id).await {
+                        Some(columns) => columns,
+                        // Retry next tick rather than spend the row's evidence.
+                        None => return,
+                    }
+                }
+                TransactionType::Deposit => (None, None),
+            };
             // Noisy by design — page on uncertainty, never silently demote.
             match storage
-                .try_quarantine_processing(row.id, captured_updated_at)
+                .try_quarantine_processing(row.id, captured_updated_at, sigs, heights)
                 .await
             {
                 Ok(true) => {
@@ -1059,6 +1263,347 @@ mod tests {
         assert_eq!(
             update.error_message.as_deref(),
             Some("withdrawal row missing nonce")
+        );
+    }
+
+    /// A quarantined withdrawal must keep its release signatures on the row,
+    /// because the journal they came from is GC'd on the next sweep. Deposits
+    /// have no such reader, so their columns stay untouched.
+    #[tokio::test]
+    async fn quarantine_persists_release_signatures_for_withdrawals_only() {
+        let mock = MockStorage::new();
+        let mut withdrawal = make_withdrawal_row(10, Some(5));
+        withdrawal.status = TransactionStatus::Processing;
+        let mut deposit = make_deposit_row(11);
+        deposit.status = TransactionStatus::Processing;
+        let w_captured = seed_processing_row(&mock, withdrawal.clone()).await;
+        let d_captured = seed_processing_row(&mock, deposit.clone()).await;
+        let w_sig = Signature::new_unique().to_string();
+        mock.insert_release_signature(withdrawal.id, w_sig.clone(), 4242)
+            .await
+            .unwrap();
+        mock.insert_release_signature(deposit.id, Signature::new_unique().to_string(), 99)
+            .await
+            .unwrap();
+
+        let storage = Storage::Mock(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(8);
+        for (row, captured) in [(&withdrawal, w_captured), (&deposit, d_captured)] {
+            route_outcome(
+                &storage,
+                row,
+                captured,
+                RecoveryAction::Quarantine {
+                    reason: "could not verify release landed (rpc down)".to_string(),
+                },
+                ProgramType::Withdraw,
+                &storage_tx,
+            )
+            .await;
+        }
+
+        let after = mock.pending_transactions.lock().unwrap();
+        let stored = after.iter().find(|t| t.id == withdrawal.id).unwrap();
+        assert_eq!(stored.status, TransactionStatus::ManualReview);
+        assert_eq!(stored.remint_signatures.as_deref(), Some(&[w_sig][..]));
+        assert_eq!(
+            stored.remint_last_valid_block_heights.as_deref(),
+            Some(&[4242i64][..])
+        );
+
+        let deposit_row = after.iter().find(|t| t.id == deposit.id).unwrap();
+        assert_eq!(deposit_row.status, TransactionStatus::ManualReview);
+        assert!(
+            deposit_row.remint_signatures.is_none()
+                && deposit_row.remint_last_valid_block_heights.is_none(),
+            "the deposit path must not start writing withdrawal remint columns"
+        );
+    }
+
+    // ── stalled-withdrawal reconcile ─────────────────────────────────
+
+    /// A withdrawal stalled in `status` with its release signatures on the row.
+    fn stalled_withdrawal(id: i64, status: TransactionStatus, sigs: &[String]) -> DbTransaction {
+        let mut row = make_withdrawal_row(id, Some(id));
+        row.status = status;
+        row.remint_last_valid_block_heights = Some(vec![100; sigs.len()]);
+        row.remint_signatures = Some(sigs.to_vec());
+        row
+    }
+
+    fn cleared_metric(outcome: &str) -> f64 {
+        OPERATOR_STALE_PROCESSING_RECOVERED
+            .with_label_values(&["withdraw", outcome, "withdrawal"])
+            .get()
+    }
+
+    /// Mock a finalized-but-failed `getSignatureStatuses`, the only shape that
+    /// classifies `Dead` without a block-height round trip.
+    fn mock_finalized_failure(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .create()
+    }
+
+    /// Proven-landed evidence promotes the row and records the landed signature.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_promotes_manual_review_on_finalized_success() {
+        let landed_sig = Signature::new_unique().to_string();
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+
+        let mock = MockStorage::new();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(stalled_withdrawal(
+                1,
+                TransactionStatus::ManualReview,
+                std::slice::from_ref(&landed_sig),
+            ));
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let before = cleared_metric("manual_review_cleared");
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(after[0].status, TransactionStatus::Completed);
+        assert_eq!(
+            after[0].counterpart_signature.as_deref(),
+            Some(landed_sig.as_str())
+        );
+        assert_eq!(
+            cleared_metric("manual_review_cleared"),
+            before + 1.0,
+            "a cleared row must be visible as its own metric series"
+        );
+    }
+
+    /// Seed one stalled row, serve `setup`'s RPC shape, and assert nothing moved.
+    async fn assert_not_promoted(
+        label: &str,
+        setup: impl FnOnce(&mut mockito::ServerGuard) -> Vec<mockito::Mock>,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = setup(&mut server);
+
+        let mock = MockStorage::new();
+        let row = stalled_withdrawal(
+            1,
+            TransactionStatus::ManualReview,
+            &[Signature::new_unique().to_string()],
+        );
+        let seeded_updated_at = row.updated_at;
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let before = cleared_metric("manual_review_cleared");
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::ManualReview,
+            "{label}: only proven-landed evidence may clear a quarantine"
+        );
+        assert_eq!(
+            after[0].updated_at, seeded_updated_at,
+            "{label}: a non-landed verdict must not write to the row at all"
+        );
+        assert_eq!(
+            cleared_metric("manual_review_cleared"),
+            before,
+            "{label}: no write means no metric"
+        );
+    }
+
+    /// The load-bearing safety property: everything short of proof is a no-op.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_leaves_row_on_every_non_landed_verdict() {
+        // Live: no status entry yet and the blockhash has not expired.
+        assert_not_promoted("live", |server| {
+            vec![mock_null_status(server), mock_block_height(server, 0)]
+        })
+        .await;
+        assert_not_promoted("dead", |server| vec![mock_finalized_failure(server)]).await;
+        assert_not_promoted("uncertain", |server| {
+            vec![server
+                .mock("POST", "/")
+                .with_status(500)
+                .with_body("internal server error")
+                .create()]
+        })
+        .await;
+    }
+
+    /// Corrupt evidence must be inert: no panic, no RPC, and no promotion.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_skips_unparseable_stored_signature() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
+            )
+            .expect(0)
+            .create();
+
+        let mock = MockStorage::new();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(stalled_withdrawal(
+                1,
+                TransactionStatus::ManualReview,
+                &["not-a-valid-base58-signature".to_string()],
+            ));
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::ManualReview
+        );
+        status.assert();
+    }
+
+    /// A negative stored block height cannot be a real one, so the row is
+    /// skipped rather than sign-wrapped into a height no chain will reach.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_skips_negative_block_height() {
+        let mut server = mockito::Server::new_async().await;
+        let status = mock_finalized_status(&mut server).expect(0);
+
+        let mock = MockStorage::new();
+        let mut row = stalled_withdrawal(
+            1,
+            TransactionStatus::ManualReview,
+            &[Signature::new_unique().to_string()],
+        );
+        row.remint_last_valid_block_heights = Some(vec![-1]);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::ManualReview
+        );
+        status.assert();
+    }
+
+    /// The sweep runs at the tail of every tick, including inside the bounded
+    /// boot-reconcile loop. A failure there must not abort the tick and cost
+    /// the remaining passes of Processing reconciliation.
+    #[tokio::test]
+    async fn recover_once_tolerates_reconcile_query_failure() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("get_stalled_withdrawals_with_signatures", true);
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        let result = recover_once(
+            &storage,
+            &client,
+            ProgramType::Withdraw,
+            &storage_tx,
+            &CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a reconcile query failure must not abort the tick: {result:?}"
+        );
+    }
+
+    /// Quarantining without the evidence is irreversible: the journal is GC'd
+    /// on the next tick, so the row could never be auto-reconciled again.
+    /// A read failure must defer the quarantine, not spend the row's evidence.
+    #[tokio::test]
+    async fn quarantine_defers_when_release_signature_read_fails() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(12, Some(6));
+        row.status = TransactionStatus::Processing;
+        let captured = seed_processing_row(&mock, row.clone()).await;
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        mock.set_should_fail("get_release_signatures", true);
+        let storage = Storage::Mock(mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        route_outcome(
+            &storage,
+            &row,
+            captured,
+            RecoveryAction::Quarantine {
+                reason: "could not verify release landed (rpc down)".to_string(),
+            },
+            ProgramType::Withdraw,
+            &storage_tx,
+        )
+        .await;
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Processing,
+            "the row must stay Processing so the next tick can retry with evidence"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a deferred quarantine must not fire the manual-review alert"
         );
     }
 

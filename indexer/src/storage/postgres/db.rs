@@ -1389,15 +1389,26 @@ impl PostgresDb {
     }
 
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    ///
+    /// The optional signature arrays are persisted by the same statement rather
+    /// than a preceding one. Splitting them is not merely slower, it cannot
+    /// work: the `updated_at` trigger fires on the first write, after which this
+    /// statement's `updated_at` compare can never match and the row would be
+    /// stranded in `processing` forever. `COALESCE` keeps a `None` call inert,
+    /// so callers with no evidence to record leave both columns as they were.
     pub async fn try_quarantine_processing_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE transactions
             SET status = 'manual_review',
+                remint_signatures = COALESCE($3, remint_signatures),
+                remint_last_valid_block_heights = COALESCE($4, remint_last_valid_block_heights),
                 processed_at = NOW()
             WHERE id = $1
               AND status = 'processing'
@@ -1406,6 +1417,115 @@ impl PostgresDb {
         )
         .bind(transaction_id)
         .bind(expected_updated_at)
+        .bind(remint_signatures)
+        .bind(remint_last_valid_block_heights)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Withdrawals stalled in `status` that still carry stored release
+    /// signatures, oldest-first.
+    ///
+    /// The evidence predicates are in SQL so a row that can never be classified
+    /// (structurally corrupt, or quarantined before anything was broadcast) is
+    /// never fetched and never costs an RPC round trip. A NULL nonce is excluded
+    /// for the same reason: no nonce means no release was ever built, so the row
+    /// cannot be the missing leaf the on-chain tree is holding. The two arrays
+    /// are index-paired, and they arrived in separate migrations, so a row can
+    /// legitimately carry signatures with no heights; that is unclassifiable too.
+    pub async fn get_stalled_withdrawals_with_signatures_internal(
+        &self,
+        status: TransactionStatus,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'withdrawal'
+              AND {} = $1
+              AND {} IS NOT NULL
+              AND {} IS NOT NULL
+              AND array_length({}, 1) > 0
+              AND {} IS NOT NULL
+            ORDER BY {} ASC
+            LIMIT $2
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::INNER_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            // Filters
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::STATUS,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            // Ordering (oldest stall first, so progress is deterministic under LIMIT)
+            transaction_cols::UPDATED_AT,
+        ))
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// CAS a stalled withdrawal to `Completed` once its release is proven landed.
+    ///
+    /// `from_status` is bound by the caller, but the statement additionally pins
+    /// the allowed source statuses inline. That redundancy is deliberate: the
+    /// guard is what stops this from resurrecting a terminal row or stealing a
+    /// `processing` row from a live sender, and it belongs in the SQL rather
+    /// than resting on every present and future caller binding the right value.
+    pub async fn try_complete_stalled_withdrawal_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'completed',
+                counterpart_signature = COALESCE($4, counterpart_signature),
+                processed_at = NOW()
+            WHERE id = $1
+              AND updated_at = $2
+              AND status = $3
+              AND status IN ('manual_review', 'pending_remint')
+              AND transaction_type = 'withdrawal'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(from_status)
+        .bind(counterpart_signature)
         .execute(&self.pool)
         .await?;
 

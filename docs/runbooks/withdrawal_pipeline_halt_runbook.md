@@ -34,8 +34,16 @@ On boot, before any withdrawal is fetched, locked, or processed, the operator:
    landed but never reached `Completed` is detected by an on-chain finality
    check and promoted to `Completed` - re-recording the nonce. A row with no
    recorded signature, or one the RPC cannot classify, is quarantined to
-   `manual_review` (never `failed`).
-2. **Validates** the rebuilt local SMT root against the on-chain root.
+   `manual_review` (never `failed`). Quarantining is not the end of the story:
+   the signatures are copied onto the row, so a row quarantined only because
+   the RPC was unreachable is re-classified on every recovery tick and at each
+   boot, and promotes itself once the release is proven finalized.
+2. **Reconciles stalled rows.** Withdrawals sitting in `manual_review` or
+   `pending_remint` that still carry release signatures are classified the same
+   way and promoted to `completed` on proof. A landed-but-unrecorded nonce
+   parked in either status no longer wedges the gate below. Rows carrying no
+   signatures are skipped entirely and stay for a human.
+3. **Validates** the rebuilt local SMT root against the on-chain root.
 
 If validation passes, the pipeline starts normally
 (`SMT root verification passed` in the logs). A residual mismatch the reconcile
@@ -44,6 +52,11 @@ error and exits without consuming nonces against a tree it cannot reason about.
 This should never fire under the known cause (the write-ahead signature plus the
 boot reconcile close that gap); it guards an unforeseen divergence such as a
 program bug or a manual on-chain admin operation.
+
+Reaching the rest of this runbook therefore means something stronger than it
+used to: the divergence is **not provable from any evidence the operator
+stored**. Either the row that consumed the nonce has no recorded signature, or
+no row in the tree window corresponds to it at all.
 
 ### Symptom
 
@@ -95,7 +108,11 @@ it, so identify the nonce by hand.
 
    A row in `manual_review` whose alert `error_message` was
    `no broadcast signatures recorded; cannot verify release landed`
-   (recovery-worker quarantine) is the prime suspect.
+   (recovery-worker quarantine) is the prime suspect, and now essentially the
+   only one: a row quarantined with `could not verify release landed (...)`
+   kept its signatures and would have cleared itself before the gate ran.
+   Confirm with `SELECT remint_signatures FROM transactions WHERE id = :id` -
+   a NULL or empty array is the shape that reaches this runbook.
 3. For each candidate, run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). Exactly
    one verdict resolves the mismatch: a `LANDED <sig>` whose

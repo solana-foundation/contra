@@ -376,6 +376,26 @@ async fn run_withdraw_preflight(
         warn!("Boot reconcile failed, proceeding to SMT validation: {}", e);
     }
 
+    // Boot is the only safe window for the pending_remint pass. Once run_sender
+    // starts it rehydrates every such row into its in-memory queue and may put a
+    // remint in flight; completing one from underneath it would pay the
+    // withdrawal and remint the burn. This returns before the sender is spawned.
+    // Best-effort for the same reason as the reconcile above: validation is the
+    // gate, and a transient error here must not crash-loop the operator.
+    if let Err(e) = recovery::reconcile_landed_withdrawals(
+        storage,
+        rpc_client,
+        crate::storage::common::models::TransactionStatus::PendingRemint,
+        cancellation_token,
+    )
+    .await
+    {
+        warn!(
+            "Pending-remint reconcile failed, proceeding to SMT validation: {}",
+            e
+        );
+    }
+
     // Only a genuine root mismatch is a refuse-to-start. Any other error (instance
     // not yet on-chain, RPC failure, DB read failure) means we could not run the
     // check; start anyway and let the sender's lazy init plus the recovery worker
@@ -422,6 +442,8 @@ mod tests {
     use super::*;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::operator::utils::smt_util::SmtState;
+    use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -493,8 +515,11 @@ mod tests {
             .create()
     }
 
-    async fn run_preflight(client: RpcClientWithRetry) -> Result<(), OperatorError> {
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+    async fn run_preflight(
+        client: RpcClientWithRetry,
+        mock: MockStorage,
+    ) -> Result<(), OperatorError> {
+        let storage = Arc::new(Storage::Mock(mock));
         let client = Arc::new(client);
         let (storage_tx, _rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
         let token = CancellationToken::new();
@@ -507,7 +532,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         // Empty DB rebuilds an empty tree, so the on-chain root must be the empty-tree root.
         let _account = mock_instance_account(&mut server, SmtState::new(0).current_root());
-        let result = run_preflight(make_rpc_client(&server.url())).await;
+        let result = run_preflight(make_rpc_client(&server.url()), MockStorage::new()).await;
         assert!(result.is_ok(), "matching root must start: {result:?}");
     }
 
@@ -518,7 +543,7 @@ mod tests {
     async fn preflight_starts_when_instance_not_found() {
         let mut server = mockito::Server::new_async().await;
         let _account = mock_instance_not_found(&mut server);
-        let result = run_preflight(make_rpc_client(&server.url())).await;
+        let result = run_preflight(make_rpc_client(&server.url()), MockStorage::new()).await;
         assert!(
             result.is_ok(),
             "AccountNotFound must start anyway, not refuse: {result:?}"
@@ -534,7 +559,7 @@ mod tests {
         let mut onchain = SmtState::new(0);
         onchain.insert_nonce(7);
         let _account = mock_instance_account(&mut server, onchain.current_root());
-        let result = run_preflight(make_rpc_client(&server.url())).await;
+        let result = run_preflight(make_rpc_client(&server.url()), MockStorage::new()).await;
         assert!(
             matches!(
                 result,
@@ -543,6 +568,115 @@ mod tests {
                 ))
             ),
             "a real mismatch must refuse to start: {result:?}"
+        );
+    }
+
+    /// A withdraw operator whose only unrecorded nonce sits in a `PendingRemint`
+    /// row carrying its release signature, plus the on-chain root that includes
+    /// that nonce. This is the exact shape that used to wedge the boot gate.
+    fn preflight_fixture(nonce: i64, signature: &str) -> (MockStorage, [u8; 32]) {
+        let mut onchain = SmtState::new(0);
+        onchain.insert_nonce(nonce as u64);
+
+        let now = chrono::Utc::now();
+        let row = DbTransaction {
+            id: 1,
+            signature: "burn-sig".to_string(),
+            trace_id: "trace-1".to_string(),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(1_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce),
+            status: TransactionStatus::PendingRemint,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: Some(vec![signature.to_string()]),
+            remint_last_valid_block_heights: Some(vec![100]),
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        };
+        let mock = MockStorage::new();
+        mock.pending_transactions.lock().unwrap().push(row);
+        (mock, onchain.current_root())
+    }
+
+    fn mock_signature_statuses(
+        server: &mut mockito::ServerGuard,
+        status: usize,
+        body: &str,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(status)
+            .with_body(body)
+            .create()
+    }
+
+    const FINALIZED_SUCCESS: &str = r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#;
+
+    /// The regression test for the whole issue: a landed-but-unrecorded release
+    /// held in `pending_remint` is reconciled by the pre-flight, so the root now
+    /// agrees and the operator starts instead of crash-looping.
+    #[tokio::test]
+    async fn preflight_completes_landed_pending_remint_and_starts() {
+        let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
+        let (mock, root) = preflight_fixture(7, &landed_sig);
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_instance_account(&mut server, root);
+        let _status = mock_signature_statuses(&mut server, 200, FINALIZED_SUCCESS);
+
+        let result = run_preflight(make_rpc_client(&server.url()), mock.clone()).await;
+
+        assert!(
+            result.is_ok(),
+            "a reconcilable divergence must start: {result:?}"
+        );
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::Completed);
+        assert_eq!(
+            rows[0].counterpart_signature.as_deref(),
+            Some(landed_sig.as_str())
+        );
+    }
+
+    /// The halt is narrowed, not weakened: an unprovable divergence still
+    /// refuses to start and leaves the row where a human can see it.
+    #[tokio::test]
+    async fn preflight_still_refuses_when_mismatch_survives_reconcile() {
+        let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
+        let (mock, root) = preflight_fixture(7, &landed_sig);
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_instance_account(&mut server, root);
+        let _status = mock_signature_statuses(&mut server, 500, "internal server error");
+
+        let result = run_preflight(make_rpc_client(&server.url()), mock.clone()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::SmtRootMismatch { .. }
+                ))
+            ),
+            "an unprovable divergence must still refuse to start: {result:?}"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::PendingRemint,
+            "an uncertain verdict must leave the row for the runbook"
         );
     }
 }

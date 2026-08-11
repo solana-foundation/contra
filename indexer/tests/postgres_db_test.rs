@@ -1171,3 +1171,396 @@ async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
     );
     Ok(())
 }
+
+// ── stalled-withdrawal reconciliation ────────────────────────────────────────
+
+/// Insert a row and force it into `status` without going through the operator.
+async fn seed_with_status(
+    pool: &PgPool,
+    storage: &Storage,
+    sig: &str,
+    txn_type: TransactionType,
+    status: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(sig, txn_type))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = $2::transaction_status WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
+
+/// I1: the promote CAS refuses every source status but `manual_review` and
+/// `pending_remint`, refuses deposits, and honours the `updated_at` compare.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_complete_stalled_withdrawal_guard_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // (label, seeded status, bound from-status, transaction type, use a stale CAS, expected)
+    let cases: &[(&str, &str, TransactionStatus, TransactionType, bool, bool)] = &[
+        (
+            "manual_review fresh",
+            "manual_review",
+            TransactionStatus::ManualReview,
+            TransactionType::Withdrawal,
+            false,
+            true,
+        ),
+        (
+            "pending_remint fresh",
+            "pending_remint",
+            TransactionStatus::PendingRemint,
+            TransactionType::Withdrawal,
+            false,
+            true,
+        ),
+        (
+            "processing fresh",
+            "processing",
+            TransactionStatus::Processing,
+            TransactionType::Withdrawal,
+            false,
+            false,
+        ),
+        (
+            "completed fresh",
+            "completed",
+            TransactionStatus::Completed,
+            TransactionType::Withdrawal,
+            false,
+            false,
+        ),
+        (
+            "manual_review stale cas",
+            "manual_review",
+            TransactionStatus::ManualReview,
+            TransactionType::Withdrawal,
+            true,
+            false,
+        ),
+        (
+            "deposit manual_review",
+            "manual_review",
+            TransactionStatus::ManualReview,
+            TransactionType::Deposit,
+            false,
+            false,
+        ),
+    ];
+
+    for (i, (label, seeded, from_status, txn_type, stale, expected)) in cases.iter().enumerate() {
+        let id = seed_with_status(&pool, &storage, &format!("cas_{i}"), *txn_type, seeded).await?;
+        let mut captured = updated_at_of(&pool, id).await;
+        if *stale {
+            captured -= chrono::Duration::seconds(60);
+        }
+
+        let promoted = storage
+            .try_complete_stalled_withdrawal(id, captured, *from_status, Some(format!("sig-{i}")))
+            .await?;
+        assert_eq!(promoted, *expected, "{label}: unexpected CAS result");
+
+        if *expected {
+            assert_eq!(status_of(&pool, id).await, "completed", "{label}");
+            let sig: Option<String> =
+                sqlx::query_scalar("SELECT counterpart_signature FROM transactions WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(sig.as_deref(), Some(format!("sig-{i}").as_str()), "{label}");
+        } else {
+            assert_eq!(
+                status_of(&pool, id).await,
+                *seeded,
+                "{label}: a refused CAS must leave the row exactly as it was"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Backdate `updated_at` past the trigger that would otherwise stamp NOW().
+async fn force_updated_at(
+    pool: &PgPool,
+    id: i64,
+    ts: chrono::DateTime<Utc>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE transactions SET updated_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(ts)
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn set_remint_signatures(
+    pool: &PgPool,
+    id: i64,
+    sigs: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let heights: Option<Vec<i64>> = sigs.as_ref().map(|s| vec![0i64; s.len()]);
+    sqlx::query(
+        "UPDATE transactions SET remint_signatures = $2, remint_last_valid_block_heights = $3
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(sigs)
+    .bind(heights)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// I2: the fetch predicates and ordering, which the mock cannot verify
+/// (`array_length` and the NULL-nonce filter are SQL-only).
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_withdrawal_query_predicates_and_ordering() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let base = Utc::now() - chrono::Duration::hours(1);
+    let sigs = || Some(vec!["sig-a".to_string()]);
+
+    // Three matching manual_review rows, seeded out of `updated_at` order.
+    let newest = seed_with_status(
+        &pool,
+        &storage,
+        "q_new",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    let oldest = seed_with_status(
+        &pool,
+        &storage,
+        "q_old",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    let middle = seed_with_status(
+        &pool,
+        &storage,
+        "q_mid",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    for (id, offset) in [(newest, 30i64), (oldest, 10), (middle, 20)] {
+        set_remint_signatures(&pool, id, sigs()).await?;
+        force_updated_at(&pool, id, base + chrono::Duration::seconds(offset)).await?;
+    }
+
+    // One pending_remint row: visible only to the PendingRemint query.
+    let remint = seed_with_status(
+        &pool,
+        &storage,
+        "q_pr",
+        TransactionType::Withdrawal,
+        "pending_remint",
+    )
+    .await?;
+    set_remint_signatures(&pool, remint, sigs()).await?;
+
+    // Every shape the predicates must exclude.
+    let wrong_status = seed_with_status(
+        &pool,
+        &storage,
+        "q_done",
+        TransactionType::Withdrawal,
+        "completed",
+    )
+    .await?;
+    set_remint_signatures(&pool, wrong_status, sigs()).await?;
+    let deposit = seed_with_status(
+        &pool,
+        &storage,
+        "q_dep",
+        TransactionType::Deposit,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, deposit, sigs()).await?;
+    let null_nonce = seed_with_status(
+        &pool,
+        &storage,
+        "q_nonce",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, null_nonce, sigs()).await?;
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(null_nonce)
+        .execute(&pool)
+        .await?;
+    let empty_sigs = seed_with_status(
+        &pool,
+        &storage,
+        "q_empty",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, empty_sigs, Some(Vec::new())).await?;
+    let no_sigs = seed_with_status(
+        &pool,
+        &storage,
+        "q_null",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, no_sigs, None).await?;
+    // Reachable on a database upgraded between the two column migrations:
+    // signatures present, the parallel heights array never backfilled.
+    let no_heights = seed_with_status(
+        &pool,
+        &storage,
+        "q_heights",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    sqlx::query("UPDATE transactions SET remint_signatures = $2 WHERE id = $1")
+        .bind(no_heights)
+        .bind(vec!["sig-orphan".to_string()])
+        .execute(&pool)
+        .await?;
+
+    let found = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 100)
+        .await?;
+    assert_eq!(
+        found.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![oldest, middle, newest],
+        "only rows with usable evidence, oldest updated_at first"
+    );
+
+    let found_remint = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::PendingRemint, 100)
+        .await?;
+    assert_eq!(
+        found_remint.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![remint],
+        "the status bind must not leak rows from the other stalled status"
+    );
+
+    let limited = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 2)
+        .await?;
+    assert_eq!(
+        limited.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![oldest, middle],
+        "LIMIT must truncate the oldest-first ordering, not an arbitrary slice"
+    );
+    Ok(())
+}
+
+async fn remint_columns_of(
+    pool: &PgPool,
+    id: i64,
+) -> Result<(Option<Vec<String>>, Option<Vec<i64>>), Box<dyn std::error::Error>> {
+    let row: (Option<Vec<String>>, Option<Vec<i64>>) = sqlx::query_as(
+        "SELECT remint_signatures, remint_last_valid_block_heights FROM transactions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// I3: the quarantine CAS stores the evidence in the same statement that flips
+/// the status, and a `None` call leaves the columns exactly as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_cas_writes_signatures_and_coalesces_none(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let sigs = vec!["sig-quarantine".to_string()];
+
+    let with_sigs = seed_with_status(
+        &pool,
+        &storage,
+        "q3_write",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    let captured = updated_at_of(&pool, with_sigs).await;
+    let quarantined = storage
+        .try_quarantine_processing(with_sigs, captured, Some(sigs.clone()), Some(vec![777i64]))
+        .await?;
+    assert!(quarantined, "fresh CAS must succeed");
+    assert_eq!(status_of(&pool, with_sigs).await, "manual_review");
+    let (stored_sigs, stored_heights) = remint_columns_of(&pool, with_sigs).await?;
+    assert_eq!(stored_sigs, Some(sigs));
+    assert_eq!(stored_heights, Some(vec![777i64]));
+
+    // NOW() is the transaction timestamp, so these two agree only if the status
+    // flip and the column write happened in one statement. A "write columns,
+    // then CAS" pair would leave two distinct timestamps (and the CAS could
+    // never match, since the first write already bumped updated_at).
+    let (updated, processed): (chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT updated_at, processed_at FROM transactions WHERE id = $1")
+            .bind(with_sigs)
+            .fetch_one(&pool)
+            .await?;
+    assert!(updated > captured, "the trigger must bump updated_at");
+    assert_eq!(
+        Some(updated),
+        processed,
+        "one statement means one NOW(); a second write would desync these"
+    );
+
+    // A None call must not erase columns an earlier transition already wrote.
+    let preloaded = seed_with_status(
+        &pool,
+        &storage,
+        "q3_keep",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    set_remint_signatures(&pool, preloaded, Some(vec!["sig-existing".to_string()])).await?;
+    let captured = updated_at_of(&pool, preloaded).await;
+    assert!(
+        storage
+            .try_quarantine_processing(preloaded, captured, None, None)
+            .await?
+    );
+    let (kept_sigs, kept_heights) = remint_columns_of(&pool, preloaded).await?;
+    assert_eq!(kept_sigs, Some(vec!["sig-existing".to_string()]));
+    assert_eq!(kept_heights, Some(vec![0i64]));
+
+    // A losing racer writes nothing at all, columns included.
+    let stale_row = seed_with_status(
+        &pool,
+        &storage,
+        "q3_stale",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    let stale = updated_at_of(&pool, stale_row).await - chrono::Duration::seconds(60);
+    assert!(
+        !storage
+            .try_quarantine_processing(
+                stale_row,
+                stale,
+                Some(vec!["sig-race".to_string()]),
+                Some(vec![1])
+            )
+            .await?
+    );
+    assert_eq!(status_of(&pool, stale_row).await, "processing");
+    assert_eq!(remint_columns_of(&pool, stale_row).await?, (None, None));
+    Ok(())
+}

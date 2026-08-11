@@ -1360,3 +1360,141 @@ async fn threshold_boundary_returns_only_strictly_older_rows() {
         "5:01-old row MUST be returned (older than threshold)"
     );
 }
+
+// IT-14: a withdrawal quarantined on RPC uncertainty carries its release
+// signatures on the row, so a later tick can prove the release landed and clear
+// it, even though the signature journal has since been GC'd.
+
+async fn remint_signatures_of(pool: &sqlx::PgPool, id: i64) -> Option<Vec<String>> {
+    sqlx::query_scalar::<_, Option<Vec<String>>>(
+        "SELECT remint_signatures FROM transactions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn journal_len(pool: &sqlx::PgPool, id: i64) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it14_manual_review_landed_release_clears_to_completed() {
+    let (db, url, _container) = start_pg("it8_clears").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 21);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    let landed_sig = Signature::new_unique();
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+        .await
+        .unwrap();
+
+    // Pass 1: nothing scripted, so every getSignatureStatuses errors and the
+    // classifier reports Uncertain, which quarantines.
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
+    assert_eq!(
+        remint_signatures_of(&pool, tx_id).await,
+        Some(vec![landed_sig.to_string()]),
+        "the quarantine must copy the evidence onto the row"
+    );
+
+    // Pass 2: the RPC recovers and reports the release finalized.
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
+    );
+    let metric_before = snapshot_recovered("withdraw", "manual_review_cleared", "withdrawal");
+
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        journal_len(&pool, tx_id).await,
+        0,
+        "the GC at the top of pass 2 removes the journal, so the promotion below \
+         can only have come from the row's own columns"
+    );
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(landed_sig.to_string())
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment(
+        "withdraw",
+        "manual_review_cleared",
+        "withdrawal",
+        metric_before,
+        "IT-14",
+    );
+    mock.shutdown().await;
+}
+
+// IT-15: a withdrawal quarantined with no evidence at all stays quarantined and
+// never costs an RPC round trip, on this tick or any later one.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it15_manual_review_without_signatures_stays_quarantined() {
+    let (db, url, _container) = start_pg("it9_no_evidence").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 22);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    for pass in 1..=2 {
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            status_of(&pool, tx_id).await,
+            "manual_review",
+            "pass {pass}: a row with no evidence must stay for a human"
+        );
+    }
+
+    assert_eq!(
+        remint_signatures_of(&pool, tx_id).await,
+        None,
+        "there was nothing to record, so COALESCE must leave the column NULL"
+    );
+    assert_eq!(
+        mock.call_count("getSignatureStatuses"),
+        0,
+        "the permanently-stuck population must be filtered in SQL, never re-classified"
+    );
+    mock.shutdown().await;
+}

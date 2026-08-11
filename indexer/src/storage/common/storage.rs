@@ -42,7 +42,6 @@ pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
-pub mod try_escalate_manual_review;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -361,17 +360,6 @@ impl Storage {
         transaction_id: i64,
     ) -> Result<Option<TransactionStatus>, StorageError> {
         get_transaction_status::get_transaction_status(self, transaction_id).await
-    }
-
-    /// Escalate a still-`Processing` row to ManualReview. `Ok(false)` means the
-    /// row moved on, so the caller's escalation does not own it and must not be
-    /// written through the generic status writer, which would accept a
-    /// `pending_remint` source and overwrite a committed handoff.
-    pub async fn try_escalate_manual_review(
-        &self,
-        transaction_id: i64,
-    ) -> Result<bool, StorageError> {
-        try_escalate_manual_review::try_escalate_manual_review(self, transaction_id).await
     }
 
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means

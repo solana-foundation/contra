@@ -237,10 +237,6 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/sender/remint.rs",
         ),
         (
-            "failed to persist pending remint:",
-            "indexer/src/operator/sender/transaction.rs",
-        ),
-        (
             "no signatures to verify — remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
         ),

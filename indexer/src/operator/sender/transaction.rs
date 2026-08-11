@@ -1181,8 +1181,9 @@ pub(super) async fn requeue_or_fail_prebroadcast(
 /// remint that will execute after the Solana finality window passes. This prevents
 /// double-spend if the original withdrawal lands on-chain after our polling window.
 /// If the PendingRemint write cannot be confirmed, the cache entries go back and
-/// the row is left to recovery; only a still-Processing undeterminable row goes to
-/// ManualReview, and a row that reads back PendingRemint is driven from here.
+/// the row is left to recovery; a row that reads back PendingRemint is driven from
+/// here. No terminal status is written on a row whose state stays unresolved: only
+/// recovery, which classifies the release on-chain first, may escalate one.
 ///
 /// For non-withdrawal transactions: delegates to send_fatal_error.
 pub(super) async fn handle_permanent_failure(
@@ -1357,17 +1358,17 @@ pub(super) async fn handle_permanent_failure(
                 );
                 return;
             }
-            // Neither state can be established, so nothing automatic can be
-            // trusted to finish this. Escalate loudly instead — but only a row
-            // that is provably still Processing. This branch also runs when the
-            // write did commit and every read-back failed, and the generic status
-            // writer accepts a `pending_remint` source, so an unguarded fallback
-            // would overwrite that committed handoff and strand the withdrawal
-            // where no sweep looks. A guard miss means the row left Processing,
-            // so read it back: only a committed PendingRemint is ours to drive.
+            // Neither state can be established, so retry the write itself: it is
+            // idempotent for this payload, which makes it the only probe that is
+            // safe whichever state committed. It takes a row that is still
+            // Processing and replays one that already carries this exact handoff,
+            // and either outcome makes the remint this sender's to drive. A
+            // terminal status here would strand the withdrawal instead, since no
+            // sweep selects ManualReview and the remint info and signature stash
+            // pulled from the caches above are the only live copy.
             unresolved => {
                 error!(
-                    "Failed to persist PendingRemint for transaction {} and could not read it back ({:?}): {}",
+                    "Failed to persist PendingRemint for transaction {} and could not read it back ({:?}), retrying the handoff: {}",
                     transaction_id, unresolved, e
                 );
                 metrics::OPERATOR_TRANSACTION_ERRORS
@@ -1376,60 +1377,30 @@ pub(super) async fn handle_permanent_failure(
                         "pending_remint_state_unknown",
                     ])
                     .inc();
-                match state.storage.try_escalate_manual_review(transaction_id).await {
-                    // The row was still Processing, so nothing committed and this
-                    // escalation owns it. The status is already durable; the queued
-                    // update drives the webhook alert and no-ops on the row, whose
-                    // status is now outside the writer's source set.
-                    Ok(true) => {
-                        send_guaranteed(
-                            storage_tx,
-                            TransactionStatusUpdate {
-                                transaction_id,
-                                trace_id: ctx.trace_id.clone(),
-                                status: TransactionStatus::ManualReview,
-                                counterpart_signature: None,
-                                processed_at: Some(Utc::now()),
-                                error_message: Some(format!(
-                                    "{} | failed to persist pending remint: {}",
-                                    error_msg, e
-                                )),
-                                remint_signature: None,
-                                remint_attempted: false,
-                                release_signatures: None,
-                            },
-                            "transaction status update",
-                        )
-                        .await
-                        .ok();
-                        return;
-                    }
-                    // The guard missed, so the row is not Processing. The escalation
-                    // reached the DB, so this read-back is the first reliable one on
-                    // this path: a PendingRemint row is the committed handoff and only
-                    // this queue drives it, since no sweep selects that status. Any
-                    // other status belongs to another writer, and queuing over it would
-                    // let the recovery GC drop the remint write-ahead rows and re-mint.
-                    Ok(false) => {
-                        match state.storage.get_transaction_status(transaction_id).await {
-                            Ok(Some(TransactionStatus::PendingRemint)) => warn!(
-                                transaction_id,
-                                "Row is PendingRemint, so the write did commit; driving the remint from this sender"
-                            ),
-                            observed => {
-                                warn!(
-                                    transaction_id,
-                                    "Row is no longer Processing ({:?}), leaving it alone", observed
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Err(escalate_err) => {
+                match state
+                    .storage
+                    .set_pending_remint(transaction_id, sig_strings, lvbhs, deadline)
+                    .await
+                {
+                    Ok(()) => warn!(
+                        transaction_id,
+                        "The handoff retry committed against an unreadable row; driving the remint from this sender"
+                    ),
+                    // Either the row is no longer ours to take or the database is
+                    // still unreachable. Both leave it where it is, so hold the
+                    // remint info and signature stash: a row that never left
+                    // Processing belongs to the recovery sweep, which reloads the
+                    // same journal and escalates only after classifying the
+                    // release on-chain.
+                    Err(retry_err) => {
                         error!(
                             transaction_id,
-                            "Could not escalate to ManualReview, leaving the row untouched: {escalate_err}"
+                            "Could not establish the PendingRemint handoff, holding the remint info and signature stash for recovery: {retry_err}"
                         );
+                        if let Some(nonce) = ctx.withdrawal_nonce {
+                            state.remint_cache.insert(nonce, info);
+                            state.pending_signatures.insert(nonce, stashed);
+                        }
                         return;
                     }
                 }
@@ -3773,14 +3744,15 @@ mod tests {
         );
     }
 
-    /// The write can commit while the read-back also fails. The escalation is
-    /// guarded on a Processing row, so it finds the committed PendingRemint and
-    /// writes nothing. An unguarded fallback would be accepted by the status
-    /// writer, whose source set includes `pending_remint`, and strand a row no
-    /// sweep selects. The guard miss then reads the row back, and a PendingRemint
-    /// is adopted here: nothing else drives that status until a restart.
+    /// The write can commit while every read-back also fails, so no read can say
+    /// who owns the row. Retrying the write is the probe: it is idempotent for
+    /// this payload, so it replays against the committed PendingRemint and proves
+    /// the handoff durable. This sender then drives the remint, since no sweep
+    /// selects that status until a restart. A terminal status would be accepted
+    /// here by the writer, whose source set includes `pending_remint`, and would
+    /// strand the row instead.
     #[tokio::test]
-    async fn permanent_failure_does_not_escalate_over_committed_pending_remint() {
+    async fn permanent_failure_adopts_committed_handoff_when_reads_fail() {
         let txn_id = 13;
         let nonce = 8;
         let mut state = make_sender_state();
@@ -3789,16 +3761,19 @@ mod tests {
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
-        mock.set_should_fail("set_pending_remint", true);
-        // The three read-back attempts fail; the read after the escalation, which
-        // proved the DB reachable, succeeds.
-        mock.set_fail_times("get_transaction_status", 3);
-        // The handoff committed; only the acknowledgement and the read-backs were lost.
-        let mut committed = processing_withdrawal_row(txn_id, nonce);
-        committed.status = TransactionStatus::PendingRemint;
-        mock.pending_transactions.lock().unwrap().push(committed);
+        // The three write attempts fail; the retry after them, which finds the DB
+        // reachable again, replays the identical payload and succeeds.
+        mock.set_fail_times("set_pending_remint", 3);
+        mock.set_should_fail("get_transaction_status", true);
 
         let broadcast = Signature::new_unique();
+        // The handoff committed; only the acknowledgement and the reads were lost,
+        // so the row already carries the payload the retry replays.
+        let mut committed = processing_withdrawal_row(txn_id, nonce);
+        committed.status = TransactionStatus::PendingRemint;
+        committed.remint_signatures = Some(vec![broadcast.to_string()]);
+        mock.pending_transactions.lock().unwrap().push(committed);
+
         mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
             .await
             .unwrap();
@@ -3832,6 +3807,11 @@ mod tests {
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            4,
+            "the three backoff attempts must be followed by the retry that resolves ownership"
+        );
         let rows = mock.pending_transactions.lock().unwrap();
         assert_eq!(
             rows[0].status,
@@ -3840,11 +3820,11 @@ mod tests {
         );
     }
 
-    /// The escalation guard can also miss because another writer moved the row:
-    /// a recovery demote leaves it Pending. Adopting it would drive a remint the
-    /// processor is about to re-release against, and the recovery GC drops the
-    /// remint write-ahead rows for any row that is not PendingRemint, so a
-    /// deferred attempt would re-mint. The read-back must leave it alone.
+    /// The retry can also miss because another writer moved the row: a recovery
+    /// demote leaves it Pending. Adopting it would drive a remint the processor is
+    /// about to re-release against, and the recovery GC drops the remint
+    /// write-ahead rows for any row that is not PendingRemint, so a deferred
+    /// attempt would re-mint. The guard miss must leave the row alone.
     #[tokio::test]
     async fn permanent_failure_does_not_adopt_row_moved_by_another_writer() {
         let txn_id = 14;
@@ -3855,10 +3835,10 @@ mod tests {
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
-        mock.set_should_fail("set_pending_remint", true);
-        mock.set_fail_times("get_transaction_status", 3);
+        mock.set_fail_times("set_pending_remint", 3);
+        mock.set_should_fail("get_transaction_status", true);
         // Recovery demoted the row while the handoff was being retried, so the
-        // PendingRemint write never committed and the escalation guard misses.
+        // PendingRemint write never committed and the retry finds no row to take.
         let mut demoted = processing_withdrawal_row(txn_id, nonce);
         demoted.status = TransactionStatus::Pending;
         mock.pending_transactions.lock().unwrap().push(demoted);
@@ -3893,6 +3873,14 @@ mod tests {
             storage_rx.try_recv().is_err(),
             "must not write a terminal status over another writer's row"
         );
+        // A guard miss and an unreachable database are indistinguishable here, so
+        // both hold the remint info and signature stash. A stale nonce entry is
+        // only ever read by a later attempt on that nonce; dropping it would lose
+        // the one case that matters, a row that never left Processing.
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be held when the retry cannot prove the row moved on"
+        );
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
@@ -3904,11 +3892,13 @@ mod tests {
         );
     }
 
-    /// When neither the write nor the read-back establishes the row's state, no
-    /// automatic component can be trusted to finish the withdrawal, so it
-    /// escalates to ManualReview and queues nothing in memory.
+    /// When neither the write nor the read-back establishes the row's state, the
+    /// remint info and signature stash stay in memory and the row keeps its
+    /// status. Terminalizing it here would hand a still-Processing withdrawal to
+    /// ManualReview, which no sweep selects, after the only live copy of them was
+    /// discarded.
     #[tokio::test]
-    async fn permanent_failure_sends_manual_review_when_state_undeterminable() {
+    async fn permanent_failure_holds_remint_info_and_stash_when_state_undeterminable() {
         let txn_id = 12;
         let nonce = 7;
         let mut state = make_sender_state();
@@ -3946,14 +3936,35 @@ mod tests {
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
 
-        let update = storage_rx
-            .try_recv()
-            .expect("should receive ManualReview status");
-        assert_eq!(update.transaction_id, txn_id);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status over a row whose state is unknown"
+        );
         assert!(
             state.pending_remints.is_empty(),
             "must not queue a remint when the row state is unknown"
+        );
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be held for recovery or a later attempt"
+        );
+        assert!(
+            state.pending_signatures.contains_key(&nonce),
+            "release signatures must be held for recovery or a later attempt"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            4,
+            "the handoff must be retried once more before the caches are restored"
+        );
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            rows[0].status,
+            TransactionStatus::Processing,
+            "the row must stay Processing so the recovery sweep owns it"
         );
     }
 

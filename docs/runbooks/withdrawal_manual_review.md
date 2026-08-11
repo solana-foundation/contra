@@ -41,7 +41,6 @@ have prefixes.
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
-| `failed to persist pending remint:` | C - ambiguous (DB lost the sig) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
@@ -215,6 +214,9 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > them** (`could not verify release landed (...)`, with the signature list
 > appended). Both land here in Path C — verify on-chain and act on the
 > verdict; never blindly re-arm a row whose release may already be on-chain.
+> A sender that could not establish the `PendingRemint` handoff leaves the row
+> `Processing` (metric `pending_remint_state_unknown`) rather than quarantining
+> it, so it reaches this path through the recovery sweep above.
 
 1. **Verify on-chain.** Run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). This is

@@ -648,18 +648,7 @@ impl MockStorage {
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: DateTime<Utc>,
     ) -> Result<(), StorageError> {
-        if self
-            .should_fail
-            .lock()
-            .unwrap()
-            .get("set_pending_remint")
-            .copied()
-            .unwrap_or(false)
-        {
-            return Err(StorageError::DatabaseError {
-                message: "Simulated set_pending_remint failure".to_string(),
-            });
-        }
+        self.check_should_fail("set_pending_remint")?;
 
         {
             let mut rows = self.pending_transactions.lock().unwrap();
@@ -702,27 +691,6 @@ impl MockStorage {
             deadline_at,
         ));
         Ok(())
-    }
-
-    /// Mirror `try_escalate_manual_review_internal`: flip a Processing row to
-    /// ManualReview, returning whether it matched. Any other status is a guard
-    /// miss that writes nothing. Honors `should_fail("try_escalate_manual_review")`.
-    pub async fn try_escalate_manual_review(
-        &self,
-        transaction_id: i64,
-    ) -> Result<bool, StorageError> {
-        self.check_should_fail("try_escalate_manual_review")?;
-        let mut rows = self.pending_transactions.lock().unwrap();
-        let Some(row) = rows
-            .iter_mut()
-            .find(|t| t.id == transaction_id && t.status == TransactionStatus::Processing)
-        else {
-            return Ok(false);
-        };
-        row.status = TransactionStatus::ManualReview;
-        row.processed_at = Some(Utc::now());
-        row.updated_at = Utc::now();
-        Ok(true)
     }
 
     /// Status of one row. `pending_transactions` is the live mirror of the

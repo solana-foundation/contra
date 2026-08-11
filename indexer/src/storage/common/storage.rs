@@ -398,10 +398,11 @@ impl Storage {
     pub async fn get_stalled_withdrawals_with_signatures(
         &self,
         status: TransactionStatus,
+        after_id: i64,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         get_stalled_withdrawals_with_signatures::get_stalled_withdrawals_with_signatures(
-            self, status, limit,
+            self, status, after_id, limit,
         )
         .await
     }
@@ -1518,7 +1519,7 @@ mod tests {
         }
 
         let found = storage
-            .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 100)
+            .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
             .await
             .unwrap();
 

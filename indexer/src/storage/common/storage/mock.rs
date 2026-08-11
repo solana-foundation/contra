@@ -700,6 +700,7 @@ impl MockStorage {
     pub async fn get_stalled_withdrawals_with_signatures(
         &self,
         status: TransactionStatus,
+        after_id: i64,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stalled_withdrawals_with_signatures")?;
@@ -710,9 +711,10 @@ impl MockStorage {
             .filter(|t| t.withdrawal_nonce.is_some())
             .filter(|t| t.remint_signatures.as_ref().is_some_and(|s| !s.is_empty()))
             .filter(|t| t.remint_last_valid_block_heights.is_some())
+            .filter(|t| t.id > after_id)
             .cloned()
             .collect();
-        matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        matched.sort_by_key(|t| t.id);
         matched.truncate(limit as usize);
         Ok(matched)
     }

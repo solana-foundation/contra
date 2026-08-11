@@ -1426,7 +1426,7 @@ impl PostgresDb {
     }
 
     /// Withdrawals stalled in `status` that still carry stored release
-    /// signatures, oldest-first.
+    /// signatures, keyed forward from `after_id`.
     ///
     /// The evidence predicates are in SQL so a row that can never be classified
     /// (structurally corrupt, or quarantined before anything was broadcast) is
@@ -1435,9 +1435,16 @@ impl PostgresDb {
     /// cannot be the missing leaf the on-chain tree is holding. The two arrays
     /// are index-paired, and they arrived in separate migrations, so a row can
     /// legitimately carry signatures with no heights; that is unclassifiable too.
+    ///
+    /// Paging is keyed on `id` rather than offset by `updated_at`. A row that
+    /// does not classify is left untouched by design, so its `updated_at` never
+    /// moves; ordering on it would return the same blocked rows on every sweep
+    /// and starve everything behind them. `id` gives the caller a cursor that
+    /// always advances.
     pub async fn get_stalled_withdrawals_with_signatures_internal(
         &self,
         status: TransactionStatus,
+        after_id: i64,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         sqlx::query_as::<_, DbTransaction>(&format!(
@@ -1452,8 +1459,9 @@ impl PostgresDb {
               AND {} IS NOT NULL
               AND array_length({}, 1) > 0
               AND {} IS NOT NULL
+              AND {} > $2
             ORDER BY {} ASC
-            LIMIT $2
+            LIMIT $3
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1486,10 +1494,13 @@ impl PostgresDb {
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
-            // Ordering (oldest stall first, so progress is deterministic under LIMIT)
-            transaction_cols::UPDATED_AT,
+            // Keyset cursor
+            transaction_cols::ID,
+            // Ordering must match the cursor so paging cannot repeat or skip
+            transaction_cols::ID,
         ))
         .bind(status)
+        .bind(after_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await

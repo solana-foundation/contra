@@ -1600,3 +1600,89 @@ async fn it16_pending_remint_landed_release_enters_completed_nonce_set() {
     );
     mock.shutdown().await;
 }
+
+// IT-17: a full batch of rows that can never clear must not hide the rows behind
+// them. Nothing is written for a non-landed verdict, so an ordering that is
+// stable across sweeps would hand back the same blocked rows forever and starve
+// every later row, including a landed one that is still wedging the boot gate.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it17_stuck_batch_does_not_starve_later_stalled_rows() {
+    let (db, url, _container) = start_pg("it17_starve").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let deadline = Utc::now() + ChronoDuration::seconds(32);
+
+    // Exactly one full batch of rows that are fetched but can never classify:
+    // the stored signature does not parse, so each is skipped without an RPC.
+    let mut blocked = Vec::new();
+    for _ in 0..100 {
+        let tx = make_withdrawal(&Signature::new_unique().to_string(), 0);
+        let id = db.insert_transaction_internal(&tx).await.unwrap();
+        sqlx::query(
+            "UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        storage
+            .set_pending_remint(id, vec!["not-a-signature".to_string()], vec![100], deadline)
+            .await
+            .unwrap();
+        blocked.push(id);
+    }
+
+    // Inserted last, so it sorts behind the whole blocked batch under any
+    // ordering the sweep might use.
+    let landed_sig = Signature::new_unique();
+    let target = make_withdrawal(&Signature::new_unique().to_string(), 0);
+    let target_id = db.insert_transaction_internal(&target).await.unwrap();
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    storage
+        .set_pending_remint(target_id, vec![landed_sig.to_string()], vec![100], deadline)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
+    );
+    let client = test_client(mock.url());
+
+    test_hooks::reconcile_stalled_withdrawals_once(
+        &storage,
+        &client,
+        private_channel_indexer::storage::TransactionStatus::PendingRemint,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, target_id).await,
+        "completed",
+        "a landed row behind a full batch of unclearable rows must still be reached"
+    );
+    assert_eq!(
+        status_of(&pool, blocked[0]).await,
+        "pending_remint",
+        "rows that cannot classify stay exactly where they are"
+    );
+    mock.shutdown().await;
+}

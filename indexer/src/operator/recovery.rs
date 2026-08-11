@@ -28,6 +28,10 @@ pub(crate) const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// Per-tick batch cap; leftovers are picked up next tick.
 pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 
+/// Batches of `RECOVERY_BATCH_LIMIT` the stalled-withdrawal sweep will page
+/// through in one pass before deferring the rest to the next tick.
+const MAX_RECONCILE_BATCHES: usize = 10;
+
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
 const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
@@ -232,38 +236,64 @@ pub(crate) async fn reconcile_landed_withdrawals(
         }
     };
 
-    let stalled = storage
-        .get_stalled_withdrawals_with_signatures(from_status, RECOVERY_BATCH_LIMIT)
-        .await?;
-    if stalled.is_empty() {
-        return Ok(());
-    }
-    debug!(
-        count = stalled.len(),
-        ?from_status,
-        "Reconcile sweep found stalled withdrawals with stored signatures"
-    );
-
-    for row in stalled {
-        if cancellation_token.is_cancelled() {
-            info!("Reconcile sweep cancelled; remaining stalled rows deferred");
+    // Page forward by id instead of taking one capped batch. A row that does not
+    // classify is deliberately left untouched, so it stays in this set for good;
+    // a fixed window would hand back the same blocked rows every sweep and hide
+    // every row behind them, including a landed one still wedging the boot gate.
+    let mut after_id = 0i64;
+    let mut scanned = 0usize;
+    for _ in 0..MAX_RECONCILE_BATCHES {
+        let batch = storage
+            .get_stalled_withdrawals_with_signatures(from_status, after_id, RECOVERY_BATCH_LIMIT)
+            .await?;
+        if batch.is_empty() {
             return Ok(());
         }
-        // The query is withdrawal-only, so this is the same belt-and-braces gate
-        // the other sweeps use: never classify a row against the wrong chain.
-        if !role_owns(ProgramType::Withdraw, &row) {
-            continue;
+        debug!(
+            count = batch.len(),
+            after_id,
+            ?from_status,
+            "Reconcile sweep found stalled withdrawals with stored signatures"
+        );
+        scanned += batch.len();
+        let exhausted = batch.len() < RECOVERY_BATCH_LIMIT as usize;
+
+        for row in batch {
+            if cancellation_token.is_cancelled() {
+                info!("Reconcile sweep cancelled; remaining stalled rows deferred");
+                return Ok(());
+            }
+            // The cursor advances even when a row is skipped, which is what stops
+            // an unclearable row from being re-fetched ahead of everything else.
+            after_id = row.id;
+            // The query is withdrawal-only, so this is the same belt-and-braces gate
+            // the other sweeps use: never classify a row against the wrong chain.
+            if !role_owns(ProgramType::Withdraw, &row) {
+                continue;
+            }
+            let Some(pending) = row_pending_sigs(&row) else {
+                continue;
+            };
+            let SigFinality::Landed(signature) =
+                classify_release_signatures(rpc_client, &pending).await
+            else {
+                continue;
+            };
+            promote_stalled_row(storage, &row, from_status, outcome_label, signature).await;
         }
-        let Some(pending) = row_pending_sigs(&row) else {
-            continue;
-        };
-        let SigFinality::Landed(signature) =
-            classify_release_signatures(rpc_client, &pending).await
-        else {
-            continue;
-        };
-        promote_stalled_row(storage, &row, from_status, outcome_label, signature).await;
+
+        if exhausted {
+            return Ok(());
+        }
     }
+
+    // Never truncate silently: at this depth the backlog is an incident of its
+    // own, and the operator needs to know the tail went unexamined this tick.
+    warn!(
+        scanned,
+        ?from_status,
+        "Reconcile sweep hit its batch budget; remaining stalled rows deferred to the next tick"
+    );
     Ok(())
 }
 

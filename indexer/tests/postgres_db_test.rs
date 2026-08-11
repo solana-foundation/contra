@@ -1436,17 +1436,22 @@ async fn stalled_withdrawal_query_predicates_and_ordering() -> Result<(), Box<dy
         .execute(&pool)
         .await?;
 
+    // Ids ascend in insertion order, which is deliberately not `updated_at`
+    // order here: a row left untouched keeps its `updated_at` forever, so the
+    // sweep pages on the one key that always advances.
+    let by_id = vec![newest, oldest, middle];
+
     let found = storage
-        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 100)
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
         .await?;
     assert_eq!(
         found.iter().map(|t| t.id).collect::<Vec<_>>(),
-        vec![oldest, middle, newest],
-        "only rows with usable evidence, oldest updated_at first"
+        by_id,
+        "only rows with usable evidence, ascending id"
     );
 
     let found_remint = storage
-        .get_stalled_withdrawals_with_signatures(TransactionStatus::PendingRemint, 100)
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::PendingRemint, 0, 100)
         .await?;
     assert_eq!(
         found_remint.iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -1454,13 +1459,23 @@ async fn stalled_withdrawal_query_predicates_and_ordering() -> Result<(), Box<dy
         "the status bind must not leak rows from the other stalled status"
     );
 
-    let limited = storage
-        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 2)
+    // Paging must cover every row exactly once: the second page starts strictly
+    // after the last id of the first, so nothing repeats and nothing is skipped.
+    let page_one = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 2)
         .await?;
     assert_eq!(
-        limited.iter().map(|t| t.id).collect::<Vec<_>>(),
-        vec![oldest, middle],
-        "LIMIT must truncate the oldest-first ordering, not an arbitrary slice"
+        page_one.iter().map(|t| t.id).collect::<Vec<_>>(),
+        by_id[..2].to_vec(),
+        "first page is the two lowest ids"
+    );
+    let page_two = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, by_id[1], 2)
+        .await?;
+    assert_eq!(
+        page_two.iter().map(|t| t.id).collect::<Vec<_>>(),
+        by_id[2..].to_vec(),
+        "the cursor must resume after the previous page, not repeat it"
     );
     Ok(())
 }

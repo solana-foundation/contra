@@ -387,18 +387,20 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Withdrawal deferral — set_pending_remint fails → ManualReview.
+// Withdrawal deferral — set_pending_remint fails → remint state held.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Same setup as the success scenario above, but neither the write nor the
 // read-back can establish which state was committed: `set_pending_remint`
-// and `get_transaction_status` both fail. With the row's owner unknown, no
-// automatic component can be trusted to finish the withdrawal, so it routes
-// to `ManualReview` with a `"failed to persist pending remint"` label. (A
-// write failure whose row still reads Processing is left to recovery
-// instead — covered by the unit tests in transaction.rs.)
+// and `get_transaction_status` both fail. With the row's owner unknown the
+// remint info and signature stash go back into the caches and the row keeps
+// its status, so the recovery sweep owns it. Terminalizing it here would
+// strand a still-Processing withdrawal in a status no sweep selects, after
+// the only live copy of them was discarded. (A write failure whose row
+// reads back Processing takes the same path directly; the unit tests in
+// transaction.rs cover that arm.)
 #[tokio::test]
-async fn deferral_undeterminable_state_routes_to_manual_review() {
+async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(603, 23);
     seed_remint_cache(&mut state, 603, 23);
@@ -431,20 +433,36 @@ async fn deferral_undeterminable_state_routes_to_manual_review() {
     )
     .await;
 
-    let update = storage_rx
-        .recv()
-        .await
-        .expect("storage-failure arm must emit a ManualReview update");
-    assert_eq!(update.transaction_id, 603);
-    assert_eq!(update.status, TransactionStatus::ManualReview);
-    let msg = update.error_message.unwrap_or_default();
     assert!(
-        msg.contains("failed to persist pending remint"),
-        "storage-failure arm must surface the persistence-error label; got {msg:?}"
+        storage_rx.try_recv().is_err(),
+        "storage-failure arm must not write a terminal status over an unresolved row"
     );
     // The row must NOT have been pushed to pending_remints — the storage
     // write failed, so the in-memory queue cannot be allowed to drift
     // ahead of the durable state.
     assert!(state.pending_remints.is_empty());
+    // The remint info and signature stash are the only thing that can still make
+    // the user whole, so they stay in memory for the recovery sweep or a later
+    // attempt.
+    assert!(
+        state.remint_cache.contains_key(&23),
+        "remint info must be held when the row's owner is unknown"
+    );
+    assert!(
+        state.pending_signatures.contains_key(&23),
+        "release signatures must be held when the row's owner is unknown"
+    );
+    let status = mock_storage
+        .pending_transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|row| row.id == 603)
+        .map(|row| row.status);
+    assert_eq!(
+        status,
+        Some(TransactionStatus::Processing),
+        "the row must stay Processing so the recovery sweep owns it"
+    );
     mock.shutdown().await;
 }

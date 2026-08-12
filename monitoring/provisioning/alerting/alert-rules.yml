@@ -81,20 +81,17 @@ groups:
                     params: [1]
               refId: C
 
-      # The /health probe reports "stalled" during a Yellowstone stream reconnect
-      # (the provider recycles the connection ~hourly; the drain-before-close is
-      # silent for a minute or two, then the indexer reconnects and gap-fills
-      # losslessly). Those blips self-heal in <2m, so gate this at 2m to page only
-      # on a sustained stall. A hard-down process still pages fast via the scrape
-      # alert above (up == 0), which does not flap this way.
+      # Core services (gateway, write-node, read-node, operators): a failing /health
+      # probe means a real outage, so keep it fast at 30s. Excludes the indexers,
+      # which flap benignly on Yellowstone reconnects and are gated separately below.
       - uid: service-down-probe
         title: "Solana Private Channels service down (health probe failed)"
         condition: C
-        for: 2m
+        for: 30s
         noDataState: Alerting
         execErrState: Error
         annotations:
-          summary: "Service {{ $labels.instance }} health check failing for 2m+ (sustained stall, not a routine reconnect)"
+          summary: "Service {{ $labels.instance }} is down (health check failed)"
         labels:
           severity: critical
         data:
@@ -104,7 +101,48 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: probe_success{job="blackbox-http"}
+              expr: probe_success{job="blackbox-http", instance!~"http://indexer-.*"}
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+              refId: C
+
+      # Indexers only: a brief /health "stalled" during a Yellowstone reconnect is
+      # self-healing (the stream drops, the indexer reconnects and gap-fills the
+      # missed slots losslessly in seconds). Those blips clear in <2m, so gate the
+      # indexer probe at 2m to page only on a sustained stall, not a routine
+      # reconnect. Scoped to the indexer instances so core-service outages above
+      # still page fast. A hard-down indexer process still pages via the scrape
+      # alert (up == 0), which does not flap this way.
+      - uid: service-down-probe-indexer
+        title: "Indexer down (health probe failed 2m+)"
+        condition: C
+        for: 2m
+        noDataState: Alerting
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.instance }} health check failing for 2m+ (sustained stall, not a routine reconnect)"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: probe_success{job="blackbox-http", instance=~"http://indexer-.*"}
               instant: true
               refId: A
           - refId: C
@@ -200,9 +238,10 @@ groups:
     interval: 1m
     rules:
       # Early smoke for a reconnect storm, before it becomes a sustained stall.
-      # Routine provider recycles run ~2-4/hour; >5 in 15m (~20/hour) means the
-      # stream is genuinely flapping. Warning severity: it rides the default
-      # contact point (single receiver here), so it is an FYI, not a hard page.
+      # Baseline is near-zero reconnects/day; >5 in 15m means the upstream stream
+      # is genuinely flapping (provider or network churn). Warning severity: it
+      # rides the default contact point (single receiver here), so it is an FYI,
+      # not a hard page.
       - uid: indexer-reconnect-storm
         title: "Indexer datasource reconnecting abnormally often"
         condition: C

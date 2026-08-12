@@ -25,8 +25,8 @@ use tracing::{error, info};
 use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
-    /// `channel_blockhash_window` is read off the channel endpoint at operator
-    /// startup, never configured, so it mirrors the node it bounds absences against.
+    /// `channel_blockhash_window` is seeded off the channel endpoint at operator
+    /// startup, never configured, and the retention proof re-reads it per verdict.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &PrivateChannelIndexerConfig,

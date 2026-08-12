@@ -178,8 +178,8 @@ pub struct SenderState {
     /// Optional second endpoint that re-checks a `Dead` verdict on the destination
     /// `rpc_client`. `None` keeps it single-endpoint. Never used for the source.
     pub fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
-    /// Blocks a blockhash stays valid on the channel node, mirroring its
-    /// `max_blockhashes`. Bounds the retention proof for a source-side absence.
+    /// Startup floor for the channel node's `max_blockhashes`, which the retention
+    /// proof re-reads and maxes against when bounding a source-side absence.
     pub channel_blockhash_window: u64,
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,

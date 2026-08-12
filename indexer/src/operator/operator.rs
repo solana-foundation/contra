@@ -9,6 +9,7 @@ use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use private_channel_metrics::{HealthState, MetricLabel};
+use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -132,10 +133,10 @@ pub async fn run(
         ))
     });
 
-    // Both roles classify channel signatures, so both read the node's own blockhash
-    // window before any absence verdict is reached. An escrow operator's fallback is
-    // a second channel endpoint and is the one the coverage proof reads, so it counts
-    // too; a withdraw operator's fallback is Solana and is out of scope here.
+    // Both roles classify channel signatures, so both seed the node's own blockhash
+    // window here. An escrow operator's fallback is a second channel endpoint and is
+    // the one the coverage proof reads, so it counts too; a withdraw operator's
+    // fallback is Solana and is out of scope here.
     let channel_fallback = match common_config.program_type {
         crate::config::ProgramType::Escrow => fallback_rpc_client.as_deref(),
         crate::config::ProgramType::Withdraw => None,
@@ -148,8 +149,8 @@ pub async fn run(
         ),
         channel_fallback,
     )
-    .await?;
-    info!("Channel blockhash window derived from the endpoint: {channel_blockhash_window}");
+    .await;
+    info!("Channel blockhash window seeded from the endpoint: {channel_blockhash_window}");
 
     let (processor_tx, processor_rx) = mpsc::channel(config.channel_buffer_size);
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
@@ -534,10 +535,6 @@ fn channel_rpc_client<'a>(
 /// Read one channel endpoint's own blockhash window. `lastValidBlockHeight` and the
 /// response context slot are derived from a single slot on the node, so their
 /// difference is exactly its `max_blockhashes`.
-///
-/// An endpoint that cannot answer is a refuse-to-start: this window bounds every
-/// absence verdict on the channel path, and both roles classify channel signatures,
-/// so there is no safe value to guess in its place.
 async fn derive_channel_blockhash_window(
     channel_rpc: &RpcClientWithRetry,
 ) -> Result<u64, OperatorError> {
@@ -552,6 +549,22 @@ async fn derive_channel_blockhash_window(
     Ok(last_valid_block_height.saturating_sub(context_slot))
 }
 
+/// One endpoint's window, or the protocol default when it cannot be read. The seed is
+/// only a floor: every absence verdict re-reads the live window and fails closed on
+/// its own, so a boot-time blip must not take the operator down with it.
+async fn seed_blockhash_window(rpc: &RpcClientWithRetry) -> u64 {
+    match derive_channel_blockhash_window(rpc).await {
+        Ok(window) => window,
+        Err(e) => {
+            warn!(
+                "Could not read a channel endpoint's blockhash window at startup, seeding with \
+                 {MAX_PROCESSING_AGE}; every absence verdict re-reads it: {e}"
+            );
+            MAX_PROCESSING_AGE as u64
+        }
+    }
+}
+
 /// The channel blockhash window covering every endpoint the coverage proof may run
 /// against. A configured fallback is the endpoint that gets floor-checked, so its
 /// window counts too; the maximum is the conservative choice because a wider window
@@ -559,12 +572,12 @@ async fn derive_channel_blockhash_window(
 async fn channel_blockhash_window(
     primary: &RpcClientWithRetry,
     fallback: Option<&RpcClientWithRetry>,
-) -> Result<u64, OperatorError> {
-    let mut window = derive_channel_blockhash_window(primary).await?;
+) -> u64 {
+    let mut window = seed_blockhash_window(primary).await;
     if let Some(fallback) = fallback {
-        window = window.max(derive_channel_blockhash_window(fallback).await?);
+        window = window.max(seed_blockhash_window(fallback).await);
     }
-    Ok(window)
+    window
 }
 
 /// Withdraw-only gate for the Solana fallback: a missing fallback only warns (the on-chain SMT gate is the release-side
@@ -835,15 +848,21 @@ mod tests {
         assert_eq!(derived.unwrap(), 600);
     }
 
-    /// The window bounds every channel absence verdict, so an endpoint that cannot
-    /// report one leaves no safe value to start on.
+    /// Every absence verdict re-reads the window and fails closed on its own, so a
+    /// boot-time read failure seeds the protocol default instead of killing startup.
     #[tokio::test]
-    async fn startup_refuses_when_window_unreadable() {
+    async fn startup_seeds_default_when_window_unreadable() {
         let mut server = mockito::Server::new_async().await;
         let _bh = mock_channel_window_error(&mut server);
         let channel = make_rpc_client(&server.url());
-        let result = derive_channel_blockhash_window(&channel).await;
-        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+        assert!(matches!(
+            derive_channel_blockhash_window(&channel).await,
+            Err(OperatorError::RpcError(_))
+        ));
+        assert_eq!(
+            channel_blockhash_window(&channel, None).await,
+            MAX_PROCESSING_AGE as u64
+        );
     }
 
     /// The coverage proof runs against the fallback whenever one is configured, so
@@ -858,26 +877,26 @@ mod tests {
 
             let primary = make_rpc_client(&primary_server.url());
             let fallback = make_rpc_client(&fallback_server.url());
-            let window = channel_blockhash_window(&primary, Some(&fallback))
-                .await
-                .unwrap();
+            let window = channel_blockhash_window(&primary, Some(&fallback)).await;
             assert_eq!(window, 600, "the wider endpoint window must win");
         }
     }
 
-    /// A fallback that cannot report its window is the same refuse-to-start as a
-    /// primary that cannot, because it is the endpoint the coverage proof reads.
+    /// A fallback that cannot report its window only lowers the seed; the readable
+    /// endpoint's wider window still stands.
     #[tokio::test]
-    async fn startup_refuses_when_fallback_window_unreadable() {
+    async fn startup_seeds_past_an_unreadable_fallback() {
         let mut primary_server = mockito::Server::new_async().await;
         let mut fallback_server = mockito::Server::new_async().await;
-        let _p = mock_channel_window(&mut primary_server, 150);
+        let _p = mock_channel_window(&mut primary_server, 600);
         let _f = mock_channel_window_error(&mut fallback_server);
 
         let primary = make_rpc_client(&primary_server.url());
         let fallback = make_rpc_client(&fallback_server.url());
-        let result = channel_blockhash_window(&primary, Some(&fallback)).await;
-        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+        assert_eq!(
+            channel_blockhash_window(&primary, Some(&fallback)).await,
+            600
+        );
     }
 
     /// Register a null `getSignatureStatuses` whose context slot is past the
@@ -920,7 +939,7 @@ mod tests {
             let _floor = mock_floor(&mut server, 800);
 
             let channel = make_rpc_client(&server.url());
-            let derived = channel_blockhash_window(&channel, None).await.unwrap();
+            let derived = channel_blockhash_window(&channel, None).await;
             assert_eq!(derived, window);
 
             let finality = crate::operator::sender::FinalityRpc::channel(&channel, None, derived);

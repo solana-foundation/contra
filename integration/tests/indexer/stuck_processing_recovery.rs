@@ -372,6 +372,8 @@ async fn deposit_dead_signature_demoted() {
     );
     // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
+    // The coverage proof reads the channel's live blockhash window per verdict.
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -1564,6 +1566,8 @@ async fn stale_jit_refire_does_not_double_mint() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
+    // The coverage proof reads the channel's live blockhash window per verdict.
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
     let recovery_client = test_client(mock.url());
     test_hooks::run_recovery_once(
         &storage,

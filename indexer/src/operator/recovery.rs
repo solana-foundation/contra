@@ -850,6 +850,23 @@ mod tests {
             .create()
     }
 
+    /// The channel's live blockhash window, which the coverage proof re-reads as
+    /// `lastValidBlockHeight - context.slot`.
+    fn mock_channel_window(server: &mut mockito::ServerGuard, window: u64) -> mockito::Mock {
+        let slot = 1_000u64;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{slot}}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{}}}}},"id":1}}"#,
+                slot + window
+            ))
+            .create()
+    }
+
     /// Root of a fresh tree carrying `nonces` (used to craft an on-chain instance).
     fn smt_root(tree_index: u64, nonces: &[u64]) -> [u8; 32] {
         use crate::operator::utils::smt_util::SmtState;
@@ -991,6 +1008,7 @@ mod tests {
         let _status = mock_null_status(&mut server);
         // Covered floor (0) so the single-endpoint absence is proven Dead.
         let _floor = mock_first_available_block(&mut server, 0);
+        let _window = mock_channel_window(&mut server, MAX_PROCESSING_AGE as u64);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);

@@ -155,9 +155,11 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get the current block height with retry. Used by the pending-remint gate
-    /// to compare against each stored signature's `last_valid_block_height` and
-    /// decide whether a broadcast can still land.
+    /// Get the current block height with retry, to compare against each stored
+    /// signature's `last_valid_block_height` and decide whether a broadcast can
+    /// still land. Solana-only: slots and heights diverge there. The channel keeps
+    /// them equal and does not implement `getBlockHeight`, so its classification
+    /// reads the height off the status response's own context slot instead.
     pub async fn get_block_height(&self) -> Result<u64, Box<client_error::Error>> {
         self.with_retry("get_block_height", RetryPolicy::Idempotent, || async {
             self.rpc_client.get_block_height().await

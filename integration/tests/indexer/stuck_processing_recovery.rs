@@ -26,6 +26,7 @@ use {
     serde_json::json,
     solana_keychain::SolanaSigner,
     solana_sdk::{
+        clock::MAX_PROCESSING_AGE,
         commitment_config::{CommitmentConfig, CommitmentLevel},
         pubkey::Pubkey,
         signature::Signature,
@@ -363,12 +364,12 @@ async fn deposit_dead_signature_demoted() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // Status null + current height (1000) > lvbh (100) -> expired/dead.
+    // Channel: the response's own context slot (200) is the block height and is
+    // past lvbh (100), so no getBlockHeight is scripted and none may be called.
     mock.enqueue(
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
-    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let client = test_client(mock.url());
@@ -381,6 +382,11 @@ async fn deposit_dead_signature_demoted() {
         .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
+    assert_eq!(
+        mock.call_count("getBlockHeight"),
+        0,
+        "the channel classification must resolve from the status response alone"
+    );
     // Recovery classifies the dead signature but never re-mints itself (the fetcher does).
     assert_eq!(mock.call_count("sendTransaction"), 0);
     assert_recovered_increment(
@@ -1415,6 +1421,7 @@ async fn build_pg_sender_state(storage: Arc<Storage>, rpc_url: String) -> Sender
         1,
         1,
         None,
+        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("sender state construction against Postgres storage")
 }
@@ -1556,7 +1563,6 @@ async fn stale_jit_refire_does_not_double_mint() {
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
-    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let recovery_client = test_client(mock.url());
     test_hooks::run_recovery_once(
@@ -1787,7 +1793,6 @@ async fn cross_operator_recovery_does_not_replay_deposit_mint() {
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
-    solana.enqueue("getBlockHeight", Reply::result(json!(1000)));
     solana.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let solana_client = test_client(solana.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
@@ -1939,6 +1944,7 @@ async fn demoted_deposit_reopens_through_gate_without_second_mint() {
         channel_client,
         None,
         ProgramType::Escrow,
+        MAX_PROCESSING_AGE as u64,
     )
     .await
     .unwrap();
@@ -1956,6 +1962,98 @@ async fn demoted_deposit_reopens_through_gate_without_second_mint() {
         channel.call_count("sendTransaction"),
         0,
         "exactly one mint broadcast total (the original write-ahead one)"
+    );
+    channel.shutdown().await;
+}
+
+// O2, the double-mint this issue is about: the channel node now reports an
+// internal storage failure as a JSON-RPC error instead of a null status. The
+// gate must read that as "cannot verify", leave the row Processing and dispatch
+// no mint; before the core fix the same failure arrived as a null and, once past
+// blockhash validity, would have been proven Dead and re-minted.
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_gate_channel_db_error_does_not_mint() {
+    use private_channel_indexer::operator::{
+        processor::{process_deposit_funds, ProcessorState},
+        utils::instruction_util::TransactionBuilder,
+        MintCache,
+    };
+
+    let (db, url, _container) = start_pg("gate_db_error").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        999,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    let captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    // Write-ahead persist of a broadcast whose blockhash has long expired.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+        .await
+        .unwrap();
+
+    // Demote and re-lock so the fetcher hands the gate a genuinely reopened row.
+    assert!(storage
+        .try_requeue_processing(tx_id, captured)
+        .await
+        .unwrap());
+    let relocked = storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
+        .await
+        .unwrap();
+    let row = relocked
+        .into_iter()
+        .find(|r| r.id == tx_id)
+        .expect("row re-locked");
+
+    let channel = MockRpcServer::start().await;
+    channel.enqueue(
+        "getSignatureStatuses",
+        Reply::error(
+            -32000,
+            "Failed to get transaction status: connection closed",
+        ),
+    );
+    let channel_client = Arc::new(test_client(channel.url()));
+
+    let mut ps = ProcessorState {
+        admin_pubkey: Pubkey::new_unique(),
+        release_funds_state: None,
+        mint_cache: MintCache::new(storage.clone()),
+    };
+    let (fetcher_tx, fetcher_rx) = tokio::sync::mpsc::channel(1);
+    let (sender_tx, mut sender_rx) = tokio::sync::mpsc::channel::<TransactionBuilder>(8);
+    let (storage_tx, _storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+    fetcher_tx.send(row).await.unwrap();
+    drop(fetcher_tx);
+
+    process_deposit_funds(
+        &mut ps,
+        fetcher_rx,
+        sender_tx,
+        storage_tx,
+        storage.clone(),
+        channel_client,
+        None,
+        ProgramType::Escrow,
+        MAX_PROCESSING_AGE as u64,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        sender_rx.try_recv().is_err(),
+        "an unverifiable channel must never dispatch a mint"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "the row stays Processing for the recovery sweep to re-check"
     );
     channel.shutdown().await;
 }

@@ -645,6 +645,29 @@ mod tests {
         );
     }
 
+    /// A channel node that cannot read a block answers `-32000`, which is outside
+    /// the skipped-or-missing set, so the slot is undetermined and retried. An
+    /// internal failure must never be read as a proven skip.
+    #[tokio::test]
+    async fn server_error_on_listed_producer_is_never_a_skip() {
+        let mut server = Server::new_async().await;
+        let _blocks = mock_get_blocks(&mut server, 100, 104, &[100, 102, 104]);
+        let _b100 = mock_get_block_at(&mut server, 100, 99);
+        let _b102 = mock_get_block_error(&mut server, 102, -32000, "Failed to read block");
+        let _b104 = mock_get_block_at(&mut server, 104, 102);
+
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .await;
+
+        let tagged = tags(&results);
+        assert_eq!(tagged[2], (102, "err"));
+        assert!(
+            tagged.iter().all(|(_, t)| *t != "skipped"),
+            "an internal read failure must not yield any proven skip: {tagged:?}"
+        );
+    }
+
     /// U-4. A batch ending in non-producers is witnessed by the first producer past
     /// the range, whose parent link proves the trailing run empty.
     #[tokio::test]

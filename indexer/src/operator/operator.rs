@@ -132,6 +132,25 @@ pub async fn run(
         ))
     });
 
+    // Both roles classify channel signatures, so both read the node's own blockhash
+    // window before any absence verdict is reached. An escrow operator's fallback is
+    // a second channel endpoint and is the one the coverage proof reads, so it counts
+    // too; a withdraw operator's fallback is Solana and is out of scope here.
+    let channel_fallback = match common_config.program_type {
+        crate::config::ProgramType::Escrow => fallback_rpc_client.as_deref(),
+        crate::config::ProgramType::Withdraw => None,
+    };
+    let channel_blockhash_window = channel_blockhash_window(
+        channel_rpc_client(
+            common_config.program_type,
+            &rpc_client,
+            source_rpc_client.as_deref(),
+        ),
+        channel_fallback,
+    )
+    .await?;
+    info!("Channel blockhash window derived from the endpoint: {channel_blockhash_window}");
+
     let (processor_tx, processor_rx) = mpsc::channel(config.channel_buffer_size);
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
     let (storage_tx, storage_rx) = mpsc::channel::<sender::TransactionStatusUpdate>(100);
@@ -168,6 +187,7 @@ pub async fn run(
                 preflight_instance,
                 &storage_tx,
                 &cancellation_token,
+                channel_blockhash_window,
             )
             .await;
 
@@ -236,6 +256,7 @@ pub async fn run(
             processor_rpc,
             processor_fallback_rpc,
             processor_source_rpc,
+            channel_blockhash_window,
         )
         .await;
     });
@@ -259,6 +280,7 @@ pub async fn run(
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
             sender::SENDER_LOCK_HEARTBEAT_INTERVAL,
+            channel_blockhash_window,
         )
         .await
         {
@@ -330,6 +352,7 @@ pub async fn run(
                 recovery_instance_pda,
                 recovery_storage_tx,
                 recovery_token,
+                channel_blockhash_window,
             )
             .await
             {
@@ -438,6 +461,7 @@ pub async fn run(
 
 /// Reconcile in-flight releases, then validate the local SMT against the on-chain root.
 /// Only a genuine `SmtRootMismatch` returns `Err` (refuse to start).
+#[allow(clippy::too_many_arguments)]
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,
@@ -445,6 +469,7 @@ async fn run_withdraw_preflight(
     instance_pda: solana_sdk::pubkey::Pubkey,
     storage_tx: &mpsc::Sender<sender::TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
+    channel_blockhash_window: u64,
 ) -> Result<(), OperatorError> {
     // Idempotent passes absorb rows that flip Processing to terminal across iterations.
     const MAX_RECONCILE_PASSES: u32 = 8;
@@ -460,6 +485,7 @@ async fn run_withdraw_preflight(
         storage_tx,
         cancellation_token,
         MAX_RECONCILE_PASSES,
+        channel_blockhash_window,
     )
     .await
     {
@@ -489,6 +515,56 @@ async fn run_withdraw_preflight(
             Ok(())
         }
     }
+}
+
+/// The endpoint that speaks the channel protocol for this role: an escrow operator's
+/// `rpc_url` is the channel, a withdraw operator's `source_rpc_url` is.
+fn channel_rpc_client<'a>(
+    program_type: crate::config::ProgramType,
+    rpc_client: &'a RpcClientWithRetry,
+    source_rpc_client: Option<&'a RpcClientWithRetry>,
+) -> &'a RpcClientWithRetry {
+    match program_type {
+        crate::config::ProgramType::Escrow => rpc_client,
+        // Mirrors the sender, which falls back to rpc_client when no source is set.
+        crate::config::ProgramType::Withdraw => source_rpc_client.unwrap_or(rpc_client),
+    }
+}
+
+/// Read one channel endpoint's own blockhash window. `lastValidBlockHeight` and the
+/// response context slot are derived from a single slot on the node, so their
+/// difference is exactly its `max_blockhashes`.
+///
+/// An endpoint that cannot answer is a refuse-to-start: this window bounds every
+/// absence verdict on the channel path, and both roles classify channel signatures,
+/// so there is no safe value to guess in its place.
+async fn derive_channel_blockhash_window(
+    channel_rpc: &RpcClientWithRetry,
+) -> Result<u64, OperatorError> {
+    let (context_slot, last_valid_block_height) = channel_rpc
+        .get_latest_blockhash_with_context(CommitmentConfig::finalized())
+        .await
+        .map_err(|e| {
+            OperatorError::RpcError(format!(
+                "could not read the channel endpoint's blockhash window at startup: {e}"
+            ))
+        })?;
+    Ok(last_valid_block_height.saturating_sub(context_slot))
+}
+
+/// The channel blockhash window covering every endpoint the coverage proof may run
+/// against. A configured fallback is the endpoint that gets floor-checked, so its
+/// window counts too; the maximum is the conservative choice because a wider window
+/// lowers the retention bound and makes the proof stricter.
+async fn channel_blockhash_window(
+    primary: &RpcClientWithRetry,
+    fallback: Option<&RpcClientWithRetry>,
+) -> Result<u64, OperatorError> {
+    let mut window = derive_channel_blockhash_window(primary).await?;
+    if let Some(fallback) = fallback {
+        window = window.max(derive_channel_blockhash_window(fallback).await?);
+    }
+    Ok(window)
 }
 
 /// Withdraw-only gate for the Solana fallback: a missing fallback only warns (the on-chain SMT gate is the release-side
@@ -570,6 +646,7 @@ mod tests {
     use base64::Engine;
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::Instance;
+    use solana_sdk::clock::MAX_PROCESSING_AGE;
     use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
@@ -649,6 +726,7 @@ mod tests {
             Pubkey::new_unique(),
             &storage_tx,
             &token,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
     }
@@ -711,6 +789,152 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(format!(r#"{{"jsonrpc":"2.0","result":"{hash}","id":0}}"#))
             .create()
+    }
+
+    // ── channel blockhash window derivation ──────────────────────────
+
+    /// Register a finalized `getLatestBlockhash` whose `lvbh - context_slot` is
+    /// `window`, which is exactly the endpoint's `max_blockhashes`.
+    fn mock_channel_window(server: &mut mockito::ServerGuard, window: u64) -> mockito::Mock {
+        let slot = 1_000u64;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{slot}}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{}}}}},"id":0}}"#,
+                slot + window
+            ))
+            .create()
+    }
+
+    /// Register a `getLatestBlockhash` that fails, standing in for an unreachable
+    /// or broken channel endpoint.
+    fn mock_channel_window_error(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"down"},"id":0}"#)
+            .create()
+    }
+
+    /// The node reports its own `max_blockhashes` as `lvbh - context_slot`, so the
+    /// operator reads the window off the endpoint instead of mirroring it in config.
+    #[tokio::test]
+    async fn startup_derives_window_from_channel_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let _bh = mock_channel_window(&mut server, 600);
+        let channel = make_rpc_client(&server.url());
+        let derived = derive_channel_blockhash_window(&channel).await;
+        assert_eq!(derived.unwrap(), 600);
+    }
+
+    /// The window bounds every channel absence verdict, so an endpoint that cannot
+    /// report one leaves no safe value to start on.
+    #[tokio::test]
+    async fn startup_refuses_when_window_unreadable() {
+        let mut server = mockito::Server::new_async().await;
+        let _bh = mock_channel_window_error(&mut server);
+        let channel = make_rpc_client(&server.url());
+        let result = derive_channel_blockhash_window(&channel).await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// The coverage proof runs against the fallback whenever one is configured, so
+    /// the window must hold for either endpoint; the larger one is the stricter proof.
+    #[tokio::test]
+    async fn startup_takes_max_window_across_channel_endpoints() {
+        for (primary_window, fallback_window) in [(150u64, 600u64), (600u64, 150u64)] {
+            let mut primary_server = mockito::Server::new_async().await;
+            let mut fallback_server = mockito::Server::new_async().await;
+            let _p = mock_channel_window(&mut primary_server, primary_window);
+            let _f = mock_channel_window(&mut fallback_server, fallback_window);
+
+            let primary = make_rpc_client(&primary_server.url());
+            let fallback = make_rpc_client(&fallback_server.url());
+            let window = channel_blockhash_window(&primary, Some(&fallback))
+                .await
+                .unwrap();
+            assert_eq!(window, 600, "the wider endpoint window must win");
+        }
+    }
+
+    /// A fallback that cannot report its window is the same refuse-to-start as a
+    /// primary that cannot, because it is the endpoint the coverage proof reads.
+    #[tokio::test]
+    async fn startup_refuses_when_fallback_window_unreadable() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let _p = mock_channel_window(&mut primary_server, 150);
+        let _f = mock_channel_window_error(&mut fallback_server);
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = channel_blockhash_window(&primary, Some(&fallback)).await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// Register a null `getSignatureStatuses` whose context slot is past the
+    /// signature's validity, i.e. an absence the coverage proof must adjudicate.
+    fn mock_null_status(server: &mut mockito::ServerGuard, context_slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{context_slot}}},"value":[null]}},"id":0}}"#
+            ))
+            .create()
+    }
+
+    /// Register a `getFirstAvailableBlock` ledger floor.
+    fn mock_floor(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":0}}"#))
+            .create()
+    }
+
+    /// The point of deriving: the window read off the node reaches `coverage_verdict`
+    /// and decides the verdict. Same floor and lvbh, opposite outcomes.
+    #[tokio::test]
+    async fn derived_window_decides_the_coverage_verdict() {
+        for (window, expect_dead) in [(150u64, true), (600u64, false)] {
+            let mut server = mockito::Server::new_async().await;
+            let _bh = mock_channel_window(&mut server, window);
+            let _status = mock_null_status(&mut server, 2000);
+            let _floor = mock_floor(&mut server, 800);
+
+            let channel = make_rpc_client(&server.url());
+            let derived = channel_blockhash_window(&channel, None).await.unwrap();
+            assert_eq!(derived, window);
+
+            let finality = crate::operator::sender::FinalityRpc::channel(&channel, None, derived);
+            let sigs = [crate::operator::sender::types::PendingSig {
+                signature: solana_sdk::signature::Signature::new_unique(),
+                last_valid_block_height: 1_000,
+            }];
+            let verdict = crate::operator::sender::classify_signatures(&finality, &sigs).await;
+            assert_eq!(
+                matches!(verdict, crate::operator::sender::SigFinality::Dead),
+                expect_dead,
+                "derived window {window} must decide the retention bound"
+            );
+        }
     }
 
     /// S1: a withdraw operator with no fallback now warns and starts (previously

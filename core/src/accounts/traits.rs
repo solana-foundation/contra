@@ -56,7 +56,10 @@ impl AccountsDB {
         super::set_account::set_account(self, pubkey, account).await
     }
 
-    pub async fn get_transaction(&self, signature: &Signature) -> Option<StoredTransaction> {
+    pub async fn get_transaction(
+        &self,
+        signature: &Signature,
+    ) -> Result<Option<StoredTransaction>> {
         super::get_transaction::get_transaction(self, signature).await
     }
 
@@ -85,7 +88,7 @@ impl AccountsDB {
         super::store_block::store_block(self, block_info).await
     }
 
-    pub async fn get_block(&self, slot: u64) -> Option<BlockInfo> {
+    pub async fn get_block(&self, slot: u64) -> Result<Option<BlockInfo>> {
         super::get_block::get_block(self, slot).await
     }
 
@@ -154,7 +157,7 @@ impl AccountsDB {
         super::get_recent_performance_samples::get_recent_performance_samples(self, limit).await
     }
 
-    pub async fn get_block_time(&self, slot: u64) -> Option<i64> {
+    pub async fn get_block_time(&self, slot: u64) -> Result<Option<i64>> {
         super::get_block_time::get_block_time(self, slot).await
     }
 }
@@ -295,7 +298,7 @@ mod tests {
 
         db.store_block(block.clone()).await.unwrap();
 
-        let loaded = db.get_block(10).await;
+        let loaded = db.get_block(10).await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.slot, 10);
@@ -305,7 +308,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_block_miss_returns_none() {
         let (db, _pg) = start_test_postgres().await;
-        assert!(db.get_block(999).await.is_none());
+        assert!(db.get_block(999).await.unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -461,7 +464,7 @@ mod tests {
     async fn get_transaction_miss() {
         let (db, _pg) = start_test_postgres().await;
         let sig = Signature::new_unique();
-        assert!(db.get_transaction(&sig).await.is_none());
+        assert!(db.get_transaction(&sig).await.unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -527,7 +530,7 @@ mod tests {
         let expected_time = block.block_time;
         db.store_block(block).await.unwrap();
 
-        let time = db.get_block_time(7).await;
+        let time = db.get_block_time(7).await.unwrap();
         assert_eq!(time, expected_time);
     }
 
@@ -553,7 +556,7 @@ mod tests {
         assert!(db.get_account_shared_data(&pk).await.is_some());
 
         // block was stored
-        let loaded = db.get_block(1).await;
+        let loaded = db.get_block(1).await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().blockhash, bh);
 
@@ -579,7 +582,7 @@ mod tests {
         // Empty batch must not error and must not mutate any observable state.
         db.write_batch(&[], vec![], None).await.unwrap();
         assert_eq!(db.get_latest_blockhash().await.unwrap(), seeded_bh);
-        assert!(db.get_block(7).await.is_some());
+        assert!(db.get_block(7).await.unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

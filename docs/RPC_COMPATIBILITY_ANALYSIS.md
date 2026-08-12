@@ -54,13 +54,13 @@ Ordered from most divergent → closest match.
 | `getSlotLeaders` | `[]` - SPC has no leader rotation. Jito-style "predict next leader" lookups get nothing. |
 | `isBlockhashValid` | Checks the Dedup stage's in-memory live-blockhash window via linear scan. Identical contract to Solana but window can be shorter than 150; older hashes return `false` indistinguishably from "never existed". |
 | `getRecentPerformanceSamples` | Real data from SPC's pipeline; default/max 720 (matches Solana). Numbers reflect SPC, not mainnet - by design. |
-| `getLatestBlockhash` | `lastValidBlockHeight = slot + 150` (literal, not derived from `max_blockhashes`). SPC keeps slot and block height equal so the value is internally consistent. No `getBlockHeight` - clients call `getSlot` instead. |
-| `getSignatureStatuses` | `confirmation_status = Finalized`, `confirmations = None` on every found tx (correct under SPC's single timeline). `searchTransactionHistory` accepted but ignored. Malformed signatures return `None` rather than Solana's `INVALID_PARAMS` error. Max 256 sigs. |
-| `getBlock` **[auth]** | `maxSupportedTransactionVersion`, `transactionDetails`, `rewards`, `encoding` honoured. `rewards` always `[]`; `numPartitions` always `None` - both SPC-faithful. |
-| `getTransaction` **[auth]** | Real lookup. Only difference from Solana is the JWT requirement. |
+| `getLatestBlockhash` | `lastValidBlockHeight = slot + max_blockhashes`, so it tracks the node's configured `transaction_expiration_ms / blocktime_ms` window rather than Solana's fixed 150. SPC keeps slot and block height equal by construction, and that equality is load-bearing: the operator reads the `getSignatureStatuses` context slot as a block height and compares it against this value. No `getBlockHeight` - clients call `getSlot` instead. |
+| `getSignatureStatuses` | `confirmation_status = Finalized`, `confirmations = None` on every found tx (correct under SPC's single timeline). `searchTransactionHistory` accepted but ignored. A storage or decode failure returns a `-32000` server error, never a `null` element, so a `null` means the signature is genuinely absent. A malformed signature fails the whole call with `-32602` invalid params, matching Solana, rather than nulling that one element. Max 256 sigs. |
+| `getBlock` **[auth]** | `maxSupportedTransactionVersion`, `transactionDetails`, `rewards`, `encoding` honoured. `rewards` always `[]`; `numPartitions` always `None` - both SPC-faithful. A transaction the node cannot read fails the whole call with `-32000` rather than returning a block that silently omits it, and a block the node cannot read returns `-32000` rather than a `null`, so a `null` means the slot genuinely holds no block. |
+| `getTransaction` **[auth]** | Real lookup. A storage or decode failure returns `-32000`, never a `null`. Only other difference from Solana is the JWT requirement. |
 | `getTransactionCount` | Backed by SPC's own counter. |
 | `getFirstAvailableBlock` | Returns the earliest slot SPC has stored. |
-| `getBlockTime` | Returns `Option<i64>` from SPC's stored block data. |
+| `getBlockTime` | Returns `Option<i64>` from SPC's stored block data. Reads the same row as `getBlock`, so a storage or decode failure returns `-32000`, never a `null`. |
 
 ---
 

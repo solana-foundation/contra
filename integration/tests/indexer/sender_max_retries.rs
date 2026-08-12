@@ -73,6 +73,7 @@ async fn build_fixture(
         retry_max_attempts,
         1,
         None,
+        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("SenderState construction must succeed under Mock storage");
     let (storage_tx, storage_rx) = mpsc::channel(16);

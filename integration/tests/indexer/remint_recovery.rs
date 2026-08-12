@@ -120,6 +120,7 @@ async fn recover_rehydrates_valid_pending_remint_row() {
         3,
         400,
         None,
+        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("constructing SenderState with Mock storage should succeed");
 
@@ -172,6 +173,7 @@ async fn recover_is_noop_when_no_pending_rows() {
         3,
         400,
         None,
+        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("constructing SenderState with Mock storage should succeed");
 
@@ -218,6 +220,7 @@ async fn recover_escalates_malformed_row_but_continues_with_others() {
         3,
         400,
         None,
+        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("constructing SenderState with Mock storage should succeed");
 

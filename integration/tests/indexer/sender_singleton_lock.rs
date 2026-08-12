@@ -104,6 +104,7 @@ fn spawn_sender(
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             heartbeat_interval,
+            solana_sdk::clock::MAX_PROCESSING_AGE as u64,
         )
         .await
     });

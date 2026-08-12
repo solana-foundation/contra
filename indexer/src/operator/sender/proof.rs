@@ -210,6 +210,7 @@ mod tests {
     use private_channel_escrow_program_client::instructions::{
         ReleaseFundsBuilder, ResetSmtRootBuilder,
     };
+    use solana_sdk::clock::MAX_PROCESSING_AGE;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -230,6 +231,7 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc.clone(),
             fallback_rpc_client: None,
+            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,

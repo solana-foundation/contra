@@ -2,7 +2,9 @@
 use super::types::InFlightQueue;
 use super::types::SenderState;
 use super::{verify_release_landed, ReleaseVerdict};
-use crate::metrics::{OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST};
+use crate::metrics::{
+    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
+};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::{
     channel_utils::send_guaranteed,
@@ -390,20 +392,69 @@ pub(crate) enum SigFinality {
     Uncertain(String),
 }
 
+/// Where an endpoint's current block height comes from. Both chains report a
+/// `context.slot`, so nothing on the wire distinguishes them; the chain is known
+/// statically at every construction site and tagged there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeightSource {
+    /// PrivateChannel: block height equals slot by construction, so the status
+    /// response's own context slot is the height. One response cannot be split
+    /// across two backends, which a separate height call can be.
+    ContextSlot,
+    /// Solana: slots and heights diverge (skipped slots), so height needs its own call.
+    BlockHeightRpc,
+}
+
+impl HeightSource {
+    /// Metric label for the chain this height source identifies.
+    fn chain_label(self) -> &'static str {
+        match self {
+            HeightSource::ContextSlot => "channel",
+            HeightSource::BlockHeightRpc => "solana",
+        }
+    }
+}
+
 /// A primary RPC endpoint plus an optional fallback. One endpoint's missing status
 /// can be a prune or lag rather than proof, so only a `Dead` verdict re-checks it.
 pub(crate) struct FinalityRpc<'a> {
     pub primary: &'a RpcClientWithRetry,
     pub fallback: Option<&'a RpcClientWithRetry>,
+    /// How to read the current block height from these endpoints.
+    pub height_source: HeightSource,
+    /// Blocks a blockhash stays valid on this chain. Bounds the slot range the
+    /// retention proof must cover, so an under-sized value would accept an
+    /// absence the endpoint has already pruned.
+    pub blockhash_window: u64,
 }
 
 impl<'a> FinalityRpc<'a> {
-    /// Single-endpoint oracle: no corroboration. Used where no independent second
-    /// endpoint exists (a single-provider chain) or none is configured.
-    pub fn single(primary: &'a RpcClientWithRetry) -> Self {
+    /// Endpoints on the PrivateChannel chain. The window is operator-configured
+    /// because the node's `max_blockhashes` is configurable, not protocol-fixed.
+    pub fn channel(
+        primary: &'a RpcClientWithRetry,
+        fallback: Option<&'a RpcClientWithRetry>,
+        blockhash_window: u64,
+    ) -> Self {
         Self {
             primary,
-            fallback: None,
+            fallback,
+            height_source: HeightSource::ContextSlot,
+            blockhash_window,
+        }
+    }
+
+    /// Endpoints on Solana, whose 150-block blockhash validity is protocol-fixed
+    /// and therefore never operator-tunable.
+    pub fn solana(
+        primary: &'a RpcClientWithRetry,
+        fallback: Option<&'a RpcClientWithRetry>,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            height_source: HeightSource::BlockHeightRpc,
+            blockhash_window: MAX_PROCESSING_AGE as u64,
         }
     }
 }
@@ -426,23 +477,37 @@ enum EndpointVerdict {
 }
 
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
-/// attempt's slot range, else `Uncertain`. A blockhash is valid for `MAX_PROCESSING_AGE`
-/// blocks, so `lvbh - MAX_PROCESSING_AGE` lower-bounds the landing slot (slot >= height); a
-/// floor at or below it proves retention, and the height-vs-slot slack only over-reports
-/// Uncertain, never a false covered. Assumes a single consistent archival endpoint, not a split pool.
+/// attempt's slot range, else `Uncertain`. A blockhash is valid for the chain's
+/// `blockhash_window` blocks, so `lvbh - window` lower-bounds the landing slot
+/// (slot >= height); a floor at or below it proves retention, and the height-vs-slot
+/// slack only over-reports Uncertain, never a false covered. Assumes a single
+/// consistent archival endpoint, not a split pool.
 async fn coverage_verdict(
+    finality: &FinalityRpc<'_>,
     rpc: &RpcClientWithRetry,
     min_lvbh: u64,
     endpoint_label: &str,
 ) -> SigFinality {
+    let chain = finality.height_source.chain_label();
     let floor = match rpc.get_first_available_block().await {
         Ok(floor) => floor,
-        Err(e) => return SigFinality::Uncertain(format!("ledger floor RPC failed: {e}")),
+        Err(e) => {
+            OPERATOR_ABSENCE_CLASSIFY
+                .with_label_values(&[chain, "uncertain"])
+                .inc();
+            return SigFinality::Uncertain(format!("ledger floor RPC failed: {e}"));
+        }
     };
-    let bound = min_lvbh.saturating_sub(MAX_PROCESSING_AGE as u64);
+    let bound = min_lvbh.saturating_sub(finality.blockhash_window);
     if floor <= bound {
+        OPERATOR_ABSENCE_CLASSIFY
+            .with_label_values(&[chain, "dead"])
+            .inc();
         SigFinality::Dead
     } else {
+        OPERATOR_ABSENCE_CLASSIFY
+            .with_label_values(&[chain, "uncertain"])
+            .inc();
         SigFinality::Uncertain(format!(
             "{endpoint_label}ledger floor {floor} above attempt window (lvbh {min_lvbh}, retained-slot bound {bound}); pruned or lagging, absence is not proof of non-inclusion"
         ))
@@ -467,7 +532,10 @@ pub(crate) async fn classify_signatures(
     finality: &FinalityRpc<'_>,
     sigs: &[PendingSig],
 ) -> SigFinality {
-    let primary_lvbh = match classify_endpoint(finality.primary, sigs).await {
+    // Primary and fallback are same-chain by construction, so both endpoints read
+    // the current height the same way.
+    let height_source = finality.height_source;
+    let primary_lvbh = match classify_endpoint(finality.primary, sigs, height_source).await {
         EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
         EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
         EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
@@ -481,7 +549,7 @@ pub(crate) async fn classify_signatures(
         // Destination path: the primary is allowed to be pruned (that is why the
         // fallback exists), so we trust the fallback's verdict and coverage-check
         // the fallback, never the primary.
-        Some(fb) => match classify_endpoint(fb, sigs).await {
+        Some(fb) => match classify_endpoint(fb, sigs, height_source).await {
             EndpointVerdict::Landed(sig) => {
                 warn_fallback_override("Landed", &sig.to_string(), sigs);
                 SigFinality::Landed(sig)
@@ -493,20 +561,24 @@ pub(crate) async fn classify_signatures(
             EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
             EndpointVerdict::DeadFinalizedFailure => SigFinality::Dead,
             EndpointVerdict::DeadByAbsence { min_lvbh } => {
-                coverage_verdict(fb, min_lvbh, "fallback ").await
+                coverage_verdict(finality, fb, min_lvbh, "fallback ").await
             }
         },
         // Source/escrow single endpoint: no second node can corroborate, so the
         // sole endpoint's coverage is the whole protection.
-        None => coverage_verdict(finality.primary, primary_lvbh, "").await,
+        None => coverage_verdict(finality, finality.primary, primary_lvbh, "").await,
     }
 }
 
 /// Thin test-only wrapper over `classify_endpoint` mapping both `Dead` shapes to `SigFinality::Dead`.
 /// Lets the per-endpoint unit tests assert status logic without the coverage gate `classify_signatures` adds.
 #[cfg(test)]
-pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
-    match classify_endpoint(rpc, sigs).await {
+pub(crate) async fn classify_against(
+    rpc: &RpcClientWithRetry,
+    sigs: &[PendingSig],
+    height_source: HeightSource,
+) -> SigFinality {
+    match classify_endpoint(rpc, sigs, height_source).await {
         EndpointVerdict::Landed(sig) => SigFinality::Landed(sig),
         EndpointVerdict::Live(reason) => SigFinality::Live(reason),
         EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
@@ -518,7 +590,11 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
 
 /// Classify `sigs` against one endpoint's `getSignatureStatuses` history, distinguishing a
 /// finalized-failed `Dead` from an absence-based one so only the latter needs a coverage proof.
-async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
+async fn classify_endpoint(
+    rpc: &RpcClientWithRetry,
+    sigs: &[PendingSig],
+    height_source: HeightSource,
+) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
     let response = match rpc.get_signature_statuses_with_history(&flat).await {
@@ -548,14 +624,19 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
         return EndpointVerdict::Landed(flat[index]);
     }
 
-    // Fetch block height only for the lvbh check on null-status sigs, so a
+    // Height is needed only for the lvbh check on null-status sigs. On the channel
+    // it is already in this response, which also binds it to the same backend and
+    // the same snapshot as the statuses; on Solana it costs a second call, so a
     // transient getBlockHeight outage isn't treated as uncertainty otherwise.
     let current_height = if response.value.iter().any(|s| s.is_none()) {
-        match rpc.get_block_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
-            }
+        match height_source {
+            HeightSource::ContextSlot => response.context.slot,
+            HeightSource::BlockHeightRpc => match rpc.get_block_height().await {
+                Ok(h) => h,
+                Err(e) => {
+                    return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
+                }
+            },
         }
     } else {
         // Unused: the null-status branch below only fires when some status is None.
@@ -1009,6 +1090,7 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
             fallback_rpc_client: None,
+            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
@@ -1107,6 +1189,7 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
             fallback_rpc_client: None,
+            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
@@ -1243,6 +1326,7 @@ mod tests {
             rpc_client,
             source_rpc_client,
             fallback_rpc_client,
+            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
@@ -2505,7 +2589,7 @@ mod tests {
             },
         ];
 
-        match classify_against(&rpc, &sigs).await {
+        match classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await {
             SigFinality::Landed(s) => assert_eq!(
                 s, success,
                 "must return the finalized-success sig, not the failed one"
@@ -2544,7 +2628,10 @@ mod tests {
         ];
 
         assert!(
-            matches!(classify_against(&rpc, &sigs).await, SigFinality::Live(_)),
+            matches!(
+                classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await,
+                SigFinality::Live(_)
+            ),
             "confirmed success behind a finalized failure must be Live, not Dead"
         );
     }
@@ -2581,7 +2668,10 @@ mod tests {
         ];
 
         assert!(
-            matches!(classify_against(&rpc, &sigs).await, SigFinality::Live(_)),
+            matches!(
+                classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await,
+                SigFinality::Live(_)
+            ),
             "a still-valid null after an expired null must be Live, not Dead"
         );
     }
@@ -2613,7 +2703,7 @@ mod tests {
 
         assert!(
             matches!(
-                classify_against(&rpc, &sigs).await,
+                classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await,
                 SigFinality::Uncertain(_)
             ),
             "length mismatch must be Uncertain"
@@ -2718,10 +2808,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2742,10 +2829,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2766,10 +2850,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         match classify_signatures(&finality, &one_expired_sig()).await {
             SigFinality::Uncertain(reason) => {
                 assert!(
@@ -2815,10 +2896,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2856,10 +2934,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2886,10 +2961,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2915,10 +2987,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2936,7 +3005,7 @@ mod tests {
         mock_dead(&mut primary).await;
 
         let p = make_rpc(&primary.url());
-        let finality = FinalityRpc::single(&p);
+        let finality = FinalityRpc::solana(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -2954,7 +3023,7 @@ mod tests {
         mock_dead_pruned(&mut primary, 1000).await;
 
         let p = make_rpc(&primary.url());
-        let finality = FinalityRpc::single(&p);
+        let finality = FinalityRpc::solana(&p, None);
         match classify_signatures(&finality, &one_expired_sig()).await {
             SigFinality::Uncertain(reason) => {
                 assert!(reason.contains("ledger floor"), "reason: {reason}");
@@ -2992,7 +3061,7 @@ mod tests {
         .await;
 
         let p = make_rpc(&primary.url());
-        let finality = FinalityRpc::single(&p);
+        let finality = FinalityRpc::solana(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &one_expired_sig()).await,
@@ -3023,10 +3092,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(matches!(
             classify_signatures(&finality, &one_expired_sig()).await,
             SigFinality::Landed(_)
@@ -3054,10 +3120,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(matches!(
             classify_signatures(&finality, &one_expired_sig()).await,
             SigFinality::Live(_)
@@ -3086,10 +3149,7 @@ mod tests {
 
         let p = make_rpc(&primary.url());
         let f = make_rpc(&fb.url());
-        let finality = FinalityRpc {
-            primary: &p,
-            fallback: Some(&f),
-        };
+        let finality = FinalityRpc::solana(&p, Some(&f));
         assert!(matches!(
             classify_signatures(&finality, &one_expired_sig()).await,
             SigFinality::Uncertain(_)
@@ -4071,7 +4131,179 @@ mod tests {
         src_send.assert_async().await;
     }
 
+    // ── channel height source (context slot) ────────────────────────
+
+    /// A null status whose response context slot is `context_slot`. On the channel
+    /// that slot IS the block height, so it is the whole freshness witness.
+    fn null_status_at(context_slot: u64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{context_slot}}},"value":[null]}},"id":0}}"#
+        )
+    }
+
+    fn sig_with_lvbh(lvbh: u64) -> Vec<PendingSig> {
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: lvbh,
+        }]
+    }
+
+    /// A channel endpoint answers `getBlockHeight` with -32601, so it is never
+    /// mocked here: its absence from the script is part of every assertion.
+    #[tokio::test]
+    async fn channel_absence_uses_response_context_slot() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 0).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sig_with_lvbh(1000)).await,
+                SigFinality::Dead
+            ),
+            "a context slot past lvbh must resolve the absence without a height call"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_absence_never_calls_block_height() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 0).await;
+        let never = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        let _ = classify_signatures(&finality, &sig_with_lvbh(1000)).await;
+        never.assert_async().await;
+    }
+
+    /// Boundary: `context.slot == lvbh` is still within validity, matching the
+    /// strict `>` the expiry check uses.
+    #[tokio::test]
+    async fn channel_absence_within_validity_is_live() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(1000)).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        assert!(matches!(
+            classify_signatures(&finality, &sig_with_lvbh(1000)).await,
+            SigFinality::Live(_)
+        ));
+    }
+
+    /// The Solana path is unchanged: heights and slots diverge there, so the
+    /// height still comes from its own call.
+    #[tokio::test]
+    async fn solana_absence_still_calls_block_height() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(200)).await;
+        mock_floor(&mut server, 0).await;
+        let height = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":1000,"id":0}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::solana(&p, None);
+        let _ = classify_signatures(&finality, &one_expired_sig()).await;
+        height.assert_async().await;
+    }
+
+    /// The core-side seam: a channel node now reports an internal failure as a
+    /// JSON-RPC error rather than a null, and that must fail closed.
+    #[tokio::test]
+    async fn channel_status_rpc_error_is_uncertain() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(
+            &mut server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"Failed to get transaction status"},"id":0}"#,
+        )
+        .await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        assert!(matches!(
+            classify_signatures(&finality, &sig_with_lvbh(100)).await,
+            SigFinality::Uncertain(_)
+        ));
+    }
+
+    /// The retention proof survives the context-slot rewrite: a pruned floor still
+    /// degrades a channel absence to Uncertain.
+    #[tokio::test]
+    async fn channel_absence_pruned_floor_is_uncertain() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 1000).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        match classify_signatures(&finality, &sig_with_lvbh(100)).await {
+            SigFinality::Uncertain(reason) => {
+                assert!(reason.contains("ledger floor"), "reason: {reason}")
+            }
+            _ => panic!("a pruned channel absence must be Uncertain"),
+        }
+    }
+
+    // ── configurable retention window ───────────────────────────────
+
+    /// The same floor and lvbh flip verdict on the window alone: a wider node
+    /// window pushes the earliest possible landing slot below the retained range.
+    #[tokio::test]
+    async fn coverage_window_widens_the_retention_bound() {
+        for (window, expect_dead) in [(150u64, true), (600u64, false)] {
+            let mut server = mockito::Server::new_async().await;
+            mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+            mock_floor(&mut server, 800).await;
+
+            let p = make_rpc(&server.url());
+            let finality = FinalityRpc::channel(&p, None, window);
+            let verdict = classify_signatures(&finality, &sig_with_lvbh(1000)).await;
+            assert_eq!(
+                matches!(verdict, SigFinality::Dead),
+                expect_dead,
+                "window {window} must decide the retention bound"
+            );
+        }
+    }
+
+    /// Solana's blockhash validity is protocol-fixed, so no operator config can
+    /// widen or narrow the window used on that path.
+    #[test]
+    fn solana_finality_pins_max_processing_age() {
+        let p = make_rpc("http://localhost:1");
+        assert_eq!(
+            FinalityRpc::solana(&p, None).blockhash_window,
+            MAX_PROCESSING_AGE as u64
+        );
+    }
+
     // ── coverage_verdict boundaries ─────────────────────────────────
+
+    /// Coverage check on the Solana window against a single endpoint.
+    async fn solana_coverage(rpc: &RpcClientWithRetry, min_lvbh: u64) -> SigFinality {
+        coverage_verdict(&FinalityRpc::solana(rpc, None), rpc, min_lvbh, "").await
+    }
 
     /// Register a single `getFirstAvailableBlock` reply and return a fast client.
     async fn floor_client(floor: u64) -> (mockito::ServerGuard, RpcClientWithRetry) {
@@ -4091,7 +4323,7 @@ mod tests {
         // lvbh 1000 -> bound 850; floor 500 <= 850.
         let (_s, rpc) = floor_client(500).await;
         assert!(matches!(
-            coverage_verdict(&rpc, 1000, "").await,
+            solana_coverage(&rpc, 1000).await,
             SigFinality::Dead
         ));
     }
@@ -4101,7 +4333,7 @@ mod tests {
         // lvbh 1000 -> bound 850; floor 850 == 850 is covered (inclusive).
         let (_s, rpc) = floor_client(850).await;
         assert!(matches!(
-            coverage_verdict(&rpc, 1000, "").await,
+            solana_coverage(&rpc, 1000).await,
             SigFinality::Dead
         ));
     }
@@ -4111,7 +4343,7 @@ mod tests {
         // lvbh 1000 -> bound 850; floor 851 > 850 is uncovered.
         let (_s, rpc) = floor_client(851).await;
         assert!(matches!(
-            coverage_verdict(&rpc, 1000, "").await,
+            solana_coverage(&rpc, 1000).await,
             SigFinality::Uncertain(_)
         ));
     }
@@ -4121,12 +4353,12 @@ mod tests {
         // lvbh 100 -> saturating bound 0. Only a floor of 0 covers it.
         let (_s1, rpc1) = floor_client(1).await;
         assert!(matches!(
-            coverage_verdict(&rpc1, 100, "").await,
+            solana_coverage(&rpc1, 100).await,
             SigFinality::Uncertain(_)
         ));
         let (_s0, rpc0) = floor_client(0).await;
         assert!(matches!(
-            coverage_verdict(&rpc0, 100, "").await,
+            solana_coverage(&rpc0, 100).await,
             SigFinality::Dead
         ));
     }
@@ -4142,7 +4374,7 @@ mod tests {
         .await;
         let rpc = make_rpc(&server.url());
         assert!(matches!(
-            coverage_verdict(&rpc, 1000, "").await,
+            solana_coverage(&rpc, 1000).await,
             SigFinality::Uncertain(_)
         ));
     }
@@ -4224,16 +4456,12 @@ mod tests {
             .lock()
             .unwrap()
             .insert(710, vec![(Signature::new_unique().to_string(), 0)]);
+        // Source is the channel: the context slot (200) is the block height and is
+        // already past the stored attempt's lvbh (0), so no getBlockHeight is needed.
         mock_rpc(
             &mut rpc_server,
             "getSignatureStatuses",
             r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
-        )
-        .await;
-        mock_rpc(
-            &mut rpc_server,
-            "getBlockHeight",
-            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
         )
         .await;
         // Pruned floor: the source cannot prove the prior attempt did not land.
@@ -4307,17 +4535,12 @@ mod tests {
             .lock()
             .unwrap()
             .insert(720, vec![(dead_attempt.clone(), 0)]);
-        // Source: expired absence with a covered floor, so classification is Dead.
+        // Source is the channel: expired absence (context slot 200 past lvbh 0) with a
+        // covered floor, so classification is Dead without a getBlockHeight call.
         mock_rpc(
             &mut source,
             "getSignatureStatuses",
             r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
-        )
-        .await;
-        mock_rpc(
-            &mut source,
-            "getBlockHeight",
-            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
         )
         .await;
         mock_rpc(

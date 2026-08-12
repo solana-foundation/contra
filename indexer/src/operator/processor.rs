@@ -375,6 +375,7 @@ pub async fn run_processor(
     rpc_client: Arc<RpcClientWithRetry>,
     fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+    channel_blockhash_window: u64,
 ) {
     info!("Starting processor");
 
@@ -424,6 +425,7 @@ pub async fn run_processor(
                 rpc_client,
                 fallback_rpc_client,
                 program_type,
+                channel_blockhash_window,
             )
             .await
             {
@@ -809,14 +811,16 @@ pub async fn process_deposit_funds(
     channel_rpc: Arc<RpcClientWithRetry>,
     channel_fallback: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
+    channel_blockhash_window: u64,
 ) -> Result<(), OperatorError> {
     let pt_label = program_type.as_label();
 
     // Classifies persisted write-ahead signatures on the channel
-    let gate_finality = FinalityRpc {
-        primary: &channel_rpc,
-        fallback: channel_fallback.as_deref(),
-    };
+    let gate_finality = FinalityRpc::channel(
+        &channel_rpc,
+        channel_fallback.as_deref(),
+        channel_blockhash_window,
+    );
 
     while let Some(transaction) = fetcher_rx.recv().await {
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
@@ -1035,6 +1039,7 @@ mod tests {
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::Instance;
     use solana_client::rpc_request::RpcRequest;
+    use solana_sdk::clock::MAX_PROCESSING_AGE;
 
     /// Channel RPC client with a single fast attempt against `url`.
     fn channel_client(url: &str) -> Arc<RpcClientWithRetry> {
@@ -1721,6 +1726,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
         assert!(result.is_ok());
@@ -1769,6 +1775,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
         assert!(
@@ -1809,6 +1816,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -1856,6 +1864,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
         assert!(
@@ -2965,6 +2974,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
         assert!(result.is_ok());
@@ -3054,6 +3064,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
         assert!(result.is_ok());
@@ -3469,6 +3480,7 @@ mod tests {
             unreachable_channel_rpc(),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
         assert!(
@@ -3507,17 +3519,6 @@ mod tests {
             ))
             .with_status(200)
             .with_body(body)
-            .create()
-    }
-
-    fn mock_block_height(server: &mut mockito::ServerGuard, height: u64) -> mockito::Mock {
-        server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getBlockHeight""#.into(),
-            ))
-            .with_status(200)
-            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{height},"id":1}}"#))
             .create()
     }
 
@@ -3591,6 +3592,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -3617,9 +3619,8 @@ mod tests {
     #[tokio::test]
     async fn reopened_deposit_with_live_sig_defers_without_mint() {
         let mut server = mockito::Server::new_async().await;
+        // Channel: context slot (200) <= lvbh (1000) means still live.
         let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
-        // current_height (50) <= lvbh (1000) means still live.
-        let _height = mock_block_height(&mut server, 50);
 
         let mock = MockStorage::new();
         let mint = Pubkey::new_unique();
@@ -3647,6 +3648,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -3671,9 +3673,8 @@ mod tests {
     #[tokio::test]
     async fn reopened_deposit_with_dead_sigs_proceeds_to_mint() {
         let mut server = mockito::Server::new_async().await;
+        // Channel: context slot (200) > lvbh (100) means expired; floor 0 proves coverage.
         let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
-        // current_height (1000) > lvbh (100) means expired; floor 0 proves coverage.
-        let _height = mock_block_height(&mut server, 1000);
         let _floor = mock_first_available_block(&mut server, 0);
 
         let mock = MockStorage::new();
@@ -3703,6 +3704,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -3755,6 +3757,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -3806,6 +3809,7 @@ mod tests {
             channel_client("http://localhost:1"),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
 
@@ -3864,6 +3868,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -3918,6 +3923,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -3968,6 +3974,7 @@ mod tests {
             channel_client(&server.url()),
             None,
             ProgramType::Escrow,
+            MAX_PROCESSING_AGE as u64,
         )
         .await;
 

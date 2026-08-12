@@ -25,6 +25,9 @@ use tracing::{error, info};
 use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
+    /// `channel_blockhash_window` is read off the channel endpoint at operator
+    /// startup, never configured, so it mirrors the node it bounds absences against.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -33,6 +36,7 @@ impl SenderState {
         retry_max_attempts: u32,
         confirmation_poll_interval_ms: u64,
         source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+        channel_blockhash_window: u64,
     ) -> Result<Self, OperatorError> {
         // Initialize global RPC client with retry
         let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -67,6 +71,7 @@ impl SenderState {
             // Source chain client (also used by MintCache). Remints broadcast here.
             source_rpc_client: mint_rpc_client,
             fallback_rpc_client,
+            channel_blockhash_window,
             storage,
             instance_pda,
             smt_state: None,
@@ -596,6 +601,7 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
             fallback_rpc_client: None,
+            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -1138,6 +1144,7 @@ mod tests {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
             fallback_rpc_client: None,
+            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: pda,
             smt_state: None,
@@ -1205,6 +1212,7 @@ mod tests {
             3,
             400,
             None,
+            MAX_PROCESSING_AGE as u64,
         );
 
         assert!(result.is_ok());
@@ -1232,6 +1240,7 @@ mod tests {
             5,
             400,
             None,
+            MAX_PROCESSING_AGE as u64,
         );
 
         assert!(result.is_ok());
@@ -1257,6 +1266,7 @@ mod tests {
             3,
             400,
             None,
+            MAX_PROCESSING_AGE as u64,
         )
         .expect("construction must succeed with an empty fallback URL");
 
@@ -1287,6 +1297,7 @@ mod tests {
             3,
             400,
             None,
+            MAX_PROCESSING_AGE as u64,
         )
         .expect("construction must succeed with a set fallback URL");
 
@@ -1294,6 +1305,34 @@ mod tests {
         assert!(state.dest_finality().fallback.is_some());
         // Source stays single-endpoint regardless of the fallback.
         assert!(state.source_finality().fallback.is_none());
+    }
+
+    /// The chain tag drives the height source, the retention window and the metric
+    /// label, so it must follow the role and not the field name: the two roles use
+    /// `rpc_client` and `source_rpc_client` for mirror-image chains.
+    #[test]
+    fn finality_chain_tags_follow_the_operator_role() {
+        use crate::operator::sender::remint::HeightSource;
+
+        let withdraw = make_sender_state_with_role(MockStorage::new(), ProgramType::Withdraw);
+        assert_eq!(
+            withdraw.dest_finality().height_source,
+            HeightSource::BlockHeightRpc
+        );
+        assert_eq!(
+            withdraw.source_finality().height_source,
+            HeightSource::ContextSlot
+        );
+
+        let escrow = make_sender_state_with_role(MockStorage::new(), ProgramType::Escrow);
+        assert_eq!(
+            escrow.dest_finality().height_source,
+            HeightSource::ContextSlot
+        );
+        assert_eq!(
+            escrow.source_finality().height_source,
+            HeightSource::BlockHeightRpc
+        );
     }
 
     /// Pins the SmtRootMismatch wedge: a landed release whose nonce never reaches

@@ -14,11 +14,13 @@ use {
         operator::{
             sender::{
                 test_hooks,
-                types::{SenderSMTState, TransactionContext},
+                types::{SenderSMTState, SenderState, TransactionContext},
             },
             utils::smt_util::SmtState,
         },
-        storage::TransactionStatus,
+        storage::{
+            common::models::DbTransactionBuilder, Storage, TransactionStatus, TransactionType,
+        },
     },
     sender_fixtures::{
         blockhash_reply, build_default_sender_state, confirmed_status_reply, make_remint_info,
@@ -49,6 +51,34 @@ fn make_release_funds_builder(nonce: u64) -> ReleaseFundsBuilder {
     builder
 }
 
+/// Seed the `Processing` row the pre-broadcast claim CASes against and arm its
+/// lease. A builder only reaches the rotation retry queue after a first dispatch
+/// through `handle_transaction_submission`, which is where the real sender arms
+/// this; the queue entry carries no token of its own.
+fn arm_release_claim(state: &mut SenderState, transaction_id: i64, nonce: u64) {
+    let owner = Pubkey::new_unique().to_string();
+    let mut row = DbTransactionBuilder::new(
+        format!("sig-{transaction_id}"),
+        1,
+        Pubkey::new_unique().to_string(),
+        1,
+    )
+    .initiator(owner.clone())
+    .recipient(owner)
+    .transaction_type(TransactionType::Withdrawal)
+    .build();
+    row.id = transaction_id;
+    row.status = TransactionStatus::Processing;
+    row.withdrawal_nonce = Some(nonce as i64);
+    let token = row.updated_at;
+
+    let Storage::Mock(ref mock) = *state.storage else {
+        panic!("expected mock storage");
+    };
+    mock.pending_transactions.lock().unwrap().push(row);
+    state.release_leases.insert(nonce, token);
+}
+
 /// Matched mismatch: the queued nonce's tree equals the local SMT tree, so the
 /// drain rebuilds and submits it rather than requeuing or escalating. The item
 /// must leave the queue and land in the SMT, and no ManualReview is emitted.
@@ -68,6 +98,7 @@ async fn rotation_drain_matched_submits() {
         nonce_to_builder: HashMap::new(),
     });
     state.remint_cache.insert(nonce, make_remint_info(20));
+    arm_release_claim(&mut state, 20, nonce);
     state.rotation_retry_queue.push((
         TransactionContext {
             transaction_id: Some(20),

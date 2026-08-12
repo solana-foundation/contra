@@ -197,14 +197,28 @@ async fn try_unpark_to_processing_cas() {
         .await
         .unwrap();
 
-    // Parked -> Processing.
+    // Parked -> Processing. The winner gets the row's new token back, which is
+    // the lease its release claim has to present.
     set_status(&pool, id, "parked").await;
-    assert!(storage.try_unpark_to_processing(id).await.unwrap());
+    let lease = storage
+        .try_unpark_to_processing(id)
+        .await
+        .unwrap()
+        .expect("unparking a Parked row returns its post-update token");
     assert_eq!(status_of(&pool, id).await, "processing");
+    assert_eq!(
+        lease,
+        updated_at_of(&pool, id).await,
+        "the returned lease must be the row's committed updated_at"
+    );
 
     // Not parked (e.g. recovery already requeued it to pending) -> no-op.
     set_status(&pool, id, "pending").await;
-    assert!(!storage.try_unpark_to_processing(id).await.unwrap());
+    assert!(storage
+        .try_unpark_to_processing(id)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(status_of(&pool, id).await, "pending");
 }
 

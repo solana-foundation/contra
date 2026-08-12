@@ -2,7 +2,7 @@ pub use super::models::*;
 pub use try_requeue_prebroadcast::RequeueOutcome;
 
 pub mod bump_pending_remint_finality_attempt;
-pub mod claim_and_persist_deposit_signature;
+pub mod claim_and_persist_signature;
 pub mod claim_remint_attempt;
 pub mod close;
 pub mod count_pending_transactions;
@@ -442,11 +442,13 @@ impl Storage {
         try_park_processing::try_park_processing(self, transaction_id).await
     }
 
-    /// CAS `Parked` → `Processing`; `Ok(false)` if the row is not `Parked`.
+    /// CAS `Parked` to `Processing`, returning the winner's post-update
+    /// `updated_at` as the sender's fresh release-claim lease. `Ok(None)` if the
+    /// row is not `Parked`.
     pub async fn try_unpark_to_processing(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
         try_unpark_to_processing::try_unpark_to_processing(self, transaction_id).await
     }
 
@@ -526,20 +528,20 @@ impl Storage {
         .await
     }
 
-    /// Atomically claim a `Processing` deposit (CAS on `updated_at`) and persist
-    /// its broadcast signature in one transaction. `Ok(Some(lease))` means the
-    /// sender still owns the row and may broadcast; the returned lease is the
-    /// row's new `updated_at`, which a later re-claim must present. `Ok(None)`
-    /// means the row was demoted or re-locked, so the builder must be dropped
-    /// without broadcasting.
-    pub async fn claim_and_persist_deposit_signature(
+    /// Atomically claim a `Processing` row (CAS on `updated_at`) and persist its
+    /// broadcast signature in one transaction. `Ok(Some(lease))` means the sender
+    /// still owns the row and may broadcast; the returned lease is the row's new
+    /// `updated_at`, which a later re-claim must present. `Ok(None)` means the row
+    /// was demoted or re-locked, so the builder must be dropped without
+    /// broadcasting. Shared by the deposit mint and the withdrawal release.
+    pub async fn claim_and_persist_signature(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         signature: String,
         last_valid_block_height: i64,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
-        claim_and_persist_deposit_signature::claim_and_persist_deposit_signature(
+        claim_and_persist_signature::claim_and_persist_signature(
             self,
             transaction_id,
             expected_updated_at,
@@ -770,102 +772,82 @@ mod tests {
         );
     }
 
-    // ── claim_and_persist_deposit_signature disposition matrix ────────
+    // ── claim_and_persist_signature disposition matrix ────────────────
 
-    /// Seed one deposit row directly with an explicit status + `updated_at` so
+    /// Seed one row directly with an explicit type, status and `updated_at` so
     /// the claim CAS can be exercised against each disposition.
     fn seed_claim_row(
         mock: &MockStorage,
         id: i64,
+        transaction_type: TransactionType,
         status: TransactionStatus,
         updated_at: chrono::DateTime<Utc>,
     ) {
         let mut row = make_db_transaction();
         row.id = id;
+        row.transaction_type = transaction_type;
         row.status = status;
         row.updated_at = updated_at;
         mock.pending_transactions.lock().unwrap().push(row);
     }
 
-    /// Owned row (Processing, matching token): claim succeeds, the signature is
-    /// persisted, and `updated_at` advances. The returned lease must equal the
-    /// row's new `updated_at`, making it usable as the next CAS token.
+    /// The claim is the single gate both the deposit mint and the withdrawal
+    /// release pass before broadcasting, so it is pinned for both row types: it
+    /// succeeds only on the exact `Processing` incarnation the caller was handed,
+    /// and every other disposition aborts without persisting a signature. A lost
+    /// claim on the withdrawal side is what makes a recovery demote safe against
+    /// a live sender.
     #[tokio::test]
-    async fn claim_succeeds_when_owned() {
-        let (storage, mock) = make_mock_storage();
-        let t0 = Utc::now();
-        seed_claim_row(&mock, 1, TransactionStatus::Processing, t0);
+    async fn claim_and_persist_signature_disposition_matrix() {
+        // (label, seeded status, token offset from the presented one, claimable)
+        let dispositions = [
+            ("owned", TransactionStatus::Processing, 0, true),
+            ("demoted", TransactionStatus::Pending, 0, false),
+            ("token stale", TransactionStatus::Processing, 30, false),
+            ("terminal", TransactionStatus::Completed, 0, false),
+        ];
 
-        let lease = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-owned".to_string(), 100)
-            .await
-            .unwrap()
-            .expect("owning the Processing incarnation must claim");
+        for txn_type in [TransactionType::Deposit, TransactionType::Withdrawal] {
+            for (id, (label, status, skew_secs, claimable)) in dispositions.iter().enumerate() {
+                let (storage, mock) = make_mock_storage();
+                let id = id as i64 + 1;
+                let presented = Utc::now();
+                let seeded = presented + chrono::Duration::seconds(*skew_secs);
+                seed_claim_row(&mock, id, txn_type, *status, seeded);
 
-        let sigs = storage.get_release_signatures(1).await.unwrap();
-        assert_eq!(sigs.len(), 1, "the broadcast signature must be persisted");
-        assert_eq!(sigs[0].0, "sig-owned");
+                let case = format!("{txn_type:?}/{label}");
+                let signature = format!("sig-{case}");
+                let claimed = storage
+                    .claim_and_persist_signature(id, presented, signature.clone(), 100)
+                    .await
+                    .unwrap();
+                let persisted = storage.get_release_signatures(id).await.unwrap();
 
-        let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
-        assert_ne!(after, t0, "a successful claim must bump updated_at");
-        assert_eq!(
-            lease, after,
-            "the returned lease must equal the row's new updated_at"
-        );
-    }
+                if !claimable {
+                    assert!(claimed.is_none(), "{case}: must not be claimable");
+                    assert!(
+                        persisted.is_empty(),
+                        "{case}: no signature may be persisted on a lost claim"
+                    );
+                    continue;
+                }
 
-    /// Recovery already demoted the row to Pending: the claim must abort and
-    /// persist no signature. This is the keystone (the bug being closed).
-    #[tokio::test]
-    async fn claim_aborts_when_demoted_to_pending() {
-        let (storage, mock) = make_mock_storage();
-        let t0 = Utc::now();
-        seed_claim_row(&mock, 1, TransactionStatus::Pending, t0);
+                let lease = claimed.expect("{case}: owning the incarnation must claim");
+                assert_eq!(
+                    persisted.len(),
+                    1,
+                    "{case}: the signature must be persisted"
+                );
+                assert_eq!(persisted[0].0, signature, "{case}: signature mismatch");
 
-        let claimed = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-demoted".to_string(), 100)
-            .await
-            .unwrap();
-        assert!(claimed.is_none(), "a demoted row must not be claimable");
-        assert!(
-            storage.get_release_signatures(1).await.unwrap().is_empty(),
-            "no signature may be persisted on a lost claim"
-        );
-    }
-
-    /// A second fetch re-locked the row, advancing its token: the stale builder's
-    /// CAS on the old token must abort.
-    #[tokio::test]
-    async fn claim_aborts_when_token_stale() {
-        let (storage, mock) = make_mock_storage();
-        let t0 = Utc::now();
-        let t1 = t0 + chrono::Duration::seconds(30);
-        seed_claim_row(&mock, 1, TransactionStatus::Processing, t1);
-
-        let claimed = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-stale".to_string(), 100)
-            .await
-            .unwrap();
-        assert!(
-            claimed.is_none(),
-            "a stale token must not claim the re-locked incarnation"
-        );
-        assert!(storage.get_release_signatures(1).await.unwrap().is_empty());
-    }
-
-    /// A terminal row (Completed) is never a valid claim target.
-    #[tokio::test]
-    async fn claim_aborts_when_terminal() {
-        let (storage, mock) = make_mock_storage();
-        let t0 = Utc::now();
-        seed_claim_row(&mock, 1, TransactionStatus::Completed, t0);
-
-        let claimed = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-terminal".to_string(), 100)
-            .await
-            .unwrap();
-        assert!(claimed.is_none(), "a terminal row must not be claimable");
-        assert!(storage.get_release_signatures(1).await.unwrap().is_empty());
+                let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
+                assert_ne!(after, presented, "{case}: a claim must bump updated_at");
+                assert_eq!(
+                    lease, after,
+                    "{case}: the lease must equal the row's new updated_at so it is usable as the next CAS token"
+                );
+            }
+        }
     }
 
     // ── status update recording ──────────────────────────────────────

@@ -43,7 +43,9 @@ have prefixes.
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
-| `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
+| `released on-chain with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
+| `release verification still uncertain after` | C - ambiguous (proof unavailable past the escalation window) | no | recovery worker quarantine |
+| `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
 | `stale tree index:` ... `release can never land on current SMT` | H - stale tree index (release can never land) | no | `sender/mod.rs` rotation drain |
@@ -208,12 +210,25 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > the remint flow uses) *before* deciding. A finalized-success signature is
 > promoted to `Completed` (never re-sent); a dead/expired signature is
 > demoted to `Pending`; a still-live signature is left in `Processing` for
-> the next sweep. It only quarantines when it cannot prove the outcome:
-> either **no broadcast signatures were recorded** (`no broadcast signatures
-> recorded; cannot verify release landed`) or **the RPC could not classify
-> them** (`could not verify release landed (...)`, with the signature list
-> appended). Both land here in Path C — verify on-chain and act on the
-> verdict; never blindly re-arm a row whose release may already be on-chain.
+> the next sweep.
+>
+> **A row with no recorded signature is no longer quarantined on sight.**
+> The signature is written in the same transaction that claims the row, so
+> an empty journal means the release never broadcast. Recovery corroborates
+> that against the on-chain SMT root and re-arms the row to `pending`
+> automatically when the nonce is provably absent - this is the manual
+> `NOT_LANDED` decision in Step 3 below, now automated with the same proof.
+> Such rows never reach manual review, so a signatureless row that does
+> arrive here means the proof itself could not be obtained: recovery
+> retried it every sweep for 10 minutes first
+> (`... release verification still uncertain after ...`). Verify on-chain
+> and act on the verdict; never blindly re-arm a row whose release may
+> already be on-chain.
+>
+> The RPC-could-not-classify case for a row that *does* have recorded
+> signatures (`could not verify release landed (...)`, with the signature
+> list appended) still lands here unchanged.
+>
 > A sender that could not establish the `PendingRemint` handoff leaves the row
 > `Processing` (metric `pending_remint_state_unknown`) rather than quarantining
 > it, so it reaches this path through the recovery sweep above.
@@ -240,8 +255,8 @@ committing the row to manual review. Sub-triggers below; same recovery.
    for RPC visibility to recover. Do not act.
 
 > **If the quarantined release actually landed** (verdict `LANDED`, but
-> the row was quarantined with `no broadcast signatures recorded; cannot
-> verify release landed` and never written `Completed`), the consumed
+> the row was quarantined with `released on-chain with no recorded
+> broadcast signature` and never written `Completed`), the consumed
 > nonce is missing from the DB. The boot pre-flight normally reconciles
 > this from the durable release signature; only if it cannot will the
 > operator refuse to start. See

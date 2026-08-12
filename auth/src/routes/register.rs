@@ -50,16 +50,6 @@ pub async fn register(
         )));
     }
 
-    // Charged after the length caps so the keyed store never holds a huge key.
-    if state
-        .throttle
-        .per_username
-        .check_key(&req.username)
-        .is_err()
-    {
-        return Err(AppError::TooManyRequests);
-    }
-
     // Hash the password with Argon2 before storing.
     let hash = state.passwords.hash(req.password).await?;
 
@@ -83,7 +73,19 @@ pub async fn register(
         AppError::Db(sqlx::Error::Database(ref db_err))
             if db_err.constraint() == Some("users_username_key") =>
         {
-            AppError::Conflict("username already taken".into())
+            // Charged on the outcome, and only when the name is already taken.
+            // Charging before the INSERT let an attacker drain the budget of a
+            // name nobody had registered, blocking the person who wanted it.
+            if state
+                .throttle
+                .per_username
+                .check_key(&req.username)
+                .is_err()
+            {
+                AppError::TooManyRequests
+            } else {
+                AppError::Conflict("username already taken".into())
+            }
         }
         other => other,
     })?;

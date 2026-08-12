@@ -28,16 +28,6 @@ pub async fn login(
         return Err(AppError::Unauthorized);
     }
 
-    // Charged after the length cap so the keyed store never holds a huge key.
-    if state
-        .throttle
-        .per_username
-        .check_key(&req.username)
-        .is_err()
-    {
-        return Err(AppError::TooManyRequests);
-    }
-
     let user = db::find_user_by_username(&state.pool, &req.username).await;
     state.pool_status.observe_app(&user);
     let user = user?;
@@ -50,7 +40,7 @@ pub async fn login(
             .passwords
             .verify(req.password, DUMMY_HASH.to_string())
             .await?;
-        return Err(AppError::Unauthorized);
+        return Err(charge_failed_attempt(&state, &req.username));
     };
 
     if !state
@@ -58,7 +48,7 @@ pub async fn login(
         .verify(req.password, user.password_hash)
         .await?
     {
-        return Err(AppError::Unauthorized);
+        return Err(charge_failed_attempt(&state, &req.username));
     }
 
     let token = state
@@ -67,6 +57,28 @@ pub async fn login(
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
 
     Ok(Json(LoginResponse { token }))
+}
+
+/// Spends one attempt against the username and picks the status for a failure.
+///
+/// Charged on the outcome, not before it. Charging up front let an
+/// unauthenticated caller drain a victim's budget just by naming them, holding
+/// that account at 429 without ever knowing its password. A correct password now
+/// succeeds regardless of the bucket, so the limiter cannot deny an account.
+///
+/// Hashing has already run by this point, so this bounds failed attempts rather
+/// than the work an attacker can cause. Per-IP throttling and the Argon2
+/// concurrency cap are what bound the work.
+fn charge_failed_attempt(state: &AppState, username: &str) -> AppError {
+    if state
+        .throttle
+        .per_username
+        .check_key(&username.to_string())
+        .is_err()
+    {
+        return AppError::TooManyRequests;
+    }
+    AppError::Unauthorized
 }
 
 #[cfg(test)]

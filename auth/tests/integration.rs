@@ -6,7 +6,7 @@
 //! Run with: `cd auth && cargo test --test integration -- --test-threads=1`
 
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use reqwest::Client;
@@ -73,7 +73,7 @@ async fn start_throttled_app(
         // so a production-sized cap would shed here on the permit wait and mask
         // what these tests are actually asserting. The cap itself is covered by
         // the password unit tests.
-        passwords: PasswordWorker::new(64),
+        passwords: PasswordWorker::new(NonZeroUsize::new(64).unwrap()),
         throttle: Arc::new(AuthThrottle::new(
             ip_per_second,
             ip_burst,
@@ -932,6 +932,52 @@ async fn test_login_accepts_max_length_multibyte_password() {
     assert_eq!(res.status(), 200, "a password that registered must log in");
 }
 
+/// The username budget is charged on the outcome, so an attacker spending it
+/// with wrong passwords cannot lock the real owner out.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_exhausted_username_budget_does_not_block_the_owner() {
+    let (db_url, _container) = start_postgres().await;
+    let generous = NonZeroU32::new(10_000).unwrap();
+    let attempts = NonZeroU32::new(3).unwrap();
+    let addr = start_throttled_app(&db_url, generous, generous, attempts).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "victim", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let mut statuses = Vec::new();
+    for _ in 0..attempts.get() + 2 {
+        let res = client
+            .post(format!("{}/auth/login", base_url(addr)))
+            .json(&json!({ "username": "victim", "password": "wrongpassword" }))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(res.status().as_u16());
+    }
+    assert!(
+        statuses.contains(&429),
+        "the budget should run out: {statuses:?}"
+    );
+
+    let res = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "victim", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        200,
+        "the owner must still log in with the correct password"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_login_over_budget_ip_is_shed() {
     let (db_url, _container) = start_postgres().await;
@@ -943,25 +989,42 @@ async fn test_login_over_budget_ip_is_shed() {
         NonZeroU32::new(10_000).unwrap(),
     )
     .await;
-    let client = Client::new();
+    // Fired concurrently. Sent one at a time, the bucket refills faster than
+    // debug-build Argon2 completes and nothing is ever shed.
+    let url = format!("{}/auth/login", base_url(addr));
+    let attempts: Vec<_> = (0..burst.get() + 3)
+        .map(|attempt| {
+            let url = url.clone();
+            tokio::spawn(async move {
+                Client::new()
+                    .post(&url)
+                    .json(&json!({
+                        "username": format!("ghost{attempt}"),
+                        "password": "password123",
+                    }))
+                    .send()
+                    .await
+                    .expect("request failed")
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
 
-    let mut statuses = Vec::new();
-    for attempt in 0..burst.get() + 3 {
-        let res = client
-            .post(format!("{}/auth/login", base_url(addr)))
-            .json(&json!({
-                "username": format!("ghost{attempt}"),
-                "password": "password123",
-            }))
-            .send()
-            .await
-            .unwrap();
-        statuses.push(res.status().as_u16());
-    }
+    let statuses: Vec<u16> = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .map(|joined| joined.expect("task panicked"))
+        .collect();
 
+    let served = statuses.iter().filter(|&&s| s == 401).count();
     assert!(
-        statuses.starts_with(&[401, 401, 401]),
+        served > 0,
         "the burst allowance should be served: {statuses:?}"
+    );
+    assert!(
+        served <= burst.get() as usize,
+        "no more than the burst should be served: {statuses:?}"
     );
     assert!(
         statuses.contains(&429),

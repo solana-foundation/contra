@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,9 +25,11 @@ pub struct PasswordWorker {
 }
 
 impl PasswordWorker {
-    pub fn new(max_concurrency: usize) -> Self {
+    /// Non-zero because a zero cap silently turns every credential request into
+    /// a 503 after the permit wait, with the service otherwise reporting healthy.
+    pub fn new(max_concurrency: NonZeroUsize) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(max_concurrency)),
+            permits: Arc::new(Semaphore::new(max_concurrency.get())),
         }
     }
 
@@ -77,7 +80,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_hash_never_authenticates() {
-        let worker = PasswordWorker::new(2);
+        let worker = PasswordWorker::new(NonZeroUsize::new(2).unwrap());
 
         assert!(!worker
             .verify("anything".to_string(), "not-a-hash".to_string())
@@ -90,7 +93,7 @@ mod tests {
     /// be bypassed by hanging up mid-request.
     #[tokio::test]
     async fn abandoned_work_keeps_its_permit() {
-        let worker = PasswordWorker::new(1);
+        let worker = PasswordWorker::new(NonZeroUsize::new(1).unwrap());
         let hash = worker.hash("password".to_string()).await.unwrap();
 
         let abandoned = worker.verify("password".to_string(), hash);
@@ -106,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn saturated_permits_shed_instead_of_queueing() {
-        let worker = PasswordWorker::new(1);
+        let worker = PasswordWorker::new(NonZeroUsize::new(1).unwrap());
         let held = worker.permits.clone().acquire_owned().await.unwrap();
 
         let err = worker

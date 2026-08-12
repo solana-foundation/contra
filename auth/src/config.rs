@@ -1,5 +1,5 @@
 use clap::Parser;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "private-channel-auth")]
@@ -28,7 +28,7 @@ pub struct Config {
     /// Maximum number of Argon2 hashes running at once. Hashing is CPU-bound,
     /// so raising this past the core count costs memory without adding throughput.
     #[arg(long, env = "AUTH_ARGON2_MAX_CONCURRENCY", default_value = "4")]
-    pub argon2_max_concurrency: usize,
+    pub argon2_max_concurrency: NonZeroUsize,
 
     /// Sustained per-IP request rate for /auth/register and /auth/login.
     #[arg(long, env = "AUTH_RATE_LIMIT_PER_SECOND", default_value = "5")]

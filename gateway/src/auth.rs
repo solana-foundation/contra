@@ -64,7 +64,7 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 ///
 /// Known limitation for `getSignaturesForAddress`: ownership is derived from
 /// the current on-chain account state. If a TokenAccount has been closed, the
-/// account fetch returns `None` and the User is rejected with 403 — even for
+/// account fetch returns `NotFound` and the User is rejected with 403 — even for
 /// signatures from when they owned the account. We accept this: closing a
 /// TokenAccount is rare in our context (no rent to reclaim for users), and the
 /// alternatives (snapshotting ownership at ingest, or deriving ATAs from a
@@ -365,6 +365,7 @@ fn verify_bearer(auth_header: &str, decoding_key: &DecodingKey) -> Option<Claims
 //   -32001  Unauthorized — missing, invalid, or expired JWT
 //   -32002  Forbidden   — account not owned by the calling user
 //   -32003  Forbidden   — method requires operator role
+//   -32004  Unavailable — ownership check could not reach the read node
 // ---------------------------------------------------------------------------
 
 fn unauthorized_body() -> Bytes {
@@ -407,6 +408,18 @@ fn db_error_body() -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": { "code": -32603, "message": "Internal error: could not verify account ownership" }
+        })
+        .to_string(),
+    )
+}
+
+/// 503 body for a gated request whose ownership check could not be completed.
+/// Distinct from `forbidden_body`: the caller may well own the account, we just
+/// could not find out.
+pub fn auth_unavailable_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32004, "message": "Service unavailable: could not verify account ownership" }
         })
         .to_string(),
     )

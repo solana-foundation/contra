@@ -3,8 +3,8 @@ pub mod db;
 pub mod metrics;
 
 use crate::auth::{
-    check_account_data_ownership, check_request_auth, decode_account_data, forbidden_body,
-    AuthDecision,
+    auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
+    forbidden_body, AuthDecision,
 };
 use clap::Parser;
 use governor::clock::DefaultClock;
@@ -130,6 +130,16 @@ pub struct Args {
     )]
     pub body_read_timeout_secs: u64,
 
+    /// Seconds the ownership account fetch may take against the read node before
+    /// a gated request is failed with 503. Must be non-zero.
+    #[arg(
+        long,
+        env = "GATEWAY_AUTH_FETCH_TIMEOUT_SECS",
+        default_value = "3",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub auth_fetch_timeout_secs: u64,
+
     /// Idle seconds before the OS starts sending TCP keepalive probes. Must be
     /// non-zero.
     #[arg(
@@ -173,6 +183,10 @@ pub struct Limits {
     /// Max time to read the full request body once headers are in. Bounds
     /// slow-body (trickle) clients that the header timeout doesn't cover.
     pub body_read_timeout: Duration,
+    /// Max time the ownership account fetch may take against the read node,
+    /// covering the request and the response body together. A hung read node
+    /// fails the gated request with 503 instead of parking it.
+    pub auth_fetch_timeout: Duration,
     /// Idle time before the OS starts sending TCP keepalive probes.
     pub tcp_keepalive_idle: Duration,
     /// Interval between TCP keepalive probes.
@@ -190,6 +204,7 @@ impl Default for Limits {
             max_connections_per_ip: NonZeroUsize::new(64).unwrap(),
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
+            auth_fetch_timeout: Duration::from_secs(3),
             tcp_keepalive_idle: Duration::from_secs(60),
             tcp_keepalive_interval: Duration::from_secs(15),
             rate_limit_per_second: NonZeroU32::new(50).unwrap(),
@@ -226,6 +241,19 @@ struct ReadyCache {
 
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Outcome of the ownership account fetch. `NotFound` means the read node
+/// answered and the account does not exist, which is a real 403. `Unavailable`
+/// means we never got a usable answer, which must not be reported to the caller
+/// as an ownership failure.
+enum AccountFetch {
+    Found {
+        data: Vec<u8>,
+        program_owner: String,
+    },
+    NotFound,
+    Unavailable,
+}
 
 /// Tracks how many connections each client IP currently holds. Entries are
 /// removed when an IP's count reaches zero, so the map only holds IPs with a
@@ -405,8 +433,10 @@ impl Gateway {
     /// node and returns the decoded account bytes alongside the program owner
     /// string (e.g. the SPL Token program ID).
     ///
-    /// Returns `None` if the account does not exist or cannot be fetched.
-    async fn fetch_account_for_auth(&self, pubkey: &str) -> Option<(Vec<u8>, String)> {
+    /// Only a `result.value` of `null` counts as `NotFound`; every other way of
+    /// not getting an answer is `Unavailable`, so an upstream outage is never
+    /// reported to the caller as "you don't own this account".
+    async fn fetch_account_for_auth(&self, pubkey: &str) -> AccountFetch {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -416,33 +446,98 @@ impl Gateway {
         })
         .to_string();
 
-        let uri = self.read_url.parse::<hyper::Uri>().ok()?;
-        let req = Request::builder()
+        let Ok(uri) = self.read_url.parse::<hyper::Uri>() else {
+            error!("Read node URL is not a valid URI: {}", self.read_url);
+            return AccountFetch::Unavailable;
+        };
+        let Ok(req) = Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(body)))
-            .ok()?;
+        else {
+            return AccountFetch::Unavailable;
+        };
 
-        let response = self.client.request(req).await.ok()?;
-        let body_bytes = response.into_body().collect().await.ok()?.to_bytes();
+        // One deadline for the request and the body read together, so a hung read
+        // node cannot park a gated request. probe_upstream bounds the same call.
+        //
+        // Each stage names itself in its error, and the causes are formatted with
+        // Debug: hyper's client error displays as a bare "client error (Connect)"
+        // and keeps the real cause (refused, DNS, TLS) in its source chain.
+        let fetched = tokio::time::timeout(self.limits.auth_fetch_timeout, async {
+            let response = self
+                .client
+                .request(req)
+                .await
+                .map_err(|e| format!("request failed: {e:?}"))?;
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| format!("response body read failed: {e:?}"))?;
+            Ok::<Bytes, String>(body.to_bytes())
+        })
+        .await;
 
-        let json: Value = serde_json::from_slice(&body_bytes).ok()?;
+        let body_bytes = match fetched {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(cause)) => {
+                warn!(
+                    "Ownership account fetch failed against {}: {}",
+                    self.read_url, cause
+                );
+                return AccountFetch::Unavailable;
+            }
+            Err(_) => {
+                warn!(
+                    "Ownership account fetch timed out after {:?}",
+                    self.limits.auth_fetch_timeout
+                );
+                return AccountFetch::Unavailable;
+            }
+        };
 
-        // getAccountInfo returns null for result.value when the account doesn't exist.
-        let value = json.get("result")?.get("value")?;
+        let Ok(json) = serde_json::from_slice::<Value>(&body_bytes) else {
+            warn!("Ownership account fetch returned a non-JSON response");
+            return AccountFetch::Unavailable;
+        };
+
+        // getAccountInfo returns null for result.value when the account doesn't
+        // exist. A missing result means the node answered with a JSON-RPC error,
+        // which says nothing about ownership.
+        let Some(value) = json.get("result").and_then(|result| result.get("value")) else {
+            warn!("Ownership account fetch returned no result: {}", json);
+            return AccountFetch::Unavailable;
+        };
         if value.is_null() {
-            return None;
+            return AccountFetch::NotFound;
         }
 
         // The program that owns this account — used to confirm it is a token account.
-        let program_owner = value.get("owner")?.as_str()?.to_owned();
+        let Some(program_owner) = value.get("owner").and_then(|owner| owner.as_str()) else {
+            warn!("Ownership account fetch returned an account with no owner");
+            return AccountFetch::Unavailable;
+        };
 
         // data is [base64_string, encoding_name] — we want index 0.
-        let encoded = value.get("data")?.get(0)?.as_str()?;
-        let data = decode_account_data(encoded)?;
+        let Some(encoded) = value
+            .get("data")
+            .and_then(|data| data.get(0))
+            .and_then(|data| data.as_str())
+        else {
+            warn!("Ownership account fetch returned an account with no base64 data");
+            return AccountFetch::Unavailable;
+        };
+        let Some(data) = decode_account_data(encoded) else {
+            warn!("Ownership account fetch returned undecodable account data");
+            return AccountFetch::Unavailable;
+        };
 
-        Some((data, program_owner))
+        AccountFetch::Found {
+            data,
+            program_owner: program_owner.to_owned(),
+        }
     }
 
     fn error_response(
@@ -495,7 +590,10 @@ impl Gateway {
             AuthDecision::Reject(status, body) => (status, body),
             AuthDecision::NeedsAccountFetch { user_id, pubkey } => {
                 let result = match self.fetch_account_for_auth(&pubkey).await {
-                    Some((data, program_owner)) => {
+                    AccountFetch::Found {
+                        data,
+                        program_owner,
+                    } => {
                         check_account_data_ownership(
                             &data,
                             &program_owner,
@@ -505,7 +603,13 @@ impl Gateway {
                         )
                         .await
                     }
-                    None => AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body()),
+                    AccountFetch::NotFound => {
+                        AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body())
+                    }
+                    AccountFetch::Unavailable => AuthDecision::Reject(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        auth_unavailable_body(),
+                    ),
                 };
                 match result {
                     AuthDecision::Proceed => return None,
@@ -515,8 +619,15 @@ impl Gateway {
             }
         };
 
+        // A 503 here is an upstream failure, not a rejected caller, so it stays out
+        // of the auth-rejection panel.
+        let error_type = if status == StatusCode::SERVICE_UNAVAILABLE {
+            "auth_fetch_unavailable"
+        } else {
+            "auth_rejected"
+        };
         Self::record_metrics(
-            Some("auth_rejected"),
+            Some(error_type),
             method_label,
             "none",
             &status.as_u16().to_string(),
@@ -1052,6 +1163,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         max_connections_per_ip: args.max_connections_per_ip,
         header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
         body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
+        auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
         tcp_keepalive_idle: Duration::from_secs(args.tcp_keepalive_idle_secs),
         tcp_keepalive_interval: Duration::from_secs(args.tcp_keepalive_interval_secs),
         rate_limit_per_second: args.rate_limit_per_second,
@@ -1078,6 +1190,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -1717,5 +1832,157 @@ mod tests {
         // IPv4 is keyed by the full address.
         let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         assert_eq!(rate_limit_key(v4), v4);
+    }
+
+    /// Shared secret for the ownership-fetch tests below, used by both the token
+    /// minter and the gateway under test.
+    const TEST_JWT_SECRET: &str = "test-gateway-secret";
+
+    /// Start a gateway with auth enforcement on. The auth pool is lazy and never
+    /// connects: every path these tests exercise rejects before any DB query.
+    async fn start_auth_gateway(read_url: &str, limits: Limits) -> SocketAddr {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+
+        let auth_db = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:password@127.0.0.1:1/unused")
+            .unwrap();
+        let gateway = Arc::new(
+            Gateway::new(
+                "http://127.0.0.1:1".to_string(),
+                read_url.to_string(),
+                "*".to_string(),
+                Some(TEST_JWT_SECRET.to_string()),
+                Some(auth_db),
+            )
+            .with_limits(limits),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, gateway).await;
+        });
+
+        addr
+    }
+
+    /// Mint a User-role JWT the gateway accepts, so a gated request gets as far
+    /// as the ownership account fetch.
+    fn user_token() -> String {
+        let claims = json!({
+            "sub": "11111111-1111-4111-8111-111111111111",
+            "role": "user",
+            "exp": (Utc::now().timestamp() + 3600) as usize,
+            "iss": "private-channel-auth",
+            "aud": "private-channel-gateway",
+        });
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    /// A raw getAccountInfo POST carrying `token`, i.e. a gated request that
+    /// triggers the ownership account fetch.
+    fn gated_request(token: &str) -> String {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["So11111111111111111111111111111111111111112"]}"#;
+        format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{}",
+            token,
+            body.len(),
+            body
+        )
+    }
+
+    /// Spawn a backend that reads the request and never answers. Accepted streams
+    /// are held open so the gateway sees a hang rather than an EOF, which leaves
+    /// the fetch deadline as the only way out.
+    async fn start_black_hole_backend() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                held.push(stream);
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn hung_read_node_returns_503_for_gated_method() {
+        let backend = start_black_hole_backend().await;
+        let addr = start_auth_gateway(
+            &format!("http://{backend}"),
+            Limits {
+                auth_fetch_timeout: Duration::from_millis(300),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(gated_request(&user_token()).as_bytes())
+            .await
+            .unwrap();
+
+        // With the deadline the gateway answers ~300ms in. Without it the ownership
+        // fetch waits on the hung read node forever and this read hangs; the 3s
+        // bound turns that regression into a failure, not a stuck test.
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(3), conn.read(&mut buf))
+            .await
+            .expect("gateway should give up on the hung read node, not hang")
+            .unwrap();
+        let elapsed = start.elapsed();
+        let response = String::from_utf8_lossy(&buf[..n]);
+
+        assert_status(&response, 503);
+        // The backend holds the connection open, so the deadline is the only way
+        // out. An immediate reply would mean the socket broke and the timeout was
+        // never exercised.
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected the fetch deadline to fire, got a reply after {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_node_rpc_error_is_503_not_403() {
+        // A node answering with a JSON-RPC error says nothing about ownership, so
+        // the caller must not be told the account isn't theirs.
+        let backend = start_mock_http_backend(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"node is behind"}}"#,
+        )
+        .await;
+        let addr = start_auth_gateway(&format!("http://{backend}"), Limits::default()).await;
+
+        let response = send_raw(addr, gated_request(&user_token()).as_bytes()).await;
+        assert_status(&response, 503);
+        assert!(
+            response.contains("-32004"),
+            "503 body should carry the unavailable code: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_account_stays_403() {
+        // The read node answered: the account really doesn't exist, so this stays a
+        // 403 and the 503 split doesn't swallow it.
+        let backend =
+            start_mock_http_backend(r#"{"jsonrpc":"2.0","id":1,"result":{"value":null}}"#).await;
+        let addr = start_auth_gateway(&format!("http://{backend}"), Limits::default()).await;
+
+        let response = send_raw(addr, gated_request(&user_token()).as_bytes()).await;
+        assert_status(&response, 403);
     }
 }

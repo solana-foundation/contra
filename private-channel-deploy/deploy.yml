@@ -13,13 +13,74 @@
   - "vars/{{ env | default(group_names | difference(['all']) | first | default('dev')) }}.yml"
 
   pre_tasks:
-  # Load plain-text secrets. File is gitignored (see .gitignore).
-  - name: Load plain-text secrets
-    ansible.builtin.include_vars:
-      file: "{{ playbook_dir }}/secrets.yml"
+  # Secrets backend: 'file' (default) loads the gitignored secrets.yml; 'doppler'
+  # pulls the same keys from Doppler at deploy time. Opt-in and per-operator: it
+  # auto-selects 'doppler' only when DOPPLER_TOKEN is set in your environment, so
+  # every other user's plain-file flow is unchanged. Force either way with
+  # `-e secrets_backend=file` or `-e secrets_backend=doppler`.
+  - name: Resolve secrets backend
+    ansible.builtin.set_fact:
+      secrets_backend: >-
+        {{ secrets_backend | default('doppler' if (lookup('env', 'DOPPLER_TOKEN') | length > 0) else 'file', true) }}
     tags: [ always ]
     run_once: true
     delegate_to: localhost
+
+  - name: Report secrets backend
+    ansible.builtin.debug:
+      msg: "Secrets backend: {{ secrets_backend }}"
+    tags: [ always ]
+    run_once: true
+    delegate_to: localhost
+
+  # File backend: gitignored plain-text secrets.yml (see .gitignore).
+  - name: Load plain-text secrets (file backend)
+    ansible.builtin.include_vars:
+      file: "{{ playbook_dir }}/secrets.yml"
+    when: secrets_backend == 'file'
+    tags: [ always ]
+    run_once: true
+    delegate_to: localhost
+
+  # Doppler backend: fetch the config's secrets at deploy time and map them onto
+  # the same var names the file backend provides, so everything downstream is
+  # unchanged. The service token (DOPPLER_TOKEN) pins the project + config, so no
+  # project/config flags are needed. Doppler keys are the UPPERCASE of these names
+  # (e.g. rpc_url -> RPC_URL). Requires the Doppler CLI on the control node.
+  - name: Load secrets from Doppler (doppler backend)
+    when: secrets_backend == 'doppler'
+    tags: [ always ]
+    run_once: true
+    delegate_to: localhost
+    block:
+    - name: Assert Doppler CLI is available
+      ansible.builtin.command: doppler --version
+      register: doppler_cli
+      changed_when: false
+
+    - name: Fetch secrets from Doppler
+      ansible.builtin.command: doppler secrets download --no-file --format json
+      environment:
+        DOPPLER_TOKEN: "{{ lookup('env', 'DOPPLER_TOKEN') }}"
+      register: doppler_download
+      changed_when: false
+      no_log: true
+
+    - name: Map Doppler secrets onto deploy vars
+      ansible.builtin.set_fact:
+        postgres_password: "{{ _d.POSTGRES_PASSWORD | default('') }}"
+        postgres_replication_password: "{{ _d.POSTGRES_REPLICATION_PASSWORD | default('') }}"
+        jwt_secret: "{{ _d.JWT_SECRET | default('') }}"
+        grafana_admin_password: "{{ _d.GRAFANA_ADMIN_PASSWORD | default('') }}"
+        solana_keypair: "{{ _d.SOLANA_KEYPAIR | default('') }}"
+        ghcr_user: "{{ _d.GHCR_USER | default('') }}"
+        ghcr_token: "{{ _d.GHCR_TOKEN | default('') }}"
+        yellowstone_token: "{{ _d.YELLOWSTONE_TOKEN | default('') }}"
+        rpc_url: "{{ _d.RPC_URL | default(rpc_url | default('')) }}"
+        notify_webhook: "{{ _d.NOTIFY_WEBHOOK | default('') }}"
+      vars:
+        _d: "{{ doppler_download.stdout | from_json }}"
+      no_log: true
 
   # Track total elapsed time for the report phase.
   - name: Capture deploy start time

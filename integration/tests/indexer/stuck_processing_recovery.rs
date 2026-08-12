@@ -867,7 +867,9 @@ async fn recovery_leaves_row_processing_when_proof_unavailable() {
 
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 3);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
-    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    // Past the 5 minute stale threshold so the sweep selects the row, but inside
+    // the 10 minute escalation window so an unreadable proof still waits.
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(6)).await;
     // Read back rather than trusting the seed's return: Postgres stores
     // microseconds, so a nanosecond-precision local timestamp never compares equal.
     let backdated = updated_at_of(&pool, tx_id).await;
@@ -898,7 +900,7 @@ async fn recovery_leaves_row_processing_when_proof_unavailable() {
         "a transient outage must not page on-call"
     );
 
-    // Aged past the window, the same unreadable proof does escalate.
+    // Well past the 10 minute window, the same unreadable proof does escalate.
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(45)).await;
     test_hooks::run_recovery_once(
         &storage,

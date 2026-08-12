@@ -1,7 +1,3 @@
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
 use axum::{extract::State, Json};
 use tracing::info;
 
@@ -9,16 +5,9 @@ use crate::{
     db,
     error::{AppError, AppResult},
     models::{RegisterRequest, User},
+    validation::{PASSWORD_MAX_LEN, PASSWORD_MIN_LEN, USERNAME_MAX_LEN, USERNAME_MIN_LEN},
     AppState,
 };
-
-const PASSWORD_MIN_LEN: usize = 6;
-/// Prevents DoS via excessively long inputs that would make Argon2 consume
-/// significant CPU and memory on every login/register attempt.
-const PASSWORD_MAX_LEN: usize = 128;
-
-const USERNAME_MIN_LEN: usize = 5;
-const USERNAME_MAX_LEN: usize = 32;
 
 pub async fn register(
     State(state): State<AppState>,
@@ -61,12 +50,18 @@ pub async fn register(
         )));
     }
 
+    // Charged after the length caps so the keyed store never holds a huge key.
+    if state
+        .throttle
+        .per_username
+        .check_key(&req.username)
+        .is_err()
+    {
+        return Err(AppError::TooManyRequests);
+    }
+
     // Hash the password with Argon2 before storing.
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(req.password.as_bytes(), &salt)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?
-        .to_string();
+    let hash = state.passwords.hash(req.password).await?;
 
     // Attempt the INSERT directly rather than doing a SELECT first.
     //

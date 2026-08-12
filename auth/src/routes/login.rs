@@ -1,10 +1,10 @@
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{extract::State, Json};
 
 use crate::{
     db,
     error::{AppError, AppResult},
     models::{LoginRequest, LoginResponse},
+    validation::{PASSWORD_MAX_LEN, USERNAME_MAX_LEN},
     AppState,
 };
 
@@ -22,22 +22,44 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<LoginResponse>> {
+    // Cap the inputs before the lookup or any hashing. Maximums only: enforcing
+    // register's minimums would lock out accounts created under an older policy.
+    if req.username.len() > USERNAME_MAX_LEN || req.password.chars().count() > PASSWORD_MAX_LEN {
+        return Err(AppError::Unauthorized);
+    }
+
+    // Charged after the length cap so the keyed store never holds a huge key.
+    if state
+        .throttle
+        .per_username
+        .check_key(&req.username)
+        .is_err()
+    {
+        return Err(AppError::TooManyRequests);
+    }
+
     let user = db::find_user_by_username(&state.pool, &req.username).await;
     state.pool_status.observe_app(&user);
     let user = user?;
 
     let Some(user) = user else {
-        // User not found — run Argon2 against the dummy hash to match the cost
-        // of the "wrong password" path and prevent username enumeration via timing.
-        let hash = PasswordHash::new(DUMMY_HASH).expect("dummy hash is valid");
-        let _ = Argon2::default().verify_password(req.password.as_bytes(), &hash);
+        // User not found. Run Argon2 against the dummy hash to match the cost of
+        // the "wrong password" path and prevent username enumeration via timing.
+        // Same worker as the real path, so the permit wait can't leak either.
+        state
+            .passwords
+            .verify(req.password, DUMMY_HASH.to_string())
+            .await?;
         return Err(AppError::Unauthorized);
     };
 
-    let hash = PasswordHash::new(&user.password_hash).map_err(|_| AppError::Unauthorized)?;
-    Argon2::default()
-        .verify_password(req.password.as_bytes(), &hash)
-        .map_err(|_| AppError::Unauthorized)?;
+    if !state
+        .passwords
+        .verify(req.password, user.password_hash)
+        .await?
+    {
+        return Err(AppError::Unauthorized);
+    }
 
     let token = state
         .jwt
@@ -52,6 +74,8 @@ mod tests {
     use super::*;
     use argon2::PasswordHash;
 
+    /// A malformed dummy hash fails to parse, which makes the unknown-user path
+    /// return without doing Argon2 work and reopens the timing oracle.
     #[test]
     fn dummy_hash_is_valid() {
         assert!(PasswordHash::new(DUMMY_HASH).is_ok());

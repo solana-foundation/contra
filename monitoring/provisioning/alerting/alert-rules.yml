@@ -44,6 +44,9 @@ groups:
     folder: Solana Private Channels Alerts
     interval: 10s
     rules:
+      # Hard-down tier: the metrics port is unreachable (crash, OOM, restart-loop).
+      # This never flaps on a routine stream reconnect, so keep it fast (30s) — it
+      # is the immediate page when the process is actually gone.
       - uid: service-down-scrape
         title: "Solana Private Channels service down (scrape target unreachable)"
         condition: C
@@ -78,14 +81,20 @@ groups:
                     params: [1]
               refId: C
 
+      # The /health probe reports "stalled" during a Yellowstone stream reconnect
+      # (the provider recycles the connection ~hourly; the drain-before-close is
+      # silent for a minute or two, then the indexer reconnects and gap-fills
+      # losslessly). Those blips self-heal in <2m, so gate this at 2m to page only
+      # on a sustained stall. A hard-down process still pages fast via the scrape
+      # alert above (up == 0), which does not flap this way.
       - uid: service-down-probe
         title: "Solana Private Channels service down (health probe failed)"
         condition: C
-        for: 30s
+        for: 2m
         noDataState: Alerting
         execErrState: Error
         annotations:
-          summary: "Service {{ $labels.instance }} is down (health check failed)"
+          summary: "Service {{ $labels.instance }} health check failing for 2m+ (sustained stall, not a routine reconnect)"
         labels:
           severity: critical
         data:
@@ -183,4 +192,47 @@ groups:
                 - evaluator:
                     type: lt
                     params: [0.5]
+              refId: C
+
+  - orgId: 1
+    name: indexer-reconnect-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      # Early smoke for a reconnect storm, before it becomes a sustained stall.
+      # Routine provider recycles run ~2-4/hour; >5 in 15m (~20/hour) means the
+      # stream is genuinely flapping. Warning severity: it rides the default
+      # contact point (single receiver here), so it is an FYI, not a hard page.
+      - uid: indexer-reconnect-storm
+        title: "Indexer datasource reconnecting abnormally often"
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} reconnected {{ $values.A }} times in 15m (routine is ~2-4/hr); upstream stream is flapping"
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_indexer_datasource_reconnects_total[15m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [5]
               refId: C

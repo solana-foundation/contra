@@ -72,8 +72,13 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 const ACCOUNT_GATED_METHODS: &[&str] = &[
     "getAccountInfo",
     "getTokenAccountBalance",
-    "getSignaturesForAddress",
+    GET_SIGNATURES_FOR_ADDRESS,
 ];
+
+/// Transaction history. Gated like the two above, and the only method whose
+/// response is also rewritten for User-role callers: see
+/// `redact_transaction_errors` in lib.rs.
+pub const GET_SIGNATURES_FOR_ADDRESS: &str = "getSignaturesForAddress";
 
 // ---------------------------------------------------------------------------
 // Token program IDs

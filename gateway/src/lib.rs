@@ -4,7 +4,7 @@ pub mod metrics;
 
 use crate::auth::{
     auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, AuthDecision,
+    forbidden_body, AuthDecision, GET_SIGNATURES_FOR_ADDRESS,
 };
 use clap::Parser;
 use governor::clock::DefaultClock;
@@ -331,6 +331,32 @@ fn configured_secret(secret: Option<&str>) -> Option<&str> {
     secret.filter(|s| !s.trim().is_empty())
 }
 
+/// Replaces every non-null `err` in a `getSignaturesForAddress` response with
+/// one constant marker. Transactions are indexed under every account they
+/// touched, so distinct error codes let a caller who owns only the destination
+/// of a failed transfer binary-search the source's balance.
+///
+/// The marker is a valid `TransactionError` so clients still parse the page. A
+/// body with no `result` array has no `err` and passes through.
+fn redact_transaction_errors(body: Bytes) -> Bytes {
+    let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
+        warn!("History response was not JSON, forwarding it unchanged");
+        return body;
+    };
+    let Some(entries) = json
+        .get_mut("result")
+        .and_then(|result| result.as_array_mut())
+    else {
+        return body;
+    };
+    for entry in entries {
+        if let Some(err) = entry.get_mut("err").filter(|err| !err.is_null()) {
+            *err = serde_json::json!({ "InstructionError": [0, "GenericError"] });
+        }
+    }
+    Bytes::from(json.to_string())
+}
+
 impl Gateway {
     pub fn new(
         write_url: String,
@@ -568,8 +594,9 @@ impl Gateway {
 
     /// Enforces RBAC on gated methods.
     ///
-    /// Returns `Some(response)` if the request must be rejected, `None` if it
-    /// may proceed. No-ops immediately when auth is not configured.
+    /// Returns `Err(response)` if the request must be rejected. `Ok(redact)` if
+    /// it may proceed, where `redact` marks a response whose transaction errors
+    /// must be collapsed. No-ops immediately when auth is not configured.
     async fn enforce_auth(
         &self,
         auth_header: Option<&str>,
@@ -577,16 +604,17 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Option<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>> {
+    ) -> Result<bool, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
+    {
         let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
             (Some(k), Some(db)) => (k, db),
-            _ => return None,
+            _ => return Ok(false),
         };
 
         let decision = check_request_auth(auth_header, decoding_key, method, params);
 
         let (status, body) = match decision {
-            AuthDecision::Proceed => return None,
+            AuthDecision::Proceed => return Ok(false),
             AuthDecision::Reject(status, body) => (status, body),
             AuthDecision::NeedsAccountFetch { user_id, pubkey } => {
                 let result = match self.fetch_account_for_auth(&pubkey).await {
@@ -612,7 +640,9 @@ impl Gateway {
                     ),
                 };
                 match result {
-                    AuthDecision::Proceed => return None,
+                    // Only User-role callers get this far, so a history query
+                    // cleared here is one whose errors we redact.
+                    AuthDecision::Proceed => return Ok(method == GET_SIGNATURES_FOR_ADDRESS),
                     AuthDecision::Reject(status, body) => (status, body),
                     AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
                 }
@@ -633,7 +663,7 @@ impl Gateway {
             &status.as_u16().to_string(),
             start.elapsed().as_secs_f64(),
         );
-        Some(self.error_response(status, Some(body)))
+        Err(self.error_response(status, Some(body)))
     }
 
     /// Build a JSON-RPC–style error body for 413 responses.
@@ -891,12 +921,13 @@ impl Gateway {
 
         // --- RBAC enforcement ---
         let params = json.get("params").cloned().unwrap_or(Value::Null);
-        if let Some(rejection) = self
+        let redact_tx_errors = match self
             .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
             .await
         {
-            return Ok(rejection);
-        }
+            Ok(redact) => redact,
+            Err(rejection) => return Ok(rejection),
+        };
 
         let (target_url, target_label) = if method == "sendTransaction" {
             info!("Routing sendTransaction to write node");
@@ -972,7 +1003,27 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                Ok(Response::from_parts(parts, body.boxed_unsync()))
+                if !redact_tx_errors {
+                    return Ok(Response::from_parts(parts, body.boxed_unsync()));
+                }
+
+                // Rewriting the page means buffering it instead of streaming.
+                let collected = match body.collect().await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(e) => {
+                        error!("Failed to read response from {}: {}", target_url, e);
+                        return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
+                    }
+                };
+                // Redaction changes the length, so let hyper re-frame the body.
+                parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+                Ok(Response::from_parts(
+                    parts,
+                    Full::new(redact_transaction_errors(collected))
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                ))
             }
             Err(e) => {
                 error!("Failed to forward request to {}: {}", target_url, e);
@@ -1832,6 +1883,39 @@ mod tests {
         // IPv4 is keyed by the full address.
         let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         assert_eq!(rate_limit_key(v4), v4);
+    }
+
+    /// Both legs of the balance probe (InsufficientFunds above the source
+    /// balance, MintMismatch at or below it) must come back indistinguishable.
+    #[test]
+    fn history_errors_collapse_to_one_marker() {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {"signature": "sig1", "slot": 1, "err": {"InstructionError": [0, {"Custom": 1}]}},
+                {"signature": "sig2", "slot": 2, "err": {"InstructionError": [0, {"Custom": 3}]}},
+                {"signature": "sig3", "slot": 3, "err": null}
+            ]
+        })
+        .to_string();
+
+        let redacted: Value =
+            serde_json::from_slice(&redact_transaction_errors(Bytes::from(body))).unwrap();
+
+        let entries = redacted["result"].as_array().unwrap();
+        assert_eq!(
+            entries[0]["err"], entries[1]["err"],
+            "two different program errors must not stay distinguishable"
+        );
+        assert_eq!(
+            entries[0]["err"],
+            json!({"InstructionError": [0, "GenericError"]})
+        );
+        assert!(
+            entries[2]["err"].is_null(),
+            "a landed transaction keeps err: null"
+        );
     }
 
     /// Shared secret for the ownership-fetch tests below, used by both the token

@@ -159,6 +159,31 @@ async fn start_mock_backend_with_body(body: impl Into<String> + Send + 'static) 
     addr
 }
 
+/// Like `start_mock_backend_with_body`, but answers each connection with the
+/// next body in `bodies` and repeats the last one after they run out. A
+/// User-role request takes two: the ownership account fetch, then the proxied
+/// call.
+async fn start_mock_backend_with_sequence(bodies: Vec<String>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = &bodies[served.min(bodies.len() - 1)];
+            served += 1;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        }
+    });
+    addr
+}
+
 /// Start a gateway with auth enforcement enabled.
 ///
 /// `write_url` defaults to an unreachable port when not needed — most tests
@@ -263,6 +288,43 @@ fn mint_account_response() -> String {
                 "rentEpoch": 0
             }
         }
+    })
+    .to_string()
+}
+
+/// A getSignaturesForAddress page carrying the two error codes that leak a
+/// balance (Custom(1) InsufficientFunds, Custom(3) MintMismatch) and one
+/// landed transaction.
+fn history_response() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": [
+            {
+                "signature": "sig1",
+                "slot": 1,
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            },
+            {
+                "signature": "sig2",
+                "slot": 2,
+                "err": {"InstructionError": [0, {"Custom": 3}]},
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            },
+            {
+                "signature": "sig3",
+                "slot": 3,
+                "err": null,
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            }
+        ]
     })
     .to_string()
 }
@@ -1262,6 +1324,102 @@ async fn test_get_signatures_for_address_operator_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+/// A User must not be able to tell the two error codes apart: that difference
+/// is what turns an owned destination account into a balance oracle.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_user_gets_uniform_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let pubkey = "So11111111111111111111111111111111111111112";
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    // First reply clears the ownership fetch, second is the proxied page.
+    let backend =
+        start_mock_backend_with_sequence(vec![system_account_response(), history_response()]).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"], entries[1]["err"],
+        "InsufficientFunds and MintMismatch must reach a User as the same value"
+    );
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, "GenericError"]})
+    );
+    assert!(
+        entries[2]["err"].is_null(),
+        "a landed transaction keeps err: null"
+    );
+}
+
+/// An Operator keeps the raw errors, so diagnostics survive the redaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_operator_keeps_raw_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let operator_id = insert_user(&pool, "operator").await;
+    let token = generate_token(operator_id, "operator");
+
+    // An Operator skips the ownership fetch, so the page is the only reply.
+    let backend = start_mock_backend_with_body(history_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["So11111111111111111111111111111111111111112"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, {"Custom": 1}]})
+    );
+    assert_eq!(
+        entries[1]["err"],
+        json!({"InstructionError": [0, {"Custom": 3}]})
+    );
 }
 
 // ── DvP swap escrow ──────────────────────────────────────────────────────────

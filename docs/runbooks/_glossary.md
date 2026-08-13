@@ -47,11 +47,17 @@ backup.
 
 ## Pipeline-halt asymmetry
 
-Withdrawals halt the entire pipeline on a deterministic per-row error
-(`processor.rs::halt_withdrawal_pipeline`). The reason is on-chain: a
-quarantined withdrawal would leave a permanent gap in the SMT that
-rejects every subsequent nonce. Halt + sweep is safer than bleeding
-errors downstream.
+Withdrawals halt the pipeline on a deterministic per-row error
+(`processor.rs::halt_withdrawal_pipeline`). The reason is tree rotation,
+not a nonce gap: the SMT is sparse and the program happily accepts a
+skipped nonce. But the processor rotates the tree at each
+`MAX_TREE_LEAVES` boundary, and once it rotates past a quarantined row's
+generation the program rejects that nonce permanently, so the row can
+never be re-armed. Halting keeps the tree still until a human decides.
+
+The sweep is bounded below by the poison row's `withdrawal_nonce`. Active
+withdrawals with a lower nonce are left alone for the recovery worker; see
+`withdrawal_manual_review.md` § Path A.halting.
 
 Deposits never halt. The deposit loop (`process_deposit_funds`)
 continues after each quarantine. There is no SMT, no nonce, no
@@ -62,12 +68,15 @@ the deposit ones do not.
 
 ## Withdrawal nonce and SMT
 
-- Each withdrawal row has `withdrawal_nonce: BIGINT NOT NULL`.
+- Each withdrawal row has `withdrawal_nonce BIGINT`. The column is nullable;
+  an insert trigger assigns the next sequence value when a withdrawal arrives
+  without one, so a NULL nonce means that trigger was bypassed or dropped.
 - The on-chain SMT has `MAX_TREE_LEAVES` slots (see
   `indexer/src/operator/tree_constants.rs`). Leaf position = `nonce % MAX_TREE_LEAVES`.
-- A quarantined withdrawal occupies its leaf logically (the next nonce
-  expects sequential progression). The pipeline halts because subsequent
-  nonces would fail at the program until the tree is rotated.
+- A quarantined withdrawal leaves its leaf unfilled. The tree is sparse, so
+  the program still accepts later nonces in the same tree; the gap is not
+  itself an error. The pipeline halts to stop the tree rotating past that
+  leaf's generation, which would make the nonce permanently unusable.
 - Rotation: `ResetSmtRootBuilder` (escrow program). Triggered automatically
   when a nonce hits the `MAX_TREE_LEAVES` boundary; no admin CLI entrypoint
   exists today.

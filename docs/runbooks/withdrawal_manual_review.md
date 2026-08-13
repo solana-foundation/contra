@@ -9,8 +9,9 @@ Triggered by webhook payload `status=manual_review` for a withdrawal row.
 - May or may not be paired with a pipeline halt: if the trigger error
   was a build-side deterministic failure (Path A.halting below), the
   operator's `halt_withdrawal_pipeline` ran and bulk-flipped every
-  active withdrawal to `manual_review`. Multiple webhooks for the same
-  timestamp burst confirm a halt occurred.
+  active withdrawal at or above the poison row's nonce to
+  `manual_review`. Multiple webhooks for the same timestamp burst
+  confirm a halt occurred.
 
 ## Triage - dispatch by `error_message`
 
@@ -36,7 +37,7 @@ have prefixes.
 |---|---|---|---|
 | `invalid_pubkey`, `invalid_builder`, `program_error` | A.halting | yes | `processor.rs` quarantine |
 | `withdrawal pipeline halted after poison-pill` | A.halting (collateral row) | yes | halt sweep, channel drain |
-| (empty `error_message`, status flipped without a quarantine update) | A.halting (collateral row) | yes | `quarantine_all_active_withdrawals` |
+| (empty `error_message`, status flipped without a quarantine update) | A.halting (collateral row) | yes | `quarantine_active_withdrawals` |
 | `mint paused:` | A.non-halting | no | pre-flight |
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
@@ -53,9 +54,18 @@ have prefixes.
 The trigger row's data is bad in a way that would corrupt the SMT (NULL
 nonce, malformed pubkey, builder rejection). The processor quarantined the
 trigger and ran `halt_withdrawal_pipeline`, which drained the fetcher
-channel and bulk-flipped every `pending`/`processing` withdrawal to
-`manual_review`. Recovery has to handle both the trigger and the
-collateral.
+channel and bulk-flipped every active withdrawal **at or above the trigger
+row's `withdrawal_nonce`** to `manual_review`. Recovery has to handle both
+the trigger and the collateral.
+
+Withdrawals *below* the trigger's nonce are deliberately left in
+`processing` or `parked`. Those rows were already signed or handed to the
+sender, and terminalizing one discards the `completed` write that lands
+when its release confirms, which leaves the operator's local SMT root
+disagreeing with chain on the next boot. The stuck-row recovery worker and
+the stale-parked sweep own those rows; do not bulk-flip them by hand. If
+the trigger row has no `withdrawal_nonce` at all the sweep is unbounded and
+every active withdrawal is collateral.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for the trigger row. Expected verdict: `NOT_LANDED` (build failed before
@@ -74,7 +84,7 @@ collateral.
    Subsequent rows are collateral from the halt sweep - those came in as
    webhooks too, but with no quarantine `error_message` (the sweep doesn't
    send a `TransactionStatusUpdate` per row; status is flipped in bulk via
-   `quarantine_all_active_withdrawals`).
+   `quarantine_active_withdrawals`).
 3. **Decide the trigger row's fate.**
    - Bad data, unrecoverable (e.g. malformed mint pubkey, NULL nonce):
      ```sql

@@ -152,7 +152,7 @@ ci-integration-test-build-test-tree:
 	@$(MAKE) -C private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 
 ci-integration-test-prebuilt:
@@ -216,7 +216,7 @@ ci-integration-test-indexer:
 	@$(MAKE) -C private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
 	@$(MAKE) -C private-channel-escrow-program build-no-clients

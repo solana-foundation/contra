@@ -1,6 +1,6 @@
 use crate::config::ProgramType;
 use crate::operator::utils::instruction_util::{
-    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, WithdrawalRemintInfo,
+    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, TransactionKind, WithdrawalRemintInfo,
 };
 use crate::operator::MintCache;
 use crate::operator::RpcClientWithRetry;
@@ -77,6 +77,8 @@ pub struct TransactionContext {
     pub transaction_id: Option<i64>,
     pub withdrawal_nonce: Option<u64>,
     pub trace_id: Option<String>,
+    /// What this transaction is; an InitializeMint and a rotation carry identical empty ids.
+    pub kind: TransactionKind,
 }
 
 /// Transaction status update to send to storage
@@ -161,11 +163,12 @@ pub struct SenderState {
     /// a stale entry from stranding a releasable withdrawal.
     pub cached_generation: Option<u64>,
     pub retry_counts: HashMap<u64, u32>,
-    /// Sender-level attempts for retryable transactions that carry no nonce,
-    /// keyed by transaction id. A rotation has neither, so every rotation shares
-    /// the `None` counter; the sender sends them one at a time and clears the
-    /// count when one settles, so they cannot shorten each other's budget.
-    pub nonceless_retry_counts: HashMap<Option<i64>, u32>,
+    /// Attempts spent on the rotation in hand; one counter suffices because at most one is ever in flight.
+    pub rotation_retry_attempts: u32,
+    /// The rotation last dispatched, kept because nothing else can re-dispatch one that failed.
+    pub rotation_in_flight: Option<Box<RotateBitmapBuilder>>,
+    /// Times that rotation has been put back on the tick, so a hopeless one stops being retried.
+    pub rotation_rearm_attempts: u32,
     pub mint_builders: HashMap<i64, MintToBuilder>,
     pub mint_cache: MintCache,
     pub retry_max_attempts: u32,

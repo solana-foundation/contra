@@ -1,7 +1,7 @@
 use crate::error::OperatorError;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::sender::mint;
-use crate::operator::ReleaseFundsBuilderWithNonce;
+use crate::operator::{ReleaseFundsBuilderWithNonce, TransactionKind};
 use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
@@ -69,6 +69,7 @@ impl SenderState {
                 );
                 self.rotation_retry_queue.push((
                     TransactionContext {
+                        kind: TransactionKind::ReleaseFunds,
                         transaction_id: Some(transaction_id),
                         withdrawal_nonce: Some(nonce),
                         trace_id: Some(trace_id),
@@ -105,7 +106,7 @@ impl SenderState {
     /// refuse one is unrecoverable: a withdrawal refused on a stale cache is
     /// never sent, so it is never rejected, so nothing ever corrects the cache
     /// that refused it. Every refusal is therefore taken against a fresh read.
-    async fn release_window(&mut self, nonce: u64) -> (GenerationWindow, u64) {
+    pub(super) async fn release_window(&mut self, nonce: u64) -> (GenerationWindow, u64) {
         let nonce_generation = nonce / NONCES_PER_GENERATION;
 
         if self.cached_generation == Some(nonce_generation) {
@@ -286,6 +287,7 @@ mod tests {
     fn queue_pending_remint(state: &mut SenderState, nonce: u64) {
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(1),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("t".to_string()),
@@ -509,11 +511,19 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
         };
-        handle_nonce_outside_generation(&mut state, &ctx, instruction, &tx).await;
+        handle_nonce_outside_generation(
+            &mut state,
+            &ctx,
+            Signature::new_unique(),
+            instruction,
+            &tx,
+        )
+        .await;
 
         assert_eq!(
             state.pending_remints.len(),
@@ -683,11 +693,19 @@ mod tests {
         for (transaction_id, nonce) in [(REFUSED_ROW, ahead + 1), (404, ahead + 2)] {
             state.cached_generation = None;
             let ctx = TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(transaction_id),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("t".to_string()),
             };
-            handle_nonce_outside_generation(&mut state, &ctx, instruction.clone(), &tx).await;
+            handle_nonce_outside_generation(
+                &mut state,
+                &ctx,
+                Signature::new_unique(),
+                instruction.clone(),
+                &tx,
+            )
+            .await;
         }
 
         assert_eq!(

@@ -1702,6 +1702,22 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Delete one stored release signature, keeping the transaction's others.
+    pub async fn delete_release_signature_internal(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM pending_release_signatures WHERE transaction_id = $1 AND signature = $2",
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Record the releases seen in one slot; idempotent on the nonce.
     pub async fn insert_observed_releases_batch_internal(
         &self,

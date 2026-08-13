@@ -4,7 +4,7 @@ use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
-use crate::operator::utils::instruction_util::TransactionBuilder;
+use crate::operator::utils::instruction_util::{TransactionBuilder, TransactionKind};
 use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
     build_and_sign, check_transaction_status, send_signed, ConfirmationResult,
@@ -141,6 +141,9 @@ impl SenderState {
                 };
                 builder.expected_generation(expected_generation);
 
+                // Kept because a rotation that fails has nothing else to rebuild it from.
+                self.rotation_in_flight = Some(builder.clone());
+
                 Ok(InstructionWithSigners {
                     instructions: vec![builder.instruction()],
                     fee_payer,
@@ -163,6 +166,7 @@ pub async fn handle_transaction_submission(
         transaction_id: tx_builder.transaction_id(),
         withdrawal_nonce: tx_builder.withdrawal_nonce(),
         trace_id: tx_builder.trace_id(),
+        kind: tx_builder.kind(),
     };
 
     let retry_policy = tx_builder.retry_policy();
@@ -344,40 +348,77 @@ pub(super) async fn persist_signature_or_abort(
     Ok(())
 }
 
-/// Sender-level attempts already spent on this transaction.
-fn sender_retry_attempts(state: &SenderState, ctx: &TransactionContext) -> u32 {
-    match ctx.withdrawal_nonce {
-        Some(nonce) => state.retry_counts.get(&nonce).copied().unwrap_or(0),
-        None => state
-            .nonceless_retry_counts
-            .get(&ctx.transaction_id)
-            .copied()
-            .unwrap_or(0),
+/// Sender-level attempts already spent, or `None` for a kind this bound does not cover.
+fn sender_retry_attempts(state: &SenderState, ctx: &TransactionContext) -> Option<u32> {
+    match ctx.kind {
+        TransactionKind::RotateBitmap => Some(state.rotation_retry_attempts),
+        TransactionKind::ReleaseFunds => ctx
+            .withdrawal_nonce
+            .map(|nonce| state.retry_counts.get(&nonce).copied().unwrap_or(0)),
+        // A mint is bounded by the poll queue, and a bound here would fail it into a status nothing can write.
+        TransactionKind::Mint | TransactionKind::InitializeMint => None,
     }
 }
 
 fn record_sender_retry_attempt(state: &mut SenderState, ctx: &TransactionContext, attempts: u32) {
-    match ctx.withdrawal_nonce {
-        Some(nonce) => {
-            state.retry_counts.insert(nonce, attempts);
+    match ctx.kind {
+        TransactionKind::RotateBitmap => state.rotation_retry_attempts = attempts,
+        TransactionKind::ReleaseFunds => {
+            if let Some(nonce) = ctx.withdrawal_nonce {
+                state.retry_counts.insert(nonce, attempts);
+            }
         }
-        None => {
-            state
-                .nonceless_retry_counts
-                .insert(ctx.transaction_id, attempts);
-        }
+        TransactionKind::Mint | TransactionKind::InitializeMint => {}
     }
 }
 
-/// Forget the retry history of a settled transaction, so the next one keyed the
-/// same way starts from a full budget.
-///
-/// Only the nonceless side needs this: a withdrawal's counter is dropped along
-/// with the rest of its caches when the nonce is cleaned up.
-fn clear_nonceless_retry_state(state: &mut SenderState, ctx: &TransactionContext) {
-    if ctx.withdrawal_nonce.is_none() {
-        state.nonceless_retry_counts.remove(&ctx.transaction_id);
+/// Forget a settled rotation, so the next starts on a full budget and nothing is left owed on this one.
+fn clear_rotation_retry_state(state: &mut SenderState, ctx: &TransactionContext) {
+    if ctx.kind == TransactionKind::RotateBitmap {
+        state.rotation_retry_attempts = 0;
+        state.rotation_rearm_attempts = 0;
+        state.rotation_in_flight = None;
     }
+}
+
+/// Re-arms allowed per rotation; each buys a fresh send budget, so the product bounds what one rotation can cost.
+const MAX_ROTATION_REARMS: u32 = 3;
+
+/// Put a failed rotation back on the tick; nothing else re-dispatches one, and the generation it owes stays shut.
+fn rearm_failed_rotation(state: &mut SenderState, error_msg: &str) {
+    // The re-armed rotation is a fresh send, so it gets the full retry budget.
+    state.rotation_retry_attempts = 0;
+
+    let give_up = |state: &mut SenderState, reason: &str| {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "rotation_lost"])
+            .inc();
+        error!(
+            "Rotation abandoned after failing: {error_msg}; {reason}. Every nonce in the \
+             unopened generation stays unreleasable until a rotation lands."
+        );
+        state.rotation_in_flight = None;
+    };
+
+    let Some(builder) = state.rotation_in_flight.clone() else {
+        give_up(state, "nothing was held to re-dispatch it from");
+        return;
+    };
+
+    if state.rotation_rearm_attempts >= MAX_ROTATION_REARMS {
+        give_up(state, "it has already been re-armed to the limit");
+        return;
+    }
+
+    state.rotation_rearm_attempts += 1;
+    metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[state.program_type.as_label(), "rotation_rearmed"])
+        .inc();
+    error!(
+        attempt = state.rotation_rearm_attempts,
+        "Rotation failed and was re-armed for the next tick: {error_msg}"
+    );
+    state.pending_rotation = Some(builder);
 }
 
 /// Sign, send, confirm, and handle the result
@@ -391,33 +432,31 @@ pub(super) async fn send_and_confirm(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     // Check retry limit - only for idempotent operations that can be retried at sender level.
-    //
-    // The bound covers transactions with no nonce too. A confirmation timeout
-    // re-enters this function, so anything retryable that is never counted
-    // recurses until the sender task dies and takes the whole pipeline with it.
+    // An uncounted rotation re-enters here forever, so the bound is keyed on the kind rather than on absent ids.
     match retry_policy {
         RetryPolicy::Idempotent => {
-            let attempts = sender_retry_attempts(state, ctx);
-            if attempts >= state.retry_max_attempts {
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[state.program_type.as_label(), "max_retries_exceeded"])
-                    .inc();
-                error!(
+            if let Some(attempts) = sender_retry_attempts(state, ctx) {
+                if attempts >= state.retry_max_attempts {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[state.program_type.as_label(), "max_retries_exceeded"])
+                        .inc();
+                    error!(
+                        nonce = ctx.withdrawal_nonce.map(|n| n as i64),
+                        transaction_id = ctx.transaction_id,
+                        "Max retries ({}) exceeded",
+                        state.retry_max_attempts
+                    );
+                    handle_permanent_failure(state, ctx, storage_tx, "Max retries exceeded").await;
+                    return;
+                }
+                record_sender_retry_attempt(state, ctx, attempts + 1);
+                info!(
                     nonce = ctx.withdrawal_nonce.map(|n| n as i64),
-                    transaction_id = ctx.transaction_id,
-                    "Max retries ({}) exceeded",
+                    "Transaction attempt {}/{}",
+                    attempts + 1,
                     state.retry_max_attempts
                 );
-                handle_permanent_failure(state, ctx, storage_tx, "Max retries exceeded").await;
-                return;
             }
-            record_sender_retry_attempt(state, ctx, attempts + 1);
-            info!(
-                nonce = ctx.withdrawal_nonce.map(|n| n as i64),
-                "Transaction attempt {}/{}",
-                attempts + 1,
-                state.retry_max_attempts
-            );
         }
         RetryPolicy::None => {
             info!("Sending non-idempotent transaction - single sender-level attempt");
@@ -562,7 +601,8 @@ pub(super) fn handle_confirmation_result<'a>(
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "nonce_outside_generation"])
                     .inc();
-                handle_nonce_outside_generation(state, ctx, instruction, storage_tx).await;
+                handle_nonce_outside_generation(state, ctx, signature, instruction, storage_tx)
+                    .await;
             }
             Ok(ConfirmationResult::MintNotInitialized) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
@@ -673,6 +713,8 @@ pub(super) fn handle_confirmation_result<'a>(
                 // local index to resync, so the rejection needs no repair: the next
                 // rotation reads the generation fresh.
                 warn!("RotateBitmap rejected: the generation already advanced on-chain");
+                // The refusal says nothing about the next rotation, so charging it would wedge every one after it.
+                clear_rotation_retry_state(state, ctx);
             }
             Ok(ConfirmationResult::Failed(program_error)) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
@@ -701,7 +743,7 @@ pub(super) async fn handle_success(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     info!("Transaction confirmed: {}", signature);
-    clear_nonceless_retry_state(state, ctx);
+    clear_rotation_retry_state(state, ctx);
 
     // Handle ReleaseFunds (withdrawal nonce-based) transactions
     if let Some(nonce) = ctx.withdrawal_nonce {
@@ -761,14 +803,14 @@ pub(super) async fn handle_success(
         .await
         .ok();
     }
-    // Handle RotateBitmap, which carries neither a nonce nor a transaction id.
+    // Handle RotateBitmap, named by its kind because an InitializeMint arrives here with the same empty ids.
     //
     // The rotation was bound to the generation the cache holds, and the program
     // accepts it only from exactly that generation, so a confirmation moves both
     // the chain and the cache on by one. Deriving the new value from the old one
     // rather than from the rotation cannot outrun the chain: an unknown cache
     // stays unknown and is resolved by the next read.
-    else {
+    else if ctx.kind == TransactionKind::RotateBitmap {
         state.cached_generation = state.cached_generation.map(|generation| generation + 1);
         info!(
             generation = state.cached_generation,
@@ -929,6 +971,7 @@ pub(super) async fn park_release_for_rotation(
 pub(super) async fn handle_nonce_outside_generation(
     state: &mut SenderState,
     ctx: &TransactionContext,
+    signature: Signature,
     instruction: InstructionWithSigners,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
@@ -998,6 +1041,7 @@ pub(super) async fn handle_nonce_outside_generation(
             .retry_counts
             .entry(nonce)
             .and_modify(|attempts| *attempts = attempts.saturating_sub(1));
+        forget_rejected_signature(state, nonce, ctx.transaction_id, &signature).await;
         state.rotation_retry_queue.push((ctx.clone(), instruction));
         return;
     }
@@ -1025,6 +1069,36 @@ pub(super) async fn handle_nonce_outside_generation(
         .to_string(),
     )
     .await;
+}
+
+/// Drop a signature the chain confirmed it rejected: it moved no funds, so it is not payout evidence worth keeping.
+async fn forget_rejected_signature(
+    state: &mut SenderState,
+    nonce: u64,
+    transaction_id: Option<i64>,
+    signature: &Signature,
+) {
+    if let Some(stashed) = state.pending_signatures.get_mut(&nonce) {
+        stashed.retain(|pending| pending.signature != *signature);
+        if stashed.is_empty() {
+            state.pending_signatures.remove(&nonce);
+        }
+    }
+
+    let Some(transaction_id) = transaction_id else {
+        return;
+    };
+    if let Err(e) = state
+        .storage
+        .delete_release_signature(transaction_id, &signature.to_string())
+        .await
+    {
+        warn!(
+            transaction_id,
+            %signature,
+            "Could not drop a rejected release signature: {e}"
+        );
+    }
 }
 
 /// Queue the compensating remint for a release the program itself refused.
@@ -1126,6 +1200,12 @@ pub(super) async fn handle_permanent_failure(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     error_msg: &str,
 ) {
+    // A rotation has no row to fail and no burn to refund, so it is re-armed instead.
+    if ctx.kind == TransactionKind::RotateBitmap {
+        rearm_failed_rotation(state, error_msg);
+        return;
+    }
+
     defer_remint_after_failure(state, ctx, storage_tx, error_msg, false).await;
 }
 
@@ -1140,7 +1220,7 @@ async fn defer_remint_after_failure(
     error_msg: &str,
     release_refused_on_chain: bool,
 ) {
-    clear_nonceless_retry_state(state, ctx);
+    clear_rotation_retry_state(state, ctx);
 
     // Extract remint info BEFORE cleanup destroys builder cache
     let remint_info = ctx
@@ -1897,6 +1977,7 @@ mod tests {
     use solana_keychain::Signer;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::sync::Semaphore;
 
@@ -1934,6 +2015,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(42),
             withdrawal_nonce: None, // not a withdrawal
             trace_id: Some("trace-42".to_string()),
@@ -1955,6 +2037,7 @@ mod tests {
 
         // Withdrawal nonce but nothing in remint_cache
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(7),
             withdrawal_nonce: Some(99),
             trace_id: Some("trace-7".to_string()),
@@ -1985,6 +2068,7 @@ mod tests {
         );
 
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
@@ -2023,6 +2107,7 @@ mod tests {
         // Note: not inserting into pending_signatures
 
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
@@ -2065,6 +2150,7 @@ mod tests {
         );
         let (tx, _rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
@@ -2168,6 +2254,7 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(50),
             withdrawal_nonce: Some(3),
             trace_id: Some("trace-50".to_string()),
@@ -2241,6 +2328,7 @@ mod tests {
 
     fn withdrawal_ctx(txn_id: i64, nonce: u64) -> TransactionContext {
         TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(txn_id),
             withdrawal_nonce: Some(nonce),
             trace_id: Some(format!("trace-{txn_id}")),
@@ -2474,6 +2562,7 @@ mod tests {
         );
 
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
@@ -2581,6 +2670,7 @@ mod tests {
         );
 
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
@@ -2608,6 +2698,7 @@ mod tests {
     async fn send_fatal_error_with_transaction_id_sends_failed_status() {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(42),
             withdrawal_nonce: None,
             trace_id: Some("trace-1".to_string()),
@@ -2628,6 +2719,7 @@ mod tests {
     async fn send_fatal_error_without_transaction_id_sends_nothing() {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::InitializeMint,
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
@@ -2646,6 +2738,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(7),
             withdrawal_nonce: None,
             trace_id: Some("trace-mint".to_string()),
@@ -2672,6 +2765,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::RotateBitmap,
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
@@ -2693,6 +2787,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(99),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-wd".to_string()),
@@ -2720,6 +2815,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(10),
             withdrawal_nonce: None,
             trace_id: None,
@@ -2752,6 +2848,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(11),
             withdrawal_nonce: None,
             trace_id: None,
@@ -2785,6 +2882,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::RotateBitmap,
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
@@ -2819,6 +2917,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(12),
             withdrawal_nonce: None,
             trace_id: None,
@@ -2854,6 +2953,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(13),
             withdrawal_nonce: None,
             trace_id: None,
@@ -2902,6 +3002,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(14),
             withdrawal_nonce: None,
             trace_id: None,
@@ -2934,6 +3035,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         // No transaction_id
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
@@ -2968,6 +3070,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(20),
             withdrawal_nonce: Some(5),
             trace_id: None,
@@ -3001,6 +3104,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(30),
             withdrawal_nonce: Some(2),
             trace_id: Some("trace-confirmed".to_string()),
@@ -3063,6 +3167,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(70),
             withdrawal_nonce: Some(4),
             trace_id: Some("trace-70".to_string()),
@@ -3189,6 +3294,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(70),
             withdrawal_nonce: Some(4),
             trace_id: Some("trace-70".to_string()),
@@ -3269,6 +3375,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(REFUSED_ROW),
             withdrawal_nonce: Some(nonce),
             trace_id: Some("trace-80".to_string()),
@@ -3318,6 +3425,96 @@ mod tests {
             state.retry_counts.get(&nonce).copied(),
             Some(1),
             "a refusal we already expected must not spend the withdrawal's retries"
+        );
+    }
+
+    /// Each retry cycle stashes another signature, so a confirmed rejection must go while an open outcome stays.
+    #[tokio::test]
+    async fn a_requeued_release_forgets_the_signature_the_chain_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let nonce = NONCES_PER_GENERATION;
+        let mock = mock_with_processing_row(REFUSED_ROW);
+        let still_open = Signature::new_unique();
+        let rejected = Signature::new_unique();
+        for signature in [still_open, rejected] {
+            mock.insert_release_signature(REFUSED_ROW, signature.to_string(), 1)
+                .await
+                .unwrap();
+        }
+
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.in_flight_withdrawals.insert(nonce);
+        state
+            .remint_cache
+            .insert(nonce, make_remint_info(REFUSED_ROW));
+        state.pending_signatures.insert(
+            nonce,
+            vec![
+                PendingSig {
+                    signature: still_open,
+                    last_valid_block_height: 1,
+                },
+                PendingSig {
+                    signature: rejected,
+                    last_valid_block_height: 1,
+                },
+            ],
+        );
+
+        let (tx, _rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(REFUSED_ROW),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some("trace-80".to_string()),
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
+            ))),
+            rejected,
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            1,
+            "the release is still queued for the rotation that opens its window"
+        );
+        let stashed: Vec<Signature> = state
+            .pending_signatures
+            .get(&nonce)
+            .expect("the open signature keeps the stash alive")
+            .iter()
+            .map(|pending| pending.signature)
+            .collect();
+        assert_eq!(
+            stashed,
+            vec![still_open],
+            "only the signature the chain confirmed rejected may be dropped"
+        );
+        let stored: Vec<String> = mock
+            .get_release_signatures(REFUSED_ROW)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(signature, _)| signature)
+            .collect();
+        assert_eq!(
+            stored,
+            vec![still_open.to_string()],
+            "the durable row must go with the stashed copy"
         );
     }
 
@@ -3430,6 +3627,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(90),
             withdrawal_nonce: Some(NONCES_PER_GENERATION),
             trace_id: Some("trace-90".to_string()),
@@ -3469,6 +3667,7 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(91),
             withdrawal_nonce: Some(1),
             trace_id: Some("trace-91".to_string()),
@@ -3509,6 +3708,7 @@ mod tests {
         );
         let (tx, _rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(91),
             withdrawal_nonce: Some(1),
             trace_id: Some("trace-91".to_string()),
@@ -3560,6 +3760,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(REFUSED_TXID),
             withdrawal_nonce: Some(nonce),
             trace_id: Some("trace-95".to_string()),
@@ -3686,6 +3887,7 @@ mod tests {
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(42),
             withdrawal_nonce: None,
             trace_id: Some("trace-fire".to_string()),
@@ -3777,6 +3979,7 @@ mod tests {
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(55),
             withdrawal_nonce: None,
             trace_id: None,
@@ -3817,6 +4020,7 @@ mod tests {
         super::super::types::InFlightTx {
             signature: sig,
             ctx: TransactionContext {
+                kind: TransactionKind::Mint,
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: Some(format!("trace-{txn_id}")),
@@ -4267,6 +4471,7 @@ mod tests {
 
     fn mint_ctx(txn_id: i64) -> TransactionContext {
         TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(txn_id),
             withdrawal_nonce: None,
             trace_id: Some(format!("trace-{txn_id}")),
@@ -4517,6 +4722,7 @@ mod tests {
         // Carry a transaction_id so the assertion exercises the `persist` gate
         // itself rather than the inner id-presence guard short-circuiting.
         let ctx = TransactionContext {
+            kind: TransactionKind::InitializeMint,
             transaction_id: Some(909),
             withdrawal_nonce: None,
             trace_id: Some("trace-init".to_string()),
@@ -4570,6 +4776,7 @@ mod tests {
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(9999),
             withdrawal_nonce: None,
             trace_id: None,
@@ -4609,6 +4816,7 @@ mod tests {
             dummy_instruction(),
             None,
             TransactionContext {
+                kind: TransactionKind::Mint,
                 transaction_id: Some(1),
                 withdrawal_nonce: None,
                 trace_id: None,
@@ -4864,6 +5072,7 @@ mod tests {
         state.cached_generation = Some(3);
         let (tx, _rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::RotateBitmap,
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: Some("trace-rotation".to_string()),
@@ -4883,6 +5092,7 @@ mod tests {
         let mut state = make_sender_state();
         let (tx, _rx) = mpsc::channel(10);
         let ctx = TransactionContext {
+            kind: TransactionKind::RotateBitmap,
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
@@ -4893,14 +5103,28 @@ mod tests {
         assert_eq!(state.cached_generation, None);
     }
 
-    /// A rotation carries no nonce, so the retry bound that lives behind the
-    /// nonce check never applied to it. A confirmation that never arrives then
-    /// re-entered this function forever and the sender loop stopped answering
-    /// anything at all: no new withdrawals, no remints, no shutdown.
-    #[tokio::test]
-    async fn nonceless_idempotent_send_stops_at_the_retry_limit() {
-        let mut server = mockito::Server::new_async().await;
-        let _blockhash = server
+    // ── rotation retry budget ────────────────────────────────────────
+
+    fn rotation_ctx() -> TransactionContext {
+        TransactionContext {
+            kind: TransactionKind::RotateBitmap,
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+        }
+    }
+
+    fn initialize_mint_ctx() -> TransactionContext {
+        TransactionContext {
+            kind: TransactionKind::InitializeMint,
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+        }
+    }
+
+    fn mock_blockhash_regex(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
                 r#""method"\s*:\s*"getLatestBlockhash""#.into(),
@@ -4920,50 +5144,89 @@ mod tests {
                 .to_string(),
             )
             .expect_at_least(1)
-            .create_async()
-            .await;
-        // Never confirms, which is what drives the Retry arm every cycle.
-        let _statuses = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
-            ))
-            .with_status(200)
-            .with_body(
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": 1,
-                    "result": {"context": {"slot": 1}, "value": [null]}
-                })
-                .to_string(),
-            )
-            .expect_at_least(1)
-            .create_async()
-            .await;
-        let send = server
+            .create()
+    }
+
+    /// Answers every `sendTransaction` and counts it, so a test can assert how many went out.
+    fn mock_send_counted(
+        server: &mut mockito::ServerGuard,
+        sends: Arc<AtomicUsize>,
+    ) -> mockito::Mock {
+        server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
                 r#""method"\s*:\s*"sendTransaction""#.into(),
             ))
             .with_status(200)
-            .with_body(
+            .with_body_from_request(move |_| {
+                sends.fetch_add(1, Ordering::SeqCst);
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": 1,
                     "result": Signature::default().to_string()
                 })
-                .to_string(),
-            )
-            .expect(3)
-            .create_async()
-            .await;
+                .to_string()
+                .into_bytes()
+            })
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// A `getSignatureStatuses` value: unconfirmed unless `confirmed`, carrying `err` when the program refused it.
+    fn statuses_body(confirmed: bool, err: Option<serde_json::Value>) -> Vec<u8> {
+        let value = if confirmed {
+            serde_json::json!([{
+                "slot": 1,
+                "confirmations": null,
+                "confirmationStatus": "finalized",
+                "err": err,
+                "status": match &err {
+                    Some(e) => serde_json::json!({"Err": e}),
+                    None => serde_json::json!({"Ok": null}),
+                }
+            }])
+        } else {
+            serde_json::json!([null])
+        };
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"context": {"slot": 1}, "value": value}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Withholds confirmation until more than `after` sends have gone out, then confirms cleanly.
+    fn mock_statuses_confirmed_after(
+        server: &mut mockito::ServerGuard,
+        sends: Arc<AtomicUsize>,
+        after: usize,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                statuses_body(sends.load(Ordering::SeqCst) > after, None)
+            })
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// An InitializeMint carries a rotation's empty ids, and capping it on that resemblance leaves its deposit with no terminal status at all.
+    #[tokio::test]
+    async fn initialize_mint_resends_past_the_rotation_retry_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_blockhash_regex(&mut server);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let _send = mock_send_counted(&mut server, sends.clone());
+        // Confirms only on the send after the cap, which a bounded run never reaches.
+        let _statuses = mock_statuses_confirmed_after(&mut server, sends.clone(), 3);
 
         let mut state = make_sender_state_with_server(&server.url());
         state.retry_max_attempts = 3;
         let (storage_tx, _storage_rx) = mpsc::channel(10);
-        let ctx = TransactionContext {
-            transaction_id: None,
-            withdrawal_nonce: None,
-            trace_id: None,
-        };
 
         let ran = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -4971,7 +5234,7 @@ mod tests {
                 &mut state,
                 dummy_instruction(),
                 None,
-                &ctx,
+                &initialize_mint_ctx(),
                 RetryPolicy::Idempotent,
                 &ExtraErrorCheckPolicy::None,
                 &storage_tx,
@@ -4979,10 +5242,208 @@ mod tests {
         )
         .await;
 
-        assert!(
-            ran.is_ok(),
-            "a transaction with no nonce must still run out of retries"
+        assert!(ran.is_ok(), "the mint must reach its confirmation");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            4,
+            "a mint must keep re-sending past the bound that belongs to rotations"
         );
-        send.assert_async().await;
+    }
+
+    /// A rotation that never confirms re-enters the send path, so without a bound it recurses until the sender task dies.
+    #[tokio::test]
+    async fn rotation_send_stops_at_the_retry_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_blockhash_regex(&mut server);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let _send = mock_send_counted(&mut server, sends.clone());
+        // Never confirms, which is what drives the Retry arm every cycle.
+        let _statuses = mock_statuses_confirmed_after(&mut server, sends.clone(), usize::MAX);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = 3;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let ran = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            send_and_confirm(
+                &mut state,
+                dummy_instruction(),
+                None,
+                &rotation_ctx(),
+                RetryPolicy::Idempotent,
+                &ExtraErrorCheckPolicy::None,
+                &storage_tx,
+            ),
+        )
+        .await;
+
+        assert!(ran.is_ok(), "a rotation must still run out of retries");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            3,
+            "a rotation must stop at the retry limit"
+        );
+    }
+
+    /// A rotation in hand, as the submit path records it before broadcasting.
+    fn rotation_builder(
+    ) -> Box<private_channel_escrow_program_client::instructions::RotateBitmapBuilder> {
+        let mut builder =
+            private_channel_escrow_program_client::instructions::RotateBitmapBuilder::new();
+        let pk = Pubkey::new_unique();
+        builder
+            .payer(pk)
+            .operator(pk)
+            .instance(pk)
+            .withdrawal_bitmap(pk)
+            .operator_pda(pk)
+            .expected_generation(0);
+        Box::new(builder)
+    }
+
+    /// Nothing re-dispatches a rotation once its boundary row is done, so a lost one shuts the next generation.
+    #[tokio::test]
+    async fn a_rotation_that_runs_out_of_retries_is_re_armed() {
+        let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_blockhash_regex(&mut server);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let _send = mock_send_counted(&mut server, sends.clone());
+        let _statuses = mock_statuses_confirmed_after(&mut server, sends.clone(), usize::MAX);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = 3;
+        state.rotation_in_flight = Some(rotation_builder());
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &rotation_ctx(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            state.pending_rotation.is_some(),
+            "a failed rotation must go back on the tick, not vanish"
+        );
+        assert_eq!(
+            state.rotation_retry_attempts, 0,
+            "the re-armed rotation needs its send budget back"
+        );
+    }
+
+    /// Re-arming cannot be unconditional, or a rotation the chain never accepts is broadcast for the life of the process.
+    #[tokio::test]
+    async fn a_rotation_that_keeps_failing_stops_being_re_armed() {
+        let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_blockhash_regex(&mut server);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let _send = mock_send_counted(&mut server, sends.clone());
+        let _statuses = mock_statuses_confirmed_after(&mut server, sends.clone(), usize::MAX);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = 1;
+        state.rotation_in_flight = Some(rotation_builder());
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let lost_before = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["escrow", "rotation_lost"])
+            .get();
+
+        for _ in 0..=MAX_ROTATION_REARMS {
+            state.pending_rotation = None;
+            send_and_confirm(
+                &mut state,
+                dummy_instruction(),
+                None,
+                &rotation_ctx(),
+                RetryPolicy::Idempotent,
+                &ExtraErrorCheckPolicy::None,
+                &storage_tx,
+            )
+            .await;
+        }
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "a rotation that cannot land must stop being re-armed"
+        );
+        assert_eq!(
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&["escrow", "rotation_lost"])
+                .get(),
+            lost_before + 1.0,
+            "giving up on a rotation must be visible"
+        );
+    }
+
+    /// Only a rotation moves the window; an InitializeMint mistaken for one leaves the cache a generation ahead of the chain.
+    #[tokio::test]
+    async fn confirmed_initialize_mint_leaves_the_cached_generation_alone() {
+        let mut state = make_sender_state();
+        state.cached_generation = Some(3);
+        let (tx, _rx) = mpsc::channel(10);
+
+        handle_success(
+            &mut state,
+            &initialize_mint_ctx(),
+            Signature::new_unique(),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(state.cached_generation, Some(3));
+    }
+
+    /// A rotation refused as a duplicate says nothing about the next one, so charging it wedges every rotation after it.
+    #[tokio::test]
+    async fn rotation_refused_as_duplicate_leaves_the_next_rotation_sendable() {
+        let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_blockhash_regex(&mut server);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let _send = mock_send_counted(&mut server, sends.clone());
+        // The first three rotations are refused with UnexpectedGeneration (custom code 14); the fourth confirms.
+        let refusals = sends.clone();
+        let _statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let err = (refusals.load(Ordering::SeqCst) <= 3)
+                    .then(|| serde_json::json!({"InstructionError": [0, {"Custom": 14}]}));
+                statuses_body(true, err)
+            })
+            .expect_at_least(1)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = 3;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        for _ in 0..4 {
+            send_and_confirm(
+                &mut state,
+                dummy_instruction(),
+                None,
+                &rotation_ctx(),
+                RetryPolicy::Idempotent,
+                &ExtraErrorCheckPolicy::None,
+                &storage_tx,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            4,
+            "a rotation must still be broadcast after earlier ones were refused as duplicates"
+        );
     }
 }

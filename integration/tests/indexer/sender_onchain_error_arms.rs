@@ -33,7 +33,9 @@ use {
         operator::{
             sender::{test_hooks, types::TransactionStatusUpdate},
             utils::{
-                instruction_util::{ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy},
+                instruction_util::{
+                    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, TransactionKind,
+                },
                 transaction_util::ConfirmationResult,
             },
             SignerUtil,
@@ -516,6 +518,7 @@ async fn mint_not_initialized_no_txn_id_routes_to_failed() {
     let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let ctx = private_channel_indexer::operator::sender::types::TransactionContext {
+        kind: TransactionKind::Mint,
         transaction_id: None,
         withdrawal_nonce: None,
         trace_id: None,

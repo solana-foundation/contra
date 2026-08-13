@@ -158,31 +158,35 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
       }
       const bitmapHeader = getWithdrawalBitmapDecoder().decode(bitmapBytes);
 
-      // Bits start after the fixed header; capacity comes from the account so a
-      // shorter test-sized bitmap counts correctly too.
-      const BITS_OFFSET = 10;
-      const capacity = (bitmapBytes.length - BITS_OFFSET) * 8;
+      // Bits start after the fixed header, whose width comes from the generated
+      // decoder so a header layout change cannot silently shift the count.
+      const bitsOffset = getWithdrawalBitmapDecoder().fixedSize;
+      // Capacity comes from the account so a shorter test-sized bitmap counts correctly.
+      const capacity = (bitmapBytes.length - bitsOffset) * 8;
       let released = 0;
-      for (let i = BITS_OFFSET; i < bitmapBytes.length; i++) {
+      for (let i = bitsOffset; i < bitmapBytes.length; i++) {
         let byte = bitmapBytes[i];
         while (byte) {
-          released += byte & 1;
-          byte >>= 1;
+          byte &= byte - 1;
+          released++;
         }
       }
       const unreleased = capacity - released;
 
-      // Rotating clears every bit, so a nonce still unreleased in this generation
-      // can never be released afterwards, and a refund still waiting on one of
-      // these bits loses the only proof of whether that user was already paid.
-      // This page cannot see those waiting refunds, so the operator has to be the
-      // one to confirm the window is safe to clear.
+      // The operator holds a release in flight and a refund awaiting finality only
+      // in memory, and it will not rotate while either depends on the bits being
+      // cleared. This page talks to the chain directly, so it cannot observe those
+      // barriers and cannot enforce them. Rotating from here is an override of them,
+      // and the unreleased count below is the only part the page can check itself.
       if (unreleased > 0) {
         const proceed = window.confirm(
-          `${unreleased} of ${capacity} nonces in generation ${bitmapHeader.generation} have not been released.\n\n` +
-            'Rotating now clears every bit and advances the generation. Those nonces can never be released afterwards, ' +
+          `OVERRIDE: this bypasses the operator's rotation safety checks.\n\n` +
+            `${unreleased} of ${capacity} nonces in generation ${bitmapHeader.generation} have not been released.\n\n` +
+            'Rotating clears every bit and advances the generation. Those nonces can never be released afterwards, ' +
             'and any refund still waiting on one of these bits loses the only proof of whether that user was already paid.\n\n' +
-            'This page cannot see refunds waiting inside the operator. Confirm with the operator before continuing.\n\n' +
+            'This page cannot see releases in flight or refunds waiting inside the operator. The operator normally rotates ' +
+            'on its own at each boundary once both have settled. Use this only when that has stalled, and confirm with the ' +
+            'operator first.\n\n' +
             'Rotate anyway?'
         );
         if (!proceed) {

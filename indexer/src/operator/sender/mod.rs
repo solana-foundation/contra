@@ -166,7 +166,7 @@ use tracing::{debug, error, info, warn};
 use proof::take_pending_rotation_if_ready;
 use transaction::{
     handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
-    send_and_confirm,
+    send_and_confirm, GenerationWindow,
 };
 use types::{PollTaskResult, SenderState};
 
@@ -385,15 +385,39 @@ pub(super) async fn drain_rotation_retry_queue(
             continue;
         };
 
-        if state.pending_rotation.is_some() {
-            // A rotation wait can outlast the stale threshold, and recovery
-            // requeues stale parked rows. Refreshing the park each tick keeps
-            // recovery from taking work this sender is still holding.
-            if let Err(e) = state.storage.try_park_processing(transaction_id).await {
-                warn!(transaction_id, "Could not refresh the park: {e}");
-            }
-            state.rotation_retry_queue.push((ctx, instruction));
+        // Read before any CAS, so an entry the drain cannot act on strands no row mid-transition.
+        let Some(nonce) = ctx.withdrawal_nonce else {
+            error!(
+                transaction_id,
+                "Dropping a queued release that names no nonce; leaving its row for recovery"
+            );
             continue;
+        };
+
+        if state.pending_rotation.is_some() {
+            hold_queued_release(state, ctx, instruction, transaction_id).await;
+            continue;
+        }
+
+        // The rotation this entry waits on can be lost, and a send into a shut window pays a fee to be refused.
+        let (window, chain_generation) = state.release_window(nonce).await;
+        match window {
+            GenerationWindow::Open => {}
+            GenerationWindow::NotYetOpen => {
+                hold_queued_release(state, ctx, instruction, transaction_id).await;
+                continue;
+            }
+            // No rotation reopens this window, so holding the row only starves the sweep that would settle it.
+            GenerationWindow::Closed => {
+                error!(
+                    nonce,
+                    chain_generation,
+                    transaction_id,
+                    "Queued release belongs to a generation the bitmap has rotated past; \
+                     leaving its parked row for recovery"
+                );
+                continue;
+            }
         }
 
         match state.storage.try_unpark_to_processing(transaction_id).await {
@@ -416,9 +440,6 @@ pub(super) async fn drain_rotation_retry_queue(
             }
         }
 
-        let nonce = ctx
-            .withdrawal_nonce
-            .expect("rotation retry must have nonce");
         info!(
             trace_id = ctx.trace_id.as_deref().unwrap_or("none"),
             "Retrying blocked nonce {} after rotation", nonce
@@ -438,6 +459,19 @@ pub(super) async fn drain_rotation_retry_queue(
         )
         .await;
     }
+}
+
+/// Keep waiting on a queued release, refreshing its park so recovery does not take work this sender still holds.
+async fn hold_queued_release(
+    state: &mut SenderState,
+    ctx: types::TransactionContext,
+    instruction: types::InstructionWithSigners,
+    transaction_id: i64,
+) {
+    if let Err(e) = state.storage.try_park_processing(transaction_id).await {
+        warn!(transaction_id, "Could not refresh the park: {e}");
+    }
+    state.rotation_retry_queue.push((ctx, instruction));
 }
 
 /// Wait for all in-flight fire-and-forget transactions to reach a terminal state.
@@ -498,7 +532,9 @@ mod tests {
     use crate::operator::sender::types::{
         InFlightTx, InstructionWithSigners, TransactionContext, MAX_IN_FLIGHT,
     };
-    use crate::operator::utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy};
+    use crate::operator::utils::instruction_util::{
+        ExtraErrorCheckPolicy, RetryPolicy, TransactionKind,
+    };
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::PrivateChannelIndexerConfig;
@@ -514,6 +550,7 @@ mod tests {
         InFlightTx {
             signature: Signature::new_unique(),
             ctx: TransactionContext {
+                kind: TransactionKind::Mint,
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: None,
@@ -742,6 +779,7 @@ mod tests {
     fn queued_release(nonce: u64) -> (TransactionContext, InstructionWithSigners) {
         (
             TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(QUEUED_ROW),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("trace-70".to_string()),
@@ -765,7 +803,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let send = mock_generation_refusal(&mut server).await;
 
-        let nonce = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        // Inside the window the bitmap reports, so the send happens and its refusal is what the entry survives.
+        let nonce = 5;
         let mut state = sender_state_with_storage(&server.url(), mock_with_parked_row(QUEUED_ROW));
         state.instance_pda = Some(Pubkey::new_unique());
         state.rotation_retry_queue.push(queued_release(nonce));
@@ -790,6 +829,92 @@ mod tests {
         );
     }
 
+    /// A lost rotation releases the drain's only hold, and each tick then pays a fee per entry for a certain refusal.
+    #[tokio::test]
+    async fn rotation_retry_drain_holds_an_entry_whose_window_has_not_opened() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        crate::operator::sender::test_support::mock_bitmap_account(&mut server, 0, &[]);
+
+        let nonce = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let before = row_updated_at(&mock, QUEUED_ROW).expect("seeded row");
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(nonce));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            1,
+            "the entry still waits for the window to open"
+        );
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "a release that was never sent must stay parked"
+        );
+        assert!(
+            row_updated_at(&mock, QUEUED_ROW).expect("row still present") > before,
+            "a held entry must keep its row fresh or recovery will take it"
+        );
+    }
+
+    /// A window the chain rotated past never reopens, so holding the row only keeps recovery from settling it.
+    #[tokio::test]
+    async fn rotation_retry_drain_releases_an_entry_whose_window_has_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        crate::operator::sender::test_support::mock_bitmap_account(&mut server, 2, &[]);
+
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(7));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert!(
+            state.rotation_retry_queue.is_empty(),
+            "an entry no rotation can unblock must stop being held"
+        );
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "the row is left where the recovery sweep can find it"
+        );
+    }
+
+    /// An entry with no nonce must be caught before the row moves, or the sender dies leaving it mid-transition.
+    #[tokio::test]
+    async fn rotation_retry_drain_drops_an_entry_that_names_no_nonce() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let (mut ctx, instruction) = queued_release(7);
+        ctx.withdrawal_nonce = None;
+        state.rotation_retry_queue.push((ctx, instruction));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert!(state.rotation_retry_queue.is_empty());
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "the row must not be left mid-transition"
+        );
+    }
+
     /// The drain takes the row back before it broadcasts. Sending first would
     /// put a release on chain for a row this sender may no longer own.
     ///
@@ -801,7 +926,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let send = mock_generation_refusal(&mut server).await;
 
-        let nonce = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        // Inside the window, so the drain reaches the broadcast under test.
+        let nonce = 5;
         let mock = mock_with_parked_row(QUEUED_ROW);
         mock.set_should_fail("try_park_processing", true);
         let mut state = sender_state_with_storage(&server.url(), mock.clone());

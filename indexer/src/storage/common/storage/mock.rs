@@ -793,6 +793,22 @@ impl MockStorage {
         Ok(())
     }
 
+    pub async fn delete_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("delete_release_signature")?;
+        let mut map = self.release_signatures.lock().unwrap();
+        if let Some(signatures) = map.get_mut(&transaction_id) {
+            signatures.retain(|(stored, _)| stored != signature);
+            if signatures.is_empty() {
+                map.remove(&transaction_id);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn insert_observed_releases_batch(
         &self,
         releases: &[DbObservedRelease],

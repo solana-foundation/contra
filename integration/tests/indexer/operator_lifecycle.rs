@@ -1537,7 +1537,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     use private_channel_indexer::operator::sender::types::{
         TransactionContext, TransactionStatusUpdate,
     };
-    use private_channel_indexer::operator::WithdrawalRemintInfo;
+    use private_channel_indexer::operator::{TransactionKind, WithdrawalRemintInfo};
     use solana_sdk::commitment_config::CommitmentLevel;
 
     println!("=== Operator Lifecycle: Landed Release With Dead Signatures ===");
@@ -1647,6 +1647,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
 
     state.pending_remints.push(PendingRemint {
         ctx: TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
             transaction_id: Some(transaction_id),
             withdrawal_nonce: Some(0),
             trace_id: Some(trace_id.clone()),

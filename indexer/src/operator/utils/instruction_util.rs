@@ -67,6 +67,15 @@ pub enum ExtraErrorCheckPolicy {
     Extra(Vec<ExtraErrorCheckFn>),
 }
 
+/// Which builder a transaction came from, so consumers dispatch on the kind rather than on absent ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionKind {
+    ReleaseFunds,
+    InitializeMint,
+    Mint,
+    RotateBitmap,
+}
+
 /// Wrapper enum for different transaction builder types
 /// Allows processor to send multiple builder types through a single channel to sender
 #[derive(Clone, Debug)]
@@ -82,6 +91,16 @@ pub enum TransactionBuilder {
 }
 
 impl TransactionBuilder {
+    /// The one place a builder variant is turned into the kind carried downstream.
+    pub fn kind(&self) -> TransactionKind {
+        match self {
+            Self::ReleaseFunds(_) => TransactionKind::ReleaseFunds,
+            Self::InitializeMint(_) => TransactionKind::InitializeMint,
+            Self::Mint(_) => TransactionKind::Mint,
+            Self::RotateBitmap(_) => TransactionKind::RotateBitmap,
+        }
+    }
+
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         match self {
             Self::ReleaseFunds(builder_with_nonce) => {

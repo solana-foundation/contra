@@ -211,6 +211,8 @@ pub fn init_labels(program_type: &str) {
         "nonce_outside_generation",
         "bitmap_unavailable",
         "rotation_already_landed",
+        "rotation_rearmed",
+        "rotation_lost",
         "bitmap_divergence",
         "mint_not_initialized",
         "confirmation_timeout_non_idempotent",

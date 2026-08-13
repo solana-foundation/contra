@@ -3,6 +3,7 @@ pub use super::models::*;
 pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
+pub mod delete_release_signature;
 pub mod delete_release_signatures;
 pub mod drop_tables;
 pub mod gc_stale_release_signatures;
@@ -493,6 +494,15 @@ impl Storage {
     /// Delete all stored release signatures for a transaction.
     pub async fn delete_release_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
         delete_release_signatures::delete_release_signatures(self, transaction_id).await
+    }
+
+    /// Delete one stored release signature, keeping the transaction's others.
+    pub async fn delete_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), StorageError> {
+        delete_release_signature::delete_release_signature(self, transaction_id, signature).await
     }
 
     /// Drop release signatures whose parent transaction is no longer

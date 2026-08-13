@@ -7,7 +7,7 @@ use crate::operator::{
     fetch_bitmap_generation, fetch_consumed_nonces, find_withdrawal_bitmap_pda, BitmapState,
     RetryConfig, RpcClientWithRetry,
 };
-use crate::operator::{MintCache, TransactionStatusUpdate, WithdrawalRemintInfo};
+use crate::operator::{MintCache, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo};
 use crate::storage::common::storage::Storage;
 use crate::storage::TransactionStatus;
 use crate::{PrivateChannelIndexerConfig, ProgramType};
@@ -57,7 +57,9 @@ impl SenderState {
             in_flight_withdrawals: HashSet::new(),
             cached_generation: None,
             retry_counts: HashMap::new(),
-            nonceless_retry_counts: HashMap::new(),
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_cache,
             mint_builders: HashMap::new(),
             retry_max_attempts,
@@ -348,6 +350,9 @@ async fn resolve_chain_ahead_nonce(
         }
     };
 
+    // Only a payout attributed to one of our sends is closed by the write below; the rest are left for a human.
+    let attributed = verdict.is_some();
+
     let update = match verdict {
         Some(sig) if repairable => {
             info!(
@@ -401,7 +406,7 @@ async fn resolve_chain_ahead_nonce(
         .await
         .ok();
 
-    if repairable {
+    if repairable && attributed {
         ChainAheadOutcome::Repaired
     } else {
         report_unrepaired(nonce);
@@ -578,6 +583,7 @@ impl SenderState {
             let deadline = tx.pending_remint_deadline_at.unwrap_or_else(Utc::now);
 
             let ctx = TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(tx.id),
                 // Carried so logs and the bitmap gate can name this withdrawal.
                 withdrawal_nonce: tx.withdrawal_nonce.map(|n| n as u64),
@@ -1460,6 +1466,75 @@ mod tests {
         let update = storage_rx.try_recv().expect("row must be escalated");
         assert_eq!(update.transaction_id, 7);
         assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    /// A payout no signature accounts for is unexplained money leaving the instance, so it must not report as repaired.
+    #[tokio::test]
+    async fn chain_ahead_nonce_with_no_attributable_signature_reports_unrepaired() {
+        let mock = MockStorage::new();
+        seed_withdrawal(&mock, 7, 2, TransactionStatus::Processing, None);
+
+        let state = make_sender_state(mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome =
+            super::resolve_chain_ahead_nonce(&state.storage, &state.rpc_client, &storage_tx, 2)
+                .await;
+
+        assert!(
+            matches!(outcome, super::ChainAheadOutcome::Unrepaired),
+            "an unattributed payout is not a repair"
+        );
+        let update = storage_rx.try_recv().expect("the row must be escalated");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    /// The other half of that rule: an attributed payout is genuinely closed and must raise no alert.
+    #[tokio::test]
+    async fn chain_ahead_nonce_matched_to_a_landed_signature_reports_repaired() {
+        let mut server = mockito::Server::new_async().await;
+        let landed = Signature::new_unique();
+        let _statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "slot": 10,
+                            "confirmations": null,
+                            "err": null,
+                            "status": {"Ok": null},
+                            "confirmationStatus": "finalized"
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mock = MockStorage::new();
+        seed_withdrawal(&mock, 7, 2, TransactionStatus::Processing, Some(landed));
+
+        let state = sender_state_with_storage(&server.url(), mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome =
+            super::resolve_chain_ahead_nonce(&state.storage, &state.rpc_client, &storage_tx, 2)
+                .await;
+
+        assert!(
+            matches!(outcome, super::ChainAheadOutcome::Repaired),
+            "an attributed payout closes the gap"
+        );
+        let update = storage_rx.try_recv().expect("the row must be completed");
+        assert_eq!(update.status, TransactionStatus::Completed);
     }
 
     /// A row that already refunded the burn, whose nonce the chain also records

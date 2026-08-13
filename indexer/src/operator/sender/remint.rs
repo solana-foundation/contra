@@ -389,12 +389,21 @@ pub async fn process_pending_remints(
                     )
                     .await;
                 }
+                // The payout record is the last gate, and the only one whose answer survives a rotation.
                 BitmapVerdict::Unknown(_) | BitmapVerdict::Clear => {
-                    info!(
-                        "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
-                        nonce_label
-                    );
-                    execute_deferred_remint(state, &entry, storage_tx).await;
+                    match recorded_release(state, &entry).await {
+                        Some(reason) => {
+                            error!("Refusing to remint nonce {}: {}", nonce_label, reason);
+                            send_manual_review(storage_tx, &entry, &reason).await;
+                        }
+                        None => {
+                            info!(
+                                "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
+                                nonce_label
+                            );
+                            execute_deferred_remint(state, &entry, storage_tx).await;
+                        }
+                    }
                 }
             },
         }
@@ -475,6 +484,24 @@ async fn bitmap_verdict(state: &SenderState, entry: &PendingRemint) -> BitmapVer
     }
 
     BitmapVerdict::Clear
+}
+
+/// Why the recorded release forbids this refund, if it does; silence never permits one, it only leaves the decision.
+async fn recorded_release(state: &SenderState, entry: &PendingRemint) -> Option<String> {
+    let nonce = entry.ctx.withdrawal_nonce?;
+
+    match state.storage.get_observed_release(nonce).await {
+        Ok(Some(release)) => Some(format!(
+            "a release for nonce {nonce} is on record (slot {}, signature {}), so it already paid \
+             out and reminting would credit it twice",
+            release.slot, release.signature
+        )),
+        Ok(None) => None,
+        // An unreadable record rules no payout out, and only a ruled-out payout may be refunded.
+        Err(e) => Some(format!(
+            "the release record for nonce {nonce} could not be read ({e}), so a payout cannot be ruled out"
+        )),
+    }
 }
 
 /// Escalate a pending-remint entry that must not be reminted and cannot be
@@ -643,11 +670,12 @@ mod tests {
     use crate::operator::sender::types::{
         PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
-    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+    use crate::operator::utils::instruction_util::{TransactionKind, WithdrawalRemintInfo};
     use crate::operator::MintCache;
     use crate::operator::RetryConfig;
     use crate::operator::RpcClientWithRetry;
     use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::DbObservedRelease;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
     use solana_sdk::commitment_config::CommitmentConfig;
@@ -683,7 +711,9 @@ mod tests {
             in_flight_withdrawals: HashSet::new(),
             retry_counts: HashMap::new(),
             cached_generation: None,
-            nonceless_retry_counts: HashMap::new(),
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
@@ -809,7 +839,9 @@ mod tests {
             in_flight_withdrawals: HashSet::new(),
             retry_counts: HashMap::new(),
             cached_generation: None,
-            nonceless_retry_counts: HashMap::new(),
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
@@ -870,7 +902,9 @@ mod tests {
             in_flight_withdrawals: HashSet::new(),
             retry_counts: HashMap::new(),
             cached_generation: None,
-            nonceless_retry_counts: HashMap::new(),
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
@@ -952,6 +986,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(555),
                 withdrawal_nonce: Some(5),
                 trace_id: Some("trace-555".to_string()),
@@ -988,6 +1023,7 @@ mod tests {
         // Push a matured entry — RPC will fail (no real endpoint)
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(8),
                 trace_id: Some("trace-20".to_string()),
@@ -1041,6 +1077,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(30),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-30".to_string()),
@@ -1090,6 +1127,7 @@ mod tests {
         // Push entry already at max attempts — next RPC failure triggers ManualReview
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(8),
                 trace_id: Some("trace-20".to_string()),
@@ -1157,6 +1195,7 @@ mod tests {
         // that proves it was processed.
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(10),
                 withdrawal_nonce: Some(1),
                 trace_id: Some("trace-10".to_string()),
@@ -1175,6 +1214,7 @@ mod tests {
         // Entry 2: immature — must not be touched at all.
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(2),
                 trace_id: Some("trace-20".to_string()),
@@ -1272,6 +1312,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(99),
                 withdrawal_nonce: Some(7),
                 trace_id: Some("trace-99".to_string()),
@@ -1334,6 +1375,7 @@ mod tests {
     fn queue_dead_remint(state: &mut SenderState, nonce: u64) {
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(99),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("trace-99".to_string()),
@@ -1522,6 +1564,103 @@ mod tests {
         );
     }
 
+    /// Record a release for `nonce` the way the indexer does when it indexes one.
+    async fn seed_observed_release(mock: &MockStorage, nonce: i64, signature: &str) {
+        mock.insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: nonce,
+            signature: signature.to_string(),
+            slot: 4_000,
+        }])
+        .await
+        .unwrap();
+    }
+
+    /// Past a rotated bitmap the refusal is all that carries the refund, so the payout record is the last refusal left.
+    #[tokio::test]
+    async fn a_recorded_release_blocks_the_refund_a_refusal_would_have_allowed() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_observed_release(&mock, 3, "sig-already-paid").await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a blocked refund must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "no mint may be attempted for a nonce that already paid out"
+        );
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("sig-already-paid"),
+            "the refusal must name the release it found: {err}"
+        );
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// A clear bit contradicting a recorded release is not the positive evidence a second credit needs.
+    #[tokio::test]
+    async fn a_recorded_release_blocks_the_refund_a_clear_bit_would_have_allowed() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_observed_release(&mock, 3, "sig-already-paid").await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a blocked refund must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "a bit that disagrees with a recorded payout may not authorise a credit"
+        );
+    }
+
+    /// An unreadable record rules nothing out, and only a ruled-out payout can be refunded.
+    #[tokio::test]
+    async fn an_unreadable_release_record_blocks_the_refund() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.set_should_fail("get_observed_release", true);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("an unreadable record must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "a lookup that never answered is not permission to credit"
+        );
+    }
+
     /// The same bypass, but for an entry that came back off a row instead of
     /// living in the queue the whole time. A restart inside the finality window
     /// must not cost the user an automatic refund, so the refusal has to survive
@@ -1575,6 +1714,7 @@ mod tests {
 
         let entry = PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(700),
                 withdrawal_nonce: Some(70),
                 trace_id: Some("trace-700".to_string()),
@@ -1648,6 +1788,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(77),
                 withdrawal_nonce: Some(11),
                 trace_id: Some("trace-77".to_string()),
@@ -1725,6 +1866,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(88),
                 withdrawal_nonce: Some(12),
                 trace_id: Some("trace-88".to_string()),
@@ -1793,6 +1935,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(89),
                 withdrawal_nonce: Some(13),
                 trace_id: Some("trace-89".to_string()),
@@ -1864,6 +2007,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(55),
                 withdrawal_nonce: Some(6),
                 trace_id: Some("trace-55".to_string()),
@@ -2100,6 +2244,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(100),
                 withdrawal_nonce: Some(20),
                 trace_id: Some("trace-100".to_string()),
@@ -2166,6 +2311,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(101),
                 withdrawal_nonce: Some(21),
                 trace_id: Some("trace-101".to_string()),
@@ -2222,6 +2368,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(102),
                 withdrawal_nonce: Some(22),
                 trace_id: Some("trace-102".to_string()),
@@ -2282,6 +2429,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(103),
                 withdrawal_nonce: Some(23),
                 trace_id: Some("trace-103".to_string()),
@@ -2354,6 +2502,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(105),
                 withdrawal_nonce: Some(25),
                 trace_id: Some("trace-105".to_string()),

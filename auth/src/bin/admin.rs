@@ -1,11 +1,20 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    private_channel_auth::{db, error::AppError, models::Role},
+    private_channel_auth::{
+        db,
+        error::AppError,
+        models::{Role, User},
+    },
     solana_sdk::pubkey::Pubkey,
     sqlx::postgres::PgPoolOptions,
-    std::{env, str::FromStr},
+    std::{
+        env,
+        io::{self, Write},
+        str::FromStr,
+    },
     tracing::{error, info},
+    uuid::Uuid,
 };
 
 #[derive(Parser, Debug)]
@@ -28,6 +37,8 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Look up a user's immutable id, role and creation time
+    ShowUser(ShowUserArgs),
     /// Attach a wallet to a user without verification — operator asserts trust
     AttachWallet(AttachWalletArgs),
     /// Set a user's RBAC role (e.g. promote to operator so the gateway grants it
@@ -36,14 +47,25 @@ enum Command {
 }
 
 #[derive(Parser, Debug)]
-struct AttachWalletArgs {
-    /// Username of the user to attach the wallet to
+struct ShowUserArgs {
+    /// Username to resolve to an id
     #[arg(long)]
     username: String,
+}
+
+#[derive(Parser, Debug)]
+struct AttachWalletArgs {
+    /// Immutable id of the user to attach the wallet to
+    #[arg(long)]
+    user_id: Uuid,
 
     /// Base58-encoded Solana pubkey to attach to the user
     #[arg(long)]
     pubkey: String,
+
+    /// Skip the confirmation prompt
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -53,13 +75,6 @@ enum RoleArg {
 }
 
 impl RoleArg {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RoleArg::Operator => "operator",
-            RoleArg::User => "user",
-        }
-    }
-
     fn to_model(&self) -> Role {
         match self {
             RoleArg::Operator => Role::Operator,
@@ -70,13 +85,17 @@ impl RoleArg {
 
 #[derive(Parser, Debug)]
 struct SetRoleArgs {
-    /// Username of the user whose role to change
+    /// Immutable id of the user whose role to change
     #[arg(long)]
-    username: String,
+    user_id: Uuid,
 
     /// Role to assign
     #[arg(long)]
     role: RoleArg,
+
+    /// Skip the confirmation prompt
+    #[arg(long)]
+    yes: bool,
 }
 
 #[tokio::main]
@@ -120,54 +139,129 @@ async fn run(args: Args) -> Result<()> {
         .await
         .map_err(|e| anyhow!("Failed to connect to auth DB: {}", e))?;
 
+    // Idempotent, and it keeps the tool usable against a database whose auth
+    // service hasn't yet restarted onto a schema carrying `admin_audit`.
+    db::init_schema(&pool).await?;
+
     match args.command {
-        Command::AttachWallet(args) => attach_wallet(&pool, args).await?,
-        Command::SetRole(args) => set_role(&pool, args).await?,
+        Command::ShowUser(args) => show_user(&pool, args).await?,
+        Command::AttachWallet(args) => attach_wallet(&pool, &admin_actor()?, args).await?,
+        Command::SetRole(args) => set_role(&pool, &admin_actor()?, args).await?,
     }
 
     Ok(())
 }
 
-async fn set_role(pool: &sqlx::PgPool, args: SetRoleArgs) -> Result<()> {
-    let role = args.role.as_str();
-    let updated = db::set_user_role(pool, &args.username, args.role.to_model()).await?;
-    if !updated {
-        return Err(anyhow!("user not found: {}", args.username));
+/// Names the person running the command in the audit trail. Required rather than
+/// defaulted: a row recording "unknown" is not worth writing.
+fn admin_actor() -> Result<String> {
+    let actor = env::var("AUTH_ADMIN_ACTOR").map_err(|_| anyhow!("AUTH_ADMIN_ACTOR is not set"))?;
+    if actor.trim().is_empty() {
+        return Err(anyhow!("AUTH_ADMIN_ACTOR must not be empty"));
     }
-    info!(username = %args.username, role, "set role");
-    println!("set role of {} to {}", args.username, role);
-    Ok(())
+    Ok(actor)
 }
 
-async fn attach_wallet(pool: &sqlx::PgPool, args: AttachWalletArgs) -> Result<()> {
-    let pubkey = Pubkey::from_str(&args.pubkey)
-        .map_err(|_| anyhow!("invalid pubkey: {}", args.pubkey))?
-        .to_string();
+fn print_user(user: &User) {
+    println!("  id:         {}", user.id);
+    println!("  username:   {}", user.username);
+    println!("  role:       {}", user.role.as_str());
+    println!("  created_at: {}", user.created_at);
+}
 
+/// Show who is about to be changed and require an explicit `yes`. These are the
+/// fields an administrator matches against what the account owner reported out of
+/// band, so a grant lands on the person it was meant for and not on whoever
+/// registered the name first.
+fn confirm(user: &User, action: &str, skip: bool) -> Result<bool> {
+    if skip {
+        return Ok(true);
+    }
+
+    println!("about to {action} for:");
+    print_user(user);
+    print!("type 'yes' to continue: ");
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+
+    Ok(answer.trim() == "yes")
+}
+
+async fn show_user(pool: &sqlx::PgPool, args: ShowUserArgs) -> Result<()> {
     let user = db::find_user_by_username(pool, &args.username)
         .await?
         .ok_or_else(|| anyhow!("user not found: {}", args.username))?;
 
-    let wallet = db::insert_verified_wallet(pool, user.id, &pubkey)
+    print_user(&user);
+
+    Ok(())
+}
+
+async fn set_role(pool: &sqlx::PgPool, actor: &str, args: SetRoleArgs) -> Result<()> {
+    let user = db::find_user_by_id(pool, args.user_id)
+        .await?
+        .ok_or_else(|| anyhow!("user not found: {}", args.user_id))?;
+
+    let role = args.role.to_model();
+    let role_str = role.as_str();
+    if !confirm(&user, &format!("set role to {role_str}"), args.yes)? {
+        println!("aborted");
+        return Ok(());
+    }
+
+    // Both ends of the transition, so a real promotion is distinguishable from a
+    // command that changed nothing.
+    let detail = format!("{} -> {role_str}", user.role.as_str());
+
+    let mut tx = pool.begin().await?;
+    if !db::set_user_role(&mut *tx, user.id, role).await? {
+        return Err(anyhow!("user not found: {}", args.user_id));
+    }
+    db::insert_admin_audit(&mut *tx, actor, "set_role", user.id, &detail).await?;
+    tx.commit().await?;
+
+    info!(user_id = %user.id, username = %user.username, actor, detail = %detail, "set role");
+    println!("set role of {} ({}) to {role_str}", user.username, user.id);
+
+    Ok(())
+}
+
+async fn attach_wallet(pool: &sqlx::PgPool, actor: &str, args: AttachWalletArgs) -> Result<()> {
+    let pubkey = Pubkey::from_str(&args.pubkey)
+        .map_err(|_| anyhow!("invalid pubkey: {}", args.pubkey))?
+        .to_string();
+
+    let user = db::find_user_by_id(pool, args.user_id)
+        .await?
+        .ok_or_else(|| anyhow!("user not found: {}", args.user_id))?;
+
+    if !confirm(&user, &format!("attach wallet {pubkey}"), args.yes)? {
+        println!("aborted");
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    let wallet = db::insert_verified_wallet(&mut *tx, user.id, &pubkey)
         .await
         .map_err(|e| match e {
             // Unique constraint on (user_id, pubkey) — wallet already attached.
             AppError::Db(sqlx::Error::Database(ref db_err))
                 if db_err.constraint() == Some("verified_wallets_user_id_pubkey_key") =>
             {
-                anyhow!(
-                    "wallet {} is already attached to user {}",
-                    pubkey,
-                    args.username
-                )
+                anyhow!("wallet {} is already attached to user {}", pubkey, user.id)
             }
             other => anyhow::Error::new(other),
         })?;
+    db::insert_admin_audit(&mut *tx, actor, "attach_wallet", user.id, &wallet.pubkey).await?;
+    tx.commit().await?;
 
     info!(
         user_id = %user.id,
         username = %user.username,
         pubkey = %wallet.pubkey,
+        actor,
         "attached wallet"
     );
 
@@ -219,11 +313,31 @@ mod tests {
         (pool, container)
     }
 
-    fn attach_args(username: &str, pubkey: &str) -> AttachWalletArgs {
+    // Every test drives the commands non-interactively; the confirmation prompt
+    // reads stdin, which no test has.
+    fn attach_args(user_id: Uuid, pubkey: &str) -> AttachWalletArgs {
         AttachWalletArgs {
-            username: username.into(),
+            user_id,
             pubkey: pubkey.into(),
+            yes: true,
         }
+    }
+
+    fn set_role_args(user_id: Uuid, role: RoleArg) -> SetRoleArgs {
+        SetRoleArgs {
+            user_id,
+            role,
+            yes: true,
+        }
+    }
+
+    async fn audit_rows(pool: &PgPool) -> Vec<(String, String, Uuid, String)> {
+        sqlx::query_as(
+            r#"SELECT actor, action, target_user_id, detail FROM private_channel_auth.admin_audit"#,
+        )
+        .fetch_all(pool)
+        .await
+        .expect("read audit trail")
     }
 
     fn run_args(command: Command) -> Args {
@@ -240,7 +354,11 @@ mod tests {
         let prev = env::var("AUTH_DATABASE_URL").ok();
         env::remove_var("AUTH_DATABASE_URL");
 
-        let result = run(run_args(Command::AttachWallet(attach_args("u", "p")))).await;
+        let result = run(run_args(Command::AttachWallet(attach_args(
+            Uuid::new_v4(),
+            "p",
+        ))))
+        .await;
 
         match prev {
             Some(p) => env::set_var("AUTH_DATABASE_URL", p),
@@ -257,7 +375,11 @@ mod tests {
         let prev = env::var("AUTH_DATABASE_URL").ok();
         env::set_var("AUTH_DATABASE_URL", "mysql://localhost/test");
 
-        let result = run(run_args(Command::AttachWallet(attach_args("u", "p")))).await;
+        let result = run(run_args(Command::AttachWallet(attach_args(
+            Uuid::new_v4(),
+            "p",
+        ))))
+        .await;
 
         match prev {
             Some(p) => env::set_var("AUTH_DATABASE_URL", p),
@@ -274,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn attach_wallet_rejects_invalid_pubkey() {
         let (pool, _c) = start_pool().await;
-        let err = attach_wallet(&pool, attach_args("alice", "not-base58"))
+        let err = attach_wallet(&pool, "admin", attach_args(Uuid::new_v4(), "not-base58"))
             .await
             .expect_err("expected error");
         assert!(err.to_string().contains("invalid pubkey"), "got: {err}");
@@ -284,7 +406,7 @@ mod tests {
     async fn attach_wallet_rejects_unknown_user() {
         let (pool, _c) = start_pool().await;
         let pubkey = Pubkey::new_unique().to_string();
-        let err = attach_wallet(&pool, attach_args("ghost", &pubkey))
+        let err = attach_wallet(&pool, "admin", attach_args(Uuid::new_v4(), &pubkey))
             .await
             .expect_err("expected error");
         assert!(err.to_string().contains("user not found"), "got: {err}");
@@ -298,7 +420,7 @@ mod tests {
             .expect("insert user");
         let pubkey = Pubkey::new_unique().to_string();
 
-        attach_wallet(&pool, attach_args("bob", &pubkey))
+        attach_wallet(&pool, "admin", attach_args(user.id, &pubkey))
             .await
             .expect("attach should succeed");
 
@@ -307,6 +429,16 @@ mod tests {
             .expect("list wallets");
         assert_eq!(wallets.len(), 1);
         assert_eq!(wallets[0].pubkey, pubkey);
+
+        assert_eq!(
+            audit_rows(&pool).await,
+            vec![(
+                "admin".to_string(),
+                "attach_wallet".to_string(),
+                user.id,
+                pubkey
+            )]
+        );
     }
 
     #[tokio::test]
@@ -317,11 +449,11 @@ mod tests {
             .expect("insert user");
         let pubkey = Pubkey::new_unique().to_string();
 
-        attach_wallet(&pool, attach_args("carol", &pubkey))
+        attach_wallet(&pool, "admin", attach_args(user.id, &pubkey))
             .await
             .expect("first attach should succeed");
 
-        let err = attach_wallet(&pool, attach_args("carol", &pubkey))
+        let err = attach_wallet(&pool, "admin", attach_args(user.id, &pubkey))
             .await
             .expect_err("second attach should fail");
         assert!(
@@ -335,30 +467,37 @@ mod tests {
             .expect("list wallets");
         assert_eq!(wallets.len(), 1, "failed attach should not duplicate row");
         assert_eq!(wallets[0].pubkey, pubkey);
+
+        // The rolled-back attach must not leave a record of a change that never happened.
+        assert_eq!(audit_rows(&pool).await.len(), 1);
     }
 
     #[tokio::test]
     async fn set_role_promotes_user_to_operator() {
         let (pool, _c) = start_pool().await;
-        db::insert_user(&pool, "dave", "$argon2id$placeholder")
+        let user = db::insert_user(&pool, "dave", "$argon2id$placeholder")
             .await
             .expect("insert user");
 
-        set_role(
-            &pool,
-            SetRoleArgs {
-                username: "dave".into(),
-                role: RoleArg::Operator,
-            },
-        )
-        .await
-        .expect("set role should succeed");
+        set_role(&pool, "admin", set_role_args(user.id, RoleArg::Operator))
+            .await
+            .expect("set role should succeed");
 
-        let user = db::find_user_by_username(&pool, "dave")
+        let promoted = db::find_user_by_id(&pool, user.id)
             .await
             .expect("find user")
             .expect("user exists");
-        assert_eq!(user.role, private_channel_auth::models::Role::Operator);
+        assert_eq!(promoted.role, Role::Operator);
+
+        assert_eq!(
+            audit_rows(&pool).await,
+            vec![(
+                "admin".to_string(),
+                "set_role".to_string(),
+                user.id,
+                "user -> operator".to_string()
+            )]
+        );
     }
 
     #[tokio::test]
@@ -366,13 +505,12 @@ mod tests {
         let (pool, _c) = start_pool().await;
         let err = set_role(
             &pool,
-            SetRoleArgs {
-                username: "ghost".into(),
-                role: RoleArg::Operator,
-            },
+            "admin",
+            set_role_args(Uuid::new_v4(), RoleArg::Operator),
         )
         .await
         .expect_err("expected error");
         assert!(err.to_string().contains("user not found"), "got: {err}");
+        assert!(audit_rows(&pool).await.is_empty());
     }
 }

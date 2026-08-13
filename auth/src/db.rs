@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::{
@@ -73,8 +73,32 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Append-only trail of privileged administrative changes. `target_user_id` is
+    // deliberately not a foreign key: deleting a user cascades through challenges
+    // and wallets, and the record of who was granted what has to outlive the account.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS private_channel_auth.admin_audit (
+            id UUID PRIMARY KEY,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_user_id UUID NOT NULL,
+            detail TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         r#"CREATE INDEX IF NOT EXISTS idx_verified_wallets_user_id ON private_channel_auth.verified_wallets (user_id)"#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS idx_admin_audit_target_user_id ON private_channel_auth.admin_audit (target_user_id)"#,
     )
     .execute(pool)
     .await?;
@@ -88,26 +112,46 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+type UserRow = (Uuid, String, String, String, DateTime<Utc>);
+
+fn user_from_row(row: UserRow) -> User {
+    let (id, username, password_hash, role, created_at) = row;
+    User {
+        id,
+        username,
+        password_hash,
+        role: match role.as_str() {
+            "operator" => Role::Operator,
+            _ => Role::User,
+        },
+        created_at,
+    }
+}
+
 pub async fn find_user_by_username(pool: &PgPool, username: &str) -> AppResult<Option<User>> {
-    let row: Option<(Uuid, String, String, String, DateTime<Utc>)> = sqlx::query_as(
+    let row: Option<UserRow> = sqlx::query_as(
         r#"SELECT id, username, password_hash, role::text, created_at FROM private_channel_auth.users WHERE username = $1"#,
     )
     .bind(username)
     .fetch_optional(pool)
     .await?;
 
-    Ok(
-        row.map(|(id, username, password_hash, role, created_at)| User {
-            id,
-            username,
-            password_hash,
-            role: match role.as_str() {
-                "operator" => Role::Operator,
-                _ => Role::User,
-            },
-            created_at,
-        }),
+    Ok(row.map(user_from_row))
+}
+
+/// Find a user by their immutable id. Privileged administrative commands key on
+/// the id rather than the username: usernames are claimed first-come on
+/// `/auth/register`, so anyone who registers the intended operator's name first
+/// would otherwise receive the grant meant for them.
+pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<User>> {
+    let row: Option<UserRow> = sqlx::query_as(
+        r#"SELECT id, username, password_hash, role::text, created_at FROM private_channel_auth.users WHERE id = $1"#,
     )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(user_from_row))
 }
 
 pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> AppResult<User> {
@@ -133,21 +177,50 @@ pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> 
     })
 }
 
-/// Set a user's role by username. Returns `false` if no such user exists.
+/// Set a user's role by immutable id. Returns `false` if no such user exists.
 /// Takes the typed `Role` so the variant is compiler-enforced; the SQL casts
 /// the lowercase string to the postgres `user_role` enum.
-pub async fn set_user_role(pool: &PgPool, username: &str, role: Role) -> AppResult<bool> {
-    let role_str = match role {
-        Role::Operator => "operator",
-        Role::User => "user",
-    };
+///
+/// Generic over the executor so the caller can commit the change and its audit
+/// row together.
+pub async fn set_user_role<'e, E: PgExecutor<'e>>(
+    executor: E,
+    user_id: Uuid,
+    role: Role,
+) -> AppResult<bool> {
     let result =
-        sqlx::query(r#"UPDATE private_channel_auth.users SET role = $2::private_channel_auth.user_role WHERE username = $1"#)
-            .bind(username)
-            .bind(role_str)
-            .execute(pool)
+        sqlx::query(r#"UPDATE private_channel_auth.users SET role = $2::private_channel_auth.user_role WHERE id = $1"#)
+            .bind(user_id)
+            .bind(role.as_str())
+            .execute(executor)
             .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Record a privileged administrative change. Callers pass the transaction that
+/// carries the change itself, so the trail can't drift from what happened.
+pub async fn insert_admin_audit<'e, E: PgExecutor<'e>>(
+    executor: E,
+    actor: &str,
+    action: &str,
+    target_user_id: Uuid,
+    detail: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO private_channel_auth.admin_audit (id, actor, action, target_user_id, detail)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(actor)
+    .bind(action)
+    .bind(target_user_id)
+    .bind(detail)
+    .execute(executor)
+    .await?;
+
+    Ok(())
 }
 
 /// Insert a new challenge tied to this user. Expires in 10 minutes.
@@ -196,8 +269,10 @@ pub async fn consume_challenge(
     Ok(row.map(|(nonce, expires_at)| Challenge { nonce, expires_at }))
 }
 
-pub async fn insert_verified_wallet(
-    pool: &PgPool,
+/// Generic over the executor so an administrative attach can commit the wallet
+/// and its audit row together.
+pub async fn insert_verified_wallet<'e, E: PgExecutor<'e>>(
+    executor: E,
     user_id: Uuid,
     pubkey: &str,
 ) -> AppResult<VerifiedWallet> {
@@ -211,7 +286,7 @@ pub async fn insert_verified_wallet(
     .bind(Uuid::new_v4())
     .bind(user_id)
     .bind(pubkey)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(VerifiedWallet {

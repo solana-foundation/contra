@@ -4,6 +4,7 @@ pub use try_requeue_prebroadcast::RequeueOutcome;
 pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_deposit_signature;
 pub mod claim_remint_attempt;
+pub mod clear_owed_rotation_target;
 pub mod close;
 pub mod count_pending_transactions;
 pub mod delete_release_signatures;
@@ -21,6 +22,7 @@ pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
+pub mod get_owed_rotation_target;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
@@ -34,11 +36,13 @@ pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
+pub mod lowest_unreleased_withdrawal_below;
 pub mod quarantine_all_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod sender_lock;
 pub mod set_mint_extension_flags;
+pub mod set_owed_rotation_target;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
@@ -144,6 +148,38 @@ impl Storage {
         slot: u64,
     ) -> Result<(), StorageError> {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
+    }
+
+    /// Tree generation the sender owes the chain; `None` if none is owed.
+    pub async fn get_owed_rotation_target(
+        &self,
+        program_type: &str,
+    ) -> Result<Option<u64>, StorageError> {
+        get_owed_rotation_target::get_owed_rotation_target(self, program_type).await
+    }
+
+    /// Record the owed tree generation before its rotation is dispatched.
+    pub async fn set_owed_rotation_target(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), StorageError> {
+        set_owed_rotation_target::set_owed_rotation_target(self, program_type, target_tree_index)
+            .await
+    }
+
+    /// Retire the owed rotation once a chain read proved the target landed.
+    pub async fn clear_owed_rotation_target(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), StorageError> {
+        clear_owed_rotation_target::clear_owed_rotation_target(
+            self,
+            program_type,
+            target_tree_index,
+        )
+        .await
     }
 
     /// Terminal status write; `Ok(false)` if row already off Processing.
@@ -284,6 +320,16 @@ impl Storage {
 
     pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
         has_active_withdrawal_below::has_active_withdrawal_below(self, nonce).await
+    }
+
+    /// Lowest withdrawal nonce below `nonce` that still owes a release; `None` if all
+    /// lower nonces are terminal. Counts `Processing` where `has_active_withdrawal_below`
+    /// does not, so it holds on the sender's submit path across a restart.
+    pub async fn lowest_unreleased_withdrawal_below(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        lowest_unreleased_withdrawal_below::lowest_unreleased_withdrawal_below(self, nonce).await
     }
 
     /// Get completed withdrawal nonces in the given range [min_nonce, max_nonce)
@@ -1284,6 +1330,45 @@ mod tests {
             .unwrap();
         let val = storage.get_committed_checkpoint("escrow").await.unwrap();
         assert_eq!(val, Some(42));
+    }
+
+    #[tokio::test]
+    async fn dispatch_owed_rotation_target_via_mock() {
+        let (storage, _mock) = make_mock_storage();
+        assert!(storage
+            .get_owed_rotation_target("withdraw")
+            .await
+            .unwrap()
+            .is_none());
+
+        storage
+            .set_owed_rotation_target("withdraw", 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_owed_rotation_target("withdraw").await.unwrap(),
+            Some(7)
+        );
+
+        // A clear naming a different target must leave the owed one alone.
+        storage
+            .clear_owed_rotation_target("withdraw", 6)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_owed_rotation_target("withdraw").await.unwrap(),
+            Some(7)
+        );
+
+        storage
+            .clear_owed_rotation_target("withdraw", 7)
+            .await
+            .unwrap();
+        assert!(storage
+            .get_owed_rotation_target("withdraw")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

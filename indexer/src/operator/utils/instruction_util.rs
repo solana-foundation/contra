@@ -252,6 +252,32 @@ pub struct ResetSmtRootBuilderWithTarget {
     pub target_tree_index: u64,
 }
 
+impl ResetSmtRootBuilderWithTarget {
+    /// Wire the reset's accounts. One constructor for both arming paths, the
+    /// processor's boundary dispatch and the sender's re-arm from the stored target,
+    /// so an account added here can never be missed by one of them.
+    pub fn new(
+        admin_pubkey: Pubkey,
+        operator_pubkey: Pubkey,
+        instance_pda: Pubkey,
+        operator_pda: Pubkey,
+        event_authority_pda: Pubkey,
+        target_tree_index: u64,
+    ) -> Self {
+        let mut builder = ResetSmtRootBuilder::new();
+        builder
+            .payer(admin_pubkey)
+            .operator(operator_pubkey)
+            .instance(instance_pda)
+            .operator_pda(operator_pda)
+            .event_authority(event_authority_pda);
+        Self {
+            builder,
+            target_tree_index,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReleaseFundsBuilderWithNonce {
     pub builder: ReleaseFundsBuilder,

@@ -576,6 +576,175 @@ async fn checkpoint_update_higher_slot() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Settled means the nonce owes nothing on the closing tree: released, written off, or
+/// reminted back to the user.
+#[tokio::test(flavor = "multi_thread")]
+async fn lowest_unreleased_withdrawal_below_ignores_settled_statuses(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // Nonces are trigger-assigned from a sequence, so insert order fixes them: 0, 1, 2.
+    for (nonce, status) in [(0, "completed"), (1, "failed"), (2, "failed_reminted")] {
+        let row = make_db_transaction(&format!("settled_{nonce}"), TransactionType::Withdrawal);
+        let id = storage.insert_db_transaction(&row).await?;
+        sqlx::query("UPDATE transactions SET status = $1::text::transaction_status WHERE id = $2")
+            .bind(status)
+            .bind(id)
+            .execute(&pool)
+            .await?;
+    }
+
+    assert_eq!(storage.lowest_unreleased_withdrawal_below(3).await?, None);
+    Ok(())
+}
+
+/// Every live status blocks, `MIN` picks the lowest, and the boundary nonce never blocks
+/// its own rotation. The `processing` step is the one that matters most: this query counts
+/// it where `has_active_withdrawal_below` does not, which is what makes the gate hold
+/// after a restart dropped the sender's in-flight map.
+#[tokio::test(flavor = "multi_thread")]
+async fn lowest_unreleased_withdrawal_below_counts_every_live_status(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // Insert order fixes the trigger-assigned nonces 0..4.
+    let mut ids = Vec::new();
+    for nonce in 0..5 {
+        let row = make_db_transaction(&format!("live_{nonce}"), TransactionType::Withdrawal);
+        ids.push(storage.insert_db_transaction(&row).await?);
+    }
+    let set_status = |id: i64, status: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE transactions SET status = $1::text::transaction_status WHERE id = $2",
+            )
+            .bind(status)
+            .bind(id)
+            .execute(&pool)
+            .await
+        }
+    };
+
+    // Settled one at a time, so each assertion names the status that is now lowest, and
+    // the walk ends with only the processing row live.
+    set_status(ids[0], "manual_review").await?;
+    set_status(ids[1], "parked").await?;
+    set_status(ids[2], "pending_remint").await?;
+    set_status(ids[3], "processing").await?;
+    set_status(ids[4], "completed").await?;
+
+    assert_eq!(
+        storage.lowest_unreleased_withdrawal_below(5).await?,
+        Some(0),
+        "manual_review blocks and is the lowest"
+    );
+
+    set_status(ids[0], "completed").await?;
+    assert_eq!(
+        storage.lowest_unreleased_withdrawal_below(5).await?,
+        Some(1),
+        "parked blocks"
+    );
+
+    set_status(ids[1], "completed").await?;
+    assert_eq!(
+        storage.lowest_unreleased_withdrawal_below(5).await?,
+        Some(2),
+        "pending_remint blocks"
+    );
+
+    // Only the processing row is live now, which is exactly where the two queries differ.
+    set_status(ids[2], "completed").await?;
+    assert_eq!(
+        storage.lowest_unreleased_withdrawal_below(5).await?,
+        Some(3),
+        "processing blocks the sender's submit"
+    );
+    assert!(
+        !storage.has_active_withdrawal_below(5).await?,
+        "while the processor's dispatch-time query ignores it, by design"
+    );
+
+    assert_eq!(
+        storage.lowest_unreleased_withdrawal_below(3).await?,
+        None,
+        "the boundary nonce belongs to the tree being opened, so it cannot block its own rotation"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owed_rotation_target_no_row_returns_none() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    assert!(storage
+        .get_owed_rotation_target("withdraw")
+        .await?
+        .is_none());
+    Ok(())
+}
+
+/// The set must work whether or not the program's `indexer_state` row exists yet: the
+/// sender's boot re-arm reads it, so an insert that silently no-ops would drop the
+/// rotation the same way the in-memory-only arm did.
+#[tokio::test(flavor = "multi_thread")]
+async fn owed_rotation_target_set_inserts_then_updates() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage.set_owed_rotation_target("withdraw", 1).await?;
+    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(1));
+
+    // Row now exists (and carries a checkpoint), so this takes the ON CONFLICT path.
+    storage.update_committed_checkpoint("withdraw", 42).await?;
+    storage.set_owed_rotation_target("withdraw", 2).await?;
+    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(2));
+    assert_eq!(
+        storage.get_committed_checkpoint("withdraw").await?,
+        Some(42),
+        "arming a rotation must not disturb the slot cursor on the same row"
+    );
+    Ok(())
+}
+
+/// A clear names the target it proved landed. Anything else must leave the rotation
+/// owed, or a stale clear would retire a rotation that still has to happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn owed_rotation_target_clear_only_matching_target() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage.set_owed_rotation_target("withdraw", 7).await?;
+
+    storage.clear_owed_rotation_target("withdraw", 6).await?;
+    assert_eq!(
+        storage.get_owed_rotation_target("withdraw").await?,
+        Some(7),
+        "a clear for a different target must not retire the owed rotation"
+    );
+
+    storage.clear_owed_rotation_target("withdraw", 7).await?;
+    assert!(
+        storage
+            .get_owed_rotation_target("withdraw")
+            .await?
+            .is_none(),
+        "the proven target must retire"
+    );
+    Ok(())
+}
+
+/// Both roles can share a database, so each reads only its own owed rotation.
+#[tokio::test(flavor = "multi_thread")]
+async fn owed_rotation_target_is_per_program_type() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage.set_owed_rotation_target("withdraw", 3).await?;
+
+    assert!(storage.get_owed_rotation_target("escrow").await?.is_none());
+    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(3));
+    Ok(())
+}
+
 /// Monotonic guard: lower slot never overwrites a higher one.
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_update_lower_slot_is_noop() -> Result<(), Box<dyn std::error::Error>> {

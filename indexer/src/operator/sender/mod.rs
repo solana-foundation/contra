@@ -312,6 +312,9 @@ pub async fn run_sender(
     // next tick
     state.recover_pending_remints(&storage_tx).await?;
 
+    // Re-arm the tree rotation this operator still owes, if a crash left one behind.
+    state.rearm_owed_rotation().await?;
+
     // Deferred remints and the two retry queues (every 500ms)
     let mut queue_check_interval = interval(Duration::from_millis(500));
 

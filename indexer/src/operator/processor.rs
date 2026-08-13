@@ -20,9 +20,7 @@ use crate::storage::common::storage::RequeueOutcome;
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
-use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, ResetSmtRootBuilder,
-};
+use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
 use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
@@ -537,28 +535,6 @@ async fn build_release_funds(
     )))
 }
 
-/// Build the tree-rotation TransactionBuilder for a nonce landing on the
-/// MAX_TREE_LEAVES boundary (normal, non-poison path).
-fn build_scheduled_rotation(
-    admin_pubkey: Pubkey,
-    release_funds_state: &ReleaseFundsState,
-    target_tree_index: u64,
-) -> TransactionBuilder {
-    let mut rotation_builder = ResetSmtRootBuilder::new();
-    rotation_builder
-        .payer(admin_pubkey)
-        .operator(release_funds_state.operator_pubkey)
-        .instance(release_funds_state.instance_pda)
-        .operator_pda(release_funds_state.operator_pda)
-        .event_authority(release_funds_state.event_authority_pda);
-    // The target travels with the builder: the sender re-checks it against chain before
-    // every attempt, and cannot re-derive it once the boundary row is out of scope.
-    TransactionBuilder::ResetSmtRoot(Box::new(ResetSmtRootBuilderWithTarget {
-        builder: rotation_builder,
-        target_tree_index,
-    }))
-}
-
 /// Token-2022 pre-flight for a withdrawal.
 ///
 /// Returns:
@@ -695,11 +671,23 @@ pub async fn process_release_funds(
                             target_tree_index,
                             "Tree rotation boundary detected, dispatching ResetSmtRoot"
                         );
-                        let rotation_tx = build_scheduled_rotation(
-                            processor_state.admin_pubkey,
-                            release_funds_state,
-                            target_tree_index,
-                        );
+                        // Record the owed generation before dispatching. The sender's
+                        // arm is in-memory, so this row is what re-arms the rotation
+                        // after a crash; persisting first means a lost dispatch is
+                        // always recoverable, never the reverse.
+                        storage
+                            .set_owed_rotation_target(pt_label, target_tree_index)
+                            .await?;
+                        let rotation_tx = TransactionBuilder::ResetSmtRoot(Box::new(
+                            ResetSmtRootBuilderWithTarget::new(
+                                processor_state.admin_pubkey,
+                                release_funds_state.operator_pubkey,
+                                release_funds_state.instance_pda,
+                                release_funds_state.operator_pda,
+                                release_funds_state.event_authority_pda,
+                                target_tree_index,
+                            ),
+                        ));
                         send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
                             .await
                             .map_err(OperatorError::ChannelSend)?;
@@ -1369,7 +1357,7 @@ mod tests {
             fetcher_rx,
             sender_tx,
             storage_tx,
-            storage,
+            storage.clone(),
             ProgramType::Withdraw,
         )
         .await;
@@ -1384,6 +1372,21 @@ mod tests {
         // re-checking against chain, and it cannot be re-derived there.
         assert_eq!(rotation.target_tree_index, 1);
 
+        // And it is durable before the dispatch, so a crash before the reset confirms
+        // re-arms the rotation at boot instead of dropping it.
+        let Storage::Mock(mock_storage) = storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        assert_eq!(
+            mock_storage
+                .owed_rotation_targets
+                .lock()
+                .unwrap()
+                .get("withdraw")
+                .copied(),
+            Some(1)
+        );
+
         // Second message must be the ReleaseFunds for the boundary nonce itself
         let msg2 = sender_rx.recv().await.unwrap();
         let TransactionBuilder::ReleaseFunds(b) = msg2 else {
@@ -1394,6 +1397,80 @@ mod tests {
 
         // No further messages — exactly two were sent
         assert!(sender_rx.try_recv().is_err(), "unexpected third message");
+    }
+
+    /// The durable target is written before the dispatch, so if that write fails the
+    /// rotation must not be sent at all: a reset in flight with no stored target is
+    /// exactly the state a crash could drop.
+    #[tokio::test]
+    async fn process_release_funds_boundary_skips_dispatch_when_target_persist_fails() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_owed_rotation_target", true);
+        let storage = Arc::new(Storage::Mock(mock));
+
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
+        };
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        {
+            let Storage::Mock(mock_storage) = storage.as_ref() else {
+                unreachable!("mock storage")
+            };
+            mock_storage.mints.lock().unwrap().insert(
+                mint_pubkey.to_string(),
+                DbMint {
+                    mint_address: mint_pubkey.to_string(),
+                    decimals: 6,
+                    token_program: spl_token::id().to_string(),
+                    created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
+                    is_pausable: Some(false),
+                    has_permanent_delegate: Some(false),
+                },
+            );
+        }
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let txn = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(MAX_TREE_LEAVES as i64),
+            crate::storage::common::models::TransactionType::Withdrawal,
+        );
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a failed target write must surface, not proceed silently"
+        );
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "neither the rotation nor the boundary withdrawal may be dispatched"
+        );
     }
 
     /// A boundary nonce must not rotate or dispatch while a lower withdrawal is

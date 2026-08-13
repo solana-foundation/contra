@@ -4,13 +4,18 @@ use crate::error::account::AccountError;
 use crate::error::OperatorError;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
+use crate::operator::utils::instruction_util::ResetSmtRootBuilderWithTarget;
 use crate::operator::utils::smt_util::SmtState;
-use crate::operator::{parse_instance, RetryConfig, RpcClientWithRetry};
+use crate::operator::{
+    find_event_authority_pda, find_operator_pda, parse_instance, RetryConfig, RpcClientWithRetry,
+    SignerUtil,
+};
 use crate::operator::{MintCache, TransactionStatusUpdate, WithdrawalRemintInfo};
 use crate::storage::common::storage::Storage;
 use crate::storage::TransactionStatus;
 use crate::PrivateChannelIndexerConfig;
 use chrono::Utc;
+use private_channel_metrics::MetricLabel;
 use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
@@ -20,7 +25,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
@@ -557,6 +562,62 @@ impl SenderState {
         }
 
         Ok(())
+    }
+
+    /// Re-arm the rotation this operator still owes the chain, read from the durable
+    /// target the processor wrote before dispatching it. A reset carries no DB row and
+    /// no nonce, so without this a crash between arming and confirmation would drop the
+    /// only automatic rotation for that boundary.
+    ///
+    /// Arming is all this does: the rotation tick reads the chain before every attempt,
+    /// so a target the chain already reached is disarmed there without sending.
+    pub(super) async fn rearm_owed_rotation(&mut self) -> Result<(), OperatorError> {
+        // Only the withdraw role can owe a rotation: it is the only one with an escrow
+        // instance to reset, so instance_pda is None for every other role.
+        let Some(instance_pda) = self.instance_pda else {
+            return Ok(());
+        };
+
+        let Some(target_tree_index) = self
+            .storage
+            .get_owed_rotation_target(self.program_type.as_label())
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let operator_pubkey = SignerUtil::get_operator_pubkey();
+        self.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget::new(
+            SignerUtil::get_admin_pubkey(),
+            operator_pubkey,
+            instance_pda,
+            find_operator_pda(&instance_pda, &operator_pubkey),
+            find_event_authority_pda(),
+            target_tree_index,
+        )));
+
+        info!(
+            target_tree_index,
+            "Re-armed owed tree rotation from persistent storage"
+        );
+
+        Ok(())
+    }
+
+    /// Retire the rotation now that a chain read proved `target_tree_index` landed.
+    /// Clears the durable target first, then the in-memory arm.
+    ///
+    /// A failed clear is not fatal: the next boot re-arms the target, and the submit
+    /// gate's chain read disarms it again without sending anything.
+    pub(super) async fn disarm_rotation(&mut self, target_tree_index: u64) {
+        if let Err(e) = self
+            .storage
+            .clear_owed_rotation_target(self.program_type.as_label(), target_tree_index)
+            .await
+        {
+            warn!(target_tree_index, "Owed rotation clear failed: {e}");
+        }
+        self.pending_rotation = None;
     }
 }
 
@@ -1115,6 +1176,118 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "Escrow must not emit any status update for a remint row"
+        );
+    }
+
+    // ── rearm_owed_rotation ──────────────────────────────────────────
+
+    static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
+
+    /// Configure an in-memory admin signer so the rotation builder's account wiring can
+    /// resolve the process-global signers. Must run before their first access.
+    fn ensure_test_signer() {
+        INIT_TEST_SIGNER.call_once(|| {
+            let keypair = solana_sdk::signer::keypair::Keypair::new();
+            let encoded = bs58::encode(keypair.to_bytes()).into_string();
+            std::env::set_var("ADMIN_SIGNER", "memory");
+            std::env::set_var("ADMIN_PRIVATE_KEY", &encoded);
+        });
+    }
+
+    /// The finding's restart hole: a reset carries no DB row and no nonce, so a crash
+    /// between arming and confirmation dropped the only automatic rotation for the
+    /// boundary. The stored target is what puts it back.
+    #[tokio::test]
+    async fn rearm_owed_rotation_arms_from_stored_target() {
+        ensure_test_signer();
+        let target_tree_index = 3u64;
+
+        let mock = MockStorage::new();
+        let mut state = make_sender_state(mock);
+        state.instance_pda = Some(Pubkey::new_unique());
+        state
+            .storage
+            .set_owed_rotation_target(state.program_type.as_label(), target_tree_index)
+            .await
+            .unwrap();
+
+        state.rearm_owed_rotation().await.unwrap();
+
+        let rotation = state
+            .pending_rotation
+            .as_ref()
+            .expect("a stored target must re-arm the rotation");
+        assert_eq!(rotation.target_tree_index, target_tree_index);
+
+        // The re-armed builder must be a complete reset, not just a carrier for the
+        // target: the sender wires these accounts itself, from globals and the instance,
+        // so a wrong or missing one would only surface on-chain. Bind the generation the
+        // way the submit path does, which is the only field left unset here.
+        let operator_pubkey = SignerUtil::get_operator_pubkey();
+        let mut builder = rotation.builder.clone();
+        builder.expected_current_tree_index(target_tree_index - 1);
+        let accounts: Vec<Pubkey> = builder
+            .instruction()
+            .accounts
+            .iter()
+            .map(|account| account.pubkey)
+            .collect();
+        let instance_pda = state.instance_pda.unwrap();
+        for expected in [
+            SignerUtil::get_admin_pubkey(),
+            operator_pubkey,
+            instance_pda,
+            find_operator_pda(&instance_pda, &operator_pubkey),
+            find_event_authority_pda(),
+        ] {
+            assert!(
+                accounts.contains(&expected),
+                "re-armed reset is missing account {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rearm_owed_rotation_noop_without_stored_target() {
+        ensure_test_signer();
+        let mock = MockStorage::new();
+        let mut state = make_sender_state(mock);
+        state.instance_pda = Some(Pubkey::new_unique());
+
+        state.rearm_owed_rotation().await.unwrap();
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "nothing owed means nothing armed"
+        );
+    }
+
+    /// Both roles can share a database, so the escrow sender must not pick up the
+    /// withdraw operator's owed rotation. It has no instance to reset, so it must not
+    /// even read the target.
+    #[tokio::test]
+    async fn rearm_owed_rotation_noop_for_escrow_role() {
+        let mock = MockStorage::new();
+        let mut state = make_sender_state_with_role(mock, crate::config::ProgramType::Escrow);
+        state
+            .storage
+            .set_owed_rotation_target("withdraw", 3)
+            .await
+            .unwrap();
+
+        state.rearm_owed_rotation().await.unwrap();
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "Escrow must not claim the withdraw operator's rotation"
+        );
+        let Storage::Mock(mock) = state.storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        assert_eq!(
+            mock.calls("get_owed_rotation_target"),
+            0,
+            "Escrow must not even read the owed target"
         );
     }
 

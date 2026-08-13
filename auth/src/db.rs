@@ -3,7 +3,7 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{Challenge, Role, User, VerifiedWallet},
 };
 
@@ -114,6 +114,9 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 type UserRow = (Uuid, String, String, String, DateTime<Utc>);
 
+/// Unknown labels fall back to the least privileged role. Only for reading a user
+/// to authorize them — the audit path parses strictly instead, since a wrong
+/// label there records a transition that never happened.
 fn role_from_str(role: &str) -> Role {
     match role {
         "operator" => Role::Operator,
@@ -215,7 +218,14 @@ pub async fn set_user_role<'e, E: PgExecutor<'e>>(
     .fetch_optional(executor)
     .await?;
 
-    Ok(row.map(|(previous,)| role_from_str(&previous)))
+    row.map(|(previous,)| match previous.as_str() {
+        "operator" => Ok(Role::Operator),
+        "user" => Ok(Role::User),
+        other => Err(AppError::Internal(anyhow::anyhow!(
+            "unknown role {other} on user {user_id}"
+        ))),
+    })
+    .transpose()
 }
 
 /// Record a privileged administrative change. Callers pass the transaction that

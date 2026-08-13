@@ -212,8 +212,8 @@ fn confirm(user: &User, action: &str, skip: bool, input: &mut impl BufRead) -> R
     print!("type 'yes' to continue: ");
     io::stdout().flush()?;
 
-    // A closed stdin reads as end-of-input, which leaves the answer empty and
-    // aborts. Piping into the tool never grants anything by default.
+    // A closed or empty stdin reads as end-of-input, leaving the answer empty,
+    // which aborts.
     let mut answer = String::new();
     input.read_line(&mut answer)?;
 
@@ -322,10 +322,11 @@ async fn attach_wallet(
 
 #[cfg(test)]
 // `ENV_LOCK` is a synchronous Mutex held across `.await` on purpose: it
-// serializes process-global env-var mutation across async tests, so the lock
-// has to stay held for the whole `run` call that reads the vars, not just the
-// setup. An async Mutex would let another test swap the environment mid-run.
-// Clippy can't distinguish the two cases, so silence the lint module-wide.
+// serializes process-global env-var mutation, so the lock has to stay held for
+// the whole `run` call that reads the vars, not just the setup. The lint guards
+// against a std guard blocking an executor thread that other tasks need; each
+// `#[tokio::test]` here gets its own runtime with a single task, so there is no
+// other task to starve. Clippy can't see that, so silence it module-wide.
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
@@ -699,6 +700,34 @@ mod tests {
                 "answer {answer:?} must not be recorded"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn attach_wallet_grants_nothing_without_confirmation() {
+        let (pool, _c) = start_pool().await;
+        let user = db::insert_user(&pool, "frank", "$argon2id$placeholder")
+            .await
+            .expect("insert user");
+        let pubkey = Pubkey::new_unique().to_string();
+
+        attach_wallet(
+            &pool,
+            "admin",
+            AttachWalletArgs {
+                user_id: user.id,
+                pubkey,
+                yes: false,
+            },
+            &mut Cursor::new("no\n"),
+        )
+        .await
+        .expect("declining is not an error");
+
+        assert!(db::list_verified_wallets(&pool, user.id)
+            .await
+            .expect("list wallets")
+            .is_empty());
+        assert!(audit_rows(&pool).await.is_empty());
     }
 
     #[tokio::test]

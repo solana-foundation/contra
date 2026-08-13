@@ -151,7 +151,7 @@ AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p a
 
 Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). The `set-role` detail is read by the same statement that performs the update, so it records the role actually replaced.
 
-This is the trail of privileged grants — one account acting on another. Self-service wallet verification and removal are not in it; those are the account's own actions through a flow that already proves key ownership.
+This is the trail of privileged grants — one account acting on another. Self-service wallet changes are not in it: verification proves key ownership before it stores anything, and removal only ever touches the caller's own wallets.
 
 Nothing in the service updates or deletes from that table, but the CLI's database role can create tables and so could drop it. If the trail needs to survive a compromised admin credential, give the audit table its own role with `INSERT` only.
 

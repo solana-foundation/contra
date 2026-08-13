@@ -28,6 +28,29 @@ pub(crate) const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// Per-tick batch cap; leftovers are picked up next tick.
 pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 
+/// Stalled withdrawals examined in one sweep before the depth is worth a warning.
+/// Purely an observability threshold: the sweep never stops early on it.
+const RECONCILE_BACKLOG_WARN_AT: usize = 1_000;
+
+/// Wall-clock ceiling on the periodic reconcile.
+///
+/// Held below `RECOVERY_INTERVAL` so the worker still idles between ticks. The
+/// tick interval bursts on a missed deadline, so a sweep that outran it would
+/// leave the worker permanently busy and push the stale-`Processing` recovery
+/// at the top of the next tick behind it. The cursor makes stopping early cost
+/// nothing: the next sweep resumes rather than restarts.
+pub(crate) const RECONCILE_SWEEP_BUDGET: Duration = Duration::from_secs(45);
+
+/// Wall-clock ceiling on the boot pre-flight's reconcile.
+///
+/// Startup waits on this sweep, and a degraded RPC turns each row into five
+/// retries, so an unbounded pass can hold withdrawals down for the better part
+/// of an hour with nothing paged. Giving up early costs nothing in that case:
+/// an RPC that cannot classify cannot promote either, so the sweep would not
+/// have cleared the row anyway. The SMT check still runs, and a mismatch that
+/// survives is the designed refuse-to-start, which is loud and has a runbook.
+pub(crate) const BOOT_RECONCILE_BUDGET: Duration = Duration::from_secs(120);
+
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
 const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
@@ -78,6 +101,9 @@ pub async fn run_recovery_worker(
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
     let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
+    // Lives across ticks so a sweep that stops on its budget resumes where it
+    // left off, rather than rescanning the same prefix every minute.
+    let mut reconcile_cursor = 0i64;
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
@@ -92,6 +118,7 @@ pub async fn run_recovery_worker(
                     &storage_tx,
                     &cancellation_token,
                     STALE_THRESHOLD,
+                    &mut reconcile_cursor,
                 )
                 .await
                 {
@@ -111,6 +138,7 @@ async fn recover_once(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     threshold: Duration,
+    reconcile_cursor: &mut i64,
 ) -> Result<(), OperatorError> {
     // Best-effort GC of release signatures whose parent is no longer Processing;
     // a failure here must not block recovery.
@@ -163,6 +191,29 @@ async fn recover_once(
         }
         requeue_parked(storage, &row, program_type).await;
     }
+
+    // `manual_review` has no owner, so re-checking it every tick is free of
+    // contention. `pending_remint` is deliberately absent here: the sender owns
+    // those rows and may have a remint in flight, so they are reconciled once at
+    // boot, before the sender exists.
+    //
+    // Best-effort: this runs at the tail of every tick, including inside the
+    // bounded boot-reconcile loop, so propagating an error here would cost the
+    // remaining passes of Processing reconciliation over a transient DB blip.
+    if program_type == ProgramType::Withdraw {
+        if let Err(e) = reconcile_landed_withdrawals(
+            storage,
+            rpc_client,
+            TransactionStatus::ManualReview,
+            RECONCILE_SWEEP_BUDGET,
+            reconcile_cursor,
+            cancellation_token,
+        )
+        .await
+        {
+            warn!("Stalled-withdrawal reconcile failed: {}", e);
+        }
+    }
     Ok(())
 }
 
@@ -184,6 +235,227 @@ fn role_owns(program_type: ProgramType, row: &DbTransaction) -> bool {
         );
     }
     owned
+}
+
+/// Clear withdrawals stalled in `from_status` whose stored release signatures
+/// prove the release finalized on-chain.
+///
+/// Only `SigFinality::Landed` writes. Rows quarantined on a structural problem
+/// carry no signatures, are filtered out by the query, and stay for a human;
+/// rows quarantined on a transient one clear themselves once the chain catches
+/// up. That asymmetry is the whole reason this is safe to run unattended.
+///
+/// `budget` bounds the sweep in wall-clock time. The periodic worker passes
+/// `None` and runs to exhaustion: it blocks nothing, and only an exhaustive
+/// sweep guarantees a row is never permanently hidden behind rows that can
+/// never clear. The boot pre-flight passes `Some`, because it holds up startup
+/// and every row costs an RPC round trip that retries five times against a
+/// degraded endpoint.
+pub(crate) async fn reconcile_landed_withdrawals(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+    from_status: TransactionStatus,
+    budget: Duration,
+    cursor: &mut i64,
+    cancellation_token: &CancellationToken,
+) -> Result<(), OperatorError> {
+    // The ceiling has to wrap the whole sweep, not gate entry to each row. A
+    // single classification retries five times, so a deadline consulted only
+    // between rows is overrun by whatever is already in flight when it passes.
+    // Dropping the future mid-flight is safe: the sole write is one CAS
+    // statement, so it either committed or it did not.
+    match tokio::time::timeout(
+        budget,
+        reconcile_sweep(storage, rpc_client, from_status, cursor, cancellation_token),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // The cursor keeps its position, so the next sweep resumes here
+            // instead of rescanning the prefix that just used up the budget.
+            warn!(
+                resume_after_id = *cursor,
+                ?from_status,
+                "Reconcile sweep hit its time budget; remainder deferred to the next sweep"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The sweep itself. Split out so the caller can impose a hard wall-clock
+/// ceiling on it as a whole.
+async fn reconcile_sweep(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+    from_status: TransactionStatus,
+    cursor: &mut i64,
+    cancellation_token: &CancellationToken,
+) -> Result<(), OperatorError> {
+    let outcome_label = match from_status {
+        TransactionStatus::ManualReview => "manual_review_cleared",
+        TransactionStatus::PendingRemint => "pending_remint_cleared",
+        other => {
+            warn!(
+                ?other,
+                "Stalled-withdrawal reconcile called with an unsupported status"
+            );
+            return Ok(());
+        }
+    };
+
+    // Page forward by id from wherever the last sweep stopped.
+    //
+    // There is no row-count cap. Rows that do not classify are left untouched by
+    // design, so nothing drains this set on its own; a cap paired with a cursor
+    // that restarts at zero would rescan the same prefix forever and hide every
+    // row behind it, including a landed release still wedging the boot gate.
+    // The time ceiling bounds the work instead, and the cursor is what keeps
+    // that bound from turning into a permanent blind spot.
+    let mut scanned = 0usize;
+    loop {
+        let batch = storage
+            .get_stalled_withdrawals_with_signatures(from_status, *cursor, RECOVERY_BATCH_LIMIT)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        debug!(
+            count = batch.len(),
+            after_id = *cursor,
+            ?from_status,
+            "Reconcile sweep found stalled withdrawals with stored signatures"
+        );
+        let exhausted = batch.len() < RECOVERY_BATCH_LIMIT as usize;
+        scanned += batch.len();
+
+        for row in batch {
+            if cancellation_token.is_cancelled() {
+                info!("Reconcile sweep cancelled; remaining stalled rows deferred");
+                return Ok(());
+            }
+            // Advances even when a row is skipped, which is what stops an
+            // unclearable row from being re-fetched ahead of everything else.
+            *cursor = row.id;
+            // The query is withdrawal-only, so this is the same belt-and-braces gate
+            // the other sweeps use: never classify a row against the wrong chain.
+            if !role_owns(ProgramType::Withdraw, &row) {
+                continue;
+            }
+            let Some(pending) = row_pending_sigs(&row) else {
+                continue;
+            };
+            let SigFinality::Landed(signature) =
+                classify_release_signatures(rpc_client, &pending).await
+            else {
+                continue;
+            };
+            promote_stalled_row(storage, &row, from_status, outcome_label, signature).await;
+        }
+
+        if exhausted {
+            break;
+        }
+    }
+
+    // Reaching the end means every row was seen, so the next sweep starts over
+    // and picks up whatever stalled in the meantime.
+    *cursor = 0;
+
+    // A backlog this deep is an incident of its own: every row in it is a
+    // withdrawal that failed and could not be resolved, and each costs an RPC
+    // round trip per sweep. Surface it rather than let the cost stay invisible.
+    if scanned >= RECONCILE_BACKLOG_WARN_AT {
+        warn!(
+            scanned,
+            ?from_status,
+            "Reconcile sweep examined an unusually deep stalled-withdrawal backlog"
+        );
+    }
+    Ok(())
+}
+
+/// Parse a stalled row's stored signatures into `PendingSig`s. Corrupt or
+/// misaligned columns yield `None` so the row is skipped rather than promoted.
+fn row_pending_sigs(row: &DbTransaction) -> Option<Vec<PendingSig>> {
+    let sigs = row.remint_signatures.as_ref()?;
+    let heights = row.remint_last_valid_block_heights.as_ref()?;
+    if sigs.len() != heights.len() {
+        warn!(
+            transaction_id = row.id,
+            "Stalled withdrawal has mismatched signature and block-height columns; skipping"
+        );
+        return None;
+    }
+    let mut pending = Vec::with_capacity(sigs.len());
+    for (sig_str, lvbh) in sigs.iter().zip(heights) {
+        let signature = match Signature::from_str(sig_str) {
+            Ok(signature) => signature,
+            Err(e) => {
+                warn!(
+                    transaction_id = row.id,
+                    "Stalled withdrawal has a malformed stored signature {sig_str}: {e}"
+                );
+                return None;
+            }
+        };
+        // A negative height is corrupt, not a very large one; casting would
+        // wrap it into a height no chain ever reaches.
+        let Ok(last_valid_block_height) = u64::try_from(*lvbh) else {
+            warn!(
+                transaction_id = row.id,
+                "Stalled withdrawal has a negative stored block height {lvbh}; skipping"
+            );
+            return None;
+        };
+        pending.push(PendingSig {
+            signature,
+            last_valid_block_height,
+        });
+    }
+    Some(pending)
+}
+
+/// CAS a proven-landed stalled row to `Completed`, then log and count it.
+async fn promote_stalled_row(
+    storage: &Storage,
+    row: &DbTransaction,
+    from_status: TransactionStatus,
+    outcome_label: &str,
+    signature: Signature,
+) {
+    let signature = signature.to_string();
+    match storage
+        .try_complete_stalled_withdrawal(
+            row.id,
+            row.updated_at,
+            from_status,
+            Some(signature.clone()),
+        )
+        .await
+    {
+        // Loud on purpose: a status that means "a human decided this needs
+        // eyes" just cleared itself, and the on-call should see why.
+        Ok(true) => {
+            warn!(
+                transaction_id = row.id,
+                ?from_status,
+                signature,
+                "Reconcile promoted a stalled withdrawal to Completed on finalized on-chain proof"
+            );
+            // Both call sites gate on the withdraw operator, so the
+            // program-type label is fixed rather than threaded through.
+            OPERATOR_STALE_PROCESSING_RECOVERED
+                .with_label_values(&[pt_label(ProgramType::Withdraw), outcome_label, "withdrawal"])
+                .inc();
+        }
+        Ok(false) => debug!(
+            id = row.id,
+            "reconcile skipped, another writer touched the row first"
+        ),
+        Err(e) => warn!(id = row.id, "reconcile write error: {}", e),
+    }
 }
 
 async fn decide_action(
@@ -324,6 +596,34 @@ async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>
     Ok(pending)
 }
 
+/// Split a row's journalled release signatures into the two parallel arrays the
+/// quarantine CAS stores. The inner `(None, None)` means there was nothing worth
+/// recording, which leaves the columns untouched.
+///
+/// An outer `None` means the read failed and the caller must defer. Quarantining
+/// blind is irreversible: the journal is GC'd as soon as the row leaves
+/// `Processing`, so a transient read error would otherwise destroy the row's only
+/// evidence and make it permanently unreconcilable.
+async fn stored_release_signatures(
+    storage: &Storage,
+    id: i64,
+) -> Option<(Option<Vec<String>>, Option<Vec<i64>>)> {
+    match storage.get_release_signatures(id).await {
+        Ok(stored) if stored.is_empty() => Some((None, None)),
+        Ok(stored) => {
+            let (sigs, heights): (Vec<String>, Vec<i64>) = stored.into_iter().unzip();
+            Some((Some(sigs), Some(heights)))
+        }
+        Err(e) => {
+            warn!(
+                id,
+                "deferring quarantine, release signature read failed: {}", e
+            );
+            None
+        }
+    }
+}
+
 fn pt_label(program_type: ProgramType) -> &'static str {
     match program_type {
         ProgramType::Escrow => "escrow",
@@ -422,9 +722,22 @@ async fn route_outcome(
             );
         }
         RecoveryAction::Quarantine { reason } => {
+            // The journal these came from is GC'd as soon as the row leaves
+            // Processing, so a quarantined withdrawal keeps its own copy or the
+            // evidence is gone before anything can re-check it.
+            let (sigs, heights) = match row.transaction_type {
+                TransactionType::Withdrawal => {
+                    match stored_release_signatures(storage, row.id).await {
+                        Some(columns) => columns,
+                        // Retry next tick rather than spend the row's evidence.
+                        None => return,
+                    }
+                }
+                TransactionType::Deposit => (None, None),
+            };
             // Noisy by design — page on uncertainty, never silently demote.
             match storage
-                .try_quarantine_processing(row.id, captured_updated_at)
+                .try_quarantine_processing(row.id, captured_updated_at, sigs, heights)
                 .await
             {
                 Ok(true) => {
@@ -485,6 +798,7 @@ pub async fn boot_reconcile_processing(
     cancellation_token: &CancellationToken,
     max_passes: u32,
 ) -> Result<(), OperatorError> {
+    let mut reconcile_cursor = 0i64;
     for pass in 0..max_passes {
         recover_once(
             storage,
@@ -493,6 +807,7 @@ pub async fn boot_reconcile_processing(
             storage_tx,
             cancellation_token,
             Duration::ZERO,
+            &mut reconcile_cursor,
         )
         .await?;
 
@@ -543,6 +858,27 @@ pub mod test_hooks {
             storage_tx,
             &token,
             STALE_THRESHOLD,
+            &mut 0,
+        )
+        .await
+    }
+
+    /// Drive one stalled-withdrawal reconcile pass, exactly as the boot
+    /// pre-flight does for `PendingRemint` and the periodic tick does for
+    /// `ManualReview`.
+    pub async fn reconcile_stalled_withdrawals_once(
+        storage: &Storage,
+        rpc_client: &RpcClientWithRetry,
+        from_status: TransactionStatus,
+    ) -> Result<(), OperatorError> {
+        let token = CancellationToken::new();
+        reconcile_landed_withdrawals(
+            storage,
+            rpc_client,
+            from_status,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &token,
         )
         .await
     }
@@ -1062,6 +1398,542 @@ mod tests {
         );
     }
 
+    /// A quarantined withdrawal must keep its release signatures on the row,
+    /// because the journal they came from is GC'd on the next sweep. Deposits
+    /// have no such reader, so their columns stay untouched.
+    #[tokio::test]
+    async fn quarantine_persists_release_signatures_for_withdrawals_only() {
+        let mock = MockStorage::new();
+        let mut withdrawal = make_withdrawal_row(10, Some(5));
+        withdrawal.status = TransactionStatus::Processing;
+        let mut deposit = make_deposit_row(11);
+        deposit.status = TransactionStatus::Processing;
+        let w_captured = seed_processing_row(&mock, withdrawal.clone()).await;
+        let d_captured = seed_processing_row(&mock, deposit.clone()).await;
+        let w_sig = Signature::new_unique().to_string();
+        mock.insert_release_signature(withdrawal.id, w_sig.clone(), 4242)
+            .await
+            .unwrap();
+        mock.insert_release_signature(deposit.id, Signature::new_unique().to_string(), 99)
+            .await
+            .unwrap();
+
+        let storage = Storage::Mock(mock.clone());
+        let (storage_tx, _rx) = mpsc::channel(8);
+        for (row, captured) in [(&withdrawal, w_captured), (&deposit, d_captured)] {
+            route_outcome(
+                &storage,
+                row,
+                captured,
+                RecoveryAction::Quarantine {
+                    reason: "could not verify release landed (rpc down)".to_string(),
+                },
+                ProgramType::Withdraw,
+                &storage_tx,
+            )
+            .await;
+        }
+
+        let after = mock.pending_transactions.lock().unwrap();
+        let stored = after.iter().find(|t| t.id == withdrawal.id).unwrap();
+        assert_eq!(stored.status, TransactionStatus::ManualReview);
+        assert_eq!(stored.remint_signatures.as_deref(), Some(&[w_sig][..]));
+        assert_eq!(
+            stored.remint_last_valid_block_heights.as_deref(),
+            Some(&[4242i64][..])
+        );
+
+        let deposit_row = after.iter().find(|t| t.id == deposit.id).unwrap();
+        assert_eq!(deposit_row.status, TransactionStatus::ManualReview);
+        assert!(
+            deposit_row.remint_signatures.is_none()
+                && deposit_row.remint_last_valid_block_heights.is_none(),
+            "the deposit path must not start writing withdrawal remint columns"
+        );
+    }
+
+    // ── stalled-withdrawal reconcile ─────────────────────────────────
+
+    /// A withdrawal stalled in `status` with its release signatures on the row.
+    fn stalled_withdrawal(id: i64, status: TransactionStatus, sigs: &[String]) -> DbTransaction {
+        let mut row = make_withdrawal_row(id, Some(id));
+        row.status = status;
+        row.remint_last_valid_block_heights = Some(vec![100; sigs.len()]);
+        row.remint_signatures = Some(sigs.to_vec());
+        row
+    }
+
+    /// A backlog of rows that can never classify must not hide the rows behind
+    /// it, at any depth. Nothing writes to them, so they stay in the set for
+    /// good and the cursor restarts at zero every sweep; a per-sweep cap would
+    /// leave the landed row below permanently unreachable.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_pages_past_a_backlog_larger_than_any_batch_budget() {
+        let landed_sig = Signature::new_unique().to_string();
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+
+        let mock = MockStorage::new();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            // Well past ten batches of RECOVERY_BATCH_LIMIT. Each parses to
+            // nothing, so it is fetched, skipped, and never costs an RPC.
+            for id in 1..=1_200 {
+                db.push(stalled_withdrawal(
+                    id,
+                    TransactionStatus::ManualReview,
+                    &["not-a-signature".to_string()],
+                ));
+            }
+            db.push(stalled_withdrawal(
+                9_999,
+                TransactionStatus::ManualReview,
+                std::slice::from_ref(&landed_sig),
+            ));
+        }
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        let target = after.iter().find(|t| t.id == 9_999).unwrap();
+        assert_eq!(
+            target.status,
+            TransactionStatus::Completed,
+            "the landed row must be reached however deep the unclearable backlog is"
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|t| t.id <= 1_200)
+                .all(|t| t.status == TransactionStatus::ManualReview),
+            "rows that cannot classify stay exactly where they are"
+        );
+    }
+
+    /// Startup waits on the boot sweep, so a backlog it cannot get through must
+    /// hand control back rather than hold withdrawals down. The SMT check after
+    /// it is what decides whether the operator may start.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_returns_when_the_boot_budget_is_spent() {
+        let mut server = mockito::Server::new_async().await;
+        // Every classification stalls, so the budget expires before the backlog does.
+        let _slow = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_chunked_body(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(())
+            })
+            .expect_at_least(1)
+            .create();
+
+        let mock = MockStorage::new();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            for id in 1..=200 {
+                db.push(stalled_withdrawal(
+                    id,
+                    TransactionStatus::PendingRemint,
+                    &[Signature::new_unique().to_string()],
+                ));
+            }
+        }
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        let started = std::time::Instant::now();
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::PendingRemint,
+            Duration::from_millis(150),
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        // The ceiling must hold even though a classification is mid-retry when it
+        // passes: a deadline consulted only between rows would overshoot by the
+        // whole in-flight retry chain, which is what the wrapping timeout stops.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the boot sweep must return on its budget even mid-retry, took {:?}",
+            started.elapsed()
+        );
+        let after = mock.pending_transactions.lock().unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|t| t.status == TransactionStatus::PendingRemint),
+            "giving up on time must never promote a row"
+        );
+    }
+
+    /// A sweep that stops on its budget must resume, not restart. Without a
+    /// cursor that survives the call, every sweep would rescan the same prefix
+    /// and the rows behind it would never be reached.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_cursor_resumes_after_a_spent_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let _slow = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_chunked_body(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(())
+            })
+            .expect_at_least(1)
+            .create();
+
+        let mock = MockStorage::new();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            for id in 1..=200 {
+                db.push(stalled_withdrawal(
+                    id,
+                    TransactionStatus::ManualReview,
+                    &[Signature::new_unique().to_string()],
+                ));
+            }
+        }
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let mut cursor = 0i64;
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            Duration::from_millis(200),
+            &mut cursor,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            cursor > 0,
+            "a sweep stopped by its budget must leave the cursor where it got to"
+        );
+        let first_stop = cursor;
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            Duration::from_millis(200),
+            &mut cursor,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            cursor > first_stop,
+            "the next sweep must carry on past {first_stop}, not restart at zero"
+        );
+    }
+
+    fn cleared_metric(outcome: &str) -> f64 {
+        OPERATOR_STALE_PROCESSING_RECOVERED
+            .with_label_values(&["withdraw", outcome, "withdrawal"])
+            .get()
+    }
+
+    /// Mock a finalized-but-failed `getSignatureStatuses`, the only shape that
+    /// classifies `Dead` without a block-height round trip.
+    fn mock_finalized_failure(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .create()
+    }
+
+    /// Proven-landed evidence promotes the row and records the landed signature.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_promotes_manual_review_on_finalized_success() {
+        let landed_sig = Signature::new_unique().to_string();
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+
+        let mock = MockStorage::new();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(stalled_withdrawal(
+                1,
+                TransactionStatus::ManualReview,
+                std::slice::from_ref(&landed_sig),
+            ));
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let before = cleared_metric("manual_review_cleared");
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(after[0].status, TransactionStatus::Completed);
+        assert_eq!(
+            after[0].counterpart_signature.as_deref(),
+            Some(landed_sig.as_str())
+        );
+        assert_eq!(
+            cleared_metric("manual_review_cleared"),
+            before + 1.0,
+            "a cleared row must be visible as its own metric series"
+        );
+    }
+
+    /// Seed one stalled row, serve `setup`'s RPC shape, and assert nothing moved.
+    async fn assert_not_promoted(
+        label: &str,
+        setup: impl FnOnce(&mut mockito::ServerGuard) -> Vec<mockito::Mock>,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let _mocks = setup(&mut server);
+
+        let mock = MockStorage::new();
+        let row = stalled_withdrawal(
+            1,
+            TransactionStatus::ManualReview,
+            &[Signature::new_unique().to_string()],
+        );
+        let seeded_updated_at = row.updated_at;
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let before = cleared_metric("manual_review_cleared");
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::ManualReview,
+            "{label}: only proven-landed evidence may clear a quarantine"
+        );
+        assert_eq!(
+            after[0].updated_at, seeded_updated_at,
+            "{label}: a non-landed verdict must not write to the row at all"
+        );
+        assert_eq!(
+            cleared_metric("manual_review_cleared"),
+            before,
+            "{label}: no write means no metric"
+        );
+    }
+
+    /// The load-bearing safety property: everything short of proof is a no-op.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_leaves_row_on_every_non_landed_verdict() {
+        // Live: no status entry yet and the blockhash has not expired.
+        assert_not_promoted("live", |server| {
+            vec![mock_null_status(server), mock_block_height(server, 0)]
+        })
+        .await;
+        assert_not_promoted("dead", |server| vec![mock_finalized_failure(server)]).await;
+        assert_not_promoted("uncertain", |server| {
+            vec![server
+                .mock("POST", "/")
+                .with_status(500)
+                .with_body("internal server error")
+                .create()]
+        })
+        .await;
+    }
+
+    /// Corrupt evidence must be inert: no panic, no RPC, and no promotion.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_skips_unparseable_stored_signature() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
+            )
+            .expect(0)
+            .create();
+
+        let mock = MockStorage::new();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(stalled_withdrawal(
+                1,
+                TransactionStatus::ManualReview,
+                &["not-a-valid-base58-signature".to_string()],
+            ));
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::ManualReview
+        );
+        status.assert();
+    }
+
+    /// A negative stored block height cannot be a real one, so the row is
+    /// skipped rather than sign-wrapped into a height no chain will reach.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_skips_negative_block_height() {
+        let mut server = mockito::Server::new_async().await;
+        let status = mock_finalized_status(&mut server).expect(0);
+
+        let mock = MockStorage::new();
+        let mut row = stalled_withdrawal(
+            1,
+            TransactionStatus::ManualReview,
+            &[Signature::new_unique().to_string()],
+        );
+        row.remint_last_valid_block_heights = Some(vec![-1]);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &client,
+            TransactionStatus::ManualReview,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::ManualReview
+        );
+        status.assert();
+    }
+
+    /// The sweep runs at the tail of every tick, including inside the bounded
+    /// boot-reconcile loop. A failure there must not abort the tick and cost
+    /// the remaining passes of Processing reconciliation.
+    #[tokio::test]
+    async fn recover_once_tolerates_reconcile_query_failure() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("get_stalled_withdrawals_with_signatures", true);
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        let result = recover_once(
+            &storage,
+            &client,
+            ProgramType::Withdraw,
+            &storage_tx,
+            &CancellationToken::new(),
+            Duration::ZERO,
+            &mut 0,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a reconcile query failure must not abort the tick: {result:?}"
+        );
+    }
+
+    /// Quarantining without the evidence is irreversible: the journal is GC'd
+    /// on the next tick, so the row could never be auto-reconciled again.
+    /// A read failure must defer the quarantine, not spend the row's evidence.
+    #[tokio::test]
+    async fn quarantine_defers_when_release_signature_read_fails() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(12, Some(6));
+        row.status = TransactionStatus::Processing;
+        let captured = seed_processing_row(&mock, row.clone()).await;
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        mock.set_should_fail("get_release_signatures", true);
+        let storage = Storage::Mock(mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        route_outcome(
+            &storage,
+            &row,
+            captured,
+            RecoveryAction::Quarantine {
+                reason: "could not verify release landed (rpc down)".to_string(),
+            },
+            ProgramType::Withdraw,
+            &storage_tx,
+        )
+        .await;
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Processing,
+            "the row must stay Processing so the next tick can retry with evidence"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a deferred quarantine must not fire the manual-review alert"
+        );
+    }
+
     // ── parked sweep ─────────────────────────────────────────────────
 
     /// A stale Parked row (orphaned by a restart) is requeued to Pending so the
@@ -1433,6 +2305,7 @@ mod tests {
             &storage_tx,
             &CancellationToken::new(),
             Duration::ZERO,
+            &mut 0,
         )
         .await
         .unwrap();

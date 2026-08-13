@@ -20,6 +20,7 @@ pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
+pub mod get_stalled_withdrawals_with_signatures;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
@@ -32,6 +33,7 @@ pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
+pub mod try_complete_stalled_withdrawal;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
@@ -391,6 +393,20 @@ impl Storage {
         .await
     }
 
+    /// Withdrawals stalled in `status` that still carry stored release
+    /// signatures, oldest-first. Rows with no usable evidence are excluded.
+    pub async fn get_stalled_withdrawals_with_signatures(
+        &self,
+        status: TransactionStatus,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_stalled_withdrawals_with_signatures::get_stalled_withdrawals_with_signatures(
+            self, status, after_id, limit,
+        )
+        .await
+    }
+
     /// CAS `Parked` → `Pending` on `updated_at`; `Ok(false)` if stale.
     pub async fn try_requeue_parked(
         &self,
@@ -416,16 +432,41 @@ impl Storage {
         .await
     }
 
+    /// CAS a stalled withdrawal (`ManualReview` or `PendingRemint`) to
+    /// `Completed` on `updated_at`; `Ok(false)` if stale or guard-rejected.
+    pub async fn try_complete_stalled_withdrawal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        try_complete_stalled_withdrawal::try_complete_stalled_withdrawal(
+            self,
+            transaction_id,
+            expected_updated_at,
+            from_status,
+            counterpart_signature,
+        )
+        .await
+    }
+
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    /// The optional signature arrays are recorded on the row in the same write;
+    /// `None` leaves both columns untouched.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, StorageError> {
         try_quarantine_processing::try_quarantine_processing(
             self,
             transaction_id,
             expected_updated_at,
+            remint_signatures,
+            remint_last_valid_block_heights,
         )
         .await
     }
@@ -1433,5 +1474,59 @@ mod tests {
         assert_eq!(poison.status, TransactionStatus::Processing);
         let sibling = rows.iter().find(|t| t.id == 43).unwrap();
         assert_eq!(sibling.status, TransactionStatus::ManualReview);
+    }
+
+    /// The mock must reject exactly what the SQL rejects, otherwise every
+    /// mock-backed test of the reconcile sweep rests on a filter that does not
+    /// exist in production.
+    #[tokio::test]
+    async fn stalled_withdrawal_query_filters_match_sql() {
+        let (storage, mock) = make_mock_storage();
+        let stalled = |id: i64, sigs: Option<Vec<String>>| {
+            let mut row = make_db_transaction();
+            row.id = id;
+            row.transaction_type = TransactionType::Withdrawal;
+            row.status = TransactionStatus::ManualReview;
+            row.withdrawal_nonce = Some(id);
+            row.remint_last_valid_block_heights = sigs.as_ref().map(|s| vec![0i64; s.len()]);
+            row.remint_signatures = sigs;
+            row
+        };
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(stalled(1, Some(vec!["sig-a".to_string()])));
+
+            let mut wrong_status = stalled(2, Some(vec!["sig-b".to_string()]));
+            wrong_status.status = TransactionStatus::PendingRemint;
+            db.push(wrong_status);
+
+            let mut deposit = stalled(3, Some(vec!["sig-c".to_string()]));
+            deposit.transaction_type = TransactionType::Deposit;
+            db.push(deposit);
+
+            let mut no_nonce = stalled(4, Some(vec!["sig-d".to_string()]));
+            no_nonce.withdrawal_nonce = None;
+            db.push(no_nonce);
+
+            db.push(stalled(5, Some(Vec::new())));
+            db.push(stalled(6, None));
+
+            // Reachable on a database upgraded between the two column
+            // migrations: signatures present, heights never backfilled.
+            let mut no_heights = stalled(7, Some(vec!["sig-e".to_string()]));
+            no_heights.remint_last_valid_block_heights = None;
+            db.push(no_heights);
+        }
+
+        let found = storage
+            .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1],
+            "only the row with a usable signature set may be returned"
+        );
     }
 }

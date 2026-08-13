@@ -278,6 +278,7 @@ pub fn init_labels(program_type: &str) {
         "status_poll_rpc_error",
         "rotation_not_landed",
         "rotation_gate_unavailable",
+        "rotation_blocked_by_lower_nonce",
         "reset_tree_already_advanced",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);

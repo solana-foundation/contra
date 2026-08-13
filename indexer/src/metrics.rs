@@ -179,6 +179,11 @@ counter_vec!(
 // stuck-row recovery worker.  `outcome` ∈ {completed, requeued, quarantined};
 // `type` ∈ {deposit, withdrawal}.  All values 0 in steady state — any
 // sustained nonzero is concrete evidence of operator crash-window activity.
+//
+// The same counter also reports withdrawals cleared out of a stalled status by
+// the reconcile sweep: `manual_review_cleared` and `pending_remint_cleared`.
+// Those two are withdrawal-only, and each one means a row that had stopped
+// moving was proven landed on-chain and promoted to Completed.
 counter_vec!(
     OPERATOR_STALE_PROCESSING_RECOVERED,
     "private_channel_operator_stale_processing_recovered_total",
@@ -267,6 +272,16 @@ pub fn init_labels(program_type: &str) {
                 txn_type,
             ]);
         }
+    }
+
+    // Stalled-row clears exist only on the withdraw side; pairing them with
+    // `deposit` would register a series that can never increment.
+    for outcome in &["manual_review_cleared", "pending_remint_cleared"] {
+        OPERATOR_STALE_PROCESSING_RECOVERED.with_label_values(&[
+            program_type,
+            outcome,
+            "withdrawal",
+        ]);
     }
 }
 

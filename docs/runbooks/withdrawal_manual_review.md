@@ -225,6 +225,23 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > appended). Both land here in Path C — verify on-chain and act on the
 > verdict; never blindly re-arm a row whose release may already be on-chain.
 
+> **Some Path C rows resolve themselves; check before you act.** The
+> quarantine now copies the broadcast signatures onto the row
+> (`remint_signatures`), and every recovery tick plus each operator boot
+> re-classifies them. A row quarantined with `could not verify release
+> landed (...)` was quarantined because the RPC was unreachable, not because
+> the release failed, so once the RPC catches up that row promotes itself to
+> `completed` with the landed signature. A row quarantined with `no broadcast
+> signatures recorded ...` has nothing to re-check and will never self-clear.
+> Re-read the row's status before starting the steps below: if it is already
+> `completed`, the sweep resolved the bookkeeping and the alert can be closed
+> against that signature. One caveat: if the row reached `manual_review` by way
+> of `pending_remint`, the running sender had already dropped that nonce from
+> its in-memory SMT, and the promotion does not put it back. That sender keeps
+> proving against a tree the chain disagrees with until it is restarted, so if
+> withdrawals stopped completing, restart the withdraw operator - it will now
+> pass the boot check rather than refuse to start.
+
 1. **Verify on-chain.** Run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). This is
    the entire decision.

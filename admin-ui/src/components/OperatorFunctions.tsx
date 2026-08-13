@@ -158,6 +158,39 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
       }
       const bitmapHeader = getWithdrawalBitmapDecoder().decode(bitmapBytes);
 
+      // Bits start after the fixed header; capacity comes from the account so a
+      // shorter test-sized bitmap counts correctly too.
+      const BITS_OFFSET = 10;
+      const capacity = (bitmapBytes.length - BITS_OFFSET) * 8;
+      let released = 0;
+      for (let i = BITS_OFFSET; i < bitmapBytes.length; i++) {
+        let byte = bitmapBytes[i];
+        while (byte) {
+          released += byte & 1;
+          byte >>= 1;
+        }
+      }
+      const unreleased = capacity - released;
+
+      // Rotating clears every bit, so a nonce still unreleased in this generation
+      // can never be released afterwards, and a refund still waiting on one of
+      // these bits loses the only proof of whether that user was already paid.
+      // This page cannot see those waiting refunds, so the operator has to be the
+      // one to confirm the window is safe to clear.
+      if (unreleased > 0) {
+        const proceed = window.confirm(
+          `${unreleased} of ${capacity} nonces in generation ${bitmapHeader.generation} have not been released.\n\n` +
+            'Rotating now clears every bit and advances the generation. Those nonces can never be released afterwards, ' +
+            'and any refund still waiting on one of these bits loses the only proof of whether that user was already paid.\n\n' +
+            'This page cannot see refunds waiting inside the operator. Confirm with the operator before continuing.\n\n' +
+            'Rotate anyway?'
+        );
+        if (!proceed) {
+          setError('Rotation cancelled: the current generation still has unreleased nonces.');
+          return;
+        }
+      }
+
       const instruction = await getRotateBitmapInstructionAsync({
         payer: transactionSigner,
         operator: transactionSigner,

@@ -10,7 +10,7 @@ use {
     sqlx::postgres::PgPoolOptions,
     std::{
         env,
-        io::{self, Write},
+        io::{self, BufRead, Write},
         str::FromStr,
     },
     tracing::{error, info},
@@ -47,10 +47,15 @@ enum Command {
 }
 
 #[derive(Parser, Debug)]
+#[group(required = true, multiple = false)]
 struct ShowUserArgs {
+    /// Id to look up, to confirm an id reported out of band against the account
+    #[arg(long)]
+    user_id: Option<Uuid>,
+
     /// Username to resolve to an id
     #[arg(long)]
-    username: String,
+    username: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -133,9 +138,39 @@ async fn run(args: Args) -> Result<()> {
         return Err(anyhow!("AUTH_DATABASE_URL must be a PostgreSQL URL"));
     }
 
+    // The actor is resolved before connecting so a missing one fails without the
+    // tool having touched the database.
+    match args.command {
+        Command::ShowUser(args) => show_user(&connect(&database_url).await?, args).await?,
+        Command::AttachWallet(args) => {
+            let actor = admin_actor()?;
+            attach_wallet(
+                &connect(&database_url).await?,
+                &actor,
+                args,
+                &mut io::stdin().lock(),
+            )
+            .await?
+        }
+        Command::SetRole(args) => {
+            let actor = admin_actor()?;
+            set_role(
+                &connect(&database_url).await?,
+                &actor,
+                args,
+                &mut io::stdin().lock(),
+            )
+            .await?
+        }
+    }
+
+    Ok(())
+}
+
+async fn connect(database_url: &str) -> Result<sqlx::PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&database_url)
+        .connect(database_url)
         .await
         .map_err(|e| anyhow!("Failed to connect to auth DB: {}", e))?;
 
@@ -143,13 +178,7 @@ async fn run(args: Args) -> Result<()> {
     // service hasn't yet restarted onto a schema carrying `admin_audit`.
     db::init_schema(&pool).await?;
 
-    match args.command {
-        Command::ShowUser(args) => show_user(&pool, args).await?,
-        Command::AttachWallet(args) => attach_wallet(&pool, &admin_actor()?, args).await?,
-        Command::SetRole(args) => set_role(&pool, &admin_actor()?, args).await?,
-    }
-
-    Ok(())
+    Ok(pool)
 }
 
 /// Names the person running the command in the audit trail. Required rather than
@@ -173,7 +202,7 @@ fn print_user(user: &User) {
 /// fields an administrator matches against what the account owner reported out of
 /// band, so a grant lands on the person it was meant for and not on whoever
 /// registered the name first.
-fn confirm(user: &User, action: &str, skip: bool) -> Result<bool> {
+fn confirm(user: &User, action: &str, skip: bool, input: &mut impl BufRead) -> Result<bool> {
     if skip {
         return Ok(true);
     }
@@ -183,42 +212,55 @@ fn confirm(user: &User, action: &str, skip: bool) -> Result<bool> {
     print!("type 'yes' to continue: ");
     io::stdout().flush()?;
 
+    // A closed stdin reads as end-of-input, which leaves the answer empty and
+    // aborts. Piping into the tool never grants anything by default.
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
+    input.read_line(&mut answer)?;
 
     Ok(answer.trim() == "yes")
 }
 
 async fn show_user(pool: &sqlx::PgPool, args: ShowUserArgs) -> Result<()> {
-    let user = db::find_user_by_username(pool, &args.username)
-        .await?
-        .ok_or_else(|| anyhow!("user not found: {}", args.username))?;
+    let user = match (args.user_id, &args.username) {
+        (Some(user_id), _) => db::find_user_by_id(pool, user_id)
+            .await?
+            .ok_or_else(|| anyhow!("user not found: {user_id}"))?,
+        (None, Some(username)) => db::find_user_by_username(pool, username)
+            .await?
+            .ok_or_else(|| anyhow!("user not found: {username}"))?,
+        // clap's argument group requires exactly one of the two.
+        (None, None) => return Err(anyhow!("one of --user-id or --username is required")),
+    };
 
     print_user(&user);
 
     Ok(())
 }
 
-async fn set_role(pool: &sqlx::PgPool, actor: &str, args: SetRoleArgs) -> Result<()> {
+async fn set_role(
+    pool: &sqlx::PgPool,
+    actor: &str,
+    args: SetRoleArgs,
+    input: &mut impl BufRead,
+) -> Result<()> {
     let user = db::find_user_by_id(pool, args.user_id)
         .await?
         .ok_or_else(|| anyhow!("user not found: {}", args.user_id))?;
 
     let role = args.role.to_model();
     let role_str = role.as_str();
-    if !confirm(&user, &format!("set role to {role_str}"), args.yes)? {
+    if !confirm(&user, &format!("set role to {role_str}"), args.yes, input)? {
         println!("aborted");
         return Ok(());
     }
 
-    // Both ends of the transition, so a real promotion is distinguishable from a
-    // command that changed nothing.
-    let detail = format!("{} -> {role_str}", user.role.as_str());
-
     let mut tx = pool.begin().await?;
-    if !db::set_user_role(&mut *tx, user.id, role).await? {
-        return Err(anyhow!("user not found: {}", args.user_id));
-    }
+    // Both ends of the transition, taken from the statement that performed it, so
+    // a real promotion is distinguishable from a command that changed nothing.
+    let previous = db::set_user_role(&mut *tx, user.id, role)
+        .await?
+        .ok_or_else(|| anyhow!("user not found: {}", args.user_id))?;
+    let detail = format!("{} -> {role_str}", previous.as_str());
     db::insert_admin_audit(&mut *tx, actor, "set_role", user.id, &detail).await?;
     tx.commit().await?;
 
@@ -228,7 +270,12 @@ async fn set_role(pool: &sqlx::PgPool, actor: &str, args: SetRoleArgs) -> Result
     Ok(())
 }
 
-async fn attach_wallet(pool: &sqlx::PgPool, actor: &str, args: AttachWalletArgs) -> Result<()> {
+async fn attach_wallet(
+    pool: &sqlx::PgPool,
+    actor: &str,
+    args: AttachWalletArgs,
+    input: &mut impl BufRead,
+) -> Result<()> {
     let pubkey = Pubkey::from_str(&args.pubkey)
         .map_err(|_| anyhow!("invalid pubkey: {}", args.pubkey))?
         .to_string();
@@ -237,7 +284,7 @@ async fn attach_wallet(pool: &sqlx::PgPool, actor: &str, args: AttachWalletArgs)
         .await?
         .ok_or_else(|| anyhow!("user not found: {}", args.user_id))?;
 
-    if !confirm(&user, &format!("attach wallet {pubkey}"), args.yes)? {
+    if !confirm(&user, &format!("attach wallet {pubkey}"), args.yes, input)? {
         println!("aborted");
         return Ok(());
     }
@@ -275,22 +322,22 @@ async fn attach_wallet(pool: &sqlx::PgPool, actor: &str, args: AttachWalletArgs)
 
 #[cfg(test)]
 // `ENV_LOCK` is a synchronous Mutex held across `.await` on purpose: it
-// serializes process-global env-var mutation across async tests. An async
-// Mutex would defeat the point — the lock window must include the spawned
-// child process's read of the env var, not just the in-test setup. Clippy
-// can't distinguish the two cases, so silence the lint module-wide.
+// serializes process-global env-var mutation across async tests, so the lock
+// has to stay held for the whole `run` call that reads the vars, not just the
+// setup. An async Mutex would let another test swap the environment mid-run.
+// Clippy can't distinguish the two cases, so silence the lint module-wide.
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use solana_sdk::pubkey::Pubkey;
     use sqlx::PgPool;
-    use std::sync::Mutex;
+    use std::{io::Cursor, sync::Mutex};
     use testcontainers::{runners::AsyncRunner, ContainerAsync};
     use testcontainers_modules::postgres::Postgres;
 
-    // env::set_var / remove_var mutate process-global state. The two `run` tests
-    // touch AUTH_DATABASE_URL — serialize them so they don't race when the
-    // surrounding test runner schedules them in parallel.
+    // env::set_var / remove_var mutate process-global state. The `run` tests
+    // touch AUTH_DATABASE_URL and AUTH_ADMIN_ACTOR — serialize them so they don't
+    // race when the surrounding test runner schedules them in parallel.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     async fn start_pool() -> (PgPool, ContainerAsync<Postgres>) {
@@ -313,8 +360,15 @@ mod tests {
         (pool, container)
     }
 
-    // Every test drives the commands non-interactively; the confirmation prompt
-    // reads stdin, which no test has.
+    fn restore(key: &str, prev: Option<String>) {
+        match prev {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+
+    // Most tests drive the commands non-interactively. The ones covering the
+    // prompt build their args inline with `yes: false` and feed a reader.
     fn attach_args(user_id: Uuid, pubkey: &str) -> AttachWalletArgs {
         AttachWalletArgs {
             user_id,
@@ -333,7 +387,7 @@ mod tests {
 
     async fn audit_rows(pool: &PgPool) -> Vec<(String, String, Uuid, String)> {
         sqlx::query_as(
-            r#"SELECT actor, action, target_user_id, detail FROM private_channel_auth.admin_audit"#,
+            r#"SELECT actor, action, target_user_id, detail FROM private_channel_auth.admin_audit ORDER BY created_at"#,
         )
         .fetch_all(pool)
         .await
@@ -360,10 +414,7 @@ mod tests {
         ))))
         .await;
 
-        match prev {
-            Some(p) => env::set_var("AUTH_DATABASE_URL", p),
-            None => env::remove_var("AUTH_DATABASE_URL"),
-        }
+        restore("AUTH_DATABASE_URL", prev);
 
         let err = result.expect_err("expected error");
         assert!(err.to_string().contains("is not set"), "got: {err}");
@@ -381,10 +432,7 @@ mod tests {
         ))))
         .await;
 
-        match prev {
-            Some(p) => env::set_var("AUTH_DATABASE_URL", p),
-            None => env::remove_var("AUTH_DATABASE_URL"),
-        }
+        restore("AUTH_DATABASE_URL", prev);
 
         let err = result.expect_err("expected error");
         assert!(
@@ -393,12 +441,75 @@ mod tests {
         );
     }
 
+    /// A missing actor has to fail before the tool connects, so it can't run DDL
+    /// against the auth database and only then refuse the command.
+    #[tokio::test]
+    async fn run_rejects_missing_admin_actor() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_url = env::var("AUTH_DATABASE_URL").ok();
+        let prev_actor = env::var("AUTH_ADMIN_ACTOR").ok();
+        // Unroutable on purpose: reaching the connect step at all is a failure.
+        env::set_var(
+            "AUTH_DATABASE_URL",
+            "postgres://auth:pw@240.0.0.1:5432/auth",
+        );
+        env::remove_var("AUTH_ADMIN_ACTOR");
+
+        let result = run(run_args(Command::SetRole(set_role_args(
+            Uuid::new_v4(),
+            RoleArg::Operator,
+        ))))
+        .await;
+
+        restore("AUTH_DATABASE_URL", prev_url);
+        restore("AUTH_ADMIN_ACTOR", prev_actor);
+
+        let err = result.expect_err("expected error");
+        assert!(
+            err.to_string().contains("AUTH_ADMIN_ACTOR is not set"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_rejects_blank_admin_actor() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev_url = env::var("AUTH_DATABASE_URL").ok();
+        let prev_actor = env::var("AUTH_ADMIN_ACTOR").ok();
+        env::set_var(
+            "AUTH_DATABASE_URL",
+            "postgres://auth:pw@240.0.0.1:5432/auth",
+        );
+        env::set_var("AUTH_ADMIN_ACTOR", "   ");
+
+        let result = run(run_args(Command::SetRole(set_role_args(
+            Uuid::new_v4(),
+            RoleArg::Operator,
+        ))))
+        .await;
+
+        restore("AUTH_DATABASE_URL", prev_url);
+        restore("AUTH_ADMIN_ACTOR", prev_actor);
+
+        let err = result.expect_err("expected error");
+        assert!(
+            err.to_string()
+                .contains("AUTH_ADMIN_ACTOR must not be empty"),
+            "got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn attach_wallet_rejects_invalid_pubkey() {
         let (pool, _c) = start_pool().await;
-        let err = attach_wallet(&pool, "admin", attach_args(Uuid::new_v4(), "not-base58"))
-            .await
-            .expect_err("expected error");
+        let err = attach_wallet(
+            &pool,
+            "admin",
+            attach_args(Uuid::new_v4(), "not-base58"),
+            &mut io::empty(),
+        )
+        .await
+        .expect_err("expected error");
         assert!(err.to_string().contains("invalid pubkey"), "got: {err}");
     }
 
@@ -406,9 +517,14 @@ mod tests {
     async fn attach_wallet_rejects_unknown_user() {
         let (pool, _c) = start_pool().await;
         let pubkey = Pubkey::new_unique().to_string();
-        let err = attach_wallet(&pool, "admin", attach_args(Uuid::new_v4(), &pubkey))
-            .await
-            .expect_err("expected error");
+        let err = attach_wallet(
+            &pool,
+            "admin",
+            attach_args(Uuid::new_v4(), &pubkey),
+            &mut io::empty(),
+        )
+        .await
+        .expect_err("expected error");
         assert!(err.to_string().contains("user not found"), "got: {err}");
     }
 
@@ -420,9 +536,14 @@ mod tests {
             .expect("insert user");
         let pubkey = Pubkey::new_unique().to_string();
 
-        attach_wallet(&pool, "admin", attach_args(user.id, &pubkey))
-            .await
-            .expect("attach should succeed");
+        attach_wallet(
+            &pool,
+            "admin",
+            attach_args(user.id, &pubkey),
+            &mut io::empty(),
+        )
+        .await
+        .expect("attach should succeed");
 
         let wallets = db::list_verified_wallets(&pool, user.id)
             .await
@@ -449,13 +570,23 @@ mod tests {
             .expect("insert user");
         let pubkey = Pubkey::new_unique().to_string();
 
-        attach_wallet(&pool, "admin", attach_args(user.id, &pubkey))
-            .await
-            .expect("first attach should succeed");
+        attach_wallet(
+            &pool,
+            "admin",
+            attach_args(user.id, &pubkey),
+            &mut io::empty(),
+        )
+        .await
+        .expect("first attach should succeed");
 
-        let err = attach_wallet(&pool, "admin", attach_args(user.id, &pubkey))
-            .await
-            .expect_err("second attach should fail");
+        let err = attach_wallet(
+            &pool,
+            "admin",
+            attach_args(user.id, &pubkey),
+            &mut io::empty(),
+        )
+        .await
+        .expect_err("second attach should fail");
         assert!(
             err.to_string().contains("is already attached"),
             "got: {err}"
@@ -472,16 +603,23 @@ mod tests {
         assert_eq!(audit_rows(&pool).await.len(), 1);
     }
 
+    /// Both directions, because the audit detail claims to record the role the
+    /// change replaced — not just the one it assigned.
     #[tokio::test]
-    async fn set_role_promotes_user_to_operator() {
+    async fn set_role_records_each_transition() {
         let (pool, _c) = start_pool().await;
         let user = db::insert_user(&pool, "dave", "$argon2id$placeholder")
             .await
             .expect("insert user");
 
-        set_role(&pool, "admin", set_role_args(user.id, RoleArg::Operator))
-            .await
-            .expect("set role should succeed");
+        set_role(
+            &pool,
+            "admin",
+            set_role_args(user.id, RoleArg::Operator),
+            &mut io::empty(),
+        )
+        .await
+        .expect("promotion should succeed");
 
         let promoted = db::find_user_by_id(&pool, user.id)
             .await
@@ -489,15 +627,78 @@ mod tests {
             .expect("user exists");
         assert_eq!(promoted.role, Role::Operator);
 
+        set_role(
+            &pool,
+            "admin",
+            set_role_args(user.id, RoleArg::User),
+            &mut io::empty(),
+        )
+        .await
+        .expect("demotion should succeed");
+
+        let demoted = db::find_user_by_id(&pool, user.id)
+            .await
+            .expect("find user")
+            .expect("user exists");
+        assert_eq!(demoted.role, Role::User);
+
         assert_eq!(
             audit_rows(&pool).await,
-            vec![(
-                "admin".to_string(),
-                "set_role".to_string(),
-                user.id,
-                "user -> operator".to_string()
-            )]
+            vec![
+                (
+                    "admin".to_string(),
+                    "set_role".to_string(),
+                    user.id,
+                    "user -> operator".to_string()
+                ),
+                (
+                    "admin".to_string(),
+                    "set_role".to_string(),
+                    user.id,
+                    "operator -> user".to_string()
+                ),
+            ]
         );
+    }
+
+    /// The prompt is the control that keeps a grant from landing on the wrong
+    /// account, so anything other than `yes` — including a closed stdin — has to
+    /// leave both the role and the trail alone.
+    #[tokio::test]
+    async fn set_role_grants_nothing_without_confirmation() {
+        let (pool, _c) = start_pool().await;
+        let user = db::insert_user(&pool, "erin", "$argon2id$placeholder")
+            .await
+            .expect("insert user");
+
+        for answer in ["no\n", "y\n", ""] {
+            set_role(
+                &pool,
+                "admin",
+                SetRoleArgs {
+                    user_id: user.id,
+                    role: RoleArg::Operator,
+                    yes: false,
+                },
+                &mut Cursor::new(answer),
+            )
+            .await
+            .expect("declining is not an error");
+
+            let unchanged = db::find_user_by_id(&pool, user.id)
+                .await
+                .expect("find user")
+                .expect("user exists");
+            assert_eq!(
+                unchanged.role,
+                Role::User,
+                "answer {answer:?} must not promote"
+            );
+            assert!(
+                audit_rows(&pool).await.is_empty(),
+                "answer {answer:?} must not be recorded"
+            );
+        }
     }
 
     #[tokio::test]
@@ -507,6 +708,7 @@ mod tests {
             &pool,
             "admin",
             set_role_args(Uuid::new_v4(), RoleArg::Operator),
+            &mut io::empty(),
         )
         .await
         .expect_err("expected error");

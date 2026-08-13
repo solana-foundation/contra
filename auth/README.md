@@ -125,11 +125,13 @@ Both mutating commands print the target's id, username, current role and creatio
 
 ### Provisioning flow
 
-Ask the account owner for their user id out of band — the registration response and the JWT `sub` claim both carry it. Confirm it against the account before granting anything:
+Ask the account owner for their user id out of band — the registration response and the JWT `sub` claim both carry it. Look that id up and check the username and creation time match the account you mean to grant:
 
 ```bash
-AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin auth-admin -- show-user --username alice
+AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin auth-admin -- show-user --user-id <uuid>
 ```
+
+Do not go the other way. `show-user --username alice` resolves a name to whoever holds it, which answers "is this name taken" but not "is this the person" — deriving the id from a name reintroduces exactly the confusion the id-based commands exist to prevent.
 
 ### Set a user's role
 
@@ -147,7 +149,11 @@ AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p a
 
 ### Audit trail
 
-Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). Nothing in the service updates or deletes from that table.
+Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). The `set-role` detail is read by the same statement that performs the update, so it records the role actually replaced.
+
+This is the trail of privileged grants — one account acting on another. Self-service wallet verification and removal are not in it; those are the account's own actions through a flow that already proves key ownership.
+
+Nothing in the service updates or deletes from that table, but the CLI's database role can create tables and so could drop it. If the trail needs to survive a compromised admin credential, give the audit table its own role with `INSERT` only.
 
 ```sql
 SELECT * FROM private_channel_auth.admin_audit ORDER BY created_at DESC;

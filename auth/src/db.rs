@@ -114,16 +114,20 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 type UserRow = (Uuid, String, String, String, DateTime<Utc>);
 
+fn role_from_str(role: &str) -> Role {
+    match role {
+        "operator" => Role::Operator,
+        _ => Role::User,
+    }
+}
+
 fn user_from_row(row: UserRow) -> User {
     let (id, username, password_hash, role, created_at) = row;
     User {
         id,
         username,
         password_hash,
-        role: match role.as_str() {
-            "operator" => Role::Operator,
-            _ => Role::User,
-        },
+        role: role_from_str(&role),
         created_at,
     }
 }
@@ -177,9 +181,15 @@ pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> 
     })
 }
 
-/// Set a user's role by immutable id. Returns `false` if no such user exists.
-/// Takes the typed `Role` so the variant is compiler-enforced; the SQL casts
-/// the lowercase string to the postgres `user_role` enum.
+/// Set a user's role by immutable id. Returns the role the user held before, or
+/// `None` if no such user exists. Takes the typed `Role` so the variant is
+/// compiler-enforced; the SQL casts the lowercase string to the postgres
+/// `user_role` enum.
+///
+/// The CTE takes the row lock before reading, so the returned previous role is
+/// the one this statement actually replaced rather than a value some concurrent
+/// change had already overwritten. Callers record it, so a stale read would put
+/// a transition in the audit trail that never happened.
 ///
 /// Generic over the executor so the caller can commit the change and its audit
 /// row together.
@@ -187,14 +197,25 @@ pub async fn set_user_role<'e, E: PgExecutor<'e>>(
     executor: E,
     user_id: Uuid,
     role: Role,
-) -> AppResult<bool> {
-    let result =
-        sqlx::query(r#"UPDATE private_channel_auth.users SET role = $2::private_channel_auth.user_role WHERE id = $1"#)
-            .bind(user_id)
-            .bind(role.as_str())
-            .execute(executor)
-            .await?;
-    Ok(result.rows_affected() > 0)
+) -> AppResult<Option<Role>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        WITH locked AS (
+            SELECT id, role FROM private_channel_auth.users WHERE id = $1 FOR UPDATE
+        )
+        UPDATE private_channel_auth.users u
+        SET role = $2::private_channel_auth.user_role
+        FROM locked
+        WHERE u.id = locked.id
+        RETURNING locked.role::text
+        "#,
+    )
+    .bind(user_id)
+    .bind(role.as_str())
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row.map(|(previous,)| role_from_str(&previous)))
 }
 
 /// Record a privileged administrative change. Callers pass the transaction that

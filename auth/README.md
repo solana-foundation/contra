@@ -11,6 +11,19 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
+| `AUTH_ARGON2_MAX_CONCURRENCY` | `4` | Concurrent Argon2 hashes. Hashing is CPU-bound, so past the core count this costs memory without adding throughput. |
+| `AUTH_RATE_LIMIT_PER_SECOND` | `5` | Sustained per-IP request rate for `/auth/register` and `/auth/login`. |
+| `AUTH_RATE_LIMIT_BURST` | `10` | Burst allowance above the sustained per-IP rate. |
+| `AUTH_USERNAME_ATTEMPTS_PER_MINUTE` | `5` | Credential attempts per minute against a single username, across all IPs. |
+
+The credential routes run Argon2, which is deliberately CPU and memory heavy. They are
+rate limited per IP and per username, capped at `AUTH_ARGON2_MAX_CONCURRENCY` concurrent
+hashes, and limited to a 4 KB request body. Over-budget requests get `429`; requests that
+wait too long for a hashing slot get `503`.
+
+Because the per-IP limit keys on the peer address, the service must be reached directly.
+Putting it behind a proxy without forwarding the client address would bucket every user
+into the proxy's IP.
 
 ## API
 
@@ -26,7 +39,7 @@ Create a new account. All users are registered with the `user` role.
 
 Username requirements: 5–32 characters, alphanumeric plus underscores and hyphens only.
 
-Password requirements: 6–72 characters (Argon2's input limit — inputs beyond 72 bytes are silently truncated, so longer passwords are rejected outright).
+Password requirements: 6–128 characters. The cap is measured in characters, not bytes.
 
 Returns the created user. Passwords are hashed with Argon2 and never returned.
 
@@ -40,7 +53,7 @@ Authenticate and receive a signed JWT (valid for 24 hours).
 { "username": "alice", "password": "hunter2" }
 ```
 
-Returns `{ "token": "<jwt>" }`. Both wrong username and wrong password return `401` to prevent username enumeration.
+Returns `{ "token": "<jwt>" }`. Both wrong username and wrong password return `401` to prevent username enumeration. Credentials over the length caps also return `401` rather than a validation error, so the response surface stays uniform.
 
 ---
 

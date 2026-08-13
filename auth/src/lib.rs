@@ -3,12 +3,16 @@ pub mod db;
 pub mod error;
 pub mod jwt;
 pub mod models;
+pub mod password;
 pub mod pool_status;
 pub mod routes;
+pub mod throttle;
+pub mod validation;
 
 use axum::{
-    extract::{FromRequestParts, State},
+    extract::{DefaultBodyLimit, FromRequestParts, State},
     http::{request::Parts, HeaderValue, Method, StatusCode},
+    middleware,
     routing::{delete, get, post},
     Json, Router,
 };
@@ -17,13 +21,21 @@ use std::sync::Arc;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use jwt::{Claims, JwtConfig};
+use password::PasswordWorker;
 use pool_status::PoolStatus;
+use throttle::AuthThrottle;
+
+/// Body cap for the credential routes, sized to the username and password
+/// limits plus JSON overhead. The rest of the router keeps axum's default.
+const CREDENTIAL_BODY_LIMIT: usize = 4096;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub jwt: Arc<JwtConfig>,
     pub pool_status: Arc<PoolStatus>,
+    pub passwords: PasswordWorker,
+    pub throttle: Arc<AuthThrottle>,
 }
 
 // Extract and validate JWT from the Authorization header for any route that declares `claims: Claims`.
@@ -90,9 +102,20 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
             axum::http::header::AUTHORIZATION,
         ]));
 
-    Router::new()
+    // The credential routes are the expensive unauthenticated surface: each one
+    // runs Argon2. They get the throttle and a tight body limit; the throttle
+    // is layered last so it runs before the body is read.
+    let credentials = Router::new()
         .route("/auth/register", post(routes::register::register))
         .route("/auth/login", post(routes::login::login))
+        .layer(DefaultBodyLimit::max(CREDENTIAL_BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            throttle::per_ip,
+        ));
+
+    Router::new()
+        .merge(credentials)
         .route("/auth/challenge-wallet", post(routes::challenge::challenge))
         .route(
             "/auth/verify-wallet",

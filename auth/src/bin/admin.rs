@@ -174,11 +174,26 @@ async fn connect(database_url: &str) -> Result<sqlx::PgPool> {
         .await
         .map_err(|e| anyhow!("Failed to connect to auth DB: {}", e))?;
 
-    // Idempotent, and it keeps the tool usable against a database whose auth
-    // service hasn't yet restarted onto a schema carrying `admin_audit`.
-    db::init_schema(&pool).await?;
+    ensure_schema(&pool).await?;
 
     Ok(pool)
+}
+
+/// Create the schema only when it is actually missing, which keeps the tool
+/// usable against a database whose auth service hasn't yet restarted onto a
+/// schema carrying `admin_audit`. Running the DDL unconditionally would mean a
+/// least-privilege admin role couldn't so much as look a user up.
+async fn ensure_schema(pool: &sqlx::PgPool) -> Result<()> {
+    let (initialized,): (bool,) =
+        sqlx::query_as(r#"SELECT to_regclass('private_channel_auth.admin_audit') IS NOT NULL"#)
+            .fetch_one(pool)
+            .await?;
+
+    if !initialized {
+        db::init_schema(pool).await?;
+    }
+
+    Ok(())
 }
 
 /// Names the person running the command in the audit trail. Required rather than
@@ -700,6 +715,39 @@ mod tests {
                 "answer {answer:?} must not be recorded"
             );
         }
+    }
+
+    /// Runs on every command, so a role without CREATE rights — the
+    /// least-privilege deployment — has to get through an initialized database.
+    #[tokio::test]
+    async fn ensure_schema_skips_ddl_when_already_initialized() {
+        let (pool, container) = start_pool().await;
+        sqlx::query("CREATE ROLE restricted LOGIN PASSWORD 'password'")
+            .execute(&pool)
+            .await
+            .expect("create role");
+        sqlx::query("GRANT USAGE ON SCHEMA private_channel_auth TO restricted")
+            .execute(&pool)
+            .await
+            .expect("grant usage");
+
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let restricted = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!(
+                "postgres://restricted:password@{host}:{port}/auth_test"
+            ))
+            .await
+            .expect("connect as restricted");
+
+        // Precondition: the role really can't run the DDL that was previously
+        // unconditional, so the assertion below isn't vacuous.
+        db::init_schema(&restricted)
+            .await
+            .expect_err("restricted must lack DDL rights");
+
+        ensure_schema(&restricted).await.expect("must not run DDL");
     }
 
     #[tokio::test]

@@ -153,7 +153,7 @@ Every role change and administrative wallet attach writes a row to `private_chan
 
 This is the trail of privileged grants — one account acting on another. Self-service wallet changes are not in it: verification proves key ownership before it stores anything, and removal only ever touches the caller's own wallets.
 
-Nothing in the service updates or deletes from that table, but the CLI's database role can create tables and so could drop it. If the trail needs to survive a compromised admin credential, give the audit table its own role with `INSERT` only.
+Nothing in the service updates or deletes from that table. The CLI only runs DDL when the schema is missing, so it works under a role with no create rights; if the trail needs to survive a compromised admin credential, that role should also have `INSERT` but not `UPDATE`/`DELETE` on the audit table.
 
 ```sql
 SELECT * FROM private_channel_auth.admin_audit ORDER BY created_at DESC;

@@ -1,20 +1,17 @@
 use crate::config::ProgramType;
 use crate::operator::utils::instruction_util::{
-    ExtraErrorCheckPolicy, MintToBuilder, ReleaseFundsBuilderWithNonce, RetryPolicy,
-    WithdrawalRemintInfo,
+    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, WithdrawalRemintInfo,
 };
+use crate::operator::MintCache;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
-use crate::{operator::utils::smt_util::SmtState, operator::MintCache};
 use chrono::{DateTime, Utc};
-use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, ResetSmtRootBuilder,
-};
+use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -104,9 +101,9 @@ pub struct TransactionStatusUpdate {
 /// tick via a single `getSignatureStatuses` RPC call.  Decoupling send from confirm
 /// allows the sender to process new transactions while waiting for on-chain confirmation.
 ///
-/// Only Mint and InitializeMint are eligible — ReleaseFunds and ResetSmtRoot still use
-/// the blocking `send_and_confirm` path because SMT proof ordering makes concurrent
-/// in-flight withdrawals unsafe.
+/// Only Mint and InitializeMint are eligible. ReleaseFunds and RotateBitmap still use
+/// the blocking `send_and_confirm` path so that at most one withdrawal is in flight
+/// when a rotation is waiting to clear the bits.
 pub struct InFlightTx {
     /// Signature returned by `sendTransaction`. Used as the polling key.
     pub signature: Signature,
@@ -143,7 +140,7 @@ pub struct InFlightTx {
     pub permit: OwnedSemaphorePermit,
 }
 
-/// Sender state tracking SMT and pending transactions
+/// Sender state tracking in-flight work and deferred remints
 pub struct SenderState {
     pub rpc_client: Arc<RpcClientWithRetry>,
     /// Source chain RPC: PrivateChannel for the withdraw operator, where the
@@ -152,24 +149,37 @@ pub struct SenderState {
     pub source_rpc_client: Arc<RpcClientWithRetry>,
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
-    pub smt_state: Option<SenderSMTState>,
+    /// Withdrawal nonces broadcast but not yet settled. The rotation barrier reads
+    /// this: clearing the bits while a release is in flight would let its nonce be
+    /// replayed in the next generation.
+    pub in_flight_withdrawals: HashSet<u64>,
+    /// The generation the bitmap was last known to be on, or `None` for unknown.
+    ///
+    /// Only ever written from a value the chain itself reported, so it can lag
+    /// the chain but never lead it. It is trusted only when it permits a send;
+    /// every refusal is taken against a fresh read instead, which is what keeps
+    /// a stale entry from stranding a releasable withdrawal.
+    pub cached_generation: Option<u64>,
     pub retry_counts: HashMap<u64, u32>,
+    /// Sender-level attempts for retryable transactions that carry no nonce,
+    /// keyed by transaction id. A rotation has neither, so every rotation shares
+    /// the `None` counter; the sender sends them one at a time and clears the
+    /// count when one settles, so they cannot shorten each other's budget.
+    pub nonceless_retry_counts: HashMap<Option<i64>, u32>,
     pub mint_builders: HashMap<i64, MintToBuilder>,
     pub mint_cache: MintCache,
     pub retry_max_attempts: u32,
     /// Milliseconds between `getSignatureStatuses` polls. Populated from `OperatorConfig`.
     pub confirmation_poll_interval_ms: u64,
-    pub rotation_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
-    /// Withdrawals parked because an unresolved PendingRemint nonce in the same
-    /// tree could leave the local SMT out of sync with chain. Drained each tick
-    /// after process_pending_remints. Stores the full builder so remint_info
-    /// travels with the parked withdrawal.
-    pub ambiguous_retry_queue: Vec<Box<ReleaseFundsBuilderWithNonce>>,
-    /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
-    pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,
+    /// Withdrawals the program refused because their generation had not opened
+    /// yet. The instruction is kept whole rather than the builder: nothing in it
+    /// depends on the generation, so a rotation makes the same bytes valid.
+    pub rotation_retry_queue: Vec<(TransactionContext, InstructionWithSigners)>,
+    /// Pending RotateBitmap transaction waiting for in-flight txs to settle
+    pub pending_rotation: Option<Box<RotateBitmapBuilder>>,
     pub program_type: ProgramType,
     /// Cached remint info for withdrawal transactions, keyed by nonce.
-    /// Extracted before cleanup_failed_transaction removes builder from SMT cache.
+    /// Extracted before cleanup_failed_transaction drops the nonce's caches.
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
     /// Signatures sent per withdrawal nonce (with lvbh), used for finality checks before reminting.
     pub pending_signatures: HashMap<u64, Vec<PendingSig>>,
@@ -208,6 +218,13 @@ pub struct PendingRemint {
     pub deadline: DateTime<Utc>,
     /// Number of times the finality check has been retried (e.g. due to RPC errors).
     pub finality_check_attempts: u32,
+    /// Set when the program itself refused this nonce's release.
+    ///
+    /// That refusal is direct proof no payout occurred, and the only evidence
+    /// that outlives a rotation. It is persisted with the entry and restored
+    /// with it, so a restart inside the finality window still lets the refund
+    /// go through instead of falling back to manual review.
+    pub release_refused_on_chain: bool,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.
@@ -228,11 +245,6 @@ pub enum PollTaskResult {
         Box<InFlightTx>,
         Option<solana_transaction_status::TransactionStatus>,
     ),
-}
-
-pub struct SenderSMTState {
-    pub smt_state: SmtState,
-    pub nonce_to_builder: HashMap<u64, (TransactionContext, ReleaseFundsBuilder)>,
 }
 
 #[derive(Clone)]

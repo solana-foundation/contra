@@ -1,0 +1,265 @@
+//! One place to build a `SenderState` for tests.
+//!
+//! Building it in one place keeps a new field from meaning a dozen edited call
+//! sites.
+
+use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
+use crate::config::ProgramType;
+use crate::operator::utils::account_util::bitmap_account_bytes;
+use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
+use crate::operator::MintCache;
+use crate::storage::common::amount::TokenAmount;
+use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+use crate::storage::common::storage::mock::MockStorage;
+use crate::storage::Storage;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+
+/// A `SenderState` pointed at `rpc_url`, with mock storage and no instance.
+pub(super) fn sender_state(rpc_url: &str) -> SenderState {
+    sender_state_with_storage(rpc_url, MockStorage::new())
+}
+
+/// Same, but with a caller-prepared `MockStorage` so a test can seed rows or
+/// arm a simulated failure before the state is built.
+pub(super) fn sender_state_with_storage(rpc_url: &str, mock: MockStorage) -> SenderState {
+    let storage = Arc::new(Storage::Mock(mock));
+    // One attempt with negligible backoff: tests that expect an RPC failure
+    // should not pay the production retry schedule for it.
+    let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
+        rpc_url.to_string(),
+        RetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        },
+        CommitmentConfig::confirmed(),
+    ));
+
+    SenderState {
+        rpc_client: rpc_client.clone(),
+        source_rpc_client: rpc_client,
+        storage: storage.clone(),
+        instance_pda: None,
+        in_flight_withdrawals: HashSet::new(),
+        cached_generation: None,
+        retry_counts: HashMap::new(),
+        nonceless_retry_counts: HashMap::new(),
+        mint_builders: HashMap::new(),
+        mint_cache: MintCache::new(storage),
+        retry_max_attempts: 3,
+        confirmation_poll_interval_ms: 1,
+        rotation_retry_queue: Vec::new(),
+        pending_rotation: None,
+        program_type: ProgramType::Escrow,
+        remint_cache: HashMap::new(),
+        pending_signatures: HashMap::new(),
+        pending_remints: Vec::new(),
+        in_flight: InFlightQueue::new(),
+        semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+    }
+}
+
+/// A mock holding one `Processing` withdrawal row, which is the state every
+/// release the sender may park or unpark starts from.
+pub(super) fn mock_with_processing_row(transaction_id: i64) -> MockStorage {
+    let mock = MockStorage::new();
+    push_processing_row(&mock, transaction_id);
+    mock
+}
+
+/// Add another `Processing` withdrawal row to an existing mock.
+pub(super) fn push_processing_row(mock: &MockStorage, transaction_id: i64) {
+    mock.pending_transactions
+        .lock()
+        .unwrap()
+        .push(withdrawal_row(
+            transaction_id,
+            TransactionStatus::Processing,
+        ));
+}
+
+/// A mock holding one already-`Parked` withdrawal row, the state the drain
+/// expects to find when it comes back for a queued release.
+pub(super) fn mock_with_parked_row(transaction_id: i64) -> MockStorage {
+    let mock = MockStorage::new();
+    mock.pending_transactions
+        .lock()
+        .unwrap()
+        .push(withdrawal_row(transaction_id, TransactionStatus::Parked));
+    mock
+}
+
+/// The status of `transaction_id` in `mock`, or `None` if it holds no such row.
+pub(super) fn row_status(mock: &MockStorage, transaction_id: i64) -> Option<TransactionStatus> {
+    mock.pending_transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|txn| txn.id == transaction_id)
+        .map(|txn| txn.status)
+}
+
+/// When `transaction_id` was last written, which is what the park heartbeat
+/// refreshes and the recovery sweep ages out.
+pub(super) fn row_updated_at(
+    mock: &MockStorage,
+    transaction_id: i64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    mock.pending_transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|txn| txn.id == transaction_id)
+        .map(|txn| txn.updated_at)
+}
+
+fn withdrawal_row(id: i64, status: TransactionStatus) -> DbTransaction {
+    let now = chrono::Utc::now();
+    DbTransaction {
+        id,
+        signature: format!("sig-{id}"),
+        instruction_index: 0,
+        trace_id: format!("trace-{id}"),
+        slot: 100,
+        initiator: Pubkey::new_unique().to_string(),
+        recipient: Pubkey::new_unique().to_string(),
+        mint: Pubkey::new_unique().to_string(),
+        amount: TokenAmount(1_000),
+        memo: None,
+        transaction_type: TransactionType::Withdrawal,
+        withdrawal_nonce: None,
+        status,
+        created_at: now,
+        updated_at: now,
+        processed_at: None,
+        counterpart_signature: None,
+        remint_signatures: None,
+        remint_last_valid_block_heights: None,
+        pending_remint_deadline_at: None,
+        finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
+        inner_index: None,
+        landed_remint_signature: None,
+        release_refused_on_chain: false,
+    }
+}
+
+/// A `getAccountInfo` JSON-RPC response carrying a withdrawal bitmap account.
+fn bitmap_account_response(generation: u64, consumed: &[u64]) -> String {
+    let bytes = bitmap_account_bytes(generation, consumed, 255);
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 1},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Mount a withdrawal bitmap account as the server's `getAccountInfo` reply.
+pub(super) fn mock_bitmap_account(
+    server: &mut mockito::ServerGuard,
+    generation: u64,
+    consumed: &[u64],
+) -> mockito::Mock {
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getAccountInfo""#.into(),
+        ))
+        .with_status(200)
+        .with_body(bitmap_account_response(generation, consumed))
+        .create()
+}
+
+/// Fail every `getAccountInfo`, so a bitmap read errors instead of answering.
+pub(super) fn mock_bitmap_read_failure(server: &mut mockito::ServerGuard) -> mockito::Mock {
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getAccountInfo""#.into(),
+        ))
+        .with_status(500)
+        .with_body("bitmap read unavailable")
+        .create()
+}
+
+/// Answer the first `getAccountInfo` with a bitmap and fail every read after it.
+pub(super) fn mock_bitmap_then_read_failure(
+    server: &mut mockito::ServerGuard,
+    generation: u64,
+    consumed: &[u64],
+) -> (mockito::Mock, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let consumed = consumed.to_vec();
+
+    let mock = server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getAccountInfo""#.into(),
+        ))
+        .with_status(200)
+        .with_body_from_request(move |_| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                return bitmap_account_response(generation, &consumed).into_bytes();
+            }
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32003, "message": "node is behind"}
+            })
+            .to_string()
+            .into_bytes()
+        })
+        .expect_at_least(1)
+        .create();
+
+    (mock, calls)
+}
+
+/// Serve a different bitmap on each successive `getAccountInfo`, so a test can
+/// stage a chain that moves between two reads. The counter is returned so the
+/// test can assert how many reads actually happened.
+pub(super) fn mock_bitmap_sequence(
+    server: &mut mockito::ServerGuard,
+    reads: Vec<(u64, Vec<u64>)>,
+) -> (mockito::Mock, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+
+    let mock = server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getAccountInfo""#.into(),
+        ))
+        .with_status(200)
+        .with_body_from_request(move |_| {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            let (generation, consumed) = reads
+                .get(index)
+                .or_else(|| reads.last())
+                .expect("mock_bitmap_sequence needs at least one read");
+            bitmap_account_response(*generation, consumed).into_bytes()
+        })
+        .expect_at_least(1)
+        .create();
+
+    (mock, calls)
+}

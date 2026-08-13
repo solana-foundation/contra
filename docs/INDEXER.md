@@ -71,8 +71,8 @@ Polls database for pending transactions with row-level locking to prevent duplic
 
 Validates transactions and builds Solana instructions that are managed by the Solana Private Channels instance's authorized operators/admins. The processor is responsible for three main tasks:
 - Processing deposits (Mainnet → Solana Private Channels) - handles building a `MintTo` instruction for the user on the Solana Private Channels payment channel.
-- Processing withdrawals (Solana Private Channels → Mainnet) - handles building a `ReleaseFunds` instruction (using the Escrow Program's SMT proof) for the user on Mainnet.
-- Rotating the SMT root on the Mainnet escrow instance to prevent double spending of withdrawals.
+- Processing withdrawals (Solana Private Channels to Mainnet) - handles building a `ReleaseFunds` instruction for the user on Mainnet, which consumes that withdrawal's nonce in the escrow instance's withdrawal bitmap.
+- Rotating that bitmap on the Mainnet escrow instance when a nonce reaches the generation boundary.
 
 **Location**: [`indexer/src/operator/processor.rs`](../indexer/src/operator/processor.rs)
 

@@ -4,7 +4,12 @@ import { useWalletStandardAccount } from '../hooks/useWalletStandardAccount';
 import { useCluster } from '../hooks/useCluster';
 import { address } from '@solana/addresses';
 import type { Address } from '@solana/addresses';
-import { decodeInstance, getCreateInstanceInstructionAsync } from '@private-channel-escrow';
+import {
+  decodeInstance,
+  getCreateInstanceInstructionAsync,
+  findWithdrawalBitmapPda,
+  getWithdrawalBitmapDecoder,
+} from '@private-channel-escrow';
 import { generateKeyPairSigner } from '@solana/signers';
 import { useWalletAccountTransactionSendingSigner } from '@solana/react';
 import type { UiWalletAccount } from '@wallet-standard/react';
@@ -26,8 +31,37 @@ interface InstanceData {
   pubkey: string;
   admin: string;
   instanceSeed: string;
-  withdrawalRoot: string;
-  currentTreeIndex: bigint;
+  generation: bigint;
+  consumedNonces: number;
+  noncesPerGeneration: number;
+}
+
+// Byte offset of the bit array inside a withdrawal bitmap account, past the
+// discriminator, bump and generation.
+const BITMAP_BITS_OFFSET = 10;
+
+function base64ToBytes(base64Data: string): Uint8Array {
+  const binaryString = atob(base64Data);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// How many nonces of the current window are already spent. The generated
+// decoder only covers the fixed header, so the bits are counted from the raw
+// account bytes.
+function countConsumedNonces(accountData: Uint8Array): number {
+  let count = 0;
+  for (let i = BITMAP_BITS_OFFSET; i < accountData.length; i++) {
+    let byte = accountData[i];
+    while (byte) {
+      count += byte & 1;
+      byte >>= 1;
+    }
+  }
+  return count;
 }
 
 // Separate component for create instance functionality to avoid hook issues
@@ -157,17 +191,26 @@ export function InstanceManager({ onInstanceSelect }: InstanceManagerProps) {
       const decoded = decodeInstance(encodedAccount as any);
       const data = decoded.data;
 
-      // Convert withdrawal root bytes to hex string
-      const withdrawalRootHex = Array.from(data.withdrawalTransactionsRoot)
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
+      // Generation and window utilization come from the bitmap, not the
+      // instance: they tell an operator how close this instance is to its next
+      // rotation, which is the one thing they can act on.
+      const [bitmapPda] = await findWithdrawalBitmapPda({ instance: instancePubkey as Address });
+      const bitmapInfo = await rpc
+        .getAccountInfo(bitmapPda, { encoding: 'base64', commitment: 'confirmed' })
+        .send();
+      if (!bitmapInfo.value) {
+        throw new Error('Withdrawal bitmap account not found for this instance');
+      }
+      const bitmapData = base64ToBytes(bitmapInfo.value.data[0]);
+      const bitmapHeader = getWithdrawalBitmapDecoder().decode(bitmapData);
 
       const instance: InstanceData = {
         pubkey: instancePubkey,
         admin: data.admin,
         instanceSeed: data.instanceSeed,
-        withdrawalRoot: withdrawalRootHex,
-        currentTreeIndex: data.currentTreeIndex,
+        generation: bitmapHeader.generation,
+        consumedNonces: countConsumedNonces(bitmapData),
+        noncesPerGeneration: (bitmapData.length - BITMAP_BITS_OFFSET) * 8,
       };
 
       setInstanceData(instance);
@@ -270,12 +313,14 @@ export function InstanceManager({ onInstanceSelect }: InstanceManagerProps) {
             <span className="info-value">{instanceData.instanceSeed}</span>
           </div>
           <div className="info-row">
-            <span className="info-label">Withdrawal Root:</span>
-            <span className="info-value mono">{instanceData.withdrawalRoot}</span>
+            <span className="info-label">Bitmap Generation:</span>
+            <span className="info-value">{instanceData.generation.toString()}</span>
           </div>
           <div className="info-row">
-            <span className="info-label">Current Tree Index:</span>
-            <span className="info-value">{instanceData.currentTreeIndex.toString()}</span>
+            <span className="info-label">Nonces Consumed:</span>
+            <span className="info-value">
+              {instanceData.consumedNonces} / {instanceData.noncesPerGeneration}
+            </span>
           </div>
           {walletAddress && instanceData.admin === walletAddress && (
             <div className="admin-badge">You are the admin of this instance</div>

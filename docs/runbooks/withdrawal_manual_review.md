@@ -50,7 +50,7 @@ have prefixes.
 
 ## Path A.halting - build error that halted the pipeline
 
-The trigger row's data is bad in a way that would corrupt the SMT (NULL
+The trigger row's data is bad in a way that makes it unreleasable (NULL
 nonce, malformed pubkey, builder rejection). The processor quarantined the
 trigger and ran `halt_withdrawal_pipeline`, which drained the fetcher
 channel and bulk-flipped every `pending`/`processing` withdrawal to
@@ -151,7 +151,7 @@ surfaced as an `OperatorError::Program`), the classifier in
 on the side of caution rather than retrying. This is the intended
 behavior: misclassifying a deterministic error as transient could put
 the operator into a tight retry loop that consumes nonces against a
-broken row and corrupts the SMT. The asymmetric cost favors a noisy
+broken row and burns its nonce. The asymmetric cost favors a noisy
 quarantine over a silent retry.
 
 What this means for recovery: the trigger row is safe to retry, not
@@ -339,7 +339,7 @@ SELECT signature, last_valid_block_height, created_at
 
 For each, `solana confirm -v <signature> --url <solana-rpc-url>` to read
 the `InstructionError`. A repeating deterministic error (escrow
-underfunded, SMT/proof rejection, account state) means re-sending will not
+underfunded, nonce already consumed, account state) means re-sending will not
 help - [escalate](_escalation.md) (Tier 2/3) to engineering. A transient
 cause (blockhash expiry under load, RPC outage during the send window)
 may already have cleared.

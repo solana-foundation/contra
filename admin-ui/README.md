@@ -32,7 +32,7 @@ This admin UI has been **completely migrated** from the deprecated `@solana/web3
 
 ### Instance Management
 - ✅ **Load and view instances** - Fully working with new RPC API
-- ✅ **Display instance data** - Admin, seed, withdrawal root, tree index
+- ✅ **Display instance data** - Admin, seed, bitmap generation, consumed-nonce count
 - ⏳ Create new instances - UI ready, transaction signing TODO
 
 ### Status Checking
@@ -46,8 +46,8 @@ This admin UI has been **completely migrated** from the deprecated `@solana/web3
 - Create Mint: Generate new SPL tokens
 
 ### Operator Functions (UI ready, transactions TODO)
-- Release Funds: Release escrowed funds with SMT proofs
-- Reset SMT Root: Reset the Sparse Merkle Tree
+- Release Funds: Release escrowed funds, consuming the withdrawal's nonce
+- Rotate Bitmap: Clear every consumed-nonce bit and open the next generation
 
 ### User Functions (UI ready, transactions TODO)
 - Deposit: Deposit tokens to escrow

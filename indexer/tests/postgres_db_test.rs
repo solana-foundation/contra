@@ -74,6 +74,7 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     }
 }
 
@@ -749,7 +750,7 @@ async fn set_pending_remint_succeeds_when_processing() -> Result<(), Box<dyn std
 
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     storage
-        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline)
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline, false)
         .await?;
 
     Ok(())
@@ -769,7 +770,7 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
 
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     let result = storage
-        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline)
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline, false)
         .await;
 
     assert!(result.is_err(), "should fail when status is not processing");

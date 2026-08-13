@@ -7,16 +7,16 @@ use crate::operator::instruction_util::{
 use crate::operator::sender::TransactionStatusUpdate;
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
-    fetch_current_tree_index, find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
-    tree_constants::MAX_TREE_LEAVES, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce,
-    SignerUtil,
+    bitmap_constants::NONCES_PER_GENERATION, fetch_bitmap_generation, find_allowed_mint_pda,
+    find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
+    MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
 };
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
 use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, ResetSmtRootBuilder,
+    ReleaseFundsBuilder, RotateBitmapBuilder,
 };
 use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_metrics::MetricLabel;
@@ -36,6 +36,7 @@ pub struct ProcessorState {
 
 pub struct ReleaseFundsState {
     pub instance_pda: Pubkey,
+    pub withdrawal_bitmap_pda: Pubkey,
     pub operator_pubkey: Pubkey,
     pub operator_pda: Pubkey,
     pub event_authority_pda: Pubkey,
@@ -58,6 +59,7 @@ impl ProcessorState {
             admin_pubkey: SignerUtil::get_admin_pubkey(),
             release_funds_state: Some(ReleaseFundsState {
                 instance_pda,
+                withdrawal_bitmap_pda: find_withdrawal_bitmap_pda(&instance_pda),
                 operator_pubkey,
                 operator_pda,
                 event_authority_pda,
@@ -131,6 +133,10 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         OperatorError::MintNotAllowed { .. } => ErrorDisposition::Quarantine("mint_not_allowed"),
         OperatorError::Program(ProgramError::InvalidBuilder { .. }) => {
             ErrorDisposition::Quarantine("invalid_builder")
+        }
+        // A bitmap the node would not serve says nothing about the row.
+        OperatorError::Program(ProgramError::BitmapUnavailable { .. }) => {
+            ErrorDisposition::Transient
         }
         // Other Program(_) variants are from the sender-side proof/root checks and
         // cannot originate in the processor today — label them generically if they
@@ -364,12 +370,11 @@ async fn build_release_funds(
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
 
-    // Sibling proofs and new withdrawal root are filled in by the sender once
-    // the nonce reaches the front of the in-flight queue.
     builder
         .payer(processor_state.admin_pubkey)
         .operator(release_funds_state.operator_pubkey)
         .instance(release_funds_state.instance_pda)
+        .withdrawal_bitmap(release_funds_state.withdrawal_bitmap_pda)
         .operator_pda(release_funds_state.operator_pda)
         .mint(mint)
         .allowed_mint(allowed_mint_pda)
@@ -426,20 +431,25 @@ async fn build_release_funds(
     )))
 }
 
-/// Build the tree-rotation TransactionBuilder for a nonce landing on the
-/// MAX_TREE_LEAVES boundary (normal, non-poison path).
+/// Build the rotation TransactionBuilder for a nonce landing on the
+/// NONCES_PER_GENERATION boundary (normal, non-poison path).
+///
+/// `expected_generation` is left unset here: the sender fills it from a fresh
+/// read once the in-flight withdrawals have settled, which is the only moment
+/// the value is still guaranteed to be current.
 fn build_scheduled_rotation(
     admin_pubkey: Pubkey,
     release_funds_state: &ReleaseFundsState,
 ) -> TransactionBuilder {
-    let mut rotation_builder = ResetSmtRootBuilder::new();
+    let mut rotation_builder = RotateBitmapBuilder::new();
     rotation_builder
         .payer(admin_pubkey)
         .operator(release_funds_state.operator_pubkey)
         .instance(release_funds_state.instance_pda)
+        .withdrawal_bitmap(release_funds_state.withdrawal_bitmap_pda)
         .operator_pda(release_funds_state.operator_pda)
         .event_authority(release_funds_state.event_authority_pda);
-    TransactionBuilder::ResetSmtRoot(Box::new(rotation_builder))
+    TransactionBuilder::RotateBitmap(Box::new(rotation_builder))
 }
 
 /// Token-2022 pre-flight for a withdrawal.
@@ -536,44 +546,47 @@ pub async fn process_release_funds(
             let release_funds_tx = build_release_funds(processor_state, &transaction).await?;
 
             // Rotate on a boundary nonce BEFORE the pre-flight, so a boundary row
-            // that quarantines below still leaves later withdrawals on the new
-            // tree. Skip if already rotated on-chain: a re-armed boundary row
-            // reprocesses this nonce, and rotating twice skips a tree generation.
+            // that quarantines below still leaves later withdrawals in the new
+            // generation.
+            //
+            // Skip if the chain has already rotated. A re-armed boundary row
+            // reprocesses the same nonce, and rotating twice would advance past
+            // a whole generation of nonces that could then never be released.
             if let Some(nonce_i64) = transaction.withdrawal_nonce {
                 let nonce = nonce_i64 as u64;
-                if nonce > 0 && nonce.is_multiple_of(MAX_TREE_LEAVES as u64) {
-                    let target_tree_index = nonce / MAX_TREE_LEAVES as u64;
+                if nonce > 0 && nonce.is_multiple_of(NONCES_PER_GENERATION) {
+                    let target_generation = nonce / NONCES_PER_GENERATION;
                     let release_funds_state = processor_state
                         .release_funds_state
                         .as_ref()
                         .ok_or(OperatorError::MissingBuilder)?;
-                    let instance_pda = release_funds_state.instance_pda;
+                    let bitmap_pda = release_funds_state.withdrawal_bitmap_pda;
                     let rpc_client = processor_state.mint_cache.rpc_client().ok_or_else(|| {
                         OperatorError::RpcError(
-                            "tree index read requires an RPC client".to_string(),
+                            "generation read requires an RPC client".to_string(),
                         )
                     })?;
-                    let onchain_tree_index =
-                        fetch_current_tree_index(rpc_client, &instance_pda).await?;
-                    if onchain_tree_index < target_tree_index {
+                    let onchain_generation =
+                        fetch_bitmap_generation(rpc_client, &bitmap_pda).await?;
+                    if onchain_generation < target_generation {
                         info!(
                             nonce,
-                            target_tree_index,
-                            "Tree rotation boundary detected, dispatching ResetSmtRoot"
+                            target_generation,
+                            "Generation boundary detected, dispatching RotateBitmap"
                         );
                         let rotation_tx = build_scheduled_rotation(
                             processor_state.admin_pubkey,
                             release_funds_state,
                         );
-                        send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
+                        send_guaranteed(&sender_tx, rotation_tx, "rotate bitmap")
                             .await
                             .map_err(OperatorError::ChannelSend)?;
                     } else {
                         info!(
                             nonce,
-                            target_tree_index,
-                            onchain_tree_index,
-                            "Boundary already rotated on-chain, skipping ResetSmtRoot"
+                            target_generation,
+                            onchain_generation,
+                            "Boundary already rotated on-chain, skipping RotateBitmap"
                         );
                     }
                 }
@@ -768,19 +781,20 @@ mod tests {
     use crate::error::{AccountError, StorageError, TransactionError};
     use crate::operator::find_allowed_mint_pda;
     use crate::operator::rpc_util::RpcClientWithRetry;
+    use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::DbMint;
     use crate::storage::common::models::TransactionType;
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    use borsh::BorshSerialize;
-    use private_channel_escrow_program_client::Instance;
     use solana_client::rpc_request::RpcRequest;
 
     fn make_release_funds_state() -> ReleaseFundsState {
+        let instance_pda = Pubkey::new_unique();
         ReleaseFundsState {
-            instance_pda: Pubkey::new_unique(),
+            instance_pda,
+            withdrawal_bitmap_pda: find_withdrawal_bitmap_pda(&instance_pda),
             operator_pubkey: Pubkey::new_unique(),
             operator_pda: Pubkey::new_unique(),
             event_authority_pda: Pubkey::new_unique(),
@@ -875,20 +889,10 @@ mod tests {
         );
     }
 
-    /// Mocked `getAccountInfo` response for an Instance account carrying the
-    /// given on-chain tree index, used to drive the boundary-rotation read.
-    fn instance_account_response(current_tree_index: u64) -> serde_json::Value {
-        let instance = Instance {
-            discriminator: 0,
-            bump: 0,
-            version: 0,
-            instance_seed: Pubkey::new_unique(),
-            admin: Pubkey::new_unique(),
-            withdrawal_transactions_root: [0u8; 32],
-            current_tree_index,
-        };
-        let mut bytes = Vec::new();
-        instance.serialize(&mut bytes).unwrap();
+    /// Mocked `getAccountInfo` response for a withdrawal bitmap account on the
+    /// given generation, used to drive the boundary-rotation read.
+    fn bitmap_account_response(generation: u64) -> serde_json::Value {
+        let bytes = bitmap_account_bytes(generation, &[], 255);
         serde_json::json!({
             "context": {"slot": 1},
             "value": {
@@ -933,6 +937,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         }
     }
 
@@ -1084,16 +1089,17 @@ mod tests {
         assert_eq!(b.trace_id, "trace-1");
     }
 
-    /// When the nonce lands exactly on MAX_TREE_LEAVES, a ResetSmtRoot transaction must be
-    /// sent before the ReleaseFunds transaction to rotate the SMT root.
+    /// When the nonce lands exactly on NONCES_PER_GENERATION, a RotateBitmap must
+    /// be dispatched before the boundary ReleaseFunds, or that release is refused
+    /// as belonging to a generation the bitmap has not opened yet.
     #[tokio::test]
-    async fn process_release_funds_tree_rotation_sends_reset_first() {
+    async fn process_release_funds_rotation_sends_rotate_first() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
 
         // On-chain tree index 0 < boundary target 1, so the rotation must fire.
         let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        mocks.insert(RpcRequest::GetAccountInfo, bitmap_account_response(0));
         let rpc_client = RpcClientWithRetry::new_mocked(mocks);
 
         let mut ps = ProcessorState {
@@ -1131,7 +1137,7 @@ mod tests {
             1,
             &mint_pubkey.to_string(),
             &recipient.to_string(),
-            Some(MAX_TREE_LEAVES as i64),
+            Some(NONCES_PER_GENERATION as i64),
             crate::storage::common::models::TransactionType::Withdrawal,
         );
 
@@ -1149,11 +1155,11 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        // First message must be ResetSmtRoot — rotation happens before the boundary withdrawal
+        // First message must be RotateBitmap: rotation happens before the boundary withdrawal
         let msg1 = sender_rx.recv().await.unwrap();
         assert!(
-            matches!(msg1, TransactionBuilder::ResetSmtRoot(_)),
-            "expected ResetSmtRoot first, got: {:?}",
+            matches!(msg1, TransactionBuilder::RotateBitmap(_)),
+            "expected RotateBitmap first, got: {:?}",
             std::mem::discriminant(&msg1)
         );
 
@@ -1162,7 +1168,7 @@ mod tests {
         let TransactionBuilder::ReleaseFunds(b) = msg2 else {
             panic!("expected ReleaseFunds second, got a different variant");
         };
-        assert_eq!(b.nonce, MAX_TREE_LEAVES as u64);
+        assert_eq!(b.nonce, NONCES_PER_GENERATION);
         assert_eq!(b.transaction_id, 1);
 
         // No further messages — exactly two were sent
@@ -1195,7 +1201,7 @@ mod tests {
 
         // Instance on tree 0 (rotation needed); escrow balance 500 < amount 1000.
         let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        mocks.insert(RpcRequest::GetAccountInfo, bitmap_account_response(0));
         mocks.insert(
             RpcRequest::GetTokenAccountBalance,
             serde_json::json!({
@@ -1219,7 +1225,7 @@ mod tests {
             1,
             &mint_pubkey.to_string(),
             &recipient.to_string(),
-            Some(MAX_TREE_LEAVES as i64),
+            Some(NONCES_PER_GENERATION as i64),
             TransactionType::Withdrawal,
         );
         fetcher_tx.send(txn).await.unwrap();
@@ -1239,8 +1245,8 @@ mod tests {
         // Rotation fired despite the bail...
         let msg = sender_rx.recv().await.unwrap();
         assert!(
-            matches!(msg, TransactionBuilder::ResetSmtRoot(_)),
-            "expected ResetSmtRoot to be dispatched before the pre-flight bail"
+            matches!(msg, TransactionBuilder::RotateBitmap(_)),
+            "expected RotateBitmap to be dispatched before the pre-flight bail"
         );
         // ...and no ReleaseFunds for the quarantined boundary row.
         assert!(
@@ -1272,7 +1278,7 @@ mod tests {
 
         // Instance already on tree 1 == boundary target, so no rotation is owed.
         let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(1));
+        mocks.insert(RpcRequest::GetAccountInfo, bitmap_account_response(1));
         let rpc_client = RpcClientWithRetry::new_mocked(mocks);
 
         let mut ps = ProcessorState {
@@ -1289,7 +1295,7 @@ mod tests {
             1,
             &mint_pubkey.to_string(),
             &recipient.to_string(),
-            Some(MAX_TREE_LEAVES as i64),
+            Some(NONCES_PER_GENERATION as i64),
             TransactionType::Withdrawal,
         );
         fetcher_tx.send(txn).await.unwrap();
@@ -1306,12 +1312,12 @@ mod tests {
         .await
         .unwrap();
 
-        // The only message is the withdrawal — no redundant ResetSmtRoot.
+        // The only message is the withdrawal, no redundant RotateBitmap.
         let msg = sender_rx.recv().await.unwrap();
         let TransactionBuilder::ReleaseFunds(b) = msg else {
-            panic!("expected ReleaseFunds, got ResetSmtRoot or another variant");
+            panic!("expected ReleaseFunds, got RotateBitmap or another variant");
         };
-        assert_eq!(b.nonce, MAX_TREE_LEAVES as u64);
+        assert_eq!(b.nonce, NONCES_PER_GENERATION);
         assert!(sender_rx.try_recv().is_err(), "no second message expected");
     }
 
@@ -1683,10 +1689,21 @@ mod tests {
             ErrorDisposition::Quarantine("invalid_builder")
         ));
 
-        let other_program = OperatorError::Program(ProgramError::SmtNotInitialized);
+        let other_program = OperatorError::Program(ProgramError::InvalidProof {
+            reason: "stale".into(),
+        });
         assert!(matches!(
             classify_processor_error(&other_program),
             ErrorDisposition::Quarantine("program_error")
+        ));
+
+        // Quarantining on an outage would halt the pipeline over an RPC blip.
+        let bitmap_unavailable = OperatorError::Program(ProgramError::BitmapUnavailable {
+            reason: "rpc down".into(),
+        });
+        assert!(matches!(
+            classify_processor_error(&bitmap_unavailable),
+            ErrorDisposition::Transient
         ));
 
         let mint_not_allowed = OperatorError::MintNotAllowed {
@@ -1744,7 +1761,9 @@ mod tests {
         ));
 
         let txn_err = OperatorError::Transaction(Box::new(TransactionError::Program(
-            ProgramError::SmtNotInitialized,
+            ProgramError::BitmapUnavailable {
+                reason: "rpc down".into(),
+            },
         )));
         assert!(matches!(
             classify_processor_error(&txn_err),
@@ -2001,7 +2020,7 @@ mod tests {
             1,
             "not_a_valid_pubkey",
             &Pubkey::new_unique().to_string(),
-            Some(MAX_TREE_LEAVES as i64),
+            Some(NONCES_PER_GENERATION as i64),
             crate::storage::common::models::TransactionType::Withdrawal,
         );
         fetcher_tx.send(txn).await.unwrap();
@@ -2468,6 +2487,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         };
 
         fetcher_tx.send(txn).await.unwrap();
@@ -2576,6 +2596,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         };
 
         fetcher_tx.send(txn).await.unwrap();

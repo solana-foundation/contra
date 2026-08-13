@@ -477,7 +477,7 @@ async fn drill_3_path_b_landed_marks_completed_with_signature(
 // ── Drill 4: Path C — ambiguous, NOT_LANDED → re-arm to pending ─────────────
 //
 // Verifies that re-arming a `manual_review` withdrawal back to `pending`
-// preserves `withdrawal_nonce` — the on-chain SMT leaf is keyed on this,
+// preserves `withdrawal_nonce` - the on-chain bitmap bit is keyed on this,
 // and a re-attempt must hit the same leaf. Also verifies the schema's
 // unique-nonce-per-withdrawal constraint does not block re-arming (the
 // row keeps the same nonce; no new row is inserted).
@@ -527,7 +527,7 @@ async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
     assert_eq!(
         nonce,
         Some(original_nonce),
-        "nonce must be preserved across re-arm — SMT leaf identity"
+        "nonce must be preserved across re-arm - the bitmap bit is keyed on it"
     );
 
     // ── Verify the nonce uniqueness constraint still holds ────────────
@@ -653,20 +653,32 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
     // resolved by recovery actions per the runbook.
     let to_completed = seed_withdrawal(&pool, "processing", 100, None).await?;
     storage
-        .set_pending_remint(to_completed, vec![sig.clone()], vec![0], deadline)
+        .set_pending_remint(to_completed, vec![sig.clone()], vec![0], deadline, false)
         .await?;
     let to_failed_reminted = seed_withdrawal(&pool, "processing", 101, None).await?;
     storage
-        .set_pending_remint(to_failed_reminted, vec![sig.clone()], vec![0], deadline)
+        .set_pending_remint(
+            to_failed_reminted,
+            vec![sig.clone()],
+            vec![0],
+            deadline,
+            false,
+        )
         .await?;
     let to_manual_review = seed_withdrawal(&pool, "processing", 102, None).await?;
     storage
-        .set_pending_remint(to_manual_review, vec![sig.clone()], vec![0], deadline)
+        .set_pending_remint(
+            to_manual_review,
+            vec![sig.clone()],
+            vec![0],
+            deadline,
+            false,
+        )
         .await?;
     // Plus one that stays in pending_remint — the only one recovery should return.
     let still_pending = seed_withdrawal(&pool, "processing", 103, None).await?;
     storage
-        .set_pending_remint(still_pending, vec![sig.clone()], vec![0], deadline)
+        .set_pending_remint(still_pending, vec![sig.clone()], vec![0], deadline, false)
         .await?;
 
     // Apply the recovery actions the runbook prescribes.
@@ -1338,7 +1350,7 @@ async fn drill_12_withdrawal_failed_recovery_flows() -> Result<(), Box<dyn std::
     assert_eq!(
         row.get::<Option<i64>, _>("withdrawal_nonce"),
         Some(nonce_a),
-        "nonce must be preserved — SMT leaf identity per _glossary.md:62-68"
+        "nonce must be preserved - the bitmap bit is keyed on it"
     );
 
     // ── (2) Cross-row signature uniqueness fence ──────────────────────────

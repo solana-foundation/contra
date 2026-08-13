@@ -322,9 +322,11 @@ Devnet variants exist for every target (`make docker-devnet-up`, `make docker-de
 ### Running with Auth (RBAC)
 
 Auth is opt-in. The gateway runs without it by default, and even when enabled the gateway's RBAC
-(account-gating and operator-only methods) protects **only the gateway port**. The read/write node RPC
+(account-gating and operator-only methods) protects **only the public gateway port**. The read/write node RPC
 ports have **no node-side authentication** of their own, so the reference compose binds them to loopback
-(`127.0.0.1`): reachable from the host for local development, but not from other machines.
+(`127.0.0.1`): reachable from the host for local development, but not from other machines. The gateway's
+internal listener (`GATEWAY_INTERNAL_PORT`) carries no RBAC either and is never published, so it is
+reachable only from the Docker network, where the operator's own services run.
 
 To enable auth, set `JWT_SECRET` in your `.env.local` and start with the `auth` profile:
 

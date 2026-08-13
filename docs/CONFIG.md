@@ -48,11 +48,17 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--port` | `GATEWAY_PORT` | `8898` | Listen port |
+| `--internal-port` | `GATEWAY_INTERNAL_PORT` | — | Internal listen port; unset means no internal listener |
 | `--write-url` | `GATEWAY_WRITE_URL` | — | Write node URL |
 | `--read-url` | `GATEWAY_READ_URL` | — | Read node URL |
 | `--cors-allowed-origin` | `GATEWAY_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
 
 Routes `sendTransaction` to the write node; all other RPC methods go to the read node.
+
+The internal port serves the operator's own services: no RBAC, no rate limiting,
+and transaction errors are not collapsed. It must never be published to the host
+— compose gives it no `ports:` entry, which is the only thing keeping it
+internal.
 
 ### Streamer
 

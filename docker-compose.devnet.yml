@@ -232,6 +232,10 @@ services:
     environment:
       - RUST_LOG=info
       - GATEWAY_PORT=${GATEWAY_PORT}
+      # Second listener for internal services. Deliberately absent from `ports:`
+      # below: it must stay reachable only from this Docker network, since it
+      # serves raw transaction errors with no RBAC.
+      - GATEWAY_INTERNAL_PORT=${GATEWAY_INTERNAL_PORT:-8904}
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
       # Optional — omit or leave blank to disable RBAC enforcement.
@@ -364,10 +368,11 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # Read channel blocks straight from the read-node, not the gateway. The
-      # gateway enforces JWT auth on getBlock/getSignaturesForAddress when
-      # JWT_SECRET is set, and internal services carry no token, so routing them
-      # through the gateway would 401 and stall indexing. The read-node serves
-      # the same RPC without the auth gate.
+      # gateway's public port enforces JWT auth on getBlock/getSignaturesForAddress
+      # when JWT_SECRET is set, and internal services carry no token, so routing
+      # them through it would 401 and stall indexing. The read-node serves the
+      # same RPC without the auth gate. GATEWAY_INTERNAL_URL would work too; this
+      # is read-only traffic, so it doesn't need the gateway's write routing.
       - COMMON_RPC_URL=${GATEWAY_READ_URL}
       - INDEXER_BACKFILL_RPC_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9100
@@ -401,7 +406,11 @@ services:
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      - COMMON_RPC_URL=${GATEWAY_URL}
+      # Mints go through the gateway (only it routes writes to the write node and
+      # reads to the read node), on the internal listener: this operator carries
+      # no JWT, and its confirmation handling routes on the exact error the
+      # public listener collapses.
+      - COMMON_RPC_URL=${GATEWAY_INTERNAL_URL:-http://gateway:8904}
       - COMMON_SOURCE_RPC_URL=${DEVNET_RPC_URL}
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       # Channel admin, not the escrow Instance.admin (a separate offline key that

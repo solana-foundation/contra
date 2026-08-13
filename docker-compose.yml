@@ -239,6 +239,10 @@ services:
     environment:
       - RUST_LOG=info
       - GATEWAY_PORT=${GATEWAY_PORT}
+      # Second listener for internal services. Deliberately absent from `ports:`
+      # below: it must stay reachable only from this Docker network, since it
+      # serves raw transaction errors with no RBAC.
+      - GATEWAY_INTERNAL_PORT=${GATEWAY_INTERNAL_PORT:-8904}
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9101
@@ -438,7 +442,7 @@ services:
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
       # source_rpc_url = channel (gateway) handle for the startup supply invariant
       # (supply <= custody). Required for escrow: the indexer refuses to start without it.
-      - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
+      - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_INTERNAL_PORT:-8904}
       - INDEXER_YELLOWSTONE_ENDPOINT=http://validator:10000
       - METRICS_PORT=9100
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
@@ -486,7 +490,7 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # rpc_url = Solana Private Channels gateway — polls for WithdrawFunds (burn) instructions on Solana Private Channels.
-      - COMMON_RPC_URL=http://gateway:${GATEWAY_PORT}
+      - COMMON_RPC_URL=http://gateway:${GATEWAY_INTERNAL_PORT:-8904}
       - METRICS_PORT=9100
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     volumes:
@@ -522,7 +526,7 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # rpc_url = Solana Private Channels gateway (routes reads→read-node, writes→write-node)
-      - COMMON_RPC_URL=http://gateway:${GATEWAY_PORT}
+      - COMMON_RPC_URL=http://gateway:${GATEWAY_INTERNAL_PORT:-8904}
       # source_rpc_url = Solana Solana validator 
       - COMMON_SOURCE_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
       # Injected by bench-tps/scripts/run.sh, the full-stack orchestration script that
@@ -587,7 +591,7 @@ services:
       # alias since local has no independent node. Use a real archival provider in prod.
       - COMMON_FALLBACK_RPC_URL=http://validator-fallback:8899
       # source_rpc_url = Solana Private Channels gateway (source of withdrawal/burn state)
-      - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
+      - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_INTERNAL_PORT:-8904}
       # Channel admin, not the escrow Instance.admin (a separate offline key that
       # never reaches this stack). The operator alias is deliberate: both roles are
       # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a

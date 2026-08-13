@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use private_channel_gateway::{serve, Gateway};
+use private_channel_gateway::{serve, Access, Gateway};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -205,7 +205,36 @@ async fn start_gateway(auth_db: PgPool, write_url: String, read_url: String) -> 
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = serve(listener, gateway).await;
+        let _ = serve(listener, gateway, Access::Public).await;
+    });
+
+    addr
+}
+
+/// Start the same gateway on its internal listener: auth is configured exactly
+/// as above, and the tier is what decides it doesn't apply.
+async fn start_internal_gateway(
+    auth_db: PgPool,
+    write_url: String,
+    read_url: String,
+) -> SocketAddr {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
+    let gateway = Arc::new(Gateway::new(
+        write_url,
+        read_url,
+        "*".to_string(),
+        Some(TEST_JWT_SECRET.to_string()),
+        Some(auth_db),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let _ = serve(listener, gateway, Access::Internal).await;
     });
 
     addr
@@ -325,6 +354,35 @@ fn history_response() -> String {
                 "confirmationStatus": "finalized"
             }
         ]
+    })
+    .to_string()
+}
+
+/// A getSignatureStatuses response carrying the same two probe errors, in the
+/// nested shape with the error repeated in the legacy `status` field.
+fn signature_status_response() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 3},
+            "value": [
+                {
+                    "slot": 1,
+                    "confirmations": null,
+                    "err": {"InstructionError": [0, {"Custom": 1}]},
+                    "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                    "confirmationStatus": "finalized"
+                },
+                {
+                    "slot": 2,
+                    "confirmations": null,
+                    "err": {"InstructionError": [0, {"Custom": 3}]},
+                    "status": {"Err": {"InstructionError": [0, {"Custom": 3}]}},
+                    "confirmationStatus": "finalized"
+                }
+            ]
+        }
     })
     .to_string()
 }
@@ -1104,7 +1162,7 @@ async fn test_empty_jwt_secret_disables_auth() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = serve(listener, gateway).await;
+        let _ = serve(listener, gateway, Access::Public).await;
     });
 
     // A gated method with no token should get 200 (auth disabled, proxied to backend).
@@ -1168,7 +1226,7 @@ async fn test_whitespace_jwt_secret_disables_auth() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = serve(listener, gateway).await;
+        let _ = serve(listener, gateway, Access::Public).await;
     });
 
     // A gated method with no token should get 200 (auth disabled, proxied to backend).
@@ -1420,6 +1478,113 @@ async fn test_get_signatures_for_address_operator_keeps_raw_errors() {
         entries[1]["err"],
         json!({"InstructionError": [0, {"Custom": 3}]})
     );
+}
+
+/// `getSignatureStatuses` needs no token at all, and the attacker holds the
+/// signature of the probe they submitted, so an anonymous caller must get the
+/// same collapsed error a User does. Otherwise the history redaction is just a
+/// door next to an open one.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signature_statuses_anonymous_gets_uniform_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let backend = start_mock_backend_with_body(signature_status_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [["sig1", "sig2"]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"]["value"].as_array().unwrap();
+    let marker = json!({"InstructionError": [0, "GenericError"]});
+    assert_eq!(
+        entries[0]["err"], entries[1]["err"],
+        "InsufficientFunds and MintMismatch must be indistinguishable here too"
+    );
+    assert_eq!(entries[0]["err"], marker);
+    assert_eq!(entries[0]["status"]["Err"], marker);
+}
+
+/// The operator's confirmation handling routes on the exact error, so the
+/// internal listener must hand back what the node said, untouched and with no
+/// token presented.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_internal_listener_keeps_raw_errors_without_a_token() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let backend = start_mock_backend_with_body(signature_status_response()).await;
+    let addr = start_internal_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [["sig1", "sig2"]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"]["value"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, {"Custom": 1}]})
+    );
+    assert_eq!(
+        entries[0]["status"]["Err"],
+        json!({"InstructionError": [0, {"Custom": 1}]})
+    );
+}
+
+/// The internal listener carries no RBAC either: the indexer polls `getBlock`,
+/// which is operator-only on the public port, and it holds no token.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_internal_listener_serves_operator_only_methods_untokened() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let backend = start_mock_backend_with_body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).await;
+    let addr = start_internal_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "getBlock", "params": [1]}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200, "the same call is 401 on the public port");
 }
 
 // ── DvP swap escrow ──────────────────────────────────────────────────────────

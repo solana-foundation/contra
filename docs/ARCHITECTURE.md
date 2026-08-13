@@ -119,7 +119,7 @@ flowchart TB
     PG_I[(Indexer DB)]
     OS[Operator Solana]
     OC[Operator Solana Private Channels]
-    GW[Gateway :8899]
+    GW["Gateway :8899 (public) / :8904 (internal only)"]
     WN[Write Node :8900]
     WP[Withdraw Program]
     PG_P[(Postgres Primary)]
@@ -134,7 +134,7 @@ flowchart TB
     Escrow -- watch --> IS
     IS -- deposit events --> PG_I
     PG_I -- pending deposits --> OS
-    OS -- mint --> GW
+    OS -- "mint (internal port)" --> GW
 
     GW -- sendTransaction --> WN
     WN --> WP

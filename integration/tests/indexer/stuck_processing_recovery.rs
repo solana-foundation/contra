@@ -365,8 +365,9 @@ async fn deposit_dead_signature_demoted() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    // Persisted write-ahead before broadcast; the mint never landed and the blockhash expired.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
+    // Persisted write-ahead before broadcast, journaling the slot its blockhash was
+    // read at; the mint never landed and the blockhash expired.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, Some(0))
         .await
         .unwrap();
 
@@ -379,8 +380,6 @@ async fn deposit_dead_signature_demoted() {
     );
     // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
-    // The coverage proof reads the channel's live blockhash window per verdict.
-    mock.enqueue("getLatestBlockhash", blockhash_reply());
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 

@@ -42,7 +42,7 @@ fn now_unix() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Escrow program discriminators (matches admin-ui/src/hooks/useActivityFeed.ts)
+// Escrow program discriminators (must match the escrow program's instruction layout)
 // ---------------------------------------------------------------------------
 const DISC_CREATE_INSTANCE: u8 = 0;
 const DISC_ALLOW_MINT: u8 = 1;

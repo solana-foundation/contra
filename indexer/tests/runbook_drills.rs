@@ -252,6 +252,14 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/recovery.rs",
         ),
         (
+            "release signature journal still unreadable after",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "malformed stored release signature",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
             "no escrow instance configured to verify the release against",
             "indexer/src/operator/recovery.rs",
         ),

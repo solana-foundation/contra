@@ -335,6 +335,17 @@ pub(crate) async fn classify_deposit_signatures(
     }
 }
 
+/// Whether a row has waited out the window allowed for an unresolvable read.
+///
+/// A negative age (clock skew) fails to convert and reads as inside the window,
+/// which is the conservative direction.
+fn proof_wait_expired(row: &DbTransaction) -> bool {
+    Utc::now()
+        .signed_duration_since(row.updated_at)
+        .to_std()
+        .is_ok_and(|age| age >= RELEASE_PROOF_ESCALATE_AFTER)
+}
+
 /// Decide a stuck Processing withdrawal's fate by verifying on-chain finality
 /// of the persisted release signatures; never demote one whose release landed.
 ///
@@ -361,7 +372,40 @@ async fn check_withdrawal(
 
     let pending = match load_pending_sigs(storage, row.id).await {
         Ok(p) => p,
-        Err(reason) => return WithdrawalAction::Quarantine { reason },
+        // Corruption is deterministic and proves a signature was recorded, so the
+        // release may have broadcast. Re-reading returns the same bytes; escalate now.
+        Err(e @ JournalError::Corrupt(_)) => {
+            return WithdrawalAction::Quarantine {
+                reason: e.to_string(),
+            }
+        }
+        // This read is the same kind of unavailability the proof gate waits on, and
+        // its internal retries span only a moment. Paging here would escalate on the
+        // very outage that stranded the row, so wait it out on the same window.
+        Err(e @ JournalError::Unavailable(_)) => {
+            OPERATOR_RELEASE_VERIFY
+                .with_label_values(&["presend", "journal_unavailable"])
+                .inc();
+            if proof_wait_expired(row) {
+                return WithdrawalAction::Quarantine {
+                    reason: format!(
+                        "release signature journal still unreadable after {}s ({e})",
+                        RELEASE_PROOF_ESCALATE_AFTER.as_secs()
+                    ),
+                };
+            }
+            // This row holds the dequeue frontier while it waits, so say so at warn:
+            // the counter alone leaves a stalled pipeline looking idle.
+            warn!(
+                transaction_id = row.id,
+                nonce,
+                "Release signature journal unreadable; withdrawal held in Processing and \
+                 blocking later nonces until it escalates: {e}"
+            );
+            return WithdrawalAction::LeaveProcessing {
+                reason: format!("release signature journal unreadable ({e})"),
+            };
+        }
     };
 
     // Nothing recorded means nothing broadcast, but corroborate that on-chain
@@ -407,14 +451,8 @@ async fn check_withdrawal(
                     .with_label_values(&["presend", "uncertain"])
                     .inc();
                 // An unreadable proof is an unavailable corroboration, not evidence
-                // of a problem, and leaving the row untouched costs nothing but a
-                // sweep. A negative age (clock skew) fails to convert and reads as
-                // inside the window, which is the conservative direction.
-                let aged_out = Utc::now()
-                    .signed_duration_since(row.updated_at)
-                    .to_std()
-                    .is_ok_and(|age| age >= RELEASE_PROOF_ESCALATE_AFTER);
-                if aged_out {
+                // of a problem, and leaving the row untouched costs nothing but a sweep.
+                if proof_wait_expired(row) {
                     WithdrawalAction::Quarantine {
                         reason: format!(
                             "no broadcast signatures recorded and \
@@ -505,24 +543,43 @@ async fn check_withdrawal(
     }
 }
 
+/// Why a signature journal read produced no usable list. The two cases pull in
+/// opposite directions: an unread journal says nothing about the row and is worth
+/// waiting on, while one that reads back corrupt will read back corrupt forever.
+pub(crate) enum JournalError {
+    /// The read itself failed, so the journal's contents are still unknown.
+    Unavailable(String),
+    /// The journal was read and holds a signature that will not parse.
+    Corrupt(String),
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(reason) | Self::Corrupt(reason) => f.write_str(reason),
+        }
+    }
+}
+
 /// Load and parse a row's persisted broadcast signatures into `PendingSig`s for the
-/// finality classifier. Shared by deposit and withdrawal recovery. A read error or a
-/// malformed stored signature returns a quarantine reason (uncertainty, never "dead"),
-/// so callers never demote a row whose signatures could not be read or parsed.
+/// finality classifier. Shared by the withdrawal recovery sweep and the sender's
+/// permanent-failure path; deposits read the journal through `check_deposit`. Neither
+/// error is ever read as "dead", so callers never demote a row whose signatures could
+/// not be read or parsed.
 pub(crate) async fn load_pending_sigs(
     storage: &Storage,
     id: i64,
-) -> Result<Vec<PendingSig>, String> {
-    // Retry a transient DB blip before quarantining; matches the deposit gate so
-    // a momentary read failure never pages ops for a healthy withdrawal.
+) -> Result<Vec<PendingSig>, JournalError> {
+    // Absorbs a brief blip only; a longer outage is the caller's to wait out.
     let stored = with_storage_backoff("journal read", id, || storage.get_release_signatures(id))
         .await
-        .map_err(|e| format!("release signature lookup failed: {e}"))?;
+        .map_err(|e| JournalError::Unavailable(format!("release signature lookup failed: {e}")))?;
 
     let mut pending = Vec::with_capacity(stored.len());
     for (sig_str, lvbh) in &stored {
-        let signature = Signature::from_str(sig_str)
-            .map_err(|e| format!("malformed stored release signature {sig_str}: {e}"))?;
+        let signature = Signature::from_str(sig_str).map_err(|e| {
+            JournalError::Corrupt(format!("malformed stored release signature {sig_str}: {e}"))
+        })?;
         pending.push(PendingSig {
             signature,
             last_valid_block_height: *lvbh as u64,
@@ -1281,6 +1338,92 @@ mod tests {
             ),
             "an unresolvable proof must escalate once it ages past the window"
         );
+    }
+
+    /// The journal read is itself a DB read, and its internal retries only cover
+    /// about 200ms. An outage past that says nothing about the row, so it waits on
+    /// the same window an unreadable proof does instead of paging on sight.
+    #[tokio::test]
+    async fn journal_unreadable_inside_window_leaves_processing() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("get_release_signatures", true);
+        let storage = Storage::Mock(mock);
+        // Unreachable: the decision must be reached without consulting an RPC.
+        let client = make_rpc_client("http://localhost:1");
+        let row = make_withdrawal_row(1, Some(3));
+
+        assert!(
+            matches!(
+                check_withdrawal(
+                    &row,
+                    &storage,
+                    &FinalityRpc::single(&client),
+                    Some(Pubkey::new_unique()),
+                )
+                .await,
+                WithdrawalAction::LeaveProcessing { .. }
+            ),
+            "an unreadable journal must not quarantine inside the window"
+        );
+    }
+
+    /// The wait is bounded the same way the proof wait is: a journal that never
+    /// becomes readable still pages rather than wedging the frontier in silence.
+    #[tokio::test]
+    async fn journal_unreadable_past_window_quarantines() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("get_release_signatures", true);
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
+        let mut row = make_withdrawal_row(1, Some(3));
+        row.updated_at = Utc::now()
+            - chrono::Duration::from_std(RELEASE_PROOF_ESCALATE_AFTER).unwrap()
+            - chrono::Duration::seconds(1);
+
+        match check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await
+        {
+            WithdrawalAction::Quarantine { reason } => assert!(
+                reason.contains("release signature journal"),
+                "reason should name the unreadable journal: {reason}"
+            ),
+            _ => panic!("an indefinitely unreadable journal must escalate"),
+        }
+    }
+
+    /// A journal that reads back unparseable is deterministic corruption and also
+    /// proves a signature was recorded, so it escalates at once: waiting would only
+    /// re-read the same bytes.
+    #[tokio::test]
+    async fn journal_corrupt_quarantines_immediately() {
+        let mock = MockStorage::new();
+        mock.insert_release_signature(1, "not-a-valid-base58-signature".to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
+        // Fresh row: corruption must not be held for the window like unavailability.
+        let row = make_withdrawal_row(1, Some(3));
+
+        match check_withdrawal(
+            &row,
+            &storage,
+            &FinalityRpc::single(&client),
+            Some(Pubkey::new_unique()),
+        )
+        .await
+        {
+            WithdrawalAction::Quarantine { reason } => assert!(
+                reason.contains("malformed stored release signature"),
+                "reason should name the corrupt signature: {reason}"
+            ),
+            _ => panic!("a corrupt journal must quarantine without waiting"),
+        }
     }
 
     /// A nonce whose tree has rotated away cannot be proven against the current

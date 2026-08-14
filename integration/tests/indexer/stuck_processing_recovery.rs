@@ -921,6 +921,84 @@ async fn recovery_leaves_row_processing_when_proof_unavailable() {
     mock.shutdown().await;
 }
 
+// The sweep's own journal read is a DB read, and its internal retries cover only
+// a moment. An outage past that must not quarantine the row: that would page on
+// the very outage the row is recovering from, and wedge every higher nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_leaves_row_processing_when_journal_unreadable() {
+    let (db, url, _container) = start_pg("wd_journal_down").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 3);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // Past the 5 minute stale threshold so the sweep selects the row, but inside
+    // the 10 minute escalation window so an unreadable journal still waits.
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(6)).await;
+    let backdated = updated_at_of(&pool, tx_id).await;
+
+    // Rename the journal table out from under the sweep so every read errors.
+    // This is the DB-outage case with the rest of the row still reachable.
+    sqlx::query("ALTER TABLE pending_release_signatures RENAME TO prs_hidden")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "an unreadable journal must not quarantine inside the window"
+    );
+    assert_eq!(
+        updated_at_of(&pool, tx_id).await,
+        backdated,
+        "the wait must not write, so updated_at stays untouched"
+    );
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "a transient outage must not page on-call"
+    );
+
+    // Restoring the table lets the very next sweep resolve the row normally,
+    // proving the wait held it recoverable rather than merely deferring a page.
+    sqlx::query("ALTER TABLE prs_hidden RENAME TO pending_release_signatures")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Tree 0 holds no completed nonces, so its root excludes nonce 3.
+    enqueue_release_proof(&mock, smt_root(0, &[]), 0);
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending",
+        "once the journal reads again the row is re-armed, not escalated"
+    );
+    mock.shutdown().await;
+}
+
 // Boot reconcile converges on a mixed batch: the demotable row leaves the
 // Processing set, the row whose recorded signature can still land stays put,
 // and the pass loop terminates on its budget rather than spinning.

@@ -45,6 +45,8 @@ have prefixes.
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `released on-chain with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
 | `release verification still uncertain after` | C - ambiguous (proof unavailable past the escalation window) | no | recovery worker quarantine |
+| `release signature journal still unreadable after` | C - ambiguous (database unreadable past the escalation window; check Postgres first) | no | recovery worker quarantine |
+| `malformed stored release signature` | C - ambiguous (journal corrupt, so a signature was recorded) | no | recovery worker quarantine |
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
@@ -219,11 +221,17 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > automatically when the nonce is provably absent - this is the manual
 > `NOT_LANDED` decision in Step 3 below, now automated with the same proof.
 > Such rows never reach manual review, so a signatureless row that does
-> arrive here means the proof itself could not be obtained: recovery
-> retried it every sweep for 10 minutes first
-> (`... release verification still uncertain after ...`). Verify on-chain
-> and act on the verdict; never blindly re-arm a row whose release may
-> already be on-chain.
+> arrive here means a read it depends on stayed broken for 10 minutes of
+> sweeps: either the on-chain proof (`... release verification still
+> uncertain after ...`) or the signature journal itself (`release signature
+> journal still unreadable after ...`). The second points at the database
+> rather than the chain, so check Postgres health before triaging the row.
+> Verify on-chain and act on the verdict; never blindly re-arm a row whose
+> release may already be on-chain.
+>
+> A journal that reads back *corrupt* is different and arrives immediately
+> (`malformed stored release signature ...`): a signature was recorded, so
+> the release may have broadcast, and re-reading only returns the same bytes.
 >
 > The RPC-could-not-classify case for a row that *does* have recorded
 > signatures (`could not verify release landed (...)`, with the signature

@@ -176,7 +176,6 @@ async fn build_fixture_inner(populate_builder: bool, populate_mint_cache: bool) 
         // MAX_POLL_ATTEMPTS_CONFIRMATION = 5 retries.
         1,
         None,
-        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("SenderState construction must succeed under Mock storage");
 

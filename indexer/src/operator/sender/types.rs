@@ -180,7 +180,6 @@ pub struct SenderState {
     pub fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     /// Startup floor for the channel node's `max_blockhashes`, which the retention
     /// proof re-reads and maxes against when bounding a source-side absence.
-    pub channel_blockhash_window: u64,
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
     pub smt_state: Option<SenderSMTState>,
@@ -238,9 +237,7 @@ impl SenderState {
         let fallback = self.fallback_rpc_client.as_deref();
         match self.program_type {
             ProgramType::Withdraw => FinalityRpc::solana(&self.rpc_client, fallback),
-            ProgramType::Escrow => {
-                FinalityRpc::channel(&self.rpc_client, fallback, self.channel_blockhash_window)
-            }
+            ProgramType::Escrow => FinalityRpc::channel(&self.rpc_client, fallback),
         }
     }
 
@@ -260,9 +257,7 @@ impl SenderState {
     /// Do not "fix" this into a symmetric SMT gate.
     pub(crate) fn source_finality(&self) -> FinalityRpc<'_> {
         match self.program_type {
-            ProgramType::Withdraw => {
-                FinalityRpc::channel(&self.source_rpc_client, None, self.channel_blockhash_window)
-            }
+            ProgramType::Withdraw => FinalityRpc::channel(&self.source_rpc_client, None),
             ProgramType::Escrow => FinalityRpc::solana(&self.source_rpc_client, None),
         }
     }

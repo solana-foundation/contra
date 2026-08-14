@@ -83,24 +83,18 @@ enum WithdrawalAction {
 pub(crate) struct RecoveryFinality<'a> {
     primary: &'a RpcClientWithRetry,
     fallback: Option<&'a RpcClientWithRetry>,
-    channel_blockhash_window: u64,
 }
 
 impl<'a> RecoveryFinality<'a> {
     pub(crate) fn new(
         primary: &'a RpcClientWithRetry,
         fallback: Option<&'a RpcClientWithRetry>,
-        channel_blockhash_window: u64,
     ) -> Self {
-        Self {
-            primary,
-            fallback,
-            channel_blockhash_window,
-        }
+        Self { primary, fallback }
     }
 
     fn channel(&self) -> FinalityRpc<'a> {
-        FinalityRpc::channel(self.primary, self.fallback, self.channel_blockhash_window)
+        FinalityRpc::channel(self.primary, self.fallback)
     }
 
     fn solana(&self) -> FinalityRpc<'a> {
@@ -134,16 +128,11 @@ pub async fn run_recovery_worker(
     instance_pda: Option<Pubkey>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: CancellationToken,
-    channel_blockhash_window: u64,
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
     // Endpoints for the sweep. The optional fallback re-checks a Dead verdict;
     // None keeps recovery single-endpoint (legacy behavior).
-    let finality = RecoveryFinality::new(
-        &rpc_client,
-        fallback_rpc_client.as_deref(),
-        channel_blockhash_window,
-    );
+    let finality = RecoveryFinality::new(&rpc_client, fallback_rpc_client.as_deref());
     let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
     loop {
         tokio::select! {
@@ -799,14 +788,9 @@ pub async fn boot_reconcile_processing(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     max_passes: u32,
-    channel_blockhash_window: u64,
 ) -> Result<(), OperatorError> {
     // Same endpoint bundle the periodic worker uses; None stays single-endpoint.
-    let finality = RecoveryFinality::new(
-        rpc_client,
-        fallback_rpc_client.as_deref(),
-        channel_blockhash_window,
-    );
+    let finality = RecoveryFinality::new(rpc_client, fallback_rpc_client.as_deref());
     for pass in 0..max_passes {
         recover_once(
             storage,
@@ -846,7 +830,6 @@ pub async fn boot_reconcile_processing(
 pub mod test_hooks {
     //! Test-only entry to drive a single recovery tick deterministically.
     use super::*;
-    use solana_sdk::clock::MAX_PROCESSING_AGE;
 
     pub async fn run_recovery_once(
         storage: &Storage,
@@ -861,7 +844,7 @@ pub mod test_hooks {
         let token = CancellationToken::new();
         // Single-endpoint bundle: the worker and boot reconcile pass a fallback
         // via their own params; this test hook keeps legacy behavior.
-        let finality = RecoveryFinality::new(rpc_client, None, MAX_PROCESSING_AGE as u64);
+        let finality = RecoveryFinality::new(rpc_client, None);
         recover_once(
             storage,
             &finality,
@@ -881,7 +864,6 @@ mod tests {
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
-    use solana_sdk::clock::MAX_PROCESSING_AGE;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
 
@@ -924,12 +906,12 @@ mod tests {
 
     /// Deposit-path bundle: mints land on the channel, at the default window.
     fn channel_finality(client: &RpcClientWithRetry) -> FinalityRpc<'_> {
-        FinalityRpc::channel(client, None, MAX_PROCESSING_AGE as u64)
+        FinalityRpc::channel(client, None)
     }
 
     /// Sweep-level bundle for tests that drive `recover_once` / `decide_action`.
     fn recovery_finality(client: &RpcClientWithRetry) -> RecoveryFinality<'_> {
-        RecoveryFinality::new(client, None, MAX_PROCESSING_AGE as u64)
+        RecoveryFinality::new(client, None)
     }
 
     fn make_rpc_client(url: &str) -> RpcClientWithRetry {
@@ -1000,23 +982,6 @@ mod tests {
             ))
             .with_status(200)
             .with_body(format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":1}}"#))
-            .create()
-    }
-
-    /// The channel's live blockhash window, which the coverage proof re-reads as
-    /// `lastValidBlockHeight - context.slot`.
-    fn mock_channel_window(server: &mut mockito::ServerGuard, window: u64) -> mockito::Mock {
-        let slot = 1_000u64;
-        server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
-            ))
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{slot}}},"value":{{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":{}}}}},"id":1}}"#,
-                slot + window
-            ))
             .create()
     }
 
@@ -1156,7 +1121,6 @@ mod tests {
         let _status = mock_null_status(&mut server);
         // Covered floor (0) so the single-endpoint absence is proven Dead.
         let _floor = mock_first_available_block(&mut server, 0);
-        let _window = mock_channel_window(&mut server, MAX_PROCESSING_AGE as u64);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
@@ -2211,7 +2175,6 @@ mod tests {
             &storage_tx,
             &CancellationToken::new(),
             5,
-            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -2499,7 +2462,6 @@ mod tests {
             &storage_tx,
             &token,
             5,
-            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -2549,7 +2511,6 @@ mod tests {
             &storage_tx,
             &token,
             5,
-            MAX_PROCESSING_AGE as u64,
         )
         .await
         .unwrap();
@@ -2614,8 +2575,7 @@ mod tests {
         let storage = Storage::Mock(mock.clone());
         let primary_client = make_rpc_client(&primary.url());
         let fb_client = make_rpc_client(&fb.url());
-        let finality =
-            RecoveryFinality::new(&primary_client, Some(&fb_client), MAX_PROCESSING_AGE as u64);
+        let finality = RecoveryFinality::new(&primary_client, Some(&fb_client));
         let (storage_tx, _rx) = mpsc::channel(8);
 
         recover_once(

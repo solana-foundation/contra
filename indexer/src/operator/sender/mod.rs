@@ -30,7 +30,6 @@ pub mod test_hooks {
         retry_max_attempts: u32,
         confirmation_poll_interval_ms: u64,
         source_rpc_client: Option<Arc<RpcClientWithRetry>>,
-        channel_blockhash_window: u64,
     ) -> Result<SenderState, OperatorError> {
         SenderState::new(
             config,
@@ -40,7 +39,6 @@ pub mod test_hooks {
             retry_max_attempts,
             confirmation_poll_interval_ms,
             source_rpc_client,
-            channel_blockhash_window,
         )
     }
 
@@ -265,7 +263,6 @@ pub async fn run_sender(
     confirmation_poll_interval_ms: u64,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
     sender_lock_heartbeat_interval: Duration,
-    channel_blockhash_window: u64,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
 
@@ -282,7 +279,6 @@ pub async fn run_sender(
         retry_max_attempts,
         confirmation_poll_interval_ms,
         source_rpc_client,
-        channel_blockhash_window,
     )?;
 
     // Refuse to start if another sender for this role already holds the lock.
@@ -677,7 +673,6 @@ mod tests {
     use chrono::Utc;
     use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
     use solana_keychain::Signer;
-    use solana_sdk::clock::MAX_PROCESSING_AGE;
     use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
@@ -714,7 +709,6 @@ mod tests {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -814,7 +808,6 @@ mod tests {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             Duration::from_secs(5),
-            MAX_PROCESSING_AGE as u64,
         )
         .await;
 
@@ -849,7 +842,6 @@ mod tests {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
             Duration::from_secs(5),
-            MAX_PROCESSING_AGE as u64,
         )
         .await;
 

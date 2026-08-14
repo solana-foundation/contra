@@ -36,7 +36,6 @@ impl SenderState {
         retry_max_attempts: u32,
         confirmation_poll_interval_ms: u64,
         source_rpc_client: Option<Arc<RpcClientWithRetry>>,
-        channel_blockhash_window: u64,
     ) -> Result<Self, OperatorError> {
         // Initialize global RPC client with retry
         let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -71,7 +70,6 @@ impl SenderState {
             // Source chain client (also used by MintCache). Remints broadcast here.
             source_rpc_client: mint_rpc_client,
             fallback_rpc_client,
-            channel_blockhash_window,
             storage,
             instance_pda,
             smt_state: None,
@@ -605,7 +603,6 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -1149,7 +1146,6 @@ mod tests {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: pda,
             smt_state: None,
@@ -1218,7 +1214,6 @@ mod tests {
             3,
             400,
             None,
-            MAX_PROCESSING_AGE as u64,
         );
 
         assert!(result.is_ok());
@@ -1246,7 +1241,6 @@ mod tests {
             5,
             400,
             None,
-            MAX_PROCESSING_AGE as u64,
         );
 
         assert!(result.is_ok());
@@ -1272,7 +1266,6 @@ mod tests {
             3,
             400,
             None,
-            MAX_PROCESSING_AGE as u64,
         )
         .expect("construction must succeed with an empty fallback URL");
 
@@ -1303,7 +1296,6 @@ mod tests {
             3,
             400,
             None,
-            MAX_PROCESSING_AGE as u64,
         )
         .expect("construction must succeed with a set fallback URL");
 

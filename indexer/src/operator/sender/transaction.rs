@@ -2208,7 +2208,6 @@ mod tests {
     use solana_client::nonblocking::rpc_client::RpcClient;
     use solana_client::rpc_request::RpcRequest;
     use solana_keychain::Signer;
-    use solana_sdk::clock::MAX_PROCESSING_AGE;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
@@ -2237,7 +2236,6 @@ mod tests {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -2275,7 +2273,6 @@ mod tests {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -5379,7 +5376,6 @@ mod tests {
                     CommitmentConfig::confirmed(),
                 )),
                 fallback_rpc_client: None,
-                channel_blockhash_window: MAX_PROCESSING_AGE as u64,
                 storage: storage.clone(),
                 instance_pda: None,
                 smt_state: None,
@@ -5507,7 +5503,6 @@ mod tests {
                     CommitmentConfig::confirmed(),
                 )),
                 fallback_rpc_client: None,
-                channel_blockhash_window: MAX_PROCESSING_AGE as u64,
                 storage: storage.clone(),
                 instance_pda: None,
                 smt_state: None,
@@ -5646,7 +5641,6 @@ mod tests {
                 CommitmentConfig::confirmed(),
             )),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -5735,7 +5729,6 @@ mod tests {
                 CommitmentConfig::confirmed(),
             )),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -5820,7 +5813,6 @@ mod tests {
                 CommitmentConfig::confirmed(),
             )),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -5914,7 +5906,6 @@ mod tests {
                 CommitmentConfig::confirmed(),
             )),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -6035,7 +6026,6 @@ mod tests {
                 CommitmentConfig::confirmed(),
             )),
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,

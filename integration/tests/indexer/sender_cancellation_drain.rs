@@ -99,7 +99,6 @@ async fn run_sender_exits_on_cancellation_with_empty_channel() {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             /* source_rpc_client */ None,
             /* sender_lock_heartbeat_interval */ Duration::from_secs(5),
-            /* channel_blockhash_window */ solana_sdk::clock::MAX_PROCESSING_AGE as u64,
         ),
     )
     .await

@@ -425,26 +425,20 @@ pub(crate) struct FinalityRpc<'a> {
     pub fallback: Option<&'a RpcClientWithRetry>,
     /// How to read the current block height from these endpoints.
     pub height_source: HeightSource,
-    /// Blocks a blockhash stays valid on this chain, bounding the slot range the
-    /// retention proof must cover. On the channel this is only a floor: the proof
-    /// re-reads the node's live window and keeps whichever is larger.
-    pub blockhash_window: u64,
 }
 
 impl<'a> FinalityRpc<'a> {
-    /// Endpoints on the PrivateChannel chain, whose `max_blockhashes` is configurable
-    /// and can change under a running operator, so `blockhash_window` is a startup
-    /// seed the coverage proof re-derives against.
+    /// Endpoints on the PrivateChannel chain. Its `max_blockhashes` is operator-tunable,
+    /// so no window value is carried here: every attempt journals the slot its own
+    /// blockhash was read at, which is what bounds the retention proof.
     pub fn channel(
         primary: &'a RpcClientWithRetry,
         fallback: Option<&'a RpcClientWithRetry>,
-        blockhash_window: u64,
     ) -> Self {
         Self {
             primary,
             fallback,
             height_source: HeightSource::ContextSlot,
-            blockhash_window,
         }
     }
 
@@ -458,7 +452,6 @@ impl<'a> FinalityRpc<'a> {
             primary,
             fallback,
             height_source: HeightSource::BlockHeightRpc,
-            blockhash_window: MAX_PROCESSING_AGE as u64,
         }
     }
 }
@@ -512,7 +505,7 @@ async fn coverage_verdict(
     let chain = finality.height_source.chain_label();
     let bound = match (min_blockhash_slot, finality.height_source) {
         (Some(slot), _) => slot,
-        (None, HeightSource::BlockHeightRpc) => min_lvbh.saturating_sub(finality.blockhash_window),
+        (None, HeightSource::BlockHeightRpc) => min_lvbh.saturating_sub(MAX_PROCESSING_AGE as u64),
         (None, HeightSource::ContextSlot) => {
             OPERATOR_ABSENCE_CLASSIFY
                 .with_label_values(&[chain, "uncertain"])
@@ -1160,7 +1153,6 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
@@ -1260,7 +1252,6 @@ mod tests {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
             fallback_rpc_client: None,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
@@ -1398,7 +1389,6 @@ mod tests {
             rpc_client,
             source_rpc_client,
             fallback_rpc_client,
-            channel_blockhash_window: MAX_PROCESSING_AGE as u64,
             storage: storage.clone(),
             instance_pda: Some(Pubkey::new_unique()),
             smt_state: None,
@@ -4316,10 +4306,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
         mock_floor(&mut server, 0).await;
-        mock_window(&mut server, MAX_PROCESSING_AGE as u64).await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &sig_with_slot(1000, 900)).await,
@@ -4334,7 +4323,6 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
         mock_floor(&mut server, 0).await;
-        mock_window(&mut server, MAX_PROCESSING_AGE as u64).await;
         let never = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -4345,7 +4333,7 @@ mod tests {
             .await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        let finality = FinalityRpc::channel(&p, None);
         let _ = classify_signatures(&finality, &sig_with_lvbh(1000)).await;
         never.assert_async().await;
     }
@@ -4358,7 +4346,7 @@ mod tests {
         mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(1000)).await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(matches!(
             classify_signatures(&finality, &sig_with_lvbh(1000)).await,
             SigFinality::Live(_)
@@ -4403,7 +4391,7 @@ mod tests {
         .await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(matches!(
             classify_signatures(&finality, &sig_with_lvbh(100)).await,
             SigFinality::Uncertain(_)
@@ -4417,10 +4405,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
         mock_floor(&mut server, 1000).await;
-        mock_window(&mut server, MAX_PROCESSING_AGE as u64).await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
+        let finality = FinalityRpc::channel(&p, None);
         match classify_signatures(&finality, &sig_with_slot(100, 50)).await {
             SigFinality::Uncertain(reason) => {
                 assert!(reason.contains("ledger floor"), "reason: {reason}")
@@ -4445,7 +4432,7 @@ mod tests {
             mock_window(&mut server, window).await;
 
             let p = make_rpc(&server.url());
-            let finality = FinalityRpc::channel(&p, None, window);
+            let finality = FinalityRpc::channel(&p, None);
             match classify_signatures(&finality, &sig_with_lvbh(1000)).await {
                 SigFinality::Uncertain(reason) => assert!(
                     reason.contains("predates the journaled blockhash slot"),
@@ -4502,17 +4489,6 @@ mod tests {
             SigFinality::Dead
         ));
         never.assert_async().await;
-    }
-
-    /// Solana's blockhash validity is protocol-fixed, so no operator config can
-    /// widen or narrow the window used on that path.
-    #[test]
-    fn solana_finality_pins_max_processing_age() {
-        let p = make_rpc("http://localhost:1");
-        assert_eq!(
-            FinalityRpc::solana(&p, None).blockhash_window,
-            MAX_PROCESSING_AGE as u64
-        );
     }
 
     // ── coverage_verdict boundaries ─────────────────────────────────
@@ -4849,7 +4825,7 @@ mod tests {
             mock_floor(&mut server, 800).await;
 
             let p = make_rpc(&server.url());
-            let finality = FinalityRpc::channel(&p, None, 150);
+            let finality = FinalityRpc::channel(&p, None);
             let verdict = classify_signatures(&finality, &sig_with_slot(1000, slot)).await;
             assert_eq!(
                 matches!(verdict, SigFinality::Dead),
@@ -4871,7 +4847,7 @@ mod tests {
         mock_window(&mut server, 150).await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 150);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &sig_with_slot(1000, 400)).await,
@@ -4891,7 +4867,7 @@ mod tests {
         mock_floor(&mut server, 800).await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 150);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &sig_with_slot(1000, 900)).await,
@@ -4925,7 +4901,7 @@ mod tests {
         ];
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 150);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &sigs).await,
@@ -4957,7 +4933,7 @@ mod tests {
         ];
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 150);
+        let finality = FinalityRpc::channel(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &sigs).await,

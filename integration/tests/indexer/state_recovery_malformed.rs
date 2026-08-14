@@ -162,7 +162,6 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
         3,
         400,
         None,
-        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("constructing SenderState with Mock storage must succeed");
 

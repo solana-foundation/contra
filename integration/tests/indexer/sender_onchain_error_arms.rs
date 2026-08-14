@@ -286,7 +286,6 @@ async fn build_state_for_jit_caller_arm(
         1,
         1,
         None,
-        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("SenderState construction must succeed under Mock storage");
     let (storage_tx, storage_rx) = tokio::sync::mpsc::channel(8);

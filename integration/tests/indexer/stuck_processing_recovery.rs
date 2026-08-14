@@ -26,7 +26,6 @@ use {
     serde_json::json,
     solana_keychain::SolanaSigner,
     solana_sdk::{
-        clock::MAX_PROCESSING_AGE,
         commitment_config::{CommitmentConfig, CommitmentLevel},
         pubkey::Pubkey,
         signature::Signature,
@@ -1052,7 +1051,6 @@ async fn boot_reconcile_converges_with_mixed_rows() {
         &storage_tx,
         &tokio_util::sync::CancellationToken::new(),
         8,
-        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .await
     .unwrap();
@@ -1885,7 +1883,6 @@ async fn build_pg_sender_state(storage: Arc<Storage>, rpc_url: String) -> Sender
         1,
         1,
         None,
-        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
     )
     .expect("sender state construction against Postgres storage")
 }
@@ -2410,7 +2407,6 @@ async fn demoted_deposit_reopens_through_gate_without_second_mint() {
         channel_client,
         None,
         ProgramType::Escrow,
-        MAX_PROCESSING_AGE as u64,
     )
     .await
     .unwrap();
@@ -2507,7 +2503,6 @@ async fn deposit_gate_channel_db_error_does_not_mint() {
         channel_client,
         None,
         ProgramType::Escrow,
-        MAX_PROCESSING_AGE as u64,
     )
     .await
     .unwrap();

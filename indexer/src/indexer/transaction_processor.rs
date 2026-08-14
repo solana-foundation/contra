@@ -655,7 +655,7 @@ mod tests {
                     payer: make_pubkey(10),
                     operator: make_pubkey(11),
                     instance: rotate_bitmap_instance(),
-                    withdrawal_bitmap: Some(make_pubkey(12)),
+                    withdrawal_bitmap: make_pubkey(12),
                     operator_pda: make_pubkey(13),
                     event_authority: make_pubkey(14),
                     private_channel_escrow_program: make_pubkey(15),
@@ -674,30 +674,19 @@ mod tests {
         make_pubkey(22)
     }
 
-    /// A successful `ReleaseFunds` in either account layout. `bitmap` is `None`
-    /// for the layout that predates the withdrawal bitmap, which is the shape a
-    /// resync from the genesis slot still replays and so has to keep being
-    /// recorded.
+    /// A successful `ReleaseFunds` on the instance this processor watches.
     fn make_release_funds_instruction(
         slot: u64,
         sig: Option<String>,
         nonce: u64,
-        bitmap: Option<Pubkey>,
     ) -> InstructionWithMetadata {
-        make_release_funds_instruction_on_instance(
-            slot,
-            sig,
-            nonce,
-            bitmap,
-            release_funds_instance(),
-        )
+        make_release_funds_instruction_on_instance(slot, sig, nonce, release_funds_instance())
     }
 
     fn make_release_funds_instruction_on_instance(
         slot: u64,
         sig: Option<String>,
         nonce: u64,
-        bitmap: Option<Pubkey>,
         instance: Pubkey,
     ) -> InstructionWithMetadata {
         InstructionWithMetadata {
@@ -706,7 +695,7 @@ mod tests {
                     payer: make_pubkey(10),
                     operator: make_pubkey(11),
                     instance,
-                    withdrawal_bitmap: bitmap,
+                    withdrawal_bitmap: make_pubkey(12),
                     operator_pda: make_pubkey(13),
                     mint: make_pubkey(2),
                     allowed_mint: make_pubkey(14),
@@ -1069,35 +1058,30 @@ mod tests {
     // observed release recording
     // ========================================================================
 
-    /// One row of the dual-layout observed-release table.
+    /// One row of the observed-release table.
     struct ObservedReleaseCase {
         label: &'static str,
-        bitmap: Option<Pubkey>,
         nonce: u64,
         slot: u64,
         signature: &'static str,
     }
 
-    /// A release must be recorded from either account layout. Both carry the
-    /// nonce, and a resync replays the older one from the genesis slot, so
-    /// skipping it would leave a hole in the record exactly where the oldest
-    /// withdrawals are.
+    /// The refund gate reads this record, so a release the indexer saw land has
+    /// to reach storage with its nonce, signature and slot intact.
     #[tokio::test]
-    async fn finalize_records_observed_release_from_both_layouts() {
+    async fn finalize_records_observed_release() {
         let cases = [
             ObservedReleaseCase {
-                label: "current layout",
-                bitmap: Some(make_pubkey(12)),
+                label: "first release",
                 nonce: 42,
                 slot: 300,
                 signature: "sig-release-current",
             },
             ObservedReleaseCase {
-                label: "legacy layout",
-                bitmap: None,
+                label: "later release",
                 nonce: 43,
                 slot: 301,
-                signature: "sig-release-legacy",
+                signature: "sig-release-later",
             },
         ];
 
@@ -1108,7 +1092,6 @@ mod tests {
                 case.slot,
                 Some(case.signature.to_string()),
                 case.nonce,
-                case.bitmap,
             ));
             processor
                 .finalize_and_checkpoint(case.slot, ProgramType::Escrow)
@@ -1146,7 +1129,6 @@ mod tests {
                 310,
                 Some("sig-release-replay".to_string()),
                 44,
-                Some(make_pubkey(12)),
             ));
             processor
                 .finalize_and_checkpoint(310, ProgramType::Escrow)
@@ -1171,7 +1153,6 @@ mod tests {
             320,
             Some("sig-release-foreign".to_string()),
             45,
-            Some(make_pubkey(12)),
             make_pubkey(99),
         ));
         processor
@@ -1195,7 +1176,6 @@ mod tests {
             330,
             Some("sig-release-fail".to_string()),
             46,
-            Some(make_pubkey(12)),
         ));
         processor
             .finalize_and_checkpoint(330, ProgramType::Escrow)

@@ -161,6 +161,7 @@ fn make_pending_remint(
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
         release_refused_on_chain: false,
+        coverage_slot: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn make_pending_remint_with_lvbh(
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
         release_refused_on_chain: false,
+        coverage_slot: None,
     }
 }
 

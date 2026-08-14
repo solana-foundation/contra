@@ -98,14 +98,15 @@ impl SenderState {
         }
     }
 
-    /// Where a nonce sits relative to the window, and against which generation.
+    /// Where a nonce sits relative to the bitmap's current generation.
     ///
-    /// The cache is trusted in one direction only. Trusting it to permit a send
-    /// costs nothing: a wrong answer there ends in an on-chain rejection, which
-    /// the program raises anyway and the sender already handles. Trusting it to
-    /// refuse one is unrecoverable: a withdrawal refused on a stale cache is
-    /// never sent, so it is never rejected, so nothing ever corrects the cache
-    /// that refused it. Every refusal is therefore taken against a fresh read.
+    ///   cache holds this generation  -> Open                    no RPC
+    ///   anything else                -> read the chain          Open | NotYetOpen | Closed
+    ///   the read failed              -> Open                    let the program judge
+    ///
+    /// Only a fresh read is allowed to say no. The cache can lag the chain, and a
+    /// lagging cache that refused a withdrawal would strand it forever: unsent
+    /// means unrejected, and that rejection is what would have corrected the cache.
     pub(super) async fn release_window(&mut self, nonce: u64) -> (GenerationWindow, u64) {
         let nonce_generation = nonce / NONCES_PER_GENERATION;
 
@@ -298,6 +299,7 @@ mod tests {
             deadline: chrono::Utc::now(),
             finality_check_attempts: 0,
             release_refused_on_chain: false,
+            coverage_slot: None,
         });
     }
 

@@ -1359,6 +1359,7 @@ async fn defer_remint_after_failure(
         deadline,
         finality_check_attempts: 0,
         release_refused_on_chain,
+        coverage_slot: None,
     });
 }
 

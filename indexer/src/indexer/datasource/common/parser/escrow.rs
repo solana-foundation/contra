@@ -21,17 +21,11 @@ pub(crate) const DEPOSIT: u8 = 6;
 const RELEASE_FUNDS: u8 = 7;
 const ROTATE_BITMAP: u8 = 8;
 
-// Account counts are the only structural difference between the current and
-// the legacy layouts of these two instructions: both kept their
-// discriminator, so nothing in the instruction data can select between them.
-// A resync backfills from the genesis slot, so legacy releases are still
-// replayed and both layouts must keep decoding correctly.
-// The legacy counts are what the escrow program required before the bitmap
-// account was added at index 3.
+// Only the post-bitmap layouts are decoded. A pre-bitmap release can only name
+// the instance this design abandons, and every escrow instruction whose instance
+// is not the configured one is dropped before it reaches storage.
 const RELEASE_FUNDS_ACCOUNTS: usize = 13;
-const RELEASE_FUNDS_ACCOUNTS_LEGACY: usize = 12;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
-const ROTATE_BITMAP_ACCOUNTS_LEGACY: usize = 6;
 
 // Event related constants
 pub(crate) const EVENT_IX_TAG_LE: &[u8] = &[0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
@@ -136,8 +130,7 @@ pub struct ReleaseFundsAccounts {
     pub payer: Pubkey,
     pub operator: Pubkey,
     pub instance: Pubkey,
-    /// `None` for instructions predating the bitmap, which had no such account.
-    pub withdrawal_bitmap: Option<Pubkey>,
+    pub withdrawal_bitmap: Pubkey,
     pub operator_pda: Pubkey,
     pub mint: Pubkey,
     pub allowed_mint: Pubkey,
@@ -154,8 +147,7 @@ pub struct RotateBitmapAccounts {
     pub payer: Pubkey,
     pub operator: Pubkey,
     pub instance: Pubkey,
-    /// `None` for the legacy six-account layout, which has no bitmap.
-    pub withdrawal_bitmap: Option<Pubkey>,
+    pub withdrawal_bitmap: Pubkey,
     pub operator_pda: Pubkey,
     pub event_authority: Pubkey,
     pub private_channel_escrow_program: Pubkey,
@@ -185,19 +177,13 @@ pub struct ReleaseFundsData {
     pub amount: u64,
     pub user: Pubkey,
     pub transaction_nonce: u64,
-    // The legacy layout's root and sibling proofs are skipped: nothing reads them.
 }
 
 impl ReleaseFundsData {
-    /// Parse ReleaseFundsData from raw bytes (after the discriminator).
-    ///
-    /// Current layout: amount (8) + user (32) + transaction_nonce (8).
-    /// Legacy layout: amount (8) + user (32) + root (32) + nonce (8) +
-    /// sibling proofs (512). The root sits between the user and the nonce, so
-    /// the two cannot share one offset table.
-    pub fn from_bytes(data: &[u8], legacy: bool) -> Result<Self, ParserError> {
-        let root_len = if legacy { 32 } else { 0 };
-        let min_len = 8 + 32 + root_len + 8;
+    /// Parse ReleaseFundsData from raw bytes after the discriminator:
+    /// amount (8) + user (32) + transaction_nonce (8).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ParserError> {
+        let min_len = 8 + 32 + 8;
         if data.len() < min_len {
             return Err(ParserError::InstructionParseFailed {
                 reason: format!("ReleaseFundsData too short: {} < {}", data.len(), min_len),
@@ -214,7 +200,7 @@ impl ReleaseFundsData {
                 reason: format!("Invalid user pubkey: {}", e),
             }
         })?;
-        offset += 32 + root_len;
+        offset += 32;
 
         let transaction_nonce = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
 
@@ -543,49 +529,37 @@ fn parse_deposit(
     }
 }
 
-/// Parse ReleaseFunds, choosing the layout by account count.
-///
-/// The bitmap added one account and dropped two arguments without changing the
-/// discriminator, so the count is the only thing that tells the two apart.
-/// Guessing from the data length would not: the program only ever checked that
-/// the data was long enough, never that it was exactly one size.
+/// Parse ReleaseFunds in the bitmap-era layout.
 fn parse_release_funds(
     data: &[u8],
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let account_count = instruction.accounts.len();
-    if account_count < RELEASE_FUNDS_ACCOUNTS_LEGACY {
+    if account_count < RELEASE_FUNDS_ACCOUNTS {
         return Err(AccountError::InsufficientAccounts {
-            required: RELEASE_FUNDS_ACCOUNTS_LEGACY,
+            required: RELEASE_FUNDS_ACCOUNTS,
             actual: account_count,
         }
         .into());
     }
 
-    let legacy = account_count < RELEASE_FUNDS_ACCOUNTS;
-    let ix_data = ReleaseFundsData::from_bytes(data, legacy)?;
+    let ix_data = ReleaseFundsData::from_bytes(data)?;
 
-    // Everything from the operator PDA on shifted by one when the bitmap arrived.
-    let shift = if legacy { 0 } else { 1 };
     let accounts = ReleaseFundsAccounts {
         payer: resolve_account(instruction, account_keys, 0)?,
         operator: resolve_account(instruction, account_keys, 1)?,
         instance: resolve_account(instruction, account_keys, 2)?,
-        withdrawal_bitmap: if legacy {
-            None
-        } else {
-            Some(resolve_account(instruction, account_keys, 3)?)
-        },
-        operator_pda: resolve_account(instruction, account_keys, 3 + shift)?,
-        mint: resolve_account(instruction, account_keys, 4 + shift)?,
-        allowed_mint: resolve_account(instruction, account_keys, 5 + shift)?,
-        user_ata: resolve_account(instruction, account_keys, 6 + shift)?,
-        instance_ata: resolve_account(instruction, account_keys, 7 + shift)?,
-        token_program: resolve_account(instruction, account_keys, 8 + shift)?,
-        associated_token_program: resolve_account(instruction, account_keys, 9 + shift)?,
-        event_authority: resolve_account(instruction, account_keys, 10 + shift)?,
-        private_channel_escrow_program: resolve_account(instruction, account_keys, 11 + shift)?,
+        withdrawal_bitmap: resolve_account(instruction, account_keys, 3)?,
+        operator_pda: resolve_account(instruction, account_keys, 4)?,
+        mint: resolve_account(instruction, account_keys, 5)?,
+        allowed_mint: resolve_account(instruction, account_keys, 6)?,
+        user_ata: resolve_account(instruction, account_keys, 7)?,
+        instance_ata: resolve_account(instruction, account_keys, 8)?,
+        token_program: resolve_account(instruction, account_keys, 9)?,
+        associated_token_program: resolve_account(instruction, account_keys, 10)?,
+        event_authority: resolve_account(instruction, account_keys, 11)?,
+        private_channel_escrow_program: resolve_account(instruction, account_keys, 12)?,
     };
 
     Ok(Some(EscrowInstruction::ReleaseFunds {
@@ -594,35 +568,29 @@ fn parse_release_funds(
     }))
 }
 
-/// Parse a rotation in either its current or legacy layout, by account count.
-/// Only the accounts are read; neither layout carries data this indexer needs.
+/// Parse a rotation. Only the accounts are read; the data carries nothing this
+/// indexer needs.
 fn parse_rotate_bitmap(
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let account_count = instruction.accounts.len();
-    if account_count < ROTATE_BITMAP_ACCOUNTS_LEGACY {
+    if account_count < ROTATE_BITMAP_ACCOUNTS {
         return Err(AccountError::InsufficientAccounts {
-            required: ROTATE_BITMAP_ACCOUNTS_LEGACY,
+            required: ROTATE_BITMAP_ACCOUNTS,
             actual: account_count,
         }
         .into());
     }
 
-    let legacy = account_count < ROTATE_BITMAP_ACCOUNTS;
-    let shift = if legacy { 0 } else { 1 };
     let accounts = RotateBitmapAccounts {
         payer: resolve_account(instruction, account_keys, 0)?,
         operator: resolve_account(instruction, account_keys, 1)?,
         instance: resolve_account(instruction, account_keys, 2)?,
-        withdrawal_bitmap: if legacy {
-            None
-        } else {
-            Some(resolve_account(instruction, account_keys, 3)?)
-        },
-        operator_pda: resolve_account(instruction, account_keys, 3 + shift)?,
-        event_authority: resolve_account(instruction, account_keys, 4 + shift)?,
-        private_channel_escrow_program: resolve_account(instruction, account_keys, 5 + shift)?,
+        withdrawal_bitmap: resolve_account(instruction, account_keys, 3)?,
+        operator_pda: resolve_account(instruction, account_keys, 4)?,
+        event_authority: resolve_account(instruction, account_keys, 5)?,
+        private_channel_escrow_program: resolve_account(instruction, account_keys, 6)?,
     };
 
     Ok(Some(EscrowInstruction::RotateBitmap { accounts }))
@@ -711,18 +679,6 @@ mod tests {
         data.extend_from_slice(&amount.to_le_bytes());
         data.extend_from_slice(user.as_ref());
         data.extend_from_slice(&nonce.to_le_bytes());
-        data
-    }
-
-    /// Legacy ReleaseFunds argument bytes, with the root between the user
-    /// and the nonce and 512 bytes of sibling proofs trailing.
-    fn create_legacy_release_funds_borsh_data(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
-        let mut data = vec![];
-        data.extend_from_slice(&amount.to_le_bytes());
-        data.extend_from_slice(user.as_ref());
-        data.extend_from_slice(&[1u8; 32]);
-        data.extend_from_slice(&nonce.to_le_bytes());
-        data.extend_from_slice(&[7u8; 512]);
         data
     }
 
@@ -951,97 +907,43 @@ mod tests {
     // parse_release_funds Tests
     // ============================================================================
 
-    /// Both layouts share discriminator 7, so the account count is the only
-    /// thing that can select between them. A resync replays legacy releases
-    /// from the genesis slot, and misreading one would put the wrong nonce and
-    /// amount into the database.
-    /// One row of the dual-layout table.
-    struct ReleaseFundsLayoutCase {
-        label: &'static str,
-        data: Vec<u8>,
-        n_accounts: usize,
-        amount: u64,
-        nonce: u64,
-        has_bitmap: bool,
-    }
-
+    /// The bitmap sits at index 3 and pushes every later account along by one,
+    /// so a wrong offset table would put the wrong nonce and amount in the
+    /// database rather than fail.
     #[test]
-    fn test_release_funds_dual_layout_table() {
+    fn test_release_funds_account_offsets() {
         let user = Pubkey::new_unique();
+        let data = create_release_funds_borsh_data(1_000, user, 42);
+        let instruction = create_instruction_with_accounts(13, "dummy".to_string());
+        let account_keys = create_n_account_keys(13);
 
-        let cases = vec![
-            ReleaseFundsLayoutCase {
-                label: "current 13-account layout",
-                data: create_release_funds_borsh_data(1_000, user, 42),
-                n_accounts: 13,
-                amount: 1_000,
-                nonce: 42,
-                has_bitmap: true,
-            },
-            ReleaseFundsLayoutCase {
-                label: "legacy 12-account layout",
-                data: create_legacy_release_funds_borsh_data(2_000, user, 43),
-                n_accounts: 12,
-                amount: 2_000,
-                nonce: 43,
-                has_bitmap: false,
-            },
-        ];
+        let parsed = parse_release_funds(&data, &instruction, &account_keys)
+            .expect("must parse")
+            .expect("must yield an instruction");
 
-        for ReleaseFundsLayoutCase {
-            label,
-            data,
-            n_accounts,
-            amount,
-            nonce,
-            has_bitmap,
-        } in cases
-        {
-            let instruction = create_instruction_with_accounts(n_accounts, "dummy".to_string());
-            let account_keys = create_n_account_keys(n_accounts);
+        let EscrowInstruction::ReleaseFunds { accounts, data } = parsed else {
+            panic!("must decode as ReleaseFunds");
+        };
 
-            let parsed = parse_release_funds(&data, &instruction, &account_keys)
-                .unwrap_or_else(|e| panic!("{label} must parse: {e}"))
-                .unwrap_or_else(|| panic!("{label} must yield an instruction"));
-
-            let EscrowInstruction::ReleaseFunds { accounts, data } = parsed else {
-                panic!("{label} must decode as ReleaseFunds");
-            };
-
-            assert_eq!(data.amount, amount, "{label} amount");
-            assert_eq!(data.transaction_nonce, nonce, "{label} nonce");
-            assert_eq!(data.user, user, "{label} user");
-            assert_eq!(
-                accounts.withdrawal_bitmap.is_some(),
-                has_bitmap,
-                "{label} bitmap account presence"
-            );
-
-            // Index 3 is the bitmap now and the operator PDA before, so a wrong shift shows here.
-            let expected_operator_pda = if has_bitmap {
-                account_keys[4]
-            } else {
-                account_keys[3]
-            };
-            assert_eq!(
-                accounts.operator_pda, expected_operator_pda,
-                "{label} shift"
-            );
-        }
+        assert_eq!(data.amount, 1_000);
+        assert_eq!(data.transaction_nonce, 42);
+        assert_eq!(data.user, user);
+        assert_eq!(accounts.withdrawal_bitmap, account_keys[3]);
+        assert_eq!(accounts.operator_pda, account_keys[4]);
+        assert_eq!(accounts.private_channel_escrow_program, account_keys[12]);
     }
 
-    /// Data too short for the layout its account count implies must error rather
-    /// than read past the end or silently mis-slice.
+    /// Data shorter than the layout needs must error rather than read past the
+    /// end or silently mis-slice.
     #[test]
     fn test_release_funds_malformed_data_errors() {
-        let user = Pubkey::new_unique();
-        // Current-length arguments (48 bytes) offered where legacy needs 80.
-        let data = create_release_funds_borsh_data(1_000, user, 42);
-        let instruction = create_instruction_with_accounts(12, "dummy".to_string());
-        let account_keys = create_n_account_keys(12);
+        let mut data = create_release_funds_borsh_data(1_000, Pubkey::new_unique(), 42);
+        data.truncate(40);
+        let instruction = create_instruction_with_accounts(13, "dummy".to_string());
+        let account_keys = create_n_account_keys(13);
 
         let err = parse_release_funds(&data, &instruction, &account_keys)
-            .expect_err("short legacy data must not parse")
+            .expect_err("short data must not parse")
             .to_string();
         assert!(err.contains("too short"), "Error: {err}");
     }
@@ -1063,40 +965,24 @@ mod tests {
     // parse_rotate_bitmap Tests
     // ============================================================================
 
-    /// Both rotation layouts share discriminator 8, so the same account-count
-    /// dispatch has to hold here too.
+    /// The rotation carries the bitmap at index 3 as well, so the same offset
+    /// mistake is possible here.
     #[test]
-    fn test_rotate_bitmap_dual_layout_table() {
-        for (label, n_accounts, has_bitmap) in [
-            ("current 7-account layout", 7usize, true),
-            ("legacy 6-account layout", 6, false),
-        ] {
-            let instruction = create_instruction_with_accounts(n_accounts, "dummy".to_string());
-            let account_keys = create_n_account_keys(n_accounts);
+    fn test_rotate_bitmap_account_offsets() {
+        let instruction = create_instruction_with_accounts(7, "dummy".to_string());
+        let account_keys = create_n_account_keys(7);
 
-            let parsed = parse_rotate_bitmap(&instruction, &account_keys)
-                .unwrap_or_else(|e| panic!("{label} must parse: {e}"))
-                .unwrap_or_else(|| panic!("{label} must yield an instruction"));
+        let parsed = parse_rotate_bitmap(&instruction, &account_keys)
+            .expect("must parse")
+            .expect("must yield an instruction");
 
-            let EscrowInstruction::RotateBitmap { accounts } = parsed else {
-                panic!("{label} must decode as RotateBitmap");
-            };
+        let EscrowInstruction::RotateBitmap { accounts } = parsed else {
+            panic!("must decode as RotateBitmap");
+        };
 
-            assert_eq!(
-                accounts.withdrawal_bitmap.is_some(),
-                has_bitmap,
-                "{label} bitmap account presence"
-            );
-            let expected_operator_pda = if has_bitmap {
-                account_keys[4]
-            } else {
-                account_keys[3]
-            };
-            assert_eq!(
-                accounts.operator_pda, expected_operator_pda,
-                "{label} shift"
-            );
-        }
+        assert_eq!(accounts.withdrawal_bitmap, account_keys[3]);
+        assert_eq!(accounts.operator_pda, account_keys[4]);
+        assert_eq!(accounts.private_channel_escrow_program, account_keys[6]);
     }
 
     #[test]

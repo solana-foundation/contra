@@ -1672,6 +1672,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         deadline: Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts: 0,
         release_refused_on_chain: false,
+        coverage_slot: None,
     });
 
     let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel::<TransactionStatusUpdate>(10);

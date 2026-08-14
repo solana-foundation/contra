@@ -228,6 +228,14 @@ pub struct PendingRemint {
     /// with it, so a restart inside the finality window still lets the refund
     /// go through instead of falling back to manual review.
     pub release_refused_on_chain: bool,
+    /// The last slot a release for this nonce could have landed in, read once.
+    ///
+    /// The indexer's checkpoint has to reach this before an absent release
+    /// record proves anything. Re-reading it each tick would move the target
+    /// the checkpoint is chasing, so it is captured on the first check and
+    /// kept. A restart re-captures a later slot, which only asks for more
+    /// coverage than before, never less.
+    pub coverage_slot: Option<u64>,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.

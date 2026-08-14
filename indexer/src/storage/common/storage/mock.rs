@@ -169,6 +169,7 @@ impl MockStorage {
         &self,
         program_type: &str,
     ) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("get_committed_checkpoint")?;
         Ok(self
             .committed_checkpoints
             .lock()

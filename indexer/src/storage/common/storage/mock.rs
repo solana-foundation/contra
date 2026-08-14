@@ -892,17 +892,17 @@ impl MockStorage {
     pub async fn try_unpark_to_processing(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<DateTime<Utc>>, StorageError> {
         self.check_should_fail("try_unpark_to_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         for txn in pending.iter_mut() {
             if txn.id == transaction_id && txn.status == TransactionStatus::Parked {
                 txn.status = TransactionStatus::Processing;
                 txn.updated_at = Utc::now();
-                return Ok(true);
+                return Ok(Some(txn.updated_at));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     pub async fn get_stale_parked_transactions(
@@ -1026,19 +1026,19 @@ impl MockStorage {
         Ok(())
     }
 
-    /// Mirror `claim_and_persist_deposit_signature_internal`: CAS the row on
+    /// Mirror `claim_and_persist_signature_internal`: CAS the row on
     /// `(id, Processing, updated_at)`; on a hit bump `updated_at`, persist the
     /// signature (mirroring the `ON CONFLICT (signature)` dedup) and return
     /// `Ok(Some(new_updated_at))`; on a miss return `Ok(None)` and persist
     /// nothing.
-    pub async fn claim_and_persist_deposit_signature(
+    pub async fn claim_and_persist_signature(
         &self,
         transaction_id: i64,
         expected_updated_at: DateTime<Utc>,
         signature: String,
         last_valid_block_height: i64,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
-        self.check_should_fail("claim_and_persist_deposit_signature")?;
+        self.check_should_fail("claim_and_persist_signature")?;
         // Scope the guard so it is released before the await below.
         let lease = {
             let mut pending = self.pending_transactions.lock().unwrap();

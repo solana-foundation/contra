@@ -240,6 +240,29 @@ fn drill_1_error_message_contracts_present_in_source() {
             "no signatures to verify — remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
         ),
+        // Withdrawal, recovery worker. The signatureless-row verdicts; the
+        // proof-gated requeue never reaches manual review, so only the two
+        // terminal ones are dispatchable.
+        (
+            "released on-chain with no recorded broadcast signature",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "release verification still uncertain after",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "release signature journal still unreadable after",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "malformed stored release signature",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "no escrow instance configured to verify the release against",
+            "indexer/src/operator/recovery.rs",
+        ),
         // Deposit — sender side. The processor-side strings (invalid_pubkey,
         // invalid_builder, program_error) are shared with withdrawals via
         // `classify_processor_error` and already covered above.

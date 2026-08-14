@@ -525,6 +525,16 @@ pub(super) async fn drain_rotation_retry_queue(
                 if remint_info.is_none() {
                     error!("Missing remint_info for rotation retry nonce {} - remint will not be possible on failure", nonce);
                 }
+                // Nothing was written to the row while it waited on the rotation,
+                // so the lease held for this nonce is still the live token.
+                let Some(fetched_updated_at) = state.release_leases.get(&nonce).copied() else {
+                    error!(
+                        transaction_id,
+                        nonce,
+                        "No ownership lease held for rotation retry; leaving row Processing for recovery"
+                    );
+                    continue;
+                };
                 info!(trace_id = %trace_id, "Retrying blocked nonce {} after rotation", nonce);
                 let tx_builder =
                     TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
@@ -533,6 +543,7 @@ pub(super) async fn drain_rotation_retry_queue(
                         transaction_id,
                         trace_id,
                         remint_info,
+                        fetched_updated_at,
                     }));
                 handle_transaction_submission(state, tx_builder, storage_tx).await;
             }
@@ -567,13 +578,17 @@ pub(super) async fn drain_ambiguous_retry_queue(
         let id = builder_with_nonce.transaction_id;
         match state.storage.try_unpark_to_processing(id).await {
             // We won the flip, the row is ours to send.
-            Ok(true) => {
+            Ok(Some(lease)) => {
+                // The park heartbeat and this unpark both bumped the row, so the
+                // token the builder arrived with is dead; carry the one we just won.
+                let mut builder_with_nonce = builder_with_nonce;
+                builder_with_nonce.fetched_updated_at = lease;
                 let tx_builder = TransactionBuilder::ReleaseFunds(builder_with_nonce);
                 handle_transaction_submission(state, tx_builder, storage_tx).await;
             }
             // Row is no longer Parked: recovery already requeued it, so another
             // path owns this nonce now. Drop our copy to avoid sending twice.
-            Ok(false) => {
+            Ok(None) => {
                 warn!(
                     transaction_id = id,
                     "Unpark CAS no-op; dropping stale parked builder"
@@ -665,6 +680,19 @@ mod tests {
     use tokio::sync::{mpsc, Semaphore};
     use tokio_util::sync::CancellationToken;
 
+    static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
+
+    /// The submission path resolves the admin signer eagerly, so any test that
+    /// drives it needs one configured before the process-wide Lazy is forced.
+    fn ensure_test_signer() {
+        INIT_TEST_SIGNER.call_once(|| {
+            let kp = solana_sdk::signer::keypair::Keypair::new();
+            let b58 = bs58::encode(kp.to_bytes()).into_string();
+            std::env::set_var("ADMIN_SIGNER", "memory");
+            std::env::set_var("ADMIN_PRIVATE_KEY", &b58);
+        });
+    }
+
     fn make_sender_state(rpc_url: &str) -> SenderState {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -694,6 +722,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -891,6 +920,37 @@ mod tests {
 
     // ── drain_ambiguous_retry_queue ──────────────────────────────────
 
+    /// A `Parked` withdrawal row as the drain finds it in the DB.
+    fn make_parked_withdrawal_row(id: i64, nonce: u64) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id,
+            signature: format!("sig-{id}"),
+            trace_id: format!("trace-{id}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(1_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce as i64),
+            status: TransactionStatus::Parked,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
     /// A parked withdrawal whose blocker is still unresolved must be put back in
     /// the queue, not sent. Proves the snapshot drain neither loops nor drops it.
     #[tokio::test]
@@ -935,6 +995,7 @@ mod tests {
                 transaction_id: 99,
                 trace_id: "trace-99".to_string(),
                 remint_info: None,
+                fetched_updated_at: chrono::Utc::now(),
             }));
 
         drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
@@ -969,6 +1030,7 @@ mod tests {
                 transaction_id: 500,
                 trace_id: "t".to_string(),
                 remint_info: None,
+                fetched_updated_at: chrono::Utc::now(),
             }));
 
         drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
@@ -980,6 +1042,70 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "dropped builder emits no status update"
+        );
+    }
+
+    /// The park heartbeat and the unpark both bump the row, so a parked builder's
+    /// arrival token is dead by the time it is sent. The unpark CAS hands back the
+    /// incarnation the sender now owns, and that is the lease the release claim
+    /// must present: the arrival token no longer claims anything.
+    #[tokio::test]
+    async fn unpark_refreshes_release_lease() {
+        ensure_test_signer();
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        // Local SMT on tree 0 and a nonce in tree 1, so the unparked builder stops
+        // at the tree-index mismatch instead of reaching an RPC this test has none of.
+        let nonce = MAX_TREE_LEAVES as u64;
+        state.smt_state = Some(smt_at(0));
+
+        let arrival_token = Utc::now() - chrono::Duration::minutes(10);
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let mut row = make_parked_withdrawal_row(7, nonce);
+        row.updated_at = arrival_token;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        state
+            .ambiguous_retry_queue
+            .push(Box::new(ReleaseFundsBuilderWithNonce {
+                builder: ReleaseFundsBuilder::new(),
+                nonce,
+                transaction_id: 7,
+                trace_id: "trace-7".to_string(),
+                remint_info: None,
+                fetched_updated_at: arrival_token,
+            }));
+
+        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
+
+        let lease = state
+            .release_leases
+            .get(&nonce)
+            .copied()
+            .expect("an unparked withdrawal holds a lease");
+        assert_ne!(
+            lease, arrival_token,
+            "the unpark must replace the token the builder arrived with"
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.claim_and_persist_signature(7, arrival_token, "stale".to_string(), 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "the arrival token is dead after park + unpark"
+        );
+        assert!(
+            mock.claim_and_persist_signature(7, lease, "fresh".to_string(), 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "the lease carried out of the unpark is the claimable incarnation"
         );
     }
 
@@ -1022,35 +1148,10 @@ mod tests {
         // Parked withdrawal nonce 3 (same tree). Seed its DB row as stale Parked.
         let stale = Utc::now() - chrono::Duration::minutes(10);
         if let Storage::Mock(mock) = &*state.storage {
-            mock.pending_transactions
-                .lock()
-                .unwrap()
-                .push(DbTransaction {
-                    id: 3,
-                    signature: "sig-3".to_string(),
-                    trace_id: "trace-3".to_string(),
-                    slot: 100,
-                    initiator: Pubkey::new_unique().to_string(),
-                    recipient: Pubkey::new_unique().to_string(),
-                    mint: Pubkey::new_unique().to_string(),
-                    amount: TokenAmount(1_000),
-                    memo: None,
-                    transaction_type: TransactionType::Withdrawal,
-                    withdrawal_nonce: Some(3),
-                    status: TransactionStatus::Parked,
-                    created_at: stale,
-                    updated_at: stale,
-                    processed_at: None,
-                    counterpart_signature: None,
-                    remint_signatures: None,
-                    remint_last_valid_block_heights: None,
-                    pending_remint_deadline_at: None,
-                    finality_check_attempts: 0,
-                    recovery_requeue_attempts: 0,
-                    instruction_index: 0,
-                    inner_index: None,
-                    landed_remint_signature: None,
-                });
+            let mut row = make_parked_withdrawal_row(3, 3);
+            row.created_at = stale;
+            row.updated_at = stale;
+            mock.pending_transactions.lock().unwrap().push(row);
         }
         state
             .ambiguous_retry_queue
@@ -1060,6 +1161,7 @@ mod tests {
                 transaction_id: 3,
                 trace_id: "trace-3".to_string(),
                 remint_info: None,
+                fetched_updated_at: chrono::Utc::now(),
             }));
 
         drain_ambiguous_retry_queue(&mut state, &storage_tx).await;

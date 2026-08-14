@@ -1499,10 +1499,15 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Status-only CAS `Processing` → `Pending` for pre-broadcast build/sign
-    /// failures. The sender owns the row while `processing`, so no `updated_at`
-    /// guard is needed. Bumps `recovery_requeue_attempts` so the recovery
-    /// quarantine cap survives restarts.
+    /// Status-only CAS `Processing` to `Pending` for pre-broadcast build/sign
+    /// failures. Bumps `recovery_requeue_attempts` so the recovery quarantine cap
+    /// survives restarts.
+    ///
+    /// Deliberately ungated on `updated_at`: it only ever re-arms a row that is
+    /// already going back in the queue, so the worst a stale caller can do is
+    /// requeue an incarnation someone else owns and spend one of its capped
+    /// attempts. It can never authorize a broadcast; that decision is gated by
+    /// `claim_and_persist_signature`, which does present the generational token.
     pub async fn try_requeue_prebroadcast_internal(
         &self,
         transaction_id: i64,
@@ -1564,32 +1569,34 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// CAS `Parked` → `Processing`. Strict on purpose: if recovery requeued the
+    /// CAS `Parked` to `Processing`. Strict on purpose: if recovery requeued the
     /// row and a new processor already took it back to `processing`, this returns
-    /// `Ok(false)` so the drain drops its stale builder instead of double-sending.
+    /// `Ok(None)` so the drain drops its stale builder instead of double-sending.
+    ///
+    /// The winner gets the post-update `updated_at` back. Park and unpark each bump
+    /// the row, so the token the parked builder arrived with is already dead; this
+    /// is the incarnation the sender's release claim must present.
     pub async fn try_unpark_to_processing_internal(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let result = self
-            .run_sender_owned(|conn| {
-                Box::pin(async move {
-                    sqlx::query(
-                        r#"
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        self.run_sender_owned(|conn| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                    r#"
                         UPDATE transactions
                         SET status = 'processing'
                         WHERE id = $1
                           AND status = 'parked'
+                        RETURNING updated_at
                         "#,
-                    )
-                    .bind(transaction_id)
-                    .execute(conn)
-                    .await
-                })
+                )
+                .bind(transaction_id)
+                .fetch_optional(conn)
+                .await
             })
-            .await?;
-
-        Ok(result.rows_affected() == 1)
+        })
+        .await
     }
 
     /// Stale `Parked` rows of one type older than the threshold, oldest-first.
@@ -1913,14 +1920,16 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Atomically claim a `Processing` deposit and persist its broadcast
-    /// signature in one transaction. The CAS on `updated_at` bumps the row so a
-    /// racing recovery demote (also a CAS on that column) loses; sharing one
-    /// transaction leaves no bumped-but-unsigned window. `Ok(Some(lease))`
-    /// returns the committed post-claim `updated_at`, valid as the next CAS
-    /// token; `Ok(None)` means the row was demoted or re-locked, so the caller
-    /// must not broadcast.
-    pub async fn claim_and_persist_deposit_signature_internal(
+    /// Atomically claim a `Processing` row and persist its broadcast signature in
+    /// one transaction. The CAS on `updated_at` bumps the row so a racing recovery
+    /// demote (also a CAS on that column) loses; sharing one transaction leaves no
+    /// bumped-but-unsigned window. `Ok(Some(lease))` returns the committed
+    /// post-claim `updated_at`, valid as the next CAS token; `Ok(None)` means the
+    /// row was demoted or re-locked, so the caller must not broadcast.
+    ///
+    /// Nothing here is type-specific: the deposit mint and the withdrawal release
+    /// both need exactly this ownership proof before they move funds.
+    pub async fn claim_and_persist_signature_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,

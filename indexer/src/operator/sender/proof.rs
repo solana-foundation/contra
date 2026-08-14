@@ -152,12 +152,20 @@ pub(super) async fn rebuild_with_regenerated_proof(
         );
     }
 
+    // The live lease is what this nonce owns right now; a rebuild inherits it
+    // rather than the token the original builder arrived with.
+    let Some(fetched_updated_at) = state.release_leases.get(&nonce).copied() else {
+        error!("No ownership lease held for nonce {nonce}; refusing to rebuild");
+        return None;
+    };
+
     let builder_with_nonce = Box::new(ReleaseFundsBuilderWithNonce {
         builder,
         nonce,
         transaction_id,
         trace_id,
         remint_info,
+        fetched_updated_at,
     });
 
     match smt_state.handle_release_funds_transaction(
@@ -194,6 +202,8 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
         // Note: when called from handle_permanent_failure, remint_cache is
         // already drained. This removal is defensive for any other call site.
         state.remint_cache.remove(&nonce);
+        // The builder is gone, so the lease it held no longer speaks for anyone.
+        state.release_leases.remove(&nonce);
     }
 
     mint::cleanup_mint_builder(state, nonce.map(|n| n as i64));
@@ -244,6 +254,7 @@ mod tests {
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -407,6 +418,7 @@ mod tests {
             transaction_id: 1,
             trace_id: "t".to_string(),
             remint_info: Some(make_test_remint_info(1, "t")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let result =
@@ -432,6 +444,7 @@ mod tests {
             transaction_id: 1,
             trace_id: "t".to_string(),
             remint_info: Some(make_test_remint_info(1, "t")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let result =
@@ -449,6 +462,7 @@ mod tests {
             transaction_id: 42,
             trace_id: "trace-42".to_string(),
             remint_info: Some(make_test_remint_info(42, "trace-42")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let result = smt.handle_release_funds_transaction(
@@ -484,6 +498,7 @@ mod tests {
                 transaction_id: nonce as i64,
                 trace_id: format!("t-{nonce}"),
                 remint_info: Some(make_test_remint_info(nonce as i64, &format!("t-{nonce}"))),
+                fetched_updated_at: chrono::Utc::now(),
             });
             smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None)
                 .unwrap();
@@ -559,6 +574,8 @@ mod tests {
         };
         smt.nonce_to_builder.insert(0, (ctx, builder));
         state.smt_state = Some(smt);
+        // A rebuild inherits the lease the nonce already holds.
+        state.release_leases.insert(0, chrono::Utc::now());
 
         let fee_payer = Pubkey::new_unique();
         let ix = InstructionWithSigners {
@@ -590,6 +607,7 @@ mod tests {
         };
         smt.nonce_to_builder.insert(0, (ctx, builder));
         state.smt_state = Some(smt);
+        state.release_leases.insert(0, chrono::Utc::now());
 
         // Seed remint_cache so rebuild can propagate it
         let remint = make_test_remint_info(1, "t");

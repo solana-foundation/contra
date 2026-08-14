@@ -203,6 +203,13 @@ pub struct SenderState {
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
     /// Signatures sent per withdrawal nonce (with lvbh), used for finality checks before reminting.
     pub pending_signatures: HashMap<u64, Vec<PendingSig>>,
+    /// Ownership lease per withdrawal nonce: the row's `updated_at` as of this
+    /// sender's most recent successful claim. Every release attempt presents the
+    /// current value and stores the one the claim returns, so a retry, a rebuild,
+    /// or an unpark still speaks for the incarnation it owns. Lives on the state
+    /// rather than the context because the retry recursion re-enters
+    /// `send_and_confirm` with an immutable context.
+    pub release_leases: HashMap<u64, DateTime<Utc>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.

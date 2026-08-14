@@ -213,6 +213,16 @@ pub async fn handle_transaction_submission(
         deposit_claim_lease: None,
     };
 
+    // A submitted builder always carries the token for the incarnation it owns,
+    // so arming the lease from it is correct on a first arrival and on a re-entry
+    // after a park or a rotation wait alike.
+    if let TransactionBuilder::ReleaseFunds(builder_with_nonce) = &tx_builder {
+        state.release_leases.insert(
+            builder_with_nonce.nonce,
+            builder_with_nonce.fetched_updated_at,
+        );
+    }
+
     // For a withdrawal, which tree does its nonce belong to? None for other txs.
     let release_tree_index = match &tx_builder {
         TransactionBuilder::ReleaseFunds(builder_with_nonce) => {
@@ -534,40 +544,87 @@ pub(super) async fn route_builder_error(
     }
 }
 
-/// Persist a broadcast signature write-ahead (DB only), fail-closed: `Err(())` means
-/// "do not broadcast". On persist failure we count the error, log it with ids, and
-/// return early so the caller aborts before sending; the row stays Processing for the
-/// recovery worker to reconcile against the chain.
-pub(super) async fn persist_signature_or_abort(
-    storage: &Storage,
-    pt: &str,
+/// Verdict of the pre-broadcast ownership claim on a release.
+enum ReleaseClaim {
+    /// The row is still the incarnation we were handed; `lease` is the token the
+    /// next claim for this nonce must present.
+    Owned(chrono::DateTime<Utc>),
+    /// Another writer reached the row first. Never broadcast.
+    Lost,
+    /// The claim write itself failed, so ownership is unknown. Never broadcast.
+    Failed,
+}
+
+/// Claim the `Processing` incarnation this release was handed and persist its
+/// broadcast signature write-ahead, both in one storage transaction. Fail-closed:
+/// only `Owned` authorizes a send.
+///
+/// A withdrawal nonce is consumed on broadcast, so this claim is what lets the
+/// recovery sweep re-arm a signatureless row at all: recovery CASes the same
+/// `updated_at` column, so a demote and a claim can never both win. Presenting
+/// the lease rather than a bare status check is deliberate, since a row that was
+/// demoted and re-fetched is `Processing` again and would pass a status test.
+async fn claim_release_or_abort(
+    state: &SenderState,
     transaction_id: i64,
+    nonce: u64,
     signature: &Signature,
     last_valid_block_height: u64,
-) -> Result<(), ()> {
-    if let Err(e) = storage
-        .insert_release_signature(
+) -> ReleaseClaim {
+    let pt = state.program_type.as_label();
+
+    // Defensive: submission arms the lease for every release it dispatches, so a
+    // missing one means we cannot prove ownership and must not pay out.
+    let Some(expected_updated_at) = state.release_leases.get(&nonce).copied() else {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt, "release_missing_claim_lease"])
+            .inc();
+        error!(
             transaction_id,
+            nonce, "No ownership lease held for release; aborting before broadcast"
+        );
+        return ReleaseClaim::Lost;
+    };
+
+    match state
+        .storage
+        .claim_and_persist_signature(
+            transaction_id,
+            expected_updated_at,
             signature.to_string(),
             last_valid_block_height as i64,
         )
         .await
     {
-        metrics::OPERATOR_TRANSACTION_ERRORS
-            .with_label_values(&[pt, "pre_send_persist_error"])
-            .inc();
-        let abort = TransactionError::PreSendPersistFailed {
-            reason: e.to_string(),
-        };
-        error!(
-            transaction_id,
-            signature = %signature,
-            "Aborting before broadcast, leaving row Processing for recovery: {}",
-            abort
-        );
-        return Err(());
+        Ok(Some(lease)) => ReleaseClaim::Owned(lease),
+        Ok(None) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "release_claim_lost"])
+                .inc();
+            warn!(
+                transaction_id,
+                nonce,
+                signature = %signature,
+                "Release ownership lost before broadcast; dropping stale builder without releasing"
+            );
+            ReleaseClaim::Lost
+        }
+        Err(e) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "pre_send_persist_error"])
+                .inc();
+            let abort = TransactionError::PreSendPersistFailed {
+                reason: e.to_string(),
+            };
+            error!(
+                transaction_id,
+                signature = %signature,
+                "Aborting before broadcast, leaving row Processing for recovery: {}",
+                abort
+            );
+            ReleaseClaim::Failed
+        }
     }
-    Ok(())
 }
 
 /// Sign, send, confirm, and handle the result
@@ -658,33 +715,34 @@ pub(super) async fn send_and_confirm(
         };
 
     // A withdrawal nonce is consumed on broadcast, so a release that lands must already
-    // have a durable signature record for crash recovery to reconcile against.
+    // have a durable signature record for crash recovery to reconcile against, and this
+    // sender must still own the row it is about to pay out.
     if let (Some(nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
-        if persist_signature_or_abort(
-            &state.storage,
-            pt,
-            txid,
-            &signature,
-            last_valid_block_height,
-        )
-        .await
-        .is_err()
+        match claim_release_or_abort(state, txid, nonce, &signature, last_valid_block_height).await
         {
-            // The persist WRITE just failed, so do not attempt another DB write here.
-            // With no stashed signature this nonce provably never broadcast, so the
-            // Stage-1 SMT/builder/retry/remint mutations describe a nonce the chain
-            // never accepted; roll them back so later withdrawals in this tree build
-            // on a root the chain agrees with. A stashed signature (retry recursion
-            // after a broadcast) means a real tx may land, so leave state intact for
-            // recovery. Row stays Processing either way.
-            if state
-                .pending_signatures
-                .get(&nonce)
-                .is_none_or(|sigs| sigs.is_empty())
-            {
-                cleanup_failed_transaction(state, Some(nonce));
+            // Each attempt presents the previous claim's token, so adopt the new one
+            // before any retry re-enters here.
+            ReleaseClaim::Owned(lease) => {
+                state.release_leases.insert(nonce, lease);
             }
-            return;
+            ReleaseClaim::Lost | ReleaseClaim::Failed => {
+                // Either the row is not ours or its write just failed, so do not
+                // attempt another DB write here. With no stashed signature this nonce
+                // provably never broadcast, so the Stage-1 SMT/builder/retry/remint
+                // mutations describe a nonce the chain never accepted; roll them back
+                // so later withdrawals in this tree build on a root the chain agrees
+                // with. A stashed signature (retry recursion after a broadcast) means a
+                // real tx may land, so leave state intact for recovery. Row stays
+                // Processing either way.
+                if state
+                    .pending_signatures
+                    .get(&nonce)
+                    .is_none_or(|sigs| sigs.is_empty())
+                {
+                    cleanup_failed_transaction(state, Some(nonce));
+                }
+                return;
+            }
         }
     }
 
@@ -1015,6 +1073,7 @@ pub(super) async fn handle_success(
         state.retry_counts.remove(&nonce);
         state.remint_cache.remove(&nonce);
         state.pending_signatures.remove(&nonce);
+        state.release_leases.remove(&nonce);
         info!("Cleaned up state for withdrawal_nonce {}", nonce);
 
         metrics::OPERATOR_MINTS_SENT
@@ -1623,7 +1682,7 @@ pub(super) async fn fire_and_store_task(
                 return;
             };
             match storage
-                .claim_and_persist_deposit_signature(
+                .claim_and_persist_signature(
                     txid,
                     deposit_expected_updated_at,
                     signature.to_string(),
@@ -2179,6 +2238,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -2215,6 +2275,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -2429,6 +2490,7 @@ mod tests {
                 transaction_id: txn_id,
                 trace_id: format!("trace-{txn_id}"),
                 remint_info: None,
+                fetched_updated_at: chrono::Utc::now(),
             },
         ))
     }
@@ -2750,7 +2812,8 @@ mod tests {
             .create()
     }
 
-    /// A successful send_and_confirm persists the signed transaction's signature (via `insert_release_signature`) before the broadcast.
+    /// A successful send_and_confirm persists the signed transaction's signature
+    /// (via the ownership claim) before the broadcast.
     #[tokio::test]
     async fn release_persists_signature_before_send() {
         let mut server = mockito::Server::new_async().await;
@@ -2774,6 +2837,7 @@ mod tests {
         let _status = mock_get_signature_statuses_null(&mut server);
 
         let mut state = make_sender_state_with_server(&server.url());
+        seed_release_claim(&mut state, 10, 5);
         let ctx = withdrawal_ctx(10, 5);
 
         send_and_confirm(
@@ -2978,6 +3042,384 @@ mod tests {
         );
     }
 
+    // ── pre-broadcast release ownership claim ─────────────────────────
+
+    /// Seed the `Processing` row a release claim CASes against and arm the sender
+    /// with the matching lease, exactly as the submission path leaves them.
+    /// Returns the arrival token.
+    fn seed_release_claim(
+        state: &mut SenderState,
+        txn_id: i64,
+        nonce: u64,
+    ) -> chrono::DateTime<Utc> {
+        let row = processing_withdrawal_row(txn_id, nonce);
+        let token = row.updated_at;
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions.lock().unwrap().push(row);
+        state.release_leases.insert(nonce, token);
+        token
+    }
+
+    /// `seed_release_claim` plus the Stage-1 SMT/builder/remint mutations a
+    /// submitted release leaves behind, which a lost claim has to roll back.
+    fn arm_release_attempt(
+        state: &mut SenderState,
+        txn_id: i64,
+        nonce: u64,
+    ) -> chrono::DateTime<Utc> {
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        seed_release_claim(state, txn_id, nonce)
+    }
+
+    /// The row as recovery leaves it after a demote: still present, no longer
+    /// `Processing`, so the sender's lease no longer names a claimable incarnation.
+    fn demote_seeded_row(state: &SenderState, txn_id: i64) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let mut rows = mock.pending_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|r| r.id == txn_id)
+            .expect("seeded row present");
+        row.status = TransactionStatus::Pending;
+        row.updated_at = Utc::now();
+    }
+
+    /// A mock RPC that answers the blockhash but refuses to accept any send, so a
+    /// broadcast is both counted and fatal to the test's intent.
+    fn mock_no_broadcast_allowed(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create()
+    }
+
+    /// Accepting `sendTransaction`, counted `expect` times.
+    fn mock_send_ok_times(server: &mut mockito::ServerGuard, expect: usize) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(expect)
+            .create()
+    }
+
+    /// Accepting `sendTransaction` with no call-count expectation.
+    fn mock_send_ok(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// A finalized, error-free status, so a broadcast release confirms on the
+    /// first poll instead of entering the idempotent retry loop.
+    fn mock_status_finalized(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
+                            "err": null,
+                            "slot": 100,
+                            "status": {"Ok": null}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// The core safety property of the claim: once recovery has demoted the row,
+    /// the lease the sender holds is dead, so the release must not broadcast and
+    /// must leave no signature behind for recovery to misread as an attempt.
+    #[tokio::test]
+    async fn release_send_drops_builder_when_claim_lost() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = mock_no_broadcast_allowed(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        arm_release_attempt(&mut state, txn_id, nonce);
+        demote_seeded_row(&state, txn_id);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(txn_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a lost claim must persist no signature"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lost claim writes no terminal status; the winning writer owns the row"
+        );
+        assert!(
+            !state.pending_signatures.contains_key(&nonce),
+            "nothing stashed when nothing broadcast"
+        );
+    }
+
+    /// A lost claim also has to undo the Stage-1 mutations, or the local SMT keeps
+    /// a nonce the chain never accepted and every later withdrawal in the tree
+    /// builds on a root the chain disagrees with.
+    ///
+    /// The RPC here would confirm the release if it were broadcast, so the
+    /// rollback can only come from the claim aborting before the send.
+    #[tokio::test]
+    async fn release_send_rolls_back_smt_when_claim_lost() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = mock_send_ok(&mut server);
+        let _status = mock_status_finalized(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        arm_release_attempt(&mut state, txn_id, nonce);
+        demote_seeded_row(&state, txn_id);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &mpsc::channel(10).0,
+        )
+        .await;
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "SMT nonce rolled back when the claim was lost"
+        );
+        assert!(
+            !smt.nonce_to_builder.contains_key(&nonce),
+            "builder dropped when the claim was lost"
+        );
+        assert!(
+            !state.retry_counts.contains_key(&nonce),
+            "retry count cleared"
+        );
+        assert!(
+            !state.remint_cache.contains_key(&nonce),
+            "remint cache cleared"
+        );
+        assert!(
+            !state.release_leases.contains_key(&nonce),
+            "the dead lease is dropped with the builder"
+        );
+    }
+
+    /// The normal path is unchanged by the claim: the release still broadcasts
+    /// once and still records its signature write-ahead. The row's `updated_at`
+    /// advancing is what separates the claim from a bare insert, and is what makes
+    /// a concurrent recovery demote lose.
+    #[tokio::test]
+    async fn release_send_broadcasts_and_stores_lease_when_claim_wins() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = mock_send_ok_times(&mut server, 1);
+        let _status = mock_status_finalized(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let arrival_token = arm_release_attempt(&mut state, txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &mpsc::channel(10).0,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(txn_id).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the claim persists the signature write-ahead"
+        );
+
+        let row_updated_at = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == txn_id)
+            .expect("seeded row present")
+            .updated_at;
+        assert_ne!(
+            row_updated_at, arrival_token,
+            "the claim must bump the row so a racing recovery CAS loses"
+        );
+    }
+
+    /// Retry recursion is the second broadcast decision for one nonce, so it has
+    /// to present the token the first claim returned. Holding the arrival token
+    /// instead would lose the second claim and silently strand the withdrawal
+    /// after one attempt.
+    #[tokio::test]
+    async fn release_retry_presents_refreshed_lease() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        // Two sender-level attempts, then the cap; a stale lease would stop at one.
+        let send = mock_send_ok_times(&mut server, 2);
+        let _status = mock_get_signature_statuses_null(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = 2;
+        arm_release_attempt(&mut state, txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &mpsc::channel(64).0,
+        )
+        .await;
+
+        send.assert();
+    }
+
+    /// The claim write itself failing is not evidence about ownership, so the
+    /// sender must not broadcast and must not follow one failed write with
+    /// another; the row is left `Processing` for recovery.
+    #[tokio::test]
+    async fn release_claim_error_leaves_row_processing_without_second_write() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = mock_no_broadcast_allowed(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        arm_release_attempt(&mut state, txn_id, nonce);
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("claim_and_persist_signature", true);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; the row stays Processing for recovery"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == txn_id)
+            .expect("seeded row present")
+            .clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "a failed claim write is followed by no second write"
+        );
+        assert!(
+            mock.status_updates.lock().unwrap().is_empty(),
+            "no follow-up storage write after the claim failed"
+        );
+    }
+
     /// Guards against over-cleaning: a persist that succeeds must still broadcast, persist
     /// the write-ahead signature, and keep the chain-accepted nonce in the SMT on a
     /// confirmed release. Pins that the abort-branch rollback never touches the success path.
@@ -3035,6 +3477,7 @@ mod tests {
         };
         smt.smt_state.insert_nonce(nonce);
         state.smt_state = Some(smt);
+        seed_release_claim(&mut state, txn_id, nonce);
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         let ctx = withdrawal_ctx(txn_id, nonce);
@@ -3101,14 +3544,9 @@ mod tests {
         let nonce = 5;
         let mut state = make_sender_state_with_server(&server.url());
         state.remint_cache.insert(nonce, make_remint_info(txn_id));
-        // The PendingRemint transition is guarded on a Processing row.
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        mock.pending_transactions
-            .lock()
-            .unwrap()
-            .push(processing_withdrawal_row(txn_id, nonce));
+        // The PendingRemint transition is guarded on a Processing row, and the
+        // pre-broadcast claim needs that row plus a live lease.
+        seed_release_claim(&mut state, txn_id, nonce);
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         let ctx = withdrawal_ctx(txn_id, nonce);
@@ -4925,6 +5363,7 @@ mod tests {
                 program_type: ProgramType::Escrow,
                 remint_cache: HashMap::new(),
                 pending_signatures: HashMap::new(),
+                release_leases: HashMap::new(),
                 pending_remints: Vec::new(),
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -5051,6 +5490,7 @@ mod tests {
                 program_type: ProgramType::Escrow,
                 remint_cache: HashMap::new(),
                 pending_signatures: HashMap::new(),
+                release_leases: HashMap::new(),
                 pending_remints: Vec::new(),
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -5188,6 +5628,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -5275,6 +5716,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -5358,6 +5800,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -5450,6 +5893,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -5569,6 +6013,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -6752,7 +7197,7 @@ mod tests {
         };
         let t_lock = Utc::now();
         seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
-        mock.set_should_fail("claim_and_persist_deposit_signature", true);
+        mock.set_should_fail("claim_and_persist_signature", true);
         let before = state.semaphore.available_permits();
         let ctx = mint_ctx_with_lease(77, t_lock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -7620,6 +8065,7 @@ mod tests {
             transaction_id: 99,
             trace_id: "trace-99".to_string(),
             remint_info: Some(remint_info.clone()),
+            fetched_updated_at: chrono::Utc::now(),
         }));
         handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
 

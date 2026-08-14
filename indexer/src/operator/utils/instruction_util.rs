@@ -259,6 +259,11 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub transaction_id: i64,
     pub trace_id: String,
     pub remint_info: Option<WithdrawalRemintInfo>,
+    /// The row's `updated_at` at the moment this builder took ownership of it,
+    /// used as the token the sender CASes on when it claims the row before
+    /// broadcasting. Proves the release is still the same `Processing`
+    /// incarnation, so a row recovery has since demoted is never released.
+    pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Builder for simple SPL token mint instructions (deposit flow)
@@ -577,6 +582,7 @@ mod tests {
             transaction_id: 7,
             trace_id: "trace-rf".to_string(),
             remint_info: None,
+            fetched_updated_at: chrono::Utc::now(),
         }))
     }
 

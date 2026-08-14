@@ -1452,7 +1452,7 @@ async fn try_requeue_prebroadcast_not_processing_is_noop() -> Result<(), Box<dyn
     Ok(())
 }
 
-// ── claim_and_persist_deposit_signature: ownership CAS + write-ahead ──────────
+// ── claim_and_persist_signature: ownership CAS + write-ahead ─────────────────
 
 /// The lock must hand back the post-lock token: the returned row's `status` is
 /// `Processing` and its `updated_at` is the trigger-bumped value equal to the
@@ -1505,7 +1505,7 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
     let token = updated_at_of(&pool, id).await;
 
     let epoch = storage
-        .claim_and_persist_deposit_signature(id, token, "sig-claim".to_string(), 555)
+        .claim_and_persist_signature(id, token, "sig-claim".to_string(), 555)
         .await?
         .expect("owning the Processing incarnation must claim");
     let sigs = storage.get_release_signatures(id).await?;
@@ -1521,7 +1521,7 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
     // A stale token must abort atomically: no new sig, no timestamp change.
     let stale = bumped - chrono::Duration::seconds(60);
     let failed = storage
-        .claim_and_persist_deposit_signature(id, stale, "sig-fail".to_string(), 1)
+        .claim_and_persist_signature(id, stale, "sig-fail".to_string(), 1)
         .await?;
     assert!(failed.is_none(), "a stale token must not claim");
     assert_eq!(
@@ -1554,14 +1554,14 @@ async fn claim_dedups_signature_on_conflict() -> Result<(), Box<dyn std::error::
 
     let token1 = updated_at_of(&pool, id).await;
     let token2 = storage
-        .claim_and_persist_deposit_signature(id, token1, "dup-sig".to_string(), 1)
+        .claim_and_persist_signature(id, token1, "dup-sig".to_string(), 1)
         .await?
         .expect("the first claim must own the fetch-time token");
     // The first claim's returned epoch is presented directly as the second
     // claim's token, pinning that a returned epoch is a valid next CAS token.
     // The re-inserted duplicate signature must be deduped.
     assert!(storage
-        .claim_and_persist_deposit_signature(id, token2, "dup-sig".to_string(), 999)
+        .claim_and_persist_signature(id, token2, "dup-sig".to_string(), 999)
         .await?
         .is_some());
     assert_eq!(

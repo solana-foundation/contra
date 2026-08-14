@@ -563,8 +563,16 @@ async fn test_concurrent_remint_claims_exactly_one_wins() -> Result<(), Box<dyn 
     let storage_a = storage.clone();
     let storage_b = storage.clone();
     let (won_a, won_b) = tokio::join!(
-        tokio::spawn(async move { storage_a.claim_remint_attempt(tx_id, sig_a, 100, &[]).await }),
-        tokio::spawn(async move { storage_b.claim_remint_attempt(tx_id, sig_b, 200, &[]).await }),
+        tokio::spawn(async move {
+            storage_a
+                .claim_remint_attempt(tx_id, sig_a, 100, None, &[])
+                .await
+        }),
+        tokio::spawn(async move {
+            storage_b
+                .claim_remint_attempt(tx_id, sig_b, 200, None, &[])
+                .await
+        }),
     );
     let won_a = won_a.expect("racer a not panic").expect("claim a ok");
     let won_b = won_b.expect("racer b not panic").expect("claim b ok");
@@ -600,7 +608,7 @@ async fn test_concurrent_supersede_of_same_dead_attempt_exactly_one_wins(
     let dead = Signature::new_unique().to_string();
     assert!(
         storage
-            .claim_remint_attempt(tx_id, dead.clone(), 100, &[])
+            .claim_remint_attempt(tx_id, dead.clone(), 100, None, &[])
             .await?
     );
 
@@ -614,12 +622,12 @@ async fn test_concurrent_supersede_of_same_dead_attempt_exactly_one_wins(
     let (won_a, won_b) = tokio::join!(
         tokio::spawn(async move {
             storage_a
-                .claim_remint_attempt(tx_id, sig_a, 300, &obs_a)
+                .claim_remint_attempt(tx_id, sig_a, 300, None, &obs_a)
                 .await
         }),
         tokio::spawn(async move {
             storage_b
-                .claim_remint_attempt(tx_id, sig_b, 400, &obs_b)
+                .claim_remint_attempt(tx_id, sig_b, 400, None, &obs_b)
                 .await
         }),
     );
@@ -640,7 +648,7 @@ async fn test_concurrent_supersede_of_same_dead_attempt_exactly_one_wins(
         "dead attempt kept plus one winner; got {stored:?}"
     );
     assert!(
-        stored.iter().any(|(sig, _)| sig == &dead),
+        stored.iter().any(|s| s.signature == dead),
         "the superseded attempt must remain readable for classification"
     );
 
@@ -661,14 +669,14 @@ async fn test_claim_without_naming_the_live_attempt_is_refused(
     let first = Signature::new_unique().to_string();
     assert!(
         storage
-            .claim_remint_attempt(tx_id, first.clone(), 100, &[])
+            .claim_remint_attempt(tx_id, first.clone(), 100, None, &[])
             .await?
     );
 
     // Nothing named: the live attempt stands and the claim is refused.
     assert!(
         !storage
-            .claim_remint_attempt(tx_id, Signature::new_unique().to_string(), 200, &[])
+            .claim_remint_attempt(tx_id, Signature::new_unique().to_string(), 200, None, &[])
             .await?,
         "a claim that supersedes nothing must not displace a live attempt"
     );
@@ -678,7 +686,13 @@ async fn test_claim_without_naming_the_live_attempt_is_refused(
     let second = Signature::new_unique().to_string();
     assert!(
         storage
-            .claim_remint_attempt(tx_id, second.clone(), 300, std::slice::from_ref(&first))
+            .claim_remint_attempt(
+                tx_id,
+                second.clone(),
+                300,
+                None,
+                std::slice::from_ref(&first)
+            )
             .await?,
         "a proven-dead attempt must be supersedable"
     );
@@ -686,14 +700,20 @@ async fn test_claim_without_naming_the_live_attempt_is_refused(
     // Naming the same now-superseded attempt again wins nothing.
     assert!(
         !storage
-            .claim_remint_attempt(tx_id, Signature::new_unique().to_string(), 400, &[first])
+            .claim_remint_attempt(
+                tx_id,
+                Signature::new_unique().to_string(),
+                400,
+                None,
+                &[first]
+            )
             .await?,
         "a second supersede of an already-retired attempt must not take the slot"
     );
 
     let stored = storage.get_remint_signatures(tx_id).await?;
     assert_eq!(stored.len(), 2, "history kept, one live; got {stored:?}");
-    assert!(stored.iter().any(|(sig, _)| sig == &second));
+    assert!(stored.iter().any(|s| s.signature == second));
 
     Ok(())
 }

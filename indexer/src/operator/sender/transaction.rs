@@ -544,12 +544,14 @@ pub(super) async fn persist_signature_or_abort(
     transaction_id: i64,
     signature: &Signature,
     last_valid_block_height: u64,
+    blockhash_slot: u64,
 ) -> Result<(), ()> {
     if let Err(e) = storage
         .insert_release_signature(
             transaction_id,
             signature.to_string(),
             last_valid_block_height as i64,
+            i64::try_from(blockhash_slot).ok(),
         )
         .await
     {
@@ -614,7 +616,7 @@ pub(super) async fn send_and_confirm(
     let send_start = std::time::Instant::now();
 
     // Build and sign before broadcasting so the signature can be persisted write-ahead.
-    let (transaction, signature, last_valid_block_height) =
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
         match build_and_sign(&state.rpc_client, instruction.clone()).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -666,6 +668,7 @@ pub(super) async fn send_and_confirm(
             txid,
             &signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
         .is_err()
@@ -705,6 +708,7 @@ pub(super) async fn send_and_confirm(
                     .push(PendingSig {
                         signature,
                         last_valid_block_height,
+                        blockhash_slot: Some(blockhash_slot),
                     });
             }
 
@@ -1451,7 +1455,7 @@ pub(super) async fn fire_and_store(
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
         .await
     {
-        Ok((signature, _last_valid_block_height)) => {
+        Ok((signature, _last_valid_block_height, _blockhash_slot)) => {
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, "in_flight"])
                 .observe(send_start.elapsed().as_secs_f64());
@@ -1568,7 +1572,7 @@ pub(super) async fn fire_and_store_task(
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
-    let (transaction, signature, last_valid_block_height) = match build_and_sign(
+    let (transaction, signature, last_valid_block_height, blockhash_slot) = match build_and_sign(
         &rpc_client,
         instruction.clone(),
     )
@@ -1628,6 +1632,7 @@ pub(super) async fn fire_and_store_task(
                     deposit_expected_updated_at,
                     signature.to_string(),
                     last_valid_block_height as i64,
+                    i64::try_from(blockhash_slot).ok(),
                 )
                 .await
             {
@@ -2340,6 +2345,7 @@ mod tests {
             vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
         // The PendingRemint transition is guarded on a Processing row, and the
@@ -2351,7 +2357,7 @@ mod tests {
             .lock()
             .unwrap()
             .push(processing_withdrawal_row(10, 5));
-        mock.insert_release_signature(10, sig.to_string(), 0)
+        mock.insert_release_signature(10, sig.to_string(), 0, None)
             .await
             .unwrap();
 
@@ -2642,6 +2648,7 @@ mod tests {
             vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2681,6 +2688,7 @@ mod tests {
             .push(PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             });
 
         assert!(state.pending_signatures.contains_key(&nonce));
@@ -2696,6 +2704,7 @@ mod tests {
             .push(PendingSig {
                 signature: sig2,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             });
         assert_eq!(state.pending_signatures[&nonce].len(), 2);
     }
@@ -2796,11 +2805,14 @@ mod tests {
         let stored = mock.get_release_signatures(10).await.unwrap();
         assert_eq!(stored.len(), 1, "exactly one release signature persisted");
         assert_eq!(
-            stored[0].0,
+            stored[0].signature,
             Signature::default().to_string(),
             "persisted signature must be the signed transaction's signature"
         );
-        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
+        assert_eq!(
+            stored[0].last_valid_block_height, 100,
+            "persisted lvbh must match the blockhash"
+        );
     }
 
     /// A failed write-ahead persist must NOT broadcast, must write no terminal status (row
@@ -2931,6 +2943,7 @@ mod tests {
             vec![PendingSig {
                 signature: prior_sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -3147,7 +3160,7 @@ mod tests {
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(
             state.pending_remints[0].signatures[0].signature.to_string(),
-            journaled[0].0,
+            journaled[0].signature,
             "the gate must carry the journaled signature"
         );
     }
@@ -3285,6 +3298,7 @@ mod tests {
             vec![PendingSig {
                 signature: prior_sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
         // The PendingRemint transition is guarded on a Processing row, and the
@@ -3296,7 +3310,7 @@ mod tests {
             .lock()
             .unwrap()
             .push(processing_withdrawal_row(txn_id, nonce));
-        mock.insert_release_signature(txn_id, prior_sig.to_string(), 0)
+        mock.insert_release_signature(txn_id, prior_sig.to_string(), 0, None)
             .await
             .unwrap();
 
@@ -3478,10 +3492,10 @@ mod tests {
             .lock()
             .unwrap()
             .push(processing_withdrawal_row(10, 5));
-        seed.insert_release_signature(10, sig1.to_string(), sig1_lvbh as i64)
+        seed.insert_release_signature(10, sig1.to_string(), sig1_lvbh as i64, None)
             .await
             .unwrap();
-        seed.insert_release_signature(10, sig2.to_string(), sig2_lvbh as i64)
+        seed.insert_release_signature(10, sig2.to_string(), sig2_lvbh as i64, None)
             .await
             .unwrap();
 
@@ -3582,10 +3596,10 @@ mod tests {
             .unwrap()
             .push(processing_withdrawal_row(txn_id, nonce));
         // Both attempts are journaled write-ahead, each before its own send.
-        mock.insert_release_signature(txn_id, stashed_attempt.to_string(), 100)
+        mock.insert_release_signature(txn_id, stashed_attempt.to_string(), 100, None)
             .await
             .unwrap();
-        mock.insert_release_signature(txn_id, ambiguous_attempt.to_string(), 200)
+        mock.insert_release_signature(txn_id, ambiguous_attempt.to_string(), 200, None)
             .await
             .unwrap();
 
@@ -3596,6 +3610,7 @@ mod tests {
             vec![PendingSig {
                 signature: stashed_attempt,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
         );
 
@@ -3656,7 +3671,7 @@ mod tests {
             .push(processing_withdrawal_row(txn_id, nonce));
 
         let broadcast = Signature::new_unique();
-        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
             .await
             .unwrap();
         state.remint_cache.insert(nonce, make_remint_info(txn_id));
@@ -3665,6 +3680,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -3715,7 +3731,7 @@ mod tests {
         mock.pending_transactions.lock().unwrap().push(committed);
 
         let broadcast = Signature::new_unique();
-        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
             .await
             .unwrap();
         state.remint_cache.insert(nonce, make_remint_info(txn_id));
@@ -3724,6 +3740,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -3777,7 +3794,7 @@ mod tests {
         committed.remint_signatures = Some(vec![broadcast.to_string()]);
         mock.pending_transactions.lock().unwrap().push(committed);
 
-        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
             .await
             .unwrap();
         state.remint_cache.insert(nonce, make_remint_info(txn_id));
@@ -3786,6 +3803,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -3847,7 +3865,7 @@ mod tests {
         mock.pending_transactions.lock().unwrap().push(demoted);
 
         let broadcast = Signature::new_unique();
-        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
             .await
             .unwrap();
         state.remint_cache.insert(nonce, make_remint_info(txn_id));
@@ -3856,6 +3874,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -3918,7 +3937,7 @@ mod tests {
             .push(processing_withdrawal_row(txn_id, nonce));
 
         let broadcast = Signature::new_unique();
-        mock.insert_release_signature(txn_id, broadcast.to_string(), 0)
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
             .await
             .unwrap();
         state.remint_cache.insert(nonce, make_remint_info(txn_id));
@@ -3927,6 +3946,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -6712,11 +6732,14 @@ mod tests {
         let stored = mock.get_release_signatures(77).await.unwrap();
         assert_eq!(stored.len(), 1, "exactly one retry signature journaled");
         assert_eq!(
-            stored[0].0,
+            stored[0].signature,
             Signature::default().to_string(),
             "journaled signature must be the broadcast signature"
         );
-        assert_eq!(stored[0].1, 100, "journaled lvbh must match the blockhash");
+        assert_eq!(
+            stored[0].last_valid_block_height, 100,
+            "journaled lvbh must match the blockhash"
+        );
         assert_eq!(
             state.in_flight.len(),
             1,
@@ -7324,7 +7347,7 @@ mod tests {
         };
         let sigs = mock.get_release_signatures(77).await.unwrap();
         assert_eq!(sigs.len(), 1, "owned claim persists exactly one signature");
-        assert_eq!(sigs[0].0, Signature::default().to_string());
+        assert_eq!(sigs[0].signature, Signature::default().to_string());
         assert_eq!(
             state.in_flight.len(),
             1,

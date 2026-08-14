@@ -267,6 +267,12 @@ impl SenderState {
 pub struct PendingSig {
     pub signature: Signature,
     pub last_valid_block_height: u64,
+    /// Slot the signing blockhash was read at. A transaction cannot land in a
+    /// block older than its blockhash, so this is the exact earliest slot the
+    /// signature could occupy, fixed at broadcast and immune to later changes
+    /// in the node's window. `None` on attempts journaled before it was
+    /// recorded; those fall back to deriving the bound from the window.
+    pub blockhash_slot: Option<u64>,
 }
 
 /// A remint deferred until Solana finality window passes, allowing us to verify

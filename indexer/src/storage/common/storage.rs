@@ -516,12 +516,14 @@ impl Storage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<(), StorageError> {
         insert_release_signature::insert_release_signature(
             self,
             transaction_id,
             signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
     }
@@ -538,6 +540,7 @@ impl Storage {
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
         claim_and_persist_deposit_signature::claim_and_persist_deposit_signature(
             self,
@@ -545,15 +548,16 @@ impl Storage {
             expected_updated_at,
             signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
     }
 
-    /// Stored release signatures for a transaction as (signature, lvbh).
+    /// Stored release signatures for a transaction, newest journal order.
     pub async fn get_release_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         get_release_signatures::get_release_signatures(self, transaction_id).await
     }
 
@@ -579,6 +583,7 @@ impl Storage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
     ) -> Result<bool, StorageError> {
         claim_remint_attempt::claim_remint_attempt(
@@ -586,16 +591,17 @@ impl Storage {
             transaction_id,
             signature,
             last_valid_block_height,
+            blockhash_slot,
             superseded_signatures,
         )
         .await
     }
 
-    /// Stored remint signatures for a transaction as (signature, lvbh).
+    /// Stored remint signatures for a transaction, newest journal order.
     pub async fn get_remint_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         get_remint_signatures::get_remint_signatures(self, transaction_id).await
     }
 
@@ -797,14 +803,14 @@ mod tests {
         seed_claim_row(&mock, 1, TransactionStatus::Processing, t0);
 
         let lease = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-owned".to_string(), 100)
+            .claim_and_persist_deposit_signature(1, t0, "sig-owned".to_string(), 100, None)
             .await
             .unwrap()
             .expect("owning the Processing incarnation must claim");
 
         let sigs = storage.get_release_signatures(1).await.unwrap();
         assert_eq!(sigs.len(), 1, "the broadcast signature must be persisted");
-        assert_eq!(sigs[0].0, "sig-owned");
+        assert_eq!(sigs[0].signature, "sig-owned");
 
         let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
         assert_ne!(after, t0, "a successful claim must bump updated_at");
@@ -823,7 +829,7 @@ mod tests {
         seed_claim_row(&mock, 1, TransactionStatus::Pending, t0);
 
         let claimed = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-demoted".to_string(), 100)
+            .claim_and_persist_deposit_signature(1, t0, "sig-demoted".to_string(), 100, None)
             .await
             .unwrap();
         assert!(claimed.is_none(), "a demoted row must not be claimable");
@@ -843,7 +849,7 @@ mod tests {
         seed_claim_row(&mock, 1, TransactionStatus::Processing, t1);
 
         let claimed = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-stale".to_string(), 100)
+            .claim_and_persist_deposit_signature(1, t0, "sig-stale".to_string(), 100, None)
             .await
             .unwrap();
         assert!(
@@ -861,7 +867,7 @@ mod tests {
         seed_claim_row(&mock, 1, TransactionStatus::Completed, t0);
 
         let claimed = storage
-            .claim_and_persist_deposit_signature(1, t0, "sig-terminal".to_string(), 100)
+            .claim_and_persist_deposit_signature(1, t0, "sig-terminal".to_string(), 100, None)
             .await
             .unwrap();
         assert!(claimed.is_none(), "a terminal row must not be claimable");

@@ -482,6 +482,9 @@ impl SenderState {
                         Ok(PendingSig {
                             signature,
                             last_valid_block_height,
+                            // The transactions-row mirror never carried a slot;
+                            // the journal table is the authority for one.
+                            blockhash_slot: None,
                         })
                     })
                     .collect()

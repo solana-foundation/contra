@@ -12,7 +12,7 @@ use private_channel_indexer::{
     operator::sender_lock_key,
     storage::{
         common::amount::TokenAmount,
-        common::models::{DbMint, DbMintStatus, MintStatusAtSlot},
+        common::models::{DbMint, DbMintStatus, MintStatusAtSlot, StoredSig},
         common::storage::sender_lock::SenderLockGuard,
         postgres::db::{probe_advisory_lock_held, release_advisory_lock},
         DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
@@ -1036,16 +1036,27 @@ async fn release_signature_insert_get_roundtrip() -> Result<(), Box<dyn std::err
     let id = storage.insert_db_transaction(&txn).await?;
 
     storage
-        .insert_release_signature(id, "sig-a".to_string(), 100)
+        .insert_release_signature(id, "sig-a".to_string(), 100, None)
         .await?;
     storage
-        .insert_release_signature(id, "sig-b".to_string(), 200)
+        .insert_release_signature(id, "sig-b".to_string(), 200, None)
         .await?;
 
     let rows = storage.get_release_signatures(id).await?;
     assert_eq!(
         rows,
-        vec![("sig-a".to_string(), 100), ("sig-b".to_string(), 200)]
+        vec![
+            StoredSig {
+                signature: "sig-a".to_string(),
+                last_valid_block_height: 100,
+                blockhash_slot: None
+            },
+            StoredSig {
+                signature: "sig-b".to_string(),
+                last_valid_block_height: 200,
+                blockhash_slot: None
+            },
+        ]
     );
     Ok(())
 }
@@ -1058,16 +1069,24 @@ async fn release_signature_insert_is_idempotent_on_signature(
     let id = storage.insert_db_transaction(&txn).await?;
 
     storage
-        .insert_release_signature(id, "dup-sig".to_string(), 100)
+        .insert_release_signature(id, "dup-sig".to_string(), 100, None)
         .await?;
     // Same signature again is a no-op (ON CONFLICT DO NOTHING).
     storage
-        .insert_release_signature(id, "dup-sig".to_string(), 999)
+        .insert_release_signature(id, "dup-sig".to_string(), 999, None)
         .await?;
 
     let rows = storage.get_release_signatures(id).await?;
     assert_eq!(rows.len(), 1, "duplicate signature must not double-insert");
-    assert_eq!(rows[0], ("dup-sig".to_string(), 100), "first write wins");
+    assert_eq!(
+        rows[0],
+        StoredSig {
+            signature: "dup-sig".to_string(),
+            last_valid_block_height: 100,
+            blockhash_slot: None
+        },
+        "first write wins"
+    );
     Ok(())
 }
 
@@ -1078,10 +1097,10 @@ async fn release_signature_delete_removes_all_for_txn() -> Result<(), Box<dyn st
     let id = storage.insert_db_transaction(&txn).await?;
 
     storage
-        .insert_release_signature(id, "sig-x".to_string(), 1)
+        .insert_release_signature(id, "sig-x".to_string(), 1, None)
         .await?;
     storage
-        .insert_release_signature(id, "sig-y".to_string(), 2)
+        .insert_release_signature(id, "sig-y".to_string(), 2, None)
         .await?;
     storage.delete_release_signatures(id).await?;
     assert!(storage.get_release_signatures(id).await?.is_empty());
@@ -1125,7 +1144,7 @@ async fn release_signature_gc_retains_non_terminal() -> Result<(), Box<dyn std::
         .execute(&pool)
         .await?;
         storage
-            .insert_release_signature(id, format!("sig-{status}"), 1)
+            .insert_release_signature(id, format!("sig-{status}"), 1, None)
             .await?;
         ids.push((status, id, survive));
     }
@@ -1251,11 +1270,15 @@ async fn release_signature_reuses_table_for_deposit() -> Result<(), Box<dyn std:
     let id = storage.insert_db_transaction(&txn).await?;
 
     storage
-        .insert_release_signature(id, "sig-deposit".to_string(), 100)
+        .insert_release_signature(id, "sig-deposit".to_string(), 100, None)
         .await?;
     assert_eq!(
         storage.get_release_signatures(id).await?,
-        vec![("sig-deposit".to_string(), 100)],
+        vec![StoredSig {
+            signature: "sig-deposit".to_string(),
+            last_valid_block_height: 100,
+            blockhash_slot: None
+        }],
         "deposit signature round-trips like a withdrawal"
     );
 
@@ -1280,7 +1303,7 @@ async fn release_signature_cascade_on_transaction_delete() -> Result<(), Box<dyn
     let txn = make_db_transaction("rel_cascade", TransactionType::Withdrawal);
     let id = storage.insert_db_transaction(&txn).await?;
     storage
-        .insert_release_signature(id, "sig-cascade".to_string(), 1)
+        .insert_release_signature(id, "sig-cascade".to_string(), 1, None)
         .await?;
 
     sqlx::query("DELETE FROM transactions WHERE id = $1")
@@ -1505,12 +1528,19 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
     let token = updated_at_of(&pool, id).await;
 
     let epoch = storage
-        .claim_and_persist_deposit_signature(id, token, "sig-claim".to_string(), 555)
+        .claim_and_persist_deposit_signature(id, token, "sig-claim".to_string(), 555, None)
         .await?
         .expect("owning the Processing incarnation must claim");
     let sigs = storage.get_release_signatures(id).await?;
     assert_eq!(sigs.len(), 1, "a successful claim persists exactly one sig");
-    assert_eq!(sigs[0], ("sig-claim".to_string(), 555));
+    assert_eq!(
+        sigs[0],
+        StoredSig {
+            signature: "sig-claim".to_string(),
+            last_valid_block_height: 555,
+            blockhash_slot: None
+        }
+    );
     let bumped = updated_at_of(&pool, id).await;
     assert_ne!(bumped, token, "a successful claim bumps updated_at");
     assert_eq!(
@@ -1521,7 +1551,7 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
     // A stale token must abort atomically: no new sig, no timestamp change.
     let stale = bumped - chrono::Duration::seconds(60);
     let failed = storage
-        .claim_and_persist_deposit_signature(id, stale, "sig-fail".to_string(), 1)
+        .claim_and_persist_deposit_signature(id, stale, "sig-fail".to_string(), 1, None)
         .await?;
     assert!(failed.is_none(), "a stale token must not claim");
     assert_eq!(
@@ -1554,14 +1584,14 @@ async fn claim_dedups_signature_on_conflict() -> Result<(), Box<dyn std::error::
 
     let token1 = updated_at_of(&pool, id).await;
     let token2 = storage
-        .claim_and_persist_deposit_signature(id, token1, "dup-sig".to_string(), 1)
+        .claim_and_persist_deposit_signature(id, token1, "dup-sig".to_string(), 1, None)
         .await?
         .expect("the first claim must own the fetch-time token");
     // The first claim's returned epoch is presented directly as the second
     // claim's token, pinning that a returned epoch is a valid next CAS token.
     // The re-inserted duplicate signature must be deduped.
     assert!(storage
-        .claim_and_persist_deposit_signature(id, token2, "dup-sig".to_string(), 999)
+        .claim_and_persist_deposit_signature(id, token2, "dup-sig".to_string(), 999, None)
         .await?
         .is_some());
     assert_eq!(
@@ -1747,11 +1777,11 @@ async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
     // The signature column is globally unique, so re-using one is a plain 23505 from a live backend.
     assert!(
         storage
-            .claim_remint_attempt(first, "shared-signature".to_string(), 10, &[])
+            .claim_remint_attempt(first, "shared-signature".to_string(), 10, None, &[])
             .await?
     );
     let err = storage
-        .claim_remint_attempt(second, "shared-signature".to_string(), 20, &[])
+        .claim_remint_attempt(second, "shared-signature".to_string(), 20, None, &[])
         .await
         .expect_err("the duplicate signature must surface the constraint violation");
 
@@ -1762,7 +1792,7 @@ async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
     // The session is still healthy, so the next fenced write still works.
     assert!(
         storage
-            .claim_remint_attempt(second, "distinct-signature".to_string(), 20, &[])
+            .claim_remint_attempt(second, "distinct-signature".to_string(), 20, None, &[])
             .await?
     );
     Ok(())
@@ -1883,5 +1913,53 @@ async fn fenced_write_blocked_on_a_row_lock_does_not_cancel_the_operator(
         storage.try_park_processing(id).await?,
         "the lock connection must survive a contended write"
     );
+    Ok(())
+}
+
+// ── journaled blockhash slot ──────────────────────────────────────────────────
+
+/// The slot the broadcast blockhash was read at round-trips through both
+/// journals, and a write that has none reads back as NULL rather than 0, which
+/// would claim the transaction could not predate genesis.
+#[tokio::test]
+async fn blockhash_slot_round_trips_and_stays_null_when_absent(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _container) = start_postgres().await?;
+
+    let txn = make_db_transaction("slot_round_trip", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "sig-with-slot".to_string(), 1_000, Some(400))
+        .await?;
+    storage
+        .insert_release_signature(id, "sig-without-slot".to_string(), 1_000, None)
+        .await?;
+
+    let rows = storage.get_release_signatures(id).await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].blockhash_slot,
+        Some(400),
+        "the slot must round-trip"
+    );
+    assert_eq!(
+        rows[1].blockhash_slot, None,
+        "a write with no slot must stay NULL, never default to 0"
+    );
+
+    assert!(
+        storage
+            .claim_remint_attempt(id, "remint-sig".to_string(), 2_000, Some(1_500), &[])
+            .await?
+    );
+    let remints = storage.get_remint_signatures(id).await?;
+    assert_eq!(remints.len(), 1);
+    assert_eq!(
+        remints[0].blockhash_slot,
+        Some(1_500),
+        "the remint journal must carry the slot too"
+    );
+
     Ok(())
 }

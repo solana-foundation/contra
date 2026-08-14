@@ -1,7 +1,7 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
     DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
-    MintStatusAtSlot, TransactionStatus, TransactionType,
+    MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
 };
 use crate::storage::common::storage::RequeueOutcome;
 use bigdecimal::BigDecimal;
@@ -15,8 +15,8 @@ pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<
 /// (transaction_id, signatures, last_valid_block_heights, deadline) persisted on PendingRemint transition.
 pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>);
 
-/// In-memory mirror of `pending_release_signatures`: txn_id → (signature, lvbh).
-pub type ReleaseSignatureMap = HashMap<i64, Vec<(String, i64)>>;
+/// In-memory mirror of `pending_release_signatures`, keyed by transaction id.
+pub type ReleaseSignatureMap = HashMap<i64, Vec<StoredSig>>;
 
 #[derive(Clone, Default)]
 pub struct MockStorage {
@@ -1013,6 +1013,7 @@ impl MockStorage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<(), StorageError> {
         self.check_should_fail("insert_release_signature")?;
         let mut map = self.release_signatures.lock().unwrap();
@@ -1020,9 +1021,11 @@ impl MockStorage {
         if map_contains_signature(&map, &signature) {
             return Ok(());
         }
-        map.entry(transaction_id)
-            .or_default()
-            .push((signature, last_valid_block_height));
+        map.entry(transaction_id).or_default().push(StoredSig {
+            signature,
+            last_valid_block_height,
+            blockhash_slot,
+        });
         Ok(())
     }
 
@@ -1037,6 +1040,7 @@ impl MockStorage {
         expected_updated_at: DateTime<Utc>,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
         self.check_should_fail("claim_and_persist_deposit_signature")?;
         // Scope the guard so it is released before the await below.
@@ -1068,15 +1072,20 @@ impl MockStorage {
         };
 
         // Reuse the write-ahead insert (mirrors the ON CONFLICT (signature) dedup).
-        self.insert_release_signature(transaction_id, signature, last_valid_block_height)
-            .await?;
+        self.insert_release_signature(
+            transaction_id,
+            signature,
+            last_valid_block_height,
+            blockhash_slot,
+        )
+        .await?;
         Ok(Some(lease))
     }
 
     pub async fn get_release_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         self.check_should_fail("get_release_signatures")?;
         Ok(self
             .release_signatures
@@ -1138,6 +1147,7 @@ impl MockStorage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
     ) -> Result<bool, StorageError> {
         self.check_should_fail("claim_remint_attempt")?;
@@ -1147,9 +1157,9 @@ impl MockStorage {
         // Compare-and-swap scoped to the observed attempts: a slot another
         // sender took in the meantime carries a signature we never classified,
         // so it can never be retired here.
-        for (sig, _) in map.get(&transaction_id).into_iter().flatten() {
-            if superseded_signatures.contains(sig) {
-                superseded.insert(sig.clone());
+        for stored in map.get(&transaction_id).into_iter().flatten() {
+            if superseded_signatures.contains(&stored.signature) {
+                superseded.insert(stored.signature.clone());
             }
         }
 
@@ -1159,7 +1169,7 @@ impl MockStorage {
             .get(&transaction_id)
             .into_iter()
             .flatten()
-            .any(|(sig, _)| !superseded.contains(sig));
+            .any(|stored| !superseded.contains(&stored.signature));
         if live
             || self
                 .foreign_remint_claims
@@ -1170,16 +1180,18 @@ impl MockStorage {
             return Ok(false);
         }
 
-        map.entry(transaction_id)
-            .or_default()
-            .push((signature, last_valid_block_height));
+        map.entry(transaction_id).or_default().push(StoredSig {
+            signature,
+            last_valid_block_height,
+            blockhash_slot,
+        });
         Ok(true)
     }
 
     pub async fn get_remint_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         self.check_should_fail("get_remint_signatures")?;
         Ok(self
             .remint_signatures
@@ -1199,8 +1211,8 @@ impl MockStorage {
             .remove(&transaction_id);
         // Deleting the rows drops their `superseded` column values with them.
         let mut superseded = self.superseded_remint_signatures.lock().unwrap();
-        for (sig, _) in removed.into_iter().flatten() {
-            superseded.remove(&sig);
+        for stored in removed.into_iter().flatten() {
+            superseded.remove(&stored.signature);
         }
         Ok(())
     }
@@ -1234,5 +1246,5 @@ impl MockStorage {
 /// True if `signature` is already recorded for any transaction in the map.
 fn map_contains_signature(map: &ReleaseSignatureMap, signature: &str) -> bool {
     map.values()
-        .any(|sigs| sigs.iter().any(|(s, _)| s == signature))
+        .any(|sigs| sigs.iter().any(|s| s.signature == signature))
 }

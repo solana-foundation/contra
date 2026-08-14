@@ -946,6 +946,7 @@ mod tests {
             let sigs = [crate::operator::sender::types::PendingSig {
                 signature: solana_sdk::signature::Signature::new_unique(),
                 last_valid_block_height: 1_000,
+                blockhash_slot: None,
             }];
             let verdict = crate::operator::sender::classify_signatures(&finality, &sigs).await;
             assert_eq!(

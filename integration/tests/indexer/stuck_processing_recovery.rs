@@ -252,7 +252,7 @@ async fn deposit_landed_promoted_to_completed() {
 
     // The mint persisted this signature write-ahead before broadcast; it then landed.
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -359,7 +359,7 @@ async fn deposit_dead_signature_demoted() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // Persisted write-ahead before broadcast; the mint never landed and the blockhash expired.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -413,7 +413,7 @@ async fn withdrawal_dead_signature_demoted() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 7);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -498,7 +498,7 @@ async fn withdrawal_dead_but_landed_completes_without_double_pay() {
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // The release write-ahead that actually landed, though the endpoint hides it.
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -573,7 +573,7 @@ async fn withdrawal_landed_signature_completed_no_resend() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -628,7 +628,7 @@ async fn withdrawal_live_signature_left_processing() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 2);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000, None)
         .await
         .unwrap();
 
@@ -717,7 +717,7 @@ async fn withdrawal_rpc_uncertain_quarantined() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 4);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -788,10 +788,10 @@ async fn gc_reclaims_non_processing_release_sigs() {
         .execute(&pool)
         .await
         .unwrap();
-    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1)
+    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1, None)
         .await
         .unwrap();
-    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2)
+    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2, None)
         .await
         .unwrap();
 
@@ -838,7 +838,7 @@ async fn rpc_failure_deposit_quarantines_to_manual_review() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 500);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -900,7 +900,7 @@ async fn malformed_stored_sig_quarantines_deposit() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 700);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100)
+    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100, None)
         .await
         .unwrap();
 
@@ -1786,7 +1786,7 @@ async fn cross_operator_recovery_does_not_replay_deposit_mint() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -1882,7 +1882,7 @@ async fn demoted_deposit_reopens_through_gate_without_second_mint() {
     let captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // Write-ahead persist of the first (and only) mint broadcast.
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -1997,7 +1997,7 @@ async fn deposit_gate_channel_db_error_does_not_mint() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     let captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // Write-ahead persist of a broadcast whose blockhash has long expired.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 

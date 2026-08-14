@@ -85,14 +85,16 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
     if !stored.is_empty() {
         let prior_attempts: Vec<PendingSig> = match stored
             .iter()
-            .map(|(sig_string, lvbh)| {
-                let signature = Signature::from_str(sig_string)
+            .map(|stored| {
+                let signature = Signature::from_str(&stored.signature)
                     .map_err(|e| format!("invalid stored remint signature: {e}"))?;
-                let last_valid_block_height = u64::try_from(*lvbh)
+                let lvbh = stored.last_valid_block_height;
+                let last_valid_block_height = u64::try_from(lvbh)
                     .map_err(|_| format!("negative last_valid_block_height: {lvbh}"))?;
                 Ok(PendingSig {
                     signature,
                     last_valid_block_height,
+                    blockhash_slot: stored.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
                 })
             })
             .collect::<Result<Vec<_>, String>>()
@@ -129,7 +131,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
             }
             // All prior attempts finalized-failed or expired: safe to resend.
             SigFinality::Dead => {
-                proven_dead = stored.iter().map(|(sig, _)| sig.clone()).collect();
+                proven_dead = stored.iter().map(|s| s.signature.clone()).collect();
             }
         }
     }
@@ -171,7 +173,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         compute_budget: None,
     };
 
-    let (transaction, signature, last_valid_block_height) =
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
         match build_and_sign(&state.source_rpc_client, ix).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -191,6 +193,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
             info.transaction_id,
             signature.to_string(),
             lvbh_i64,
+            i64::try_from(blockhash_slot).ok(),
             &proven_dead,
         )
         .await
@@ -471,9 +474,13 @@ enum EndpointVerdict {
     DeadFinalizedFailure,
     /// At least one signature is null-status past its blockhash validity. Absence
     /// is trustworthy only if the endpoint still retains the attempt's slot range;
-    /// `min_lvbh` is the lowest such height, bounding that range.
+    /// `min_lvbh` is the lowest such height, bounding the top of that range.
     DeadByAbsence {
         min_lvbh: u64,
+        /// Lowest journaled blockhash slot across those signatures, which is the
+        /// exact bottom of the range. `None` if any of them predates the column,
+        /// in which case the bound falls back to the window derivation.
+        min_blockhash_slot: Option<u64>,
     },
 }
 
@@ -499,25 +506,35 @@ async fn retention_window(
 }
 
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
-/// attempt's slot range, else `Uncertain`. A blockhash is valid for the chain's
-/// blockhash window, so `lvbh - window` lower-bounds the landing slot
-/// (slot >= height); a floor at or below it proves retention, and the height-vs-slot
-/// slack only over-reports Uncertain, never a false covered. Assumes a single
-/// consistent archival endpoint, not a split pool.
+/// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
+/// proves retention. Assumes a single consistent archival endpoint, not a split pool.
+///
+/// The bottom of the range is the slot the attempt's blockhash was read at, journaled
+/// with the broadcast. Attempts written before that column exists have none, and fall
+/// back to `lvbh - window`: a blockhash is valid for the chain's blockhash window, so
+/// that lower-bounds the landing slot (slot >= height), and the height-vs-slot slack
+/// only over-reports Uncertain, never a false covered.
 async fn coverage_verdict(
     finality: &FinalityRpc<'_>,
     rpc: &RpcClientWithRetry,
     min_lvbh: u64,
+    min_blockhash_slot: Option<u64>,
     endpoint_label: &str,
 ) -> SigFinality {
     let chain = finality.height_source.chain_label();
-    let window = match retention_window(finality, rpc).await {
-        Ok(window) => window,
-        Err(e) => {
-            OPERATOR_ABSENCE_CLASSIFY
-                .with_label_values(&[chain, "uncertain"])
-                .inc();
-            return SigFinality::Uncertain(format!("blockhash window RPC failed: {e}"));
+    let bound = match min_blockhash_slot {
+        Some(slot) => slot,
+        None => {
+            let window = match retention_window(finality, rpc).await {
+                Ok(window) => window,
+                Err(e) => {
+                    OPERATOR_ABSENCE_CLASSIFY
+                        .with_label_values(&[chain, "uncertain"])
+                        .inc();
+                    return SigFinality::Uncertain(format!("blockhash window RPC failed: {e}"));
+                }
+            };
+            min_lvbh.saturating_sub(window)
         }
     };
     let floor = match rpc.get_first_available_block().await {
@@ -529,7 +546,6 @@ async fn coverage_verdict(
             return SigFinality::Uncertain(format!("ledger floor RPC failed: {e}"));
         }
     };
-    let bound = min_lvbh.saturating_sub(window);
     if floor <= bound {
         OPERATOR_ABSENCE_CLASSIFY
             .with_label_values(&[chain, "dead"])
@@ -566,15 +582,19 @@ pub(crate) async fn classify_signatures(
     // Primary and fallback are same-chain by construction, so both endpoints read
     // the current height the same way.
     let height_source = finality.height_source;
-    let primary_lvbh = match classify_endpoint(finality.primary, sigs, height_source).await {
-        EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
-        EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
-        EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
-        // A finalized-failed status is immutable on-chain evidence, so trust it directly and
-        // skip fallback corroboration; only an absence-based Dead needs a coverage proof.
-        EndpointVerdict::DeadFinalizedFailure => return SigFinality::Dead,
-        EndpointVerdict::DeadByAbsence { min_lvbh } => min_lvbh,
-    };
+    let (primary_lvbh, primary_blockhash_slot) =
+        match classify_endpoint(finality.primary, sigs, height_source).await {
+            EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
+            EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
+            EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
+            // A finalized-failed status is immutable on-chain evidence, so trust it directly and
+            // skip fallback corroboration; only an absence-based Dead needs a coverage proof.
+            EndpointVerdict::DeadFinalizedFailure => return SigFinality::Dead,
+            EndpointVerdict::DeadByAbsence {
+                min_lvbh,
+                min_blockhash_slot,
+            } => (min_lvbh, min_blockhash_slot),
+        };
 
     match finality.fallback {
         // Destination path: the primary is allowed to be pruned (that is why the
@@ -591,13 +611,23 @@ pub(crate) async fn classify_signatures(
             }
             EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
             EndpointVerdict::DeadFinalizedFailure => SigFinality::Dead,
-            EndpointVerdict::DeadByAbsence { min_lvbh } => {
-                coverage_verdict(finality, fb, min_lvbh, "fallback ").await
-            }
+            EndpointVerdict::DeadByAbsence {
+                min_lvbh,
+                min_blockhash_slot,
+            } => coverage_verdict(finality, fb, min_lvbh, min_blockhash_slot, "fallback ").await,
         },
         // Source/escrow single endpoint: no second node can corroborate, so the
         // sole endpoint's coverage is the whole protection.
-        None => coverage_verdict(finality, finality.primary, primary_lvbh, "").await,
+        None => {
+            coverage_verdict(
+                finality,
+                finality.primary,
+                primary_lvbh,
+                primary_blockhash_slot,
+                "",
+            )
+            .await
+        }
     }
 }
 
@@ -677,6 +707,10 @@ async fn classify_endpoint(
     // Lowest lvbh across null-status expired sigs bounds the slot range whose
     // retention the coverage proof must cover.
     let mut min_absent_lvbh: Option<u64> = None;
+    // Lowest journaled blockhash slot across those same sigs, the exact bottom of
+    // that range. Latched off the moment one of them has none.
+    let mut min_absent_blockhash_slot: Option<u64> = None;
+    let mut absent_slot_unknown = false;
 
     // Walk the sigs to see if any could still land (index-aligned with response.value).
     for (index, pending_sig) in sigs.iter().enumerate() {
@@ -700,6 +734,20 @@ async fn classify_endpoint(
                     m.min(pending_sig.last_valid_block_height)
                 }),
             );
+            // One attempt without a journaled slot forfeits the exact bound for
+            // the whole set: the proof must cover every absent signature, and
+            // that one's earliest possible block is unknown.
+            match pending_sig.blockhash_slot {
+                Some(slot) if !absent_slot_unknown => {
+                    min_absent_blockhash_slot =
+                        Some(min_absent_blockhash_slot.map_or(slot, |m: u64| m.min(slot)));
+                }
+                Some(_) => {}
+                None => {
+                    absent_slot_unknown = true;
+                    min_absent_blockhash_slot = None;
+                }
+            }
             continue;
         }
         return EndpointVerdict::Live(format!(
@@ -710,7 +758,10 @@ async fn classify_endpoint(
 
     match min_absent_lvbh {
         // At least one sig is an expired absence: its non-inclusion needs a proof.
-        Some(min_lvbh) => EndpointVerdict::DeadByAbsence { min_lvbh },
+        Some(min_lvbh) => EndpointVerdict::DeadByAbsence {
+            min_lvbh,
+            min_blockhash_slot: min_absent_blockhash_slot,
+        },
         // No absence: every sig carried a finalized-failed status.
         None => EndpointVerdict::DeadFinalizedFailure,
     }
@@ -1090,6 +1141,7 @@ mod tests {
     use crate::operator::RetryConfig;
     use crate::operator::RpcClientWithRetry;
     use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::StoredSig;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
     use solana_sdk::commitment_config::CommitmentConfig;
@@ -1450,6 +1502,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1485,6 +1538,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "max retries".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1538,6 +1592,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1587,6 +1642,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "max retries".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1654,6 +1710,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1672,6 +1729,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: future_deadline,
@@ -1769,6 +1827,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1879,6 +1938,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: recorded,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -1979,6 +2039,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2027,6 +2088,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2096,6 +2158,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2134,10 +2197,14 @@ mod tests {
         // A prior remint attempt is on record, so classification must run before
         // any resend — and the source backend errors, making it unverifiable.
         let unverifiable = Signature::new_unique().to_string();
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(700, vec![(unverifiable.clone(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            700,
+            vec![StoredSig {
+                signature: unverifiable.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         let _status = mock_rpc(
             &mut rpc_server,
             "getSignatureStatuses",
@@ -2156,6 +2223,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2231,6 +2299,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2319,6 +2388,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2398,6 +2468,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "timeout".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2476,6 +2547,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -2545,10 +2617,12 @@ mod tests {
                 PendingSig {
                     signature: sig1,
                     last_valid_block_height: 0,
+                    blockhash_slot: None,
                 },
                 PendingSig {
                     signature: sig2,
                     last_valid_block_height: 0,
+                    blockhash_slot: None,
                 },
             ],
             original_error: "release_funds failed".to_string(),
@@ -2613,10 +2687,12 @@ mod tests {
             PendingSig {
                 signature: failed,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             },
             PendingSig {
                 signature: success,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             },
         ];
 
@@ -2651,10 +2727,12 @@ mod tests {
             PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             },
             PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             },
         ];
 
@@ -2691,10 +2769,12 @@ mod tests {
             PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             },
             PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 2000,
+                blockhash_slot: None,
             },
         ];
 
@@ -2725,10 +2805,12 @@ mod tests {
             PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             },
             PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             },
         ];
 
@@ -2774,6 +2856,7 @@ mod tests {
         vec![PendingSig {
             signature: Signature::new_unique(),
             last_valid_block_height: 100,
+            blockhash_slot: None,
         }]
     }
 
@@ -3238,6 +3321,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3295,6 +3379,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 1000,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3351,6 +3436,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 1000,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3411,6 +3497,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3483,6 +3570,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3564,10 +3652,14 @@ mod tests {
         seed_pending_remint_row(&mock, 901, 0);
         // A prior attempt is on record, so classification runs before any resend.
         let live_attempt = Signature::new_unique().to_string();
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(901, vec![(live_attempt.clone(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            901,
+            vec![StoredSig {
+                signature: live_attempt.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {
@@ -3581,6 +3673,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3656,10 +3749,14 @@ mod tests {
         let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         let at_cap = MAX_FINALITY_CHECK_ATTEMPTS - 1;
         seed_pending_remint_row(&mock, txn_id, at_cap as i32);
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(txn_id, vec![(Signature::new_unique().to_string(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            txn_id,
+            vec![StoredSig {
+                signature: Signature::new_unique().to_string(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {
@@ -3673,6 +3770,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3752,6 +3850,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3821,6 +3920,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3904,6 +4004,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -3977,10 +4078,14 @@ mod tests {
             row.remint_last_valid_block_heights = Some(vec![0]);
             row.pending_remint_deadline_at = Some(Utc::now() - chrono::Duration::seconds(1));
         }
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(905, vec![(landed_remint.to_string(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            905,
+            vec![StoredSig {
+                signature: landed_remint.to_string(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         // Restart: rehydrate the queue from the DB row.
@@ -4033,10 +4138,14 @@ mod tests {
 
         let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url(), None);
         seed_pending_remint_row(&mock, 906, 0);
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(906, vec![(landed_sig.to_string(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            906,
+            vec![StoredSig {
+                signature: landed_sig.to_string(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         // The durable terminal write fails.
         mock.set_should_fail("record_remint_result", true);
         let (storage_tx, _storage_rx) = mpsc::channel(10);
@@ -4052,6 +4161,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -4064,7 +4174,11 @@ mod tests {
         // landed signature instead of broadcasting a duplicate.
         assert_eq!(
             mock.remint_signatures.lock().unwrap().get(&906),
-            Some(&vec![(landed_sig.to_string(), 0)]),
+            Some(&vec![StoredSig {
+                signature: landed_sig.to_string(),
+                last_valid_block_height: 0,
+                blockhash_slot: None
+            }]),
             "write-ahead rows must be kept when the terminal record write fails"
         );
     }
@@ -4135,6 +4249,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: release_sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -4176,6 +4291,16 @@ mod tests {
         vec![PendingSig {
             signature: Signature::new_unique(),
             last_valid_block_height: lvbh,
+            blockhash_slot: None,
+        }]
+    }
+
+    /// One absent signature whose broadcast blockhash slot was journaled.
+    fn sig_with_slot(lvbh: u64, blockhash_slot: u64) -> Vec<PendingSig> {
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: lvbh,
+            blockhash_slot: Some(blockhash_slot),
         }]
     }
 
@@ -4440,7 +4565,7 @@ mod tests {
 
     /// Coverage check on the Solana window against a single endpoint.
     async fn solana_coverage(rpc: &RpcClientWithRetry, min_lvbh: u64) -> SigFinality {
-        coverage_verdict(&FinalityRpc::solana(rpc, None), rpc, min_lvbh, "").await
+        coverage_verdict(&FinalityRpc::solana(rpc, None), rpc, min_lvbh, None, "").await
     }
 
     /// Register a single `getFirstAvailableBlock` reply and return a fast client.
@@ -4562,6 +4687,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -4590,10 +4716,14 @@ mod tests {
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         // A prior remint attempt is on record, so classification runs before resend.
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(710, vec![(Signature::new_unique().to_string(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            710,
+            vec![StoredSig {
+                signature: Signature::new_unique().to_string(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         // Source is the channel: the context slot (200) is the block height and is
         // already past the stored attempt's lvbh (0), so no getBlockHeight is needed.
         mock_rpc(
@@ -4636,6 +4766,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -4669,10 +4800,14 @@ mod tests {
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         let dead_attempt = Signature::new_unique().to_string();
-        mock.remint_signatures
-            .lock()
-            .unwrap()
-            .insert(720, vec![(dead_attempt.clone(), 0)]);
+        mock.remint_signatures.lock().unwrap().insert(
+            720,
+            vec![StoredSig {
+                signature: dead_attempt.clone(),
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
         // Source is the channel: expired absence (context slot 200 past lvbh 0) with a
         // covered floor, so classification is Dead without a getBlockHeight call.
         mock_rpc(
@@ -4720,6 +4855,7 @@ mod tests {
             signatures: vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
@@ -4744,6 +4880,156 @@ mod tests {
             2,
             "history kept plus the new claim: {stored:?}"
         );
-        assert_eq!(stored[0].0, dead_attempt);
+        assert_eq!(stored[0].signature, dead_attempt);
+    }
+
+    // ── per-attempt blockhash slot ──────────────────────────────────
+
+    /// The journaled slot is the exact earliest block the signature could be in,
+    /// so it decides the proof outright: same floor, opposite verdicts.
+    #[tokio::test]
+    async fn journaled_slot_decides_the_coverage_verdict() {
+        for (slot, expect_dead) in [(900u64, true), (400u64, false)] {
+            let mut server = mockito::Server::new_async().await;
+            mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+            mock_floor(&mut server, 800).await;
+
+            let p = make_rpc(&server.url());
+            let finality = FinalityRpc::channel(&p, None, 150);
+            let verdict = classify_signatures(&finality, &sig_with_slot(1000, slot)).await;
+            assert_eq!(
+                matches!(verdict, SigFinality::Dead),
+                expect_dead,
+                "journaled slot {slot} must bound the retention proof"
+            );
+        }
+    }
+
+    /// The whole point of journaling the slot: a node narrowed after the attempt
+    /// was broadcast cannot shrink that attempt's bound. The window says 150,
+    /// which would put the bound at 850 and pass the floor of 800, but the
+    /// attempt was actually signed at slot 400 and could be in a pruned block.
+    #[tokio::test]
+    async fn a_narrowed_window_cannot_shrink_a_journaled_bound() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 800).await;
+        mock_window(&mut server, 150).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, 150);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sig_with_slot(1000, 400)).await,
+                SigFinality::Uncertain(_)
+            ),
+            "the journaled slot, not the current window, must bound the proof"
+        );
+    }
+
+    /// A journaled slot makes the bound self-contained, so the window is never
+    /// read. Registering no `getLatestBlockhash` proves the call does not happen:
+    /// an unreadable window would otherwise be Uncertain, and this is Dead.
+    #[tokio::test]
+    async fn journaled_slot_needs_no_window_rpc() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 800).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, 150);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sig_with_slot(1000, 900)).await,
+                SigFinality::Dead
+            ),
+            "a journaled slot must not consult the blockhash window"
+        );
+    }
+
+    /// Rows written before the column exists carry no slot, so they keep the
+    /// window derivation: bound 1000 - 600 = 400, floor 800 above it.
+    #[tokio::test]
+    async fn absent_slot_falls_back_to_the_window() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 800).await;
+        mock_window(&mut server, 600).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, 150);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sig_with_lvbh(1000)).await,
+                SigFinality::Uncertain(_)
+            ),
+            "a row with no journaled slot must still be bounded by the window"
+        );
+    }
+
+    /// The proof has to cover every absent signature, so one attempt without a
+    /// journaled slot forfeits the exact bound for the whole set even though the
+    /// other attempt has one that would have proven coverage on its own.
+    #[tokio::test]
+    async fn one_absent_sig_without_a_slot_forfeits_the_exact_bound() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 800).await;
+        mock_window(&mut server, 600).await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 1000,
+                blockhash_slot: Some(900),
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 1000,
+                blockhash_slot: None,
+            },
+        ];
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, 150);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sigs).await,
+                SigFinality::Uncertain(_)
+            ),
+            "an unknown bound on any absent signature must not be ignored"
+        );
+    }
+
+    /// Several journaled slots: the lowest one bounds the range, since the proof
+    /// must reach the earliest block any of them could occupy.
+    #[tokio::test]
+    async fn lowest_journaled_slot_bounds_the_set() {
+        let mut server = mockito::Server::new_async().await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_floor(&mut server, 800).await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 1000,
+                blockhash_slot: Some(950),
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 1000,
+                blockhash_slot: Some(700),
+            },
+        ];
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None, 150);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sigs).await,
+                SigFinality::Uncertain(_)
+            ),
+            "the lowest journaled slot must bound the set"
+        );
     }
 }

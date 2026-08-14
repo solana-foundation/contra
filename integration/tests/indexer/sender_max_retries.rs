@@ -308,7 +308,7 @@ async fn deferral_with_ambiguous_send_gates_on_journaled_signature() {
     assert_eq!(state.pending_remints.len(), 1);
     assert_eq!(
         state.pending_remints[0].signatures[0].signature.to_string(),
-        journaled[0].0,
+        journaled[0].signature,
         "the gate must carry the journaled signature"
     );
     mock.shutdown().await;
@@ -333,7 +333,7 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
     seed_processing_withdrawal_row(&mock_storage, 602, 22);
     let prior_attempt = Signature::new_unique();
     mock_storage
-        .insert_release_signature(602, prior_attempt.to_string(), 0)
+        .insert_release_signature(602, prior_attempt.to_string(), 0, None)
         .await
         .expect("journal the earlier broadcast");
     state.pending_signatures.insert(
@@ -341,6 +341,7 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
         vec![PendingSig {
             signature: prior_attempt,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         }],
     );
 
@@ -408,7 +409,7 @@ async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
     seed_processing_withdrawal_row(&mock_storage, 603, 23);
     let prior_attempt = Signature::new_unique();
     mock_storage
-        .insert_release_signature(603, prior_attempt.to_string(), 0)
+        .insert_release_signature(603, prior_attempt.to_string(), 0, None)
         .await
         .expect("journal the earlier broadcast");
     state.pending_signatures.insert(
@@ -416,6 +417,7 @@ async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
         vec![PendingSig {
             signature: prior_attempt,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         }],
     );
     mock_storage.set_should_fail("set_pending_remint", true);

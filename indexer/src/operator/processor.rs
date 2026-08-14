@@ -3570,7 +3570,7 @@ mod tests {
             TransactionType::Deposit,
         );
         mock.pending_transactions.lock().unwrap().push(txn.clone());
-        mock.insert_release_signature(txn.id, sig.to_string(), lvbh)
+        mock.insert_release_signature(txn.id, sig.to_string(), lvbh, None)
             .await
             .unwrap();
         txn

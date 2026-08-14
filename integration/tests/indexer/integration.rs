@@ -424,7 +424,8 @@ async fn verify_deposit_indexing(
 
     // Wait for checkpoint
     println!("Waiting for checkpoints to reach slot {}...", current_slot);
-    let checkpoint_ready = db::wait_for_checkpoint(pool, "escrow", current_slot, 30).await?;
+    let checkpoint_ready =
+        db::wait_for_checkpoint(pool, "escrow", current_slot, *WAIT_TIMEOUT_SECS).await?;
 
     assert!(checkpoint_ready, "Checkpoint did not catch up");
     println!("✓ Indexer caught up to slot {}\n", current_slot);
@@ -652,12 +653,7 @@ async fn execute_tree_rotation_boundary_phase(
             small_amount,
         )
         .await?;
-        operator_util::wait_for_transaction_completion(
-            pool,
-            &withdrawal_tx.signature,
-            *WAIT_TIMEOUT_SECS,
-        )
-        .await?;
+        operator_util::wait_for_transaction_completion(pool, &withdrawal_tx.signature).await?;
         println!("  ✓ nonce {} released", next_nonce + i);
     }
 
@@ -686,12 +682,7 @@ async fn execute_tree_rotation_boundary_phase(
         calculate_user_total_deposited(0) / 20,
     )
     .await?;
-    operator_util::wait_for_transaction_completion(
-        pool,
-        &boundary_tx.signature,
-        *WAIT_TIMEOUT_SECS,
-    )
-    .await?;
+    operator_util::wait_for_transaction_completion(pool, &boundary_tx.signature).await?;
 
     // Verify the on-chain generation advanced and the bits were cleared.
     println!("\nVerifying bitmap rotation occurred...");
@@ -774,9 +765,9 @@ async fn execute_post_rotation_verification_phase(
 
     // Wait for all post-rotation withdrawals to complete
     println!("Waiting for post-rotation withdrawals to complete...");
-    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_1.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_2.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_3.signature, 60).await?;
+    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_1.signature).await?;
+    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_2.signature).await?;
+    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_3.signature).await?;
 
     println!("✓ All 3 post-rotation withdrawals completed successfully");
 

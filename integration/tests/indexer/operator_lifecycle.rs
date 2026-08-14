@@ -188,8 +188,8 @@ async fn wait_for_transaction_status(
     pool: &sqlx::PgPool,
     signature: &str,
     expected_status: &str,
-    timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout_secs = *WAIT_TIMEOUT_SECS;
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < timeout_secs {
         if let Some(tx) = db::get_transaction(pool, signature).await? {
@@ -386,7 +386,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     .await?;
 
     // 4. wait_for_transaction_completion(pool, sig, 180s)
-    operator_util::wait_for_transaction_completion(&pool, &signature, 180).await?;
+    operator_util::wait_for_transaction_completion(&pool, &signature).await?;
 
     // 5. Assert status = "completed", counterpart_signature.is_some()
     let db_tx = db::get_transaction(&pool, &signature)
@@ -477,7 +477,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &signature, 180).await?;
+    operator_util::wait_for_transaction_completion(&pool, &signature).await?;
 
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
@@ -567,8 +567,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     // Use the env-aware timeout so coverage-instrumented runs (which set
     // PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600) don't hit the 180 s ceiling that was
     // tuned for uninstrumented nextest.
-    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig, *WAIT_TIMEOUT_SECS)
-        .await?;
+    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig).await?;
 
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
@@ -684,7 +683,7 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
 
-    wait_for_transaction_status(&pool, &mint_fail_sig, "failed", 180).await?;
+    wait_for_transaction_status(&pool, &mint_fail_sig, "failed").await?;
 
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();
@@ -735,7 +734,7 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     // (`indexer/src/operator/sender/transaction.rs`) routes the row to
     // `ManualReview`, NOT `Failed` — reverting that to `Failed` would risk
     // double-reminting if the broadcast had succeeded silently.
-    wait_for_transaction_status(&pool, &withdrawal_sig, "manual_review", 180).await?;
+    wait_for_transaction_status(&pool, &withdrawal_sig, "manual_review").await?;
 
     alert_mock.assert();
 
@@ -1259,7 +1258,7 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &next_sig, *WAIT_TIMEOUT_SECS).await?;
+    operator_util::wait_for_transaction_completion(&pool, &next_sig).await?;
 
     assert!(
         !operator_handle._handle.is_finished(),
@@ -1353,8 +1352,7 @@ async fn test_second_release_of_same_nonce_moves_no_tokens(
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig, *WAIT_TIMEOUT_SECS)
-        .await?;
+    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig).await?;
 
     let balance_after_first = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
@@ -1506,7 +1504,7 @@ async fn test_withdrawal_one_generation_early_succeeds_after_rotation(
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &early_sig, *WAIT_TIMEOUT_SECS).await?;
+    operator_util::wait_for_transaction_completion(&pool, &early_sig).await?;
 
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(

@@ -9,6 +9,13 @@ cp .env.example .env
 # Generate strong values with: openssl rand -hex 32
 ```
 
+The commands below read their signers from keypair files. Create them first:
+```bash
+mkdir -p keypairs
+solana-keygen new -o ./keypairs/admin.json -s --no-bip39-passphrase  # signs create_instance / add_operator / allow_mint
+solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase   # signs deposit / withdraw
+```
+
 Run all commands from project root:
 
 ## 1. Create Instance

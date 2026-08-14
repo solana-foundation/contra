@@ -88,6 +88,18 @@ You configure and drive your escrow instance from the CLI tools in [`scripts/dev
 
 See [`scripts/devnet/README.md`](../scripts/devnet/README.md) for the full command reference; the steps below call out the relevant one at each point.
 
+The CLI tools read their signers from keypair files, so create them before running any command:
+
+```shell
+mkdir -p keypairs
+
+# Admin keypair: owns the escrow instance, signs create_instance / allow_mint / add_operator
+solana-keygen new -o ./keypairs/admin.json -s --no-bip39-passphrase
+
+# User keypair: holds the whitelisted token, signs deposit / withdraw
+solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
+```
+
 ## Step 3: Create an Escrow Instance
 
 1. **Fund your admin keypair**  
@@ -242,7 +254,7 @@ cargo run --bin add_operator -- \
 
 ### Deposit (Solana → Solana Private Channels)
 
-Run `deposit` from a keypair holding the whitelisted token on Devnet (amounts are in base units, e.g. 1 USDC is `1000000`):
+Run `deposit` from a keypair holding the whitelisted token on Devnet (amounts are in base units, e.g. 1 USDC is `1000000`). Make sure `./keypairs/user.json` has Devnet SOL for fees and holds the whitelisted token before depositing:
 
 ```shell
 cargo run --bin deposit -- \

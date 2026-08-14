@@ -3575,7 +3575,7 @@ mod tests {
             TransactionType::Deposit,
         );
         mock.pending_transactions.lock().unwrap().push(txn.clone());
-        mock.insert_release_signature(txn.id, sig.to_string(), lvbh, None)
+        mock.insert_release_signature(txn.id, sig.to_string(), lvbh, Some(0))
             .await
             .unwrap();
         txn

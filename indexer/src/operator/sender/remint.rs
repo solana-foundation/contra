@@ -487,33 +487,21 @@ enum EndpointVerdict {
 /// The window the retention proof must cover. Solana's is protocol-fixed and costs no
 /// call; a channel node's `max_blockhashes` can change under a running operator, so it
 /// is read fresh as `lvbh - context_slot`, with the startup value kept as a floor.
-async fn retention_window(
-    finality: &FinalityRpc<'_>,
-    rpc: &RpcClientWithRetry,
-) -> Result<u64, String> {
-    match finality.height_source {
-        HeightSource::BlockHeightRpc => Ok(finality.blockhash_window),
-        HeightSource::ContextSlot => {
-            let (context_slot, last_valid_block_height) = rpc
-                .get_latest_blockhash_with_context(CommitmentConfig::finalized())
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(last_valid_block_height
-                .saturating_sub(context_slot)
-                .max(finality.blockhash_window))
-        }
-    }
-}
-
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
 /// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
 /// proves retention. Assumes a single consistent archival endpoint, not a split pool.
 ///
 /// The bottom of the range is the slot the attempt's blockhash was read at, journaled
-/// with the broadcast. Attempts written before that column exists have none, and fall
-/// back to `lvbh - window`: a blockhash is valid for the chain's blockhash window, so
-/// that lower-bounds the landing slot (slot >= height), and the height-vs-slot slack
-/// only over-reports Uncertain, never a false covered.
+/// with the broadcast. An attempt journaled before that column existed carries none, and
+/// then the bound depends on whether the chain's window can move:
+///
+/// - Solana's is `MAX_PROCESSING_AGE`, fixed by the protocol, so `lvbh - window` holds no
+///   matter when the attempt was broadcast (slot >= height, and that slack only
+///   over-reports Uncertain, never a false covered).
+/// - The channel's is `max_blockhashes`, which an operator can lower. A reduction before
+///   the read would reconstruct a bound narrower than the one the attempt was actually
+///   broadcast under, and nothing left on the row can reveal that. So absence is not
+///   provable and the verdict is `Uncertain`.
 async fn coverage_verdict(
     finality: &FinalityRpc<'_>,
     rpc: &RpcClientWithRetry,
@@ -522,19 +510,18 @@ async fn coverage_verdict(
     endpoint_label: &str,
 ) -> SigFinality {
     let chain = finality.height_source.chain_label();
-    let bound = match min_blockhash_slot {
-        Some(slot) => slot,
-        None => {
-            let window = match retention_window(finality, rpc).await {
-                Ok(window) => window,
-                Err(e) => {
-                    OPERATOR_ABSENCE_CLASSIFY
-                        .with_label_values(&[chain, "uncertain"])
-                        .inc();
-                    return SigFinality::Uncertain(format!("blockhash window RPC failed: {e}"));
-                }
-            };
-            min_lvbh.saturating_sub(window)
+    let bound = match (min_blockhash_slot, finality.height_source) {
+        (Some(slot), _) => slot,
+        (None, HeightSource::BlockHeightRpc) => min_lvbh.saturating_sub(finality.blockhash_window),
+        (None, HeightSource::ContextSlot) => {
+            OPERATOR_ABSENCE_CLASSIFY
+                .with_label_values(&[chain, "uncertain"])
+                .inc();
+            return SigFinality::Uncertain(format!(
+                "{endpoint_label}attempt predates the journaled blockhash slot (lvbh {min_lvbh}); \
+                 the channel's blockhash window may have been reduced since it was broadcast, so \
+                 absence is not proof of non-inclusion"
+            ));
         }
     };
     let floor = match rpc.get_first_available_block().await {
@@ -4335,7 +4322,7 @@ mod tests {
         let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
         assert!(
             matches!(
-                classify_signatures(&finality, &sig_with_lvbh(1000)).await,
+                classify_signatures(&finality, &sig_with_slot(1000, 900)).await,
                 SigFinality::Dead
             ),
             "a context slot past lvbh must resolve the absence without a height call"
@@ -4434,7 +4421,7 @@ mod tests {
 
         let p = make_rpc(&server.url());
         let finality = FinalityRpc::channel(&p, None, MAX_PROCESSING_AGE as u64);
-        match classify_signatures(&finality, &sig_with_lvbh(100)).await {
+        match classify_signatures(&finality, &sig_with_slot(100, 50)).await {
             SigFinality::Uncertain(reason) => {
                 assert!(reason.contains("ledger floor"), "reason: {reason}")
             }
@@ -4442,91 +4429,55 @@ mod tests {
         }
     }
 
-    // ── configurable retention window ───────────────────────────────
+    // ── legacy attempts with no journaled slot ──────────────────────
 
-    /// The same floor and lvbh flip verdict on the window alone: a wider node
-    /// window pushes the earliest possible landing slot below the retained range.
+    /// The channel's `max_blockhashes` is operator-tunable, so an attempt journaled
+    /// before the slot column existed has no reconstructable bound: a reduction since
+    /// broadcast would make `lvbh - window` claim more coverage than the node has.
+    /// No window value may turn such an attempt into a `Dead`.
     #[tokio::test]
-    async fn coverage_window_widens_the_retention_bound() {
-        for (window, expect_dead) in [(150u64, true), (600u64, false)] {
+    async fn channel_absence_without_a_journaled_slot_is_uncertain() {
+        // A floor of 0 retains everything, so only the missing bound can hold it back.
+        for window in [150u64, 600u64] {
             let mut server = mockito::Server::new_async().await;
             mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
-            mock_floor(&mut server, 800).await;
+            mock_floor(&mut server, 0).await;
             mock_window(&mut server, window).await;
 
             let p = make_rpc(&server.url());
             let finality = FinalityRpc::channel(&p, None, window);
-            let verdict = classify_signatures(&finality, &sig_with_lvbh(1000)).await;
-            assert_eq!(
-                matches!(verdict, SigFinality::Dead),
-                expect_dead,
-                "window {window} must decide the retention bound"
-            );
+            match classify_signatures(&finality, &sig_with_lvbh(1000)).await {
+                SigFinality::Uncertain(reason) => assert!(
+                    reason.contains("predates the journaled blockhash slot"),
+                    "reason: {reason}"
+                ),
+                _ => panic!("a legacy channel attempt must be Uncertain"),
+            }
         }
     }
 
-    /// A node whose window grew since startup needs more retention than the
-    /// startup value demands, so the stale value would call a pruned range Dead.
+    /// Solana's window is `MAX_PROCESSING_AGE`, fixed by the protocol and beyond any
+    /// operator's reach, so a legacy attempt there keeps a sound `lvbh - window` bound.
     #[tokio::test]
-    async fn channel_window_grown_since_startup_is_uncertain() {
+    async fn solana_absence_without_a_journaled_slot_still_resolves() {
         let mut server = mockito::Server::new_async().await;
         mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
-        mock_floor(&mut server, 800).await;
-        mock_window(&mut server, 600).await;
-
-        let p = make_rpc(&server.url());
-        // The startup seed of 150 puts the bound at 850, above the floor: Dead.
-        let finality = FinalityRpc::channel(&p, None, 150);
-        assert!(
-            matches!(
-                classify_signatures(&finality, &sig_with_lvbh(1000)).await,
-                SigFinality::Uncertain(_)
-            ),
-            "a window grown since startup must be read at the decision point"
-        );
-    }
-
-    /// The fresh read is the safety mechanism, so an unreadable window fails
-    /// closed instead of falling back to the startup value alone.
-    #[tokio::test]
-    async fn channel_window_read_failure_is_uncertain() {
-        let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
-        mock_floor(&mut server, 800).await;
         mock_rpc(
             &mut server,
-            "getLatestBlockhash",
-            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"down"},"id":0}"#,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":2000,"id":0}"#,
         )
         .await;
+        mock_floor(&mut server, 0).await;
 
         let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 150);
-        match classify_signatures(&finality, &sig_with_lvbh(1000)).await {
-            SigFinality::Uncertain(reason) => {
-                assert!(reason.contains("blockhash window"), "reason: {reason}")
-            }
-            _ => panic!("an unreadable window must not fall back to the startup value"),
-        }
-    }
-
-    /// A window that shrank since the signature was signed is the opposite skew,
-    /// so the startup value stays a floor rather than being replaced.
-    #[tokio::test]
-    async fn channel_window_keeps_the_larger_startup_seed() {
-        let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
-        mock_floor(&mut server, 800).await;
-        mock_window(&mut server, 150).await;
-
-        let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 600);
+        let finality = FinalityRpc::solana(&p, None);
         assert!(
             matches!(
                 classify_signatures(&finality, &sig_with_lvbh(1000)).await,
-                SigFinality::Uncertain(_)
+                SigFinality::Dead
             ),
-            "the wider startup seed must survive a narrower fresh read"
+            "a protocol-fixed window keeps the legacy bound sound"
         );
     }
 
@@ -4808,7 +4759,7 @@ mod tests {
             vec![StoredSig {
                 signature: dead_attempt.clone(),
                 last_valid_block_height: 0,
-                blockhash_slot: None,
+                blockhash_slot: Some(0),
             }],
         );
         // Source is the channel: expired absence (context slot 200 past lvbh 0) with a
@@ -4947,26 +4898,6 @@ mod tests {
                 SigFinality::Dead
             ),
             "a journaled slot must not consult the blockhash window"
-        );
-    }
-
-    /// Rows written before the column exists carry no slot, so they keep the
-    /// window derivation: bound 1000 - 600 = 400, floor 800 above it.
-    #[tokio::test]
-    async fn absent_slot_falls_back_to_the_window() {
-        let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
-        mock_floor(&mut server, 800).await;
-        mock_window(&mut server, 600).await;
-
-        let p = make_rpc(&server.url());
-        let finality = FinalityRpc::channel(&p, None, 150);
-        assert!(
-            matches!(
-                classify_signatures(&finality, &sig_with_lvbh(1000)).await,
-                SigFinality::Uncertain(_)
-            ),
-            "a row with no journaled slot must still be bounded by the window"
         );
     }
 

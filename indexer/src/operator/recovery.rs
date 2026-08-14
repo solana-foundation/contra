@@ -1160,7 +1160,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, Some(0))
             .await
             .unwrap();
         let storage = Storage::Mock(mock);

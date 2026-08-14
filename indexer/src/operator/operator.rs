@@ -928,11 +928,12 @@ mod tests {
             .create()
     }
 
-    /// The point of deriving: the window read off the node reaches `coverage_verdict`
-    /// and decides the verdict. Same floor and lvbh, opposite outcomes.
+    /// A channel attempt journaled before the blockhash slot existed cannot have its
+    /// bound reconstructed: the node's window may have been narrowed since it was
+    /// broadcast. No derived window, wide or narrow, may turn that into a `Dead`.
     #[tokio::test]
-    async fn derived_window_decides_the_coverage_verdict() {
-        for (window, expect_dead) in [(150u64, true), (600u64, false)] {
+    async fn channel_attempt_without_a_journaled_slot_is_never_dead() {
+        for window in [150u64, 600u64] {
             let mut server = mockito::Server::new_async().await;
             let _bh = mock_channel_window(&mut server, window);
             let _status = mock_null_status(&mut server, 2000);
@@ -948,11 +949,12 @@ mod tests {
                 last_valid_block_height: 1_000,
                 blockhash_slot: None,
             }];
-            let verdict = crate::operator::sender::classify_signatures(&finality, &sigs).await;
-            assert_eq!(
-                matches!(verdict, crate::operator::sender::SigFinality::Dead),
-                expect_dead,
-                "derived window {window} must decide the retention bound"
+            assert!(
+                matches!(
+                    crate::operator::sender::classify_signatures(&finality, &sigs).await,
+                    crate::operator::sender::SigFinality::Uncertain(_)
+                ),
+                "a legacy channel attempt must fail closed under window {window}"
             );
         }
     }

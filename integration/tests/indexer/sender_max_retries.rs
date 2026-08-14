@@ -91,9 +91,31 @@ fn seed_remint_cache(state: &mut SenderState, transaction_id: i64, nonce: u64) {
         .insert(nonce, make_remint_info(transaction_id));
 }
 
+/// Arm the ownership lease the pre-broadcast claim presents, the way
+/// `handle_transaction_submission` arms it for a real dispatch. Read from the
+/// row so a re-armed nonce presents its current incarnation: every claim bumps
+/// `updated_at`, so a token cached across calls would be spent.
+fn arm_release_lease(
+    state: &mut SenderState,
+    storage: &MockStorage,
+    transaction_id: i64,
+    nonce: u64,
+) {
+    let token = storage
+        .pending_transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|t| t.id == transaction_id)
+        .expect("seeded Processing row")
+        .updated_at;
+    state.release_leases.insert(nonce, token);
+}
+
 /// Seed the Processing withdrawal row that the PendingRemint transition is
 /// guarded on, so `set_pending_remint` can commit against the mock store the
-/// way it does against Postgres.
+/// way it does against Postgres. The row is also what the pre-broadcast
+/// ownership claim CASes against.
 fn seed_processing_withdrawal_row(storage: &MockStorage, transaction_id: i64, nonce: u64) {
     let owner = Pubkey::new_unique().to_string();
     let mut tx = DbTransactionBuilder::new(
@@ -135,8 +157,9 @@ fn enqueue_failing_send(mock: &MockRpcServer, label: &str) {
 // stay unconsumed, proving the short-circuit fired.
 #[tokio::test]
 async fn idempotent_send_loops_capped_by_retry_max_attempts() {
-    let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(3).await;
+    let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(404, 7);
+    seed_processing_withdrawal_row(&mock_storage, 404, 7);
 
     // Three failing wire sends — every call increments the retry counter.
     for i in 0..3 {
@@ -146,6 +169,9 @@ async fn idempotent_send_loops_capped_by_retry_max_attempts() {
     enqueue_failing_send(&mock, "should never be consumed");
 
     for _ in 0..4 {
+        // Each pass stands for a fresh dispatch of this nonce, which is where the
+        // real sender arms the lease; the previous pass's failure dropped it.
+        arm_release_lease(&mut state, &mock_storage, 404, 7);
         test_hooks::run_send_and_confirm(
             &mut state,
             make_instruction(),
@@ -223,14 +249,16 @@ async fn idempotent_send_loops_capped_by_retry_max_attempts() {
 // retry-counter check (`attempts >= retry_max_attempts`).
 #[tokio::test]
 async fn idempotent_send_loops_capped_at_higher_budget() {
-    let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(4).await;
+    let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(4).await;
     let ctx = withdrawal_ctx(505, 11);
+    seed_processing_withdrawal_row(&mock_storage, 505, 11);
 
     for i in 0..4 {
         enqueue_failing_send(&mock, &format!("attempt {}", i + 1));
     }
 
     for _ in 0..5 {
+        arm_release_lease(&mut state, &mock_storage, 505, 11);
         test_hooks::run_send_and_confirm(
             &mut state,
             make_instruction(),
@@ -273,6 +301,7 @@ async fn deferral_with_ambiguous_send_gates_on_journaled_signature() {
     let ctx = withdrawal_ctx(601, 21);
     seed_remint_cache(&mut state, 601, 21);
     seed_processing_withdrawal_row(&mock_storage, 601, 21);
+    arm_release_lease(&mut state, &mock_storage, 601, 21);
     // pending_signatures intentionally NOT seeded.
 
     enqueue_failing_send(&mock, "permanent send error");
@@ -331,6 +360,7 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
     let ctx = withdrawal_ctx(602, 22);
     seed_remint_cache(&mut state, 602, 22);
     seed_processing_withdrawal_row(&mock_storage, 602, 22);
+    arm_release_lease(&mut state, &mock_storage, 602, 22);
     let prior_attempt = Signature::new_unique();
     mock_storage
         .insert_release_signature(602, prior_attempt.to_string(), 0, None)
@@ -407,6 +437,7 @@ async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
     let ctx = withdrawal_ctx(603, 23);
     seed_remint_cache(&mut state, 603, 23);
     seed_processing_withdrawal_row(&mock_storage, 603, 23);
+    arm_release_lease(&mut state, &mock_storage, 603, 23);
     let prior_attempt = Signature::new_unique();
     mock_storage
         .insert_release_signature(603, prior_attempt.to_string(), 0, None)

@@ -187,14 +187,20 @@ counter_vec!(
     &["program_type", "outcome"]
 );
 
-// Release-side SMT confirmation gate: the on-chain root verdict on the terminal
-// Dead branch of a release consumer. `site` is one of {recovery, remint}; `verdict`
-// is one of {landed, not_landed, uncertain}. A rising `uncertain` rate is a stuck
-// DB-vs-chain divergence worth alerting on.
+// Release-side SMT confirmation gate: the on-chain root verdict wherever a
+// release consumer needs to know whether a nonce actually released. `site` is one
+// of {recovery, remint, presend}; `verdict` is one of {landed, not_landed,
+// uncertain}, plus `journal_unavailable` on `presend` only. `recovery` and
+// `remint` are the terminal Dead branch of a recorded signature; `presend` is a
+// Processing withdrawal with no recorded signature at all, where the verdict
+// decides whether the row is re-armed. A rising `uncertain` rate is a stuck
+// DB-vs-chain divergence worth alerting on, and on `presend` it also means rows
+// are waiting out the escalation window. `journal_unavailable` is the same wait
+// for a row whose signature journal could not be read at all.
 counter_vec!(
     OPERATOR_RELEASE_VERIFY,
     "private_channel_operator_release_verify_total",
-    "Release-side SMT confirmation verdicts on the Dead branch",
+    "Release-side SMT confirmation verdicts",
     &["site", "verdict"]
 );
 
@@ -284,6 +290,8 @@ pub fn init_labels(program_type: &str) {
         "program_error",
         "confirmation_error",
         "deposit_ownership_lost",
+        "release_claim_lost",
+        "release_missing_claim_lease",
         "jit_missing_claim_lease",
         "malformed_status_response",
         "status_poll_rpc_error",
@@ -340,11 +348,14 @@ pub fn init_labels(program_type: &str) {
 
     // Release-verify gate labels are program-independent (site, verdict); the
     // idempotent pre-registration is harmless across repeated init_labels calls.
-    for site in &["recovery", "remint"] {
+    for site in &["recovery", "remint", "presend"] {
         for verdict in &["landed", "not_landed", "uncertain"] {
             OPERATOR_RELEASE_VERIFY.with_label_values(&[site, verdict]);
         }
     }
+    // Only presend reads the journal before proving anything, so this pair is
+    // registered on its own rather than widening the grid with dead series.
+    OPERATOR_RELEASE_VERIFY.with_label_values(&["presend", "journal_unavailable"]);
 
     // Pre-register every reason so the alert query sees a zero series, not nothing.
     for reason in &["not_held", "probe_error", "probe_timeout", "fenced_write"] {

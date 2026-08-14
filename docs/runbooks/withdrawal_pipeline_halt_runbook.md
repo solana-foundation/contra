@@ -33,8 +33,12 @@ On boot, before any withdrawal is fetched, locked, or processed, the operator:
    signature persisted **write-ahead** (before broadcast), so a release that
    landed but never reached `Completed` is detected by an on-chain finality
    check and promoted to `Completed` - re-recording the nonce. A row with no
-   recorded signature, or one the RPC cannot classify, is quarantined to
-   `manual_review` (never `failed`).
+   recorded signature is checked against the on-chain SMT root: proven absent,
+   it is re-armed to `pending`; proven present, it is quarantined as an
+   invariant violation; unprovable, it is left `Processing` for a later sweep
+   and quarantined only once it ages past 10 minutes. A row whose recorded
+   signatures the RPC cannot classify is quarantined to `manual_review`
+   (never `failed`).
 2. **Validates** the rebuilt local SMT root against the on-chain root.
 
 If validation passes, the pipeline starts normally
@@ -94,8 +98,10 @@ it, so identify the nonce by hand.
    ```
 
    A row in `manual_review` whose alert `error_message` was
-   `no broadcast signatures recorded; cannot verify release landed`
-   (recovery-worker quarantine) is the prime suspect.
+   `released on-chain with no recorded broadcast signature`
+   (recovery-worker quarantine) is the prime suspect: that verdict means the
+   sweep already read the nonce in the on-chain root while the journal held
+   nothing, which is exactly this mismatch.
 3. For each candidate, run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). Exactly
    one verdict resolves the mismatch: a `LANDED <sig>` whose

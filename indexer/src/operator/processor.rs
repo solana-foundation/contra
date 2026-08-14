@@ -535,6 +535,8 @@ async fn build_release_funds(
             transaction_id: transaction.id,
             trace_id: transaction.trace_id.clone(),
             remint_info: Some(remint_info),
+            // The post-lock token the sender proves ownership against.
+            fetched_updated_at: transaction.updated_at,
         },
     )))
 }
@@ -2199,7 +2201,10 @@ mod tests {
     }
 
     /// Fallback path: if the requeue CAS write itself fails, the row is left
-    /// Processing for the recovery sweep to reconcile (no counter bump).
+    /// Processing for the recovery sweep to reconcile (no counter bump). This
+    /// rescue is best-effort by design, since it writes through the database that
+    /// just failed; the durable rescue is the sweep, which proves the nonce never
+    /// released and re-arms the row on its next pass.
     #[tokio::test]
     async fn process_release_funds_transient_requeue_write_failure_left_for_recovery() {
         let mock = MockStorage::new();

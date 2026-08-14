@@ -167,6 +167,14 @@ async fn counterpart_sig_of(pool: &sqlx::PgPool, id: i64) -> Option<String> {
     .unwrap()
 }
 
+async fn requeue_attempts_of(pool: &sqlx::PgPool, id: i64) -> i32 {
+    sqlx::query_scalar("SELECT recovery_requeue_attempts FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn updated_at_of(pool: &sqlx::PgPool, id: i64) -> chrono::DateTime<Utc> {
     sqlx::query_scalar("SELECT updated_at FROM transactions WHERE id = $1")
         .bind(id)
@@ -660,10 +668,28 @@ async fn withdrawal_live_signature_left_processing() {
     mock.shutdown().await;
 }
 
-// Withdrawal with no recorded signatures -> quarantine (can't verify, double-payout risk).
+// Withdrawal with no recorded signatures -> requeue, gated on proving the
+// nonce is absent from the on-chain root.
 
+/// The two reads the signatureless proof makes: a finalized blockhash whose tip
+/// height binds the snapshot, then the instance account holding `root`.
+fn enqueue_release_proof(mock: &MockRpcServer, root: [u8; 32], tree_index: u64) {
+    mock.enqueue(
+        "getLatestBlockhash",
+        Reply::result(json!({
+            "context": {"slot": 500},
+            "value": {"blockhash": "11111111111111111111111111111111", "lastValidBlockHeight": 1000}
+        })),
+    );
+    mock.enqueue("getAccountInfo", instance_account_reply(root, tree_index));
+}
+
+// A `Processing` withdrawal stranded with no recorded signature never
+// broadcast, and the on-chain root proves the nonce is absent, so the sweep
+// re-arms it instead of paging a human. Before this it went to manual review,
+// which wedged every higher nonce behind it.
 #[tokio::test(flavor = "multi_thread")]
-async fn withdrawal_no_signatures_quarantined() {
+async fn recovery_requeues_signatureless_withdrawal() {
     let (db, url, _container) = start_pg("wd_no_sigs").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
@@ -674,33 +700,469 @@ async fn withdrawal_no_signatures_quarantined() {
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
     let mock = MockRpcServer::start().await;
+    // Tree 0 holds no completed nonces, so its root excludes nonce 3.
+    enqueue_release_proof(&mock, smt_root(0, &[]), 0);
     let client = test_client(mock.url());
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
+    let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
-    // No RPC needed - empty signature set short-circuits before classification.
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    assert_eq!(requeue_attempts_of(&pool, tx_id).await, 1);
+    // No signature to classify, and re-arming never broadcasts.
     assert_eq!(mock.call_count("getSignatureStatuses"), 0);
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    let update = storage_rx
-        .try_recv()
-        .expect("manual_review update should be sent");
-    let err = update.error_message.as_deref().unwrap_or("");
     assert!(
-        err.contains("no broadcast signatures recorded"),
-        "reason: {err}"
+        storage_rx.try_recv().is_err(),
+        "a proven-safe requeue must not page on-call"
     );
     assert_recovered_increment(
         "withdraw",
-        "quarantined",
+        "requeued",
         "withdrawal",
         metric_before,
-        "withdrawal no signatures quarantined",
+        "signatureless withdrawal requeued",
+    );
+    mock.shutdown().await;
+}
+
+// The property the whole design rests on, in both orders against the real
+// trigger and the real CAS: a recovery demote and a sender claim contend on one
+// `updated_at`, so exactly one wins and the loser never broadcasts.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_demote_and_claim_yield_exactly_one_broadcast() {
+    let nonce = 3u64;
+
+    // Order 1: the sweep demotes first, so the sender's claim must lose.
+    {
+        let (db, url, _container) = start_pg("wd_race_demote_first").await;
+        let storage = Arc::new(Storage::Postgres(db.clone()));
+        storage.init_schema().await.unwrap();
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+        let tx = make_withdrawal(&Signature::new_unique().to_string(), nonce as i64);
+        let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+        let held = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+        let mock = MockRpcServer::start().await;
+        enqueue_release_proof(&mock, smt_root(0, &[]), 0);
+        // The sender still builds and signs before it claims.
+        mock.enqueue("getLatestBlockhash", blockhash_reply());
+        mock.enqueue("sendTransaction", send_transaction_echo_reply());
+        let client = test_client(mock.url());
+        let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+        test_hooks::run_recovery_once(
+            &storage,
+            &client,
+            ProgramType::Withdraw,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status_of(&pool, tx_id).await, "pending");
+
+        let mut state = build_pg_sender_state(storage.clone(), mock.url()).await;
+        state.release_leases.insert(nonce, held);
+        sender_hooks::run_send_and_confirm(
+            &mut state,
+            make_instruction(),
+            None,
+            &sender_fixtures::withdrawal_ctx(tx_id, nonce),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert_eq!(
+            mock.call_count("sendTransaction"),
+            0,
+            "the sender lost the claim and must not release"
+        );
+        assert!(
+            db.get_release_signatures_internal(tx_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a lost claim writes no signature"
+        );
+        assert_eq!(status_of(&pool, tx_id).await, "pending");
+        mock.shutdown().await;
+    }
+
+    // Order 2: the sender claims first, so the sweep's demote must lose.
+    {
+        let (db, url, _container) = start_pg("wd_race_claim_first").await;
+        let storage = Arc::new(Storage::Postgres(db.clone()));
+        storage.init_schema().await.unwrap();
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+        let tx = make_withdrawal(&Signature::new_unique().to_string(), nonce as i64);
+        let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+        let held = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+        let mock = MockRpcServer::start().await;
+        mock.enqueue("getLatestBlockhash", blockhash_reply());
+        mock.enqueue("sendTransaction", send_transaction_echo_reply());
+        mock.enqueue(
+            "getSignatureStatuses",
+            Reply::result(json!({
+                "context": {"slot": 200},
+                "value": [{
+                    "slot": 100,
+                    "confirmations": null,
+                    "err": null,
+                    "status": {"Ok": null},
+                    "confirmationStatus": "finalized"
+                }]
+            })),
+        );
+        let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+        let mut state = build_pg_sender_state(storage.clone(), mock.url()).await;
+        state.release_leases.insert(nonce, held);
+        sender_hooks::run_send_and_confirm(
+            &mut state,
+            make_instruction(),
+            None,
+            &sender_fixtures::withdrawal_ctx(tx_id, nonce),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+        assert_eq!(
+            mock.call_count("sendTransaction"),
+            1,
+            "the owning sender releases exactly once"
+        );
+
+        // `held` is the token the sweep captured before its RPC round trip; the
+        // claim has since bumped the row, so the demote write must find nothing.
+        assert!(
+            !storage.try_requeue_processing(tx_id, held).await.unwrap(),
+            "a demote on a stale token must lose to the claim"
+        );
+        assert_eq!(
+            status_of(&pool, tx_id).await,
+            "processing",
+            "the released row must not be re-armed"
+        );
+        mock.shutdown().await;
+    }
+}
+
+// An unreadable proof is not evidence of a problem: the row is left exactly
+// where it was, with no write at all, until it ages past the escalation window.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_leaves_row_processing_when_proof_unavailable() {
+    let (db, url, _container) = start_pg("wd_proof_down").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 3);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // Past the 5 minute stale threshold so the sweep selects the row, but inside
+    // the 10 minute escalation window so an unreadable proof still waits.
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(6)).await;
+    // Read back rather than trusting the seed's return: Postgres stores
+    // microseconds, so a nanosecond-precision local timestamp never compares equal.
+    let backdated = updated_at_of(&pool, tx_id).await;
+
+    let mock = MockRpcServer::start().await;
+    // Nothing scripted: every freshness read errors, so the proof is inconclusive.
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "processing");
+    assert_eq!(
+        updated_at_of(&pool, tx_id).await,
+        backdated,
+        "the Uncertain path must not write, so updated_at stays untouched"
+    );
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "a transient outage must not page on-call"
+    );
+
+    // Well past the 10 minute window, the same unreadable proof does escalate.
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(45)).await;
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
+    let update = storage_rx
+        .try_recv()
+        .expect("an escalated row must page on-call");
+    let err = update.error_message.as_deref().unwrap_or("");
+    assert!(err.contains("still uncertain"), "reason: {err}");
+    mock.shutdown().await;
+}
+
+// The sweep's own journal read is a DB read, and its internal retries cover only
+// a moment. An outage past that must not quarantine the row: that would page on
+// the very outage the row is recovering from, and wedge every higher nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_leaves_row_processing_when_journal_unreadable() {
+    let (db, url, _container) = start_pg("wd_journal_down").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 3);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // Past the 5 minute stale threshold so the sweep selects the row, but inside
+    // the 10 minute escalation window so an unreadable journal still waits.
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(6)).await;
+    let backdated = updated_at_of(&pool, tx_id).await;
+
+    // Rename the journal table out from under the sweep so every read errors.
+    // This is the DB-outage case with the rest of the row still reachable.
+    sqlx::query("ALTER TABLE pending_release_signatures RENAME TO prs_hidden")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "an unreadable journal must not quarantine inside the window"
+    );
+    assert_eq!(
+        updated_at_of(&pool, tx_id).await,
+        backdated,
+        "the wait must not write, so updated_at stays untouched"
+    );
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "a transient outage must not page on-call"
+    );
+
+    // Restoring the table lets the very next sweep resolve the row normally,
+    // proving the wait held it recoverable rather than merely deferring a page.
+    sqlx::query("ALTER TABLE prs_hidden RENAME TO pending_release_signatures")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Tree 0 holds no completed nonces, so its root excludes nonce 3.
+    enqueue_release_proof(&mock, smt_root(0, &[]), 0);
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending",
+        "once the journal reads again the row is re-armed, not escalated"
+    );
+    mock.shutdown().await;
+}
+
+// Boot reconcile converges on a mixed batch: the demotable row leaves the
+// Processing set, the row whose recorded signature can still land stays put,
+// and the pass loop terminates on its budget rather than spinning.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_reconcile_converges_with_mixed_rows() {
+    let (db, url, _container) = start_pg("wd_boot_mixed").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let signatureless = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 3))
+        .await
+        .unwrap();
+    seed_backdated_processing(&pool, signatureless, ChronoDuration::minutes(10)).await;
+
+    let live = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 4))
+        .await
+        .unwrap();
+    seed_backdated_processing(&pool, live, ChronoDuration::minutes(10)).await;
+    db.insert_release_signature_internal(live, Signature::new_unique().to_string(), 5_000, None)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    enqueue_release_proof(&mock, smt_root(0, &[]), 0);
+    // The live row is re-classified every pass: a null status below its lvbh.
+    mock.enqueue_sequence(
+        "getSignatureStatuses",
+        (0..16).map(|_| Reply::result(json!({"context": {"slot": 200}, "value": [null]}))),
+    );
+    mock.enqueue_sequence("getBlockHeight", (0..16).map(|_| Reply::result(json!(100))));
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    private_channel_indexer::operator::recovery::boot_reconcile_processing(
+        &storage,
+        &client,
+        None,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+        &tokio_util::sync::CancellationToken::new(),
+        8,
+        solana_sdk::clock::MAX_PROCESSING_AGE as u64,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, signatureless).await, "pending");
+    assert_eq!(
+        status_of(&pool, live).await,
+        "processing",
+        "a still-live signature keeps its row for the next sweep"
+    );
+    // One proof only: the demoted row leaves the Processing set after pass 1.
+    assert_eq!(mock.call_count("getAccountInfo"), 1);
+    mock.shutdown().await;
+}
+
+// The requeue cap is the backstop: a row that keeps coming back is escalated
+// rather than cycled between Pending and Processing forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_quarantines_after_requeue_cap() {
+    let (db, url, _container) = start_pg("wd_requeue_cap").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx_id = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 3))
+        .await
+        .unwrap();
+    // Set the counter first: any write fires the trigger and refreshes
+    // updated_at, which would lift the row back out of the stale window.
+    sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 3 WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    // The proof still says NotLanded; the cap is what overrides the demote.
+    enqueue_release_proof(&mock, smt_root(0, &[]), 0);
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
+    let update = storage_rx.try_recv().expect("a capped row must page");
+    let err = update.error_message.as_deref().unwrap_or("");
+    assert!(err.contains("recovery requeues"), "reason: {err}");
+    mock.shutdown().await;
+}
+
+// The point of re-arming: a requeued withdrawal is handed back out by the
+// dequeue frontier, ahead of its higher-nonce sibling, so the demote unwedges
+// the queue instead of blocking it the way manual_review does.
+#[tokio::test(flavor = "multi_thread")]
+async fn requeued_withdrawal_is_refetched_in_nonce_order() {
+    let (db, url, _container) = start_pg("wd_refetch_order").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let stranded = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 3))
+        .await
+        .unwrap();
+    seed_backdated_processing(&pool, stranded, ChronoDuration::minutes(10)).await;
+    // A higher nonce waiting behind it, already Pending.
+    let sibling = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 9))
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    enqueue_release_proof(&mock, smt_root(0, &[]), 0);
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        Some(Pubkey::new_unique()),
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status_of(&pool, stranded).await, "pending");
+
+    let locked = storage
+        .get_and_lock_pending_transactions(TransactionType::Withdrawal, 10)
+        .await
+        .unwrap();
+    let ids: Vec<i64> = locked.iter().map(|r| r.id).collect();
+    assert!(
+        ids.contains(&stranded),
+        "the re-armed withdrawal must be re-fetchable: {ids:?}"
+    );
+    let position = |id: i64| ids.iter().position(|candidate| *candidate == id);
+    assert!(
+        position(sibling).is_none() || position(stranded) < position(sibling),
+        "nonce order must be preserved: {ids:?}"
     );
     mock.shutdown().await;
 }

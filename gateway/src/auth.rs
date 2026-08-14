@@ -124,23 +124,19 @@ const DELEGATE_END: usize = 108;
 // Read access is granted to either trading party (user_a, user_b) or the
 // settlement_authority, by inspecting raw bytes (no full deserialization).
 //
-// SWAP_DVP_SIZE and SWAP_DVP_OWNER_FIELDS mirror the SwapDvp layout in
-// dvp-swap-program/program/src/state/swap_dvp.rs. They are not derived from it,
-// so if a field is added or reordered there, update them here or these checks
-// will read the wrong bytes.
+// SWAP_DVP_SIZE and SWAP_DVP_OWNER_FIELDS mirror the SwapDvp layout in the
+// vendored DvP swap client (dvp-swap-program/clients/rust, from
+// solana-foundation/dvp). They are not derived from it, so if a field is added
+// or reordered upstream, update them here or these checks will read the wrong
+// bytes.
 // ---------------------------------------------------------------------------
 
-/// DvP swap escrow program ID.
-///
-/// WARNING: the DvP swap program is NOT deployed yet. This value is the local
-/// `declare_id!` from dvp-swap-program/program/src/lib.rs and is a placeholder.
-/// Update it with the real program ID once the program is deployed, otherwise
-/// no live DvP account will match and these checks will never fire.
-const DVP_SWAP_PROGRAM: &str = "DzG1qJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC";
+/// DvP swap escrow program ID (devnet deployment).
+const DVP_SWAP_PROGRAM: &str = "dvp34bdbcEm4f4FCUjGV4mDAkDshaQR4LkK8fdcsyZq";
 
 /// Serialized size of a SwapDvp account (SwapDvp::LEN). Smaller DvP-owned
 /// accounts (e.g. the nonce tombstone PDA) are not swaps and are denied.
-const SWAP_DVP_SIZE: usize = 394;
+const SWAP_DVP_SIZE: usize = 458;
 
 /// Byte ranges of the SwapDvp fields whose pubkey grants read access.
 /// Layout: bump(1), user_a, user_b, mint_a, mint_b, settlement_authority, ...

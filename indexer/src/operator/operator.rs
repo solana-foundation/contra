@@ -90,10 +90,12 @@ pub async fn run(
     });
 
     // Boot pre-flight for withdraw operators: reconcile in-flight releases, then
-    // validate the local SMT against the on-chain root BEFORE any row is fetched,
-    // locked, or processed. A residual mismatch the reconcile cannot resolve is a
-    // fail-closed refuse-to-start; it should never fire once the write-ahead
-    // signatures and this reconcile have run, and guards an unforeseen divergence.
+    // diff the on-chain bitmap against the database BEFORE any row is fetched,
+    // locked, or processed.
+    //
+    // Only a database that claims a release the chain never made is a
+    // refuse-to-start. The opposite direction, a release the chain made that the
+    // database never recorded, is repaired in place and startup continues.
     if program_type == crate::config::ProgramType::Withdraw {
         if let Some(preflight_instance) = instance_pda {
             // The main rpc_client is the chain where the instance and releases live.
@@ -349,8 +351,8 @@ pub async fn run(
     Ok(())
 }
 
-/// Reconcile in-flight releases, then validate the local SMT against the on-chain root.
-/// Only a genuine `SmtRootMismatch` returns `Err` (refuse to start).
+/// Reconcile in-flight releases, then diff the on-chain bitmap against the
+/// database. Only a genuine `BitmapDivergence` returns `Err` (refuse to start).
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,
@@ -373,7 +375,10 @@ async fn run_withdraw_preflight(
     )
     .await
     {
-        warn!("Boot reconcile failed, proceeding to SMT validation: {}", e);
+        warn!(
+            "Boot reconcile failed, proceeding to bitmap validation: {}",
+            e
+        );
     }
 
     // Boot is the only safe window for the pending_remint pass. Once run_sender
@@ -390,36 +395,38 @@ async fn run_withdraw_preflight(
         crate::storage::common::models::TransactionStatus::PendingRemint,
         recovery::BOOT_RECONCILE_BUDGET,
         // Boot runs once, so the cursor has nowhere to resume to. If the budget
-        // is spent the SMT check below decides whether the operator may start.
+        // is spent the bitmap check below decides whether the operator may start.
         &mut 0,
         cancellation_token,
     )
     .await
     {
         warn!(
-            "Pending-remint reconcile failed, proceeding to SMT validation: {}",
+            "Pending-remint reconcile failed, proceeding to bitmap validation: {}",
             e
         );
     }
 
-    // Only a genuine root mismatch is a refuse-to-start. Any other error (instance
-    // not yet on-chain, RPC failure, DB read failure) means we could not run the
-    // check; start anyway and let the sender's lazy init plus the recovery worker
-    // re-validate, neither of which marks a row Failed. Refusing on those would
-    // crash-loop the operator on any transient boot condition.
-    match sender::validate_smt_root(storage, rpc_client, Some(instance_pda)).await {
-        Ok(_) => Ok(()),
+    // Only a genuine divergence is a refuse-to-start. Any other error (instance or
+    // bitmap not yet on-chain, RPC failure, DB read failure) means we could not run
+    // the check at all; start anyway and let the recovery worker re-validate, which
+    // never marks a row Failed. Refusing on those would crash-loop the operator on
+    // any transient boot condition.
+    match sender::validate_bitmap_consistency(storage, rpc_client, Some(instance_pda), storage_tx)
+        .await
+    {
+        Ok(()) => Ok(()),
         Err(e)
             if matches!(
                 e,
-                OperatorError::Program(crate::error::ProgramError::SmtRootMismatch { .. })
+                OperatorError::Program(crate::error::ProgramError::BitmapDivergence { .. })
             ) =>
         {
             Err(e)
         }
         Err(e) => {
             warn!(
-                "Could not validate SMT root at boot, starting anyway (lazy init will re-check): {}",
+                "Could not validate the withdrawal bitmap at boot, starting anyway: {}",
                 e
             );
             Ok(())
@@ -446,15 +453,13 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::operator::utils::rpc_util::RetryConfig;
-    use crate::operator::utils::smt_util::SmtState;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    use borsh::BorshSerialize;
-    use private_channel_escrow_program_client::Instance;
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
 
@@ -471,18 +476,12 @@ mod tests {
         )
     }
 
-    fn mock_instance_account(server: &mut mockito::ServerGuard, root: [u8; 32]) -> mockito::Mock {
-        let instance = Instance {
-            discriminator: 0,
-            bump: 0,
-            version: 0,
-            instance_seed: Pubkey::new_unique(),
-            admin: Pubkey::new_unique(),
-            withdrawal_transactions_root: root,
-            current_tree_index: 0,
-        };
-        let mut bytes = Vec::new();
-        instance.serialize(&mut bytes).unwrap();
+    fn mock_bitmap_account(
+        server: &mut mockito::ServerGuard,
+        generation: u64,
+        consumed: &[u64],
+    ) -> mockito::Mock {
+        let bytes = bitmap_account_bytes(generation, consumed, 255);
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -509,8 +508,8 @@ mod tests {
             .create()
     }
 
-    // getAccountInfo with a null value: the instance does not exist on-chain yet.
-    fn mock_instance_not_found(server: &mut mockito::ServerGuard) -> mockito::Mock {
+    // getAccountInfo with a null value: the bitmap does not exist on-chain yet.
+    fn mock_bitmap_not_found(server: &mut mockito::ServerGuard) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -521,69 +520,139 @@ mod tests {
             .create()
     }
 
-    async fn run_preflight(
+    async fn run_preflight_with(
+        storage: Arc<Storage>,
         client: RpcClientWithRetry,
-        mock: MockStorage,
     ) -> Result<(), OperatorError> {
-        let storage = Arc::new(Storage::Mock(mock));
+        run_preflight_capturing(storage, client).await.0
+    }
+
+    /// Same pre-flight, but hands back the status updates it emitted. The
+    /// chain-ahead repair reports through the channel, not the storage mock,
+    /// so an escalation is only visible here.
+    async fn run_preflight_capturing(
+        storage: Arc<Storage>,
+        client: RpcClientWithRetry,
+    ) -> (
+        Result<(), OperatorError>,
+        Vec<sender::TransactionStatusUpdate>,
+    ) {
         let client = Arc::new(client);
-        let (storage_tx, _rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
+        let (storage_tx, mut rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
         let token = CancellationToken::new();
-        run_withdraw_preflight(&storage, &client, Pubkey::new_unique(), &storage_tx, &token).await
+        let result =
+            run_withdraw_preflight(&storage, &client, Pubkey::new_unique(), &storage_tx, &token)
+                .await;
+        drop(storage_tx);
+
+        let mut updates = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            updates.push(update);
+        }
+        (result, updates)
     }
 
-    /// Matching local and on-chain roots: the pre-flight passes and the operator starts.
-    #[tokio::test]
-    async fn preflight_starts_when_root_matches() {
-        let mut server = mockito::Server::new_async().await;
-        // Empty DB rebuilds an empty tree, so the on-chain root must be the empty-tree root.
-        let _account = mock_instance_account(&mut server, SmtState::new(0).current_root());
-        let result = run_preflight(make_rpc_client(&server.url()), MockStorage::new()).await;
-        assert!(result.is_ok(), "matching root must start: {result:?}");
+    async fn run_preflight(client: RpcClientWithRetry) -> Result<(), OperatorError> {
+        run_preflight_with(Arc::new(Storage::Mock(MockStorage::new())), client).await
     }
 
-    /// Regression guard (the integration failure): an instance not yet on-chain surfaces
-    /// as AccountNotFound, which must NOT refuse to start (only a real mismatch does).
-    /// Refusing here would crash-loop the operator at boot.
+    /// An empty database against an empty bitmap agrees, so the operator starts.
     #[tokio::test]
-    async fn preflight_starts_when_instance_not_found() {
+    async fn preflight_starts_when_bitmap_agrees_with_db() {
         let mut server = mockito::Server::new_async().await;
-        let _account = mock_instance_not_found(&mut server);
-        let result = run_preflight(make_rpc_client(&server.url()), MockStorage::new()).await;
+        let _account = mock_bitmap_account(&mut server, 0, &[]);
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+        assert!(result.is_ok(), "agreeing state must start: {result:?}");
+    }
+
+    /// Regression guard: a bitmap not yet on-chain surfaces as AccountNotFound,
+    /// which must NOT refuse to start. Refusing here would crash-loop the
+    /// operator on a fresh deployment.
+    #[tokio::test]
+    async fn preflight_starts_when_bitmap_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_bitmap_not_found(&mut server);
+        let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(
             result.is_ok(),
             "AccountNotFound must start anyway, not refuse: {result:?}"
         );
     }
 
-    /// A genuine root divergence is the only refuse-to-start: the operator returns
-    /// `Err(SmtRootMismatch)` so it never consumes nonces against a tree it cannot reason about.
+    /// Chain ahead of the database: the release landed and only the bookkeeping
+    /// is missing, so the operator repairs what it can and starts.
     #[tokio::test]
-    async fn preflight_refuses_to_start_on_root_mismatch() {
+    async fn preflight_starts_when_chain_is_ahead() {
         let mut server = mockito::Server::new_async().await;
-        // On-chain root carries a nonce the empty DB will never reconcile.
-        let mut onchain = SmtState::new(0);
-        onchain.insert_nonce(7);
-        let _account = mock_instance_account(&mut server, onchain.current_root());
-        let result = run_preflight(make_rpc_client(&server.url()), MockStorage::new()).await;
+        let _account = mock_bitmap_account(&mut server, 0, &[7]);
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+        assert!(
+            result.is_ok(),
+            "a landed-but-unrecorded release must not halt boot: {result:?}"
+        );
+    }
+
+    /// The one refuse-to-start: the database claims a release the chain never
+    /// made, so every later decision would rest on a false history.
+    #[tokio::test]
+    async fn preflight_refuses_to_start_when_db_is_ahead() {
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mock = MockStorage::new();
+        let now = chrono::Utc::now();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(DbTransaction {
+                id: 1,
+                signature: "sig".to_string(),
+                trace_id: "trace".to_string(),
+                slot: 1,
+                initiator: Pubkey::new_unique().to_string(),
+                recipient: Pubkey::new_unique().to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                amount: TokenAmount(1_000),
+                memo: None,
+                transaction_type: TransactionType::Withdrawal,
+                withdrawal_nonce: Some(7),
+                status: TransactionStatus::Completed,
+                created_at: now,
+                updated_at: now,
+                processed_at: None,
+                counterpart_signature: None,
+                remint_signatures: None,
+                remint_last_valid_block_heights: None,
+                pending_remint_deadline_at: None,
+                finality_check_attempts: 0,
+                recovery_requeue_attempts: 0,
+                instruction_index: 0,
+                inner_index: None,
+                landed_remint_signature: None,
+                release_refused_on_chain: false,
+            });
+
+        let result = run_preflight_with(
+            Arc::new(Storage::Mock(mock)),
+            make_rpc_client(&server.url()),
+        )
+        .await;
+
         assert!(
             matches!(
                 result,
                 Err(OperatorError::Program(
-                    crate::error::ProgramError::SmtRootMismatch { .. }
+                    crate::error::ProgramError::BitmapDivergence { .. }
                 ))
             ),
-            "a real mismatch must refuse to start: {result:?}"
+            "a real divergence must refuse to start: {result:?}"
         );
     }
 
     /// A withdraw operator whose only unrecorded nonce sits in a `PendingRemint`
-    /// row carrying its release signature, plus the on-chain root that includes
-    /// that nonce. This is the exact shape that used to wedge the boot gate.
-    fn preflight_fixture(nonce: i64, signature: &str) -> (MockStorage, [u8; 32]) {
-        let mut onchain = SmtState::new(0);
-        onchain.insert_nonce(nonce as u64);
-
+    /// row carrying its release signature. Paired with a bitmap that has the
+    /// matching bit set, this is the shape that used to wedge the boot gate.
+    fn preflight_fixture(nonce: i64, signature: &str) -> MockStorage {
         let now = chrono::Utc::now();
         let row = DbTransaction {
             id: 1,
@@ -610,10 +679,11 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         };
         let mock = MockStorage::new();
         mock.pending_transactions.lock().unwrap().push(row);
-        (mock, onchain.current_root())
+        mock
     }
 
     fn mock_signature_statuses(
@@ -634,17 +704,21 @@ mod tests {
     const FINALIZED_SUCCESS: &str = r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#;
 
     /// The regression test for the whole issue: a landed-but-unrecorded release
-    /// held in `pending_remint` is reconciled by the pre-flight, so the root now
-    /// agrees and the operator starts instead of crash-looping.
+    /// held in `pending_remint` is reconciled by the pre-flight, so the bitmap
+    /// now agrees and the operator starts instead of crash-looping.
     #[tokio::test]
     async fn preflight_completes_landed_pending_remint_and_starts() {
         let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
-        let (mock, root) = preflight_fixture(7, &landed_sig);
+        let mock = preflight_fixture(7, &landed_sig);
         let mut server = mockito::Server::new_async().await;
-        let _account = mock_instance_account(&mut server, root);
+        let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let _status = mock_signature_statuses(&mut server, 200, FINALIZED_SUCCESS);
 
-        let result = run_preflight(make_rpc_client(&server.url()), mock.clone()).await;
+        let result = run_preflight_with(
+            Arc::new(Storage::Mock(mock.clone())),
+            make_rpc_client(&server.url()),
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -658,31 +732,39 @@ mod tests {
         );
     }
 
-    /// The halt is narrowed, not weakened: an unprovable divergence still
-    /// refuses to start and leaves the row where a human can see it.
+    /// The unprovable case. Under the SMT this was a refuse-to-start, because
+    /// any root mismatch was. The bitmap narrows the halt to db-ahead only: a
+    /// consumed nonce the reconcile cannot attribute is a payout that really
+    /// happened, so boot continues and the row is escalated to manual_review
+    /// instead of being completed on a guess.
     #[tokio::test]
-    async fn preflight_still_refuses_when_mismatch_survives_reconcile() {
+    async fn preflight_escalates_when_chain_ahead_survives_reconcile() {
         let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
-        let (mock, root) = preflight_fixture(7, &landed_sig);
+        let mock = preflight_fixture(7, &landed_sig);
         let mut server = mockito::Server::new_async().await;
-        let _account = mock_instance_account(&mut server, root);
+        let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let _status = mock_signature_statuses(&mut server, 500, "internal server error");
 
-        let result = run_preflight(make_rpc_client(&server.url()), mock.clone()).await;
+        let (result, updates) = run_preflight_capturing(
+            Arc::new(Storage::Mock(mock.clone())),
+            make_rpc_client(&server.url()),
+        )
+        .await;
 
         assert!(
-            matches!(
-                result,
-                Err(OperatorError::Program(
-                    crate::error::ProgramError::SmtRootMismatch { .. }
-                ))
-            ),
-            "an unprovable divergence must still refuse to start: {result:?}"
+            result.is_ok(),
+            "an unattributable payout must not halt boot: {result:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|u| u.status == TransactionStatus::ManualReview),
+            "the row must be escalated for a human, not left silent: {updates:?}"
         );
         assert_eq!(
             mock.pending_transactions.lock().unwrap()[0].status,
             TransactionStatus::PendingRemint,
-            "an uncertain verdict must leave the row for the runbook"
+            "an uncertain verdict must not complete the row"
         );
     }
 }

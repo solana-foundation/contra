@@ -6,7 +6,12 @@ import { useCluster } from '../hooks/useCluster';
 import { address } from '@solana/addresses';
 import { useWalletAccountTransactionSendingSigner } from '@solana/react';
 import { getBase58Decoder } from '@solana/codecs-strings';
-import { getReleaseFundsInstructionAsync, getResetSmtRootInstructionAsync, fetchInstance } from '@private-channel-escrow';
+import {
+  getReleaseFundsInstructionAsync,
+  getRotateBitmapInstructionAsync,
+  getWithdrawalBitmapDecoder,
+  findWithdrawalBitmapPda,
+} from '@private-channel-escrow';
 import { findAssociatedTokenPda } from '@solana-program/token';
 import {
   pipe,
@@ -56,15 +61,13 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
   const [mintAddress, setMintAddress] = useState('');
   const [userAddress, setUserAddress] = useState('');
   const [amount, setAmount] = useState('');
-  const [newWithdrawalRoot, setNewWithdrawalRoot] = useState('');
   const [transactionNonce, setTransactionNonce] = useState('');
-  const [siblingProofs, setSiblingProofs] = useState('');
 
   const chainId = (network === 'localnet' ? 'solana:devnet' : `solana:${network}`) as `solana:${string}`;
   const transactionSigner = useWalletAccountTransactionSendingSigner(account, chainId);
 
   const handleReleaseFunds = async () => {
-    if (!mintAddress || !userAddress || !amount || !newWithdrawalRoot || !transactionNonce || !siblingProofs) {
+    if (!mintAddress || !userAddress || !amount || !transactionNonce) {
       setError('Please fill in all fields');
       return;
     }
@@ -73,20 +76,6 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
       setLoading(true);
       setError('');
       setSuccess(null);
-
-      // Convert hex strings to Uint8Array
-      const withdrawalRootHex = newWithdrawalRoot.startsWith('0x') ? newWithdrawalRoot.slice(2) : newWithdrawalRoot;
-      const withdrawalRootBytes = new Uint8Array(withdrawalRootHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-
-      const proofsHex = siblingProofs.startsWith('0x') ? siblingProofs.slice(2) : siblingProofs;
-      const proofsBytes = new Uint8Array(proofsHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-
-      if (withdrawalRootBytes.length !== 32) {
-        throw new Error('newWithdrawalRoot must be 32 bytes');
-      }
-      if (proofsBytes.length !== 512) {
-        throw new Error('siblingProofs must be 512 bytes');
-      }
 
       // Find user ATA
       const [userAta] = await findAssociatedTokenPda({
@@ -104,9 +93,7 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
         userAta,
         amount: BigInt(amount),
         user: address(userAddress),
-        newWithdrawalRoot: Array.from(withdrawalRootBytes),
         transactionNonce: BigInt(transactionNonce),
-        siblingProofs: Array.from(proofsBytes),
       });
 
       console.log('Created release funds instruction:', instruction);
@@ -139,9 +126,7 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
       setMintAddress('');
       setUserAddress('');
       setAmount('');
-      setNewWithdrawalRoot('');
       setTransactionNonce('');
-      setSiblingProofs('');
 
     } catch (err) {
       console.error('Error releasing funds:', err);
@@ -151,25 +136,73 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
     }
   };
 
-  const handleResetSmtRoot = async () => {
+  const handleRotateBitmap = async () => {
     try {
       setLoading(true);
       setError('');
       setSuccess(null);
 
-      // Bind the reset to the instance's current tree index so a replay (e.g. an
-      // ambiguously-confirmed retry) is rejected on-chain instead of rotating twice.
-      const instanceAccount = await fetchInstance(rpc, address(instancePubkey));
+      // Bind the rotation to the generation the chain is on, so a replay (e.g. an
+      // ambiguously-confirmed retry) is rejected instead of skipping a generation.
+      const [bitmapPda] = await findWithdrawalBitmapPda({ instance: address(instancePubkey) });
+      const bitmapInfo = await rpc
+        .getAccountInfo(bitmapPda, { encoding: 'base64', commitment: 'confirmed' })
+        .send();
+      if (!bitmapInfo.value) {
+        throw new Error('Withdrawal bitmap account not found for this instance');
+      }
+      const binary = atob(bitmapInfo.value.data[0]);
+      const bitmapBytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bitmapBytes[i] = binary.charCodeAt(i);
+      }
+      const bitmapHeader = getWithdrawalBitmapDecoder().decode(bitmapBytes);
 
-      // Get the reset SMT root instruction
-      const instruction = await getResetSmtRootInstructionAsync({
+      // Bits start after the fixed header, whose width comes from the generated
+      // decoder so a header layout change cannot silently shift the count.
+      const bitsOffset = getWithdrawalBitmapDecoder().fixedSize;
+      // Capacity comes from the account so a shorter test-sized bitmap counts correctly.
+      const capacity = (bitmapBytes.length - bitsOffset) * 8;
+      let released = 0;
+      for (let i = bitsOffset; i < bitmapBytes.length; i++) {
+        let byte = bitmapBytes[i];
+        while (byte) {
+          byte &= byte - 1;
+          released++;
+        }
+      }
+      const unreleased = capacity - released;
+
+      // The operator holds a release in flight and a refund awaiting finality only
+      // in memory, and it will not rotate while either depends on the bits being
+      // cleared. This page talks to the chain directly, so it cannot observe those
+      // barriers and cannot enforce them. Rotating from here is an override of them,
+      // and the unreleased count below is the only part the page can check itself.
+      if (unreleased > 0) {
+        const proceed = window.confirm(
+          `OVERRIDE: this bypasses the operator's rotation safety checks.\n\n` +
+            `${unreleased} of ${capacity} nonces in generation ${bitmapHeader.generation} have not been released.\n\n` +
+            'Rotating clears every bit and advances the generation. Those nonces can never be released afterwards, ' +
+            'and any refund still waiting on one of these bits loses the only proof of whether that user was already paid.\n\n' +
+            'This page cannot see releases in flight or refunds waiting inside the operator. The operator normally rotates ' +
+            'on its own at each boundary once both have settled. Use this only when that has stalled, and confirm with the ' +
+            'operator first.\n\n' +
+            'Rotate anyway?'
+        );
+        if (!proceed) {
+          setError('Rotation cancelled: the current generation still has unreleased nonces.');
+          return;
+        }
+      }
+
+      const instruction = await getRotateBitmapInstructionAsync({
         payer: transactionSigner,
         operator: transactionSigner,
         instance: address(instancePubkey),
-        expectedCurrentTreeIndex: instanceAccount.data.currentTreeIndex,
+        expectedGeneration: bitmapHeader.generation,
       });
 
-      console.log('Created reset SMT root instruction:', instruction);
+      console.log('Created rotate bitmap instruction:', instruction);
 
       // Get recent blockhash
       const { value: latestBlockhash } = await rpc.getLatestBlockhash({ commitment: 'confirmed' }).send();
@@ -195,11 +228,11 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
 
       console.log('Transaction sent with signature:', signature);
 
-      setSuccess(`SMT root reset successfully! Signature: ${signature}`);
+      setSuccess(`Bitmap rotated successfully! Signature: ${signature}`);
 
     } catch (err) {
-      console.error('Error resetting SMT root:', err);
-      setError(err instanceof Error ? err.message : 'Failed to reset SMT root');
+      console.error('Error rotating bitmap:', err);
+      setError(err instanceof Error ? err.message : 'Failed to rotate bitmap');
     } finally {
       setLoading(false);
     }
@@ -256,16 +289,6 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
           />
         </div>
         <div className="form-group">
-          <label>New Withdrawal Root (32 bytes hex)</label>
-          <input
-            type="text"
-            value={newWithdrawalRoot}
-            onChange={(e) => setNewWithdrawalRoot(e.target.value)}
-            placeholder="0x..."
-            className="input"
-          />
-        </div>
-        <div className="form-group">
           <label>Transaction Nonce</label>
           <input
             type="number"
@@ -275,19 +298,9 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
             className="input"
           />
         </div>
-        <div className="form-group">
-          <label>Sibling Proofs (512 bytes hex)</label>
-          <textarea
-            value={siblingProofs}
-            onChange={(e) => setSiblingProofs(e.target.value)}
-            placeholder="0x..."
-            className="input textarea"
-            rows={3}
-          />
-        </div>
         <button
           onClick={handleReleaseFunds}
-          disabled={loading || !mintAddress || !userAddress || !amount || !newWithdrawalRoot || !transactionNonce || !siblingProofs}
+          disabled={loading || !mintAddress || !userAddress || !amount || !transactionNonce}
           className="button button-primary"
         >
           {loading ? 'Processing...' : 'Release Funds'}
@@ -295,16 +308,18 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
       </div>
 
       <div className="function-section">
-        <h3>Reset SMT Root</h3>
+        <h3>Rotate Bitmap</h3>
         <p className="info-text">
-          This will reset the Sparse Merkle Tree root to the empty tree state
+          Clears every consumed-nonce bit and opens the next generation. Only do this
+          once the instance has reached its generation boundary: nonces from the
+          generation being closed can never be released afterwards.
         </p>
         <button
-          onClick={handleResetSmtRoot}
+          onClick={handleRotateBitmap}
           disabled={loading}
           className="button button-warning"
         >
-          {loading ? 'Processing...' : 'Reset SMT Root'}
+          {loading ? 'Processing...' : 'Rotate Bitmap'}
         </button>
       </div>
     </div>

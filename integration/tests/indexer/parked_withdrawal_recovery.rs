@@ -349,6 +349,59 @@ async fn recovery_requeues_stale_parked_to_pending() {
     );
 }
 
+/// The whole point of parking a rotation wait. A release held for a rotation was
+/// never broadcast, so it has no signatures, which is exactly the shape the
+/// stale-`Processing` sweep quarantines. Recording the wait as `Parked` is what
+/// tells recovery to rebuild the withdrawal instead of paging an operator, and a
+/// restart is the case where the in-memory queue is gone and only the row is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_requeues_an_orphaned_rotation_wait_instead_of_quarantining_it() {
+    let (db, url, _c) = start_pg("recovery_rotation_wait").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    // Two identical waiting releases: one whose wait was recorded, one left in
+    // the state a rotation wait used to sit in.
+    let parked = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 23))
+        .await
+        .unwrap();
+    let unrecorded = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 24))
+        .await
+        .unwrap();
+    set_status(&pool, parked, "processing").await;
+    set_status(&pool, unrecorded, "processing").await;
+
+    // The one write the rotation-wait path makes. Neither row records a
+    // signature, because neither was ever broadcast.
+    assert!(
+        storage.try_park_processing(parked).await.unwrap(),
+        "a waiting release must be parkable"
+    );
+
+    // The restart: the queue that was driving both waits is gone.
+    backdate(&pool, parked, ChronoDuration::minutes(10)).await;
+    backdate(&pool, unrecorded, ChronoDuration::minutes(10)).await;
+
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status_of(&pool, parked).await,
+        "pending",
+        "an orphaned rotation wait must be rebuilt, not escalated"
+    );
+    assert_eq!(
+        status_of(&pool, unrecorded).await,
+        "manual_review",
+        "an unrecorded wait is indistinguishable from a lost broadcast"
+    );
+}
+
 /// An escrow operator shares this database but owns only deposits. Parking is
 /// withdrawal-only, so its parked sweep must find nothing: unparking a withdrawal
 /// would hand a row a withdraw sender still owns back to the pending queue.

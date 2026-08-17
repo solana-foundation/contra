@@ -3,15 +3,24 @@
 //! via the `test_hooks::run_send_and_confirm` wrapper.
 //!
 //! The retry counter only fires for the
-//! `RetryPolicy::Idempotent` + `withdrawal_nonce` combination — the
-//! withdrawal path. Each call to `send_and_confirm` increments
+//! `RetryPolicy::Idempotent` + `withdrawal_nonce` combination, the
+//! withdrawal path. Each entry into `send_and_confirm` increments
 //! `state.retry_counts[nonce]`; once that count reaches
-//! `state.retry_max_attempts`, the next call short-circuits, increments
+//! `state.retry_max_attempts`, the next entry short-circuits, increments
 //! the `max_retries_exceeded` metric, and routes to
-//! `handle_permanent_failure` *without* attempting the wire send.
+//! `handle_permanent_failure` without attempting the wire send.
+//!
+//! The re-entry that makes the counter accumulate is the confirmation
+//! retry: a broadcast the cluster accepts but never confirms polls to
+//! exhaustion, `check_transaction_status` answers
+//! `ConfirmationResult::Retry`, and the `Idempotent` arm of
+//! `handle_confirmation_result` calls `send_and_confirm` again. Nothing
+//! on that route is terminal, so nothing clears the counter between
+//! resends. The cap tests below drive exactly that loop from a single
+//! call and let the recursion supply the rest.
 //!
 //! Because the test omits the on-chain machinery a real withdrawal
-//! requires (SMT state, instance PDA, etc.), we construct the
+//! requires (instance PDA, withdrawal bitmap, etc.), we construct the
 //! `TransactionContext` and `InstructionWithSigners` directly and rely
 //! on the same `MockRpcServer` plumbing the JIT and sign-and-send tests
 //! use. With no `remint_cache` entry seeded in `state`, the
@@ -29,13 +38,16 @@ use {
                 test_hooks,
                 types::{PendingSig, SenderState, TransactionStatusUpdate},
             },
-            utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
+            utils::{
+                instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
+                transaction_util::MAX_POLL_ATTEMPTS_CONFIRMATION,
+            },
         },
         storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
     },
     sender_fixtures::{
         blockhash_reply, ensure_admin_signer_env, make_config, make_instruction, make_remint_info,
-        withdrawal_ctx,
+        null_status_reply, send_transaction_echo_reply, withdrawal_ctx,
     },
     solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
     std::sync::Arc,
@@ -96,139 +108,174 @@ fn enqueue_failing_send(mock: &MockRpcServer, label: &str) {
     mock.enqueue("sendTransaction", Reply::error(-32601, label.to_string()));
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Sender retry counter — cap at `retry_max_attempts`, then short-circuit.
-// ─────────────────────────────────────────────────────────────────────
+/// Number of `getSignatureStatuses` calls one unconfirmed send spends
+/// before `check_transaction_status` gives up and answers `Retry`.
+const POLLS_PER_SEND: usize = MAX_POLL_ATTEMPTS_CONFIRMATION as usize;
+
+/// Enqueue one full "accepted but never confirms" cycle: the blockhash
+/// fetch, a broadcast the mock accepts, and the null status replies that
+/// drive `check_transaction_status` to `ConfirmationResult::Retry`. That
+/// verdict is what re-enters `send_and_confirm` under
+/// `RetryPolicy::Idempotent`, so one cycle equals one turn of the
+/// production resend loop.
+fn enqueue_unconfirmed_send(mock: &MockRpcServer) {
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    for _ in 0..POLLS_PER_SEND {
+        mock.enqueue("getSignatureStatuses", null_status_reply());
+    }
+}
+
+// ---------------------------------------------------------------------
+// Sender retry counter: cap at `retry_max_attempts`, then short-circuit.
+// ---------------------------------------------------------------------
 //
-// With `retry_max_attempts = 3`: the first three `send_and_confirm`
-// calls each issue one wire send (which fails) and route to
-// `handle_permanent_failure`. The fourth call observes
-// `retry_counts[nonce] == 3 >= retry_max_attempts` at the function
-// entry, increments the `max_retries_exceeded` metric, and routes to
-// `handle_permanent_failure` *without* touching the RPC. The fourth
-// `getLatestBlockhash`/`sendTransaction` script (if scripted) would
-// stay unconsumed, proving the short-circuit fired.
+// With `retry_max_attempts = 3` a single call is enough: every broadcast
+// is accepted and never confirms, so each confirmation ends in
+// `ConfirmationResult::Retry` and the `Idempotent` arm re-enters
+// `send_and_confirm` without passing through any terminal cleanup. The
+// first three entries each spend one wire send; the fourth observes
+// `retry_counts[nonce] == 3 >= retry_max_attempts`, increments the
+// `max_retries_exceeded` metric, and routes to
+// `handle_permanent_failure` without touching the RPC. The fourth
+// scripted cycle stays queued, which is what separates "the loop stopped"
+// from "the loop ran out of script".
 #[tokio::test]
 async fn idempotent_send_loops_capped_by_retry_max_attempts() {
     let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(404, 7);
 
-    // Three failing wire sends — every call increments the retry counter.
-    for i in 0..3 {
-        enqueue_failing_send(&mock, &format!("attempt {}", i + 1));
-    }
-    // A fourth scripted pair that the short-circuit must NOT consume.
-    enqueue_failing_send(&mock, "should never be consumed");
-
+    // Three cycles the resend loop may spend, plus one the cap must leave alone.
     for _ in 0..4 {
-        test_hooks::run_send_and_confirm(
-            &mut state,
-            make_instruction(),
-            None,
-            &ctx,
-            RetryPolicy::Idempotent,
-            &ExtraErrorCheckPolicy::None,
-            &storage_tx,
-        )
-        .await;
+        enqueue_unconfirmed_send(&mock);
     }
 
-    // The counter must reflect exactly three attempts (the fourth call
-    // observed `attempts >= retry_max_attempts` and short-circuited).
-    let attempts = state.retry_counts.get(&7).copied().unwrap_or(0);
-    assert_eq!(
-        attempts, 3,
-        "retry_counts[nonce] must equal retry_max_attempts after the cap is hit"
-    );
+    test_hooks::run_send_and_confirm(
+        &mut state,
+        make_instruction(),
+        None,
+        &ctx,
+        RetryPolicy::Idempotent,
+        &ExtraErrorCheckPolicy::None,
+        &storage_tx,
+    )
+    .await;
 
     // Wire layer: exactly three `sendTransaction` calls, not four.
     assert_eq!(
         mock.call_count("sendTransaction"),
         3,
-        "the fourth call must short-circuit before issuing any wire send"
+        "the fourth entry must short-circuit before issuing any wire send"
     );
-    // The fourth scripted pair must remain queued.
+    // Every send polled to exhaustion, so the loop turned on Retry and nothing else.
+    assert_eq!(
+        mock.call_count("getSignatureStatuses"),
+        3 * POLLS_PER_SEND,
+        "each of the three sends must poll to exhaustion before re-entering"
+    );
+    // The fourth scripted cycle must remain queued.
     assert_eq!(
         mock.remaining_scripted("sendTransaction"),
         1,
         "the fourth scripted reply must remain unconsumed"
     );
 
-    // Every call routed to `handle_permanent_failure`, which (with no
-    // `remint_cache` entry) falls through to `send_fatal_error`. Drain
-    // the channel and confirm we got 4 `Failed` updates — three from
-    // the wire-error path and one from the max-retries-exceeded short-
-    // circuit. The fourth carries the distinct "Max retries exceeded"
-    // error message.
+    // The cap is a terminal transition, so the nonce's caches are dropped
+    // with it. A counter left behind would be spent budget charged to
+    // whatever withdrawal reuses the nonce next, so its absence is part of
+    // what the cap has to guarantee.
+    assert!(
+        !state.retry_counts.contains_key(&7),
+        "the terminal transition must clear the nonce's retry counter"
+    );
+
+    // Only the short-circuit is terminal here: the three Retry verdicts
+    // recursed instead of reporting, so exactly one update reaches
+    // storage. With no `remint_cache` entry seeded,
+    // `handle_permanent_failure` falls through to `send_fatal_error` and
+    // that update carries the "Max retries exceeded" label.
     let mut updates = Vec::new();
     while let Ok(u) = storage_rx.try_recv() {
         updates.push(u);
     }
     assert_eq!(
         updates.len(),
-        4,
-        "every call must emit exactly one status update"
+        1,
+        "only the capped entry is terminal, so it must emit the only status update"
     );
+    assert_eq!(updates[0].status, TransactionStatus::Failed);
     assert!(
-        updates
-            .iter()
-            .all(|u| u.status == TransactionStatus::Failed),
-        "every status update must be Failed; got {:?}",
-        updates.iter().map(|u| &u.status).collect::<Vec<_>>()
-    );
-    assert!(
-        updates
-            .last()
-            .and_then(|u| u.error_message.as_deref())
+        updates[0]
+            .error_message
+            .as_deref()
             .map(|m| m.contains("Max retries"))
             .unwrap_or(false),
-        "the final update must surface the Max-retries-exceeded label; got {:?}",
-        updates.last().and_then(|u| u.error_message.as_deref())
+        "the update must surface the Max-retries-exceeded label; got {:?}",
+        updates[0].error_message.as_deref()
     );
 
     mock.shutdown().await;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Higher-budget boundary — retry counter still trips on the (n+1)th call.
-// ─────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------
+// Higher-budget boundary: the counter still trips on the (n+1)th entry.
+// ---------------------------------------------------------------------
 //
-// Same shape with `retry_max_attempts = 4`: four wire sends consumed,
-// the fifth call short-circuits. Pins the inclusive boundary of the
-// retry-counter check (`attempts >= retry_max_attempts`).
+// Same shape with `retry_max_attempts = 4`: four wire sends consumed by
+// the resend loop, the fifth entry short-circuits. Pins the inclusive
+// boundary of the retry-counter check (`attempts >= retry_max_attempts`)
+// at a budget the first test cannot distinguish from a hard-coded three.
 #[tokio::test]
 async fn idempotent_send_loops_capped_at_higher_budget() {
     let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(4).await;
     let ctx = withdrawal_ctx(505, 11);
 
-    for i in 0..4 {
-        enqueue_failing_send(&mock, &format!("attempt {}", i + 1));
-    }
-
     for _ in 0..5 {
-        test_hooks::run_send_and_confirm(
-            &mut state,
-            make_instruction(),
-            None,
-            &ctx,
-            RetryPolicy::Idempotent,
-            &ExtraErrorCheckPolicy::None,
-            &storage_tx,
-        )
-        .await;
+        enqueue_unconfirmed_send(&mock);
     }
 
-    assert_eq!(state.retry_counts.get(&11).copied().unwrap_or(0), 4);
-    assert_eq!(mock.call_count("sendTransaction"), 4);
+    test_hooks::run_send_and_confirm(
+        &mut state,
+        make_instruction(),
+        None,
+        &ctx,
+        RetryPolicy::Idempotent,
+        &ExtraErrorCheckPolicy::None,
+        &storage_tx,
+    )
+    .await;
+
+    assert_eq!(
+        mock.call_count("sendTransaction"),
+        4,
+        "the fifth entry must short-circuit before issuing any wire send"
+    );
+    assert_eq!(
+        mock.call_count("getSignatureStatuses"),
+        4 * POLLS_PER_SEND,
+        "each of the four sends must poll to exhaustion before re-entering"
+    );
+    assert_eq!(
+        mock.remaining_scripted("sendTransaction"),
+        1,
+        "the fifth scripted reply must remain unconsumed"
+    );
+    assert!(
+        !state.retry_counts.contains_key(&11),
+        "the terminal transition must clear the nonce's retry counter"
+    );
 
     let mut updates = Vec::new();
     while let Ok(u) = storage_rx.try_recv() {
         updates.push(u);
     }
-    assert_eq!(updates.len(), 5);
-    assert!(updates
-        .iter()
-        .all(|u| u.status == TransactionStatus::Failed));
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].status, TransactionStatus::Failed);
+    assert!(updates[0]
+        .error_message
+        .as_deref()
+        .map(|m| m.contains("Max retries"))
+        .unwrap_or(false));
     mock.shutdown().await;
 }
 

@@ -617,6 +617,54 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     mock.shutdown().await;
 }
 
+// IT-4f: the GC leaves an escalated row's signatures alone.
+
+/// `ManualReview` means the outcome is unknown, and the broadcast signatures are
+/// the only thing that can still decide it: the boot divergence check attributes
+/// a consumed nonce with them, and without them it alerts instead of repairing.
+/// Reclaiming them at the moment of doubt is the one case the GC must not touch.
+#[tokio::test(flavor = "multi_thread")]
+async fn it4f_gc_retains_manual_review_release_sigs() {
+    let (db, url, _container) = start_pg("it4f_gc_manual").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let escalated = make_withdrawal(&Signature::new_unique().to_string(), 40);
+    let id = db.insert_transaction_internal(&escalated).await.unwrap();
+    sqlx::query(
+        "UPDATE transactions SET status = 'manual_review'::transaction_status WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 7)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "an escalated row must keep the evidence that can resolve it"
+    );
+    mock.shutdown().await;
+}
+
 // IT-5 / IT-D5: deposit with a persisted signature but an RPC that cannot classify it.
 // ManualReview (never a silent demote, which would risk a double-mint).
 
@@ -961,6 +1009,7 @@ async fn it11_pending_remint_rows_untouched() {
         vec!["fake-sig".to_string()],
         vec![1],
         Utc::now() + ChronoDuration::minutes(30),
+        false,
     )
     .await
     .unwrap();
@@ -1429,18 +1478,22 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
             }]
         })),
     );
+    // Drop the journal by hand: the GC keeps `manual_review` signatures on
+    // purpose, so clearing it here is what proves the promotion below came
+    // from the row's own columns rather than the journal.
+    storage.delete_release_signatures(tx_id).await.unwrap();
+    assert_eq!(
+        journal_len(&pool, tx_id).await,
+        0,
+        "precondition: the journal must be empty before the promoting pass"
+    );
+
     let metric_before = snapshot_recovered("withdraw", "manual_review_cleared", "withdrawal");
 
     test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
         .await
         .unwrap();
 
-    assert_eq!(
-        journal_len(&pool, tx_id).await,
-        0,
-        "the GC at the top of pass 2 removes the journal, so the promotion below \
-         can only have come from the row's own columns"
-    );
     assert_eq!(status_of(&pool, tx_id).await, "completed");
     assert_eq!(
         counterpart_sig_of(&pool, tx_id).await,
@@ -1501,7 +1554,7 @@ async fn it15_manual_review_without_signatures_stays_quarantined() {
 
 // IT-16: the boot pre-flight's own path, against real Postgres. A PendingRemint
 // withdrawal whose release finalized is promoted, and the nonce then appears in
-// the completed set the SMT gate rebuilds from. That last assertion is the whole
+// the completed set the bitmap diff is taken against. That last assertion is the whole
 // point: it proves the promotion feeds the exact query that refuses the boot,
 // which the MockStorage unit test cannot show.
 
@@ -1536,12 +1589,13 @@ async fn it16_pending_remint_landed_release_enters_completed_nonce_set() {
             vec![landed_sig.to_string()],
             vec![100],
             Utc::now() + ChronoDuration::seconds(32),
+            false,
         )
         .await
         .unwrap();
 
-    // The wedge: the chain has this nonce, the completed set the gate rebuilds
-    // from does not, so validate_smt_root would diverge and refuse to start.
+    // The wedge: the chain has this nonce, the completed set the gate diffs
+    // against does not, so the bitmap check would see it as chain-ahead.
     assert!(
         !storage
             .get_completed_withdrawal_nonces(0, 1000)
@@ -1587,8 +1641,8 @@ async fn it16_pending_remint_landed_release_enters_completed_nonce_set() {
             .await
             .unwrap()
             .contains(&nonce_u64),
-        "the promoted nonce must now be in the set the SMT gate rebuilds from, \
-         or the boot would still refuse to start"
+        "the promoted nonce must now be in the set the bitmap diff is taken against, \
+         or the boot pre-flight would still see it as chain-ahead"
     );
     assert_eq!(mock.call_count("sendTransaction"), 0);
     assert_recovered_increment(
@@ -1629,7 +1683,13 @@ async fn it17_stuck_batch_does_not_starve_later_stalled_rows() {
         .await
         .unwrap();
         storage
-            .set_pending_remint(id, vec!["not-a-signature".to_string()], vec![100], deadline)
+            .set_pending_remint(
+                id,
+                vec!["not-a-signature".to_string()],
+                vec![100],
+                deadline,
+                false,
+            )
             .await
             .unwrap();
         blocked.push(id);
@@ -1646,7 +1706,13 @@ async fn it17_stuck_batch_does_not_starve_later_stalled_rows() {
         .await
         .unwrap();
     storage
-        .set_pending_remint(target_id, vec![landed_sig.to_string()], vec![100], deadline)
+        .set_pending_remint(
+            target_id,
+            vec![landed_sig.to_string()],
+            vec![100],
+            deadline,
+            false,
+        )
         .await
         .unwrap();
 

@@ -109,7 +109,7 @@ counter_vec!(
 // A status write matched no row because the transaction had already moved
 // off Processing. That is routine for most statuses and is not counted here;
 // only a skipped `Completed` increments, because it means an on-chain release
-// the DB will never record, which wedges the next boot's SMT root check.
+// the DB will never record, which wedges the next boot's bitmap diff.
 // Any nonzero sample needs a human.
 counter_vec!(
     OPERATOR_DB_UPDATE_SKIPPED,
@@ -229,8 +229,13 @@ pub fn init_labels(program_type: &str) {
         "build_error",
         "max_retries_exceeded",
         "rpc_send_error",
-        "invalid_smt_proof",
-        "invalid_nonce_for_tree_index",
+        "nonce_already_used",
+        "nonce_outside_generation",
+        "bitmap_unavailable",
+        "rotation_already_landed",
+        "rotation_rearmed",
+        "rotation_lost",
+        "bitmap_divergence",
         "mint_not_initialized",
         "confirmation_timeout_non_idempotent",
         "confirmation_timeout",

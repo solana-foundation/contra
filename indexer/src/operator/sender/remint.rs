@@ -1,11 +1,12 @@
 #[cfg(test)]
 use super::types::InFlightQueue;
 use super::types::SenderState;
-use crate::operator::tree_constants::MAX_TREE_LEAVES;
+use crate::config::ProgramType;
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
-        check_transaction_status, remint_idempotency_memo,
+        check_transaction_status, fetch_consumed_nonces, find_withdrawal_bitmap_pda,
+        remint_idempotency_memo,
         sender::{
             find_existing_mint_signature_with_memo,
             transaction::FINALITY_SAFETY_DELAY,
@@ -19,6 +20,7 @@ use crate::{
     storage::TransactionStatus,
 };
 use chrono::Utc;
+use private_channel_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signature};
 use tokio::sync::mpsc;
@@ -340,7 +342,7 @@ pub async fn process_pending_remints(
     }
 
     // Each matured entry leaves the queue unless we push it back into `remaining`.
-    for entry in matured {
+    for mut entry in matured {
         let nonce_label = entry
             .ctx
             .withdrawal_nonce
@@ -352,22 +354,8 @@ pub async fn process_pending_remints(
         // not source_rpc_client which only the remint MintTo uses.
         match classify_release_signatures(&state.rpc_client, &entry.signatures).await {
             // Case 1: a sig finalized successfully, the withdrawal landed.
+            // Nothing local to repair: the chain is the only record of consumption.
             SigFinality::Landed(sig) => {
-                // Chain root now includes this nonce. handle_permanent_failure
-                // removed it from the local SMT assuming the tx failed; put it
-                // back so local matches chain. Skip if the tree already rotated
-                // past this nonce's window.
-                if let Some(nonce) = entry.ctx.withdrawal_nonce {
-                    if let Some(smt) = state.smt_state.as_mut() {
-                        if smt.smt_state.tree_index() == nonce / MAX_TREE_LEAVES as u64 {
-                            if smt.smt_state.insert_nonce(nonce) {
-                                info!("Re-inserted landed nonce {nonce} into local SMT");
-                            } else {
-                                debug!("Landed nonce {nonce} already present in local SMT, no divergence");
-                            }
-                        }
-                    }
-                }
                 send_completed(storage_tx, &entry, &nonce_label, sig).await;
             }
             // Case 2: could still land or unclassifiable → defer, don't remint.
@@ -382,19 +370,258 @@ pub async fn process_pending_remints(
                 )
                 .await;
             }
-            // Case 3: every sig is finalized-failed or expired, safe to remint.
-            SigFinality::Dead => {
-                info!(
-                    "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
-                    nonce_label
-                );
-                execute_deferred_remint(state, &entry, storage_tx).await;
-            }
+            // Case 3: every sig is finalized-failed or expired, so the bitmap decides.
+            SigFinality::Dead => match bitmap_verdict(state, &entry).await {
+                BitmapVerdict::Blocked(reason) => {
+                    error!("Refusing to remint nonce {}: {}", nonce_label, reason);
+                    send_manual_review(storage_tx, &entry, &reason).await;
+                }
+                // Not knowing whether the release landed is never permission to
+                // credit the user again, so an unanswerable bitmap takes the same
+                // route as an unclassifiable signature: wait a while, look
+                // again, and hand the entry to a human if it stays unanswerable.
+                BitmapVerdict::Unknown(reason) if !entry.release_refused_on_chain => {
+                    defer_or_escalate(
+                        &mut remaining,
+                        entry,
+                        &nonce_label,
+                        &reason,
+                        &state.storage,
+                        storage_tx,
+                    )
+                    .await;
+                }
+                // The payout record is the last gate, and the only one whose answer survives a rotation.
+                BitmapVerdict::Unknown(_) | BitmapVerdict::Clear => {
+                    match release_record(state, &mut entry).await {
+                        ReleaseRecord::Found(reason) => {
+                            error!("Refusing to remint nonce {}: {}", nonce_label, reason);
+                            send_manual_review(storage_tx, &entry, &reason).await;
+                        }
+                        // The indexer normally catches up in seconds, so waiting
+                        // costs a tick where escalating costs a person.
+                        ReleaseRecord::Unproven(reason) => {
+                            defer_or_escalate(
+                                &mut remaining,
+                                entry,
+                                &nonce_label,
+                                &reason,
+                                &state.storage,
+                                storage_tx,
+                            )
+                            .await;
+                        }
+                        ReleaseRecord::ProvenAbsent => {
+                            info!(
+                                "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
+                                nonce_label
+                            );
+                            execute_deferred_remint(state, &entry, storage_tx).await;
+                        }
+                    }
+                }
+            },
         }
     }
 
     // `remaining` = entries not yet due + entries `defer_or_escalate` re-queued.
     state.pending_remints = remaining;
+}
+
+/// What the chain can tell us about a nonce at the instant before a remint.
+///
+/// The three outcomes exist because "the bit is not set" and "we could not read
+/// the bit" are completely different facts. Collapsing them into one is how a
+/// gate that exists to stop a double credit ends up waving one through, so the
+/// two are kept apart all the way to the decision.
+enum BitmapVerdict {
+    /// The bit is set: the release landed, so a remint would pay it out twice.
+    Blocked(String),
+    /// The bit is clear inside the window the bitmap currently covers.
+    Clear,
+    /// The bitmap could not answer, which is not the same as answering "no".
+    Unknown(String),
+}
+
+/// Ask the chain whether this nonce was actually released before crediting the
+/// user again.
+///
+/// This read is the safety property the credit rests on. Every other input to the
+/// decision is indirect: signatures can look dead while the release landed under
+/// one we never recorded. The bit is the release.
+///
+/// It is deliberately consulted here and nowhere earlier. Anywhere sooner and the
+/// answer could go stale before the credit; this is the last instant at which it
+/// is still true.
+async fn bitmap_verdict(state: &SenderState, entry: &PendingRemint) -> BitmapVerdict {
+    // No nonce or no instance means there is no bitmap to consult at all.
+    // Neither is reachable from the withdraw sender, which is the only one that
+    // queues a remint and is always configured with the instance that owns the
+    // bitmap, so this is a shape guard rather than a live outcome.
+    let (Some(nonce), Some(instance_pda)) = (entry.ctx.withdrawal_nonce, state.instance_pda) else {
+        return BitmapVerdict::Clear;
+    };
+
+    let bitmap = match fetch_consumed_nonces(
+        &state.rpc_client,
+        &find_withdrawal_bitmap_pda(&instance_pda),
+    )
+    .await
+    {
+        Ok(bitmap) => bitmap,
+        Err(e) => {
+            warn!("Could not read the bitmap before reminting nonce {nonce}: {e}");
+            return BitmapVerdict::Unknown(format!("bitmap read failed: {e}"));
+        }
+    };
+
+    // Rotation clears every bit, so outside the current window a clear bit is
+    // indistinguishable from a release that happened and was then wiped. Of the
+    // two readings available here, treating it as "free" is the only one that
+    // can pay a user twice, so the window is reported as unanswerable instead.
+    if !bitmap.covers(nonce) {
+        debug!(
+            "Bitmap is on generation {} and cannot answer for nonce {nonce}",
+            bitmap.generation
+        );
+        return BitmapVerdict::Unknown(format!(
+            "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
+            bitmap.generation
+        ));
+    }
+
+    if bitmap.is_consumed(nonce) {
+        return BitmapVerdict::Blocked(format!(
+            "nonce {nonce} is consumed on-chain in generation {}, so the release landed \
+             despite every signature looking dead; reminting would credit it twice",
+            bitmap.generation
+        ));
+    }
+
+    BitmapVerdict::Clear
+}
+
+/// What the indexer's record of releases can say about this nonce.
+///
+/// The three outcomes exist because an absent row has two very different
+/// meanings: the indexer walked the slots and saw no release, or it has not
+/// walked them yet. Only the first rules a payout out.
+enum ReleaseRecord {
+    /// A release is on record, so refunding would credit the nonce twice.
+    Found(String),
+    /// Every slot a release could sit in is indexed, and none holds one.
+    ProvenAbsent,
+    /// No row, but the record is not known to cover the window in question.
+    Unproven(String),
+}
+
+/// Ask the indexer's record whether this nonce already paid out.
+///
+/// This is the last gate, and past a rotation it is the only one, because the
+/// bits that would have answered have been cleared. So it has to distinguish an
+/// absence it can stand behind from one it cannot: the checkpoint is the highest
+/// slot the indexer has fully processed, and a release is written before the
+/// checkpoint moves past its slot, so a checkpoint at or beyond the window makes
+/// an empty lookup a real negative rather than a gap.
+async fn release_record(state: &SenderState, entry: &mut PendingRemint) -> ReleaseRecord {
+    let Some(nonce) = entry.ctx.withdrawal_nonce else {
+        return ReleaseRecord::ProvenAbsent;
+    };
+
+    match state.storage.get_observed_release(nonce).await {
+        Ok(Some(release)) => {
+            return ReleaseRecord::Found(format!(
+                "a release for nonce {nonce} is on record (slot {}, signature {}), so it already \
+                 paid out and reminting would credit it twice",
+                release.slot, release.signature
+            ))
+        }
+        Ok(None) => {}
+        // An unreadable record rules no payout out, and only a ruled-out payout may be refunded.
+        Err(e) => {
+            return ReleaseRecord::Found(format!(
+                "the release record for nonce {nonce} could not be read ({e}), so a payout cannot \
+                 be ruled out"
+            ))
+        }
+    }
+
+    coverage_verdict(state, entry, nonce).await
+}
+
+/// Whether the indexer has walked far enough for the empty lookup above to mean
+/// anything.
+async fn coverage_verdict(
+    state: &SenderState,
+    entry: &mut PendingRemint,
+    nonce: u64,
+) -> ReleaseRecord {
+    let bound = match entry.coverage_slot {
+        Some(slot) => slot,
+        None => match state.rpc_client.get_slot().await {
+            // A release that happened is in a slot at or below this one, so this
+            // is the whole window the record has to cover.
+            Ok(slot) => {
+                entry.coverage_slot = Some(slot);
+                slot
+            }
+            Err(e) => {
+                return ReleaseRecord::Unproven(format!(
+                    "could not read the current slot to bound the release window for nonce \
+                     {nonce} ({e})"
+                ))
+            }
+        },
+    };
+
+    match state
+        .storage
+        .get_committed_checkpoint(ProgramType::Escrow.as_label())
+        .await
+    {
+        Ok(Some(checkpoint)) if checkpoint >= bound => ReleaseRecord::ProvenAbsent,
+        Ok(Some(checkpoint)) => ReleaseRecord::Unproven(format!(
+            "no release is on record for nonce {nonce}, but the indexer has only reached slot \
+             {checkpoint} of {bound}, so a release could still be unindexed"
+        )),
+        Ok(None) => ReleaseRecord::Unproven(format!(
+            "no release is on record for nonce {nonce} and the indexer has committed no \
+             checkpoint, so nothing says the record covers slot {bound}"
+        )),
+        Err(e) => ReleaseRecord::Unproven(format!(
+            "no release is on record for nonce {nonce} and the indexer checkpoint could not be \
+             read ({e}), so its coverage is unknown"
+        )),
+    }
+}
+
+/// Escalate a pending-remint entry that must not be reminted and cannot be
+/// completed either.
+async fn send_manual_review(
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    entry: &PendingRemint,
+    reason: &str,
+) {
+    let Some(transaction_id) = entry.ctx.transaction_id else {
+        error!("Cannot escalate a pending remint with no transaction id: {reason}");
+        return;
+    };
+    send_guaranteed(
+        storage_tx,
+        TransactionStatusUpdate {
+            transaction_id,
+            trace_id: entry.ctx.trace_id.clone(),
+            status: TransactionStatus::ManualReview,
+            counterpart_signature: None,
+            processed_at: Some(Utc::now()),
+            error_message: Some(format!("{} | {}", entry.original_error, reason)),
+            remint_signature: None,
+            remint_attempted: false,
+        },
+        "transaction status update",
+    )
+    .await
+    .ok();
 }
 
 /// Report a pending-remint entry as Completed because one of its withdrawal
@@ -530,20 +757,21 @@ async fn defer_or_escalate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::sender::test_support::{mock_bitmap_account, mock_bitmap_read_failure};
     use crate::operator::sender::types::{
-        PendingRemint, PendingSig, SenderSMTState, SenderState, TransactionContext, MAX_IN_FLIGHT,
+        PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
-    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
-    use crate::operator::utils::smt_util::SmtState;
+    use crate::operator::utils::instruction_util::{TransactionKind, WithdrawalRemintInfo};
     use crate::operator::MintCache;
     use crate::operator::RetryConfig;
     use crate::operator::RpcClientWithRetry;
     use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::DbObservedRelease;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::Once;
     use tokio::sync::{mpsc, Semaphore};
@@ -571,14 +799,17 @@ mod tests {
             source_rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
-            smt_state: None,
+            in_flight_withdrawals: HashSet::new(),
             retry_counts: HashMap::new(),
+            cached_generation: None,
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
-            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -624,6 +855,46 @@ mod tests {
                 instruction_index: 0,
                 inner_index: None,
                 landed_remint_signature: None,
+                release_refused_on_chain: false,
+            });
+    }
+
+    /// A stored PendingRemint row for a release the program refused: real
+    /// signatures so the finality check can classify them, a deadline that has
+    /// already matured so the entry is due on the first pass, and the refusal
+    /// recorded on the row rather than only in the queue.
+    fn seed_refused_pending_remint_row(mock: &MockStorage, id: i64, nonce: i64) {
+        use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+        let now = Utc::now();
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(DbTransaction {
+                id,
+                signature: Signature::new_unique().to_string(),
+                trace_id: format!("trace-{id}"),
+                slot: 0,
+                initiator: Pubkey::new_unique().to_string(),
+                recipient: Pubkey::new_unique().to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                amount: TokenAmount(5_000),
+                memo: None,
+                transaction_type: TransactionType::Withdrawal,
+                withdrawal_nonce: Some(nonce),
+                status: TransactionStatus::PendingRemint,
+                created_at: now,
+                updated_at: now,
+                processed_at: None,
+                counterpart_signature: None,
+                remint_signatures: Some(vec![Signature::new_unique().to_string()]),
+                remint_last_valid_block_heights: Some(vec![0]),
+                pending_remint_deadline_at: Some(now - chrono::Duration::seconds(1)),
+                finality_check_attempts: 0,
+                recovery_requeue_attempts: 0,
+                instruction_index: 0,
+                inner_index: None,
+                landed_remint_signature: None,
+                release_refused_on_chain: true,
             });
     }
 
@@ -656,14 +927,17 @@ mod tests {
             source_rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
-            smt_state: None,
+            in_flight_withdrawals: HashSet::new(),
             retry_counts: HashMap::new(),
+            cached_generation: None,
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
-            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -716,14 +990,17 @@ mod tests {
             source_rpc_client,
             storage: storage.clone(),
             instance_pda: None,
-            smt_state: None,
+            in_flight_withdrawals: HashSet::new(),
             retry_counts: HashMap::new(),
+            cached_generation: None,
+            rotation_retry_attempts: 0,
+            rotation_in_flight: None,
+            rotation_rearm_attempts: 0,
             mint_builders: HashMap::new(),
             mint_cache: MintCache::new(storage),
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 1,
             rotation_retry_queue: Vec::new(),
-            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -795,11 +1072,13 @@ mod tests {
             .create_async()
             .await;
 
-        let (mut state, _mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let _cover = cover_release_window(&mut dest, &mock).await;
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(555),
                 withdrawal_nonce: Some(5),
                 trace_id: Some("trace-555".to_string()),
@@ -812,6 +1091,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -835,6 +1116,7 @@ mod tests {
         // Push a matured entry — RPC will fail (no real endpoint)
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(8),
                 trace_id: Some("trace-20".to_string()),
@@ -847,6 +1129,8 @@ mod tests {
             original_error: "max retries".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -887,6 +1171,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(30),
                 withdrawal_nonce: Some(9),
                 trace_id: Some("trace-30".to_string()),
@@ -899,6 +1184,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 1,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -935,6 +1222,7 @@ mod tests {
         // Push entry already at max attempts — next RPC failure triggers ManualReview
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(8),
                 trace_id: Some("trace-20".to_string()),
@@ -947,6 +1235,8 @@ mod tests {
             original_error: "max retries".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 2, // MAX_FINALITY_CHECK_ATTEMPTS - 1
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1001,6 +1291,7 @@ mod tests {
         // that proves it was processed.
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(10),
                 withdrawal_nonce: Some(1),
                 trace_id: Some("trace-10".to_string()),
@@ -1013,11 +1304,14 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         // Entry 2: immature — must not be touched at all.
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(20),
                 withdrawal_nonce: Some(2),
                 trace_id: Some("trace-20".to_string()),
@@ -1030,6 +1324,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: future_deadline,
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1114,6 +1410,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(99),
                 withdrawal_nonce: Some(7),
                 trace_id: Some("trace-99".to_string()),
@@ -1126,6 +1423,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1150,50 +1449,34 @@ mod tests {
         );
     }
 
-    /// A withdrawal that ambiguously failed but actually landed must have its
-    /// nonce re-inserted into the local SMT. Otherwise later withdrawals in the
-    /// same tree fail InvalidSmtProof until restart.
-    #[tokio::test]
-    async fn process_pending_remints_reinserts_landed_nonce_into_smt() {
-        let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
-        let (storage_tx, _storage_rx) = mpsc::channel(10);
+    // ── remint bitmap gate ──────────────────────────────────────────
 
-        let landed_nonce: u64 = 7;
-
-        // Withdrawal signature finalized successfully.
-        let _status_mock = rpc_server
+    /// Arm the getSignatureStatuses route so every stored signature classifies
+    /// as finalized-and-failed, which is the verdict that would otherwise remint.
+    async fn mock_dead_signature(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignatureStatuses""#.into()),
-                mockito::Matcher::Regex(r#""searchTransactionHistory"\s*:\s*true"#.into()),
-            ]))
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
                 r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
-                    "slot":100,"confirmations":null,"err":null,
-                    "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+                    "slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":12}]},
+                    "status":{"Err":{"InstructionError":[0,{"Custom":12}]}},
+                    "confirmationStatus":"finalized"}]},"id":0}"#,
             )
             .create_async()
-            .await;
+            .await
+    }
 
-        // Local SMT has forgotten the nonce: the bug's starting state.
-        state.smt_state = Some(SenderSMTState {
-            smt_state: SmtState::new(0),
-            nonce_to_builder: HashMap::new(),
-        });
-        assert!(!state
-            .smt_state
-            .as_ref()
-            .unwrap()
-            .smt_state
-            .contains_nonce(landed_nonce));
-
+    fn queue_dead_remint(state: &mut SenderState, nonce: u64) {
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(99),
-                withdrawal_nonce: Some(landed_nonce),
+                withdrawal_nonce: Some(nonce),
                 trace_id: Some("trace-99".to_string()),
             },
             remint_info: make_remint_info(99),
@@ -1204,22 +1487,482 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
+    }
 
+    /// The money-safety case. Every signature looks dead, but the bit says the
+    /// release landed. Reminting here would credit the user twice, so the entry
+    /// must escalate instead and no mint may be attempted.
+    #[tokio::test]
+    async fn remint_blocked_when_bitmap_shows_nonce_consumed() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[3]);
+
+        let (mut state, _mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a blocked remint must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "no mint may be attempted once the bit proves the release landed"
+        );
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// A clear bit leaves the signature verdict standing, so the remint proceeds
+    /// down its normal path. The gate must not block every remint.
+    #[tokio::test]
+    async fn remint_proceeds_when_bitmap_shows_nonce_free() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let _cover = cover_release_window(&mut server, &mock).await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("the remint path must report an outcome");
+        assert!(
+            update.remint_attempted,
+            "a clear bit must let the remint run; got {:?}",
+            update.status
+        );
+    }
+
+    /// A bitmap we could not read says nothing about the nonce, and "nothing"
+    /// is not permission to credit the user a second time. The entry must go
+    /// back on the queue for another look rather than reminting on the strength
+    /// of a read that never happened.
+    #[tokio::test]
+    async fn remint_defers_when_the_bitmap_cannot_be_read() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_read_failure(&mut server);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
         process_pending_remints(&mut state, &storage_tx).await;
 
         assert!(
-            state
-                .smt_state
-                .as_ref()
-                .unwrap()
-                .smt_state
-                .contains_nonce(landed_nonce),
-            "landed nonce must be re-inserted so local tree matches chain"
+            storage_rx.try_recv().is_err(),
+            "an unreadable bitmap must not resolve the entry either way"
         );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the entry must be deferred for another attempt, not reminted"
+        );
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    }
+
+    /// Deferring on an unreadable bitmap must still terminate.
+    #[tokio::test]
+    async fn remint_escalates_after_the_bitmap_stays_unreadable() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_read_failure(&mut server);
+
+        let (mut state, _mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].finality_check_attempts = MAX_FINALITY_CHECK_ATTEMPTS - 1;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("the attempt cap must produce an outcome");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
         assert!(
-            state.pending_remints.is_empty(),
-            "entry consumed after Completed"
+            !update.remint_attempted,
+            "no mint may be attempted while the bitmap is unreadable"
+        );
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// Once the bitmap has rotated past a nonce its cleared bit is not evidence
+    /// the release never happened, so the gate must treat the window as
+    /// unanswerable and defer rather than hand the signature verdict a payout
+    /// it has no way to check.
+    #[tokio::test]
+    async fn remint_defers_when_the_bitmap_has_rotated_past_the_nonce() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        // Generation 1 covers a later window than nonce 3.
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_pending_remint_row(&mock, 99, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a rotated-past window must not resolve the entry"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "a cleared bit in another generation proves nothing, so defer"
+        );
+    }
+
+    /// The one case a rotated-past window must not block: the program itself
+    /// refused this release, so the funds provably never moved and the user
+    /// would otherwise be left holding neither the withdrawal nor the tokens
+    /// that were burned to pay for it.
+    #[tokio::test]
+    async fn remint_proceeds_past_a_rotated_bitmap_when_the_chain_refused_the_release() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let _cover = cover_release_window(&mut server, &mock).await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("the remint path must report an outcome");
+        assert!(
+            update.remint_attempted,
+            "an on-chain refusal is proof enough to return the tokens; got {:?}",
+            update.status
+        );
+    }
+
+    /// Record a release for `nonce` the way the indexer does when it indexes one.
+    async fn seed_observed_release(mock: &MockStorage, nonce: i64, signature: &str) {
+        mock.insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: nonce,
+            signature: signature.to_string(),
+            slot: 4_000,
+        }])
+        .await
+        .unwrap();
+    }
+
+    /// Put the record gate in the state a refund needs: a slot to bound the
+    /// window a release could sit in, and a checkpoint that has reached it.
+    async fn cover_release_window(
+        server: &mut mockito::ServerGuard,
+        mock: &MockStorage,
+    ) -> mockito::Mock {
+        let (slot_mock, _) = mock_get_slot(server, 1_000);
+        mock.update_committed_checkpoint("escrow", 1_000)
+            .await
+            .unwrap();
+        slot_mock
+    }
+
+    /// Answer `getSlot` with `slot`, counting the calls so a test can prove the
+    /// bound is read once rather than on every tick.
+    fn mock_get_slot(
+        server: &mut mockito::ServerGuard,
+        slot: u64,
+    ) -> (mockito::Mock, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSlot""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!(r#"{{"jsonrpc":"2.0","result":{slot},"id":0}}"#).into_bytes()
+            })
+            .expect_at_least(0)
+            .create();
+        (mock, calls)
+    }
+
+    /// An absent record only means "no release" once the indexer has walked the
+    /// slots a release could sit in. Until its checkpoint covers them, absence
+    /// is a gap in the record, and a gap is not permission to credit.
+    #[tokio::test]
+    async fn a_refund_waits_while_the_indexer_has_not_covered_the_release_window() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        // The indexer is 1000 slots behind the point a release could have landed.
+        mock.update_committed_checkpoint("escrow", 8_000)
+            .await
+            .unwrap();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter, so the row has to exist.
+        seed_pending_remint_row(&mock, 99, 0);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "an uncovered window must defer quietly, not settle the row"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the entry must wait for the indexer instead of refunding on an unproven absence"
+        );
+    }
+
+    /// Once the checkpoint reaches the bound, the absence is real evidence and
+    /// the refund the refusal authorised goes through unattended.
+    #[tokio::test]
+    async fn a_refund_proceeds_once_the_checkpoint_covers_the_release_window() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.update_committed_checkpoint("escrow", 9_000)
+            .await
+            .unwrap();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a covered window must let the refund report an outcome");
+        assert!(
+            update.remint_attempted,
+            "a proven absence is what the refund was waiting on; got {:?}",
+            update.status
+        );
+    }
+
+    /// The bound is the slot a release could last have landed in, so it is read
+    /// once and kept. Re-reading it each tick would move the target the
+    /// checkpoint is chasing and the refund could never clear.
+    #[tokio::test]
+    async fn the_coverage_bound_is_read_once_and_then_reused() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let (_slot, calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.update_committed_checkpoint("escrow", 8_000)
+            .await
+            .unwrap();
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter, so the row has to exist.
+        seed_pending_remint_row(&mock, 99, 0);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+
+        for _ in 0..2 {
+            // Mature the entry again so the second tick re-evaluates it.
+            state.pending_remints[0].deadline = Utc::now() - chrono::Duration::seconds(1);
+            process_pending_remints(&mut state, &storage_tx).await;
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the bound must be captured once, not chased"
+        );
+    }
+
+    /// A checkpoint that cannot be read says nothing about coverage, and nothing
+    /// is not the positive evidence a second credit needs.
+    #[tokio::test]
+    async fn an_unreadable_checkpoint_holds_the_refund() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.set_should_fail("get_committed_checkpoint", true);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter, so the row has to exist.
+        seed_pending_remint_row(&mock, 99, 0);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "an unreadable checkpoint must hold the refund, not wave it through"
+        );
+    }
+
+    /// Past a rotated bitmap the refusal is all that carries the refund, so the payout record is the last refusal left.
+    #[tokio::test]
+    async fn a_recorded_release_blocks_the_refund_a_refusal_would_have_allowed() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_observed_release(&mock, 3, "sig-already-paid").await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a blocked refund must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "no mint may be attempted for a nonce that already paid out"
+        );
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("sig-already-paid"),
+            "the refusal must name the release it found: {err}"
+        );
+        assert!(state.pending_remints.is_empty());
+    }
+
+    /// A clear bit contradicting a recorded release is not the positive evidence a second credit needs.
+    #[tokio::test]
+    async fn a_recorded_release_blocks_the_refund_a_clear_bit_would_have_allowed() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_observed_release(&mock, 3, "sig-already-paid").await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a blocked refund must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "a bit that disagrees with a recorded payout may not authorise a credit"
+        );
+    }
+
+    /// An unreadable record rules nothing out, and only a ruled-out payout can be refunded.
+    #[tokio::test]
+    async fn an_unreadable_release_record_blocks_the_refund() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        mock.set_should_fail("get_observed_release", true);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        state.pending_remints[0].release_refused_on_chain = true;
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("an unreadable record must still report the row");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            !update.remint_attempted,
+            "a lookup that never answered is not permission to credit"
+        );
+    }
+
+    /// The same bypass, but for an entry that came back off a row instead of
+    /// living in the queue the whole time. A restart inside the finality window
+    /// must not cost the user an automatic refund, so the refusal has to survive
+    /// the trip through storage and still carry the remint past a rotated bitmap.
+    #[tokio::test]
+    async fn a_recovered_on_chain_refusal_still_bypasses_a_rotated_bitmap() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        seed_refused_pending_remint_row(&mock, 55, 3);
+        let _cover = cover_release_window(&mut server, &mock).await;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+        assert_eq!(state.pending_remints.len(), 1, "the row must re-hydrate");
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("the remint path must report an outcome");
+        assert!(
+            update.remint_attempted,
+            "a refusal recovered from storage is still proof enough to return the tokens; got {:?}",
+            update.status
         );
     }
 
@@ -1245,6 +1988,7 @@ mod tests {
 
         let entry = PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(700),
                 withdrawal_nonce: Some(70),
                 trace_id: Some("trace-700".to_string()),
@@ -1257,6 +2001,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         };
 
         execute_deferred_remint(&state, &entry, &storage_tx).await;
@@ -1286,7 +2032,8 @@ mod tests {
     async fn process_pending_remints_not_finalized_remint_fails_sends_manual_review() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let _cover = cover_release_window(&mut rpc_server, &mock).await;
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -1317,6 +2064,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(77),
                 withdrawal_nonce: Some(11),
                 trace_id: Some("trace-77".to_string()),
@@ -1329,6 +2077,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1393,6 +2143,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(88),
                 withdrawal_nonce: Some(12),
                 trace_id: Some("trace-88".to_string()),
@@ -1405,6 +2156,8 @@ mod tests {
             original_error: "timeout".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1428,7 +2181,8 @@ mod tests {
     async fn process_pending_remints_skips_block_height_when_all_sigs_classifiable() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let _cover = cover_release_window(&mut rpc_server, &mock).await;
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -1460,6 +2214,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(89),
                 withdrawal_nonce: Some(13),
                 trace_id: Some("trace-89".to_string()),
@@ -1472,6 +2227,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1530,6 +2287,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(55),
                 withdrawal_nonce: Some(6),
                 trace_id: Some("trace-55".to_string()),
@@ -1548,6 +2306,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1743,7 +2503,8 @@ mod tests {
     async fn process_pending_remints_all_sigs_expired_proceeds_to_remint() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let _cover = cover_release_window(&mut rpc_server, &mock).await;
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -1765,6 +2526,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(100),
                 withdrawal_nonce: Some(20),
                 trace_id: Some("trace-100".to_string()),
@@ -1777,6 +2539,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1830,6 +2594,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(101),
                 withdrawal_nonce: Some(21),
                 trace_id: Some("trace-101".to_string()),
@@ -1842,6 +2607,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1885,6 +2652,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(102),
                 withdrawal_nonce: Some(22),
                 trace_id: Some("trace-102".to_string()),
@@ -1897,6 +2665,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 2, // one more attempt hits the cap
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -1944,6 +2714,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(103),
                 withdrawal_nonce: Some(23),
                 trace_id: Some("trace-103".to_string()),
@@ -1956,6 +2727,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;
@@ -2015,6 +2788,7 @@ mod tests {
 
         state.pending_remints.push(PendingRemint {
             ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
                 transaction_id: Some(105),
                 withdrawal_nonce: Some(25),
                 trace_id: Some("trace-105".to_string()),
@@ -2027,6 +2801,8 @@ mod tests {
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
         });
 
         process_pending_remints(&mut state, &storage_tx).await;

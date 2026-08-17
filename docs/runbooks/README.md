@@ -5,15 +5,15 @@ withdrawal operator (private channel → Solana releases) and the deposit / escr
 operator (Solana → private channel mints). Start here when an alert fires.
 
 The two operators have different failure shapes: withdrawals can halt
-the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
-routes by webhook + `transaction_type`.
+the pipeline (a nonce gap the chain will reject), deposits cannot. The
+dispatch table below routes by webhook + `transaction_type`.
 
-> **One halt has no dedicated alert.** The **SMT-root-mismatch boot
+> **One halt has no dedicated alert.** The **withdrawal bitmap boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
-> The common cause is auto-reconciled at boot; an unforeseen divergence the
-> reconcile cannot resolve makes the operator **refuse to start**, surfacing
-> as a boot-time crash-loop with `SMT root mismatch` in the operator logs.
-> Recognize it by that pattern, not a single alert, and not via this
+> A chain-ahead divergence is repaired at boot and the operator starts; only
+> a database-ahead divergence makes it **refuse to start**, surfacing as a
+> boot-time crash-loop with `Withdrawal bitmap divergence` in the operator
+> logs. Recognize it by that pattern, not a single alert, and not via this
 > dispatch table. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
 
@@ -82,7 +82,7 @@ The runbooks call this out at every relevant site.
 - [`_escalation.md`](_escalation.md) - escalation tiers and contacts.
   Every "escalate" call-site in the recovery runbooks links here.
 - [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
-  the SMT-root-mismatch startup halt (log-discovered, not paged).
+  the withdrawal-bitmap startup halt (log-discovered, not paged).
 
 ## Drills
 

@@ -47,39 +47,38 @@ backup.
 
 ## Pipeline-halt asymmetry
 
-Withdrawals halt the pipeline on a deterministic per-row error
-(`processor.rs::halt_withdrawal_pipeline`). The reason is tree rotation,
-not a nonce gap: the SMT is sparse and the program happily accepts a
-skipped nonce. But the processor rotates the tree at each
-`MAX_TREE_LEAVES` boundary, and once it rotates past a quarantined row's
-generation the program rejects that nonce permanently, so the row can
-never be re-armed. Halting keeps the tree still until a human decides.
+Withdrawals halt the entire pipeline on a deterministic per-row error
+(`processor.rs::halt_withdrawal_pipeline`). The reason is on-chain: a
+quarantined withdrawal leaves a permanent hole in the nonce sequence,
+and the row is unreleasable once its generation rotates away. Halt +
+sweep is safer than bleeding errors downstream.
 
 The sweep is bounded below by the poison row's `withdrawal_nonce`. Active
 withdrawals with a lower nonce are left alone for the recovery worker; see
-`withdrawal_manual_review.md` § Path A.halting.
+`withdrawal_manual_review.md` § Path A.
 
 Deposits never halt. The deposit loop (`process_deposit_funds`)
-continues after each quarantine. There is no SMT, no nonce, no
-sequential dependency between deposits.
+continues after each quarantine. There is no nonce and no sequential
+dependency between deposits.
 
 This is why the withdrawal runbooks have a dedicated halt runbook and
 the deposit ones do not.
 
-## Withdrawal nonce and SMT
+## Withdrawal nonce and the bitmap
 
-- Each withdrawal row has `withdrawal_nonce BIGINT`. The column is nullable;
-  an insert trigger assigns the next sequence value when a withdrawal arrives
-  without one, so a NULL nonce means that trigger was bypassed or dropped.
-- The on-chain SMT has `MAX_TREE_LEAVES` slots (see
-  `indexer/src/operator/tree_constants.rs`). Leaf position = `nonce % MAX_TREE_LEAVES`.
-- A quarantined withdrawal leaves its leaf unfilled. The tree is sparse, so
-  the program still accepts later nonces in the same tree; the gap is not
-  itself an error. The pipeline halts to stop the tree rotating past that
-  leaf's generation, which would make the nonce permanently unusable.
-- Rotation: `ResetSmtRootBuilder` (escrow program). Triggered automatically
-  when a nonce hits the `MAX_TREE_LEAVES` boundary; no admin CLI entrypoint
-  exists today.
+- Each withdrawal row has `withdrawal_nonce: BIGINT NOT NULL`.
+- The escrow instance owns a withdrawal bitmap PDA holding one bit per nonce
+  in the current generation. `NONCES_PER_GENERATION` (see
+  `indexer/src/operator/constants.rs`) sets the window; bit position =
+  `nonce % NONCES_PER_GENERATION`.
+- A set bit is the authoritative answer to "did this nonce release?". The
+  program refuses a second release of the same nonce with `NonceAlreadyUsed`.
+- Generation: `nonce / NONCES_PER_GENERATION`. A nonce outside the bitmap's
+  current generation is refused with `NonceOutsideCurrentGeneration`.
+- Rotation: `RotateBitmapBuilder` (escrow program) clears every bit and
+  advances the generation. Triggered automatically when a nonce hits the
+  `NONCES_PER_GENERATION` boundary; no admin CLI entrypoint exists today.
+  Nonces from a rotated-past generation can never be released.
 
 ## On-chain references
 

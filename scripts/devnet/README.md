@@ -12,6 +12,10 @@ cp .env.example .env
 Run all commands from project root:
 
 ## 1. Create Instance
+
+Also allocates the instance's withdrawal bitmap (8 KB, about 0.058 SOL of rent),
+so fund the admin keypair accordingly before running this.
+
 ```bash
 cargo run --bin create_instance -- \
   https://api.devnet.solana.com \

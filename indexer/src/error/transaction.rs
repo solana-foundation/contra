@@ -24,28 +24,25 @@ pub enum ProgramError {
     #[error("Invalid proof: {reason}")]
     InvalidProof { reason: String },
 
-    #[error("SMT proof generation failed: {reason}")]
-    SmtProofFailed { reason: String },
-
-    #[error("SMT state not initialized")]
-    SmtNotInitialized,
-
     #[error("Invalid instruction builder: {reason}")]
     InvalidBuilder { reason: String },
 
-    #[error("Tree rotation pending: {in_flight_count} in-flight transactions must settle before rotating")]
+    #[error("Bitmap rotation pending: {in_flight_count} in-flight transactions must settle before rotating")]
     RotationPending { in_flight_count: usize },
 
-    #[error("Transaction nonce {nonce} expects tree_index {expected_tree_index} but current local tree_index is {current_tree_index}")]
-    TreeIndexMismatch {
+    #[error("Withdrawal bitmap unavailable: {reason}")]
+    BitmapUnavailable { reason: String },
+
+    #[error("Transaction nonce {nonce} belongs to generation {nonce_generation} but the bitmap is on generation {chain_generation}")]
+    GenerationMismatch {
         nonce: u64,
-        expected_tree_index: u64,
-        current_tree_index: u64,
+        nonce_generation: u64,
+        chain_generation: u64,
     },
 
-    #[error("SMT root mismatch: local root {local_root:?} does not match on-chain root {onchain_root:?}. Database may be out of sync with on-chain state.")]
-    SmtRootMismatch {
-        local_root: [u8; 32],
-        onchain_root: [u8; 32],
+    #[error("Withdrawal bitmap diverges from the database: nonces {db_only:?} are Completed in the database but unconsumed on-chain, nonces {chain_only:?} are consumed on-chain but not Completed in the database")]
+    BitmapDivergence {
+        db_only: Vec<u64>,
+        chain_only: Vec<u64>,
     },
 }

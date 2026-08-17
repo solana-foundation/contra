@@ -31,7 +31,7 @@ use {
                     TransactionStatusUpdate,
                 },
             },
-            utils::instruction_util::WithdrawalRemintInfo,
+            utils::instruction_util::{TransactionKind, WithdrawalRemintInfo},
             SignerUtil,
         },
         storage::{common::storage::mock::MockStorage, Storage},
@@ -158,6 +158,7 @@ pub fn null_status_reply() -> Reply {
 /// remint-deferral branch is not taken.
 pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
     TransactionContext {
+        kind: TransactionKind::Mint,
         transaction_id: Some(transaction_id),
         withdrawal_nonce: None,
         trace_id: Some(format!("trace-{transaction_id}")),
@@ -169,6 +170,7 @@ pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
 /// retry-counter logic in `send_and_confirm`.
 pub fn withdrawal_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
     TransactionContext {
+        kind: TransactionKind::ReleaseFunds,
         transaction_id: Some(transaction_id),
         withdrawal_nonce: Some(nonce),
         trace_id: Some(format!("trace-{transaction_id}")),

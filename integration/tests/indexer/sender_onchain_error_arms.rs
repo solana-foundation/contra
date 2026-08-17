@@ -14,7 +14,9 @@
 //! Out of scope (covered separately):
 //!   - `Ok(Confirmed)` arm — already exercised by the
 //!     `sender_poll_rpc_error` success scenario via `handle_success`.
-//!   - `Ok(Failed(InvalidSmtProof))` arm — needs an SMT state fixture.
+//!   - `Ok(Failed(NonceAlreadyUsed))` and
+//!     `Ok(Failed(NonceOutsideCurrentGeneration))` arms: both read the
+//!     bitmap, so they are pinned by the sender unit tests instead.
 //!   - `Ok(MintNotInitialized)` JIT-init arm — covered by `jit_mint_helper`.
 //!   - `Ok(Retry) + Idempotent` arm — recursive `send_and_confirm`,
 //!     covered transitively by the next iteration's wire scripting.
@@ -31,7 +33,9 @@ use {
         operator::{
             sender::{test_hooks, types::TransactionStatusUpdate},
             utils::{
-                instruction_util::{ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy},
+                instruction_util::{
+                    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, TransactionKind,
+                },
                 transaction_util::ConfirmationResult,
             },
             SignerUtil,
@@ -86,20 +90,24 @@ async fn drive_and_recv(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// InvalidTransactionNonceForCurrentTreeIndex — fatal arm.
+// NonceOutsideCurrentGeneration with no nonce: fatal arm.
 // ─────────────────────────────────────────────────────────────────────
+//
+// The routing arm needs a nonce to decide which side of the window the
+// rejection falls on. Without one there is nothing to place, so it drops
+// through to a plain permanent failure.
 #[tokio::test]
-async fn invalid_transaction_nonce_routes_to_fatal_arm() {
+async fn nonce_outside_generation_without_nonce_routes_to_fatal_arm() {
     let result = Ok(ConfirmationResult::Failed(Some(
-        PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
+        PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration,
     )));
     let update = drive_and_recv(result, RetryPolicy::Idempotent, 401).await;
     assert_eq!(update.transaction_id, 401);
     assert_eq!(update.status, TransactionStatus::Failed);
     assert_eq!(
         update.error_message.as_deref(),
-        Some("Invalid nonce for tree index"),
-        "the InvalidTransactionNonce arm must pass its specific error message; got {:?}",
+        Some("nonce outside the current bitmap generation"),
+        "the generation arm must pass its specific error message; got {:?}",
         update.error_message
     );
 }
@@ -108,8 +116,7 @@ async fn invalid_transaction_nonce_routes_to_fatal_arm() {
 // Failed(Some(other)) — generic catch-all arm.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Any program error not specifically routed (InvalidSmtProof,
-// InvalidTransactionNonce, MintNotInitialized) falls into the generic
+// Any program error not specifically routed falls into the generic
 // `Failed(program_error)` catch-all and is debug-formatted into the
 // error message.
 #[tokio::test]
@@ -170,24 +177,24 @@ async fn retry_under_none_policy_routes_to_fatal_arm() {
 // Err(TransactionError) — fatal arm.
 // ─────────────────────────────────────────────────────────────────────
 //
-// A failure inside the polling layer (e.g. SMT-state unavailable
+// A failure inside the polling layer (e.g. the bitmap unreadable,
 // surfacing as a ProgramError) routes through the catch-all `Err(e)`
 // arm. The `error_msg` is the Display of the underlying error.
 #[tokio::test]
 async fn err_result_routes_to_confirmation_error_arm() {
-    let result = Err(TransactionError::Program(ProgramError::SmtNotInitialized));
+    let result = Err(TransactionError::Program(ProgramError::BitmapUnavailable {
+        reason: "rpc down".to_string(),
+    }));
     let update = drive_and_recv(result, RetryPolicy::Idempotent, 405).await;
     assert_eq!(update.status, TransactionStatus::Failed);
     let msg = update.error_message.unwrap_or_default();
-    // The underlying ProgramError::SmtNotInitialized has Display
-    // "SMT not initialized"; whatever the exact wording, it must
-    // not be empty and must not match any of the other arms' labels.
+    // It must be non-empty and must not collide with another arm's label.
     assert!(
         !msg.is_empty(),
         "confirmation_error arm must surface the underlying error string"
     );
     assert!(
-        !msg.contains("Invalid nonce")
+        !msg.contains("nonce outside")
             && !msg.contains("Unexpected mint")
             && !msg.contains("unsafe to retry"),
         "confirmation_error arm must not collide with another arm's error label; got {msg:?}"
@@ -511,6 +518,7 @@ async fn mint_not_initialized_no_txn_id_routes_to_failed() {
     let (mut state, mut storage_rx, storage_tx, mock) = build_default_sender_state().await;
 
     let ctx = private_channel_indexer::operator::sender::types::TransactionContext {
+        kind: TransactionKind::Mint,
         transaction_id: None,
         withdrawal_nonce: None,
         trace_id: None,

@@ -51,7 +51,7 @@ have prefixes.
 
 ## Path A.halting - build error that halted the pipeline
 
-The trigger row's data is bad in a way that would corrupt the SMT (NULL
+The trigger row's data is bad in a way that makes it unreleasable (NULL
 nonce, malformed pubkey, builder rejection). The processor quarantined the
 trigger and ran `halt_withdrawal_pipeline`, which drained the fetcher
 channel and bulk-flipped every active withdrawal **at or above the trigger
@@ -61,8 +61,8 @@ the trigger and the collateral.
 Withdrawals *below* the trigger's nonce are deliberately left in
 `processing` or `parked`. Those rows were already signed or handed to the
 sender, and terminalizing one discards the `completed` write that lands
-when its release confirms, which leaves the operator's local SMT root
-disagreeing with chain on the next boot. The stuck-row recovery worker and
+when its release confirms, which leaves the next boot's bitmap diff seeing
+a set bit with no `completed` row. The stuck-row recovery worker and
 the stale-parked sweep own those rows; do not bulk-flip them by hand. If
 the trigger row has no `withdrawal_nonce` at all the sweep is unbounded and
 every active withdrawal is collateral.
@@ -161,7 +161,7 @@ surfaced as an `OperatorError::Program`), the classifier in
 on the side of caution rather than retrying. This is the intended
 behavior: misclassifying a deterministic error as transient could put
 the operator into a tight retry loop that consumes nonces against a
-broken row and corrupts the SMT. The asymmetric cost favors a noisy
+broken row and burns its nonce. The asymmetric cost favors a noisy
 quarantine over a silent retry.
 
 What this means for recovery: the trigger row is safe to retry, not
@@ -235,12 +235,10 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > signatures recorded ...` has nothing to re-check and will never self-clear.
 > Re-read the row's status before starting the steps below: if it is already
 > `completed`, the sweep resolved the bookkeeping and the alert can be closed
-> against that signature. One caveat: if the row reached `manual_review` by way
-> of `pending_remint`, the running sender had already dropped that nonce from
-> its in-memory SMT, and the promotion does not put it back. That sender keeps
-> proving against a tree the chain disagrees with until it is restarted, so if
-> withdrawals stopped completing, restart the withdraw operator - it will now
-> pass the boot check rather than refuse to start.
+> against that signature. The promotion is bookkeeping only and needs no
+> operator restart to take effect: the sender holds no local copy of the
+> released-nonce set, and every release is authorized against the on-chain
+> bitmap itself.
 
 1. **Verify on-chain.** Run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). This is
@@ -366,7 +364,7 @@ SELECT signature, last_valid_block_height, created_at
 
 For each, `solana confirm -v <signature> --url <solana-rpc-url>` to read
 the `InstructionError`. A repeating deterministic error (escrow
-underfunded, SMT/proof rejection, account state) means re-sending will not
+underfunded, nonce already consumed, account state) means re-sending will not
 help - [escalate](_escalation.md) (Tier 2/3) to engineering. A transient
 cause (blockhash expiry under load, RPC outage during the send window)
 may already have cleared.

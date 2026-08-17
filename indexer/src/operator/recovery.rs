@@ -47,8 +47,9 @@ pub(crate) const RECONCILE_SWEEP_BUDGET: Duration = Duration::from_secs(45);
 /// retries, so an unbounded pass can hold withdrawals down for the better part
 /// of an hour with nothing paged. Giving up early costs nothing in that case:
 /// an RPC that cannot classify cannot promote either, so the sweep would not
-/// have cleared the row anyway. The SMT check still runs, and a mismatch that
-/// survives is the designed refuse-to-start, which is loud and has a runbook.
+/// have cleared the row anyway. The bitmap diff still runs, and a db-ahead
+/// divergence that survives is the designed refuse-to-start, which is loud and
+/// has a runbook.
 pub(crate) const BOOT_RECONCILE_BUDGET: Duration = Duration::from_secs(120);
 
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
@@ -786,10 +787,11 @@ async fn route_outcome(
 /// `Duration::ZERO` threshold (so even a fresh crash row is reconciled) until no
 /// `Processing` rows of this role's type remain, bounded by `max_passes`. Rows
 /// belonging to the other role are never counted or touched. A withdraw operator is
-/// single-active (SMT nonce ordering forbids a second sender), so at boot there
-/// is no live sibling whose not-yet-stale work this could disrupt. Exhausting
-/// `max_passes` with rows still `Processing` returns `Ok`: the caller's
-/// `validate_smt_root` is the terminal gate that refuses to start on a real mismatch.
+/// single-active (the sender holds an advisory lock and releases block on
+/// confirmation), so at boot there is no live sibling whose not-yet-stale work
+/// this could disrupt. Exhausting `max_passes` with rows still `Processing`
+/// returns `Ok`: the caller's bitmap diff is the terminal gate that refuses to
+/// start on a real divergence.
 pub async fn boot_reconcile_processing(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
@@ -920,6 +922,7 @@ mod tests {
             recovery_requeue_attempts: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         }
     }
 
@@ -1523,8 +1526,8 @@ mod tests {
     }
 
     /// Startup waits on the boot sweep, so a backlog it cannot get through must
-    /// hand control back rather than hold withdrawals down. The SMT check after
-    /// it is what decides whether the operator may start.
+    /// hand control back rather than hold withdrawals down. The bitmap diff
+    /// after it is what decides whether the operator may start.
     #[tokio::test]
     #[serial_test::serial(manual_review_cleared_metric)]
     async fn reconcile_returns_when_the_boot_budget_is_spent() {
@@ -2214,12 +2217,10 @@ mod tests {
 
     // ── boot pre-flight (reconcile then validate) ──────────────────
 
-    use crate::operator::sender::validate_smt_root;
-    use crate::operator::utils::smt_util::SmtState;
+    use crate::operator::sender::validate_bitmap_consistency;
+    use crate::operator::utils::account_util::bitmap_account_bytes;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
-    use borsh::BorshSerialize;
-    use private_channel_escrow_program_client::Instance;
 
     /// Mock a finalized-success `getSignatureStatuses` so the classifier reports the release landed.
     fn mock_finalized_status(server: &mut mockito::ServerGuard) -> mockito::Mock {
@@ -2236,19 +2237,9 @@ mod tests {
             .create()
     }
 
-    /// Mock `getAccountInfo` to return an Instance carrying `root`.
-    fn mock_instance_account(server: &mut mockito::ServerGuard, root: [u8; 32]) -> mockito::Mock {
-        let instance = Instance {
-            discriminator: 0,
-            bump: 0,
-            version: 0,
-            instance_seed: Pubkey::new_unique(),
-            admin: Pubkey::new_unique(),
-            withdrawal_transactions_root: root,
-            current_tree_index: 0,
-        };
-        let mut bytes = Vec::new();
-        instance.serialize(&mut bytes).unwrap();
+    /// Mock `getAccountInfo` to return a bitmap recording `consumed` as released.
+    fn mock_bitmap_account(server: &mut mockito::ServerGuard, consumed: &[u64]) -> mockito::Mock {
+        let bytes = bitmap_account_bytes(0, consumed, 255);
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -2322,16 +2313,15 @@ mod tests {
         );
     }
 
-    /// Pre-flight happy path: a landed-but-uncompleted nonce is reconciled to Completed, then `validate_smt_root` agrees; zero rows Failed.
+    /// Pre-flight happy path: a landed-but-uncompleted nonce is reconciled to
+    /// Completed, then the bitmap diff agrees; zero rows Failed.
     #[tokio::test]
     async fn preflight_reconciles_landed_nonce_then_validates_ok() {
         let landed_nonce: u64 = 3;
-        let mut onchain_tree = SmtState::new(0);
-        onchain_tree.insert_nonce(landed_nonce);
 
         let mut server = mockito::Server::new_async().await;
         let _status = mock_finalized_status(&mut server);
-        let _account = mock_instance_account(&mut server, onchain_tree.current_root());
+        let _account = mock_bitmap_account(&mut server, &[landed_nonce]);
 
         let mock = MockStorage::new();
         let row = processing_withdrawal(1, landed_nonce as i64);
@@ -2355,7 +2345,9 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, Some(Pubkey::new_unique()), &storage_tx)
+                .await;
         assert!(
             validated.is_ok(),
             "validate must pass once the landed nonce is reconciled: {validated:?}"
@@ -2369,22 +2361,18 @@ mod tests {
         );
     }
 
-    /// Pre-flight refuse-to-start path: a divergence the reconcile cannot resolve
-    /// (a no-signature Processing row goes to ManualReview, leaving the DB one nonce
-    /// behind an on-chain root) makes `validate_smt_root` return Err. No row is
-    /// Failed (the anti-SOLA2-21 assertion).
+    /// Pre-flight halt path: the database records a Completed release the chain
+    /// never made, which is the one divergence the reconcile cannot explain away.
+    /// No row is Failed (the anti-SOLA2-21 assertion).
     #[tokio::test]
     async fn preflight_refuses_start_on_unreconcilable_mismatch() {
-        // On-chain root includes nonce 7 that the DB will never record.
-        let mut onchain_tree = SmtState::new(0);
-        onchain_tree.insert_nonce(7);
-
         let mut server = mockito::Server::new_async().await;
-        let _account = mock_instance_account(&mut server, onchain_tree.current_root());
+        // Nothing consumed on-chain, so the Completed row below has no bit.
+        let _account = mock_bitmap_account(&mut server, &[]);
 
         let mock = MockStorage::new();
-        // A no-signature Processing withdrawal is quarantined to ManualReview, not Failed.
-        let row = processing_withdrawal(1, 7);
+        let mut row = processing_withdrawal(1, 7);
+        row.status = TransactionStatus::Completed;
         mock.pending_transactions.lock().unwrap().push(row);
         let storage = Storage::Mock(mock.clone());
         let client = make_rpc_client(&server.url());
@@ -2402,12 +2390,14 @@ mod tests {
         .await
         .unwrap();
 
-        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        let validated =
+            validate_bitmap_consistency(&storage, &client, Some(Pubkey::new_unique()), &storage_tx)
+                .await;
         assert!(
             matches!(
                 validated,
                 Err(OperatorError::Program(
-                    crate::error::ProgramError::SmtRootMismatch { .. }
+                    crate::error::ProgramError::BitmapDivergence { .. }
                 ))
             ),
             "unreconcilable divergence must refuse to start: {validated:?}"

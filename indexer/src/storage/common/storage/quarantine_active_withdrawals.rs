@@ -4,15 +4,16 @@ use crate::{error::StorageError, storage::common::storage::Storage};
 ///
 /// Called once per poison-pill detection in the withdrawal pipeline.
 /// Halting the pipeline instead of skipping the single bad row is
-/// deliberate: the processor rotates the withdrawal tree whenever it
-/// crosses a boundary nonce, and once the tree has rotated past the
+/// deliberate: the processor rotates the withdrawal bitmap whenever it
+/// crosses a boundary nonce, and once the bitmap has rotated past the
 /// quarantined row's generation the on-chain program rejects that nonce
 /// permanently. Stopping keeps the row re-armable until a human decides.
 ///
 /// `min_nonce` bounds the sweep to the poison row's own nonce and above.
 /// A row below it may already be signed or in flight, and terminalizing one
-/// would discard its eventual `Completed` write, leaving the operator's
-/// local tree disagreeing with chain. `None` keeps the sweep unbounded,
+/// would discard its eventual `Completed` write, leaving the next boot's
+/// bitmap diff seeing a set bit with no `Completed` row. `None` keeps the
+/// sweep unbounded,
 /// which is the fallback when the poison row carries no nonce.
 ///
 /// `exclude_id` is the poison row already quarantined via the async storage

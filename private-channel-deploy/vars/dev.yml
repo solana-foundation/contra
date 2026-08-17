@@ -65,7 +65,8 @@ withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # Leave commented on localnet: the deploy's pipeline phase creates the instance
 # and writes the real PDA back into .env (env.j2 falls back to the all-1s
 # placeholder until then). On devnet/mainnet the instance already exists —
-# uncomment and set it to the address you created (e.g. via the Admin UI), or
+# uncomment and set it to the address you created (e.g. via the `create_instance`
+# CLI in scripts/devnet), or
 # the indexer will watch a placeholder address that nothing is deployed at.
 # (Must stay commented when unset: Jinja2 `| default()` only fills an *undefined*
 # var, so an active placeholder would render a non-base58 ESCROW_INSTANCE_ID and

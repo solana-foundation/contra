@@ -554,20 +554,32 @@ impl MockStorage {
             .collect())
     }
 
-    pub async fn quarantine_all_active_withdrawals(
+    pub async fn quarantine_active_withdrawals(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, StorageError> {
-        self.check_should_fail("quarantine_all_active_withdrawals")?;
+        self.check_should_fail("quarantine_active_withdrawals")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         let mut affected = 0u64;
         for txn in pending.iter_mut() {
+            // Mirror the SQL's active-status set: pending, processing, parked.
             let quarantinable = matches!(
                 txn.status,
-                TransactionStatus::Pending | TransactionStatus::Processing
+                TransactionStatus::Pending
+                    | TransactionStatus::Processing
+                    | TransactionStatus::Parked
             );
             let excluded = exclude_id.is_some_and(|id| txn.id == id);
-            if txn.transaction_type == TransactionType::Withdrawal && quarantinable && !excluded {
+            // A NULL nonce fails the SQL comparison, so it is never swept
+            // once a floor is set.
+            let above_floor = min_nonce
+                .is_none_or(|floor| txn.withdrawal_nonce.is_some_and(|nonce| nonce >= floor));
+            if txn.transaction_type == TransactionType::Withdrawal
+                && quarantinable
+                && !excluded
+                && above_floor
+            {
                 txn.status = TransactionStatus::ManualReview;
                 affected += 1;
             }
@@ -731,10 +743,76 @@ impl MockStorage {
         Ok(false)
     }
 
+    /// Mirror `get_stalled_withdrawals_with_signatures_internal`, including the
+    /// evidence predicates: a missing nonce, an absent/empty signature array, or
+    /// a missing heights array makes the row unclassifiable, so it is not
+    /// returned.
+    pub async fn get_stalled_withdrawals_with_signatures(
+        &self,
+        status: TransactionStatus,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_stalled_withdrawals_with_signatures")?;
+        let pending = self.pending_transactions.lock().unwrap();
+        let mut matched: Vec<DbTransaction> = pending
+            .iter()
+            .filter(|t| t.transaction_type == TransactionType::Withdrawal && t.status == status)
+            .filter(|t| t.withdrawal_nonce.is_some())
+            .filter(|t| t.remint_signatures.as_ref().is_some_and(|s| !s.is_empty()))
+            .filter(|t| t.remint_last_valid_block_heights.is_some())
+            .filter(|t| t.id > after_id)
+            .cloned()
+            .collect();
+        matched.sort_by_key(|t| t.id);
+        matched.truncate(limit as usize);
+        Ok(matched)
+    }
+
+    /// Mirror `try_complete_stalled_withdrawal_internal`: the source status is
+    /// pinned to the two stalled statuses regardless of what the caller binds.
+    pub async fn try_complete_stalled_withdrawal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_complete_stalled_withdrawal")?;
+        if !matches!(
+            from_status,
+            TransactionStatus::ManualReview | TransactionStatus::PendingRemint
+        ) {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.transaction_type == TransactionType::Withdrawal
+                && txn.status == from_status
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Completed;
+                if counterpart_signature.is_some() {
+                    txn.counterpart_signature = counterpart_signature;
+                }
+                let now = Utc::now();
+                txn.processed_at = Some(now);
+                txn.updated_at = now;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Mirror `try_quarantine_processing_internal`, `COALESCE` included: a
+    /// `None` argument leaves the existing column value in place.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: DateTime<Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_quarantine_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();
@@ -744,6 +822,12 @@ impl MockStorage {
                 && txn.updated_at == expected_updated_at
             {
                 txn.status = TransactionStatus::ManualReview;
+                if remint_signatures.is_some() {
+                    txn.remint_signatures = remint_signatures;
+                }
+                if remint_last_valid_block_heights.is_some() {
+                    txn.remint_last_valid_block_heights = remint_last_valid_block_heights;
+                }
                 let now = Utc::now();
                 txn.processed_at = Some(now);
                 txn.updated_at = now;

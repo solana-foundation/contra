@@ -1498,15 +1498,26 @@ impl PostgresDb {
     }
 
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    ///
+    /// The optional signature arrays are persisted by the same statement rather
+    /// than a preceding one. Splitting them is not merely slower, it cannot
+    /// work: the `updated_at` trigger fires on the first write, after which this
+    /// statement's `updated_at` compare can never match and the row would be
+    /// stranded in `processing` forever. `COALESCE` keeps a `None` call inert,
+    /// so callers with no evidence to record leave both columns as they were.
     pub async fn try_quarantine_processing_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE transactions
             SET status = 'manual_review',
+                remint_signatures = COALESCE($3, remint_signatures),
+                remint_last_valid_block_heights = COALESCE($4, remint_last_valid_block_heights),
                 processed_at = NOW()
             WHERE id = $1
               AND status = 'processing'
@@ -1515,6 +1526,127 @@ impl PostgresDb {
         )
         .bind(transaction_id)
         .bind(expected_updated_at)
+        .bind(remint_signatures)
+        .bind(remint_last_valid_block_heights)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Withdrawals stalled in `status` that still carry stored release
+    /// signatures, keyed forward from `after_id`.
+    ///
+    /// The evidence predicates are in SQL so a row that can never be classified
+    /// (structurally corrupt, or quarantined before anything was broadcast) is
+    /// never fetched and never costs an RPC round trip. A NULL nonce is excluded
+    /// for the same reason: no nonce means no release was ever built, so the row
+    /// cannot account for a bit the on-chain bitmap is holding. The two arrays
+    /// are index-paired, and they arrived in separate migrations, so a row can
+    /// legitimately carry signatures with no heights; that is unclassifiable too.
+    ///
+    /// Paging is keyed on `id` rather than offset by `updated_at`. A row that
+    /// does not classify is left untouched by design, so its `updated_at` never
+    /// moves; ordering on it would return the same blocked rows on every sweep
+    /// and starve everything behind them. `id` gives the caller a cursor that
+    /// always advances.
+    pub async fn get_stalled_withdrawals_with_signatures_internal(
+        &self,
+        status: TransactionStatus,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'withdrawal'
+              AND {} = $1
+              AND {} IS NOT NULL
+              AND {} IS NOT NULL
+              AND array_length({}, 1) > 0
+              AND {} IS NOT NULL
+              AND {} > $2
+            ORDER BY {} ASC
+            LIMIT $3
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::INNER_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            // Filters
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::STATUS,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            // Keyset cursor
+            transaction_cols::ID,
+            // Ordering must match the cursor so paging cannot repeat or skip
+            transaction_cols::ID,
+        ))
+        .bind(status)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// CAS a stalled withdrawal to `Completed` once its release is proven landed.
+    ///
+    /// `from_status` is bound by the caller, but the statement additionally pins
+    /// the allowed source statuses inline. That redundancy is deliberate: the
+    /// guard is what stops this from resurrecting a terminal row or stealing a
+    /// `processing` row from a live sender, and it belongs in the SQL rather
+    /// than resting on every present and future caller binding the right value.
+    pub async fn try_complete_stalled_withdrawal_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'completed',
+                counterpart_signature = COALESCE($4, counterpart_signature),
+                processed_at = NOW()
+            WHERE id = $1
+              AND updated_at = $2
+              AND status = $3
+              AND status IN ('manual_review', 'pending_remint')
+              AND transaction_type = 'withdrawal'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(from_status)
+        .bind(counterpart_signature)
         .execute(&self.pool)
         .await?;
 
@@ -1774,13 +1906,19 @@ impl PostgresDb {
         Ok(result.rows_affected())
     }
 
-    /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.
+    /// Flip active withdrawals at or above `min_nonce` to `ManualReview`.
     ///
     /// `exclude_id` is the poison row that the caller has already quarantined
     /// via the async `storage_tx` writer. That update may not have hit the DB
-    /// yet when this sweep runs, so the row's status is still
-    /// `Pending`/`Processing` here; excluding it prevents a second
-    /// `ManualReview` webhook for the same transaction.
+    /// yet when this sweep runs, so the row's status is still active here;
+    /// excluding it prevents a second `ManualReview` webhook for the same
+    /// transaction.
+    ///
+    /// `min_nonce` is the poison row's own nonce. Bounding the sweep keeps
+    /// lower-nonce rows out of it: such a row may already be signed or
+    /// broadcast by the sender, and terminalizing one drops its later
+    /// `Completed` write. A NULL `withdrawal_nonce` never satisfies the
+    /// comparison, so such a row is left alone. `None` sweeps everything.
     ///
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
@@ -1791,15 +1929,16 @@ impl PostgresDb {
     /// require an `instance_pda` column on `transactions` that does not exist
     /// today.
     // Coverage-ignore rationale (category b, defensive recovery):
-    //   `quarantine_all_active_withdrawals_internal` is only invoked by
+    //   `quarantine_active_withdrawals_internal` is only invoked by
     //   the poison-pill pipeline in `operator/processor.rs`
-    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded —
-    //   integration tests do not produce malformed rows that would trip
+    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded.
+    //   Integration tests do not produce malformed rows that would trip
     //   it. The SQL itself is trivial; the behavior is covered via the
-    //   `Storage::Mock` variant in in-crate tests.
-    pub async fn quarantine_all_active_withdrawals_internal(
+    //   `Storage::Mock` variant in in-crate tests and by the runbook drills.
+    pub async fn quarantine_active_withdrawals_internal(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -1808,9 +1947,11 @@ impl PostgresDb {
             WHERE transaction_type = 'withdrawal'
               AND status IN ('pending', 'processing', 'parked')
               AND ($1::BIGINT IS NULL OR id <> $1)
+              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
             "#,
         )
         .bind(exclude_id)
+        .bind(min_nonce)
         .execute(&self.pool)
         .await?;
 

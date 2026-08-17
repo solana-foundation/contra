@@ -106,6 +106,18 @@ counter_vec!(
     &["program_type"]
 );
 
+// A status write matched no row because the transaction had already moved
+// off Processing. That is routine for most statuses and is not counted here;
+// only a skipped `Completed` increments, because it means an on-chain release
+// the DB will never record, which wedges the next boot's bitmap diff.
+// Any nonzero sample needs a human.
+counter_vec!(
+    OPERATOR_DB_UPDATE_SKIPPED,
+    "private_channel_operator_db_updates_skipped_total",
+    "Completed status DB updates that matched no row",
+    &["program_type", "status"]
+);
+
 histogram_vec!(
     OPERATOR_RPC_SEND_DURATION,
     "private_channel_operator_rpc_send_duration_seconds",
@@ -167,6 +179,11 @@ counter_vec!(
 // stuck-row recovery worker.  `outcome` ∈ {completed, requeued, quarantined};
 // `type` ∈ {deposit, withdrawal}.  All values 0 in steady state — any
 // sustained nonzero is concrete evidence of operator crash-window activity.
+//
+// The same counter also reports withdrawals cleared out of a stalled status by
+// the reconcile sweep: `manual_review_cleared` and `pending_remint_cleared`.
+// Those two are withdrawal-only, and each one means a row that had stopped
+// moving was proven landed on-chain and promoted to Completed.
 counter_vec!(
     OPERATOR_STALE_PROCESSING_RECOVERED,
     "private_channel_operator_stale_processing_recovered_total",
@@ -198,6 +215,11 @@ pub fn init_labels(program_type: &str) {
     for status in &["Pending", "Processing", "Completed", "Failed"] {
         OPERATOR_DB_UPDATES.with_label_values(&[program_type, status]);
     }
+
+    // Only Completed is ever counted here. Seeding the other statuses would
+    // publish series that are pinned at zero by construction, which reads on
+    // a dashboard as "no skips happened" rather than "never measured".
+    OPERATOR_DB_UPDATE_SKIPPED.with_label_values(&[program_type, "Completed"]);
 
     for result in &["success", "failure", "error"] {
         OPERATOR_RPC_SEND_DURATION.with_label_values(&[program_type, result]);
@@ -256,6 +278,16 @@ pub fn init_labels(program_type: &str) {
             ]);
         }
     }
+
+    // Stalled-row clears exist only on the withdraw side; pairing them with
+    // `deposit` would register a series that can never increment.
+    for outcome in &["manual_review_cleared", "pending_remint_cleared"] {
+        OPERATOR_STALE_PROCESSING_RECOVERED.with_label_values(&[
+            program_type,
+            outcome,
+            "withdrawal",
+        ]);
+    }
 }
 
 pub fn init() {
@@ -273,6 +305,7 @@ pub fn init() {
         INDEXER_SLOT_PROCESSING_DURATION,
         OPERATOR_TRANSACTIONS_FETCHED,
         OPERATOR_DB_UPDATES,
+        OPERATOR_DB_UPDATE_SKIPPED,
         OPERATOR_DB_UPDATE_ERRORS,
         OPERATOR_RPC_SEND_DURATION,
         OPERATOR_TRANSACTION_ERRORS,

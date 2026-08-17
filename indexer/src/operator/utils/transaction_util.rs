@@ -418,8 +418,9 @@ mod tests {
         assert!(matches!(result, Ok(ConfirmationResult::Confirmed)));
     }
 
-    /// A confirmed status carrying Custom(11) must decode to Failed(InvalidSmtProof) so
-    /// the sender receives the exact escrow-program error rather than a generic failure.
+    /// A confirmed status carrying Custom(11) must decode to
+    /// Failed(InvalidWithdrawalBitmap) so the sender receives the exact
+    /// escrow-program error rather than a generic failure.
     #[tokio::test]
     async fn check_transaction_status_returns_failed_on_program_error() {
         let mut server = mockito::Server::new_async().await;

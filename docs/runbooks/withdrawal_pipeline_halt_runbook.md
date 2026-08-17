@@ -40,20 +40,42 @@ On boot, before any withdrawal is fetched, locked, or processed, the operator:
    landed but never reached `completed` is detected by an on-chain finality
    check and promoted to `completed`. A row with no recorded signature, or one
    the RPC cannot classify, is quarantined to `manual_review` (never `failed`).
-2. **Diffs the bitmap** for the generation the bitmap is currently on against
+   Quarantining is not the end of the story: the signatures are copied onto the
+   row, so a row quarantined only because the RPC was unreachable is
+   re-classified on every recovery tick and at each boot, and promotes itself
+   once the release is proven finalized.
+2. **Reconciles stalled `pending_remint` rows.** Withdrawals parked in
+   `pending_remint` that still carry release signatures are classified the same
+   way and promoted to `completed` on proof, so a landed-but-unrecorded nonce
+   held there no longer wedges the diff below. Rows carrying no signatures are
+   skipped entirely and stay for a human. This runs at boot only, before the
+   sender exists: the sender owns those rows and may have a remint in flight,
+   so completing one from underneath it would pay the withdrawal and remint the
+   burn. The equivalent sweep over `manual_review` has no owner and runs on
+   every recovery tick instead. The boot pass is time-bounded
+   (`BOOT_RECONCILE_BUDGET`); if it runs out, the diff below still decides
+   whether the operator may start.
+3. **Diffs the bitmap** for the generation the bitmap is currently on against
    `completed` withdrawals whose nonce falls in that generation's window.
-3. **Repairs chain-ahead nonces in place.** For each nonce whose bit is set with
+4. **Repairs chain-ahead nonces in place.** For each nonce whose bit is set with
    no `completed` row, the operator loads that withdrawal's stored broadcast
    signatures and classifies them on-chain. A landed signature marks the row
    `completed` against it; anything else escalates that single row to
    `manual_review`. Startup continues either way.
-4. **Re-reads the bitmap once before halting on DB-ahead.** The bitmap and the
+5. **Re-reads the bitmap once before halting on DB-ahead.** The bitmap and the
    database are read at different instants, so a release landing between them
    looks exactly like DB-ahead. A real divergence survives the second read; a
    race does not.
 
 If the diff is clean, the pipeline starts normally
 (`Withdrawal bitmap verification passed` in the logs).
+
+Reaching the rest of this runbook therefore means something stronger than it
+used to. The self-clearing sweeps above run first, so any row that could have
+resolved itself from stored evidence already has. What is left is the db-ahead
+direction alone: a `completed` row whose bit is clear in the current
+generation, which survived the confirmatory re-read. Chain-ahead nonces never
+get here - they are repaired or escalated in place and boot continues.
 
 ### Symptom
 

@@ -1478,18 +1478,22 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
             }]
         })),
     );
+    // Drop the journal by hand: the GC keeps `manual_review` signatures on
+    // purpose, so clearing it here is what proves the promotion below came
+    // from the row's own columns rather than the journal.
+    storage.delete_release_signatures(tx_id).await.unwrap();
+    assert_eq!(
+        journal_len(&pool, tx_id).await,
+        0,
+        "precondition: the journal must be empty before the promoting pass"
+    );
+
     let metric_before = snapshot_recovered("withdraw", "manual_review_cleared", "withdrawal");
 
     test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
         .await
         .unwrap();
 
-    assert_eq!(
-        journal_len(&pool, tx_id).await,
-        0,
-        "the GC at the top of pass 2 removes the journal, so the promotion below \
-         can only have come from the row's own columns"
-    );
     assert_eq!(status_of(&pool, tx_id).await, "completed");
     assert_eq!(
         counterpart_sig_of(&pool, tx_id).await,

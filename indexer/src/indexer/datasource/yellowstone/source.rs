@@ -55,7 +55,7 @@ pub struct YellowstoneSource {
     storage: Option<Arc<Storage>>,
     health: Option<Arc<private_channel_metrics::HealthState>>,
     /// Silent-stream watchdog window. Defaults to STREAM_STALL_TIMEOUT; overridable
-    /// (mainly so tests can drive the reconnect path without a 60s wait).
+    /// (mainly so tests can drive the reconnect path without a 120s wait).
     stall_timeout: std::time::Duration,
 }
 

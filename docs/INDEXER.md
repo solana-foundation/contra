@@ -39,7 +39,12 @@ Recovers missed slots on indexer restart or network issues:
      cannot be proven empty aborts the batch rather than being checkpointed past
    - Process blocks in order
    - Update checkpoint per slot via `CheckpointWriter` (driven by `SlotComplete` events)
-4. Switch to real-time mode (Yellowstone or polling)
+4. For the Yellowstone datasource, persist a startup anchor before the live stream runs, so a
+   durable checkpoint always exists: reconnect gap repair replays from it and withholds live slots
+   rather than advancing the checkpoint without one. The anchor is the resolved backfill range's
+   floor, or the current chain tip when backfill is disabled. RPC polling has no reconnect repair
+   and writes no anchor; it resumes from its configured start slot
+5. Switch to real-time mode (Yellowstone or polling)
 
 **Location**: [`indexer/src/indexer/backfill.rs`](../indexer/src/indexer/backfill.rs)
 

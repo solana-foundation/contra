@@ -13,6 +13,9 @@ use crate::{
 #[cfg(feature = "datasource-rpc")]
 use crate::indexer::backfill::BackfillService;
 
+#[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
+use crate::indexer::backfill::ensure_startup_anchor;
+
 #[cfg(feature = "datasource-rpc")]
 use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
 
@@ -130,6 +133,10 @@ pub async fn run(
     #[cfg(feature = "datasource-rpc")]
     let mut rpc_live_start_slot: Option<u64> = None;
 
+    // Floor of the resolved startup range; None makes the anchor fall back to the chain tip.
+    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
+    let mut startup_anchor_hint: Option<u64> = None;
+
     if indexer_config.backfill.enabled {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -191,6 +198,11 @@ pub async fn run(
                         // Pin the live source to backfill's boundary so it resumes with
                         // no hole and no overlap, whether or not there is a gap to fill.
                         rpc_live_start_slot = Some(range.live_start_slot);
+                        // The floor, never the target: the range above it is not filled yet.
+                        #[cfg(feature = "datasource-yellowstone")]
+                        {
+                            startup_anchor_hint = Some(range.anchor);
+                        }
                         if let Some((from_slot, target)) = range.gap {
                             checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
                             let instruction_tx_clone = instruction_tx.clone();
@@ -301,6 +313,18 @@ pub async fn run(
                     "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
                     indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
                 );
+
+                // Reconnect repair replays from the durable checkpoint, so one has to exist
+                // before the stream can deliver anything. Failing here refuses to start,
+                // which beats streaming past a window that could never be recovered: once a
+                // later slot is checkpointed, the slots below it stop being reachable.
+                ensure_startup_anchor(
+                    &storage,
+                    common_config.program_type,
+                    &gap_rpc_poller,
+                    startup_anchor_hint,
+                )
+                .await?;
 
                 source
                     .with_gap_detection(

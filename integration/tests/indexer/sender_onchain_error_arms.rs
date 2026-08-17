@@ -292,11 +292,14 @@ async fn build_state_for_jit_caller_arm(
     (state, storage_rx, storage_tx, mock, mint)
 }
 
-/// Seed a Processing deposit row in the mock store so JIT re-fire tests have a target.
+/// Seed a Processing deposit row in the mock store so JIT re-fire tests have a
+/// target. `requeue_attempts` seeds the durable counter the transient verdict
+/// spends, so a test can start the row at the cap.
 fn seed_processing_deposit(
     storage: &MockStorage,
     id: i64,
     updated_at: chrono::DateTime<chrono::Utc>,
+    requeue_attempts: i32,
 ) {
     use private_channel_indexer::storage::common::models::DbTransactionBuilder;
     let owner = Pubkey::new_unique().to_string();
@@ -309,7 +312,18 @@ fn seed_processing_deposit(
     tx.id = id;
     tx.status = TransactionStatus::Processing;
     tx.updated_at = updated_at;
+    tx.recovery_requeue_attempts = requeue_attempts;
     storage.pending_transactions.lock().unwrap().push(tx);
+}
+
+/// Read a seeded deposit row's status and durable requeue counter together.
+fn deposit_row_state(storage: &MockStorage, id: i64) -> (TransactionStatus, i32) {
+    let rows = storage.pending_transactions.lock().unwrap();
+    let row = rows
+        .iter()
+        .find(|t| t.id == id)
+        .expect("row must be seeded");
+    (row.status, row.recovery_requeue_attempts)
 }
 
 fn make_mint_builder_for_caller_arm(mint: Pubkey) -> MintToBuilder {
@@ -372,7 +386,7 @@ async fn mint_not_initialized_jit_retry_completes() {
     // Seed a Processing row the re-fire's claim owns via the same t0 the ctx carries.
     let t0 = chrono::Utc::now();
     if let Storage::Mock(mock_storage) = &*state.storage {
-        seed_processing_deposit(mock_storage, 5001, t0);
+        seed_processing_deposit(mock_storage, 5001, t0, 0);
     }
 
     // JIT pre-check sees admin-owned init, so Retry without sending init.
@@ -487,11 +501,13 @@ async fn mint_not_initialized_jit_manual_review_corrupt_state() {
     mock.shutdown().await;
 }
 
-/// JitOutcome::PermanentFailure — the caller arm routes through
-/// `handle_permanent_failure` and the resulting status is Failed.
+/// JitOutcome::Transient: a real RPC-driven transient verdict must re-arm the
+/// funded deposit for the fetcher instead of ending it. A terminal status here
+/// is read by no worker, so the deposit would sit with its escrow funded and no
+/// private channel mint until someone edited the database by hand.
 #[tokio::test]
-async fn mint_not_initialized_jit_permanent_failure() {
-    // Mint cache empty → JIT body returns PermanentFailure("mint not in mint cache").
+async fn mint_not_initialized_jit_transient_requeues_deposit() {
+    // Mint cache empty, so the JIT body returns Transient("mint not in mint cache").
     let (mut state, mut storage_rx, storage_tx, mock, mint) =
         build_state_for_jit_caller_arm(false).await;
 
@@ -503,23 +519,71 @@ async fn mint_not_initialized_jit_permanent_failure() {
     );
 
     let txn_id: i64 = 5004;
+    if let Storage::Mock(mock_storage) = &*state.storage {
+        seed_processing_deposit(mock_storage, txn_id, chrono::Utc::now(), 0);
+    }
+
     drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, None, &storage_tx).await;
 
-    let update = storage_rx
-        .recv()
-        .await
-        .expect("PermanentFailure path must emit a status update");
-    assert_eq!(update.transaction_id, txn_id);
-    assert_eq!(
-        update.status,
-        TransactionStatus::Failed,
-        "JitOutcome::PermanentFailure must route through handle_permanent_failure"
-    );
-    let msg = update.error_message.unwrap_or_default();
     assert!(
-        msg.contains("mint not in mint cache"),
-        "Failed error_message must surface the permanent-failure reason; got {msg:?}"
+        storage_rx.try_recv().is_err(),
+        "a transient JIT verdict must not write any status for a funded deposit"
     );
+    if let Storage::Mock(mock_storage) = &*state.storage {
+        let (status, attempts) = deposit_row_state(mock_storage, txn_id);
+        assert_eq!(
+            status,
+            TransactionStatus::Pending,
+            "the deposit must be re-armed for the fetcher"
+        );
+        assert_eq!(attempts, 1, "the durable requeue counter must be consumed");
+        assert!(
+            mock_storage
+                .get_release_signatures(txn_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a transient verdict must broadcast nothing and journal nothing"
+        );
+    }
+    mock.shutdown().await;
+}
+
+/// At the durable requeue cap the sender stops re-arming, but it still must not
+/// terminalize the deposit. The row is left Processing so the recovery sweep,
+/// which verifies the mint on-chain first, owns the escalation.
+#[tokio::test]
+async fn mint_not_initialized_jit_transient_at_cap_leaves_processing() {
+    let (mut state, mut storage_rx, storage_tx, mock, mint) =
+        build_state_for_jit_caller_arm(false).await;
+
+    mock.enqueue(
+        "getAccountInfo",
+        account_info_reply_bytes(&[0u8; Mint::LEN]),
+    );
+
+    // The cap constant is crate-private to the indexer, so this mirrors its
+    // value rather than importing it.
+    let txn_id: i64 = 5005;
+    if let Storage::Mock(mock_storage) = &*state.storage {
+        seed_processing_deposit(mock_storage, txn_id, chrono::Utc::now(), 3);
+    }
+
+    drive_caller_arm_with_jit_setup(&mut state, txn_id, mint, None, &storage_tx).await;
+
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "the sender must never terminalize a deposit, even at the requeue cap"
+    );
+    if let Storage::Mock(mock_storage) = &*state.storage {
+        let (status, attempts) = deposit_row_state(mock_storage, txn_id);
+        assert_eq!(
+            status,
+            TransactionStatus::Processing,
+            "at the cap the row waits for the recovery sweep"
+        );
+        assert_eq!(attempts, 3, "the cap must not be exceeded");
+    }
     mock.shutdown().await;
 }
 

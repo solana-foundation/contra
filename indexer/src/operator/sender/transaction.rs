@@ -979,8 +979,12 @@ pub(super) fn handle_confirmation_result<'a>(
                         cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                         state.mint_builders.remove(&txn_id);
                     }
-                    JitOutcome::PermanentFailure(reason) => {
-                        handle_permanent_failure(state, ctx, storage_tx, &reason).await;
+                    // Only deposits reach this block: the guard above proves a
+                    // cached mint builder, and those are cached for the deposit
+                    // mint alone. So there is no nonce-keyed state to unwind
+                    // and no withdrawal remint to compensate here.
+                    JitOutcome::Transient(reason) => {
+                        requeue_deposit_after_jit(state, txn_id, &signature, &reason).await;
                     }
                 }
             }
@@ -1241,6 +1245,81 @@ pub(super) async fn requeue_or_fail_prebroadcast(
                 nonce, "Pre-broadcast requeue write failed, row left Processing for recovery: {e}"
             );
         }
+    }
+}
+
+/// Re-arm a deposit whose JIT mint initialization could not be completed yet.
+/// The `mint_to` was already broadcast and failed on chain, and its signature is
+/// still journaled; the helper only adds an `InitializeMint`, which moves no
+/// balance and is idempotent, so re-arming sends nothing value-bearing. The
+/// re-mint is authorized by the processor's journal gate, which re-mints only
+/// once the stored attempt is proven dead, so bypassing that gate here would
+/// allow a double mint. No status is written on any branch: the cap, a raced row
+/// and a failed write all leave the row to the recovery sweep, which classifies
+/// the deposit on-chain before escalating to a human.
+pub(super) async fn requeue_deposit_after_jit(
+    state: &mut SenderState,
+    txn_id: i64,
+    signature: &Signature,
+    reason: &str,
+) {
+    let pt = state.program_type.as_label();
+    metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[pt, "mint_jit_transient"])
+        .inc();
+
+    // The row leaves this task on every branch below and the next pickup builds
+    // its own builder, so the cached one would only go stale here.
+    state.mint_builders.remove(&txn_id);
+
+    match state
+        .storage
+        .try_requeue_prebroadcast(txn_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeued"])
+                .inc();
+            warn!(
+                transaction_id = txn_id,
+                attempts, "JIT verdict: transient - requeued deposit to Pending: {reason}"
+            );
+        }
+        // The capped write still matches the row, so its `updated_at` trigger
+        // fires and the staleness clock restarts. That delays the recovery
+        // sweep by one window, which is the cost of keeping the cap inside a
+        // single statement rather than reading the counter separately.
+        Ok(RequeueOutcome::AtCap) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+                .inc();
+            leave_processing_for_recovery(
+                pt,
+                Some(txn_id),
+                signature,
+                &format!("JIT mint initialization still failing at the requeue cap ({reason})"),
+            );
+        }
+        // Someone else advanced the row, so it is not Processing and the
+        // recovery sweep will not look at it. Reporting it as left-for-recovery
+        // would send an on-call after a reconciliation that never runs.
+        Ok(RequeueOutcome::NotProcessing) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "mint_jit_requeue_raced"])
+                .inc();
+            warn!(
+                transaction_id = txn_id,
+                signature = %signature,
+                "JIT requeue skipped, row no longer Processing and now owned elsewhere: {reason}",
+            );
+        }
+        Err(e) => leave_processing_for_recovery(
+            pt,
+            Some(txn_id),
+            signature,
+            &format!("JIT requeue write failed ({e}); underlying verdict: {reason}"),
+        ),
     }
 }
 
@@ -7553,6 +7632,189 @@ mod tests {
             !mock.get_release_signatures(77).await.unwrap().is_empty(),
             "JIT retry must reuse the freed parent slot and journal its signature at saturation"
         );
+    }
+
+    // ── JIT transient verdict: bounded requeue, never terminal ────────
+
+    /// Seed a cached builder that carries no mint pubkey so the JIT helper returns
+    /// its transient verdict on the second guard, before it reads the signer or
+    /// issues any RPC. That keeps the tests below on the caller arm alone.
+    fn seed_mint_builder_without_mint(state: &mut SenderState, txn_id: i64) {
+        use crate::operator::utils::instruction_util::MintToBuilder;
+        state.mint_builders.insert(txn_id, MintToBuilder::new());
+    }
+
+    /// Set the durable requeue counter on an already-seeded mock row.
+    fn set_requeue_attempts(state: &SenderState, id: i64, attempts: i32) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let mut rows = mock.pending_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|t| t.id == id)
+            .expect("row must be seeded");
+        row.recovery_requeue_attempts = attempts;
+    }
+
+    /// Read a seeded mock row's status and durable requeue counter together.
+    fn deposit_row_state(state: &SenderState, id: i64) -> (TransactionStatus, i32) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let rows = mock.pending_transactions.lock().unwrap();
+        let row = rows
+            .iter()
+            .find(|t| t.id == id)
+            .expect("row must be seeded");
+        (row.status, row.recovery_requeue_attempts)
+    }
+
+    /// Drive the caller arm with a transient JIT verdict against a mock storage
+    /// whose RPC endpoint is unreachable, which is itself the proof that this
+    /// path issues no RPC.
+    async fn drive_transient_jit(
+        state: &mut SenderState,
+        txn_id: i64,
+    ) -> mpsc::Receiver<TransactionStatusUpdate> {
+        let (storage_tx, storage_rx) = mpsc::channel(10);
+        handle_confirmation_result(
+            state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &mint_ctx(txn_id),
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+        storage_rx
+    }
+
+    /// A transient JIT verdict on a funded deposit must re-arm the row, not end it.
+    /// The source-chain escrow is already funded at this point and no worker reads
+    /// a Failed row, so a terminal status here strands the deposit until a human
+    /// edits the database.
+    #[tokio::test]
+    async fn jit_transient_requeues_deposit_to_pending() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 88);
+        seed_mock_deposit(&state, 88, TransactionStatus::Processing, Utc::now());
+
+        let mut storage_rx = drive_transient_jit(&mut state, 88).await;
+
+        let (status, attempts) = deposit_row_state(&state, 88);
+        assert_eq!(
+            status,
+            TransactionStatus::Pending,
+            "a transient JIT verdict must re-arm the deposit for the fetcher"
+        );
+        assert_eq!(attempts, 1, "the durable requeue counter must be consumed");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the sender must write no status for a transient deposit verdict"
+        );
+        assert!(
+            !state.mint_builders.contains_key(&88),
+            "the cached builder must be released once the row leaves this task"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(88).await.unwrap().is_empty(),
+            "a transient verdict must journal nothing"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a transient verdict must stash no in-flight entry"
+        );
+    }
+
+    /// At the requeue cap the sender stops re-arming and hands the row to the
+    /// recovery sweep, which classifies the deposit on-chain before it escalates.
+    /// `decide_action_caps_demote_at_threshold` in the recovery module pins the
+    /// other half of that handoff: a deposit row at the cap yields Quarantine.
+    #[tokio::test]
+    async fn jit_transient_at_cap_leaves_processing() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 89);
+        seed_mock_deposit(&state, 89, TransactionStatus::Processing, Utc::now());
+        set_requeue_attempts(&state, 89, MAX_RECOVERY_REQUEUE_ATTEMPTS);
+
+        let mut storage_rx = drive_transient_jit(&mut state, 89).await;
+
+        let (status, attempts) = deposit_row_state(&state, 89);
+        assert_eq!(
+            status,
+            TransactionStatus::Processing,
+            "at the cap the row stays Processing for the recovery sweep"
+        );
+        assert_eq!(
+            attempts, MAX_RECOVERY_REQUEUE_ATTEMPTS,
+            "the cap must not be exceeded"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the sender must never terminalize a deposit, even at the cap"
+        );
+        assert!(!state.mint_builders.contains_key(&89));
+    }
+
+    /// A row another writer already advanced is left alone: nothing to requeue and
+    /// nothing to report. The row is not Processing, so the recovery sweep will not
+    /// pick it up either, which is why this branch does not claim it was left for
+    /// recovery.
+    #[tokio::test]
+    async fn jit_transient_not_processing_is_noop() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 90);
+        seed_mock_deposit(&state, 90, TransactionStatus::Pending, Utc::now());
+
+        let mut storage_rx = drive_transient_jit(&mut state, 90).await;
+
+        let (status, attempts) = deposit_row_state(&state, 90);
+        assert_eq!(status, TransactionStatus::Pending, "row left untouched");
+        assert_eq!(attempts, 0, "no counter is spent on a row we do not own");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a raced row must not receive a status from this sender"
+        );
+        assert!(!state.mint_builders.contains_key(&90));
+    }
+
+    /// A failed requeue write leaves the row exactly where it was. Recovery reads
+    /// the same row and reconciles it, so nothing is lost by not retrying here.
+    #[tokio::test]
+    async fn jit_transient_requeue_write_error_leaves_processing() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 91);
+        seed_mock_deposit(&state, 91, TransactionStatus::Processing, Utc::now());
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("try_requeue_prebroadcast", true);
+
+        let mut storage_rx = drive_transient_jit(&mut state, 91).await;
+
+        let (status, attempts) = deposit_row_state(&state, 91);
+        assert_eq!(
+            status,
+            TransactionStatus::Processing,
+            "a failed requeue write must leave the row for recovery"
+        );
+        assert_eq!(attempts, 0, "a failed write consumes no attempt");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a failed requeue write must not be escalated into a terminal status"
+        );
+        assert!(!state.mint_builders.contains_key(&91));
     }
 
     /// A Terminal run broadcasts without writing any signature even though a

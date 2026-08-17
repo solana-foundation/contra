@@ -8,7 +8,7 @@ use crate::{
     error::StorageError,
     storage::common::models::{
         DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
-        MintStatusAtSlot, TransactionStatus, TransactionType,
+        MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
     },
     storage::common::storage::RequeueOutcome,
     storage::postgres::lock_connection::LockConnection,
@@ -665,6 +665,7 @@ impl PostgresDb {
                 transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
                 signature TEXT NOT NULL,
                 last_valid_block_height BIGINT NOT NULL,
+                blockhash_slot BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -695,12 +696,33 @@ impl PostgresDb {
                 transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
                 signature TEXT NOT NULL,
                 last_valid_block_height BIGINT NOT NULL,
+                blockhash_slot BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
         )
         .execute(&self.pool)
         .await?;
+
+        // Slot the broadcast blockhash was read at. A transaction cannot land in a
+        // block older than its blockhash, so this is an exact lower bound on where
+        // the signature could be, independent of the node's blockhash window at
+        // verdict time. NULL on rows written before this column existed; those fall
+        // back to deriving the bound from the window.
+        info!("Running blockhash_slot migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE pending_release_signatures
+                ADD COLUMN IF NOT EXISTS blockhash_slot BIGINT;
+                ALTER TABLE pending_remint_signatures
+                ADD COLUMN IF NOT EXISTS blockhash_slot BIGINT;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("blockhash_slot migration complete");
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_prms_transaction_id ON pending_remint_signatures(transaction_id)",
@@ -1903,18 +1925,20 @@ impl PostgresDb {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO pending_release_signatures
-                (transaction_id, signature, last_valid_block_height)
-            VALUES ($1, $2, $3)
+                (transaction_id, signature, last_valid_block_height, blockhash_slot)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (signature) DO NOTHING
             "#,
         )
         .bind(transaction_id)
         .bind(signature)
         .bind(last_valid_block_height)
+        .bind(blockhash_slot)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1935,6 +1959,7 @@ impl PostgresDb {
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
@@ -1963,14 +1988,15 @@ impl PostgresDb {
         sqlx::query(
             r#"
             INSERT INTO pending_release_signatures
-                (transaction_id, signature, last_valid_block_height)
-            VALUES ($1, $2, $3)
+                (transaction_id, signature, last_valid_block_height, blockhash_slot)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (signature) DO NOTHING
             "#,
         )
         .bind(transaction_id)
         .bind(signature)
         .bind(last_valid_block_height)
+        .bind(blockhash_slot)
         .execute(&mut *tx)
         .await?;
 
@@ -1982,10 +2008,10 @@ impl PostgresDb {
     pub async fn get_release_signatures_internal(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as::<_, (String, i64)>(
+    ) -> Result<Vec<StoredSig>, sqlx::Error> {
+        sqlx::query_as::<_, StoredSig>(
             r#"
-            SELECT signature, last_valid_block_height
+            SELECT signature, last_valid_block_height, blockhash_slot
             FROM pending_release_signatures
             WHERE transaction_id = $1
             ORDER BY id ASC
@@ -2044,6 +2070,7 @@ impl PostgresDb {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
     ) -> Result<bool, sqlx::Error> {
         // Both statements are sender-owned, so the transaction moves whole and never mixes fenced work.
@@ -2069,14 +2096,15 @@ impl PostgresDb {
                 let claimed = sqlx::query(
                     r#"
                     INSERT INTO pending_remint_signatures
-                        (transaction_id, signature, last_valid_block_height)
-                    VALUES ($1, $2, $3)
+                        (transaction_id, signature, last_valid_block_height, blockhash_slot)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (transaction_id) WHERE NOT superseded DO NOTHING
                     "#,
                 )
                 .bind(transaction_id)
                 .bind(signature)
                 .bind(last_valid_block_height)
+                .bind(blockhash_slot)
                 .execute(&mut *tx)
                 .await?;
 
@@ -2091,10 +2119,10 @@ impl PostgresDb {
     pub async fn get_remint_signatures_internal(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as::<_, (String, i64)>(
+    ) -> Result<Vec<StoredSig>, sqlx::Error> {
+        sqlx::query_as::<_, StoredSig>(
             r#"
-            SELECT signature, last_valid_block_height
+            SELECT signature, last_valid_block_height, blockhash_slot
             FROM pending_remint_signatures
             WHERE transaction_id = $1
             ORDER BY id ASC

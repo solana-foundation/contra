@@ -21,6 +21,7 @@ pub mod test_hooks {
 
     pub use super::remint::DeferredRemintOutcome;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_sender_state(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -1094,14 +1095,14 @@ mod tests {
             panic!("expected mock storage");
         };
         assert!(
-            mock.claim_and_persist_signature(7, arrival_token, "stale".to_string(), 1)
+            mock.claim_and_persist_signature(7, arrival_token, "stale".to_string(), 1, None)
                 .await
                 .unwrap()
                 .is_none(),
             "the arrival token is dead after park + unpark"
         );
         assert!(
-            mock.claim_and_persist_signature(7, lease, "fresh".to_string(), 1)
+            mock.claim_and_persist_signature(7, lease, "fresh".to_string(), 1, None)
                 .await
                 .unwrap()
                 .is_some(),

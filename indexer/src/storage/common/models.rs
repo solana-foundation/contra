@@ -121,6 +121,18 @@ pub struct MintDbBalance {
     pub total_withdrawals: BigDecimal,
 }
 
+/// One journaled broadcast attempt, written ahead of the send so a crash cannot
+/// lose it. `blockhash_slot` is the slot the signing blockhash was read at, which
+/// lower-bounds where the signature could have landed; it is `None` on rows
+/// written before that was recorded, and those fall back to deriving the bound
+/// from the endpoint's blockhash window.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StoredSig {
+    pub signature: String,
+    pub last_valid_block_height: i64,
+    pub blockhash_slot: Option<i64>,
+}
+
 /// Durable reconciliation-halt state. Its presence (a single row) is the
 /// cross-process, restart-surviving signal that freezes both operators'
 /// fetchers after a proven insolvency; absence means not halted.

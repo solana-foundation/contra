@@ -155,9 +155,50 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get the current block height with retry. Used by the pending-remint gate
-    /// to compare against each stored signature's `last_valid_block_height` and
-    /// decide whether a broadcast can still land.
+    /// The same blockhash read as `get_latest_blockhash_with_commitment`, at the
+    /// same commitment, but also returning the response's context slot as
+    /// `(blockhash, context_slot, last_valid_block_height)`.
+    ///
+    /// A transaction cannot land in a block older than the blockhash it was signed
+    /// with, so recording that slot alongside the broadcast gives the finality
+    /// classifier an exact lower bound on where the signature could be, one that
+    /// does not depend on what the node's blockhash window happens to be later.
+    pub async fn get_latest_blockhash_with_commitment_and_context(
+        &self,
+    ) -> Result<(Hash, u64, u64), Box<client_error::Error>> {
+        let commitment = self.rpc_client.commitment();
+        self.with_retry(
+            "get_latest_blockhash_with_commitment_and_context",
+            RetryPolicy::Idempotent,
+            || async {
+                let response = self
+                    .rpc_client
+                    .send::<Response<RpcBlockhash>>(
+                        RpcRequest::GetLatestBlockhash,
+                        serde_json::json!([commitment]),
+                    )
+                    .await?;
+                let blockhash = Hash::from_str(&response.value.blockhash).map_err(|e| {
+                    Box::new(client_error::Error::from(ErrorKind::Custom(format!(
+                        "unparseable blockhash {}: {e}",
+                        response.value.blockhash
+                    ))))
+                })?;
+                Ok::<_, Box<client_error::Error>>((
+                    blockhash,
+                    response.context.slot,
+                    response.value.last_valid_block_height,
+                ))
+            },
+        )
+        .await
+    }
+
+    /// Get the current block height with retry, to compare against each stored
+    /// signature's `last_valid_block_height` and decide whether a broadcast can
+    /// still land. Solana-only: slots and heights diverge there. The channel keeps
+    /// them equal and does not implement `getBlockHeight`, so its classification
+    /// reads the height off the status response's own context slot instead.
     pub async fn get_block_height(&self) -> Result<u64, Box<client_error::Error>> {
         self.with_retry("get_block_height", RetryPolicy::Idempotent, || async {
             self.rpc_client.get_block_height().await

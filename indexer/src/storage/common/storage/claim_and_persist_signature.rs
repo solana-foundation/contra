@@ -12,6 +12,7 @@ pub async fn claim_and_persist_signature(
     expected_updated_at: chrono::DateTime<chrono::Utc>,
     signature: String,
     last_valid_block_height: i64,
+    blockhash_slot: Option<i64>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db
@@ -20,6 +21,7 @@ pub async fn claim_and_persist_signature(
                 expected_updated_at,
                 signature,
                 last_valid_block_height,
+                blockhash_slot,
             )
             .await?),
         #[cfg(any(test, feature = "test-mock-storage"))]
@@ -29,6 +31,7 @@ pub async fn claim_and_persist_signature(
                 expected_updated_at,
                 signature,
                 last_valid_block_height,
+                blockhash_slot,
             )
             .await
         }

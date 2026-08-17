@@ -230,6 +230,17 @@ counter_vec!(
     &["program_type", "reason"]
 );
 
+// Absence-based finality classification: how a null status past blockhash
+// validity resolved once the ledger-floor retention proof ran. `chain` is one of
+// {channel, solana}; `outcome` is one of {dead, uncertain}. Sized before and after
+// deploy to see how much of the newly-reachable channel `dead` population is real.
+counter_vec!(
+    OPERATOR_ABSENCE_CLASSIFY,
+    "private_channel_operator_absence_classify_total",
+    "Absence-based finality verdicts after the ledger-floor retention proof",
+    &["chain", "outcome"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -350,6 +361,13 @@ pub fn init_labels(program_type: &str) {
     for reason in &["not_held", "probe_error", "probe_timeout", "fenced_write"] {
         OPERATOR_SENDER_LOCK_LOST.with_label_values(&[program_type, reason]);
     }
+
+    // Chain/outcome labels are program-independent; both roles classify both chains.
+    for chain in &["channel", "solana"] {
+        for outcome in &["dead", "uncertain"] {
+            OPERATOR_ABSENCE_CLASSIFY.with_label_values(&[chain, outcome]);
+        }
+    }
 }
 
 pub fn init() {
@@ -378,6 +396,7 @@ pub fn init() {
         OPERATOR_STALE_PROCESSING_RECOVERED,
         OPERATOR_REOPENED_DEPOSIT_GATE,
         OPERATOR_RELEASE_VERIFY,
+        OPERATOR_ABSENCE_CLASSIFY,
         OPERATOR_REMINT_CLAIM_LOST,
         OPERATOR_SENDER_LOCK_LOST,
     );

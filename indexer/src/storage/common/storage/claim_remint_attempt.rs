@@ -7,6 +7,7 @@ pub async fn claim_remint_attempt(
     transaction_id: i64,
     signature: String,
     last_valid_block_height: i64,
+    blockhash_slot: Option<i64>,
     superseded_signatures: &[String],
 ) -> Result<bool, StorageError> {
     match storage {
@@ -15,6 +16,7 @@ pub async fn claim_remint_attempt(
                 transaction_id,
                 signature,
                 last_valid_block_height,
+                blockhash_slot,
                 superseded_signatures,
             )
             .await?),
@@ -24,6 +26,7 @@ pub async fn claim_remint_attempt(
                 transaction_id,
                 signature,
                 last_valid_block_height,
+                blockhash_slot,
                 superseded_signatures,
             )
             .await

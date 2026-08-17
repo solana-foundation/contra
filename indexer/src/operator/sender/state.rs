@@ -25,6 +25,9 @@ use tracing::{error, info};
 use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
+    /// `channel_blockhash_window` is seeded off the channel endpoint at operator
+    /// startup, never configured, and the retention proof re-reads it per verdict.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -478,6 +481,9 @@ impl SenderState {
                         Ok(PendingSig {
                             signature,
                             last_valid_block_height,
+                            // The transactions-row mirror never carried a slot;
+                            // the journal table is the authority for one.
+                            blockhash_slot: None,
                         })
                     })
                     .collect()
@@ -1297,6 +1303,34 @@ mod tests {
         assert!(state.dest_finality().fallback.is_some());
         // Source stays single-endpoint regardless of the fallback.
         assert!(state.source_finality().fallback.is_none());
+    }
+
+    /// The chain tag drives the height source, the retention window and the metric
+    /// label, so it must follow the role and not the field name: the two roles use
+    /// `rpc_client` and `source_rpc_client` for mirror-image chains.
+    #[test]
+    fn finality_chain_tags_follow_the_operator_role() {
+        use crate::operator::sender::remint::HeightSource;
+
+        let withdraw = make_sender_state_with_role(MockStorage::new(), ProgramType::Withdraw);
+        assert_eq!(
+            withdraw.dest_finality().height_source,
+            HeightSource::BlockHeightRpc
+        );
+        assert_eq!(
+            withdraw.source_finality().height_source,
+            HeightSource::ContextSlot
+        );
+
+        let escrow = make_sender_state_with_role(MockStorage::new(), ProgramType::Escrow);
+        assert_eq!(
+            escrow.dest_finality().height_source,
+            HeightSource::ContextSlot
+        );
+        assert_eq!(
+            escrow.source_finality().height_source,
+            HeightSource::BlockHeightRpc
+        );
     }
 
     /// Pins the SmtRootMismatch wedge: a landed release whose nonce never reaches

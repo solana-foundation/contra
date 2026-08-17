@@ -450,6 +450,122 @@ mod tests {
         assert!(block.is_none());
     }
 
+    /// A block whose transaction rows cannot be read must error, not encode a
+    /// block that silently omits them: a short block reads as complete downstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_error_is_not_a_short_block() {
+        let (mut db, _pg) = start_pg().await;
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let sig = *tx.signature();
+        let processed = make_executed_tx(vec![]);
+
+        let mut block = make_block_info(7, Hash::new_unique());
+        block.transaction_signatures = vec![sig];
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, 7, 1_700_000_000, &processed)],
+            Some(block),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DROP TABLE transactions")
+            .execute(test_pool(&db).as_ref())
+            .await
+            .unwrap();
+
+        let deps = make_read_deps(db);
+        assert!(get_block_impl::get_block_impl(&deps, 7, None)
+            .await
+            .is_err());
+    }
+
+    /// How the block store is broken before a block read runs.
+    #[derive(Clone, Copy)]
+    enum BlockStore {
+        /// Readable, slot genuinely absent.
+        Healthy,
+        /// The lookup query itself fails.
+        Unreadable,
+        /// The row is present but its payload cannot be deserialized.
+        Corrupt,
+    }
+
+    /// Read one slot against a block store in the given state.
+    async fn block_with_store(
+        state: BlockStore,
+    ) -> jsonrpsee::core::RpcResult<Option<serde_json::Value>> {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+        let pool = test_pool(&db);
+
+        match state {
+            BlockStore::Healthy => {}
+            BlockStore::Unreadable => {
+                sqlx::query("DROP TABLE blocks")
+                    .execute(pool.as_ref())
+                    .await
+                    .unwrap();
+            }
+            BlockStore::Corrupt => {
+                sqlx::query("UPDATE blocks SET data = $1 WHERE slot = $2")
+                    .bind(&[0u8, 1, 2][..])
+                    .bind(10i64)
+                    .execute(pool.as_ref())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let deps = make_read_deps(db);
+        get_block_impl::get_block_impl(&deps, 10, None).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_db_error_is_rpc_error() {
+        assert!(block_with_store(BlockStore::Unreadable).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_corrupt_row_is_rpc_error() {
+        assert!(block_with_store(BlockStore::Corrupt).await.is_err());
+    }
+
+    /// Truncation prunes blocks, so a genuinely absent slot is routine and must
+    /// keep reading as absence rather than becoming an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_genuine_miss_is_absent() {
+        assert!(block_with_store(BlockStore::Healthy)
+            .await
+            .unwrap()
+            .is_some());
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+        assert!(get_block_impl::get_block_impl(&deps, 999, None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// `getBlockTime` reads the same row, so it inherits the same split: an
+    /// unreadable store errors while a pruned slot is still a null.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_time_db_error_is_rpc_error() {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+        sqlx::query("DROP TABLE blocks")
+            .execute(test_pool(&db).as_ref())
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+        assert!(get_block_time_impl::get_block_time_impl(&deps, 10)
+            .await
+            .is_err());
+    }
+
     // ── get_transaction ───────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
@@ -547,20 +663,178 @@ mod tests {
         assert!(resp.value[0].is_none());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_signature_statuses_invalid_sig() {
-        let (db, _pg) = start_pg().await;
+    /// How the transaction store is broken before a status query runs.
+    #[derive(Clone, Copy)]
+    enum TxStore {
+        /// Readable, signature genuinely absent.
+        Healthy,
+        /// The lookup query itself fails.
+        Unreadable,
+        /// The row is present but its payload cannot be deserialized.
+        Corrupt,
+    }
+
+    /// The pool behind a test `AccountsDB`, for setups that must break the store.
+    fn test_pool(db: &AccountsDB) -> Arc<sqlx::PgPool> {
+        match db {
+            AccountsDB::Postgres(pg) => Arc::clone(&pg.pool),
+            AccountsDB::Redis(_) => panic!("test harness is Postgres-backed"),
+        }
+    }
+
+    /// Query one signature's status against a store in the given state.
+    async fn statuses_with_store(
+        state: TxStore,
+    ) -> jsonrpsee::core::RpcResult<
+        solana_rpc_client_types::response::Response<
+            Vec<Option<solana_transaction_status_client_types::TransactionStatus>>,
+        >,
+    > {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+        let sig = solana_sdk::signature::Signature::new_unique();
+        let pool = test_pool(&db);
+
+        match state {
+            TxStore::Healthy => {}
+            TxStore::Unreadable => {
+                sqlx::query("DROP TABLE transactions")
+                    .execute(pool.as_ref())
+                    .await
+                    .unwrap();
+            }
+            TxStore::Corrupt => {
+                sqlx::query("INSERT INTO transactions (signature, data) VALUES ($1, $2)")
+                    .bind(sig.as_ref())
+                    .bind(&[0u8, 1, 2][..])
+                    .execute(pool.as_ref())
+                    .await
+                    .unwrap();
+            }
+        }
+
         let deps = make_read_deps(db);
+        get_signature_statuses_impl::get_signature_statuses_impl(&deps, vec![sig.to_string()], None)
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signature_statuses_db_error_is_rpc_error() {
+        assert!(statuses_with_store(TxStore::Unreadable).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signature_statuses_corrupt_row_is_rpc_error() {
+        assert!(statuses_with_store(TxStore::Corrupt).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signature_statuses_genuine_miss_is_null() {
+        let resp = statuses_with_store(TxStore::Healthy).await.unwrap();
+        assert!(resp.value[0].is_none());
+    }
+
+    /// The freshness witness the channel finality check reads is the response
+    /// context slot, which must equal the latest block's height for the
+    /// `lvbh` comparison to be exact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signature_statuses_context_slot_is_block_height() {
+        let (mut db, _pg) = start_pg().await;
+        let block = make_block_info(10, Hash::new_unique());
+        db.write_batch(&[], vec![], Some(block.clone()))
+            .await
+            .unwrap();
+
+        let deps = make_read_deps(db);
+        let sig = solana_sdk::signature::Signature::new_unique();
         let resp = get_signature_statuses_impl::get_signature_statuses_impl(
             &deps,
-            vec!["bad_sig".to_string()],
+            vec![sig.to_string()],
             None,
         )
         .await
         .unwrap();
-        // Invalid signatures return None (not an error)
-        assert_eq!(resp.value.len(), 1);
-        assert!(resp.value[0].is_none());
+        assert_eq!(Some(resp.context.slot), block.block_height);
+    }
+
+    /// The context slot is read before the per-signature lookups, so a block that
+    /// commits while the lookups run can never make the reported context newer than
+    /// the snapshot those lookups observed. A view that stalls the lookup makes the
+    /// ordering observable; reversing the two reads would report the newer slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_signature_statuses_context_slot_not_after_lookup() {
+        let (mut db, _pg) = start_pg().await;
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let sig = *tx.signature();
+        let processed = make_executed_tx(vec![]);
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, 1, 1_700_000_000, &processed)],
+            Some(make_block_info(10, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        // Park every transaction lookup long enough for the commit below to land
+        // strictly between the slot read and the lookup.
+        let pool = test_pool(&db);
+        sqlx::query("ALTER TABLE transactions RENAME TO transactions_store")
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE VIEW transactions AS SELECT signature, data FROM transactions_store \
+             WHERE pg_sleep(2)::text = ''",
+        )
+        .execute(pool.as_ref())
+        .await
+        .unwrap();
+
+        let deps = make_read_deps(db.clone());
+        let query = tokio::spawn(async move {
+            get_signature_statuses_impl::get_signature_statuses_impl(
+                &deps,
+                vec![sig.to_string()],
+                None,
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        db.write_batch(&[], vec![], Some(make_block_info(99, Hash::new_unique())))
+            .await
+            .unwrap();
+        assert!(
+            !query.is_finished(),
+            "the lookup must still be parked, else the interleaving was not exercised"
+        );
+
+        let resp = query.await.unwrap().unwrap();
+        assert_eq!(
+            resp.context.slot, 10,
+            "context slot must predate a commit that landed during the lookups"
+        );
+    }
+
+    /// An unparseable signature is a client error, so the whole call fails with
+    /// invalid params exactly as Solana does, rather than rendering as a null
+    /// element that a caller would read as proof of non-inclusion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signature_statuses_invalid_sig() {
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+        let good = solana_sdk::signature::Signature::new_unique().to_string();
+        let err = get_signature_statuses_impl::get_signature_statuses_impl(
+            &deps,
+            vec![good, "bad_sig".to_string()],
+            None,
+        )
+        .await
+        .expect_err("an unparseable signature must fail the whole call");
+        assert_eq!(err.code(), crate::rpc::error::INVALID_PARAMS_CODE);
     }
 
     // ── get_token_account_balance ─────────────────────────────────────────

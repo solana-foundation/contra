@@ -11,7 +11,9 @@ use crate::operator::sender::{
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::TransactionStatusUpdate;
-use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+use crate::storage::common::models::{
+    DbTransaction, StoredSig, TransactionStatus, TransactionType,
+};
 use crate::storage::common::storage::Storage;
 use chrono::{DateTime, Utc};
 use solana_sdk::pubkey::Pubkey;
@@ -75,6 +77,31 @@ enum WithdrawalAction {
     Quarantine { reason: String },
 }
 
+/// The endpoint pair a recovery sweep works with, before a chain is chosen. The
+/// sweep dispatches by row type and the row type fixes the chain: deposit mints
+/// land on the channel, withdrawal releases on Solana.
+pub(crate) struct RecoveryFinality<'a> {
+    primary: &'a RpcClientWithRetry,
+    fallback: Option<&'a RpcClientWithRetry>,
+}
+
+impl<'a> RecoveryFinality<'a> {
+    pub(crate) fn new(
+        primary: &'a RpcClientWithRetry,
+        fallback: Option<&'a RpcClientWithRetry>,
+    ) -> Self {
+        Self { primary, fallback }
+    }
+
+    fn channel(&self) -> FinalityRpc<'a> {
+        FinalityRpc::channel(self.primary, self.fallback)
+    }
+
+    fn solana(&self) -> FinalityRpc<'a> {
+        FinalityRpc::solana(self.primary, self.fallback)
+    }
+}
+
 /// Unified action for the storage router.
 enum RecoveryAction {
     Complete {
@@ -92,6 +119,7 @@ enum RecoveryAction {
 }
 
 /// Recovery loop. First tick runs on boot (the prime crash-recovery moment).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_recovery_worker(
     storage: Arc<Storage>,
     rpc_client: Arc<RpcClientWithRetry>,
@@ -102,12 +130,9 @@ pub async fn run_recovery_worker(
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
-    // Destination finality oracle. The optional fallback re-checks a Dead verdict;
+    // Endpoints for the sweep. The optional fallback re-checks a Dead verdict;
     // None keeps recovery single-endpoint (legacy behavior).
-    let finality = FinalityRpc {
-        primary: &rpc_client,
-        fallback: fallback_rpc_client.as_deref(),
-    };
+    let finality = RecoveryFinality::new(&rpc_client, fallback_rpc_client.as_deref());
     let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
     loop {
         tokio::select! {
@@ -148,7 +173,7 @@ fn expected_transaction_type(program_type: ProgramType) -> TransactionType {
 
 async fn recover_once(
     storage: &Storage,
-    finality: &FinalityRpc<'_>,
+    finality: &RecoveryFinality<'_>,
     program_type: ProgramType,
     instance_pda: Option<Pubkey>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
@@ -216,14 +241,14 @@ async fn recover_once(
 async fn decide_action(
     row: &DbTransaction,
     storage: &Storage,
-    finality: &FinalityRpc<'_>,
+    finality: &RecoveryFinality<'_>,
     instance_pda: Option<Pubkey>,
 ) -> RecoveryAction {
     // Recovery is same-type by construction: the sweep queries filter on the
-    // operator's own row type, so `finality` is always the chain the row's
-    // signatures were broadcast to.
+    // operator's own row type. The row type still selects the chain here, so a
+    // deposit is never classified with Solana's height source or window.
     let action = match row.transaction_type {
-        TransactionType::Deposit => match check_deposit(row, storage, finality).await {
+        TransactionType::Deposit => match check_deposit(row, storage, &finality.channel()).await {
             DepositOutcome::Landed { signature } => RecoveryAction::Complete {
                 signature,
                 release_signatures: None,
@@ -233,7 +258,7 @@ async fn decide_action(
             DepositOutcome::Ambiguous { reason } => RecoveryAction::Quarantine { reason },
         },
         TransactionType::Withdrawal => {
-            match check_withdrawal(row, storage, finality, instance_pda).await {
+            match check_withdrawal(row, storage, &finality.solana(), instance_pda).await {
                 WithdrawalAction::Complete {
                     signature,
                     release_signatures,
@@ -296,7 +321,7 @@ pub(crate) async fn check_deposit(
 /// exactly once per decision. A malformed stored signature is uncertainty,
 /// never Dead, so a re-mint can never be authorized on an unreadable journal.
 pub(crate) async fn classify_deposit_signatures(
-    stored: &[(String, i64)],
+    stored: &[StoredSig],
     finality: &FinalityRpc<'_>,
 ) -> DepositOutcome {
     if stored.is_empty() {
@@ -304,11 +329,13 @@ pub(crate) async fn classify_deposit_signatures(
     }
 
     let mut pending = Vec::with_capacity(stored.len());
-    for (sig_str, lvbh) in stored {
+    for entry in stored {
+        let sig_str = &entry.signature;
         match Signature::from_str(sig_str) {
             Ok(signature) => pending.push(PendingSig {
                 signature,
-                last_valid_block_height: *lvbh as u64,
+                last_valid_block_height: entry.last_valid_block_height as u64,
+                blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
             }),
              // Corrupt or tampered stored signature: treat as uncertain, never mint.
             Err(e) => {
@@ -576,13 +603,15 @@ pub(crate) async fn load_pending_sigs(
         .map_err(|e| JournalError::Unavailable(format!("release signature lookup failed: {e}")))?;
 
     let mut pending = Vec::with_capacity(stored.len());
-    for (sig_str, lvbh) in &stored {
+    for entry in &stored {
+        let sig_str = &entry.signature;
         let signature = Signature::from_str(sig_str).map_err(|e| {
             JournalError::Corrupt(format!("malformed stored release signature {sig_str}: {e}"))
         })?;
         pending.push(PendingSig {
             signature,
-            last_valid_block_height: *lvbh as u64,
+            last_valid_block_height: entry.last_valid_block_height as u64,
+            blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
         });
     }
     Ok(pending)
@@ -760,11 +789,8 @@ pub async fn boot_reconcile_processing(
     cancellation_token: &CancellationToken,
     max_passes: u32,
 ) -> Result<(), OperatorError> {
-    // Same corroboration bundle the periodic worker uses; None stays single-endpoint.
-    let finality = FinalityRpc {
-        primary: rpc_client,
-        fallback: fallback_rpc_client.as_deref(),
-    };
+    // Same endpoint bundle the periodic worker uses; None stays single-endpoint.
+    let finality = RecoveryFinality::new(rpc_client, fallback_rpc_client.as_deref());
     for pass in 0..max_passes {
         recover_once(
             storage,
@@ -818,7 +844,7 @@ pub mod test_hooks {
         let token = CancellationToken::new();
         // Single-endpoint bundle: the worker and boot reconcile pass a fallback
         // via their own params; this test hook keeps legacy behavior.
-        let finality = FinalityRpc::single(rpc_client);
+        let finality = RecoveryFinality::new(rpc_client, None);
         recover_once(
             storage,
             &finality,
@@ -876,6 +902,16 @@ mod tests {
         row.transaction_type = TransactionType::Withdrawal;
         row.withdrawal_nonce = nonce;
         row
+    }
+
+    /// Deposit-path bundle: mints land on the channel, at the default window.
+    fn channel_finality(client: &RpcClientWithRetry) -> FinalityRpc<'_> {
+        FinalityRpc::channel(client, None)
+    }
+
+    /// Sweep-level bundle for tests that drive `recover_once` / `decide_action`.
+    fn recovery_finality(client: &RpcClientWithRetry) -> RecoveryFinality<'_> {
+        RecoveryFinality::new(client, None)
     }
 
     fn make_rpc_client(url: &str) -> RpcClientWithRetry {
@@ -1021,7 +1057,7 @@ mod tests {
         let storage = Storage::Mock(MockStorage::new());
         let client = make_rpc_client("http://localhost:1");
         let row = make_deposit_row(1);
-        let outcome = check_deposit(&row, &storage, &FinalityRpc::single(&client)).await;
+        let outcome = check_deposit(&row, &storage, &channel_finality(&client)).await;
         assert!(
             matches!(outcome, DepositOutcome::NotLanded),
             "empty sigs must map to NotLanded (Demote), not Ambiguous/Quarantine"
@@ -1039,7 +1075,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_deposit_row(1);
-        let outcome = check_deposit(&row, &storage, &FinalityRpc::single(&client)).await;
+        let outcome = check_deposit(&row, &storage, &channel_finality(&client)).await;
         assert!(
             matches!(outcome, DepositOutcome::NotLanded),
             "a transient read blip must be retried, not quarantined as Ambiguous"
@@ -1064,13 +1100,13 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        match check_deposit(&row, &storage, &FinalityRpc::single(&client)).await {
+        match check_deposit(&row, &storage, &channel_finality(&client)).await {
             DepositOutcome::Landed { signature } => assert_eq!(signature, landed_sig.to_string()),
             _ => panic!("expected Landed"),
         }
@@ -1080,15 +1116,15 @@ mod tests {
     #[tokio::test]
     async fn deposit_dead_sigs_demote() {
         let mut server = mockito::Server::new_async().await;
+        // Channel: the status response's own context slot (200) is the block
+        // height, and 200 > lvbh (100) means expired/dead. No getBlockHeight.
         let _status = mock_null_status(&mut server);
-        // current_height (1000) > lvbh (100) means expired/dead.
-        let _height = mock_block_height(&mut server, 1000);
         // Covered floor (0) so the single-endpoint absence is proven Dead.
         let _floor = mock_first_available_block(&mut server, 0);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, Some(0))
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1096,7 +1132,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_deposit(&row, &storage, &FinalityRpc::single(&client)).await,
+                check_deposit(&row, &storage, &channel_finality(&client)).await,
                 DepositOutcome::NotLanded
             ),
             "dead sigs map to NotLanded (Demote)"
@@ -1107,13 +1143,12 @@ mod tests {
     #[tokio::test]
     async fn deposit_live_sig_leaves_processing() {
         let mut server = mockito::Server::new_async().await;
+        // Channel: context slot (200) <= lvbh (1000) means still live.
         let _status = mock_null_status(&mut server);
-        // current_height (50) <= lvbh (1000) means still live.
-        let _height = mock_block_height(&mut server, 50);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1121,7 +1156,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_deposit(&row, &storage, &FinalityRpc::single(&client)).await,
+                check_deposit(&row, &storage, &channel_finality(&client)).await,
                 DepositOutcome::Live { .. }
             ),
             "a still-live sig must leave the row Processing, not demote"
@@ -1140,13 +1175,13 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        match check_deposit(&row, &storage, &FinalityRpc::single(&client)).await {
+        match check_deposit(&row, &storage, &channel_finality(&client)).await {
             DepositOutcome::Ambiguous { reason } => {
                 assert!(
                     reason.contains("could not verify mint landed"),
@@ -1163,13 +1198,18 @@ mod tests {
     async fn deposit_malformed_stored_sig_quarantines() {
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, "not-a-valid-base58-signature".to_string(), 100)
-            .await
-            .unwrap();
+        mock.insert_release_signature(
+            row.id,
+            "not-a-valid-base58-signature".to_string(),
+            100,
+            None,
+        )
+        .await
+        .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
 
-        match check_deposit(&row, &storage, &FinalityRpc::single(&client)).await {
+        match check_deposit(&row, &storage, &channel_finality(&client)).await {
             DepositOutcome::Ambiguous { reason } => {
                 assert!(
                     reason.contains("malformed stored release signature"),
@@ -1189,7 +1229,8 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, None);
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
+        let action =
+            check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None), None).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(reason.contains("withdrawal row missing nonce"));
@@ -1228,7 +1269,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1254,7 +1295,7 @@ mod tests {
         match check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await
@@ -1277,7 +1318,7 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, Some(3));
 
-        match check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await {
+        match check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None), None).await {
             WithdrawalAction::Quarantine { reason } => assert!(
                 reason.contains("no escrow instance configured"),
                 "reason must name the missing instance: {reason}"
@@ -1301,7 +1342,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1330,7 +1371,7 @@ mod tests {
                 check_withdrawal(
                     &row,
                     &storage,
-                    &FinalityRpc::single(&client),
+                    &FinalityRpc::solana(&client, None),
                     Some(Pubkey::new_unique()),
                 )
                 .await,
@@ -1357,7 +1398,7 @@ mod tests {
                 check_withdrawal(
                     &row,
                     &storage,
-                    &FinalityRpc::single(&client),
+                    &FinalityRpc::solana(&client, None),
                     Some(Pubkey::new_unique()),
                 )
                 .await,
@@ -1383,7 +1424,7 @@ mod tests {
         match check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await
@@ -1402,7 +1443,7 @@ mod tests {
     #[tokio::test]
     async fn journal_corrupt_quarantines_immediately() {
         let mock = MockStorage::new();
-        mock.insert_release_signature(1, "not-a-valid-base58-signature".to_string(), 100)
+        mock.insert_release_signature(1, "not-a-valid-base58-signature".to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1413,7 +1454,7 @@ mod tests {
         match check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await
@@ -1447,7 +1488,7 @@ mod tests {
                 check_withdrawal(
                     &row,
                     &storage,
-                    &FinalityRpc::single(&client),
+                    &FinalityRpc::solana(&client, None),
                     Some(Pubkey::new_unique()),
                 )
                 .await,
@@ -1471,7 +1512,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(3));
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1480,7 +1521,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1507,7 +1548,7 @@ mod tests {
         match decide_action(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &recovery_finality(&client),
             Some(Pubkey::new_unique()),
         )
         .await
@@ -1566,7 +1607,7 @@ mod tests {
         let mock = MockStorage::new();
         // Small nonce so tree_index is 0 under both prod and test-tree sizes.
         let row = make_withdrawal_row(1, Some(3));
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1575,7 +1616,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1599,7 +1640,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(3));
         let recorded = Signature::new_unique().to_string();
-        mock.insert_release_signature(row.id, recorded.clone(), 100)
+        mock.insert_release_signature(row.id, recorded.clone(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1608,7 +1649,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1653,7 +1694,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(3));
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1662,7 +1703,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1694,7 +1735,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(3));
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1703,7 +1744,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1739,7 +1780,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(3));
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1748,7 +1789,7 @@ mod tests {
         let action = check_withdrawal(
             &row,
             &storage,
-            &FinalityRpc::single(&client),
+            &FinalityRpc::solana(&client, None),
             Some(Pubkey::new_unique()),
         )
         .await;
@@ -1774,13 +1815,14 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
+        let action =
+            check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None), None).await;
         match action {
             WithdrawalAction::Complete { signature, .. } => {
                 assert_eq!(signature, landed_sig.to_string());
@@ -1815,13 +1857,14 @@ mod tests {
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
         // current_height (50) <= lvbh (1000) means still live.
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
+        let action =
+            check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None), None).await;
         assert!(
             matches!(action, WithdrawalAction::LeaveProcessing { .. }),
             "expected LeaveProcessing"
@@ -1841,13 +1884,14 @@ mod tests {
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
         let recorded_sig = Signature::new_unique().to_string();
-        mock.insert_release_signature(row.id, recorded_sig.clone(), 100)
+        mock.insert_release_signature(row.id, recorded_sig.clone(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &FinalityRpc::single(&client), None).await;
+        let action =
+            check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None), None).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -2237,14 +2281,14 @@ mod tests {
         let mut row = make_deposit_row(52);
         // One below the cap still demotes (requeues) - pins the off-by-one boundary.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
-        let below = decide_action(&row, &storage, &FinalityRpc::single(&client), None).await;
+        let below = decide_action(&row, &storage, &recovery_finality(&client), None).await;
         assert!(
             matches!(below, RecoveryAction::Demote),
             "one below the cap must still Demote (requeue)"
         );
         // At the cap, the demote is converted to Quarantine.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let at_cap = decide_action(&row, &storage, &FinalityRpc::single(&client), None).await;
+        let at_cap = decide_action(&row, &storage, &recovery_finality(&client), None).await;
         assert!(
             matches!(at_cap, RecoveryAction::Quarantine { .. }),
             "demote at the cap must become Quarantine"
@@ -2356,7 +2400,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = processing_withdrawal(1, 42);
         mock.pending_transactions.lock().unwrap().push(row.clone());
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock.clone());
@@ -2365,7 +2409,7 @@ mod tests {
 
         recover_once(
             &storage,
-            &FinalityRpc::single(&client),
+            &recovery_finality(&client),
             ProgramType::Withdraw,
             None,
             &storage_tx,
@@ -2401,7 +2445,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = processing_withdrawal(1, landed_nonce as i64);
         mock.pending_transactions.lock().unwrap().push(row.clone());
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock.clone());
@@ -2525,16 +2569,13 @@ mod tests {
         let mock = MockStorage::new();
         let row = processing_withdrawal(1, 42);
         mock.pending_transactions.lock().unwrap().push(row.clone());
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock.clone());
         let primary_client = make_rpc_client(&primary.url());
         let fb_client = make_rpc_client(&fb.url());
-        let finality = FinalityRpc {
-            primary: &primary_client,
-            fallback: Some(&fb_client),
-        };
+        let finality = RecoveryFinality::new(&primary_client, Some(&fb_client));
         let (storage_tx, _rx) = mpsc::channel(8);
 
         recover_once(

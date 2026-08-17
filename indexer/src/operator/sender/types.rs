@@ -178,6 +178,8 @@ pub struct SenderState {
     /// Optional second endpoint that re-checks a `Dead` verdict on the destination
     /// `rpc_client`. `None` keeps it single-endpoint. Never used for the source.
     pub fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
+    /// Startup floor for the channel node's `max_blockhashes`, which the retention
+    /// proof re-reads and maxes against when bounding a source-side absence.
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
     pub smt_state: Option<SenderSMTState>,
@@ -226,23 +228,38 @@ pub struct SenderState {
 impl SenderState {
     /// Finality oracle for the destination `rpc_client`, carrying the optional
     /// fallback used to re-check a `Dead` verdict (the prunable Solana path).
+    ///
+    /// Which chain `rpc_client` points at is decided by the role, not the field
+    /// name: a withdraw operator sends ReleaseFunds to Solana, an escrow operator
+    /// mints deposits on the channel. The tag must follow the role or a still-valid
+    /// signature could be read against the wrong height scale.
     pub(crate) fn dest_finality(&self) -> FinalityRpc<'_> {
-        FinalityRpc {
-            primary: &self.rpc_client,
-            fallback: self.fallback_rpc_client.as_deref(),
+        let fallback = self.fallback_rpc_client.as_deref();
+        match self.program_type {
+            ProgramType::Withdraw => FinalityRpc::solana(&self.rpc_client, fallback),
+            ProgramType::Escrow => FinalityRpc::channel(&self.rpc_client, fallback),
         }
     }
 
-    /// Finality oracle for the source `source_rpc_client`, single-endpoint: the
-    /// PrivateChannel gateway is single-provider, with no second node to check.
+    /// Finality oracle for `source_rpc_client`, single-endpoint: neither chain has
+    /// a second node configured for this role's source.
+    ///
+    /// `source_rpc_client` is the mirror of `rpc_client`: the channel for a withdraw
+    /// operator (where the remint MintTo lands) and Solana custody for an escrow one.
     ///
     /// The source (remint MintTo) path deliberately stays absence-authoritative
     /// and is NOT downgraded by an on-chain SMT check the way the destination
-    /// (release) path is. The self-hosted PrivateChannel node is the canonical
-    /// source of truth, so an absent status there is genuine non-inclusion, not a
-    /// prune or lag. Do not "fix" this into a symmetric SMT gate.
+    /// (release) path is. What makes absence trustworthy here is the snapshot,
+    /// not the node's canonicity: the status and the block height it is compared
+    /// against come from one response over one totally ordered commit log, and
+    /// the node reports its own failures as errors rather than as a missing
+    /// status. The ledger-floor check still bounds it to the retained range.
+    /// Do not "fix" this into a symmetric SMT gate.
     pub(crate) fn source_finality(&self) -> FinalityRpc<'_> {
-        FinalityRpc::single(&self.source_rpc_client)
+        match self.program_type {
+            ProgramType::Withdraw => FinalityRpc::channel(&self.source_rpc_client, None),
+            ProgramType::Escrow => FinalityRpc::solana(&self.source_rpc_client, None),
+        }
     }
 }
 
@@ -252,6 +269,12 @@ impl SenderState {
 pub struct PendingSig {
     pub signature: Signature,
     pub last_valid_block_height: u64,
+    /// Slot the signing blockhash was read at. A transaction cannot land in a
+    /// block older than its blockhash, so this is the exact earliest slot the
+    /// signature could occupy, fixed at broadcast and immune to later changes
+    /// in the node's window. `None` on attempts journaled before it was
+    /// recorded; those fall back to deriving the bound from the window.
+    pub blockhash_slot: Option<u64>,
 }
 
 /// A remint deferred until Solana finality window passes, allowing us to verify

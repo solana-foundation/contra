@@ -518,12 +518,14 @@ impl Storage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<(), StorageError> {
         insert_release_signature::insert_release_signature(
             self,
             transaction_id,
             signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
     }
@@ -540,6 +542,7 @@ impl Storage {
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
         claim_and_persist_signature::claim_and_persist_signature(
             self,
@@ -547,15 +550,16 @@ impl Storage {
             expected_updated_at,
             signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
     }
 
-    /// Stored release signatures for a transaction as (signature, lvbh).
+    /// Stored release signatures for a transaction, newest journal order.
     pub async fn get_release_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         get_release_signatures::get_release_signatures(self, transaction_id).await
     }
 
@@ -581,6 +585,7 @@ impl Storage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
     ) -> Result<bool, StorageError> {
         claim_remint_attempt::claim_remint_attempt(
@@ -588,16 +593,17 @@ impl Storage {
             transaction_id,
             signature,
             last_valid_block_height,
+            blockhash_slot,
             superseded_signatures,
         )
         .await
     }
 
-    /// Stored remint signatures for a transaction as (signature, lvbh).
+    /// Stored remint signatures for a transaction, newest journal order.
     pub async fn get_remint_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         get_remint_signatures::get_remint_signatures(self, transaction_id).await
     }
 
@@ -818,7 +824,7 @@ mod tests {
                 let case = format!("{txn_type:?}/{label}");
                 let signature = format!("sig-{case}");
                 let claimed = storage
-                    .claim_and_persist_signature(id, presented, signature.clone(), 100)
+                    .claim_and_persist_signature(id, presented, signature.clone(), 100, None)
                     .await
                     .unwrap();
                 let persisted = storage.get_release_signatures(id).await.unwrap();
@@ -838,7 +844,10 @@ mod tests {
                     1,
                     "{case}: the signature must be persisted"
                 );
-                assert_eq!(persisted[0].0, signature, "{case}: signature mismatch");
+                assert_eq!(
+                    persisted[0].signature, signature,
+                    "{case}: signature mismatch"
+                );
 
                 let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
                 assert_ne!(after, presented, "{case}: a claim must bump updated_at");

@@ -438,6 +438,7 @@ pub async fn run(
 
 /// Reconcile in-flight releases, then validate the local SMT against the on-chain root.
 /// Only a genuine `SmtRootMismatch` returns `Err` (refuse to start).
+#[allow(clippy::too_many_arguments)]
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,

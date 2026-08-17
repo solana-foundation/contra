@@ -42,6 +42,7 @@
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
 
+use private_channel_indexer::storage::common::models::StoredSig;
 use {
     private_channel_indexer::{
         config::ProgramType,
@@ -145,6 +146,7 @@ fn make_pending_remint(
         .map(|signature| PendingSig {
             signature,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         })
         .collect();
     PendingRemint {
@@ -175,6 +177,7 @@ fn make_pending_remint_with_lvbh(
         signatures: vec![PendingSig {
             signature,
             last_valid_block_height,
+            blockhash_slot: None,
         }],
         original_error: "release_funds failed".to_string(),
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
@@ -233,11 +236,14 @@ async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
     .unwrap();
 
     // The write-ahead signature persisted before a prior broadcast.
-    storage_mock
-        .remint_signatures
-        .lock()
-        .unwrap()
-        .insert(txn_id, vec![(prior_remint_sig.to_string(), 0)]);
+    storage_mock.remint_signatures.lock().unwrap().insert(
+        txn_id,
+        vec![StoredSig {
+            signature: prior_remint_sig.to_string(),
+            last_valid_block_height: 0,
+            blockhash_slot: None,
+        }],
+    );
 
     // Classification on the source chain reports it finalized-success.
     mock.enqueue(

@@ -25,6 +25,7 @@
 //!      per transaction, reads back in order, and GC keeps rows while
 //!      PendingRemint but sweeps them once the parent is terminal.
 
+use private_channel_indexer::storage::common::models::StoredSig;
 use {
     chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
@@ -289,12 +290,12 @@ async fn test_remint_signatures_round_trip_and_gc() {
     let attempt_a = Signature::new_unique().to_string();
     let attempt_b = Signature::new_unique().to_string();
     assert!(db
-        .claim_remint_attempt_internal(tx_id, attempt_a.clone(), 100, &[])
+        .claim_remint_attempt_internal(tx_id, attempt_a.clone(), 100, None, &[])
         .await
         .unwrap());
     // A second attempt only takes it by naming the one it proved dead.
     assert!(!db
-        .claim_remint_attempt_internal(tx_id, attempt_b.clone(), 200, &[])
+        .claim_remint_attempt_internal(tx_id, attempt_b.clone(), 200, None, &[])
         .await
         .unwrap());
     assert!(db
@@ -302,6 +303,7 @@ async fn test_remint_signatures_round_trip_and_gc() {
             tx_id,
             attempt_b.clone(),
             200,
+            None,
             std::slice::from_ref(&attempt_a)
         )
         .await
@@ -310,7 +312,18 @@ async fn test_remint_signatures_round_trip_and_gc() {
     let stored = db.get_remint_signatures_internal(tx_id).await.unwrap();
     assert_eq!(
         stored,
-        vec![(attempt_a.clone(), 100), (attempt_b.clone(), 200)],
+        vec![
+            StoredSig {
+                signature: attempt_a.clone(),
+                last_valid_block_height: 100,
+                blockhash_slot: None,
+            },
+            StoredSig {
+                signature: attempt_b.clone(),
+                last_valid_block_height: 200,
+                blockhash_slot: None,
+            },
+        ],
         "both attempts must round-trip in insertion order; a superseded one stays classifiable"
     );
 

@@ -630,7 +630,9 @@ async fn settle_transactions(
         blockhash: next_blockhash,
         previous_blockhash: last_blockhash,
         parent_slot: last_slot,
-        // TODO: Do we need this?
+        // Block height equals the slot: slots are strictly contiguous from genesis,
+        // and both lastValidBlockHeight and the getSignatureStatuses context slot
+        // are read as block heights on that basis. Do not diverge them.
         block_height: Some(next_slot),
         block_time: Some(block_time),
         transaction_signatures: block_transaction_signatures,
@@ -889,7 +891,7 @@ mod tests {
         assert_ne!(r2.blockhash, Hash::default());
 
         // The persisted block must record r1's hash as parent, proving the chain link is written through, not just in memory.
-        let block1 = db.get_block(1).await.expect("block 1 persisted");
+        let block1 = db.get_block(1).await.unwrap().expect("block 1 persisted");
         assert_eq!(block1.previous_blockhash, r1.blockhash);
     }
 
@@ -929,7 +931,7 @@ mod tests {
 
         assert_ne!(r.blockhash, Hash::default());
         assert_ne!(r.blockhash, parent_hash);
-        let block = db.get_block(r.slot).await.unwrap();
+        let block = db.get_block(r.slot).await.unwrap().unwrap();
         assert_eq!(block.blockhash, r.blockhash);
         assert_eq!(block.previous_blockhash, parent_hash);
     }
@@ -960,7 +962,7 @@ mod tests {
         .unwrap();
 
         // Should have stored a block, and the transaction signature
-        let block = db.get_block(result.slot).await;
+        let block = db.get_block(result.slot).await.unwrap();
         assert!(block.is_some());
         assert_eq!(block.unwrap().transaction_signatures.len(), 1);
     }
@@ -1063,7 +1065,7 @@ mod tests {
         .unwrap();
 
         // Failed transactions still get their signature recorded in the block
-        let block = db.get_block(result.slot).await.unwrap();
+        let block = db.get_block(result.slot).await.unwrap().unwrap();
         assert!(block.transaction_signatures.contains(&sig));
         // But no account settlements
         assert!(result.account_settlements.is_empty());
@@ -1099,7 +1101,7 @@ mod tests {
             result.account_settlements.is_empty(),
             "a failed executed tx must persist no account writes"
         );
-        let block = db.get_block(result.slot).await.unwrap();
+        let block = db.get_block(result.slot).await.unwrap().unwrap();
         assert!(
             block.transaction_signatures.contains(&sig),
             "a failed executed tx must still be recorded by signature"
@@ -1147,7 +1149,7 @@ mod tests {
         );
         assert_eq!(result.account_settlements.len(), 1, "only A settles");
 
-        let block = db.get_block(result.slot).await.unwrap();
+        let block = db.get_block(result.slot).await.unwrap().unwrap();
         assert!(block.transaction_signatures.contains(&sig1));
         assert!(
             block.transaction_signatures.contains(&sig2),
@@ -1428,8 +1430,8 @@ mod tests {
         assert_ne!(r2.blockhash, r1.blockhash);
 
         // Both blocks should be stored
-        assert!(db.get_block(0).await.is_some());
-        assert!(db.get_block(1).await.is_some());
+        assert!(db.get_block(0).await.unwrap().is_some());
+        assert!(db.get_block(1).await.unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1468,7 +1470,7 @@ mod tests {
         .unwrap();
 
         // Signature should be recorded in the block
-        let block = db.get_block(result.slot).await.unwrap();
+        let block = db.get_block(result.slot).await.unwrap().unwrap();
         assert!(block.transaction_signatures.contains(&sig));
 
         // No account settlements — fees-only transactions don't modify accounts
@@ -1926,7 +1928,7 @@ mod tests {
             "first block has default hash"
         );
 
-        let block = db.get_block(result.slot).await.unwrap();
+        let block = db.get_block(result.slot).await.unwrap().unwrap();
         assert_eq!(
             block.transaction_signatures.len(),
             3,
@@ -1969,7 +1971,7 @@ mod tests {
         .unwrap();
         assert_eq!(r1.slot, 0);
 
-        let block1 = db.get_block(0).await.unwrap();
+        let block1 = db.get_block(0).await.unwrap().unwrap();
         assert_eq!(block1.parent_slot, 0, "first block parent_slot is 0");
         assert_eq!(block1.block_height, Some(0), "first block height is 0");
         assert!(block1.block_time.is_some(), "block time is set");
@@ -2001,7 +2003,7 @@ mod tests {
         .unwrap();
         assert_eq!(r2.slot, 1);
 
-        let block2 = db.get_block(1).await.unwrap();
+        let block2 = db.get_block(1).await.unwrap().unwrap();
         assert_eq!(block2.parent_slot, 0, "second block parent_slot is 0");
         assert_eq!(block2.block_height, Some(1), "second block height is 1");
         assert_eq!(
@@ -2069,7 +2071,7 @@ mod tests {
         .await
         .unwrap();
 
-        let block = db.get_block(result.slot).await.unwrap();
+        let block = db.get_block(result.slot).await.unwrap().unwrap();
         assert_eq!(
             block.transaction_signatures.len(),
             3,

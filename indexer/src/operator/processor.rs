@@ -815,10 +815,7 @@ pub async fn process_deposit_funds(
     let pt_label = program_type.as_label();
 
     // Classifies persisted write-ahead signatures on the channel
-    let gate_finality = FinalityRpc {
-        primary: &channel_rpc,
-        fallback: channel_fallback.as_deref(),
-    };
+    let gate_finality = FinalityRpc::channel(&channel_rpc, channel_fallback.as_deref());
 
     while let Some(transaction) = fetcher_rx.recv().await {
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
@@ -3515,17 +3512,6 @@ mod tests {
             .create()
     }
 
-    fn mock_block_height(server: &mut mockito::ServerGuard, height: u64) -> mockito::Mock {
-        server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getBlockHeight""#.into(),
-            ))
-            .with_status(200)
-            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{height},"id":1}}"#))
-            .create()
-    }
-
     fn mock_first_available_block(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
         server
             .mock("POST", "/")
@@ -3557,7 +3543,7 @@ mod tests {
             TransactionType::Deposit,
         );
         mock.pending_transactions.lock().unwrap().push(txn.clone());
-        mock.insert_release_signature(txn.id, sig.to_string(), lvbh)
+        mock.insert_release_signature(txn.id, sig.to_string(), lvbh, Some(0))
             .await
             .unwrap();
         txn
@@ -3622,9 +3608,8 @@ mod tests {
     #[tokio::test]
     async fn reopened_deposit_with_live_sig_defers_without_mint() {
         let mut server = mockito::Server::new_async().await;
+        // Channel: context slot (200) <= lvbh (1000) means still live.
         let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
-        // current_height (50) <= lvbh (1000) means still live.
-        let _height = mock_block_height(&mut server, 50);
 
         let mock = MockStorage::new();
         let mint = Pubkey::new_unique();
@@ -3676,9 +3661,8 @@ mod tests {
     #[tokio::test]
     async fn reopened_deposit_with_dead_sigs_proceeds_to_mint() {
         let mut server = mockito::Server::new_async().await;
+        // Channel: context slot (200) > lvbh (100) means expired; floor 0 proves coverage.
         let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
-        // current_height (1000) > lvbh (100) means expired; floor 0 proves coverage.
-        let _height = mock_block_height(&mut server, 1000);
         let _floor = mock_first_available_block(&mut server, 0);
 
         let mock = MockStorage::new();

@@ -259,9 +259,8 @@ pub mod rpc_mocks {
             .create()
     }
 
-    /// Mock `getBlock(slot)` answering one of the skipped-or-missing error codes
-    /// (-32004 / -32007 / -32009) that a node returns when it cannot serve a slot.
-    pub fn mock_get_block_absent(server: &mut Server, slot: u64, code: i32) -> Mock {
+    /// Mock `getBlock(slot)` answering a JSON-RPC error with the given code.
+    pub fn mock_get_block_error(server: &mut Server, slot: u64, code: i32, message: &str) -> Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -272,12 +271,18 @@ pub mod rpc_mocks {
             .with_body(
                 json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": code, "message": "Slot skipped or missing" },
+                    "error": { "code": code, "message": message },
                     "id": 1
                 })
                 .to_string(),
             )
             .create()
+    }
+
+    /// Mock `getBlock(slot)` answering one of the skipped-or-missing error codes
+    /// (-32004 / -32007 / -32009) that a node returns when it cannot serve a slot.
+    pub fn mock_get_block_absent(server: &mut Server, slot: u64, code: i32) -> Mock {
+        mock_get_block_error(server, slot, code, "Slot skipped or missing")
     }
 
     /// Register a whole scenario in one line: the `getBlocks` enumeration over

@@ -162,6 +162,16 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get the current slot with retry. The refund gate uses it as the last slot
+    /// a release could have landed in, which is what the indexer's checkpoint
+    /// then has to cover before an absent release record counts as evidence.
+    pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
+        self.with_retry("get_slot", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_slot().await
+        })
+        .await
+    }
+
     /// Send transaction with configurable retry policy
     ///
     /// # Arguments

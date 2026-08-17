@@ -49,28 +49,32 @@ backup.
 
 Withdrawals halt the entire pipeline on a deterministic per-row error
 (`processor.rs::halt_withdrawal_pipeline`). The reason is on-chain: a
-quarantined withdrawal would leave a permanent gap in the SMT that
-rejects every subsequent nonce. Halt + sweep is safer than bleeding
-errors downstream.
+quarantined withdrawal leaves a permanent hole in the nonce sequence,
+and the row is unreleasable once its generation rotates away. Halt +
+sweep is safer than bleeding errors downstream.
 
 Deposits never halt. The deposit loop (`process_deposit_funds`)
-continues after each quarantine. There is no SMT, no nonce, no
-sequential dependency between deposits.
+continues after each quarantine. There is no nonce and no sequential
+dependency between deposits.
 
 This is why the withdrawal runbooks have a dedicated halt runbook and
 the deposit ones do not.
 
-## Withdrawal nonce and SMT
+## Withdrawal nonce and the bitmap
 
 - Each withdrawal row has `withdrawal_nonce: BIGINT NOT NULL`.
-- The on-chain SMT has `MAX_TREE_LEAVES` slots (see
-  `indexer/src/operator/tree_constants.rs`). Leaf position = `nonce % MAX_TREE_LEAVES`.
-- A quarantined withdrawal occupies its leaf logically (the next nonce
-  expects sequential progression). The pipeline halts because subsequent
-  nonces would fail at the program until the tree is rotated.
-- Rotation: `ResetSmtRootBuilder` (escrow program). Triggered automatically
-  when a nonce hits the `MAX_TREE_LEAVES` boundary; no admin CLI entrypoint
-  exists today.
+- The escrow instance owns a withdrawal bitmap PDA holding one bit per nonce
+  in the current generation. `NONCES_PER_GENERATION` (see
+  `indexer/src/operator/constants.rs`) sets the window; bit position =
+  `nonce % NONCES_PER_GENERATION`.
+- A set bit is the authoritative answer to "did this nonce release?". The
+  program refuses a second release of the same nonce with `NonceAlreadyUsed`.
+- Generation: `nonce / NONCES_PER_GENERATION`. A nonce outside the bitmap's
+  current generation is refused with `NonceOutsideCurrentGeneration`.
+- Rotation: `RotateBitmapBuilder` (escrow program) clears every bit and
+  advances the generation. Triggered automatically when a nonce hits the
+  `NONCES_PER_GENERATION` boundary; no admin CLI entrypoint exists today.
+  Nonces from a rotated-past generation can never be released.
 
 ## On-chain references
 

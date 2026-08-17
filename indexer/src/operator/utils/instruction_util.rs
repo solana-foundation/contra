@@ -4,7 +4,7 @@ use crate::operator::{
     SignerUtil, DEFAULT_CU_MINT, DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, ResetSmtRootBuilder,
+    ReleaseFundsBuilder, RotateBitmapBuilder,
 };
 use solana_keychain::Signer;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -67,21 +67,40 @@ pub enum ExtraErrorCheckPolicy {
     Extra(Vec<ExtraErrorCheckFn>),
 }
 
+/// Which builder a transaction came from, so consumers dispatch on the kind rather than on absent ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionKind {
+    ReleaseFunds,
+    InitializeMint,
+    Mint,
+    RotateBitmap,
+}
+
 /// Wrapper enum for different transaction builder types
 /// Allows processor to send multiple builder types through a single channel to sender
 #[derive(Clone, Debug)]
 pub enum TransactionBuilder {
-    /// Release funds transaction (PrivateChannel → Solana) - requires SMT proof
+    /// Release funds transaction (PrivateChannel to Solana) - consumes a nonce bit
     ReleaseFunds(Box<ReleaseFundsBuilderWithNonce>),
     /// Initialize mint transaction (Solana → PrivateChannel) - simple initialize_mint instruction
     InitializeMint(Box<InitializeMintBuilder>),
     /// Mint transaction (Solana → PrivateChannel) - simple SPL mint, no proof needed
     Mint(Box<MintToBuilderWithTxnId>),
-    /// Reset SMT root transaction - rotates to new tree
-    ResetSmtRoot(Box<ResetSmtRootBuilder>),
+    /// Rotate the withdrawal bitmap - clears the bits and opens the next generation
+    RotateBitmap(Box<RotateBitmapBuilder>),
 }
 
 impl TransactionBuilder {
+    /// The one place a builder variant is turned into the kind carried downstream.
+    pub fn kind(&self) -> TransactionKind {
+        match self {
+            Self::ReleaseFunds(_) => TransactionKind::ReleaseFunds,
+            Self::InitializeMint(_) => TransactionKind::InitializeMint,
+            Self::Mint(_) => TransactionKind::Mint,
+            Self::RotateBitmap(_) => TransactionKind::RotateBitmap,
+        }
+    }
+
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         match self {
             Self::ReleaseFunds(builder_with_nonce) => {
@@ -89,13 +108,13 @@ impl TransactionBuilder {
             }
             Self::InitializeMint(builder) => Ok(vec![builder.instruction()?]),
             Self::Mint(builder_with_txn_id) => builder_with_txn_id.builder.instructions(),
-            Self::ResetSmtRoot(builder) => Ok(vec![builder.instruction()]),
+            Self::RotateBitmap(builder) => Ok(vec![builder.instruction()]),
         }
     }
 
     pub fn compute_unit_price(&self) -> Option<u64> {
         match self {
-            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => Some(1),
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => Some(1),
             Self::InitializeMint(_) | Self::Mint(_) => None,
         }
     }
@@ -105,13 +124,13 @@ impl TransactionBuilder {
     pub fn compute_budget(&self) -> Option<u32> {
         match self {
             Self::ReleaseFunds(_) => DEFAULT_CU_RELEASE_FUNDS,
-            Self::InitializeMint(_) | Self::Mint(_) | Self::ResetSmtRoot(_) => DEFAULT_CU_MINT,
+            Self::InitializeMint(_) | Self::Mint(_) | Self::RotateBitmap(_) => DEFAULT_CU_MINT,
         }
     }
 
     pub fn signers(&self) -> Vec<&'static Signer> {
         match self {
-            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => {
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => {
                 vec![SignerUtil::admin_signer(), SignerUtil::operator_signer()]
             }
             Self::InitializeMint(_) | Self::Mint(_) => vec![SignerUtil::admin_signer()],
@@ -124,7 +143,7 @@ impl TransactionBuilder {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.transaction_id),
             Self::Mint(builder) => Some(builder.txn_id),
-            Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
+            Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
         }
     }
 
@@ -132,14 +151,14 @@ impl TransactionBuilder {
         match self {
             Self::ReleaseFunds(b) => Some(b.trace_id.clone()),
             Self::Mint(b) => Some(b.trace_id.clone()),
-            Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
+            Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
         }
     }
 
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.nonce),
-            Self::InitializeMint(_) | Self::Mint(_) | Self::ResetSmtRoot(_) => None,
+            Self::InitializeMint(_) | Self::Mint(_) | Self::RotateBitmap(_) => None,
         }
     }
 
@@ -151,13 +170,13 @@ impl TransactionBuilder {
     ///   verification to prevent duplicate issuance.
     /// - **ReleaseFunds**: Idempotent retry - Uses transaction nonce to prevent duplicates.
     ///   Safe to retry on transient network failures.
-    /// - **ResetSmtRoot**: Idempotent retry - carries expected_current_tree_index, so a
-    ///   replay after the first reset lands is rejected on-chain (UnexpectedTreeIndex)
-    ///   rather than advancing the tree twice; the sender then syncs local SMT.
+    /// - **RotateBitmap**: Idempotent retry - carries expected_generation, so a replay
+    ///   after the first rotation lands is rejected on-chain (UnexpectedGeneration)
+    ///   rather than skipping a whole generation of nonces.
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
             Self::Mint(_) => RetryPolicy::None,
-            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::ResetSmtRoot(_) => {
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::RotateBitmap(_) => {
                 RetryPolicy::Idempotent
             }
         }
@@ -171,7 +190,7 @@ impl TransactionBuilder {
             Self::InitializeMint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_already_initialized_error)])
             }
-            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => ExtraErrorCheckPolicy::None,
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => ExtraErrorCheckPolicy::None,
         }
     }
 }
@@ -399,7 +418,7 @@ impl InitializeMintBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
+    use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
     use solana_sdk::pubkey::Pubkey;
 
     fn pk(i: u8) -> Pubkey {
@@ -524,9 +543,8 @@ mod tests {
             .private_channel_escrow_program(pk(11))
             .amount(100)
             .user(pk(12))
-            .new_withdrawal_root([0u8; 32])
-            .transaction_nonce(42)
-            .sibling_proofs([0u8; 512]);
+            .withdrawal_bitmap(pk(13))
+            .transaction_nonce(42);
         TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
             builder: inner.clone(),
             nonce: 42,
@@ -554,16 +572,18 @@ mod tests {
         )))
     }
 
-    fn make_reset_smt_builder() -> TransactionBuilder {
-        let mut inner = ResetSmtRootBuilder::new();
+    fn make_rotate_bitmap_builder() -> TransactionBuilder {
+        let mut inner = RotateBitmapBuilder::new();
         inner
             .payer(pk(1))
             .operator(pk(2))
             .instance(pk(3))
-            .operator_pda(pk(4))
-            .event_authority(pk(5))
-            .private_channel_escrow_program(pk(6));
-        TransactionBuilder::ResetSmtRoot(Box::new(inner.clone()))
+            .withdrawal_bitmap(pk(4))
+            .operator_pda(pk(5))
+            .event_authority(pk(6))
+            .private_channel_escrow_program(pk(7))
+            .expected_generation(0);
+        TransactionBuilder::RotateBitmap(Box::new(inner.clone()))
     }
 
     #[test]
@@ -571,7 +591,7 @@ mod tests {
         assert_eq!(make_release_funds_builder().compute_unit_price(), Some(1));
         assert_eq!(make_init_mint_builder().compute_unit_price(), None);
         assert_eq!(make_mint_builder().compute_unit_price(), None);
-        assert_eq!(make_reset_smt_builder().compute_unit_price(), Some(1));
+        assert_eq!(make_rotate_bitmap_builder().compute_unit_price(), Some(1));
     }
 
     #[test]
@@ -582,7 +602,10 @@ mod tests {
         );
         assert_eq!(make_init_mint_builder().compute_budget(), DEFAULT_CU_MINT);
         assert_eq!(make_mint_builder().compute_budget(), DEFAULT_CU_MINT);
-        assert_eq!(make_reset_smt_builder().compute_budget(), DEFAULT_CU_MINT);
+        assert_eq!(
+            make_rotate_bitmap_builder().compute_budget(),
+            DEFAULT_CU_MINT
+        );
     }
 
     #[test]
@@ -590,7 +613,7 @@ mod tests {
         assert_eq!(make_release_funds_builder().transaction_id(), Some(7));
         assert_eq!(make_init_mint_builder().transaction_id(), None);
         assert_eq!(make_mint_builder().transaction_id(), Some(10));
-        assert_eq!(make_reset_smt_builder().transaction_id(), None);
+        assert_eq!(make_rotate_bitmap_builder().transaction_id(), None);
     }
 
     #[test]
@@ -604,7 +627,7 @@ mod tests {
             make_mint_builder().trace_id(),
             Some("trace-mint".to_string())
         );
-        assert_eq!(make_reset_smt_builder().trace_id(), None);
+        assert_eq!(make_rotate_bitmap_builder().trace_id(), None);
     }
 
     #[test]
@@ -612,7 +635,7 @@ mod tests {
         assert_eq!(make_release_funds_builder().withdrawal_nonce(), Some(42));
         assert_eq!(make_init_mint_builder().withdrawal_nonce(), None);
         assert_eq!(make_mint_builder().withdrawal_nonce(), None);
-        assert_eq!(make_reset_smt_builder().withdrawal_nonce(), None);
+        assert_eq!(make_rotate_bitmap_builder().withdrawal_nonce(), None);
     }
 
     #[test]
@@ -630,7 +653,7 @@ mod tests {
             RetryPolicy::None
         ));
         assert!(matches!(
-            make_reset_smt_builder().retry_policy(),
+            make_rotate_bitmap_builder().retry_policy(),
             RetryPolicy::Idempotent
         ));
     }
@@ -650,7 +673,7 @@ mod tests {
             ExtraErrorCheckPolicy::Extra(_)
         ));
         assert!(matches!(
-            make_reset_smt_builder().extra_error_checks_policy(),
+            make_rotate_bitmap_builder().extra_error_checks_policy(),
             ExtraErrorCheckPolicy::None
         ));
     }

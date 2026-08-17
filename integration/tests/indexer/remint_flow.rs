@@ -133,6 +133,7 @@ fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         });
 }
 
@@ -159,6 +160,8 @@ fn make_pending_remint(
         // as matured and processes it on the first tick.
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
+        release_refused_on_chain: false,
+        coverage_slot: None,
     }
 }
 
@@ -182,6 +185,8 @@ fn make_pending_remint_with_lvbh(
         original_error: "release_funds failed".to_string(),
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
+        release_refused_on_chain: false,
+        coverage_slot: None,
     }
 }
 

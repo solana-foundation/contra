@@ -1,7 +1,7 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    DbMint, DbMintStatus, DbTransaction, MintDbBalance, MintStatusAtSlot, TransactionStatus,
-    TransactionType,
+    DbMint, DbMintStatus, DbObservedRelease, DbTransaction, MintDbBalance, MintStatusAtSlot,
+    TransactionStatus, TransactionType,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -10,8 +10,11 @@ use std::sync::{Arc, Mutex};
 /// Recorded status update from `update_transaction_status`.
 pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<Utc>);
 
-/// (transaction_id, signatures, last_valid_block_heights, deadline) persisted on PendingRemint transition.
-pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>);
+/// What a PendingRemint transition persists, in tuple order: the transaction id,
+/// the withdrawal signatures, their last_valid_block_heights, the deadline the
+/// finality check waits out, and whether the program itself refused the release.
+/// Tests read this to check what the sender actually wrote.
+pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>, bool);
 
 /// In-memory mirror of `pending_release_signatures`: txn_id → (signature, lvbh).
 pub type ReleaseSignatureMap = HashMap<i64, Vec<(String, i64)>>;
@@ -34,6 +37,8 @@ pub struct MockStorage {
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
     /// Mirrors the `pending_release_signatures` table for verify-before-demote.
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `observed_releases` table, keyed by withdrawal nonce.
+    pub observed_releases: Arc<Mutex<HashMap<i64, DbObservedRelease>>>,
 }
 
 impl MockStorage {
@@ -164,6 +169,7 @@ impl MockStorage {
         &self,
         program_type: &str,
     ) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("get_committed_checkpoint")?;
         Ok(self
             .committed_checkpoints
             .lock()
@@ -428,12 +434,31 @@ impl MockStorage {
         Ok(nonces)
     }
 
+    pub async fn get_withdrawal_by_nonce(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<DbTransaction>, StorageError> {
+        self.check_should_fail("get_withdrawal_by_nonce")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|t| {
+                t.transaction_type == TransactionType::Withdrawal
+                    && t.withdrawal_nonce == Some(nonce as i64)
+            })
+            .cloned())
+    }
+
     pub async fn set_pending_remint(
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: DateTime<Utc>,
+        release_refused_on_chain: bool,
     ) -> Result<(), StorageError> {
         if self
             .should_fail
@@ -452,7 +477,20 @@ impl MockStorage {
             remint_signatures,
             remint_last_valid_block_heights,
             deadline_at,
+            release_refused_on_chain,
         ));
+        // Mirror the single-row Postgres write. A seeded row for this id is the
+        // one recovery reads back later, so the refusal has to land on it here or
+        // the two halves of the mock would disagree about what was persisted.
+        if let Some(row) = self
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t.id == transaction_id)
+        {
+            row.release_refused_on_chain = release_refused_on_chain;
+        }
         Ok(())
     }
 
@@ -756,22 +794,66 @@ impl MockStorage {
         Ok(())
     }
 
+    pub async fn delete_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("delete_release_signature")?;
+        let mut map = self.release_signatures.lock().unwrap();
+        if let Some(signatures) = map.get_mut(&transaction_id) {
+            signatures.retain(|(stored, _)| stored != signature);
+            if signatures.is_empty() {
+                map.remove(&transaction_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn insert_observed_releases_batch(
+        &self,
+        releases: &[DbObservedRelease],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("insert_observed_releases_batch")?;
+        let mut store = self.observed_releases.lock().unwrap();
+        for release in releases {
+            // Mirror `ON CONFLICT (withdrawal_nonce) DO NOTHING`: first write wins.
+            store
+                .entry(release.withdrawal_nonce)
+                .or_insert_with(|| release.clone());
+        }
+        Ok(())
+    }
+
+    pub async fn get_observed_release(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<DbObservedRelease>, StorageError> {
+        self.check_should_fail("get_observed_release")?;
+        Ok(self.observed_releases.lock().unwrap().get(&nonce).cloned())
+    }
+
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
         self.check_should_fail("gc_stale_release_signatures")?;
-        // Mirror the Postgres predicate: drop sigs whose parent is not
-        // `Processing`; an unknown transaction id counts as non-processing.
-        let processing_ids: std::collections::HashSet<i64> = self
+        // Mirror the Postgres predicate: keep sigs for rows still `Processing`
+        // or escalated to `ManualReview`; an unknown transaction id is neither.
+        let retained_ids: std::collections::HashSet<i64> = self
             .pending_transactions
             .lock()
             .unwrap()
             .iter()
-            .filter(|t| t.status == TransactionStatus::Processing)
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TransactionStatus::Processing | TransactionStatus::ManualReview
+                )
+            })
             .map(|t| t.id)
             .collect();
         let mut map = self.release_signatures.lock().unwrap();
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {
-            if processing_ids.contains(txn_id) {
+            if retained_ids.contains(txn_id) {
                 true
             } else {
                 removed += sigs.len() as u64;

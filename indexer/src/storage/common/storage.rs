@@ -3,6 +3,7 @@ pub use super::models::*;
 pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
+pub mod delete_release_signature;
 pub mod delete_release_signatures;
 pub mod drop_tables;
 pub mod gc_stale_release_signatures;
@@ -14,16 +15,19 @@ pub mod get_escrow_balances_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
+pub mod get_observed_release;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
+pub mod get_withdrawal_by_nonce;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
+pub mod insert_observed_releases_batch;
 pub mod insert_release_signature;
 pub mod quarantine_all_active_withdrawals;
 pub mod record_remint_result;
@@ -173,6 +177,25 @@ impl Storage {
         sync_mint_status::sync_mint_status(self, mint_addresses).await
     }
 
+    /// Record the `ReleaseFunds` instructions a slot was seen to contain.
+    /// Idempotent on the withdrawal nonce, so live indexing, a backfill and a
+    /// resync can all report the same release without erroring on the second
+    /// write or leaving a duplicate behind.
+    pub async fn insert_observed_releases_batch(
+        &self,
+        releases: &[DbObservedRelease],
+    ) -> Result<(), StorageError> {
+        insert_observed_releases_batch::insert_observed_releases_batch(self, releases).await
+    }
+
+    /// The release recorded for `nonce`, if the indexer has seen one.
+    pub async fn get_observed_release(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<DbObservedRelease>, StorageError> {
+        get_observed_release::get_observed_release(self, nonce).await
+    }
+
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
     pub async fn get_mint_status_at_slot(
         &self,
@@ -255,14 +278,26 @@ impl Storage {
             .await
     }
 
-    /// Transitions a withdrawal to PendingRemint, storing withdrawal
-    /// signatures + lvbh for the finality check on restart.
+    /// The withdrawal row that owns `nonce`, if any.
+    pub async fn get_withdrawal_by_nonce(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<DbTransaction>, StorageError> {
+        get_withdrawal_by_nonce::get_withdrawal_by_nonce(self, nonce).await
+    }
+
+    /// Transitions a withdrawal to PendingRemint, storing the withdrawal
+    /// signatures and their lvbh for the finality check on restart, plus whether
+    /// the program itself refused the release. That refusal is proof no payout
+    /// occurred and the only such proof that outlives a bitmap rotation, so it is
+    /// durable from the moment the refund is queued.
     pub async fn set_pending_remint(
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: chrono::DateTime<chrono::Utc>,
+        release_refused_on_chain: bool,
     ) -> Result<(), StorageError> {
         set_pending_remint::set_pending_remint(
             self,
@@ -270,6 +305,7 @@ impl Storage {
             remint_signatures,
             remint_last_valid_block_heights,
             deadline_at,
+            release_refused_on_chain,
         )
         .await
     }
@@ -460,6 +496,15 @@ impl Storage {
         delete_release_signatures::delete_release_signatures(self, transaction_id).await
     }
 
+    /// Delete one stored release signature, keeping the transaction's others.
+    pub async fn delete_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), StorageError> {
+        delete_release_signature::delete_release_signature(self, transaction_id, signature).await
+    }
+
     /// Drop release signatures whose parent transaction is no longer
     /// `Processing`. Returns the number of rows removed.
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
@@ -512,6 +557,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         }
     }
 
@@ -942,6 +988,42 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// The escalation exists because the outcome is unknown, and the broadcast
+    /// signatures are the only thing that can still settle it. Every other
+    /// terminal status names a decided outcome with nothing left to reconstruct,
+    /// so the sweep still reclaims those.
+    #[tokio::test]
+    async fn release_signature_gc_keeps_processing_and_manual_review_only() {
+        let cases = [
+            (TransactionStatus::Processing, true),
+            (TransactionStatus::ManualReview, true),
+            (TransactionStatus::Completed, false),
+            (TransactionStatus::Failed, false),
+            (TransactionStatus::FailedReminted, false),
+        ];
+
+        for (status, retained) in cases {
+            let (storage, mock) = make_mock_storage();
+            let mut row = make_db_transaction();
+            row.id = 1;
+            row.status = status;
+            mock.pending_transactions.lock().unwrap().push(row);
+            storage
+                .insert_release_signature(1, "sig-gc".to_string(), 10)
+                .await
+                .unwrap();
+
+            storage.gc_stale_release_signatures().await.unwrap();
+
+            assert_eq!(
+                !storage.get_release_signatures(1).await.unwrap().is_empty(),
+                retained,
+                "{status:?} must {} its signatures",
+                if retained { "keep" } else { "lose" }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_get_committed_checkpoint_via_mock() {
         let (storage, _mock) = make_mock_storage();
@@ -1330,6 +1412,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         });
     }
 

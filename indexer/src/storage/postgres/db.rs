@@ -5,8 +5,8 @@ use tracing::{info, warn};
 use crate::{
     error::StorageError,
     storage::common::models::{
-        DbMint, DbMintStatus, DbTransaction, MintDbBalance, MintStatusAtSlot, TransactionStatus,
-        TransactionType,
+        DbMint, DbMintStatus, DbObservedRelease, DbTransaction, MintDbBalance, MintStatusAtSlot,
+        TransactionStatus, TransactionType,
     },
     PostgresConfig,
 };
@@ -36,6 +36,7 @@ mod transaction_cols {
     pub const INSTRUCTION_INDEX: &str = "instruction_index";
     pub const INNER_INDEX: &str = "inner_index";
     pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
+    pub const RELEASE_REFUSED_ON_CHAIN: &str = "release_refused_on_chain";
 }
 
 /// ON CONFLICT target for the transactions composite uniqueness. inner_index is
@@ -342,6 +343,23 @@ impl PostgresDb {
         .await?;
         info!("landed_remint_signature migration complete");
 
+        // A release the program refused is proof no payout occurred and the only
+        // such proof that outlives a bitmap rotation, so it is persisted with the
+        // pending remint. NOT NULL DEFAULT FALSE: every row written before this
+        // column existed was queued without a refusal, so false is its true value.
+        info!("Running release_refused_on_chain migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS release_refused_on_chain BOOLEAN NOT NULL DEFAULT FALSE;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("release_refused_on_chain migration complete");
+
         // Widen a legacy BIGINT amount column to NUMERIC(20,0). BIGINT wraps amounts
         // above i64::MAX negative; the cast is lossless and the guard makes it a no-op
         // once already NUMERIC. Required because the BigDecimal decoder rejects BIGINT.
@@ -614,6 +632,24 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Every ReleaseFunds the indexer saw succeed on chain, keyed by the nonce
+        // it consumed. A refund reads this to tell a nonce that was never paid out
+        // from one that was, which nothing else can answer once the nonce's
+        // generation has rotated. The nonce is the primary key because the program
+        // lets exactly one release consume it.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS observed_releases (
+                withdrawal_nonce BIGINT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                slot BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -623,6 +659,14 @@ impl PostgresDb {
 
         // Drop tables with CASCADE to handle dependencies
         sqlx::query("DROP TABLE IF EXISTS pending_release_signatures CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        // Dropped with the rest because the nonce sequence goes too: a resync
+        // reassigns nonces from zero, so any surviving row would name a
+        // different withdrawal than the one it was written for. The backfill
+        // replays from the genesis slot and rebuilds the table as it goes.
+        sqlx::query("DROP TABLE IF EXISTS observed_releases CASCADE")
             .execute(&self.pool)
             .await?;
 
@@ -845,7 +889,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -875,6 +920,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -897,7 +943,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -926,6 +973,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -935,6 +983,59 @@ impl PostgresDb {
         .bind(TransactionStatus::PendingRemint)
         .bind(TransactionType::Withdrawal)
         .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Fetch the withdrawal row owning `nonce`, whatever its status.
+    pub async fn get_withdrawal_by_nonce_internal(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = $1 AND {} = $2
+            ORDER BY {} DESC
+            LIMIT 1
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::INNER_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            // Filters
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::TRANSACTION_TYPE,
+            // Newest first, so a re-armed row wins over an abandoned predecessor.
+            transaction_cols::ID,
+        ))
+        .bind(nonce)
+        .bind(TransactionType::Withdrawal)
+        .fetch_optional(&self.pool)
         .await
     }
 
@@ -963,7 +1064,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -993,6 +1095,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -1055,7 +1158,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -1086,6 +1190,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -1163,7 +1268,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -1195,6 +1301,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -1292,7 +1399,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'parked'
               AND {} < NOW() - make_interval(secs => $1)
@@ -1324,6 +1432,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -1412,14 +1521,18 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Transitions a withdrawal to PendingRemint status, storing the
-    /// withdrawal signatures needed for the finality check on restart.
+    /// Transitions a withdrawal to PendingRemint status, storing the withdrawal
+    /// signatures needed for the finality check on restart and whether the
+    /// program itself refused the release. The refusal rides in this same UPDATE
+    /// so a crash can never leave a queued refund without the proof that lets it
+    /// be paid out once the bitmap has rotated past the nonce.
     pub async fn set_pending_remint_internal(
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: chrono::DateTime<chrono::Utc>,
+        release_refused_on_chain: bool,
     ) -> Result<(), sqlx::Error> {
         let result = sqlx::query(
             r#"
@@ -1429,6 +1542,7 @@ impl PostgresDb {
                 remint_signatures = $3,
                 remint_last_valid_block_heights = $4,
                 pending_remint_deadline_at = $5,
+                release_refused_on_chain = $6,
                 updated_at = NOW()
             WHERE id = $1
                 AND status = 'processing'
@@ -1439,6 +1553,7 @@ impl PostgresDb {
         .bind(remint_signatures)
         .bind(remint_last_valid_block_heights)
         .bind(deadline_at)
+        .bind(release_refused_on_chain)
         .execute(&self.pool)
         .await?;
 
@@ -1587,6 +1702,61 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Delete one stored release signature, keeping the transaction's others.
+    pub async fn delete_release_signature_internal(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM pending_release_signatures WHERE transaction_id = $1 AND signature = $2",
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record the releases seen in one slot; idempotent on the nonce.
+    pub async fn insert_observed_releases_batch_internal(
+        &self,
+        releases: &[DbObservedRelease],
+    ) -> Result<(), sqlx::Error> {
+        for release in releases {
+            sqlx::query(
+                r#"
+                INSERT INTO observed_releases (withdrawal_nonce, signature, slot)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (withdrawal_nonce) DO NOTHING
+                "#,
+            )
+            .bind(release.withdrawal_nonce)
+            .bind(&release.signature)
+            .bind(release.slot)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The release recorded for `nonce`, if the indexer has seen one.
+    pub async fn get_observed_release_internal(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<DbObservedRelease>, sqlx::Error> {
+        sqlx::query_as::<_, DbObservedRelease>(
+            r#"
+            SELECT withdrawal_nonce, signature, slot
+            FROM observed_releases
+            WHERE withdrawal_nonce = $1
+            "#,
+        )
+        .bind(nonce)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Drop release signatures whose parent transaction is no longer
     /// `processing`. Returns the number of rows removed.
     pub async fn gc_stale_release_signatures_internal(&self) -> Result<u64, sqlx::Error> {
@@ -1594,7 +1764,8 @@ impl PostgresDb {
             r#"
             DELETE FROM pending_release_signatures
             WHERE transaction_id IN (
-                SELECT id FROM transactions WHERE status <> 'processing'
+                SELECT id FROM transactions
+                WHERE status NOT IN ('processing', 'manual_review')
             )
             "#,
         )

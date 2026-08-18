@@ -166,6 +166,47 @@ groups:
                     params: [1]
               refId: C
 
+      # Probe-pipeline health. The filtered probe rules above use noDataState OK so
+      # a stack that doesn't probe a given target set can't false-alert. The flip
+      # side: a dead blackbox exporter (all probe_success series vanish) would then
+      # look healthy. Watch the pipeline itself — up == 0 on the blackbox job means
+      # Prometheus can't reach the exporter, so no /health probing is happening.
+      - uid: blackbox-probe-pipeline-down
+        title: "Health-probe pipeline down (blackbox exporter unreachable)"
+        condition: C
+        for: 1m
+        # noData means the blackbox job isn't configured here (a stack not running
+        # probes), not a failure. A reachable-but-down exporter emits up=0 and fires.
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Blackbox exporter unreachable ({{ $labels.instance }}); /health probes are not running"
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: up{job="blackbox-http"}
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+              refId: C
+
   - orgId: 1
     name: feepayer-alerts
     folder: Solana Private Channels Alerts

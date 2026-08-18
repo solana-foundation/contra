@@ -88,7 +88,10 @@ groups:
         title: "Solana Private Channels service down (health probe failed)"
         condition: C
         for: 30s
-        noDataState: Alerting
+        # No series means this stack probes none of these targets (e.g. a dev
+        # monitoring stack), not an outage. A real down still emits
+        # probe_success=0 and fires. Avoids a permanent alert on empty results.
+        noDataState: OK
         execErrState: Error
         annotations:
           summary: "Service {{ $labels.instance }} is down (health check failed)"
@@ -129,7 +132,11 @@ groups:
         title: "Indexer down (health probe failed 2m+)"
         condition: C
         for: 2m
-        noDataState: Alerting
+        # No indexer probe series means this stack doesn't probe the indexers
+        # (e.g. a dev monitoring stack), not an indexer outage. A real down
+        # emits probe_success=0 and fires; this just avoids a permanent alert
+        # when the instance filter matches nothing.
+        noDataState: OK
         execErrState: Error
         annotations:
           summary: "Indexer {{ $labels.instance }} health check failing for 2m+ (sustained stall, not a routine reconnect)"

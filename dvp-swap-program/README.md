@@ -30,7 +30,7 @@ sync.
 
 Vendored at `solana-foundation/dvp` commit
 `9103afe2c6375cdd7c755b4a0cbfd3aa00e6d8f2`, plus the `verify.rs` test-offset fix
-from dvp PR #10 (which the vendored copy carries until that merges upstream). To
+from dvp PR #8 (which the vendored copy carries until that merges upstream). To
 refresh:
 
 ```bash

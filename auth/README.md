@@ -108,22 +108,55 @@ There are two roles: `user` (default) and `operator`.
 | `user` | Standard role. All registered accounts start as `user`. |
 | `operator` | Elevated role. Can call operator-only methods on the gateway without ownership checks. |
 
-**Operators must be provisioned directly in the database** — there is no API to assign or escalate to the operator role. This is intentional: operator access is an infrastructure-level concern, not a self-service one.
+**Operators must be provisioned with the admin CLI** — there is no API to assign or escalate to the operator role. This is intentional: operator access is an infrastructure-level concern, not a self-service one.
 
-```sql
-UPDATE private_channel_auth.users SET role = 'operator' WHERE username = 'alice';
-```
+Never provision by username. Usernames are claimed first-come on `/auth/register`, so anyone who registers the intended operator's name before you promote it receives the operator role instead. The admin CLI takes the immutable user id for exactly this reason.
 
 ## Admin CLI
 
-Operator-only commands for managing users directly against the auth database. Requires `AUTH_DATABASE_URL` (same DB the auth service uses).
+Operator-only commands for managing users directly against the auth database.
+
+| Variable | Description |
+|---|---|
+| `AUTH_DATABASE_URL` | Same DB the auth service uses. |
+| `AUTH_ADMIN_ACTOR` | Who is running the command. Required for `set-role` and `attach-wallet`; recorded in the audit trail. |
+
+Both mutating commands print the target's id, username, current role and creation time and wait for a typed `yes` before proceeding. `--yes` skips the prompt for scripted use.
+
+### Provisioning flow
+
+Ask the account owner for their user id out of band — the registration response and the JWT `sub` claim both carry it. Look that id up and check the username and creation time match the account you mean to grant:
+
+```bash
+AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin auth-admin -- show-user --user-id <uuid>
+```
+
+Do not go the other way. `show-user --username alice` resolves a name to whoever holds it, which answers "is this name taken" but not "is this the person" — deriving the id from a name reintroduces exactly the confusion the id-based commands exist to prevent.
+
+### Set a user's role
+
+```bash
+AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p auth --bin auth-admin -- set-role --user-id <uuid> --role operator
+```
 
 ### Attach a wallet to a user
 
 Inserts a row into `private_channel_auth.verified_wallets` without running the challenge/signature flow — the operator is asserting trust, the user does not prove ownership. Use this for provisioning or recovery, not as a substitute for the normal verification flow.
 
 ```bash
-AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin admin -- attach-wallet --username alice --pubkey <base58>
+AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p auth --bin auth-admin -- attach-wallet --user-id <uuid> --pubkey <base58>
+```
+
+### Audit trail
+
+Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). The `set-role` detail is read by the same statement that performs the update, so it records the role actually replaced.
+
+This is the trail of privileged grants — one account acting on another. Self-service wallet changes are not in it: verification proves key ownership before it stores anything, and removal only ever touches the caller's own wallets.
+
+Nothing in the service updates or deletes from that table. The CLI only runs DDL when the schema is missing, so it works under a role with no create rights; if the trail needs to survive a compromised admin credential, that role should also have `INSERT` but not `UPDATE`/`DELETE` on the audit table.
+
+```sql
+SELECT * FROM private_channel_auth.admin_audit ORDER BY created_at DESC;
 ```
 
 ## Wallet verification flow

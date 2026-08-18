@@ -187,6 +187,18 @@ pub mod rpc_mocks {
     use mockito::{Mock, Server};
     use serde_json::json;
 
+    /// Mock `getSlot` replying with the chain tip.
+    pub fn mock_get_slot(server: &mut Server, slot: u64) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({ "method": "getSlot" }),
+            ))
+            .with_status(200)
+            .with_body(json!({ "jsonrpc": "2.0", "result": slot, "id": 1 }).to_string())
+            .create()
+    }
+
     /// Mock `getBlocks(start, end)` replying with the slots that produced a block.
     /// Body-matched on method and range so it coexists with the getBlock mocks.
     pub fn mock_get_blocks(server: &mut Server, start: u64, end: u64, produced: &[u64]) -> Mock {

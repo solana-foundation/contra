@@ -188,11 +188,12 @@ async fn gap_fill_runs_after_drop_stream() {
     server.shutdown().await;
 }
 
-/// Error path: fresh system (checkpoint=0) must skip reconnect gap-fill —
-/// no RPC backfill calls, no spurious SlotCompletes. Startup backfill (when
-/// configured) is responsible for initial catch-up, not the reconnect path.
+/// The bug, end to end. With no durable anchor there is no lower bound to replay from, so
+/// the slot the replacement stream resumes at must be withheld. Forwarding it is what used
+/// to carry the checkpoint over the slots that arrived while nothing was listening, and
+/// once the checkpoint passed them nothing revisited them on any later restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fresh_system_reconnect_does_not_gap_fill() {
+async fn reconnect_without_anchor_withholds_live_slots() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
@@ -200,8 +201,13 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
 
     let mut rpc_mock = MockitoServer::new_async().await;
 
-    // No getBlock mocks — any call would panic mockito's matcher. getSlot is
-    // tolerated (the reconnect path may probe it before checking checkpoint).
+    // Any repair attempt would land here; without an anchor none may be made.
+    let no_blocks = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlock"})))
+        .expect(0)
+        .create_async()
+        .await;
     let _slot_mock = rpc_mock
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
@@ -219,7 +225,7 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         CommitmentLevel::Confirmed,
     ));
 
-    // No checkpoint seeded → get_last_checkpoint returns 0 → skip path.
+    // No checkpoint seeded, so the source has never recorded a recovery anchor.
     let storage: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
 
     let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(64);
@@ -240,26 +246,42 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         .await
         .expect("yellowstone source start");
 
-    // Stream one slot, drop, give the reconnect path time to run.
+    // The first connection is a cold start and forwards its block without arming.
     server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
-    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
-    server.drop_stream();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("slot 100 must be forwarded on the first connection");
+    assert!(
+        matches!(
+            first,
+            Some(ProcessorMessage::SlotComplete { slot: 100, .. })
+        ),
+        "expected SlotComplete for slot 100, got {first:?}"
+    );
 
-    // Drain the channel — only the streamed slot 100 should appear, never
-    // any backfill SlotCompletes (which would mean we contacted the RPC).
-    let mut all_slots = vec![];
-    while let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
-        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
-    {
-        all_slots.push(slot);
+    // Drop, then resume at a later slot. Slot 101 is the value-bearing slot nobody saw.
+    server.drop_stream();
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(102)));
+
+    // Hold well past the 5s retry backoff: a regression forwards 102 almost immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut leaked = vec![];
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            leaked.push(slot);
+        }
     }
 
-    let unexpected: Vec<_> = all_slots.iter().filter(|&&s| s != 100).collect();
     assert!(
-        unexpected.is_empty(),
-        "fresh system must NOT trigger gap-fill; unexpected slots: {:?}",
-        unexpected
+        leaked.is_empty(),
+        "no slot may be forwarded without a durable anchor; leaked: {leaked:?}"
+    );
+    no_blocks.assert_async().await;
+    assert!(
+        server.call_count("subscribe") >= 2,
+        "the source resubscribes; the withheld block, not a blocked resubscribe, is the guard"
     );
 
     cancel.cancel();

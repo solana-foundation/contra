@@ -141,7 +141,7 @@ async fn fill_reconnect_gap_to<F, Fut>(
 ) -> GapFillOutcome
 where
     F: Fn() -> Fut,
-    Fut: Future<Output = Result<u64, CheckpointError>>,
+    Fut: Future<Output = Result<Option<u64>, CheckpointError>>,
 {
     loop {
         if cancel.is_cancelled() {
@@ -150,7 +150,23 @@ where
 
         // Re-read every cycle so an operator resync moves the anchor without a restart.
         let checkpoint = match get_checkpoint().await {
-            Ok(slot) => slot,
+            Ok(Some(slot)) => slot,
+            // No anchor means no lower bound to replay from, so resolving here would let
+            // the caller forward live slots over an interval nothing has covered. Retry
+            // instead: startup writes an anchor before any live block, so this only shows
+            // up if the checkpoint row was destroyed underneath a running indexer.
+            Ok(None) => {
+                error!(
+                    "Reconnect gap-fill: no durable checkpoint anchor for {:?}; holding the \
+                     checkpoint rather than skipping the gap",
+                    program_type
+                );
+                record_missing_anchor(program_type);
+                if backoff_cancelled(cancel, backoff).await {
+                    return GapFillOutcome::Cancelled;
+                }
+                continue;
+            }
             Err(e) => {
                 warn!(
                     "Reconnect gap-fill: checkpoint read failed, retrying: {}",
@@ -163,11 +179,6 @@ where
                 continue;
             }
         };
-
-        // Fresh system: startup backfill owns initial catch-up.
-        if checkpoint == 0 {
-            return GapFillOutcome::Resolved;
-        }
 
         let gap = match validate_gap(target, checkpoint, max_gap_slots) {
             Ok(None) => {
@@ -258,9 +269,10 @@ struct ReconnectGapCtx {
 /// prior is aborted). Sent before the first live block so the gate wins the FIFO race.
 #[cfg(feature = "datasource-rpc")]
 /// Returns whether it is safe to forward the block that triggered this arm. `false`
-/// means cancellation interrupted the checkpoint read before the gate was armed, so the
-/// caller must NOT forward the block: its SlotComplete would advance the checkpoint over
-/// the still-unfilled gap. `true` means the gate is armed, or a fresh system needs none.
+/// means cancellation ended the wait before the gate was armed, so the caller must NOT
+/// forward the block: its SlotComplete would advance the checkpoint over the still
+/// unfilled gap, and every slot underneath it would stop being reachable. `true` means
+/// the gate is armed and the block is safe to hand on.
 async fn arm_reconnect_gap(
     t_sub: u64,
     ctx: &ReconnectGapCtx,
@@ -269,12 +281,25 @@ async fn arm_reconnect_gap(
     backoff: Duration,
     prev: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<bool, DataSourceRpcError> {
-    // Resolve the anchor before arming: the gate must seed the frontier to the durable
-    // checkpoint, so a wrong/zero `from` would freeze it. Retry a failed read until it
-    // succeeds or cancellation ends it (returning false so the block is not forwarded).
+    // Resolve the anchor before arming, because the gate seeds its frontier from it.
     let checkpoint = loop {
         match get_last_checkpoint(&ctx.storage, ctx.program_type).await {
-            Ok(slot) => break slot,
+            Ok(Some(slot)) => break slot,
+            // An anchor at slot zero is a real anchor and gets repaired like any other.
+            // Absence is different: without a lower bound there is nothing to replay
+            // from, so forwarding this block would let its SlotComplete carry the
+            // checkpoint over slots no one has read. Wait for an anchor instead.
+            Ok(None) => {
+                error!(
+                    "Reconnect gap: no durable checkpoint anchor for {:?}; withholding live \
+                     slots until one exists",
+                    ctx.program_type
+                );
+                record_missing_anchor(ctx.program_type);
+                if backoff_cancelled(cancel, backoff).await {
+                    return Ok(false);
+                }
+            }
             Err(e) => {
                 warn!("Reconnect gap: checkpoint read failed, retrying: {}", e);
                 record_gap_fill_error(ctx.program_type);
@@ -284,12 +309,6 @@ async fn arm_reconnect_gap(
             }
         }
     };
-
-    // Fresh system: startup backfill owns initial catch-up and there is no residual
-    // window; arming would freeze the frontier on a range the fill never emits.
-    if checkpoint == 0 {
-        return Ok(true);
-    }
 
     send_guaranteed(
         tx,
@@ -351,6 +370,17 @@ async fn backoff_cancelled(cancel: &CancellationToken, backoff: Duration) -> boo
 fn record_gap_fill_error(program_type: ProgramType) {
     metrics::INDEXER_RPC_ERRORS
         .with_label_values(&[program_type.as_label(), "gap_fill"])
+        .inc();
+}
+
+/// Counted apart from a gap-fill error because the cause and the fix differ: this one means
+/// the recovery anchor is missing and live slots are being held back, which needs the anchor
+/// restored, while a gap-fill error means the RPC endpoint is misbehaving and usually clears
+/// on its own. Sharing one label would page the wrong person.
+#[cfg(feature = "datasource-rpc")]
+fn record_missing_anchor(program_type: ProgramType) {
+    metrics::INDEXER_RPC_ERRORS
+        .with_label_values(&[program_type.as_label(), "missing_anchor"])
         .inc();
 }
 
@@ -726,8 +756,17 @@ mod tests {
         )
     }
 
-    fn checkpoint_ok(slot: u64) -> impl Fn() -> std::future::Ready<Result<u64, CheckpointError>> {
-        move || std::future::ready(Ok(slot))
+    /// A durable anchor at `slot`.
+    fn checkpoint_ok(
+        slot: u64,
+    ) -> impl Fn() -> std::future::Ready<Result<Option<u64>, CheckpointError>> {
+        move || std::future::ready(Ok(Some(slot)))
+    }
+
+    /// A store that has never recorded an anchor, which must not be read as slot zero.
+    fn checkpoint_absent() -> impl Fn() -> std::future::Ready<Result<Option<u64>, CheckpointError>>
+    {
+        || std::future::ready(Ok(None))
     }
 
     /// Mock storage seeded with an escrow checkpoint, backing arm_reconnect_gap's
@@ -829,19 +868,70 @@ mod tests {
         assert_eq!(slots, vec![100, 101, 102, 103]);
     }
 
-    /// Checkpoint 0 is a fresh system; startup backfill owns catch-up, so the
-    /// fill resolves without a single RPC call.
+    /// A store with no anchor must stall, never resolve over a range nothing has read.
     #[tokio::test]
-    async fn gap_fill_fresh_system_resolves_without_rpc() {
+    async fn gap_fill_missing_anchor_retries_instead_of_resolving() {
         let mut server = Server::new_async().await;
         let untouched = server.mock("POST", "/").expect(0).create_async().await;
 
         let poller = test_poller(&server);
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let cancel_task = cancel.clone();
+
+        let mut handle = tokio::spawn(async move {
+            fill_reconnect_gap_to(
+                100,
+                checkpoint_absent(),
+                &poller,
+                1000,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+                &cancel_task,
+                TEST_BACKOFF,
+            )
+            .await
+        });
+
+        // Several retry cycles must pass without the loop resolving or touching the RPC.
+        tokio::time::sleep(TEST_BACKOFF * 5).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut handle)
+                .await
+                .is_err(),
+            "a missing anchor must stall, not resolve"
+        );
+        untouched.assert_async().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no message may be emitted while the anchor is missing"
+        );
+
+        cancel.cancel();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("cancellation must end the stall")
+            .unwrap();
+        assert_eq!(outcome, GapFillOutcome::Cancelled);
+    }
+
+    /// A durable slot 0 is a real anchor; the batch starts one past it, so 0 is not replayed.
+    #[tokio::test]
+    async fn gap_fill_genuine_zero_anchor_fills_gap() {
+        let mut server = Server::new_async().await;
+        let _enum = mock_dense_range(&mut server, 1, 3);
+        let _blocks: Vec<_> = (1..=3)
+            .map(|s| mock_get_block_success(&mut server, s))
+            .collect();
+
+        let poller = test_poller(&server);
+        let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
         let outcome = fill_reconnect_gap_to(
-            100,
+            3,
             checkpoint_ok(0),
             &poller,
             1000,
@@ -855,7 +945,15 @@ mod tests {
         .await;
 
         assert_eq!(outcome, GapFillOutcome::Resolved);
-        untouched.assert_async().await;
+        drop(tx);
+
+        let mut slots = vec![];
+        while let Some(msg) = rx.recv().await {
+            if let ProcessorMessage::SlotComplete { slot, .. } = msg {
+                slots.push(slot);
+            }
+        }
+        assert_eq!(slots, vec![1, 2, 3]);
     }
 
     /// A failing checkpoint read retries instead of skipping the gap check.
@@ -873,7 +971,7 @@ mod tests {
                 if n < 2 {
                     Err(CheckpointError::InvalidCheckpoint { slot: 0, last: 0 })
                 } else {
-                    Ok(100)
+                    Ok(Some(100))
                 }
             }
         };
@@ -1114,10 +1212,10 @@ mod tests {
         assert_eq!(slots, vec![100, 101, 102, 103]);
     }
 
-    /// A fresh system (checkpoint 0) arms no gate and spawns no fill: startup
-    /// backfill owns catch-up, and arming would freeze the frontier forever.
+    /// No anchor means the block is unsafe to forward; letting it through was the bug.
     #[tokio::test]
-    async fn arm_reconnect_gap_fresh_system_does_not_arm() {
+    async fn arm_reconnect_gap_missing_anchor_withholds_block() {
+        use crate::storage::common::storage::mock::MockStorage;
         let mut server = Server::new_async().await;
         let no_blocks = server
             .mock("POST", "/")
@@ -1126,20 +1224,29 @@ mod tests {
             .create_async()
             .await;
 
-        let ctx = test_gap_ctx(&server, storage_with_checkpoint(0), 1000);
+        // No checkpoint seeded; the pre-cancelled token ends the retry loop at once.
+        let ctx = test_gap_ctx(&server, Arc::new(Storage::Mock(MockStorage::new())), 1000);
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
+        cancel.cancel();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        arm_reconnect_gap(103, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        let safe = arm_reconnect_gap(103, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
 
-        assert!(prev.is_none(), "a fresh system must not spawn a backfill");
+        assert!(
+            !safe,
+            "a missing anchor must report the block unsafe to forward"
+        );
+        assert!(
+            prev.is_none(),
+            "no backfill is spawned without a durable anchor"
+        );
         assert!(
             rx.recv().await.is_none(),
-            "a fresh system must emit no Regate and no SlotComplete"
+            "no Regate and no SlotComplete may be emitted without an anchor"
         );
         no_blocks.assert_async().await;
     }

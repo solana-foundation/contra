@@ -261,6 +261,7 @@ pub fn init_labels(program_type: &str) {
         "missing_meta",
         "block_unavailable",
         "gap_fill",
+        "missing_anchor",
     ] {
         INDEXER_RPC_ERRORS.with_label_values(&[program_type, error_type]);
     }

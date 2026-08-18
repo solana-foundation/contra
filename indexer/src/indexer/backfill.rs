@@ -4,7 +4,7 @@ use crate::{
     config::{BackfillConfig, ProgramType},
     error::{BackfillError, DataSourceError, IndexerError},
     indexer::{
-        checkpoint::get_last_checkpoint,
+        checkpoint::{get_last_checkpoint, program_key},
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
             rpc_polling::{decoder, rpc::RpcPoller, types::BlockFetch},
@@ -215,6 +215,70 @@ pub async fn fill_slot_range(
     Ok(processed_count)
 }
 
+/// Fetch the chain tip, retrying transient RPC failures on the same backoff as block fetches.
+pub(crate) async fn latest_slot_with_retry(rpc_poller: &RpcPoller) -> Result<u64, IndexerError> {
+    let mut retry_count = 0;
+    loop {
+        match rpc_poller.get_latest_slot().await {
+            Ok(slot) => return Ok(slot),
+            Err(e) => {
+                retry_count += 1;
+                if retry_count >= BACKFILL_MAX_RETRIES {
+                    error!(
+                        "Failed to fetch latest slot after {} retries: {}",
+                        BACKFILL_MAX_RETRIES, e
+                    );
+                    return Err(BackfillError::SlotFetchFailed { slot: 0, source: e }.into());
+                }
+                warn!(
+                    "Retry {}/{} fetching latest slot after error: {}",
+                    retry_count, BACKFILL_MAX_RETRIES, e
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    BACKFILL_RETRY_DELAY_MS * retry_count as u64,
+                ))
+                .await;
+            }
+        }
+    }
+}
+
+/// Make sure a durable recovery anchor exists before any live slot is processed, and
+/// return the anchor now in force.
+///
+/// Reconnect repair replays everything between the durable checkpoint and the slot the
+/// replacement stream resumes at, so it needs a lower bound it can trust. An existing
+/// checkpoint is that bound and is returned untouched; only a store that has never held one
+/// gets a row written. The value is the bottom of the startup range when one was resolved,
+/// because the range above it has not been filled yet and claiming it would lose those
+/// slots; with no startup backfill there is no range to inherit, so the chain tip is the
+/// boundary the deployment is choosing and persisting it is what makes it recoverable.
+pub async fn ensure_startup_anchor(
+    storage: &Arc<Storage>,
+    program_type: ProgramType,
+    rpc_poller: &RpcPoller,
+    resolved_from_slot: Option<u64>,
+) -> Result<u64, IndexerError> {
+    if let Some(existing) = get_last_checkpoint(storage, program_type).await? {
+        return Ok(existing);
+    }
+
+    let anchor = match resolved_from_slot {
+        Some(from_slot) => from_slot,
+        None => latest_slot_with_retry(rpc_poller).await?,
+    };
+
+    storage
+        .update_committed_checkpoint(&program_key(program_type), anchor)
+        .await?;
+
+    info!(
+        "Startup anchor persisted for {:?}: slot {}",
+        program_type, anchor
+    );
+    Ok(anchor)
+}
+
 /// Resolved startup boundary shared by both producers. Backfill fills `gap` and the
 /// live RPC source resumes at `live_start_slot`, so the two meet with no hole and no
 /// overlap: `live_start_slot` is one past the highest slot backfill covers (or one past
@@ -224,6 +288,8 @@ pub struct StartupRange {
     pub gap: Option<(u64, u64)>,
     /// First slot the live RPC source must request.
     pub live_start_slot: u64,
+    /// Bottom of the resolved range; carried separately because it outlives an empty `gap`.
+    pub anchor: u64,
 }
 
 /// Backfill service for recovering missed slots on startup
@@ -268,7 +334,10 @@ impl BackfillService {
             self.program_type
         );
 
-        let last_checkpoint = get_last_checkpoint(&self.storage, self.program_type).await?;
+        // Catch-up starts at genesis when nothing was ever indexed, so absence is a zero here.
+        let last_checkpoint = get_last_checkpoint(&self.storage, self.program_type)
+            .await?
+            .unwrap_or(0);
 
         // Use the larger of configured start_slot and database checkpoint
         // Note: start_slot is inclusive (first slot to process), checkpoint is exclusive (last processed)
@@ -297,32 +366,7 @@ impl BackfillService {
             last_checkpoint
         };
 
-        // Retry transient RPC failures with backoff (same policy as block fetches), so a
-        // single hiccup gating the checkpoint writer doesn't force an ungated fallback.
-        let mut retry_count = 0;
-        let current_slot = loop {
-            match self.rpc_poller.get_latest_slot().await {
-                Ok(slot) => break slot,
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count >= BACKFILL_MAX_RETRIES {
-                        error!(
-                            "Failed to fetch latest slot after {} retries: {}",
-                            BACKFILL_MAX_RETRIES, e
-                        );
-                        return Err(BackfillError::SlotFetchFailed { slot: 0, source: e }.into());
-                    }
-                    warn!(
-                        "Retry {}/{} fetching latest slot after error: {}",
-                        retry_count, BACKFILL_MAX_RETRIES, e
-                    );
-                    tokio::time::sleep(Duration::from_millis(
-                        BACKFILL_RETRY_DELAY_MS * retry_count as u64,
-                    ))
-                    .await;
-                }
-            }
-        };
+        let current_slot = latest_slot_with_retry(&self.rpc_poller).await?;
 
         // One past the highest slot backfill covers (gap) or the durable checkpoint
         // (no gap); max guards against an RPC node lagging behind the checkpoint.
@@ -339,6 +383,7 @@ impl BackfillService {
                 Ok(StartupRange {
                     gap: None,
                     live_start_slot,
+                    anchor: from_slot,
                 })
             }
             Some(gap) => {
@@ -349,6 +394,7 @@ impl BackfillService {
                 Ok(StartupRange {
                     gap: Some((from_slot, current_slot)),
                     live_start_slot,
+                    anchor: from_slot,
                 })
             }
         }
@@ -389,6 +435,156 @@ impl BackfillService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::BackfillConfig;
+    use crate::storage::common::storage::mock::MockStorage;
+    use crate::test_utils::rpc_mocks::mock_get_slot;
+    use mockito::Server;
+    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_transaction_status::UiTransactionEncoding;
+
+    // ============================================================================
+    // Startup anchor Tests
+    // ============================================================================
+
+    /// Mock RPC plus a store either seeded with a checkpoint or left empty.
+    async fn anchor_fixture(
+        seeded: Option<u64>,
+    ) -> (mockito::ServerGuard, Arc<Storage>, RpcPoller) {
+        let server = Server::new_async().await;
+        let mock = MockStorage::new();
+        if let Some(slot) = seeded {
+            mock.set_checkpoint("escrow", slot);
+        }
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+        (server, Arc::new(Storage::Mock(mock)), poller)
+    }
+
+    /// Read back the escrow checkpoint the fixture's store currently holds.
+    async fn stored_checkpoint(storage: &Arc<Storage>) -> Option<u64> {
+        storage.get_committed_checkpoint("escrow").await.unwrap()
+    }
+
+    fn backfill_config(start_slot: Option<u64>, max_gap_slots: u64) -> BackfillConfig {
+        BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: String::new(),
+            batch_size: 10,
+            max_gap_slots,
+            start_slot,
+        }
+    }
+
+    /// The anchor must be the range bottom in both arms, including the one with no gap.
+    #[tokio::test]
+    async fn resolve_range_anchor_is_from_slot_in_both_arms() {
+        // (tip, expected gap, expected live_start_slot)
+        let cases = [(150u64, Some((100u64, 150u64)), 151u64), (90, None, 101)];
+
+        for (tip, want_gap, want_live_start) in cases {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, tip);
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 100);
+            let storage: Arc<Storage> = Arc::new(Storage::Mock(mock));
+            let poller = Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            ));
+
+            let service = BackfillService::new(
+                storage,
+                poller,
+                ProgramType::Escrow,
+                backfill_config(None, 1000),
+                None,
+            );
+            let range = service.resolve_range().await.unwrap();
+
+            assert_eq!(range.gap, want_gap, "gap for tip {tip}");
+            assert_eq!(
+                range.anchor, 100,
+                "anchor must be the range bottom for tip {tip}"
+            );
+            assert_eq!(
+                range.live_start_slot, want_live_start,
+                "live_start_slot for tip {tip}"
+            );
+        }
+    }
+
+    /// A resolved boundary is written straight through, with no tip probe.
+    #[tokio::test]
+    async fn ensure_startup_anchor_persists_hint_without_rpc() {
+        let (mut server, storage, poller) = anchor_fixture(None).await;
+        let untouched = server.mock("POST", "/").expect(0).create();
+
+        let anchor = ensure_startup_anchor(&storage, ProgramType::Escrow, &poller, Some(500))
+            .await
+            .unwrap();
+
+        assert_eq!(anchor, 500);
+        assert_eq!(stored_checkpoint(&storage).await, Some(500));
+        untouched.assert();
+    }
+
+    /// With no boundary to inherit, the tip the stream begins at is what gets persisted.
+    #[tokio::test]
+    async fn ensure_startup_anchor_probes_tip_when_no_hint() {
+        let (mut server, storage, poller) = anchor_fixture(None).await;
+        let _slot = mock_get_slot(&mut server, 900);
+
+        let anchor = ensure_startup_anchor(&storage, ProgramType::Escrow, &poller, None)
+            .await
+            .unwrap();
+
+        assert_eq!(anchor, 900);
+        assert_eq!(stored_checkpoint(&storage).await, Some(900));
+    }
+
+    /// The dangerous case. Moving a live checkpoint forward would mark unread slots as
+    /// handled, which is the exact loss this anchor exists to prevent. An existing row must
+    /// therefore win over a hint above it and over a tip above it, and must cost no RPC
+    /// call at all, since a probe that never runs cannot return a value that overwrites it.
+    #[tokio::test]
+    async fn ensure_startup_anchor_never_moves_an_existing_checkpoint() {
+        let (mut server, storage, poller) = anchor_fixture(Some(100)).await;
+        let untouched = server.mock("POST", "/").expect(0).create();
+
+        let from_hint = ensure_startup_anchor(&storage, ProgramType::Escrow, &poller, Some(5_000))
+            .await
+            .unwrap();
+        assert_eq!(from_hint, 100, "a hint above the row must not move it");
+        assert_eq!(stored_checkpoint(&storage).await, Some(100));
+
+        let from_probe = ensure_startup_anchor(&storage, ProgramType::Escrow, &poller, None)
+            .await
+            .unwrap();
+        assert_eq!(from_probe, 100, "the tip probe must not be reached at all");
+        assert_eq!(stored_checkpoint(&storage).await, Some(100));
+
+        untouched.assert();
+    }
+
+    /// A failed anchor write must abort startup, not fall through into live streaming.
+    #[tokio::test]
+    async fn ensure_startup_anchor_fails_closed_on_write_failure() {
+        let (_server, storage, poller) = anchor_fixture(None).await;
+        if let Storage::Mock(mock) = storage.as_ref() {
+            // The mock keys its write fault on the program string, the read on the method.
+            mock.set_should_fail("escrow", true);
+        }
+
+        let result = ensure_startup_anchor(&storage, ProgramType::Escrow, &poller, Some(7)).await;
+
+        assert!(result.is_err(), "a failed anchor write must abort startup");
+        assert_eq!(stored_checkpoint(&storage).await, None);
+    }
 
     // ============================================================================
     // validate_gap Tests

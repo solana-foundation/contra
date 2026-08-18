@@ -304,11 +304,9 @@ impl CheckpointWriter {
             if !state.dirty {
                 continue;
             }
-            let program_type_str = format!("{:?}", program_type).to_lowercase();
-
             match self
                 .storage
-                .update_committed_checkpoint(&program_type_str, state.frontier)
+                .update_committed_checkpoint(&program_key(program_type), state.frontier)
                 .await
             {
                 Ok(_) => {
@@ -329,18 +327,26 @@ impl CheckpointWriter {
     }
 }
 
-/// Helper to get the last checkpoint for a program type
+/// Storage key a program type's checkpoint row is stored under.
+pub(crate) fn program_key(program_type: ProgramType) -> String {
+    format!("{:?}", program_type).to_lowercase()
+}
+
+/// Read a program type's durable checkpoint, or `None` when it has never been written.
+///
+/// Absence and slot zero are deliberately kept apart. A caller that wants to catch up
+/// from the beginning can treat `None` as genesis, but reconnect repair needs to know
+/// it has no recovery anchor at all, because advancing past a gap it cannot replay
+/// would put the missed slots permanently out of reach.
 pub async fn get_last_checkpoint(
     storage: &Arc<Storage>,
     program_type: ProgramType,
-) -> Result<u64, CheckpointError> {
-    let program_type_str = format!("{:?}", program_type).to_lowercase();
+) -> Result<Option<u64>, CheckpointError> {
     let checkpoint = storage
-        .get_committed_checkpoint(&program_type_str)
-        .await?
-        .unwrap_or(0);
+        .get_committed_checkpoint(&program_key(program_type))
+        .await?;
 
-    info!("Last checkpoint for {:?}: {}", program_type, checkpoint);
+    info!("Last checkpoint for {:?}: {:?}", program_type, checkpoint);
     Ok(checkpoint)
 }
 
@@ -691,18 +697,34 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(checkpoint, 12345);
+        assert_eq!(checkpoint, Some(12345));
     }
 
+    /// Both halves belong in one test: the bug was that "never anchored" and
+    /// "anchored at genesis" produced the same value, so the assertion that
+    /// matters is that these two stores now read back differently. Reconnect
+    /// repair keys its fail-closed decision on exactly this distinction.
     #[tokio::test]
-    async fn test_get_last_checkpoint_defaults_to_zero() {
-        let storage: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+    async fn get_last_checkpoint_returns_none_when_absent() {
+        let absent: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+        assert_eq!(
+            get_last_checkpoint(&absent, ProgramType::Escrow)
+                .await
+                .unwrap(),
+            None,
+            "a store with no row must report absence, not slot zero"
+        );
 
-        let checkpoint = get_last_checkpoint(&storage, ProgramType::Escrow)
-            .await
-            .unwrap();
-
-        assert_eq!(checkpoint, 0);
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", 0);
+        let genesis: Arc<Storage> = Arc::new(Storage::Mock(mock));
+        assert_eq!(
+            get_last_checkpoint(&genesis, ProgramType::Escrow)
+                .await
+                .unwrap(),
+            Some(0),
+            "a durable anchor at genesis must be distinguishable from absence"
+        );
     }
 
     #[tokio::test]
@@ -719,8 +741,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(escrow_checkpoint, 100);
-        assert_eq!(withdraw_checkpoint, 200);
+        assert_eq!(escrow_checkpoint, Some(100));
+        assert_eq!(withdraw_checkpoint, Some(200));
     }
 
     // ============================================================================

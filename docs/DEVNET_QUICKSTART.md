@@ -82,54 +82,41 @@ This builds all Solana Private Channels services (gateway, nodes, indexer, opera
 > **This guide builds and runs the stack *locally* with Docker Compose.** For an **automated single-host remote deployment** follow the **[Operator Runbook](../private-channel-deploy/README.md)** instead.
 > The remaining private-channel related steps below are for local setup only.
 
-## Step 2: Set Up Admin UI
+## Step 2: Set Up Instance Management Tooling
 
-The Admin UI lets you create and configure your escrow instance via a web interface.
+You configure and drive your escrow instance from the CLI tools in [`scripts/devnet/`](../scripts/devnet/README.md). Each program action (create instance, add operator, allow mint, deposit, withdraw) has its own `cargo run --bin ...` command. You can also use the [Escrow](../private-channel-escrow-program/clients/typescript) and [Withdrawal](../private-channel-withdraw-program/clients/typescript) TypeScript clients directly.
 
-If you prefer, you can also use the [scripts](../scripts/devnet/README.md) or the [Escrow](../private-channel-escrow-program/clients/typescript) and [Withdrawal](../private-channel-withdraw-program/clients/typescript) clients to interact with the programs.
+See [`scripts/devnet/README.md`](../scripts/devnet/README.md) for the full command reference; the steps below call out the relevant one at each point.
 
-```shell
-cd admin-ui
-pnpm install
-```
-
-Create an environment file for the Admin UI:
+The CLI tools read their signers from keypair files, so create them before running any command:
 
 ```shell
-# admin-ui/.env
-PRIVATE_CHANNEL_RPC_URL=http://localhost:8899
+mkdir -p keypairs
+
+# Admin keypair: owns the escrow instance, signs create_instance / allow_mint / add_operator
+solana-keygen new -o ./keypairs/admin.json -s --no-bip39-passphrase
+
+# User keypair: holds the whitelisted token, signs deposit / withdraw
+solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
 ```
-
-Start the development server:
-
-```shell
-pnpm dev
-```
-
-Open [http://localhost:5173](http://localhost:5173) in your browser.
-
-> **Running on a remote host?** Vite binds the dev server to loopback (`127.0.0.1:5173`), so it isn't reachable over the public IP. Rather than exposing the dev server, forward the port over SSH from your local machine and browse to `http://localhost:5173` locally:
->
-> ```shell
-> ssh -L 5173:127.0.0.1:5173 <user>@<remote-host>
-> ```
->
-> Your wallet's RPC URLs (`http://localhost:8899` for the gateway in later steps) resolve through the same tunnel, so add `-L 8899:127.0.0.1:8899` too if you need the gateway from your local wallet.
 
 ## Step 3: Create an Escrow Instance
 
-1. **Connect Wallet**  
+1. **Fund your admin keypair**  
 
-   - Set your browser wallet to **Devnet** network  
-   - Ensure you have Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
+   - Ensure your admin keypair (`./keypairs/admin.json`) has Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
 
 2. **Create Instance**  
 
-   - In the Admin UI, click **"Create New Instance"**  
-   - Approve the transaction in your wallet  
-   - **Copy the Instance Address** — you'll need this for configuration
+   Run `create_instance` (see [`scripts/devnet/README.md`](../scripts/devnet/README.md)):
 
-![Create Instance](./assets/create-instance.png)
+   ```shell
+   cargo run --bin create_instance -- \
+     https://api.devnet.solana.com \
+     ./keypairs/admin.json
+   ```
+
+   **Copy the printed Instance Address** — you'll need it for configuration.
 
 ## Step 4: Generate Operator Keypair
 
@@ -224,7 +211,6 @@ For reference, here are the ports and endpoints that are now running:
 | PostgreSQL Primary | `5432` | State database (write) — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | PostgreSQL Replica | `5433` | State database (read) — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | PostgreSQL Indexer | `5434` | Indexer/operator database — bound to `127.0.0.1` (loopback-only), not externally reachable |
-| Admin UI | `5173` | Web interface for instance management |
 | Grafana | `37429` | Metrics dashboard (default password: `admin`) |
 | Prometheus | `9090` | Metrics collection |
 | cAdvisor | `8080` | Container metrics |
@@ -238,55 +224,64 @@ but not from other machines. RBAC is an application-layer control on the gateway
 
 ## Step 7: Configure the Instance (Whitelist Mint + Add Operator)
 
-With the services running, configure the instance from the Admin UI. Because the indexer is already streaming, the `AllowMint` and `AddOperator` events are indexed live — no backfill needed, and your first deposit won't be quarantined.
+With the services running, configure the instance using the CLI tools in [`scripts/devnet/`](../scripts/devnet/README.md). Because the indexer is already streaming, the `AllowMint` and `AddOperator` events are indexed live — no backfill needed, and your first deposit won't be quarantined.
 
 ### Whitelist a Token Mint
 
-1. Go to **Admin Functions** → **Mint Management**  
-2. Enter the mint address you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` – you can get some at the [USDC Faucet](https://faucet.circle.com/) or use your own devnet token mint)  
-3. Click **"Allow Mint"** and approve the transaction
+Pick the mint you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` – you can get some at the [USDC Faucet](https://faucet.circle.com/) or use your own devnet token mint), then run `allow_mint`:
 
-![Allow Mint](./assets/allow-mint.png)
+```shell
+cargo run --bin allow_mint -- \
+  https://api.devnet.solana.com \
+  ./keypairs/admin.json \
+  <INSTANCE_ID> \
+  <MINT_ADDRESS>
+```
 
 ### Add Operator
 
-1. Go to **Admin Functions** → **Operator Management**  
-2. Enter your operator's public key (from Step 4)  
-3. Click **"Add Operator"** and approve the transaction
+Run `add_operator` with your operator's public key (from Step 4):
+
+```shell
+cargo run --bin add_operator -- \
+  https://api.devnet.solana.com \
+  ./keypairs/admin.json \
+  <INSTANCE_ID> \
+  <OPERATOR_PUBKEY>
+```
 
 ## Step 8: Test Deposits and Withdrawals
 
 ### Deposit (Solana → Solana Private Channels)
 
-1. In the Admin UI, scroll down to **User Functions**
-2. Enter your whitelisted token that you are holding in the connected wallet
-3. Enter an amount and click **"Deposit"** (make sure to include decimals for precision, e.g., 1 USDC should be 1000000)
-4. Approve the transaction in your wallet
+Run `deposit` from a keypair holding the whitelisted token on Devnet (amounts are in base units, e.g. 1 USDC is `1000000`). Make sure `./keypairs/user.json` has Devnet SOL for fees and holds the whitelisted token before depositing:
+
+```shell
+cargo run --bin deposit -- \
+  https://api.devnet.solana.com \
+  ./keypairs/user.json \
+  <INSTANCE_ID> \
+  <MINT_ADDRESS> \
+  <AMOUNT>
+```
 
 The indexer will detect the deposit and the operator will mint equivalent tokens on the Solana Private Channels payment channel.
 
-![Deposit](./assets/deposit-funds.png)
-
-### Verify Deposit on Solana Private Channels
-
-You can verify your token is on the Solana Private Channels instance by navigating to **Solana Private Channels Management** at the top of the screen. Paste the mint’s address and click “Check Balance”. You should see that your tokens have landed on Solana Private Channels!
-
 ### Transfer (Within the Solana Private Channels Payment Channel)
 
-After your balance has been verified on Solana Private Channels, you should now have an option to Transfer funds to another user. This is a simple way to demonstrate using the Solana Private Channels payment channel.
-
-1. **Important**: Since we are working on the Solana Private Channels payment channel, you must switch your wallet’s RPC before transferring. Change it to **Localnet** or **Custom** (varies by wallet provider) and enter `http://localhost:8899` (the local gateway for your Solana Private Channels RPC)
-2. Enter a user destination address and amount (with decimal precision)
-3. Click send and confirm the transaction in your wallet!
-4. You can check your Solana Private Channels balance again and notice that the funds have been debited by your transfer amount.
+Transfers happen *inside* the payment channel, so they go through the local gateway RPC (`http://localhost:8899`) rather than Devnet. To demonstrate a transfer with a browser wallet, point the wallet's RPC at **Localnet** or **Custom** `http://localhost:8899`, then send the whitelisted token to another user's address. Check the recipient's channel balance to confirm the funds moved.
 
 ### Withdraw (Solana Private Channels → Solana)
 
-1. In the Admin UI, go back to **Escrow Management**
-2. Paste the token mint address and enter withdrawal amount
-3. **Important**: Before withdrawing, make sure your wallet’s RPC is connected to **Localnet** or **Custom** and enter `http://localhost:8899` (the local gateway for your Solana Private Channels RPC)
-4. Click **"Withdraw"** and approve the transaction
-5. (Make sure to switch your wallet back to Devnet when you’re ready to do more devnet activity)
+Run `withdraw` against the local gateway (`http://localhost:8899`):
+
+```shell
+cargo run --bin withdraw -- \
+  http://localhost:8899 \
+  ./keypairs/user.json \
+  <MINT_ADDRESS> \
+  <AMOUNT>
+```
 
 The indexer detects the burn on Solana Private Channels, builds a Merkle proof, and the operator releases funds from the Solana escrow. You should be able to check your balance in your wallet or on Solana explorer to see the withdrawal.
 
@@ -334,10 +329,9 @@ make docker-devnet-clean
 
 - Ensure operator has Devnet SOL for fees  
 - Verify the mint is whitelisted on the instance  
-- Try using CLI tools in `scripts/devnet/` instead of the Admin UI  
 - Check operator logs: `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs operator-solana`  
   - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh with `make docker-devnet-clean`.
-- If using the Admin UI, ensure your wallet is on the correct cluster for the correct task (instructions relating to instance management and deposits should use Devnet, and transfers/withdrawals should use your Solana Private Channels RPC URL (localhost:8899 in our example))
+- Point each command at the correct RPC for the task: instance management and deposits go against Devnet (`https://api.devnet.solana.com`), while transfers and withdrawals go against your Solana Private Channels gateway RPC (`http://localhost:8899` in our example)
 
 ### Indexer not detecting events
 

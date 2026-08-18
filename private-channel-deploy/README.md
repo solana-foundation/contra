@@ -54,9 +54,13 @@ Doppler setup (one time):
 1. Create a Doppler project and config, and add the `secrets.yml` keys as secrets. Doppler names are the UPPERCASE of the file keys: `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, `JWT_SECRET`, `GRAFANA_ADMIN_PASSWORD`, `SOLANA_KEYPAIR`, `GHCR_USER`, `GHCR_TOKEN`, `YELLOWSTONE_TOKEN`, `RPC_URL`, `NOTIFY_WEBHOOK`.
 2. Import your existing file in one shot (uppercases the keys, keeps values):
    ```bash
-   # from private-channel-deploy/, with the doppler CLI installed + `doppler setup` done
-   uv run --with pyyaml python3 -c "import yaml,json,sys; d=yaml.safe_load(open('secrets.yml')); json.dump({k.upper():('' if v is None else str(v)) for k,v in d.items()}, sys.stdout)" > /tmp/spc-secrets.json
-   doppler secrets upload /tmp/spc-secrets.json && rm -f /tmp/spc-secrets.json
+   # from private-channel-deploy/, with the doppler CLI installed + `doppler setup` done.
+   # Subshell keeps the plaintext in a private 0700 tempdir and wipes it on any exit
+   # (including failure or Ctrl-C), so credentials never linger in a world-readable /tmp.
+   ( set -euo pipefail
+     dir="$(mktemp -d)"; trap 'rm -rf "$dir"' EXIT
+     uv run --with pyyaml python3 -c "import yaml,json,sys; d=yaml.safe_load(open('secrets.yml')); json.dump({k.upper():('' if v is None else str(v)) for k,v in d.items()}, sys.stdout)" > "$dir/secrets.json"
+     doppler secrets upload "$dir/secrets.json" )
    ```
 3. Mint a **read-only** service token scoped to that config, then run deploys with it in the environment:
    ```bash

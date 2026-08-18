@@ -141,7 +141,7 @@ impl SenderState {
                 // validate_smt_root reports a root mismatch).
                 match check_rotation_against_chain(self, target_tree_index).await {
                     RotationCheck::Landed { onchain_index } => {
-                        self.pending_rotation = None;
+                        self.disarm_rotation(target_tree_index).await;
                         return Err(ProgramError::RotationNotOwed {
                             target_tree_index,
                             onchain_tree_index: onchain_index,
@@ -174,6 +174,52 @@ impl SenderState {
                     );
 
                     return Err(ProgramError::RotationPending { in_flight_count }.into());
+                }
+
+                // Never close a tree a lower nonce still has to release on: that release can
+                // only land while the chain holds its tree, so rotating past it strands an
+                // already-burned withdrawal.
+                //
+                // The processor applies this same rule at dispatch but excludes Processing
+                // rows, covering those with the sender's in-flight map instead. That map does
+                // not survive a restart while the owed target now does, so the durable check
+                // runs here, fresh on every attempt.
+                //
+                // Below the in-flight check on purpose: a release the sender just confirmed
+                // leaves that map before its Completed write reaches the database, so the
+                // in-memory answer is both free and fresher, and normal pacing takes the
+                // quiet RotationPending branch rather than this one.
+                //
+                // Checked both ways: a saturating multiply would wrap to -1 as an i64 and
+                // make the query match nothing, turning this gate into a no-op on exactly
+                // the corrupt target it should refuse to act on.
+                let Some(boundary_nonce) = target_tree_index
+                    .checked_mul(MAX_TREE_LEAVES as u64)
+                    .and_then(|nonce| i64::try_from(nonce).ok())
+                else {
+                    error!("Owed rotation target {target_tree_index} has no boundary nonce");
+                    return Err(ProgramError::RotationGateUnavailable { target_tree_index }.into());
+                };
+                match self
+                    .storage
+                    .lowest_unreleased_withdrawal_below(boundary_nonce)
+                    .await
+                {
+                    Ok(Some(blocking_nonce)) => {
+                        return Err(ProgramError::RotationBlockedByLowerNonce {
+                            target_tree_index,
+                            blocking_nonce: blocking_nonce as u64,
+                        }
+                        .into())
+                    }
+                    Ok(None) => {}
+                    // Fail closed: an unevaluated gate is not a passed gate.
+                    Err(e) => {
+                        error!("Unreleased-nonce gate read failed: {e}");
+                        return Err(
+                            ProgramError::RotationGateUnavailable { target_tree_index }.into()
+                        );
+                    }
                 }
 
                 // Bind the reset to the generation before the target so the program's
@@ -439,7 +485,26 @@ pub(super) async fn route_builder_error(
                 .inc();
             warn!(
                 target_tree_index,
-                "Tree index unreadable, rotation stays armed and was not submitted"
+                "Rotation gate unreadable, rotation stays armed and was not submitted"
+            );
+        }
+        // Distinct from the unavailable case above: the gate was read and says the
+        // closing tree still owes a release. Resolving that nonce is what unblocks it,
+        // so it gets its own label rather than reading as a chain or RPC problem.
+        OperatorError::Program(ProgramError::RotationBlockedByLowerNonce {
+            target_tree_index,
+            blocking_nonce,
+        }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    state.program_type.as_label(),
+                    "rotation_blocked_by_lower_nonce",
+                ])
+                .inc();
+            warn!(
+                target_tree_index,
+                blocking_nonce,
+                "Rotation withheld: a lower nonce still owes a release on the closing tree"
             );
         }
         OperatorError::Program(ProgramError::TreeIndexMismatch {
@@ -1045,7 +1110,7 @@ pub(super) fn handle_confirmation_result<'a>(
                         check_rotation_against_chain(state, target_tree_index).await,
                         RotationCheck::Landed { .. }
                     ) {
-                        state.pending_rotation = None;
+                        state.disarm_rotation(target_tree_index).await;
                     }
                 }
             }
@@ -1144,14 +1209,16 @@ pub(super) async fn handle_success(
     // a local SMT being present, or a confirmed reset could leave the rotation owed.
     // InitializeMint has no id either but never arrives here: it confirms inline in the
     // JIT path, so a reset is the only thing this branch can be.
-    else if let Some(rotation) = state.pending_rotation.take() {
+    else if let Some(target_tree_index) = state
+        .pending_rotation
+        .as_ref()
+        .map(|rotation| rotation.target_tree_index)
+    {
+        state.disarm_rotation(target_tree_index).await;
         if let Some(ref mut smt_state) = state.smt_state {
-            smt_state.smt_state.reset(rotation.target_tree_index);
+            smt_state.smt_state.reset(target_tree_index);
         }
-        info!(
-            "Tree rotation complete! Updated local SMT to tree_index {}",
-            rotation.target_tree_index
-        );
+        info!("Tree rotation complete! Updated local SMT to tree_index {target_tree_index}");
     }
 }
 
@@ -2313,14 +2380,20 @@ mod tests {
 
     /// Serialized `Instance` reporting `current_tree_index`. Its root is deliberately
     /// not `EMPTY_TREE_ROOT`, so any `validate_smt_root` that runs against it fails.
+    /// Instance bytes whose root matches no rebuilt tree, so an SMT init on top of it
+    /// fails. Gate tests rely on that to prove the gate ran before the init.
     fn instance_bytes(current_tree_index: u64) -> Vec<u8> {
+        instance_bytes_with_root(current_tree_index, [0u8; 32])
+    }
+
+    fn instance_bytes_with_root(current_tree_index: u64, root: [u8; 32]) -> Vec<u8> {
         let instance = Instance {
             discriminator: 0,
             bump: 0,
             version: 0,
             instance_seed: Pubkey::new_unique(),
             admin: Pubkey::new_unique(),
-            withdrawal_transactions_root: [0u8; 32],
+            withdrawal_transactions_root: root,
             current_tree_index,
         };
         let mut bytes = Vec::new();
@@ -4513,6 +4586,12 @@ mod tests {
             builder: ResetSmtRootBuilder::new(),
             target_tree_index,
         }));
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
 
         let (tx, mut rx) = mpsc::channel(10);
         // No transaction_id, no withdrawal_nonce = ResetSmtRoot context
@@ -4537,6 +4616,15 @@ mod tests {
         assert!(
             state.pending_rotation.is_none(),
             "a confirmed reset proves the tree advanced, so the rotation is disarmed"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "the durable target must retire on a confirmed reset"
         );
     }
 
@@ -4664,6 +4752,12 @@ mod tests {
             builder: ResetSmtRootBuilder::new(),
             target_tree_index,
         }));
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
@@ -4695,6 +4789,15 @@ mod tests {
         assert!(
             state.pending_rotation.is_none(),
             "chain reached the target, so the rotation is no longer owed"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "the durable target must retire once the chain proved it landed"
         );
         drop(tx);
         assert!(
@@ -4938,6 +5041,12 @@ mod tests {
         let mut state = make_sender_state();
         state.instance_pda = Some(Pubkey::new_unique());
         state.rpc_client = mock_rpc_client(&instance_bytes(target_tree_index));
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
         assert!(
             state.smt_state.is_none(),
             "the gate must not need a local SMT"
@@ -4968,6 +5077,15 @@ mod tests {
         assert!(
             state.pending_rotation.is_none(),
             "a rotation the chain completed is no longer owed"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "the durable target must retire too, or the next boot re-arms a landed rotation"
         );
     }
 
@@ -5011,6 +5129,197 @@ mod tests {
         );
     }
 
+    /// A server whose every `getAccountInfo` returns an instance at `tree_index` carrying
+    /// the root of an empty tree there, so a `validate_smt_root` against an empty database
+    /// agrees with it.
+    ///
+    /// Needed wherever a test drives both the rotation gate's chain read and the SMT init
+    /// above it: the mocked `RpcClient` consumes one canned response per request, while a
+    /// mockito mock answers every call.
+    async fn server_serving_empty_instance(tree_index: u64) -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getAccountInfo"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [
+                                STANDARD.encode(instance_bytes_with_root(
+                                    tree_index,
+                                    SmtState::new(tree_index).current_root(),
+                                )),
+                                "base64"
+                            ],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+        server
+    }
+
+    /// A withdrawal row on the closing tree, at `nonce`, in a status that still owes a
+    /// release.
+    fn unreleased_withdrawal_row(nonce: i64, status: TransactionStatus) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id: nonce,
+            signature: Signature::new_unique().to_string(),
+            trace_id: format!("trace-{nonce}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(5_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce),
+            status,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
+    /// The durable half of the in-flight guard. A release can only land while the chain
+    /// holds its tree, so a rotation must not close a tree a lower nonce still owes a
+    /// release on. The processor checks this at dispatch but excludes Processing rows,
+    /// relying on the sender's in-flight map for those; that map is gone after a restart
+    /// while the owed target survives, so the check has to hold here too.
+    #[tokio::test]
+    async fn reset_gate_withholds_while_lower_nonce_unreleased() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+        let blocking_nonce = MAX_TREE_LEAVES as i64 - 1;
+
+        // Chain a generation behind the target, so the rotation is genuinely owed.
+        let server = server_serving_empty_instance(target_tree_index - 1).await;
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
+
+        // Processing, the status a restart leaves behind and the one the processor's
+        // dispatch-time query deliberately ignores.
+        let Storage::Mock(mock) = state.storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(unreleased_withdrawal_row(
+                blocking_nonce,
+                TransactionStatus::Processing,
+            ));
+
+        let Err(err) = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget {
+                    builder: ResetSmtRootBuilder::new(),
+                    target_tree_index,
+                },
+            )))
+            .await
+        else {
+            panic!("a rotation that would strand a lower nonce must not be submitted")
+        };
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(ProgramError::RotationBlockedByLowerNonce {
+                    target_tree_index: target,
+                    blocking_nonce: blocking,
+                }) if target == target_tree_index && blocking == blocking_nonce as u64
+            ),
+            "expected RotationBlockedByLowerNonce, got {err:?}"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "the rotation is still owed, just withheld"
+        );
+        assert_eq!(
+            state.storage.get_owed_rotation_target(pt).await.unwrap(),
+            Some(target_tree_index),
+            "withholding must not retire the durable target"
+        );
+    }
+
+    /// The mirror case: a lower nonce that already released is no reason to withhold, or
+    /// the tree could never rotate at all.
+    #[tokio::test]
+    async fn reset_gate_submits_when_lower_nonces_are_terminal() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        let server = server_serving_empty_instance(target_tree_index - 1).await;
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+
+        let Storage::Mock(mock) = state.storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        // Written off and reminted, not Completed: a completed nonce would join the rebuilt
+        // tree and no longer match the empty root this instance serves. That `completed`
+        // counts as settled is pinned against Postgres instead.
+        mock.pending_transactions.lock().unwrap().extend([
+            unreleased_withdrawal_row(MAX_TREE_LEAVES as i64 - 2, TransactionStatus::Failed),
+            unreleased_withdrawal_row(
+                MAX_TREE_LEAVES as i64 - 1,
+                TransactionStatus::FailedReminted,
+            ),
+        ]);
+
+        // Fully wired, unlike the tests that return before the build: this one gets all the
+        // way to the instruction.
+        let instance_pda = state.instance_pda.unwrap();
+        let result = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget::new(
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    instance_pda,
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    target_tree_index,
+                ),
+            )))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "released and reminted nonces must not withhold the rotation, got {:?}",
+            result.err()
+        );
+    }
+
     // ── rotation arming ──────────────────────────────────────────────
 
     /// A rotation must survive the whole submission path when it cannot be sent, error
@@ -5024,6 +5333,12 @@ mod tests {
         // make_sender_state leaves instance_pda None, so the gate's tree-index read fails
         // and the rotation is never submitted.
         let mut state = make_sender_state();
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         handle_transaction_submission(
@@ -5039,6 +5354,94 @@ mod tests {
         assert!(
             state.pending_rotation.is_some(),
             "rotation must survive a failed submission so the tick can retry it"
+        );
+        assert_eq!(
+            state.storage.get_owed_rotation_target(pt).await.unwrap(),
+            Some(target_tree_index),
+            "the durable target must survive too, so a crash here still re-arms"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a reset has no row, so no status update"
+        );
+    }
+
+    /// A crash leaves nothing in memory, only the durable target. Boot re-arms from it, the
+    /// tick drives it, and the reset is signed, broadcast, confirmed, then retired from both
+    /// the arm and the row.
+    ///
+    /// The pieces are covered in isolation elsewhere; this is the one that proves they
+    /// connect, since a re-arm that never reaches `sendTransaction` would leave the rotation
+    /// owed forever while every isolated assertion still passed.
+    #[tokio::test]
+    async fn owed_rotation_survives_restart_and_is_sent_by_the_tick() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        // Chain a generation behind the target, so the rotation is owed and lands.
+        let mut server = server_serving_empty_instance(target_tree_index - 1).await;
+        let _hash = mock_blockhash(&mut server);
+        // The RPC client rejects a response whose signature differs from the one it sent,
+        // and this transaction is really signed, so echo it back out of the request: a
+        // serialized legacy transaction is a 1-byte signature count then the signature.
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body_from_request(|req| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body().expect("request body present"))
+                        .expect("request body is json");
+                let encoded = body["params"][0].as_str().expect("transaction param");
+                let raw = STANDARD.decode(encoded).expect("base64 transaction");
+                let signature = bs58::encode(&raw[1..1 + 64]).into_string();
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": signature})
+                    .to_string()
+                    .into_bytes()
+            })
+            .expect(1)
+            .create();
+        let _status = mock_status_bodies(&mut server, |_, count| finalized_value_body(count));
+
+        // A fresh process: no armed rotation, no SMT state, only the durable target.
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
+
+        state.rearm_owed_rotation().await.unwrap();
+        assert!(
+            state.pending_rotation.is_some(),
+            "boot must re-arm from the durable target"
+        );
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        drive_pending_rotation(&mut state, &storage_tx).await;
+
+        send.assert();
+        assert!(
+            state.pending_rotation.is_none(),
+            "a confirmed reset retires the arm"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "and the durable target, so the next boot does not re-arm it"
+        );
+        assert_eq!(
+            state.smt_state.as_ref().unwrap().smt_state.tree_index(),
+            target_tree_index,
+            "local SMT moves to the generation the reset proved"
         );
         assert!(
             storage_rx.try_recv().is_err(),

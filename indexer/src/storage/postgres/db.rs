@@ -516,6 +516,15 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Tree generation the sender still owes the chain. NULL means none owed.
+        // Written before the rotation is dispatched, cleared only once a chain read
+        // shows the tree reached it, so a crash leaves the rotation re-armable.
+        sqlx::query(
+            "ALTER TABLE indexer_state ADD COLUMN IF NOT EXISTS owed_rotation_target BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Create updated_at trigger function
         sqlx::query(
             r#"
@@ -1255,6 +1264,68 @@ impl PostgresDb {
         Ok(())
     }
 
+    pub async fn get_owed_rotation_target_internal(
+        &self,
+        program_type: &str,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let result: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT owed_rotation_target FROM indexer_state WHERE program_type = $1",
+        )
+        .bind(program_type)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result
+            .and_then(|(target,)| target)
+            .map(|target| target as u64))
+    }
+
+    pub async fn set_owed_rotation_target_internal(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO indexer_state (program_type, owed_rotation_target, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (program_type)
+            DO UPDATE SET
+                owed_rotation_target = EXCLUDED.owed_rotation_target,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(program_type)
+        .bind(target_tree_index as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Clear only if the stored target is still the one the caller proved landed, so a
+    /// clear can never retire a rotation that is still owed.
+    pub async fn clear_owed_rotation_target_internal(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE indexer_state
+            SET owed_rotation_target = NULL
+            WHERE program_type = $1
+              AND owed_rotation_target = $2
+            "#,
+        )
+        .bind(program_type)
+        .bind(target_tree_index as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn get_and_lock_pending_transactions_internal(
         &self,
         transaction_type: TransactionType,
@@ -1403,6 +1474,39 @@ impl PostgresDb {
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
+    }
+
+    /// Lowest withdrawal nonce below `nonce` that still owes a release, or `None` if every
+    /// lower nonce is terminal. Gates the sender's rotation submit: rotating past a nonce
+    /// that still owes a release closes the only tree that release can ever land on.
+    ///
+    /// Evaluated fresh on every attempt, so it covers rows that entered a live status
+    /// after the rotation was dispatched (a recovery demote to `pending`, a park, a queued
+    /// remint, a quarantine). `Processing` is included where
+    /// `has_active_withdrawal_below_internal` omits it: that query runs in the processor,
+    /// where a `Processing` row is one the sender holds in memory, and this one must hold
+    /// after a restart dropped that memory. Terminal means `completed` (released) or
+    /// `failed`/`failed_reminted` (written off or reminted), which are safe to rotate past.
+    pub async fn lowest_unreleased_withdrawal_below_internal(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let lowest: Option<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT MIN({nonce_col}) FROM transactions
+            WHERE {ttype} = $2
+              AND {nonce_col} < $1
+              AND {status} IN ('pending', 'processing', 'parked', 'pending_remint', 'manual_review')
+            "#,
+            ttype = transaction_cols::TRANSACTION_TYPE,
+            nonce_col = transaction_cols::WITHDRAWAL_NONCE,
+            status = transaction_cols::STATUS,
+        ))
+        .bind(nonce)
+        .bind(TransactionType::Withdrawal)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(lowest)
     }
 
     /// Returns true if the row was updated; false if already terminal.

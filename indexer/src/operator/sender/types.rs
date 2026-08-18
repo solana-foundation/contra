@@ -196,7 +196,8 @@ pub struct SenderState {
     /// travels with the parked withdrawal.
     pub ambiguous_retry_queue: Vec<Box<ReleaseFundsBuilderWithNonce>>,
     /// The tree rotation the sender owes the chain, with the generation it owes.
-    /// A reset has no DB row and no nonce, so this is its only record; it is cleared
+    /// A reset has no DB row and no nonce, so its durable record is
+    /// `indexer_state.owed_rotation_target`, re-armed here at boot. Both are cleared
     /// only where a fresh on-chain read shows the chain reached the target.
     pub pending_rotation: Option<Box<ResetSmtRootBuilderWithTarget>>,
     pub program_type: ProgramType,

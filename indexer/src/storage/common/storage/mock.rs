@@ -54,6 +54,9 @@ pub struct MockStorage {
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Mirrors the single-row `reconciliation_halt` table; `None` = not halted.
     pub reconciliation_halt: Arc<Mutex<Option<HaltInfo>>>,
+    /// Mirrors `indexer_state.owed_rotation_target`: the tree generation the sender
+    /// owes, per program type. An absent key is a NULL column.
+    pub owed_rotation_targets: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl MockStorage {
@@ -296,6 +299,32 @@ impl MockStorage {
         }))
     }
 
+    pub async fn lowest_unreleased_withdrawal_below(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        self.check_should_fail("lowest_unreleased_withdrawal_below")?;
+        let pending = self.pending_transactions.lock().unwrap();
+        // Processing included, unlike has_active_withdrawal_below: this gates the
+        // sender's submit, which must hold after a restart dropped its in-flight map.
+        Ok(pending
+            .iter()
+            .filter(|t| {
+                t.transaction_type == TransactionType::Withdrawal
+                    && matches!(
+                        t.status,
+                        TransactionStatus::Pending
+                            | TransactionStatus::Processing
+                            | TransactionStatus::Parked
+                            | TransactionStatus::PendingRemint
+                            | TransactionStatus::ManualReview
+                    )
+            })
+            .filter_map(|t| t.withdrawal_nonce)
+            .filter(|lower| *lower < nonce)
+            .min())
+    }
+
     pub async fn get_committed_checkpoint(
         &self,
         program_type: &str,
@@ -325,6 +354,46 @@ impl MockStorage {
                 }
             })
             .or_insert(slot);
+        Ok(())
+    }
+
+    pub async fn get_owed_rotation_target(
+        &self,
+        program_type: &str,
+    ) -> Result<Option<u64>, StorageError> {
+        self.check_should_fail("get_owed_rotation_target")?;
+        Ok(self
+            .owed_rotation_targets
+            .lock()
+            .unwrap()
+            .get(program_type)
+            .copied())
+    }
+
+    pub async fn set_owed_rotation_target(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("set_owed_rotation_target")?;
+        self.owed_rotation_targets
+            .lock()
+            .unwrap()
+            .insert(program_type.to_string(), target_tree_index);
+        Ok(())
+    }
+
+    pub async fn clear_owed_rotation_target(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("clear_owed_rotation_target")?;
+        // Mirrors the postgres WHERE guard: only the proven target is retired.
+        let mut map = self.owed_rotation_targets.lock().unwrap();
+        if map.get(program_type) == Some(&target_tree_index) {
+            map.remove(program_type);
+        }
         Ok(())
     }
 

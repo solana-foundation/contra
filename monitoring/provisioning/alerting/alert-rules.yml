@@ -374,3 +374,76 @@ groups:
                     type: gt
                     params: [0]
               refId: C
+
+  - orgId: 1
+    name: tree-rotation-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: rotation-not-landing
+        title: "Tree rotation owed but not landing"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) owes a tree rotation that keeps failing to land. The owed target is durable, so it is retried every 5s and survives restarts, and nothing else pages for it. Until the tree advances, the boundary withdrawal and every higher nonce cannot be released. Check the destination RPC, the signers, the fee payer balance and the database (a failed gate read also withholds it); the armed target is in indexer_state.owed_rotation_target."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_not_landed"}[10m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [30]
+              refId: C
+
+      - uid: rotation-blocked-by-lower-nonce
+        title: "Tree rotation withheld: a lower nonce still owes a release"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) is withholding a tree rotation because a withdrawal on the closing tree has not released yet. This is the safe outcome, not a fault: rotating would close the only tree that release can ever land on. The withheld nonce is in the sender log. Resolve that withdrawal, by releasing it or letting its remint finish, and the rotation proceeds on its own."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}[10m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [30]
+              refId: C

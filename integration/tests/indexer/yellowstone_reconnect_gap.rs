@@ -288,3 +288,72 @@ async fn reconnect_without_anchor_withholds_live_slots() {
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
     server.shutdown().await;
 }
+
+/// Silent-stall watchdog: a stream that stays open but stops emitting (no FIN, no
+/// error, no server ping) must be force-reconnected. This is the prod failure that
+/// wedged the escrow indexer for ~12h: `stream.next()` blocked forever because
+/// nothing tripped the reconnect path. The mock holds the stream open once its
+/// queue drains, so an empty queue past the stall window reproduces it exactly.
+/// No gap detection here — this isolates the watchdog from the backfill path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stall_watchdog_forces_reconnect_on_silent_stream() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    let server = MockYellowstoneServer::start().await;
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(64);
+    let cancel = CancellationToken::new();
+
+    // Short watchdog so the test drives the reconnect without the 60s prod wait.
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_stall_timeout(Duration::from_millis(300));
+
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // Deliver one slot so the first connection is streaming, then stop: the mock
+    // holds the stream open and silent, arming the watchdog.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+    assert!(
+        matches!(
+            first,
+            Ok(Some(ProcessorMessage::SlotComplete { slot: 100, .. }))
+        ),
+        "expected slot 100 before the stall; got {first:?}"
+    );
+
+    // Watchdog (300ms) fires, then the Err path backs off 5s before resubscribing,
+    // so allow generous headroom for the second handshake.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while server.call_count("subscribe") < 2 {
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "silent stream must force a reconnect; subscribe count stuck at {}",
+                server.call_count("subscribe")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        server.call_count("subscribe") >= 2,
+        "watchdog should resubscribe after a silent stall; got {}",
+        server.call_count("subscribe")
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    server.shutdown().await;
+}

@@ -286,7 +286,10 @@ mod tests {
     #[test]
     fn strict_try_from_bytes_rejects_invalid_option_tag() {
         let mut bytes = on_chain_bytes(&sample());
-        let tag_offset = 1 + 32 * 7 + 8 * 4 + 64 + 32 * 2;
+        // Offset of the earliest_settlement_timestamp Option tag. Mirrors
+        // SWAP_DVP_ACCOUNT_LEN: 4 pubkeys follow ref_string (user_a/user_b
+        // settlement destinations + mint_a/mint_b authorities), not 2.
+        let tag_offset = 1 + 32 * 7 + 8 * 4 + 64 + 32 * 2 + 32 * 2;
         bytes[tag_offset] = 2;
         assert!(matches!(
             SwapDvp::try_from_bytes(&bytes),

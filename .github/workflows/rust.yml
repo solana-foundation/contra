@@ -127,6 +127,8 @@ jobs:
               - 'indexer/**'
               - 'gateway/**'
               - 'auth/**'
+              # Re-vendoring the DvP client runs its tests via ci-unit-coverage.
+              - 'dvp-swap-program/**'
 
   build-artifacts:
     name: Build Shared Artifacts

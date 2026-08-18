@@ -54,9 +54,6 @@ pub struct YellowstoneSource {
     #[cfg(feature = "datasource-rpc")]
     storage: Option<Arc<Storage>>,
     health: Option<Arc<private_channel_metrics::HealthState>>,
-    /// Silent-stream watchdog window. Defaults to STREAM_STALL_TIMEOUT; overridable
-    /// (mainly so tests can drive the reconnect path without a 120s wait).
-    stall_timeout: std::time::Duration,
 }
 
 impl YellowstoneSource {
@@ -82,18 +79,11 @@ impl YellowstoneSource {
             #[cfg(feature = "datasource-rpc")]
             storage: None,
             health: None,
-            stall_timeout: STREAM_STALL_TIMEOUT,
         }
     }
 
     pub fn with_health(mut self, health: Arc<private_channel_metrics::HealthState>) -> Self {
         self.health = Some(health);
-        self
-    }
-
-    /// Override the silent-stream watchdog window (mainly for tests).
-    pub fn with_stall_timeout(mut self, stall_timeout: std::time::Duration) -> Self {
-        self.stall_timeout = stall_timeout;
         self
     }
 
@@ -121,25 +111,6 @@ impl YellowstoneSource {
 
 #[cfg(feature = "datasource-rpc")]
 const RECONNECT_GAP_RETRY_BACKOFF: Duration = Duration::from_secs(5);
-
-// Stall recovery: a half-open stream (peer stops sending, no FIN/error) hangs
-// stream.next() forever. Two independent backstops force a reconnect.
-
-/// HTTP/2 keepalive interval: send a PING to the peer this often so a dead transport
-/// surfaces as a stream error instead of hanging. Paired with keep_alive_while_idle so
-/// pings fire even when no blocks stream (escrow blocks are sparse on quiet clusters).
-const GRPC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// Tear the connection down if a keepalive PING goes unanswered this long.
-const GRPC_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Application-level watchdog: force a reconnect if no message of ANY kind (a block or
-/// a server ping) arrives within this window. Backstops the h2 keepalive for a server
-/// that keeps the socket up but wedges mid-stream. When escrow is idle, server pings are
-/// the only regular signal, so this sits well above any reasonable ping cadence to avoid
-/// tearing down a healthy but quiet stream. If idle false-reconnects ever show up in the
-/// reconnect metric, subscribe to slots for a per-slot heartbeat instead of widening this.
-const STREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Terminal states of the reconnect gap repair; there is no error variant because
 /// failures retry inside the loop instead of falling through to a resubscribe.
@@ -440,7 +411,6 @@ impl DataSource for YellowstoneSource {
         #[cfg(feature = "datasource-rpc")]
         let escrow_instance_id = self.escrow_instance_id;
         let health = self.health.clone();
-        let stall_timeout = self.stall_timeout;
 
         #[cfg(feature = "datasource-rpc")]
         let rpc_poller = self.rpc_poller.clone();
@@ -497,7 +467,6 @@ impl DataSource for YellowstoneSource {
                     tx.clone(),
                     cancellation_token.clone(),
                     health.as_ref(),
-                    stall_timeout,
                     #[cfg(feature = "datasource-rpc")]
                     gap_ctx,
                     #[cfg(feature = "datasource-rpc")]
@@ -560,7 +529,6 @@ async fn connect_and_stream(
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     health: Option<&Arc<private_channel_metrics::HealthState>>,
-    stall_timeout: std::time::Duration,
     // Present only on reconnects (after the first connection). When set, the first
     // live block arms the gate + backfill so the residual window cannot be leapfrogged.
     #[cfg(feature = "datasource-rpc")] gap_ctx: Option<&ReconnectGapCtx>,
@@ -581,9 +549,6 @@ async fn connect_and_stream(
         .map_err(|e| DataSourceRpcError::Protocol {
             reason: e.to_string(),
         })?
-        .http2_keep_alive_interval(GRPC_KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(GRPC_KEEPALIVE_TIMEOUT)
-        .keep_alive_while_idle(true)
         .connect()
         .await
         .map_err(|e| DataSourceRpcError::Protocol {
@@ -651,22 +616,6 @@ async fn connect_and_stream(
                 drop(subscribe_tx);
                 info!("Yellowstone gRPC connection closed");
                 break;
-            }
-            // Fresh timer each iteration, so any inbound message resets it. Fires only
-            // when the stream goes fully silent; returns Err to take the reconnect +
-            // gap-fill path (which replays whatever slots were missed while wedged).
-            _ = tokio::time::sleep(stall_timeout) => {
-                warn!(
-                    "Yellowstone stream stalled: no message in {:?}, forcing reconnect",
-                    stall_timeout
-                );
-                metrics::INDEXER_RPC_ERRORS
-                    .with_label_values(&[program_type.as_label(), "stall"])
-                    .inc();
-                return Err(DataSourceRpcError::Protocol {
-                    reason: format!("stream stalled: no message in {stall_timeout:?}"),
-                }
-                .into());
             }
             message = stream.next() => {
                 match message {

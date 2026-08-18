@@ -47,11 +47,11 @@ host_data_dir: /tmp/private-channel-test
 
 # === Gateway auth & port ===================================================
 
-# gateway_enforce_jwt — whether the gateway requires a signed JWT on every RPC call.
-#   false : operator services can call getSignaturesForAddress without auth (required for the dev self-test).
-#   true  : production setting. When enabling, also set `jwt_secret` in secrets.yml
-#           (already required there; the gateway will refuse to start without it).
-gateway_enforce_jwt: false
+# gateway_enforce_jwt — whether the gateway's public port requires a signed JWT.
+# On by default: the operator services carry no JWT but reach the gateway on
+# GATEWAY_INTERNAL_PORT, which is exempt from RBAC and from error redaction.
+# This had to be false before that listener existed, or every gated read 401'd.
+gateway_enforce_jwt: true
 
 # gateway_port — host-side port the gateway listens on. Default 8899 in vars/common.yml.
 # Override here if 8899 collides on this host (e.g. local Solana test-validator).

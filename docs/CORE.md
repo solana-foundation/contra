@@ -178,8 +178,18 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Max loaded accounts data | 64 MB | [`core/src/processor.rs`](../core/src/processor.rs) |
 | Max signatures per `getSignatureStatuses` | 256 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max slot range for `getBlocks`, max limit for `getBlocksWithLimit` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
-| Max RPC response size | 10 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max addresses per `simulateTransaction` | the transaction's own account count (matches Agave) | [`core/src/rpc/simulate_transaction_impl.rs`](../core/src/rpc/simulate_transaction_impl.rs) |
+| Max encoded bytes for `simulateTransaction` accounts | 5 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max RPC response size | 10 MB, **declared but not enforced** (see below) | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Gateway max request body | 64 KB | [`gateway/src/lib.rs`](../gateway/src/lib.rs) |
+
+`MAX_RESPONSE_SIZE` does not currently limit anything. It is passed to
+`RpcModule::raw_json_request`, whose second parameter is jsonrpsee's subscription buffer size, and
+jsonrpsee's own `inner_call` hardcodes `max_response_size = usize::MAX`. Core drives hyper directly
+rather than using jsonrpsee's server, and the gateway streams upstream bodies through without a cap,
+so no read method has an enforced response ceiling. `simulateTransaction` is the exception: its
+accounts array is bounded explicitly by the 5 MB budget above. Treat the 10 MB row as intent, not
+protection, when reasoning about memory.
 
 ### No Fork Choice
 

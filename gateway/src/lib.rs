@@ -671,6 +671,10 @@ impl Gateway {
         start: Instant,
     ) -> Result<bool, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
     {
+        // Auth off, so nothing is redacted either. Every method is ungated in this
+        // mode, so a caller reads the balance straight from getTokenAccountBalance
+        // instead of inferring it from error codes. Redacting would also hit the
+        // operator services, since with no key we cannot tell who is an Operator.
         let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
             (Some(k), Some(db)) => (k, db),
             _ => return Ok(false),

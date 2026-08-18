@@ -18,13 +18,12 @@ use tracing::{error, info, warn};
 use super::types::{InstructionWithSigners, SenderState};
 
 /// Verdict from `try_jit_mint_initialization`. The caller in
-/// `transaction.rs` matches on this to decide whether to recursively retry,
-/// quarantine the deposit to ManualReview, or route to the existing
-/// PermanentFailure path. The `String` payloads are operator-visible
-/// `error_message`s; ManualReview reasons are constructed in full here
-/// (with the literal `"Mint instruction failed after JIT: "` prefix) so
-/// `drill_1` can grep the runbook-dispatch substrings in a single source
-/// file.
+/// `transaction.rs` matches on this to decide whether to re-issue the mint,
+/// quarantine the deposit to ManualReview, or re-arm it for another attempt.
+/// The ManualReview payload is an operator-visible `error_message` and is
+/// constructed in full here (with the literal `"Mint instruction failed after
+/// JIT: "` prefix) so `drill_1` can grep the runbook-dispatch substrings in a
+/// single source file. The Transient payload only ever reaches the logs.
 pub enum JitOutcome {
     /// Mint is correctly initialized with the operator's admin as
     /// `mint_authority`. Caller should retry the supplied instruction.
@@ -35,10 +34,9 @@ pub enum JitOutcome {
     /// inconsistency). Caller routes to `ManualReview`.
     ManualReview(String),
 
-    /// Transient or builder failure (RPC, mint cache miss, build error).
-    /// Caller routes to the existing permanent-failure path (`Failed`
-    /// status).
-    PermanentFailure(String),
+    /// No site behind this proves the mint unusable, so the caller re-arms
+    /// the deposit under a cap; the re-mint is gated on its stored signature.
+    Transient(String),
 }
 
 /// Outcome of decoding raw mint account bytes and comparing the embedded
@@ -114,7 +112,7 @@ const MR_CORRUPT_MINT_STATE: &str =
     "Mint instruction failed after JIT: corrupt mint state on-chain — decode failed";
 
 /// Attempt JIT mint initialization. Returns a `JitOutcome` verdict for the
-/// caller to dispatch (Retry / ManualReview / PermanentFailure).
+/// caller to dispatch (Retry / ManualReview / Transient).
 pub(super) async fn try_jit_mint_initialization(
     state: &mut SenderState,
     transaction_id: i64,
@@ -122,13 +120,13 @@ pub(super) async fn try_jit_mint_initialization(
 ) -> JitOutcome {
     // 1. Get cached builder + extract mint.
     let Some(builder) = state.mint_builders.get(&transaction_id).cloned() else {
-        return JitOutcome::PermanentFailure(format!(
+        return JitOutcome::Transient(format!(
             "no cached MintToBuilder for transaction_id {}",
             transaction_id
         ));
     };
     let Some(mint) = builder.get_mint() else {
-        return JitOutcome::PermanentFailure(format!(
+        return JitOutcome::Transient(format!(
             "MintToBuilder for transaction_id {} is missing mint pubkey",
             transaction_id
         ));
@@ -188,7 +186,7 @@ pub(super) async fn try_jit_mint_initialization(
     // time execution reaches this point, the mint is known-allowed.
     let Ok(mint_metadata) = state.mint_cache.get_mint_metadata(&mint).await else {
         error!("Mint {} not found in mint cache", mint);
-        return JitOutcome::PermanentFailure(format!("mint not in mint cache: {}", mint));
+        return JitOutcome::Transient(format!("mint not in mint cache: {}", mint));
     };
 
     info!(
@@ -215,7 +213,7 @@ pub(super) async fn try_jit_mint_initialization(
         Ok(ix) => ix,
         Err(e) => {
             error!("Failed to build InitializeMint instruction: {}", e);
-            return JitOutcome::PermanentFailure(format!(
+            return JitOutcome::Transient(format!(
                 "Failed to build InitializeMint instruction: {}",
                 e
             ));
@@ -234,7 +232,7 @@ pub(super) async fn try_jit_mint_initialization(
         Ok((s, _, _)) => s,
         Err(e) => {
             error!("Failed to send InitializeMint transaction: {}", e);
-            return JitOutcome::PermanentFailure(format!(
+            return JitOutcome::Transient(format!(
                 "Failed to send InitializeMint transaction: {}",
                 e
             ));
@@ -254,10 +252,7 @@ pub(super) async fn try_jit_mint_initialization(
         Ok(r) => r,
         Err(e) => {
             error!("Failed to check InitializeMint status: {}", e);
-            return JitOutcome::PermanentFailure(format!(
-                "Failed to check InitializeMint status: {}",
-                e
-            ));
+            return JitOutcome::Transient(format!("Failed to check InitializeMint status: {}", e));
         }
     };
 
@@ -304,8 +299,9 @@ pub(super) async fn try_jit_mint_initialization(
 ///   so operators can see the race-recovery happen; post-init is silent.
 /// - `Uninitialized`: post-init treats this as an RPC inconsistency
 ///   (InitializeMint said Confirmed but the mint isn't there); fallback
-///   treats it as the canonical "InitializeMint could not be confirmed"
-///   permanent failure that drives the existing Failed-runbook dispatch.
+///   treats it as the canonical "InitializeMint could not be confirmed".
+///   Both are Transient: neither proves the mint is unusable, so the
+///   deposit is re-armed rather than ended.
 fn jit_verdict(
     check: AuthorityCheck,
     instruction: InstructionWithSigners,
@@ -340,7 +336,7 @@ fn jit_verdict(
                     "InitializeMint transaction could not be confirmed: {:?}",
                     result
                 );
-                JitOutcome::PermanentFailure(
+                JitOutcome::Transient(
                     "InitializeMint transaction could not be confirmed".to_string(),
                 )
             }
@@ -349,7 +345,7 @@ fn jit_verdict(
                     "JIT post-init: InitializeMint confirmed but mint {} reads as uninitialized",
                     mint
                 );
-                JitOutcome::PermanentFailure(format!(
+                JitOutcome::Transient(format!(
                     "InitializeMint confirmed but mint {} reads as uninitialized — RPC inconsistency",
                     mint
                 ))
@@ -362,7 +358,7 @@ fn jit_verdict(
 /// from the first successful decode. Absorbs read-RPC lag after a racing
 /// InitializeMint. On exhausted attempts with no successful decode,
 /// returns `Uninitialized` (the most conservative "I couldn't confirm
-/// it's there" reading — caller maps this to PermanentFailure on the   
+/// it's there" reading — caller maps this to Transient on the
 /// fallback path).
 async fn mint_authority_check_with_backoff(
     rpc_client: &RpcClientWithRetry,

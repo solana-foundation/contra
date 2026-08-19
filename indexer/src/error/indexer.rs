@@ -36,6 +36,20 @@ pub enum IndexerError {
 
     #[error("Reconciliation failed: {0}")]
     Reconciliation(#[from] ReconciliationError),
+
+    /// A backfill-only run finished without durably recording its whole range.
+    /// `committed` is `None` when no checkpoint was ever written, which is not
+    /// the same as a checkpoint that stalled part way and must stay
+    /// distinguishable in the logs an operator reads after a failed repair.
+    #[error(
+        "backfill for {program_type} left the committed checkpoint at {committed:?}, short of \
+         target slot {target}; the range was not fully recorded"
+    )]
+    BackfillIncomplete {
+        program_type: String,
+        committed: Option<u64>,
+        target: u64,
+    },
 }
 
 /// Errors from startup reconciliation against on-chain state

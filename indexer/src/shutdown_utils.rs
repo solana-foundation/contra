@@ -7,11 +7,13 @@
 //! - Forced exit on timeout (configurable)
 //! - Buffer time before storage closure
 
+use crate::config::ProgramType;
 use crate::error::IndexerError;
-use crate::indexer::checkpoint::CheckpointMsg;
+use crate::indexer::checkpoint::{get_last_checkpoint, CheckpointMsg};
 use crate::indexer::datasource::common::datasource::DataSource;
 use crate::indexer::datasource::common::types::ProcessorMessage;
 use crate::storage::Storage;
+use private_channel_metrics::MetricLabel;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -525,12 +527,18 @@ async fn perform_operator_shutdown_stages(
     Ok(())
 }
 
-/// Graceful cleanup after backfill completion
+/// Graceful cleanup after backfill completion.
+///
+/// `verify` names the program and the inclusive top slot a one-shot backfill was asked
+/// to reach. When set, the durable checkpoint is re-read after the writer has drained
+/// and the run only succeeds if it got that far. Pass `None` to keep the drain-and-close
+/// behaviour with no completeness claim.
 pub async fn cleanup_after_backfill(
     checkpoint_handle: tokio::task::JoinHandle<()>,
     checkpoint_tx: mpsc::Sender<CheckpointMsg>,
     storage: Arc<Storage>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    verify: Option<(ProgramType, u64)>,
+) -> Result<(), IndexerError> {
     info!("Cleaning up after backfill completion...");
 
     let config = ShutdownConfig::default();
@@ -550,7 +558,18 @@ pub async fn cleanup_after_backfill(
         Err(_) => warn!("Checkpoint writer drain timed out"),
     }
 
-    // Stage 2: Close storage connections
+    // Stage 2: Confirm the range was recorded, after the drain flushed the last batch and
+    // before stage 3 closes the pool the read needs. A drained writer proves nothing on its
+    // own: a stalled gate holds the frontier short of the target, and a failed final write
+    // is only logged, so the sole trustworthy signal is the checkpoint the database holds.
+    let verdict = match verify {
+        Some((program_type, target)) => verify_checkpoint_reached(&storage, program_type, target)
+            .await
+            .inspect_err(|e| error!("Backfill completeness check failed: {}", e)),
+        None => Ok(()),
+    };
+
+    // Stage 3: Close storage connections
     info!("Closing storage connections...");
     match tokio::time::timeout(
         Duration::from_secs(config.storage_close_timeout_secs),
@@ -563,8 +582,32 @@ pub async fn cleanup_after_backfill(
         Err(_) => warn!("Storage close timed out"),
     }
 
+    verdict?;
     info!("Backfill cleanup complete");
     Ok(())
+}
+
+/// Fail unless the durable checkpoint for `program_type` reached `target`.
+///
+/// Compared with `>=` so a live indexer that pushed the checkpoint on cannot fail a repair.
+async fn verify_checkpoint_reached(
+    storage: &Arc<Storage>,
+    program_type: ProgramType,
+    target: u64,
+) -> Result<(), IndexerError> {
+    let committed = get_last_checkpoint(storage, program_type).await?;
+    if committed.is_some_and(|slot| slot >= target) {
+        info!(
+            "Backfill verified for {:?}: checkpoint {:?} reached target {}",
+            program_type, committed, target
+        );
+        return Ok(());
+    }
+    Err(IndexerError::BackfillIncomplete {
+        program_type: program_type.as_label().to_string(),
+        committed,
+        target,
+    })
 }
 
 async fn wait_with_progress<T>(
@@ -669,20 +712,105 @@ mod tests {
     // cleanup_after_backfill
     // ====================================================================
 
-    #[tokio::test]
-    async fn cleanup_after_backfill_ok() {
-        let mock = MockStorage::new();
-        let storage = Arc::new(Storage::Mock(mock));
+    /// Drain-only checkpoint writer plus the channel that feeds it.
+    fn drained_writer() -> (tokio::task::JoinHandle<()>, mpsc::Sender<CheckpointMsg>) {
         let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<CheckpointMsg>(10);
-
-        // Start a simple checkpoint writer that just drains
-        let checkpoint_handle = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut rx = checkpoint_rx;
             while rx.recv().await.is_some() {}
         });
+        (handle, checkpoint_tx)
+    }
 
-        let result = cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage).await;
-        assert!(result.is_ok());
+    /// No target means no verification, which is what the resync rebuild relies on.
+    #[tokio::test]
+    async fn cleanup_after_backfill_without_target_skips_verification() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let (checkpoint_handle, checkpoint_tx) = drained_writer();
+
+        let result = cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage, None).await;
+
+        assert!(
+            result.is_ok(),
+            "an absent checkpoint must not fail a run that asked for no verification"
+        );
+    }
+
+    /// A frontier level with or ahead of the target is a complete run.
+    #[tokio::test]
+    async fn cleanup_after_backfill_accepts_frontier_at_or_past_target() {
+        // A live indexer running alongside a repair can push the checkpoint past the target.
+        for committed in [150u64, 151] {
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", committed);
+            let storage = Arc::new(Storage::Mock(mock));
+            let (checkpoint_handle, checkpoint_tx) = drained_writer();
+
+            let result = cleanup_after_backfill(
+                checkpoint_handle,
+                checkpoint_tx,
+                storage,
+                Some((ProgramType::Escrow, 150)),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "committed {committed} must pass: {result:?}"
+            );
+        }
+    }
+
+    /// A frontier short of the target means the range was not fully recorded.
+    #[tokio::test]
+    async fn cleanup_after_backfill_rejects_frontier_below_target() {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", 149);
+        let storage = Arc::new(Storage::Mock(mock));
+        let (checkpoint_handle, checkpoint_tx) = drained_writer();
+
+        let result = cleanup_after_backfill(
+            checkpoint_handle,
+            checkpoint_tx,
+            storage,
+            Some((ProgramType::Escrow, 150)),
+        )
+        .await;
+
+        match result {
+            Err(IndexerError::BackfillIncomplete {
+                program_type,
+                committed,
+                target,
+            }) => {
+                assert_eq!(program_type, "escrow");
+                assert_eq!(committed, Some(149));
+                assert_eq!(target, 150);
+            }
+            other => panic!("a short frontier must be reported, got: {other:?}"),
+        }
+    }
+
+    /// An unreadable checkpoint is not evidence of success.
+    #[tokio::test]
+    async fn cleanup_after_backfill_surfaces_checkpoint_read_failure() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("get_committed_checkpoint", true);
+        let storage = Arc::new(Storage::Mock(mock));
+        let (checkpoint_handle, checkpoint_tx) = drained_writer();
+
+        let result = cleanup_after_backfill(
+            checkpoint_handle,
+            checkpoint_tx,
+            storage,
+            Some((ProgramType::Escrow, 150)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a checkpoint read that fails must fail the run rather than pass it"
+        );
     }
 
     // ====================================================================

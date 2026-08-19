@@ -1,0 +1,90 @@
+name: Publish Image
+
+# Build the app image on every merge to main (and on release tags) and push it
+# to GHCR tagged with the commit sha, so deploys pin a real, traceable artifact
+# instead of a locally-built one. The repo is public, so GHCR storage/bandwidth
+# is free; the prune job below just keeps the registry tidy.
+#
+# To deploy a published image: set image_registry: ghcr.io/solana-foundation and
+# image_tag: sha-<short> (or a release tag) in the stack's vars, and leave the
+# GHCR pull path on. No local build needed.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + push app image
+    runs-on: private-channel-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      # versions.env pins the build-arg tool versions the Dockerfile expects.
+      - name: Load pinned tool versions
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # sha tag on every build; :latest only on main; v<semver> on release tags.
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/private-channel-app
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern=v{{version}}
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            SOLANA_VERSION=${{ env.SOLANA_VERSION }}
+            PNPM_VERSION=${{ env.PNPM_VERSION }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Nothing expires in GHCR on its own. Free on a public repo, but prune the
+  # dangling untagged manifests (from overwritten :latest, etc.) so they don't
+  # accumulate. Keeps the 50 most recent versions regardless. Best-effort.
+  prune:
+    name: Prune untagged versions
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete untagged image versions
+        continue-on-error: true
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: private-channel-app
+          package-type: container
+          min-versions-to-keep: 50
+          delete-only-untagged-versions: true

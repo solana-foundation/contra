@@ -15,9 +15,13 @@
 //! 1. Sweep the escrow instance's on-chain token accounts, summed per mint.
 //! 2. Query the DB for per-mint aggregate balances (all deposits − completed withdrawals).
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
-//! 4. If any |on_chain - db_expected| > threshold → log error, emit alert, abort startup.
-//! 5. If any mismatch ≤ threshold (but > 0) → log warning, continue.
-//! 6. If all balanced (or both sides empty) → log info, continue.
+//! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
+//!    error, emit alert, abort startup. Checked first: it reads the chain on both sides,
+//!    so it is unaffected by how far behind the DB is and can never be repaired by
+//!    indexing more slots.
+//! 5. If any |on_chain - db_expected| > threshold → log error, emit alert, abort startup.
+//! 6. If any mismatch ≤ threshold (but > 0) → log warning, continue.
+//! 7. If all balanced (or both sides empty) → log info, continue.
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
@@ -136,11 +140,13 @@ pub async fn run_startup_reconciliation(
         "Comparing DB totals against on-chain escrow balances"
     );
 
-    classify_and_report(config, &results)?;
-
-    // Independent supply invariant: the minted channel-token supply must not
-    // exceed on-chain custody.
+    // The supply invariant runs first because it reads the chain on both sides and so
+    // means the same thing however far behind the ledger is. Reporting the ledger
+    // mismatch ahead of it would hide the graver finding whenever both are true, and
+    // would send startup back for another catch-up that cannot change this answer.
     check_channel_supply_invariant(channel_rpc_url, config, &results).await?;
+
+    classify_and_report(config, &results)?;
 
     Ok(())
 }
@@ -981,6 +987,49 @@ mod tests {
                 ..
             })) => assert_eq!(count, 1),
             other => panic!("supply over custody must block startup, got: {:?}", other),
+        }
+    }
+
+    /// A stale ledger must not hide a supply breach. The breach is the graver finding and
+    /// the only one of the two that no amount of further indexing can clear, so startup
+    /// has to report it rather than the mismatch that happens to sit alongside it.
+    #[tokio::test]
+    async fn startup_reconciliation_reports_the_supply_breach_over_a_stale_ledger() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // Custody 1000 against a ledger at 900 is a mismatch of 100, and minted supply
+        // 1200 is 200 above custody. Both exceed the threshold on the same mint.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_channel_supply(&mut server, 1_200).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 900, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+
+        match result {
+            Err(IndexerError::Reconciliation(ReconciliationError::SupplyExceedsCustody {
+                count,
+                ..
+            })) => assert_eq!(count, 1),
+            other => panic!(
+                "the supply breach must surface ahead of the ledger mismatch, got: {:?}",
+                other
+            ),
         }
     }
 

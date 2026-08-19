@@ -548,7 +548,8 @@ async fn unexplainable_mismatch_still_halts_startup() {
     // Escrow custody holds nothing, so nothing backs the phantom row.
     let _custody = mock_escrow_custody(&mut rpc, &[]).await;
 
-    // Only the supply invariant reads this, and the custody comparison fails first.
+    // Only the supply invariant reads this, and it errors on every method, so each mint
+    // is skipped with a warning and the custody comparison is what fails the boot.
     let chain = MockRpcServer::start().await;
 
     let handle = spawn_indexer(

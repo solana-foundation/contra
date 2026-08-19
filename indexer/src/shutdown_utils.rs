@@ -27,6 +27,21 @@ pub const SHUTDOWN_DATASOURCE_TIMEOUT_SECS: u64 = 10;
 pub const SHUTDOWN_DATASOURCE_COMPLETION_TIMEOUT_SECS: u64 = 5;
 pub const SHUTDOWN_PROCESSOR_DRAIN_TIMEOUT_SECS: u64 = 20;
 pub const SHUTDOWN_CHECKPOINT_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// Drain bound for a one-shot backfill's final flush, which is deliberately far longer than
+/// the live-shutdown one above.
+///
+/// That flush has to be allowed to finish, because the checkpoint it writes is what the
+/// completeness check then reads. The pool waits up to 30 seconds for a connection before it
+/// gives up on its own, so anything below that cancels writers that were never stuck and
+/// turns a finished repair into a reported failure. Nothing else is running by this point,
+/// so the only cost of waiting is a slower exit on a database that is already in trouble.
+pub const SHUTDOWN_BACKFILL_DRAIN_TIMEOUT_SECS: u64 = 45;
+
+/// How long the pool waits for a connection before giving up on its own.
+const POOL_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+/// Enforced at build time: below this line the cancellation above stops being a backstop for a
+/// stuck writer and starts cutting off healthy ones.
+const _: () = assert!(SHUTDOWN_BACKFILL_DRAIN_TIMEOUT_SECS > POOL_ACQUIRE_TIMEOUT_SECS);
 
 pub const SHUTDOWN_SENDER_BASE_TIMEOUT_SECS: u64 = 10;
 pub const SHUTDOWN_SENDER_TIME_PER_TX_SECS: u64 = 2;
@@ -53,6 +68,8 @@ pub struct ShutdownConfig {
     pub processor_drain_timeout_secs: u64,
     /// Timeout for checkpoint writer to drain (seconds)
     pub checkpoint_drain_timeout_secs: u64,
+    /// Timeout for a one-shot backfill's final checkpoint flush (seconds)
+    pub backfill_drain_timeout_secs: u64,
 
     // Operator-specific timeouts
     /// Base timeout for sender to complete in-flight transactions (seconds)
@@ -84,6 +101,7 @@ impl Default for ShutdownConfig {
             datasource_completion_timeout_secs: SHUTDOWN_DATASOURCE_COMPLETION_TIMEOUT_SECS,
             processor_drain_timeout_secs: SHUTDOWN_PROCESSOR_DRAIN_TIMEOUT_SECS,
             checkpoint_drain_timeout_secs: SHUTDOWN_CHECKPOINT_DRAIN_TIMEOUT_SECS,
+            backfill_drain_timeout_secs: SHUTDOWN_BACKFILL_DRAIN_TIMEOUT_SECS,
 
             // Operator defaults
             sender_base_timeout_secs: SHUTDOWN_SENDER_BASE_TIMEOUT_SECS,
@@ -548,7 +566,7 @@ pub async fn cleanup_after_backfill(
     drop(checkpoint_tx);
 
     match tokio::time::timeout(
-        Duration::from_secs(config.checkpoint_drain_timeout_secs),
+        Duration::from_secs(config.backfill_drain_timeout_secs),
         &mut checkpoint_handle,
     )
     .await
@@ -561,7 +579,13 @@ pub async fn cleanup_after_backfill(
             // moments later and call a finished backfill incomplete, and the close would
             // pull the pool out from under a write still in flight. Cancelling first makes
             // the checkpoint read afterwards a settled fact rather than a snapshot.
-            warn!("Checkpoint writer drain timed out; cancelling it before verifying");
+            //
+            // The bound above is set so that reaching here means the writer is genuinely
+            // stuck rather than slow, which is what makes cancelling it the right call.
+            warn!(
+                "Checkpoint writer still running after {}s; cancelling it before verifying",
+                config.backfill_drain_timeout_secs
+            );
             checkpoint_handle.abort();
             let _ = checkpoint_handle.await;
         }
@@ -693,6 +717,10 @@ mod tests {
         assert_eq!(
             config.checkpoint_drain_timeout_secs,
             SHUTDOWN_CHECKPOINT_DRAIN_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.backfill_drain_timeout_secs,
+            SHUTDOWN_BACKFILL_DRAIN_TIMEOUT_SECS
         );
         assert_eq!(
             config.sender_base_timeout_secs,

@@ -76,8 +76,12 @@
         ghcr_user: "{{ _d.GHCR_USER | default('') }}"
         ghcr_token: "{{ _d.GHCR_TOKEN | default('') }}"
         yellowstone_token: "{{ _d.YELLOWSTONE_TOKEN | default('') }}"
+        # yellowstone_endpoint normally comes from vars/<env>.yml; only override it
+        # when the Doppler config carries DEVNET_YELLOWSTONE_ENDPOINT (its .env name).
+        yellowstone_endpoint: "{{ _d.DEVNET_YELLOWSTONE_ENDPOINT | default(yellowstone_endpoint | default('')) }}"
         rpc_url: "{{ _d.RPC_URL | default(rpc_url | default('')) }}"
-        notify_webhook: "{{ _d.NOTIFY_WEBHOOK | default('') }}"
+        # env.j2 renders notify_webhook into ALERT_WEBHOOK_URL; accept either name.
+        notify_webhook: "{{ _d.ALERT_WEBHOOK_URL | default(_d.NOTIFY_WEBHOOK | default('')) }}"
       vars:
         _d: "{{ doppler_download.stdout | from_json }}"
       no_log: true

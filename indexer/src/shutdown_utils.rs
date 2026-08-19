@@ -565,6 +565,8 @@ pub async fn cleanup_after_backfill(
     info!("Draining checkpoint writer...");
     drop(checkpoint_tx);
 
+    // Set when the writer had to be cancelled, which changes what a short checkpoint means.
+    let mut cancelled_after_secs = None;
     match tokio::time::timeout(
         Duration::from_secs(config.backfill_drain_timeout_secs),
         &mut checkpoint_handle,
@@ -582,12 +584,16 @@ pub async fn cleanup_after_backfill(
             //
             // The bound above is set so that reaching here means the writer is genuinely
             // stuck rather than slow, which is what makes cancelling it the right call.
+            // Waiting without a bound is not the alternative it looks like: a connection that
+            // never answers would hold a one-shot job open forever, so the wait stays bounded
+            // and the shortfall is reported under its own error instead.
             warn!(
                 "Checkpoint writer still running after {}s; cancelling it before verifying",
                 config.backfill_drain_timeout_secs
             );
             checkpoint_handle.abort();
             let _ = checkpoint_handle.await;
+            cancelled_after_secs = Some(config.backfill_drain_timeout_secs);
         }
     }
 
@@ -596,9 +602,11 @@ pub async fn cleanup_after_backfill(
     // own: a stalled gate holds the frontier short of the target, and a failed final write
     // is only logged, so the sole trustworthy signal is the checkpoint the database holds.
     let verdict = match verify {
-        Some((program_type, target)) => verify_checkpoint_reached(&storage, program_type, target)
-            .await
-            .inspect_err(|e| error!("Backfill completeness check failed: {}", e)),
+        Some((program_type, target)) => {
+            verify_checkpoint_reached(&storage, program_type, target, cancelled_after_secs)
+                .await
+                .inspect_err(|e| error!("Backfill completeness check failed: {}", e))
+        }
         None => Ok(()),
     };
 
@@ -623,10 +631,15 @@ pub async fn cleanup_after_backfill(
 /// Fail unless the durable checkpoint for `program_type` reached `target`.
 ///
 /// Compared with `>=` so a live indexer that pushed the checkpoint on cannot fail a repair.
+/// `cancelled_after_secs` carries how long the writer was given before it was stopped, which
+/// separates a checkpoint that is short because a slot never made it from one that is short
+/// only because the flush never got to confirm. Both still fail, since a cancelled writer
+/// leaves the two indistinguishable in the database, but they need different operator action.
 async fn verify_checkpoint_reached(
     storage: &Arc<Storage>,
     program_type: ProgramType,
     target: u64,
+    cancelled_after_secs: Option<u64>,
 ) -> Result<(), IndexerError> {
     let committed = get_last_checkpoint(storage, program_type).await?;
     if committed.is_some_and(|slot| slot >= target) {
@@ -636,11 +649,19 @@ async fn verify_checkpoint_reached(
         );
         return Ok(());
     }
-    Err(IndexerError::BackfillIncomplete {
-        program_type: program_type.as_label().to_string(),
-        committed,
-        target,
-    })
+    match cancelled_after_secs {
+        Some(waited_secs) => Err(IndexerError::BackfillCheckpointUnconfirmed {
+            program_type: program_type.as_label().to_string(),
+            committed,
+            target,
+            waited_secs,
+        }),
+        None => Err(IndexerError::BackfillIncomplete {
+            program_type: program_type.as_label().to_string(),
+            committed,
+            target,
+        }),
+    }
 }
 
 async fn wait_with_progress<T>(
@@ -802,6 +823,42 @@ mod tests {
             1,
             "the writer must be cancelled before the checkpoint is read and the pool closed"
         );
+    }
+
+    /// A cancelled writer is reported apart from a genuinely short frontier.
+    ///
+    /// Both leave the same stale checkpoint behind, so the database cannot tell them apart and
+    /// both have to fail. What differs is what the operator does next: chase a slot the
+    /// pipeline could not store, or wait for the database to recover and run it again.
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_after_backfill_names_a_cancelled_writer_rather_than_a_missing_slot() {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", 100);
+        let storage = Arc::new(Storage::Mock(mock));
+        let (checkpoint_tx, _checkpoint_rx) = mpsc::channel::<CheckpointMsg>(1);
+        let checkpoint_handle = tokio::spawn(std::future::pending::<()>());
+
+        let result = cleanup_after_backfill(
+            checkpoint_handle,
+            checkpoint_tx,
+            storage,
+            Some((ProgramType::Escrow, 150)),
+        )
+        .await;
+
+        match result {
+            Err(IndexerError::BackfillCheckpointUnconfirmed {
+                committed,
+                target,
+                waited_secs,
+                ..
+            }) => {
+                assert_eq!(committed, Some(100));
+                assert_eq!(target, 150);
+                assert_eq!(waited_secs, SHUTDOWN_BACKFILL_DRAIN_TIMEOUT_SECS);
+            }
+            other => panic!("a cancelled writer must not read as a missing slot, got: {other:?}"),
+        }
     }
 
     /// A frontier level with or ahead of the target is a complete run.

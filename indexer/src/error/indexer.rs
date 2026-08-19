@@ -50,6 +50,22 @@ pub enum IndexerError {
         committed: Option<u64>,
         target: u64,
     },
+
+    /// The checkpoint writer had to be cancelled before it confirmed its final flush, so the
+    /// run cannot prove it finished even though its slots may all be stored. Kept apart from
+    /// `BackfillIncomplete` because the operator action differs: this one points at a slow or
+    /// wedged database, not at a slot the pipeline failed to record.
+    #[error(
+        "backfill for {program_type} could not confirm its checkpoint: the writer was still \
+         running after {waited_secs}s and was cancelled, leaving the durable checkpoint at \
+         {committed:?} against target {target}. Re-run the repair once the database is healthy"
+    )]
+    BackfillCheckpointUnconfirmed {
+        program_type: String,
+        committed: Option<u64>,
+        target: u64,
+        waited_secs: u64,
+    },
 }
 
 /// Errors from startup reconciliation against on-chain state

@@ -77,6 +77,20 @@ const RECONCILE_RETRY_DELAY_MS: u64 = 2_000;
 #[cfg(all(feature = "datasource-rpc", test))]
 const RECONCILE_RETRY_DELAY_MS: u64 = 10;
 
+/// Whether another fill could plausibly clear this failure.
+///
+/// Only a balance mismatch can be, and only because the chain kept moving while startup
+/// was catching up, so the next fill may pull in the rows that explain it. Storage, RPC,
+/// configuration and corruption faults produce the same answer however many times they
+/// are retried, so they stop the boot on the spot instead of paying for two more fills.
+#[cfg(feature = "datasource-rpc")]
+fn reconcile_error_may_clear(error: &IndexerError) -> bool {
+    matches!(
+        error,
+        IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold { .. })
+    )
+}
+
 /// Compare on-chain escrow custody against the indexed ledger.
 ///
 /// A non-escrow program has no custody to check and returns immediately. The instance id
@@ -364,7 +378,7 @@ pub async fn run(
                     .await
                 {
                     Ok(()) => break,
-                    Err(e) if attempt < RECONCILE_MAX_ATTEMPTS => {
+                    Err(e) if attempt < RECONCILE_MAX_ATTEMPTS && reconcile_error_may_clear(&e) => {
                         warn!(
                             "Startup reconciliation attempt {}/{} did not balance, retrying \
                              after letting the chain move on: {}",
@@ -584,6 +598,54 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a balance mismatch earns another fill. Retrying the rest would repeat the
+    /// whole range resolution and fill twice over before failing with the same error,
+    /// and would log an infrastructure fault as if the books were out by a deposit.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn only_a_balance_mismatch_is_worth_another_fill() {
+        let cases = [
+            (
+                ReconciliationError::MismatchExceedsThreshold {
+                    count: 1,
+                    threshold: 0,
+                },
+                true,
+            ),
+            (
+                ReconciliationError::Rpc {
+                    mint: "mint".to_string(),
+                    reason: "unreachable".to_string(),
+                },
+                false,
+            ),
+            (ReconciliationError::MissingChannelRpc, false),
+            (
+                ReconciliationError::InvalidPubkey {
+                    pubkey: "bad".to_string(),
+                    reason: "malformed".to_string(),
+                },
+                false,
+            ),
+            (
+                ReconciliationError::DbBalanceOverflow {
+                    mint: "mint".to_string(),
+                    net: "1".to_string(),
+                },
+                false,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let rendered = error.to_string();
+            assert_eq!(
+                reconcile_error_may_clear(&IndexerError::Reconciliation(error)),
+                expected,
+                "wrong retry decision for: {rendered}"
+            );
+        }
+    }
 
     /// A ready shutdown future must not steal the race from an already-finished
     /// processor: the biased select reports the processor's fatal error so run()

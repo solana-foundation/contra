@@ -6472,6 +6472,7 @@ dependencies = [
  "bs58",
  "chrono",
  "clap 4.5.48",
+ "dvp-swap-program-client",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-rustls",

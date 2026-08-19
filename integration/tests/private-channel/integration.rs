@@ -81,7 +81,7 @@ async fn test_with_postgres() {
             node_host, node_port
         );
 
-        let test_context = setup(node_db_url.clone()).await.unwrap();
+        let test_context = setup(node_db_url.clone(), None).await.unwrap();
         test_suite(&test_context.private_channel_ctx, &test_context.solana_ctx).await;
         shutdown(test_context).await;
 
@@ -118,7 +118,7 @@ async fn test_signature_statuses_only_with_postgres() {
             node_host, node_port
         );
 
-        let test_context = setup(node_db_url).await.unwrap();
+        let test_context = setup(node_db_url, None).await.unwrap();
         run_get_signature_statuses_test(&test_context.private_channel_ctx).await;
         shutdown(test_context).await;
     })
@@ -131,7 +131,30 @@ async fn test_with_redis() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        // Start Redis container for private_channel accountsdb
+        // Redis is a cache in front of Postgres, never the accounts database, so
+        // the node needs both: the source of truth a cache miss resolves against,
+        // and the cache itself.
+        let node_postgres_container = Postgres::default()
+            .with_db_name("private_channel_node")
+            .with_user("postgres")
+            .with_password("password")
+            .start()
+            .await
+            .expect("Failed to start node PostgreSQL container");
+
+        let node_host = node_postgres_container
+            .get_host()
+            .await
+            .expect("Failed to get node host");
+        let node_port = node_postgres_container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Failed to get node port");
+        let node_db_url = format!(
+            "postgres://postgres:password@{}:{}/private_channel_node",
+            node_host, node_port
+        );
+
         let redis_container = Redis::default()
             .with_tag("7")
             .start()
@@ -150,7 +173,7 @@ async fn test_with_redis() {
 
         println!("Redis container started at: {}", redis_url);
 
-        let test_context = setup(redis_url).await.unwrap();
+        let test_context = setup(node_db_url, Some(redis_url)).await.unwrap();
         test_suite(&test_context.private_channel_ctx, &test_context.solana_ctx).await;
 
         shutdown(test_context).await;
@@ -163,7 +186,10 @@ async fn test_with_redis() {
 ///   1. Validator + both Postgres containers  (all independent)
 ///   2. Both indexers              (each has its own DB and datasource)
 ///   3. Both operators             (independent of each other)
-async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
+async fn setup(
+    accountsdb_connection_url: String,
+    redis_cache_url: Option<String>,
+) -> Result<TestContext> {
     // Acquire global setup lock to serialize test initialization.
     // With nextest each test runs in its own process so this never blocks across
     // tests; it only guards against concurrent calls within the same process.
@@ -258,7 +284,7 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url: accountsdb_connection_url.clone(),
-        redis_cache_url: None,
+        redis_cache_url,
         admin_keys: vec![operator_key.pubkey()],
         transaction_expiration_ms: 15000,
         blocktime_ms: 100,

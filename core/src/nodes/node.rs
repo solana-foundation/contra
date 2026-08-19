@@ -132,14 +132,15 @@ pub struct NodeHandles {
     shutdown_token: CancellationToken,
 }
 
-/// How long a read node waits for a write node to stamp the cache before giving
-/// up. A cache the write node has not aligned yet is retried rather than fatal;
-/// one that names another deployment never becomes valid, but retrying it costs
-/// only this window and it fails closed either way.
+/// How long a read node waits out a cache stamped for another deployment. Worth
+/// waiting for in Aio, where the settler alongside this node purges and re-stamps
+/// it moments later; a genuinely wrong Redis costs only this window and then
+/// fails closed. An unstamped cache is not waited for at all, since the node
+/// serves correctly from Postgres until a write node stamps one.
 ///
-/// This covers a cache the write node has not stamped yet, not a Postgres it has
-/// not created the schema in. That case fails earlier, when the cache handle
-/// reads the deployment id, and is not retried.
+/// This covers the cache, not a Postgres the write node has not created the
+/// schema in. That case fails earlier, when the cache handle reads the deployment
+/// id, and is not retried.
 ///
 /// Serving is not gated on this: every cached read rechecks the stamp for itself,
 /// so a cache condemned later is dropped without waiting for a restart. Failing

@@ -5,7 +5,7 @@ use {
     solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     std::sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -31,6 +31,10 @@ pub struct RedisAccountsDB {
     /// moved on, so a rebuild overtaken by a later condemnation cannot return a
     /// cache to service whose purge predates the newer gap.
     condemnations: Arc<AtomicU64>,
+    /// Whether a rebuild is already working on this cache. A condemned cache is
+    /// not mirrored to, so its tip stays frozen and every later batch sees the
+    /// same discontinuity; without this, each one would condemn again.
+    rebuilding: Arc<AtomicBool>,
 }
 
 impl RedisAccountsDB {
@@ -59,8 +63,15 @@ impl RedisAccountsDB {
             fallback,
             deployment_id,
             condemnations: Arc::new(AtomicU64::new(0)),
+            rebuilding: Arc::new(AtomicBool::new(false)),
         };
         Ok(db)
+    }
+
+    /// The deployment this cache must name to be readable. Renewing the lease
+    /// rewrites it, so the mirror path needs it without a Postgres round trip.
+    pub(crate) fn deployment_id(&self) -> &[u8] {
+        &self.deployment_id
     }
 
     /// How many times this cache has been taken out of service. Shared across
@@ -74,6 +85,22 @@ impl RedisAccountsDB {
     /// rebuild already in flight.
     pub(crate) fn record_condemnation(&self) {
         self.condemnations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Claims the right to rebuild this cache, returning false when a rebuild
+    /// already holds it. Checking and claiming in one step, so two batches
+    /// cannot both decide they are the one to condemn.
+    pub(crate) fn try_begin_rebuild(&self) -> bool {
+        self.rebuilding
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Releases the claim. Called however the rebuild ended: a failed one that
+    /// held the claim would leave the cache unmirrored and unable to condemn
+    /// again, so it would never recover.
+    pub(crate) fn finish_rebuild(&self) {
+        self.rebuilding.store(false, Ordering::SeqCst);
     }
 
     /// Reads a cached value and the deployment stamp in one round trip, yielding

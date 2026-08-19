@@ -9,9 +9,14 @@
 //!
 //! Both are handled by one mechanism. Each Postgres database is stamped with an
 //! identifier at creation and the cache carries a copy, which every cached read
-//! checks against the identifier the handle was built with. Clearing that stamp
-//! therefore takes the cache out of service on the next read, with no window and
-//! nothing to notify:
+//! checks against the identifier the handle was built with. That copy is a lease
+//! rather than a flag: the settler renews it on every mirrored batch, so a cache
+//! nobody is maintaining falls out of service without anyone having to say so.
+//! This matters because the writer that should revoke may be the thing that
+//! failed, and it cannot revoke through a connection it has lost.
+//!
+//! Clearing the stamp does the same thing immediately, for the cases where the
+//! writer is healthy enough to say so:
 //!
 //! - [`staleness_reason`] compares a cache against Postgres at startup, where a
 //!   mismatch means another ledger's data or a tip that does not line up.
@@ -23,6 +28,7 @@ use {
     super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB},
     anyhow::{anyhow, Context, Result},
     redis::AsyncCommands,
+    std::time::Duration,
     tracing::{info, warn},
 };
 
@@ -31,6 +37,19 @@ use {
 /// absence from Redis means the cache has never been checked against a source of
 /// truth.
 pub(crate) const DEPLOYMENT_ID_KEY: &str = "deployment_id";
+
+/// How long the cache stays trusted without renewal.
+///
+/// The writer renews on every mirrored batch, so a writer that stops
+/// maintaining the cache stops extending it. Revoking would be faster, but
+/// revoking needs a working Redis connection and the cases that matter most are
+/// the ones where the writer has lost it or died outright. Expiry needs nothing.
+///
+/// Sized well above any tolerable settle latency. A settler stalled inside a
+/// slow Postgres write is not diverging from Postgres, so expiring there would
+/// shed no staleness and would land the whole read fleet on the database that is
+/// already the bottleneck.
+pub(crate) const CACHE_LEASE_TTL: Duration = Duration::from_secs(30);
 
 /// Cached ledger state, keyed by pubkey, signature, slot or address. `addr_sigs:`
 /// is no longer written, but a cache filled by an older build still holds it and
@@ -49,6 +68,20 @@ const LEDGER_FIXED_KEYS: [&str; 5] = [
 
 /// Keys per SCAN round. Bounds how long one round blocks the Redis event loop.
 const SCAN_COUNT: usize = 512;
+
+/// Whether the cache may still be written to and served.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CacheStatus {
+    /// Contiguous with the last batch mirrored into it. Mirror this one and
+    /// renew its lease.
+    InService,
+    /// A batch was missed, so every key in it is suspect. Already taken out of
+    /// service; the caller owes it a purge off the block-production path.
+    Condemned,
+    /// Out of service with a purge already running. Leave it alone: do not
+    /// mirror, do not renew its lease, do not start a second purge.
+    Rebuilding,
+}
 
 /// Reads the identifier Postgres was stamped with at schema creation.
 pub(crate) async fn read_deployment_id(db: &PostgresAccountsDB) -> Result<Vec<u8>> {
@@ -140,15 +173,13 @@ pub(crate) async fn staleness_reason(
 /// cache is suspect.
 ///
 /// The response is to clear the deployment stamp, which takes the cache out of
-/// service on the next read. Returns whether a rebuild is needed; the caller runs
-/// one off the block-production path, because a SCAN over a large keyspace costs
-/// far more than a blocktime allows.
-///
-/// Mirroring continues while the rebuild runs. Nothing is served from an
-/// unstamped cache, and `SCAN` returns every key present for the whole pass, so
-/// the rebuild clears the stale ones regardless of what is written alongside it.
-/// Keys written during the pass may be swept too, which only costs a miss.
-pub(crate) async fn ensure_cache_continuity(redis_db: &RedisAccountsDB, slot: u64) -> Result<bool> {
+/// service on the next read. The caller runs the purge off the block-production
+/// path, because a SCAN over a large keyspace costs far more than a blocktime
+/// allows.
+pub(crate) async fn ensure_cache_continuity(
+    redis_db: &RedisAccountsDB,
+    slot: u64,
+) -> Result<CacheStatus> {
     let mut conn = redis_db.connection.clone();
     let cached_slot: Option<u64> = conn
         .get("latest_slot")
@@ -158,10 +189,20 @@ pub(crate) async fn ensure_cache_continuity(redis_db: &RedisAccountsDB, slot: u6
     // No tip: an empty or freshly purged cache, with nothing to be contiguous
     // with and nothing to lose.
     let Some(cached_slot) = cached_slot else {
-        return Ok(false);
+        return Ok(CacheStatus::InService);
     };
     if cached_slot + 1 == slot {
-        return Ok(false);
+        return Ok(CacheStatus::InService);
+    }
+
+    // A condemned cache is not mirrored to, so its tip stays where it is and
+    // every later batch lands here too. The rebuild already running covers them
+    // all: nothing is written to the cache while it runs, so no new gap can open
+    // behind it. Condemning again would purge the whole keyspace once per block
+    // and, worse, would bump the generation and supersede that rebuild, leaving
+    // nothing to stamp the cache back into service.
+    if !redis_db.try_begin_rebuild() {
+        return Ok(CacheStatus::Rebuilding);
     }
 
     warn!(
@@ -171,8 +212,14 @@ pub(crate) async fn ensure_cache_continuity(redis_db: &RedisAccountsDB, slot: u6
     // Recorded before the stamp is cleared so a rebuild started for this
     // condemnation cannot be handed a generation that already looks stale.
     redis_db.record_condemnation();
-    clear_deployment_id(redis_db).await?;
-    Ok(true)
+    if let Err(e) = clear_deployment_id(redis_db).await {
+        // The caller only rebuilds on `Condemned`, so returning an error here
+        // would leave the claim held by a condemnation that never produced a
+        // rebuild, and nothing would ever purge the cache.
+        redis_db.finish_rebuild();
+        return Err(e);
+    }
+    Ok(CacheStatus::Condemned)
 }
 
 /// Empties a condemned cache and then stamps it, which puts it back into service.
@@ -187,17 +234,28 @@ pub(crate) async fn ensure_cache_continuity(redis_db: &RedisAccountsDB, slot: u6
 /// that only that later purge removes. So a superseded rebuild finishes its purge,
 /// which is never wasted work, and leaves the stamping to its successor.
 pub(crate) async fn rebuild_cache(redis_db: &RedisAccountsDB, generation: u64) -> Result<()> {
-    let deployment_id = read_deployment_id(&redis_db.fallback).await?;
-    purge_ledger_keys(redis_db).await?;
+    let outcome = async {
+        let deployment_id = read_deployment_id(&redis_db.fallback).await?;
+        purge_ledger_keys(redis_db).await?;
 
-    if redis_db.condemnation_generation() != generation {
-        info!("Redis cache was condemned again while rebuilding; a later rebuild will finish it");
-        return Ok(());
+        if redis_db.condemnation_generation() != generation {
+            info!(
+                "Redis cache was condemned again while rebuilding; a later rebuild will finish it"
+            );
+            return Ok(());
+        }
+
+        stamp_deployment_id(redis_db, &deployment_id).await?;
+        info!("Redis cache rebuilt and back in service");
+        Ok(())
     }
+    .await;
 
-    stamp_deployment_id(redis_db, &deployment_id).await?;
-    info!("Redis cache rebuilt and back in service");
-    Ok(())
+    // Released however the rebuild ended. A failed one that kept the claim would
+    // leave the cache unmirrored and unable to condemn again, so nothing would
+    // ever retry the purge and it would stay out of service until a restart.
+    redis_db.finish_rebuild();
+    outcome
 }
 
 /// Removes every cached ledger key, leaving the cache empty rather than wrong.
@@ -257,26 +315,30 @@ pub(crate) async fn purge_ledger_keys(redis_db: &RedisAccountsDB) -> Result<()> 
     Ok(())
 }
 
-/// Marks the cache as belonging to this deployment. Written only after the cache
-/// is known to be coherent, and cleared before a purge, so an interrupted purge
-/// leaves the cache unstamped rather than falsely stamped.
+/// Leases the cache to this deployment for [`CACHE_LEASE_TTL`]. Written only
+/// after the cache is known to be coherent, and cleared before a purge, so an
+/// interrupted purge leaves the cache unstamped rather than falsely stamped.
+///
+/// Also the renewal: the settler re-stamps after every mirrored batch, which is
+/// what ties trust to maintenance. Nothing else extends the lease, so a cache
+/// nobody is mirroring to falls out of service on its own.
 pub(crate) async fn stamp_deployment_id(
     redis_db: &RedisAccountsDB,
     deployment_id: &[u8],
 ) -> Result<()> {
     let mut conn = redis_db.connection.clone();
-    conn.set::<_, _, ()>(DEPLOYMENT_ID_KEY, deployment_id)
+    conn.set_ex::<_, _, ()>(DEPLOYMENT_ID_KEY, deployment_id, CACHE_LEASE_TTL.as_secs())
         .await
         .context("Failed to write deployment id to Redis")
 }
 
 /// Whether a read node should start against this cache.
 ///
-/// The write node aligns and stamps the cache; a read node has no business
-/// purging anything, so it only decides whether what it finds is usable. Usable
-/// means either the stamp for this deployment, or no ledger state at all, which
-/// cannot answer anything wrongly. Anything else is another ledger's data or the
-/// residue of an interrupted rebuild, and the two are indistinguishable here.
+/// Only a cache naming another deployment is refused, because that is a
+/// misconfiguration no amount of waiting fixes: the node has been pointed at the
+/// wrong Redis. An unstamped cache is fine to start against, stamped or not,
+/// since nothing is served from one and the lease lapsing is the ordinary state
+/// during a writer outage.
 ///
 /// A startup gate only. Individual reads check the stamp again for themselves, so
 /// this is about refusing to start against a misconfigured cache rather than
@@ -297,11 +359,15 @@ pub(crate) async fn verify_cache_stamp(redis_db: &RedisAccountsDB) -> Result<()>
             hex::encode(&cached_id),
             hex::encode(&deployment_id)
         )),
-        None if holds_ledger_keys(redis_db).await? => Err(anyhow!(
-            "Redis cache holds ledger keys but names no deployment; it has not been \
-             aligned with Postgres"
-        )),
-        None => Ok(()),
+        None => {
+            // Worth saying out loud: pointed at an idle deployment's Redis, this
+            // is the only symptom, since nothing there renews a lease to compare
+            // against.
+            if holds_ledger_keys(redis_db).await? {
+                warn!("Redis cache holds ledger keys but no live lease; serving from Postgres until a write node stamps it");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -402,11 +468,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            !ensure_cache_continuity(&redis_db, cached_tip + 1)
+        assert_eq!(
+            ensure_cache_continuity(&redis_db, cached_tip + 1)
                 .await
                 .unwrap(),
-            "a contiguous batch needs no rebuild"
+            CacheStatus::InService,
+            "a contiguous batch leaves the cache in service"
         );
 
         let still_cached: bool = conn
@@ -442,9 +509,10 @@ mod tests {
             .unwrap();
 
         // Redis is back after missing slots 101..=200.
-        assert!(
+        assert_eq!(
             ensure_cache_continuity(&redis_db, 201).await.unwrap(),
-            "a missed batch must call for a rebuild"
+            CacheStatus::Condemned,
+            "a missed batch must condemn the cache"
         );
 
         let stamped: Option<Vec<u8>> = conn.get(DEPLOYMENT_ID_KEY).await.unwrap();
@@ -462,6 +530,42 @@ mod tests {
         );
     }
 
+    /// A condemned cache is not mirrored to, so its tip stays frozen and every
+    /// later batch sees the same discontinuity. Condemning again would spawn a
+    /// full-keyspace purge per block, and worse, would bump the generation and
+    /// supersede the rebuild already running, leaving nothing to stamp the cache
+    /// back into service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cache_already_rebuilding_is_not_condemned_again() {
+        let (redis_db, postgres_db, _pg, _redis) = start_cache().await;
+        let deployment_id = read_deployment_id(&postgres_db).await.unwrap();
+        stamp_deployment_id(&redis_db, &deployment_id)
+            .await
+            .unwrap();
+
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("latest_slot", 100u64).await.unwrap();
+
+        assert_eq!(
+            ensure_cache_continuity(&redis_db, 201).await.unwrap(),
+            CacheStatus::Condemned
+        );
+        let generation = redis_db.condemnation_generation();
+
+        // The tip is still 100, because a condemned cache is not mirrored to, so
+        // this batch looks exactly like the one that condemned it.
+        assert_eq!(
+            ensure_cache_continuity(&redis_db, 202).await.unwrap(),
+            CacheStatus::Rebuilding,
+            "a rebuild already in flight covers this"
+        );
+        assert_eq!(
+            redis_db.condemnation_generation(),
+            generation,
+            "re-condemning would supersede the rebuild in flight"
+        );
+    }
+
     /// An empty or freshly purged cache has no tip to be contiguous with, and
     /// nothing to lose either way.
     #[tokio::test(flavor = "multi_thread")]
@@ -472,9 +576,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            !ensure_cache_continuity(&redis_db, 42).await.unwrap(),
-            "a cache with no tip needs no rebuild"
+        assert_eq!(
+            ensure_cache_continuity(&redis_db, 42).await.unwrap(),
+            CacheStatus::InService,
+            "a cache with no tip has nothing to be discontiguous with"
         );
 
         let stamped: Option<Vec<u8>> = conn_get_stamp(&redis_db).await;
@@ -543,7 +648,10 @@ mod tests {
         // Two gaps in a row: this rebuild carries the first generation while a
         // second condemnation has already happened.
         let superseded = redis_db.condemnation_generation();
-        assert!(ensure_cache_continuity(&redis_db, 200).await.unwrap());
+        assert_eq!(
+            ensure_cache_continuity(&redis_db, 200).await.unwrap(),
+            CacheStatus::Condemned
+        );
         let current = redis_db.condemnation_generation();
         assert_ne!(
             superseded, current,
@@ -565,6 +673,30 @@ mod tests {
         assert!(
             stamped.is_some(),
             "the newest rebuild must put the cache back in service"
+        );
+    }
+
+    /// Trust must decay on its own rather than wait to be revoked. A writer that
+    /// has lost Redis cannot announce it through the connection it just lost, so
+    /// the lease is what makes "nobody is maintaining this cache" and "stop
+    /// serving it" the same event.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stamping_leases_the_cache_rather_than_trusting_it_forever() {
+        let (redis_db, postgres_db, _pg, _redis) = start_cache().await;
+        let deployment_id = read_deployment_id(&postgres_db).await.unwrap();
+
+        stamp_deployment_id(&redis_db, &deployment_id)
+            .await
+            .unwrap();
+
+        // TTL is -1 for a key with no expiry and -2 for one that is absent, so
+        // this fails on a plain SET. The upper bound catches a seconds/millis
+        // mixup, which would grant hours and still read as positive.
+        let mut conn = redis_db.connection.clone();
+        let ttl: i64 = conn.ttl(DEPLOYMENT_ID_KEY).await.unwrap();
+        assert!(
+            ttl > 0 && ttl <= CACHE_LEASE_TTL.as_secs() as i64,
+            "the stamp must carry a lease, got TTL {ttl}"
         );
     }
 
@@ -609,10 +741,14 @@ mod tests {
             .expect("an empty cache must be accepted");
     }
 
-    /// Ledger state with no stamp is what a failed or interrupted purge leaves
-    /// behind. It cannot be told apart from another ledger's data.
+    /// Ledger keys with no stamp is what a lapsed lease leaves behind, which is
+    /// the ordinary "no writer has mirrored lately" state rather than evidence
+    /// of anything wrong. A read node must still start, because it serves
+    /// nothing from an unstamped cache: every read resolves against Postgres, so
+    /// the answers are correct and only slower. Refusing to boot here would take
+    /// reads down for the length of a writer outage.
     #[tokio::test(flavor = "multi_thread")]
-    async fn verify_cache_stamp_rejects_unstamped_ledger_state() {
+    async fn verify_cache_stamp_accepts_unstamped_ledger_state() {
         let (redis_db, _postgres_db, _pg, _redis) = start_cache().await;
         let mut conn = redis_db.connection.clone();
         let _: () = conn
@@ -620,12 +756,8 @@ mod tests {
             .await
             .unwrap();
 
-        let error = verify_cache_stamp(&redis_db)
+        verify_cache_stamp(&redis_db)
             .await
-            .expect_err("unstamped ledger state must be rejected");
-        assert!(
-            format!("{error}").contains("deployment"),
-            "error should name the missing stamp, got: {error}"
-        );
+            .expect("a lapsed lease must not stop a read node from starting");
     }
 }

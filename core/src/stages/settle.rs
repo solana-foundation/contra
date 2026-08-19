@@ -729,13 +729,21 @@ async fn settle_transactions(
     if let Some(redis) = redis_db {
         // Checked before the write, because the write advances the cached tip
         // and the tip is what shows a batch was missed.
-        let mirror = match redis_coherence::ensure_cache_continuity(redis, next_slot).await {
+        let may_mirror = match redis_coherence::ensure_cache_continuity(redis, next_slot).await {
+            Ok(redis_coherence::CacheStatus::InService) => true,
+            // A purge is already walking this cache. Writing to it would renew
+            // the lease and put back into service the stale keys that purge has
+            // not reached yet, and starting a second one would supersede it.
+            Ok(redis_coherence::CacheStatus::Rebuilding) => false,
             // The check has already cleared the stamp, so nothing is served from
             // the cache until the rebuild finishes and stamps it again. Spawned
-            // because purging a large keyspace costs far more than a blocktime,
-            // and mirroring continues meanwhile because reads are gated on the
-            // stamp rather than on what the cache holds.
-            Ok(true) => {
+            // because purging a large keyspace costs far more than a blocktime.
+            //
+            // Mirroring stops until that rebuild is done. The purge would sweep
+            // most of what this wrote anyway, and a successful write renews the
+            // lease, which would put the stale keys the purge has not reached
+            // yet straight back into service.
+            Ok(redis_coherence::CacheStatus::Condemned) => {
                 metrics.redis_cache_condemned();
                 let rebuilding = redis.clone();
                 let rebuild_metrics = Arc::clone(metrics);
@@ -748,21 +756,28 @@ async fn settle_transactions(
                         }
                     }
                 });
-                true
+                false
             }
-            Ok(false) => true,
             // Whether a batch was missed is now unknown, so this write must not
             // happen: it would advance the cached tip over any gap that does
             // exist, erasing the only evidence of it. Skipping leaves the tip
             // where it is, so the next check that succeeds still sees the gap.
+            //
+            // Blocks keep being produced either way, so the cache has to stop
+            // being served now rather than whenever its lease runs out. This
+            // often fails too, since the check just failed against the same
+            // Redis, and the lease is what covers that.
             Err(e) => {
                 warn!("Skipping the Redis cache write, continuity unknown: {}", e);
+                if let Err(e) = redis_coherence::clear_deployment_id(redis).await {
+                    warn!("Could not take the Redis cache out of service: {}", e);
+                }
                 false
             }
         };
 
-        if mirror {
-            if let Err(e) = crate::accounts::write_batch::write_batch_redis(
+        if may_mirror {
+            match crate::accounts::write_batch::write_batch_redis(
                 redis,
                 &accounts_vec,
                 transactions_for_db,
@@ -770,16 +785,30 @@ async fn settle_transactions(
             )
             .await
             {
-                warn!(
-                    "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
-                    e
-                );
-                metrics.redis_cache_write_failed();
-                // The account keys this batch should have updated still hold
-                // pre-batch balances. Drop them now so reads miss and resolve
-                // against Postgres, rather than waiting for the next batch to
-                // notice the tip did not advance and rebuild the whole cache.
-                crate::accounts::write_batch::invalidate_batch_redis(redis, &accounts_vec).await;
+                // Renewing only on a mirrored batch is what ties trust to
+                // maintenance: a writer that stops mirroring stops extending the
+                // lease, whether or not it is still able to reach Redis to say
+                // so.
+                Ok(()) => {
+                    if let Err(e) =
+                        redis_coherence::stamp_deployment_id(redis, redis.deployment_id()).await
+                    {
+                        warn!("Failed to renew the Redis cache lease: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
+                        e
+                    );
+                    metrics.redis_cache_write_failed();
+                    // The account keys this batch should have updated still hold
+                    // pre-batch balances. Drop them now so reads miss and resolve
+                    // against Postgres, rather than waiting for the next batch to
+                    // notice the tip did not advance and rebuild the whole cache.
+                    crate::accounts::write_batch::invalidate_batch_redis(redis, &accounts_vec)
+                        .await;
+                }
             }
         }
     }
@@ -2550,6 +2579,122 @@ mod tests {
             }
         }
         assert_eq!(survivors, 0, "the purge must walk the whole keyspace");
+    }
+
+    /// Mirroring a batch is what proves the cache is being maintained, so it has
+    /// to extend the lease. A settler that mirrored without renewing would let a
+    /// perfectly healthy cache lapse and send every read to Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_renews_the_cache_lease_after_mirroring() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stamp_key = redis_coherence::DEPLOYMENT_ID_KEY;
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // One slot behind the batch below, so continuity holds and the mirror
+        // actually runs.
+        let last_slot = 200u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", last_slot).await.unwrap();
+
+        // Stands in for a lease most of the way through its life, so a renewal
+        // shows up as the TTL climbing back rather than as a value we have to
+        // wait out.
+        let shortened_lease_secs = 5i64;
+        let _: () = conn
+            .pexpire(stamp_key, shortened_lease_secs * 1000)
+            .await
+            .unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(
+            Some(LastBlock {
+                slot: last_slot,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ttl: i64 = conn.ttl(stamp_key).await.unwrap();
+        assert!(
+            ttl > shortened_lease_secs,
+            "a mirrored batch must renew the lease, got TTL {ttl}"
+        );
+    }
+
+    /// A cached tip that will not parse leaves the settler unable to tell whether
+    /// batches were missed, and this is the case where Redis is perfectly
+    /// reachable while the check still fails. Blocks keep being produced either
+    /// way, so the cache has to stop being served immediately rather than when
+    /// its lease eventually runs out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_unstamps_a_cache_whose_continuity_cannot_be_checked() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stamp_key = redis_coherence::DEPLOYMENT_ID_KEY;
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // The tip is read as a u64, so a value that is not one fails the check
+        // without Redis being down.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(
+            Some(LastBlock {
+                slot: 200,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stamped: Option<Vec<u8>> = conn.get(stamp_key).await.unwrap();
+        assert_eq!(
+            stamped, None,
+            "a cache whose continuity cannot be checked must stop being served"
+        );
     }
 
     /// Settling a batch far ahead of the cached tip is what an outage looks like

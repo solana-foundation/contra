@@ -1,29 +1,31 @@
-//! Redis warm-cache + settle-write coverage test.
+//! Redis cache-alignment + settle-write coverage test.
 //!
-//! This standalone test exercises four regions by
-//! running a minimal PrivateChannel node with a Postgres `accountsdb_connection_url`
-//! **and** `REDIS_URL` set to a testcontainers-provided Redis instance.
-//! This is the only configuration that fires the hybrid path in
+//! Runs a minimal PrivateChannel node with a Postgres `accountsdb_connection_url`
+//! **and** `redis_cache_url` pointed at a testcontainers-provided Redis instance.
+//! That is the configuration which fires the cache path in
 //! `core/src/stages/settle.rs`:
 //!
-//! * The Redis init block in the settle worker (reads `REDIS_URL`, constructs
-//!   `Option<RedisAccountsDB>`).
+//! * The Redis init block in the settle worker.
+//! * The startup cache alignment against Postgres.
 //! * The best-effort Redis write on each settled batch.
 //!
-//! A second sub-test drives the `AccountsDB::Redis` read path with
-//! `accountsdb_connection_url=redis://...`, which exercises:
+//! The other two tests cover the read side end to end: a read node refusing to
+//! start against a cache stamped for another deployment, and a node answering
+//! reads whose key families are never mirrored, which only the Postgres fallback
+//! can do.
 //!
-//! * The `hex_to_b58` helper in `accounts/get_signatures_for_address`.
-//! * `get_signatures_for_address_redis` (the Redis backend dispatch arm).
+//! Redis as the accounts database itself is rejected at startup, so there is no
+//! Redis-only variant to cover here; see `accounts::traits` for that.
 //!
 //! This file is intentionally standalone (its own `[[test]]` target) so that
 //! it runs independently of the broader `private_channel_integration` suite.
 
 use anyhow::Result;
+use private_channel_core::accounts::postgres::PostgresAccountsDB;
 use private_channel_core::nodes::node::{run_node, NodeConfig, NodeMode};
 use private_channel_core::stage_metrics::NoopMetrics;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer};
+use solana_sdk::{signature::Keypair, signer::Signer};
 use std::{net::TcpListener, sync::Arc, time::Duration};
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::{postgres::Postgres, redis::Redis};
@@ -58,6 +60,7 @@ fn minimal_node_config(accountsdb_connection_url: String, port: u16) -> NodeConf
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 2,
         accountsdb_connection_url,
+        redis_cache_url: None,
         admin_keys: vec![dummy_admin],
         transaction_expiration_ms: 15000,
         blocktime_ms: 100,
@@ -79,12 +82,12 @@ async fn wait_for_first_block(url: &str) {
     panic!("node never produced a block at {url}");
 }
 
-/// Exercise the settle worker's Redis init block + the per-batch
-/// best-effort Redis write by running a Postgres-backed node with
-/// `REDIS_URL` pointed at a live Redis testcontainer. The settle worker will
-/// warm the cache on startup and attempt the Redis write on every block.
+/// Exercise the settle worker's Redis init block + the per-batch best-effort
+/// Redis write by running a Postgres-backed node with `redis_cache_url` pointed
+/// at a live Redis testcontainer. The settle worker aligns the cache on startup
+/// and attempts the Redis write on every block.
 #[tokio::test(flavor = "multi_thread")]
-async fn settle_worker_uses_redis_warm_cache_when_env_set() -> Result<()> {
+async fn settle_worker_mirrors_to_the_configured_redis_cache() -> Result<()> {
     // 1. Start Postgres (primary accountsdb).
     let pg = Postgres::default()
         .with_db_name("private_channel_node")
@@ -97,9 +100,8 @@ async fn settle_worker_uses_redis_warm_cache_when_env_set() -> Result<()> {
     let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
     let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
 
-    // 2. Start Redis (optional warm cache).
-    // Pin Redis 7 — the default image tag is 5.0 which lacks the
-    // `ZRANGE ... BYSCORE REV LIMIT` syntax used by the backend helper.
+    // 2. Start Redis (optional cache). Pin Redis 7, the default image tag is
+    // 5.0 and predates commands this path relies on.
     let redis = Redis::default()
         .with_tag("7")
         .start()
@@ -109,30 +111,19 @@ async fn settle_worker_uses_redis_warm_cache_when_env_set() -> Result<()> {
     let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
     let redis_url = format!("redis://{redis_host}:{redis_port}");
 
-    // 3. Set REDIS_URL so the settle worker's env-var branch fires. We keep
-    //    this set for the duration of the test and rely on process isolation
-    //    (nextest runs each test in its own process) so we don't clobber any
-    //    parallel test.
-    //
-    //    SAFETY: env mutation in a test — nextest process isolation keeps this
-    //    confined. Wrapped in `unsafe` for Rust 2024/recent std semantics.
-    // We use the older API here for compatibility with the project's Rust
-    // edition (2021) — `set_var` is still safe to call in single-threaded
-    // test startup.
-    std::env::set_var("REDIS_URL", &redis_url);
-
-    // 4. Start the node pointed at Postgres.
+    // 3. Start the node pointed at Postgres, with the cache configured.
     let port = get_free_port();
-    let config = minimal_node_config(pg_url.clone(), port);
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.redis_cache_url = Some(redis_url.clone());
     let handles = run_node(config).await.expect("run_node");
     let url = format!("http://127.0.0.1:{port}");
 
-    // 5. Wait for the settle worker to produce at least one block. This
+    // 4. Wait for the settle worker to produce at least one block. This
     //    guarantees both the Redis init branch and the per-batch Redis
     //    write branch were taken.
     wait_for_first_block(&url).await;
 
-    // 6. Issue a handful of `getLatestBlockhash` calls to ensure multiple
+    // 5. Issue a handful of `getLatestBlockhash` calls to ensure multiple
     //    settle cycles run and the Redis best-effort write path is hit
     //    repeatedly.
     let client = RpcClient::new(url.clone());
@@ -144,10 +135,9 @@ async fn settle_worker_uses_redis_warm_cache_when_env_set() -> Result<()> {
         sleep(Duration::from_millis(150)).await;
     }
 
-    // 7. Sanity-probe Redis itself — the warm cache must have published
-    //    `latest_slot` at least once (set by `warm_redis_cache`). This is a
-    //    direct assertion that the REDIS_URL branch actually produced
-    //    observable side-effects, not just compiled code.
+    // 6. Sanity-probe Redis itself: the cache must have published `latest_slot`
+    //    at least once. Direct evidence the configured cache produced
+    //    observable side effects, not just compiled code.
     let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
     let mut conn = redis_client
         .get_multiplexed_async_connection()
@@ -174,21 +164,29 @@ async fn settle_worker_uses_redis_warm_cache_when_env_set() -> Result<()> {
     );
 
     handles.shutdown().await;
-    std::env::remove_var("REDIS_URL");
     Ok(())
 }
 
-/// Exercise `hex_to_b58` and `get_signatures_for_address_redis`
-/// by running a node with `accountsdb_connection_url=redis://...` and issuing
-/// a `getSignaturesForAddress` RPC. With no indexed signatures the response
-/// is an empty list, but that still dispatches through the Redis-backend arm
-/// and through the `ZRANGE ... BYSCORE REV` query — enough to cover the
-/// entry point and the empty-result early-return branch.
+/// A read node must refuse to start against a cache carrying another ledger's
+/// deployment stamp. Only the write node aligns and purges the cache; a read node
+/// that finds foreign state can only decline to serve it, because serving it is
+/// exactly the harm the stamp exists to prevent.
+///
+/// Read mode on purpose. An Aio node runs a settler, which now shares the cache
+/// URL and would purge the foreign stamp before the read path ever inspected it.
 #[tokio::test(flavor = "multi_thread")]
-async fn get_signatures_for_address_dispatches_to_redis_backend() -> Result<()> {
-    // Start Redis (used as the sole accountsdb).
-    // Pin Redis 7 — the default image tag is 5.0 which lacks the
-    // `ZRANGE ... BYSCORE REV LIMIT` syntax used by the backend helper.
+async fn read_node_refuses_a_cache_from_another_deployment() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
     let redis = Redis::default()
         .with_tag("7")
         .start()
@@ -198,67 +196,121 @@ async fn get_signatures_for_address_dispatches_to_redis_backend() -> Result<()> 
     let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
     let redis_url = format!("redis://{redis_host}:{redis_port}");
 
-    // Make sure REDIS_URL is NOT set — we're exercising the
-    // `AccountsDB::Redis` read-path branch, not the Postgres+Redis hybrid.
-    std::env::remove_var("REDIS_URL");
-
-    let port = get_free_port();
-    let config = minimal_node_config(redis_url.clone(), port);
-    let handles = run_node(config).await.expect("run_node");
-    let url = format!("http://127.0.0.1:{port}");
-
-    // Wait for the node to be ready.
-    wait_for_first_block(&url).await;
-
-    // Ask for signatures on an arbitrary address — routes through
-    // `AccountsDB::Redis` → `get_signatures_for_address_redis`. With no
-    // indexed transactions, the query must return an empty vec. This
-    // dispatches into the `ZRANGE` call and exits via the
-    // `if sig_strings.is_empty()` early-return branch of
-    // `get_signatures_for_address_redis`.
-    let client = RpcClient::new(url);
-    let arbitrary = Pubkey::new_unique();
-    let sigs = client
-        .get_signatures_for_address(&arbitrary)
+    // A read node never creates the schema, so mint it here as a write node
+    // would. Without it the node fails on a missing deployment id instead of on
+    // the foreign stamp this test is about.
+    PostgresAccountsDB::new(&pg_url, false)
         .await
-        .expect("getSignaturesForAddress");
-    assert!(
-        sigs.is_empty(),
-        "fresh Redis backend must return empty signature list, got {} entries",
-        sigs.len()
-    );
+        .expect("initialize schema");
 
-    // Seed a couple of fake entries in `addr_sigs:{pubkey}` so the
-    // non-empty-result branch (which calls `hex_to_b58` + `MGET`) is
-    // also exercised. A valid blob is required because the helper
-    // deserializes `StoredTransaction` and returns `Err` on corruption.
-    // Rather than fabricate a valid blob, we insert entries with no
-    // matching `tx:{sig}` and expect the helper to return a `Transaction
-    // data missing` error — that still traverses the `hex_to_b58` loop
-    // plus MGET, hitting `hex_to_b58` and the `missing blob` error arm
-    // inside `get_signatures_for_address_redis`.
     use redis::AsyncCommands;
     let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
     let mut conn = redis_client
         .get_multiplexed_async_connection()
         .await
         .expect("redis conn");
-    let key = format!("addr_sigs:{arbitrary}");
-    // 64-byte dummy signature, hex-encoded. Score = slot = 1.
-    let dummy_sig_hex = "00".repeat(64);
     let _: () = conn
-        .zadd(&key, &dummy_sig_hex, 1i64)
+        .set("deployment_id", &[9u8; 16][..])
         .await
-        .expect("zadd dummy sig");
+        .expect("stamp a foreign deployment");
+    let _: () = conn
+        .set(
+            format!("account:{}", Keypair::new().pubkey()),
+            vec![1u8, 2, 3],
+        )
+        .await
+        .expect("seed foreign ledger state");
 
-    let result = client.get_signatures_for_address(&arbitrary).await;
-    // `get_signatures_for_address_redis` returns `Err("Transaction data
-    // missing...")` when the `tx:{sig}` key is absent, and the RPC handler
-    // propagates it via `?` — so the client must always see an error here.
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.mode = NodeMode::Read;
+    config.redis_cache_url = Some(redis_url.clone());
+    let result = run_node(config).await;
+
+    let error = result.err().expect("node must refuse the foreign cache");
+    let message = format!("{error:#}");
+    // The exact mismatch, not just the word "deployment", which a missing
+    // deployment id would also produce.
     assert!(
-        result.is_err(),
-        "Redis backend must return an error for a missing tx blob, got Ok({:?})",
-        result.ok()
+        message.contains("belongs to deployment"),
+        "error should name the deployment mismatch, got: {message}"
+    );
+    Ok(())
+}
+
+/// Drive the read path through a configured Redis cache.
+///
+/// Every read below is from a family the cache never holds: ranges, address
+/// history and counters are not mirrored, because a short answer from a partial
+/// mirror cannot be told from a complete one. They can only be answered by
+/// Postgres, which makes this the end-to-end proof that the cache sits in front
+/// of the source of truth rather than in place of it.
+///
+/// One `redis_cache_url` drives both paths, so the tail also asserts the settler
+/// mirrored to the same instance the read path attached to.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_path_serves_through_a_redis_cache() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
+    let redis = Redis::default()
+        .with_tag("7")
+        .start()
+        .await
+        .expect("start redis");
+    let redis_host = redis.get_host().await.expect("redis host");
+    let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
+    let redis_url = format!("redis://{redis_host}:{redis_port}");
+
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.redis_cache_url = Some(redis_url.clone());
+    let handles = run_node(config).await.expect("run_node");
+    let url = format!("http://127.0.0.1:{port}");
+
+    wait_for_first_block(&url).await;
+
+    // Each of these reads goes through AccountsDB::Redis. None of their key
+    // families is mirrored, so every one is resolved by the Postgres fallback.
+    let client = RpcClient::new(url.clone());
+    client
+        .get_latest_blockhash()
+        .await
+        .expect("getLatestBlockhash through the cache");
+    let slot = client.get_slot().await.expect("getSlot");
+    client
+        .get_blocks(0, Some(slot))
+        .await
+        .expect("getBlocks through the cache");
+    client
+        .get_transaction_count()
+        .await
+        .expect("getTransactionCount through the cache");
+    client
+        .get_signatures_for_address(&Keypair::new().pubkey())
+        .await
+        .expect("getSignaturesForAddress through the cache");
+
+    // One knob drives both paths, so the settler must have mirrored to the same
+    // instance the read path attached to.
+    use redis::AsyncCommands;
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    let cached_slot: Option<u64> = conn.get("latest_slot").await.expect("redis get");
+    assert!(
+        cached_slot.is_some(),
+        "the settler must mirror to the cache the read path uses"
     );
 
     handles.shutdown().await;

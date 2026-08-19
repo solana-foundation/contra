@@ -2,11 +2,10 @@ use {
     super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
     crate::accounts::types::StoredTransaction,
     anyhow::{Context, Result},
-    redis::AsyncCommands,
     solana_sdk::signature::Signature,
     sqlx::Row,
     std::sync::Arc,
-    tracing::debug,
+    tracing::{debug, warn},
 };
 
 /// `Ok(None)` means the signature is genuinely absent from this node's history.
@@ -52,17 +51,28 @@ async fn get_transaction_redis(
     db: &RedisAccountsDB,
     signature: &Signature,
 ) -> Result<Option<StoredTransaction>> {
-    let mut conn = db.connection.clone();
     let key = format!("tx:{}", signature);
-    let data: Option<Vec<u8>> = conn
-        .get(key)
-        .await
-        .with_context(|| format!("Failed to read transaction {} from Redis", signature))?;
-
-    let Some(bytes) = data else {
-        return Ok(None);
+    let cached = match db.get_trusted::<Vec<u8>>(&key).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!("Failed to read transaction {} from Redis: {}", signature, e);
+            None
+        }
     };
-    let tx = bincode::deserialize(&bytes)
-        .with_context(|| format!("Failed to deserialize transaction {}", signature))?;
-    Ok(Some(tx))
+
+    if let Some(bytes) = cached {
+        match bincode::deserialize(&bytes) {
+            Ok(tx) => return Ok(Some(tx)),
+            // Written by an older build whose StoredTransaction had a different
+            // layout. Falling through keeps the signature readable.
+            Err(e) => warn!(
+                "Failed to deserialize cached transaction {}: {}",
+                signature, e
+            ),
+        }
+    }
+
+    // A signature missing or unreadable in the cache is a miss, never proof the
+    // transaction did not land. Only the source of truth can answer that.
+    get_transaction_postgres(&db.fallback, signature).await
 }

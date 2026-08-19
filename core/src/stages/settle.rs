@@ -1,8 +1,8 @@
 use {
     crate::{
         accounts::{
-            postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::BlockInfo,
-            write_batch::AddressSignatureRow, AccountsDB,
+            postgres::PostgresAccountsDB, redis::RedisAccountsDB, redis_coherence,
+            traits::BlockInfo, write_batch::AddressSignatureRow, AccountsDB,
         },
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
@@ -95,64 +95,73 @@ struct LastBlock {
     blockhash: Hash,
 }
 
-/// Warm the Redis cache by reading from Postgres and writing to Redis
-/// This is called on startup to ensure Redis has the latest state from Postgres
+/// Align the Redis cache with the Postgres source of truth at startup.
+///
+/// Redis outlives the process that filled it, so its contents are checked
+/// against Postgres before anything reads through them: a cache naming a
+/// different deployment, or whose tip does not match Postgres exactly, is
+/// emptied. A purged cache is empty rather than wrong, and reads then miss and
+/// resolve against Postgres.
+///
+/// `postgres_slot` and `postgres_blockhash` are the caller's view of the
+/// Postgres tip. The caller checks only that the two agree on being present or
+/// absent, and reads them in a way that maps a query failure to absent, so an
+/// unreachable Postgres arrives here as an empty ledger and purges the cache.
+/// Wrong in the safe direction, and worth tightening at the read rather than
+/// here.
+///
+/// This covers what a restart can see, including a cache left unstamped by an
+/// interrupted rebuild. Gaps that open while the settler keeps running are caught
+/// per batch by `ensure_cache_continuity` instead.
+///
+/// Returns whether the cache had to be emptied, which the caller records: a
+/// deployment that purges on every boot is two of them sharing one Redis.
 pub async fn warm_redis_cache(
     postgres_db: &PostgresAccountsDB,
     redis_db: &RedisAccountsDB,
-) -> Result<()> {
-    info!("Warming Redis cache from Postgres...");
+    postgres_slot: Option<u64>,
+    postgres_blockhash: Option<Hash>,
+) -> Result<bool> {
+    info!("Aligning Redis cache with Postgres...");
 
-    // Read latest_slot from Postgres
-    let pool = postgres_db.pool.clone();
-    let slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
-        .fetch_one(pool.as_ref())
-        .await
-        .context("Failed to query latest slot from Postgres")?;
+    let deployment_id = redis_coherence::read_deployment_id(postgres_db).await?;
 
-    if let Some(slot_value) = slot {
-        let slot_u64 = slot_value as u64;
+    let mut purged = false;
+    if let Some(reason) =
+        redis_coherence::staleness_reason(redis_db, &deployment_id, postgres_slot).await?
+    {
+        warn!(
+            "Purging Redis cache, it cannot serve this ledger: {}",
+            reason
+        );
+        // Cleared first: an interrupted purge leaves the cache unstamped, so the
+        // next startup purges again rather than trusting a half-emptied cache.
+        redis_coherence::clear_deployment_id(redis_db).await?;
+        redis_coherence::purge_ledger_keys(redis_db).await?;
+        purged = true;
+    }
 
-        // Write latest_slot to Redis
-        let mut conn = redis_db.connection.clone();
-        conn.set::<_, _, ()>("latest_slot", slot_u64)
+    let mut conn = redis_db.connection.clone();
+    if let Some(slot) = postgres_slot {
+        conn.set::<_, _, ()>("latest_slot", slot)
             .await
             .map_err(|e| anyhow!("Failed to write latest_slot to Redis: {}", e))?;
-
-        info!("Warmed Redis cache: latest_slot = {}", slot_u64);
-    } else {
-        warn!("No blocks found in Postgres - skipping latest_slot cache warming");
     }
-
-    // Read latest_blockhash from Postgres
-    let blockhash_bytes: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT value FROM metadata WHERE key = 'latest_blockhash'")
-            .fetch_optional(pool.as_ref())
-            .await
-            .context("Failed to query latest blockhash from Postgres")?;
-
-    if let Some(bytes) = blockhash_bytes {
-        // Convert bytes to Hash and then to string for Redis storage
-        let hash_array: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid blockhash bytes length: {}", bytes.len()))?;
-        let hash = Hash::new_from_array(hash_array);
-        let hash_str = hash.to_string();
-
-        // Write latest_blockhash to Redis
-        let mut conn = redis_db.connection.clone();
-        conn.set::<_, _, ()>("latest_blockhash", hash_str.clone())
+    if let Some(blockhash) = postgres_blockhash {
+        conn.set::<_, _, ()>("latest_blockhash", blockhash.to_string())
             .await
             .map_err(|e| anyhow!("Failed to write latest_blockhash to Redis: {}", e))?;
-
-        info!("Warmed Redis cache: latest_blockhash = {}", hash_str);
-    } else {
-        warn!("No blockhash found in Postgres metadata - skipping latest_blockhash cache warming");
     }
 
-    info!("Redis cache warming completed successfully");
-    Ok(())
+    // Stamped last: the cache only names this deployment once it is coherent
+    // with it.
+    redis_coherence::stamp_deployment_id(redis_db, &deployment_id).await?;
+
+    info!(
+        "Redis cache aligned with Postgres: latest_slot = {:?}",
+        postgres_slot
+    );
+    Ok(purged)
 }
 
 pub struct SettleArgs {
@@ -162,6 +171,9 @@ pub struct SettleArgs {
     /// Bounded channel to the background `address_index_writer`.
     pub address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
     pub accountsdb_connection_url: String,
+    /// The cache the read path also attaches to. One knob for both, so a writer
+    /// cannot stop mirroring a cache that readers still trust.
+    pub redis_cache_url: Option<String>,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64,
     pub shutdown_token: CancellationToken,
@@ -176,6 +188,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         settled_blockhashes_tx,
         address_signatures_tx,
         accountsdb_connection_url,
+        redis_cache_url,
         blocktime_ms,
         perf_sample_period_secs,
         shutdown_token,
@@ -190,6 +203,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
             address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
             accountsdb_connection_url: String,
+            redis_cache_url: Option<String>,
             blocktime_ms: u64,
             perf_sample_period_secs: u64,
             shutdown_token: CancellationToken,
@@ -202,11 +216,19 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 .await
                 .unwrap();
 
-            let mut redis_db: Option<RedisAccountsDB> = match std::env::var("REDIS_URL") {
-                Ok(redis_url) => {
+            // The cache handle carries the Postgres source of truth so reads
+            // through it resolve a miss instead of reporting an absence. The
+            // settler itself only writes through it.
+            let AccountsDB::Postgres(ref postgres_db) = accounts_db else {
+                anyhow::bail!("Settle worker requires a Postgres accounts database");
+            };
+            let postgres_db = postgres_db.clone();
+
+            let mut redis_db: Option<RedisAccountsDB> = match redis_cache_url {
+                Some(ref redis_url) => {
                     match tokio::time::timeout(
                         Duration::from_secs(5),
-                        RedisAccountsDB::new(&redis_url),
+                        RedisAccountsDB::new(redis_url, postgres_db.clone()),
                     )
                     .await
                     {
@@ -224,23 +246,25 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         }
                     }
                 }
-                Err(_) => {
-                    info!("REDIS_URL not set, running Postgres-only");
+                None => {
+                    info!("No Redis cache configured, running Postgres-only");
                     None
                 }
             };
 
-            // Warm Redis cache from Postgres on startup
-            if let (AccountsDB::Postgres(ref pg), Some(ref redis)) = (&accounts_db, &redis_db) {
-                if let Err(e) = warm_redis_cache(pg, redis).await {
-                    warn!("Cache warming failed (non-fatal): {}", e);
-                }
-            }
-
-            let last_slot = accounts_db.get_latest_slot().await.ok().flatten();
+            // Propagated, never mapped to "no blocks": an unreachable Postgres
+            // read as an empty ledger makes the settler believe it is at genesis
+            // and start writing slot 0 over a live chain. `Ok(None)` here means
+            // the ledger genuinely has no blocks.
+            let last_slot = accounts_db
+                .get_latest_slot()
+                .await
+                .context("Failed to read the latest slot at startup")?;
             let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
 
-            // Validate that last_slot and last_blockhash are both present or both absent
+            // Validate that last_slot and last_blockhash are both present or both absent.
+            // Runs before the cache is aligned: an incoherent tip is not a
+            // baseline anything can be checked against.
             match (last_slot, last_blockhash) {
                 (Some(_), None) => {
                     anyhow::bail!("Invalid state: last_slot exists but last_blockhash is missing");
@@ -250,6 +274,37 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 }
                 _ => {}
             }
+
+            // Align the cache with Postgres before the first dual-write. Failing
+            // to verify it means the cache cannot be trusted, so drop it and run
+            // Postgres-only rather than write a second ledger into it.
+            redis_db = match redis_db {
+                Some(redis) => {
+                    match warm_redis_cache(&postgres_db, &redis, last_slot, last_blockhash).await {
+                        Ok(purged) => {
+                            if purged {
+                                metrics.redis_cache_purged();
+                            }
+                            Some(redis)
+                        }
+                        Err(e) => {
+                            error!("Redis cache alignment failed, running Postgres-only: {}", e);
+                            metrics.redis_cache_disabled();
+                            // The failure may have come before the stamp was
+                            // cleared, leaving a stamped cache whose tip is about
+                            // to stop advancing. Nothing else will ever clear it:
+                            // dropping the handle here means no further continuity
+                            // checks run, so read nodes would serve those frozen
+                            // values indefinitely.
+                            if let Err(e) = redis_coherence::clear_deployment_id(&redis).await {
+                                error!("Could not take the Redis cache out of service: {}", e);
+                            }
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
 
             let mut last_block = match (last_slot, last_blockhash) {
                 (Some(last_slot), Some(last_blockhash)) => Some(LastBlock {
@@ -466,6 +521,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url,
+            redis_cache_url,
             blocktime_ms,
             perf_sample_period_secs,
             shutdown_token,
@@ -671,18 +727,89 @@ async fn settle_transactions(
     // Phase 3: Redis write best-effort (non-fatal)
     let t_redis_start = tokio::time::Instant::now();
     if let Some(redis) = redis_db {
-        if let Err(e) = crate::accounts::write_batch::write_batch_redis(
-            redis,
-            &accounts_vec,
-            transactions_for_db,
-            Some(block_info),
-        )
-        .await
-        {
-            warn!(
-                "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
-                e
-            );
+        // Checked before the write, because the write advances the cached tip
+        // and the tip is what shows a batch was missed.
+        let may_mirror = match redis_coherence::ensure_cache_continuity(redis, next_slot).await {
+            Ok(redis_coherence::CacheStatus::InService) => true,
+            // A purge is already walking this cache. Writing to it would renew
+            // the lease and put back into service the stale keys that purge has
+            // not reached yet, and starting a second one would supersede it.
+            Ok(redis_coherence::CacheStatus::Rebuilding) => false,
+            // The check has already cleared the stamp, so nothing is served from
+            // the cache until the rebuild finishes and stamps it again. Spawned
+            // because purging a large keyspace costs far more than a blocktime.
+            //
+            // Mirroring stops until that rebuild is done. The purge would sweep
+            // most of what this wrote anyway, and a successful write renews the
+            // lease, which would put the stale keys the purge has not reached
+            // yet straight back into service.
+            Ok(redis_coherence::CacheStatus::Condemned) => {
+                metrics.redis_cache_condemned();
+                let rebuilding = redis.clone();
+                let rebuild_metrics = Arc::clone(metrics);
+                let generation = redis.condemnation_generation();
+                tokio::spawn(async move {
+                    match redis_coherence::rebuild_cache(&rebuilding, generation).await {
+                        Ok(()) => rebuild_metrics.redis_cache_purged(),
+                        Err(e) => {
+                            warn!("Redis cache rebuild failed, it stays out of service: {}", e)
+                        }
+                    }
+                });
+                false
+            }
+            // Whether a batch was missed is now unknown, so this write must not
+            // happen: it would advance the cached tip over any gap that does
+            // exist, erasing the only evidence of it. Skipping leaves the tip
+            // where it is, so the next check that succeeds still sees the gap.
+            //
+            // Blocks keep being produced either way, so the cache has to stop
+            // being served now rather than whenever its lease runs out. This
+            // often fails too, since the check just failed against the same
+            // Redis, and the lease is what covers that.
+            Err(e) => {
+                warn!("Skipping the Redis cache write, continuity unknown: {}", e);
+                if let Err(e) = redis_coherence::clear_deployment_id(redis).await {
+                    warn!("Could not take the Redis cache out of service: {}", e);
+                }
+                false
+            }
+        };
+
+        if may_mirror {
+            match crate::accounts::write_batch::write_batch_redis(
+                redis,
+                &accounts_vec,
+                transactions_for_db,
+                Some(block_info),
+            )
+            .await
+            {
+                // Renewing only on a mirrored batch is what ties trust to
+                // maintenance: a writer that stops mirroring stops extending the
+                // lease, whether or not it is still able to reach Redis to say
+                // so.
+                Ok(()) => {
+                    if let Err(e) =
+                        redis_coherence::stamp_deployment_id(redis, redis.deployment_id()).await
+                    {
+                        warn!("Failed to renew the Redis cache lease: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
+                        e
+                    );
+                    metrics.redis_cache_write_failed();
+                    // The account keys this batch should have updated still hold
+                    // pre-batch balances. Drop them now so reads miss and resolve
+                    // against Postgres, rather than waiting for the next batch to
+                    // notice the tip did not advance and rebuild the whole cache.
+                    crate::accounts::write_batch::invalidate_batch_redis(redis, &accounts_vec)
+                        .await;
+                }
+            }
         }
     }
     let t_redis_ms = t_redis_start.elapsed().as_secs_f64() * 1000.0;
@@ -1511,7 +1638,7 @@ mod tests {
         };
 
         // Create Redis connection
-        let redis_db = match RedisAccountsDB::new(&redis_url).await {
+        let redis_db = match RedisAccountsDB::new(&redis_url, postgres_db.clone()).await {
             Ok(db) => db,
             Err(e) => {
                 eprintln!("Skipping test: Cannot connect to test Redis: {}", e);
@@ -1564,7 +1691,13 @@ mod tests {
         }
 
         // Execute: Call warm_redis_cache
-        let result = warm_redis_cache(&postgres_db, &redis_db).await;
+        let result = warm_redis_cache(
+            &postgres_db,
+            &redis_db,
+            Some(test_slot),
+            Some(test_blockhash),
+        )
+        .await;
 
         // Verify: Function should succeed
         assert!(
@@ -1626,6 +1759,7 @@ mod tests {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url,
+            redis_cache_url: None,
             blocktime_ms: 100,
             perf_sample_period_secs: 60,
             shutdown_token: shutdown.clone(),
@@ -1657,6 +1791,7 @@ mod tests {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url,
+            redis_cache_url: None,
             blocktime_ms: 50, // fast for testing
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -1753,6 +1888,7 @@ mod tests {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url,
+            redis_cache_url: None,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -1792,6 +1928,7 @@ mod tests {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url,
+            redis_cache_url: None,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -1843,6 +1980,7 @@ mod tests {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url,
+            redis_cache_url: None,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -2161,7 +2299,11 @@ mod tests {
         // Test that warm_redis_cache reads latest_slot and latest_blockhash from Postgres
         // and writes them to Redis
         let (mut pg_db, _pg) = start_test_postgres().await;
-        let (redis_db, _redis) = start_test_redis().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
 
         // Seed Postgres via settle_transactions
         let from = Keypair::new();
@@ -2183,11 +2325,11 @@ mod tests {
         .await
         .unwrap();
 
-        // Get the PostgresAccountsDB variant for warm_redis_cache
-        let AccountsDB::Postgres(ref pg) = pg_db else {
-            panic!("Expected Postgres variant")
-        };
-        warm_redis_cache(pg, &redis_db).await.unwrap();
+        let slot = pg_db.get_latest_slot().await.unwrap();
+        let blockhash = pg_db.get_latest_blockhash().await.ok();
+        warm_redis_cache(&postgres_db, &redis_db, slot, blockhash)
+            .await
+            .unwrap();
 
         // Verify Redis was populated
         let mut conn = redis_db.connection.clone();
@@ -2197,25 +2339,585 @@ mod tests {
         assert!(bh.is_some(), "Redis latest_blockhash should be set");
     }
 
+    /// A cache filled before this check existed names no deployment. Holding
+    /// ledger state against a Postgres with no blocks, it can only be a previous
+    /// ledger's, so it must not survive into the new one.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_warm_redis_cache_empty_postgres() {
-        // Test that warm_redis_cache handles empty Postgres gracefully
+    async fn warm_redis_cache_purges_an_unstamped_cache_when_postgres_is_empty() {
         let (pg_db, _pg) = start_test_postgres().await;
-        let (redis_db, _redis) = start_test_redis().await;
-
-        let AccountsDB::Postgres(ref pg) = pg_db else {
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
             panic!("Expected Postgres variant")
         };
-        // Should succeed without panic — empty DB is gracefully handled
-        warm_redis_cache(pg, &redis_db).await.unwrap();
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
 
-        // No keys should be written when Postgres is empty
+        let stale_pubkey = Pubkey::new_unique();
+        let stale_slot = 4242u64;
         let mut conn = redis_db.connection.clone();
-        let slot: Option<u64> = conn.get("latest_slot").await.ok();
+        let _: () = conn
+            .set(format!("account:{}", stale_pubkey), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+        let _: () = conn.set("latest_slot", stale_slot).await.unwrap();
+
+        warm_redis_cache(&postgres_db, &redis_db, None, None)
+            .await
+            .unwrap();
+
+        let account_exists: bool = conn
+            .exists(format!("account:{}", stale_pubkey))
+            .await
+            .unwrap();
+        assert!(!account_exists, "stale account key must not survive");
+        let slot: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(slot, None, "stale tip must not survive");
+    }
+
+    /// A reused Redis instance carrying another ledger's keys is the case the
+    /// deployment identifier exists to catch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_purges_a_cache_from_another_deployment() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stale_pubkey = Pubkey::new_unique();
+        let stale_slot = 9000u64;
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &[9u8; 16][..]).await.unwrap();
+        let _: () = conn
+            .set(format!("account:{}", stale_pubkey), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+        let _: () = conn
+            .set(format!("block:{}", stale_slot), vec![4u8, 5, 6])
+            .await
+            .unwrap();
+        let _: () = conn.set("latest_slot", stale_slot).await.unwrap();
+
+        warm_redis_cache(&postgres_db, &redis_db, None, None)
+            .await
+            .unwrap();
+
+        let account_exists: bool = conn
+            .exists(format!("account:{}", stale_pubkey))
+            .await
+            .unwrap();
         assert!(
-            slot.is_none(),
-            "Redis should have no slot when Postgres is empty"
+            !account_exists,
+            "another ledger's accounts must not survive"
         );
+        let block_exists: bool = conn.exists(format!("block:{}", stale_slot)).await.unwrap();
+        assert!(!block_exists, "another ledger's blocks must not survive");
+
+        let stamped: Option<Vec<u8>> = conn.get("deployment_id").await.unwrap();
+        assert_eq!(
+            stamped,
+            Some(
+                redis_coherence::read_deployment_id(&postgres_db)
+                    .await
+                    .unwrap()
+            ),
+            "the cache must be re-stamped with this deployment"
+        );
+    }
+
+    /// Same deployment, but Postgres was restored to an earlier point: the cache
+    /// holds slots the source of truth no longer has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_purges_a_cache_ahead_of_postgres() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let cached_slot = 9000u64;
+        let postgres_slot = 10u64;
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+        let _: () = conn
+            .set(format!("block:{}", cached_slot), vec![4u8, 5, 6])
+            .await
+            .unwrap();
+        let _: () = conn.set("latest_slot", cached_slot).await.unwrap();
+
+        warm_redis_cache(
+            &postgres_db,
+            &redis_db,
+            Some(postgres_slot),
+            Some(Hash::new_unique()),
+        )
+        .await
+        .unwrap();
+
+        let block_exists: bool = conn.exists(format!("block:{}", cached_slot)).await.unwrap();
+        assert!(!block_exists, "slots ahead of Postgres must not survive");
+        let slot: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(
+            slot,
+            Some(postgres_slot),
+            "the tip must be rewound to Postgres"
+        );
+    }
+
+    /// Every cached ledger key family has to go, not just the ones a read path
+    /// happens to consult today. A family left behind is exactly the kind of
+    /// unvalidated state that made a reused cache dangerous.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_purges_every_ledger_key_family() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stale_pubkey = Pubkey::new_unique();
+        let stale_signature = Signature::new_unique();
+        let stale_slot = 9000u64;
+        let prefixed_keys = [
+            format!("account:{}", stale_pubkey),
+            format!("tx:{}", stale_signature),
+            format!("block:{}", stale_slot),
+        ];
+        let fixed_keys = [
+            "block_slot_index",
+            "transaction_count",
+            "performance_samples",
+            "latest_slot",
+            "latest_blockhash",
+        ];
+
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &[9u8; 16][..]).await.unwrap();
+        for key in &prefixed_keys {
+            let _: () = conn.set(key, vec![1u8, 2, 3]).await.unwrap();
+        }
+        // Written with the types an older build used, since the purge has to
+        // clear what those builds left behind.
+        let addr_sigs_key = format!("addr_sigs:{}", stale_pubkey);
+        let _: () = conn
+            .zadd(&addr_sigs_key, "deadbeef", stale_slot as f64)
+            .await
+            .unwrap();
+        let _: () = conn
+            .zadd("block_slot_index", stale_slot, stale_slot as f64)
+            .await
+            .unwrap();
+        let _: () = conn.set("transaction_count", 77u64).await.unwrap();
+        let _: () = conn.lpush("performance_samples", "{}").await.unwrap();
+        let _: () = conn.set("latest_slot", stale_slot).await.unwrap();
+        let _: () = conn
+            .set("latest_blockhash", Hash::new_unique().to_string())
+            .await
+            .unwrap();
+
+        warm_redis_cache(&postgres_db, &redis_db, None, None)
+            .await
+            .unwrap();
+
+        for key in prefixed_keys.iter().chain(std::iter::once(&addr_sigs_key)) {
+            let exists: bool = conn.exists(key).await.unwrap();
+            assert!(!exists, "{} must not survive the purge", key);
+        }
+        for key in fixed_keys {
+            let exists: bool = conn.exists(key).await.unwrap();
+            assert!(!exists, "{} must not survive the purge", key);
+        }
+    }
+
+    /// One SCAN round returns a bounded slice of the keyspace, so the purge has
+    /// to keep walking until the cursor wraps. With more keys than fit in a
+    /// round, a single-pass purge would leave most of them behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_purges_more_keys_than_one_scan_round_returns() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Comfortably more than the purge's per-round COUNT of 512.
+        let key_count = 1500;
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &[9u8; 16][..]).await.unwrap();
+        let mut seed = redis::pipe();
+        for _ in 0..key_count {
+            seed.set(format!("account:{}", Pubkey::new_unique()), vec![1u8, 2, 3]);
+        }
+        let _: () = seed.query_async(&mut conn).await.unwrap();
+
+        warm_redis_cache(&postgres_db, &redis_db, None, None)
+            .await
+            .unwrap();
+
+        let mut survivors = 0usize;
+        let mut cursor = 0u64;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("account:*")
+                .arg("COUNT")
+                .arg(512)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+            survivors += keys.len();
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(survivors, 0, "the purge must walk the whole keyspace");
+    }
+
+    /// Mirroring a batch is what proves the cache is being maintained, so it has
+    /// to extend the lease. A settler that mirrored without renewing would let a
+    /// perfectly healthy cache lapse and send every read to Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_renews_the_cache_lease_after_mirroring() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stamp_key = redis_coherence::DEPLOYMENT_ID_KEY;
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // One slot behind the batch below, so continuity holds and the mirror
+        // actually runs.
+        let last_slot = 200u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", last_slot).await.unwrap();
+
+        // Stands in for a lease most of the way through its life, so a renewal
+        // shows up as the TTL climbing back rather than as a value we have to
+        // wait out.
+        let shortened_lease_secs = 5i64;
+        let _: () = conn
+            .pexpire(stamp_key, shortened_lease_secs * 1000)
+            .await
+            .unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(
+            Some(LastBlock {
+                slot: last_slot,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ttl: i64 = conn.ttl(stamp_key).await.unwrap();
+        assert!(
+            ttl > shortened_lease_secs,
+            "a mirrored batch must renew the lease, got TTL {ttl}"
+        );
+    }
+
+    /// A cached tip that will not parse leaves the settler unable to tell whether
+    /// batches were missed, and this is the case where Redis is perfectly
+    /// reachable while the check still fails. Blocks keep being produced either
+    /// way, so the cache has to stop being served immediately rather than when
+    /// its lease eventually runs out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_unstamps_a_cache_whose_continuity_cannot_be_checked() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stamp_key = redis_coherence::DEPLOYMENT_ID_KEY;
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // The tip is read as a u64, so a value that is not one fails the check
+        // without Redis being down.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(
+            Some(LastBlock {
+                slot: 200,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stamped: Option<Vec<u8>> = conn.get(stamp_key).await.unwrap();
+        assert_eq!(
+            stamped, None,
+            "a cache whose continuity cannot be checked must stop being served"
+        );
+    }
+
+    /// Settling a batch far ahead of the cached tip is what an outage looks like
+    /// from the settler's side. The cache must be condemned and left untouched:
+    /// if this write advanced the tip, it would close the only gap the startup
+    /// check can see, and the accounts missed during the outage would be served
+    /// as current from then on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_unstamps_a_cache_that_missed_batches() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let cached_tip = 100u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+        let _: () = conn.set("latest_slot", cached_tip).await.unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(
+            Some(LastBlock {
+                slot: 200,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The stamp is the durable evidence, and clearing it takes the cache out
+        // of service on the very next read. Writing carries on, so the tip
+        // advances; that is safe precisely because reads are gated on the stamp
+        // rather than on the tip.
+        let stamped: Option<Vec<u8>> = conn.get("deployment_id").await.unwrap();
+        assert_eq!(
+            stamped, None,
+            "a cache that missed batches must stop being served"
+        );
+    }
+
+    /// Postgres with no blocks cannot back any cached ledger state, whatever the
+    /// tips say. Both tips absent compares equal, so without an explicit guard a
+    /// correctly-stamped cache that lost only its `latest_slot` key, evicted
+    /// under `allkeys-lru` or removed by hand, would survive against a
+    /// truncated or replaced Postgres and keep serving its accounts.
+    ///
+    /// Stamped and tipless on purpose: an unstamped cache exits at the stamp
+    /// guard and never reaches this one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_purges_a_stamped_tipless_cache_when_postgres_is_empty() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let stale_pubkey = Pubkey::new_unique();
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+        let _: () = conn
+            .set(format!("account:{}", stale_pubkey), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+
+        warm_redis_cache(&postgres_db, &redis_db, None, None)
+            .await
+            .unwrap();
+
+        let account_exists: bool = conn
+            .exists(format!("account:{}", stale_pubkey))
+            .await
+            .unwrap();
+        assert!(
+            !account_exists,
+            "cached accounts must not survive a Postgres with no blocks"
+        );
+    }
+
+    /// A cache left *behind* Postgres is the crash window: the settler commits to
+    /// Postgres before mirroring to Redis, so a kill between the two leaves the
+    /// cached tip short and every account the batch touched holding its
+    /// pre-batch value. Those keys are present, so reads hit them and never
+    /// reach the fallback. Being behind is not being incomplete, and the cache
+    /// must not survive it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_purges_a_cache_behind_postgres() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let stale_pubkey = Pubkey::new_unique();
+        let cached_slot = 41u64;
+        let postgres_slot = 42u64;
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+        // Right deployment, one batch behind: the pre-batch balance is still here.
+        let _: () = conn
+            .set(format!("account:{}", stale_pubkey), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+        let _: () = conn.set("latest_slot", cached_slot).await.unwrap();
+
+        warm_redis_cache(
+            &postgres_db,
+            &redis_db,
+            Some(postgres_slot),
+            Some(Hash::new_unique()),
+        )
+        .await
+        .unwrap();
+
+        let account_exists: bool = conn
+            .exists(format!("account:{}", stale_pubkey))
+            .await
+            .unwrap();
+        assert!(
+            !account_exists,
+            "a pre-batch balance must not survive a tip that fell behind"
+        );
+        let slot: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(slot, Some(postgres_slot), "the tip must be Postgres's");
+    }
+
+    /// An empty cache is trivially coherent: nothing to purge, and the mismatch
+    /// between an absent cached tip and a real Postgres tip is a normal first
+    /// attach rather than a stale cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_accepts_an_empty_cache() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let slot = 42u64;
+        warm_redis_cache(
+            &postgres_db,
+            &redis_db,
+            Some(slot),
+            Some(Hash::new_unique()),
+        )
+        .await
+        .unwrap();
+
+        let mut conn = redis_db.connection.clone();
+        let cached_slot: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(cached_slot, Some(slot), "the tip must be published");
+        let stamped: Option<Vec<u8>> = conn.get("deployment_id").await.unwrap();
+        assert_eq!(
+            stamped,
+            Some(
+                redis_coherence::read_deployment_id(&postgres_db)
+                    .await
+                    .unwrap()
+            ),
+            "an empty cache must be stamped for this deployment"
+        );
+    }
+
+    /// The counterweight to the purge tests: a cache that agrees with Postgres
+    /// keeps its contents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_redis_cache_keeps_a_coherent_cache() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let cached_pubkey = Pubkey::new_unique();
+        let slot = 10u64;
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+        let _: () = conn
+            .set(format!("account:{}", cached_pubkey), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+        let _: () = conn.set("latest_slot", slot).await.unwrap();
+
+        warm_redis_cache(
+            &postgres_db,
+            &redis_db,
+            Some(slot),
+            Some(Hash::new_unique()),
+        )
+        .await
+        .unwrap();
+
+        let account_exists: bool = conn
+            .exists(format!("account:{}", cached_pubkey))
+            .await
+            .unwrap();
+        assert!(account_exists, "a coherent cache must be left intact");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2237,6 +2939,7 @@ mod tests {
             settled_blockhashes_tx: _settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url.clone(),
+            redis_cache_url: None,
             blocktime_ms: 50,
             perf_sample_period_secs: 1, // fires after 1s
             shutdown_token: shutdown.clone(),
@@ -2298,6 +3001,7 @@ mod tests {
             settled_blockhashes_tx,
             address_signatures_tx,
             accountsdb_connection_url: url,
+            redis_cache_url: None,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),

@@ -1,6 +1,9 @@
 use {
     crate::{
-        accounts::{address_index_repair::repair_address_signatures, AccountsDB},
+        accounts::{
+            address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
+            redis::RedisAccountsDB, AccountsDB,
+        },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps, WriteDeps,
@@ -64,6 +67,9 @@ pub struct NodeConfig {
     /// batches ≥ `MIN_PARALLEL_BATCH_SIZE`; smaller batches always run sequentially.
     pub max_svm_workers: usize,
     pub accountsdb_connection_url: String,
+    /// Optional Redis cache in front of the read path. Reads consult Redis
+    /// first and fall through to `accountsdb_connection_url` on a miss.
+    pub redis_cache_url: Option<String>,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
     pub transaction_expiration_ms: u64,
     pub blocktime_ms: u64,
@@ -96,6 +102,7 @@ impl Default for NodeConfig {
             max_svm_workers: 8,
             accountsdb_connection_url: "postgresql://user:password@localhost:5432/private_channel"
                 .to_string(),
+            redis_cache_url: None,
             admin_keys: vec![],               // No admin keys by default
             transaction_expiration_ms: 15000, // 15 seconds default
             blocktime_ms: 100,                // 100ms default
@@ -123,6 +130,42 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+}
+
+/// How long a read node waits out a cache stamped for another deployment. Worth
+/// waiting for in Aio, where the settler alongside this node purges and re-stamps
+/// it moments later; a genuinely wrong Redis costs only this window and then
+/// fails closed. An unstamped cache is not waited for at all, since the node
+/// serves correctly from Postgres until a write node stamps one.
+///
+/// This covers the cache, not a Postgres the write node has not created the
+/// schema in. That case fails earlier, when the cache handle reads the deployment
+/// id, and is not retried.
+///
+/// Serving is not gated on this: every cached read rechecks the stamp for itself,
+/// so a cache condemned later is dropped without waiting for a restart. Failing
+/// here is about not starting a node whose cache is misconfigured, rather than
+/// letting it come up and quietly serve every read from Postgres.
+const CACHE_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const CACHE_VERIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn wait_for_verified_cache(
+    redis: &crate::accounts::redis::RedisAccountsDB,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + CACHE_VERIFY_TIMEOUT;
+    loop {
+        match crate::accounts::redis_coherence::verify_cache_stamp(redis).await {
+            Ok(()) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                warn!(
+                    "Redis cache not usable yet ({}), waiting for a write node",
+                    e
+                );
+                tokio::time::sleep(CACHE_VERIFY_INTERVAL).await;
+            }
+            Err(e) => return Err(format!("Redis cache never became usable: {e:#}").into()),
+        }
+    }
 }
 
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
@@ -297,6 +340,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 settled_blockhashes_tx,
                 address_signatures_tx: addr_sig_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+                redis_cache_url: config.redis_cache_url.clone(),
                 blocktime_ms: config.blocktime_ms,
                 perf_sample_period_secs: config.perf_sample_period_secs,
                 shutdown_token: shutdown_token.clone(),
@@ -336,7 +380,30 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
     let read_deps = match config.mode {
         NodeMode::Read | NodeMode::Aio => {
-            let accounts_db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            let accounts_db = match config.redis_cache_url {
+                // Redis in front of Postgres. Postgres stays reachable so a
+                // key missing from the cache resolves against the source of
+                // truth instead of reading as an absence.
+                Some(ref redis_url) => {
+                    let postgres = PostgresAccountsDB::new(&config.accountsdb_connection_url, true)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e)
+                        })?;
+                    let redis = RedisAccountsDB::new(redis_url, postgres)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?;
+                    // Only a write node aligns the cache, so wait for one to
+                    // publish a stamp rather than serving whatever is there. An
+                    // empty cache verifies immediately. Foreign state verifies
+                    // only once a write node purges it, which in Aio is the
+                    // settler alongside this one.
+                    wait_for_verified_cache(&redis).await?;
+                    info!("Read path caching through Redis with Postgres fallback");
+                    AccountsDB::Redis(redis)
+                }
+                None => AccountsDB::new(&config.accountsdb_connection_url, true).await?,
+            };
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).

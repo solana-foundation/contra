@@ -26,7 +26,8 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Settlement interval (ms) |
 | `--transaction-expiration-ms` | `PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS` | `15000` | Transaction lifetime before dedup eviction |
 | `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 channel admin pubkeys, gating SPL `InitializeMint`. Not the escrow `Instance.admin`, which is a separate offline key |
-| `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string |
+| `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string. Must be PostgreSQL: Redis is a cache, never the accounts database |
+| `--redis-cache-url` | `PRIVATE_CHANNEL_REDIS_CACHE_URL` | — | Optional Redis cache in front of the read path. Misses resolve against PostgreSQL |
 | `--log-level` | `PRIVATE_CHANNEL_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `--json-logs` | `PRIVATE_CHANNEL_JSON_LOGS` | `false` | Structured JSON log output |
 | `--perf-sample-period-secs` | `PRIVATE_CHANNEL_PERF_SAMPLE_PERIOD_SECS` | `60` | Performance metrics sampling interval |
@@ -119,7 +120,9 @@ On restart, the write node recovers state from PostgreSQL before accepting trans
 
 2. **Settlement state**: Queries `latest_slot` and `latest_blockhash` from the database to resume block production from the correct point.
 
-3. **Redis cache warming** (optional): If `REDIS_URL` is configured, preloads the latest account state from PostgreSQL into Redis on startup.
+3. **Redis cache alignment** (optional): If `--redis-cache-url` is configured, checks that the cache belongs to this ledger before the first write to it. The same flag wires the read path, so a writer cannot stop mirroring a cache that readers still trust. Each PostgreSQL database is stamped with a `deployment_id` at creation and the cache carries a copy; a cache naming a different deployment, or whose tip does not match PostgreSQL exactly, is emptied. The chain tip is then published and the cache stamped. Account, block and transaction state is not preloaded: a key missing from the cache is a miss that resolves against PostgreSQL. The two node roles differ on failure: a write node that cannot verify the cache drops it and runs PostgreSQL-only rather than writing a second ledger into it, while a read node refuses to start, because it cannot purge the cache itself and has no business serving what it found.
+
+   The same stamp governs the cache while the node runs. Every cached read checks it, so clearing it takes the cache out of service on the next read. If a settled batch fails to reach the cache, the cached tip stops advancing; the next batch notices, clears the stamp and rebuilds the cache in the background, after which it is stamped again and serves normally. A cache purged on every startup usually means two deployments sharing one Redis instance. `private_channel_redis_cache_purged_total` is the signal.
 
 The write node does not use a WAL — all state is deterministically recoverable from the PostgreSQL block history.
 

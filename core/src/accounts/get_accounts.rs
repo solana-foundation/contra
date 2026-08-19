@@ -71,18 +71,68 @@ async fn get_accounts_redis(
     redis_db: &RedisAccountsDB,
     accounts: &[Pubkey],
 ) -> Vec<Option<AccountSharedData>> {
+    // MGET with no keys is a Redis error, and there is nothing to resolve.
+    if accounts.is_empty() {
+        return Vec::new();
+    }
+
     let mut conn = redis_db.connection.clone();
-    let keys = accounts
-        .iter()
-        .map(|key| format!("account:{}", key))
-        .collect::<Vec<_>>();
+    // The deployment stamp rides along as the first key, so the same round trip
+    // that fetches the values also proves the cache may still be read from.
+    let mut keys = Vec::with_capacity(accounts.len() + 1);
+    keys.push(crate::accounts::redis_coherence::DEPLOYMENT_ID_KEY.to_string());
+    keys.extend(accounts.iter().map(|key| format!("account:{}", key)));
     let data: RedisResult<Vec<Option<Vec<u8>>>> = conn.mget(keys).await;
 
-    match data {
-        Ok(results) => results
-            .into_iter()
-            .map(|opt| opt.and_then(|bytes| bincode::deserialize(&bytes).ok()))
-            .collect(),
-        Err(_) => vec![None; accounts.len()],
+    let mut results: Vec<Option<AccountSharedData>> = match data {
+        // MGET answers one entry per key, so the split always succeeds; a short
+        // reply is treated as an untrusted cache rather than indexed into, since
+        // this runs under an RPC request where a panic is far worse than a miss.
+        Ok(cached) if cached.len() == accounts.len() + 1 => {
+            let (stamp, values) = cached.split_first().expect("checked non-empty above");
+            if redis_db.stamp_is_current(stamp.as_ref()) {
+                values
+                    .iter()
+                    .map(|opt| {
+                        opt.as_ref()
+                            .and_then(|bytes| bincode::deserialize(bytes).ok())
+                    })
+                    .collect()
+            } else {
+                // Condemned or foreign cache: every position is a miss.
+                vec![None; accounts.len()]
+            }
+        }
+        Ok(cached) => {
+            tracing::error!(
+                "Redis returned {} values for {} keys; treating the cache as unusable",
+                cached.len(),
+                accounts.len() + 1
+            );
+            vec![None; accounts.len()]
+        }
+        Err(e) => {
+            tracing::error!("Failed to read accounts from Redis: {}", e);
+            vec![None; accounts.len()]
+        }
+    };
+
+    // Every position the cache could not answer is a miss. Resolve just those
+    // against the source of truth, keeping the result aligned with `accounts`.
+    let missing: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, account)| account.is_none())
+        .map(|(position, _)| position)
+        .collect();
+    if missing.is_empty() {
+        return results;
     }
+
+    let missing_pubkeys: Vec<Pubkey> = missing.iter().map(|&position| accounts[position]).collect();
+    let resolved = get_accounts_postgres(&redis_db.fallback, &missing_pubkeys).await;
+    for (position, account) in missing.into_iter().zip(resolved) {
+        results[position] = account;
+    }
+    results
 }

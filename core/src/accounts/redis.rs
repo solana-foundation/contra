@@ -1,17 +1,40 @@
 use {
+    super::postgres::PostgresAccountsDB,
     anyhow::Result,
     redis::{aio::ConnectionManager, AsyncCommands, RedisResult},
     solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
+    std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 #[derive(Clone)]
 pub struct RedisAccountsDB {
     pub connection: ConnectionManager,
+    /// The Postgres source of truth this cache sits in front of. A key absent
+    /// from Redis is a cache miss to be resolved here, never an authoritative
+    /// "does not exist".
+    ///
+    /// Not optional: a cache with no source of truth behind it can only answer
+    /// a miss by claiming the data does not exist, which is the one answer it
+    /// must never give.
+    pub fallback: PostgresAccountsDB,
+    /// The deployment the cache must name for its contents to be usable, read
+    /// from Postgres once at construction because it never changes for a given
+    /// database. Held here so a read can check the stamp without a second
+    /// round trip.
+    deployment_id: Vec<u8>,
+    /// Counts how many times this cache has been taken out of service. A rebuild
+    /// carries the value it was started with and declines to stamp if it has
+    /// moved on, so a rebuild overtaken by a later condemnation cannot return a
+    /// cache to service whose purge predates the newer gap.
+    condemnations: Arc<AtomicU64>,
 }
 
 impl RedisAccountsDB {
-    pub async fn new(redis_url: &str) -> Result<Self, String> {
+    pub async fn new(redis_url: &str, fallback: PostgresAccountsDB) -> Result<Self, String> {
         // Parse URL to extract host/port without credentials for error messages
         let sanitized_url = if let Ok(parsed) = url::Url::parse(redis_url) {
             let host = parsed.host_str().unwrap_or("unknown");
@@ -27,8 +50,62 @@ impl RedisAccountsDB {
             .await
             .map_err(|_| format!("Failed to connect to Redis at {}", sanitized_url))?;
 
-        let db = Self { connection };
+        let deployment_id = super::redis_coherence::read_deployment_id(&fallback)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+
+        let db = Self {
+            connection,
+            fallback,
+            deployment_id,
+            condemnations: Arc::new(AtomicU64::new(0)),
+        };
         Ok(db)
+    }
+
+    /// How many times this cache has been taken out of service. Shared across
+    /// clones of the handle, so a rebuild running on one clone sees a
+    /// condemnation raised on another.
+    pub(crate) fn condemnation_generation(&self) -> u64 {
+        self.condemnations.load(Ordering::SeqCst)
+    }
+
+    /// Records that the cache has been taken out of service, superseding any
+    /// rebuild already in flight.
+    pub(crate) fn record_condemnation(&self) {
+        self.condemnations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Reads a cached value and the deployment stamp in one round trip, yielding
+    /// the value only while the stamp still names this deployment. Checking the
+    /// stamp per read, rather than on a timer, is what makes a condemnation take
+    /// effect on the very next read. `MGET` of two keys costs what `GET` of one
+    /// costs.
+    ///
+    /// `None` covers a missing key, a missing stamp and a foreign stamp alike:
+    /// all three mean the cache cannot answer, and callers resolve that against
+    /// Postgres.
+    pub(crate) async fn get_trusted<T: redis::FromRedisValue>(
+        &self,
+        key: &str,
+    ) -> RedisResult<Option<T>> {
+        let mut conn = self.connection.clone();
+        let (stamp, value): (Option<Vec<u8>>, Option<T>) = redis::cmd("MGET")
+            .arg(super::redis_coherence::DEPLOYMENT_ID_KEY)
+            .arg(key)
+            .query_async(&mut conn)
+            .await?;
+
+        match stamp {
+            Some(stamp) if stamp == self.deployment_id => Ok(value),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether a stamp read alongside cached values still names this deployment.
+    /// For batch reads that fetch the stamp as part of their own `MGET`.
+    pub(crate) fn stamp_is_current(&self, stamp: Option<&Vec<u8>>) -> bool {
+        stamp.is_some_and(|stamp| *stamp == self.deployment_id)
     }
 
     pub async fn set_account(&mut self, pubkey: Pubkey, account: AccountSharedData) {

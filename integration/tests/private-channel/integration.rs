@@ -258,6 +258,7 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url: accountsdb_connection_url.clone(),
+        redis_cache_url: None,
         admin_keys: vec![operator_key.pubkey()],
         transaction_expiration_ms: 15000,
         blocktime_ms: 100,

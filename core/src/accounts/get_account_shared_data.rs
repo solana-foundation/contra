@@ -69,14 +69,31 @@ async fn get_account_shared_data_redis(
     db: &RedisAccountsDB,
     pubkey: &Pubkey,
 ) -> Option<AccountSharedData> {
-    let mut conn = db.connection.clone();
     let key = format!("account:{}", pubkey);
-    let data: redis::RedisResult<Vec<u8>> = conn.get(key).await;
-    match data {
-        Ok(bytes) => bincode::deserialize(&bytes).ok(),
+    let cached = match db.get_trusted::<Vec<u8>>(&key).await {
+        Ok(bytes) => bytes,
         Err(e) => {
             error!("Failed to get account {} from Redis: {}", pubkey, e);
             None
         }
+    };
+
+    if let Some(bytes) = cached {
+        match bincode::deserialize(&bytes) {
+            Ok(account) => return Some(account),
+            Err(e) => {
+                error!("Failed to deserialize cached account {}: {}", pubkey, e);
+                // Evict it, or every later read pays both hops to reach the same
+                // conclusion. Nothing else would ever remove it.
+                let mut conn = db.connection.clone();
+                if let Err(e) = conn.del::<_, ()>(&key).await {
+                    error!("Failed to evict corrupt cached account {}: {}", pubkey, e);
+                }
+            }
+        }
     }
+
+    // Absent, unreadable or corrupt cache entries are misses, not proof the
+    // account does not exist. Resolve them against the source of truth.
+    get_account_shared_data_postgres(&db.fallback, pubkey).await
 }

@@ -1,7 +1,7 @@
 use {
     super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
-    anyhow::{anyhow, Result},
-    redis::AsyncCommands,
+    anyhow::Result,
+    tracing::warn,
 };
 
 pub async fn get_latest_slot(db: &AccountsDB) -> Result<Option<u64>> {
@@ -29,7 +29,17 @@ async fn get_latest_slot_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>
 }
 
 async fn get_latest_slot_redis(db: &RedisAccountsDB) -> Result<Option<u64>> {
-    let mut conn = db.connection.clone();
-    let result: redis::RedisResult<Option<u64>> = conn.get("latest_slot").await;
-    result.map_err(|e| anyhow!("Failed to get latest slot from Redis: {}", e))
+    let cached = match db.get_trusted::<u64>("latest_slot").await {
+        Ok(slot) => slot,
+        Err(e) => {
+            warn!("Failed to get latest slot from Redis: {}", e);
+            None
+        }
+    };
+
+    match cached {
+        Some(slot) => Ok(Some(slot)),
+        // No cached tip is a miss, not an empty ledger.
+        None => get_latest_slot_postgres(&db.fallback).await,
+    }
 }

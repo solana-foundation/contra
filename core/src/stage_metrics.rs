@@ -48,6 +48,14 @@ pub trait StageMetrics: Send + Sync {
     fn settler_db_write_duration_ms(&self, ms: f64);
     fn settler_processing_duration_ms(&self, ms: f64);
 
+    // Redis cache (optional read-through cache in front of Postgres). These are
+    // the only signal that the cache has taken itself out of service; without
+    // them a node silently serves every read from Postgres.
+    fn redis_cache_purged(&self);
+    fn redis_cache_condemned(&self);
+    fn redis_cache_write_failed(&self);
+    fn redis_cache_disabled(&self);
+
     // Address-index writer (off-critical-path background worker)
     fn address_signatures_queue_depth(&self, depth: usize);
     fn address_signatures_send_blocked_ms(&self, ms: f64);
@@ -146,6 +154,18 @@ impl StageMetrics for NoopMetrics {
     fn settler_processing_duration_ms(&self, ms: f64) {
         debug!("settler: processing_duration={:.3}ms", ms);
     }
+    fn redis_cache_purged(&self) {
+        debug!("redis cache: purged");
+    }
+    fn redis_cache_condemned(&self) {
+        debug!("redis cache: condemned");
+    }
+    fn redis_cache_write_failed(&self) {
+        debug!("redis cache: write failed");
+    }
+    fn redis_cache_disabled(&self) {
+        debug!("redis cache: disabled");
+    }
     fn address_signatures_queue_depth(&self, depth: usize) {
         debug!("address_signatures: queue_depth={}", depth);
     }
@@ -170,6 +190,30 @@ impl StageMetrics for NoopMetrics {
 use private_channel_metrics::{counter_vec, gauge_vec, init_metrics};
 
 // Counters
+counter_vec!(
+    REDIS_CACHE_PURGED,
+    "private_channel_redis_cache_purged_total",
+    "Times the Redis cache was emptied because its contents could not be trusted",
+    &[]
+);
+counter_vec!(
+    REDIS_CACHE_CONDEMNED,
+    "private_channel_redis_cache_condemned_total",
+    "Times the Redis cache was taken out of service after missing a settled batch",
+    &[]
+);
+counter_vec!(
+    REDIS_CACHE_WRITE_FAILED,
+    "private_channel_redis_cache_write_failed_total",
+    "Best-effort Redis cache writes that failed after Postgres had committed",
+    &[]
+);
+counter_vec!(
+    REDIS_CACHE_DISABLED,
+    "private_channel_redis_cache_disabled_total",
+    "Times a node gave up on the Redis cache and continued Postgres-only",
+    &[]
+);
 counter_vec!(
     RPC_INGRESS_SHED,
     "private_channel_rpc_ingress_shed_total",
@@ -486,6 +530,22 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .observe(ms);
     }
+    fn redis_cache_purged(&self) {
+        REDIS_CACHE_PURGED.with_label_values(&[] as &[&str]).inc();
+    }
+    fn redis_cache_condemned(&self) {
+        REDIS_CACHE_CONDEMNED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn redis_cache_write_failed(&self) {
+        REDIS_CACHE_WRITE_FAILED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn redis_cache_disabled(&self) {
+        REDIS_CACHE_DISABLED.with_label_values(&[] as &[&str]).inc();
+    }
     fn settler_processing_duration_ms(&self, ms: f64) {
         SETTLER_PROCESSING_DURATION
             .with_label_values(&[] as &[&str])
@@ -552,6 +612,10 @@ pub fn init_prometheus_metrics() {
         ADDRESS_SIGNATURES_FLUSH_ERRORS,
         ADDRESS_SIGNATURES_QUEUE_DEPTH,
         ADDRESS_SIGNATURES_SEND_BLOCKED,
-        ADDRESS_SIGNATURES_FLUSH_DURATION
+        ADDRESS_SIGNATURES_FLUSH_DURATION,
+        REDIS_CACHE_PURGED,
+        REDIS_CACHE_CONDEMNED,
+        REDIS_CACHE_WRITE_FAILED,
+        REDIS_CACHE_DISABLED
     );
 }

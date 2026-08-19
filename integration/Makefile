@@ -188,12 +188,12 @@ integration-coverage-private-channel:
 	@# Kept in sync with the integration-test group; runs the backpressure CI guards (RSS test stays #[ignore]).
 	@cargo llvm-cov test --no-report --workspace --test ingress_backpressure -- --nocapture
 
-# Redis-backend warm-cache + read-path coverage.
-# Runs a Postgres+Redis node and a Redis-only node to exercise settle.rs's
-# `REDIS_URL`/best-effort-write branches and the
-# `get_signatures_for_address_redis` dispatch arm. Runs independently of the
-# main private_channel_integration suite — its profraw aggregates into the same
-# `cargo llvm-cov report` output, so coverage accumulates naturally.
+# Redis cache coverage.
+# Runs Postgres+Redis nodes to cover the settle worker's cache setup, the
+# per-block cache write, the startup alignment, and the read path falling back
+# to Postgres. Runs on its own, apart from the main private_channel_integration
+# suite. Its coverage data merges into the same report, so running it separately
+# loses nothing.
 # CI should invoke this target in parallel with (or immediately after)
 # `integration-coverage-private-channel`.
 integration-coverage-private-channel-redis:

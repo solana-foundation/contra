@@ -22,6 +22,7 @@ pub mod get_transaction_count;
 pub mod postgres;
 pub mod precompiles;
 pub mod redis;
+pub mod redis_coherence;
 pub mod set_account;
 pub mod set_latest_slot;
 pub mod store_block;

@@ -1945,7 +1945,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_marks_db_loaded_account_clean() {
-        let (mut redis_raw, _redis) = crate::test_helpers::start_test_redis().await;
+        // The cache needs its Postgres source of truth, though this test seeds
+        // the key directly so every read below is a cache hit.
+        let (pg_db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let crate::accounts::AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (mut redis_raw, _redis) =
+            crate::test_helpers::start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
         let pubkey = Pubkey::new_unique();
         let account = make_account(5000, &[7, 7, 7], &Pubkey::default());
         // Seed Redis using the exact key/serialization get_accounts_redis expects.

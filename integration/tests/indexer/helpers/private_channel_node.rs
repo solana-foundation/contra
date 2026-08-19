@@ -86,6 +86,7 @@ pub async fn start_private_channel_node(
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url,
+        redis_cache_url: None,
         admin_keys: vec![admin_pubkey],
         transaction_expiration_ms: 15000,
         blocktime_ms: 100,

@@ -1,5 +1,5 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
+    super::{postgres::PostgresAccountsDB, traits::AccountsDB},
     anyhow::{anyhow, Context, Result},
 };
 
@@ -30,8 +30,11 @@ pub async fn get_blocks_with_limit(
         AccountsDB::Postgres(postgres_db) => {
             get_blocks_with_limit_postgres(postgres_db, start_slot, limit).await
         }
+        // Served from the source of truth, and no slot index is cached. One
+        // would hold only the blocks written since the cache attached, so the
+        // first `limit` members it could offer would not be the ledger's.
         AccountsDB::Redis(redis_db) => {
-            get_blocks_with_limit_redis(redis_db, start_slot, limit).await
+            get_blocks_with_limit_postgres(&redis_db.fallback, start_slot, limit).await
         }
     }
 }
@@ -53,28 +56,4 @@ async fn get_blocks_with_limit_postgres(
     .context("Failed to query blocks with limit")?;
 
     Ok(slots.into_iter().map(|s| s as u64).collect())
-}
-
-async fn get_blocks_with_limit_redis(
-    db: &RedisAccountsDB,
-    start_slot: u64,
-    limit: u64,
-) -> Result<Vec<u64>> {
-    let mut conn = db.connection.clone();
-
-    // ZRANGE ... BYSCORE returns ascending score (slot) order, and LIMIT stops the
-    // scan at `limit` members rather than walking to the end. Requires Redis 6.2+.
-    let slots: Vec<u64> = redis::cmd("ZRANGE")
-        .arg("block_slot_index")
-        .arg(start_slot)
-        .arg("+inf")
-        .arg("BYSCORE")
-        .arg("LIMIT")
-        .arg(0i64)
-        .arg(limit as i64)
-        .query_async(&mut conn)
-        .await
-        .map_err(|e| anyhow!("Failed to query block slot index in Redis: {}", e))?;
-
-    Ok(slots)
 }

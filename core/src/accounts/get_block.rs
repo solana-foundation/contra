@@ -5,10 +5,9 @@ use {
         traits::{AccountsDB, BlockInfo},
     },
     anyhow::{Context, Result},
-    redis::AsyncCommands,
     sqlx::Row,
     std::sync::Arc,
-    tracing::debug,
+    tracing::{debug, warn},
 };
 
 /// `Ok(None)` means the slot genuinely holds no block on this node, which is
@@ -43,17 +42,26 @@ async fn get_block_postgres(db: &PostgresAccountsDB, slot: u64) -> Result<Option
 }
 
 async fn get_block_redis(db: &RedisAccountsDB, slot: u64) -> Result<Option<BlockInfo>> {
-    let mut conn = db.connection.clone();
     let key = format!("block:{}", slot);
-    let data: Option<Vec<u8>> = conn
-        .get(key)
-        .await
-        .with_context(|| format!("Failed to read block at slot {} from Redis", slot))?;
-
-    let Some(bytes) = data else {
-        return Ok(None);
+    let cached = match db.get_trusted::<Vec<u8>>(&key).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!("Failed to read block at slot {} from Redis: {}", slot, e);
+            None
+        }
     };
-    let block_info = bincode::deserialize(&bytes)
-        .with_context(|| format!("Failed to deserialize block at slot {}", slot))?;
-    Ok(Some(block_info))
+
+    if let Some(bytes) = cached {
+        match bincode::deserialize(&bytes) {
+            Ok(block_info) => return Ok(Some(block_info)),
+            // Written by an older build whose BlockInfo had fewer fields. Falling
+            // through keeps the slot readable; failing here would make it error
+            // for as long as the entry sat in the cache.
+            Err(e) => warn!("Failed to deserialize cached block at slot {}: {}", slot, e),
+        }
+    }
+
+    // A slot missing or unreadable in the cache is a miss, not a pruned or
+    // skipped slot.
+    get_block_postgres(&db.fallback, slot).await
 }

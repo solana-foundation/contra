@@ -129,10 +129,12 @@ Intercepts rent collection to prevent the runtime from debiting lamports from sy
 
 ### Stage 5: Settler
 
-Batches execution results every 100ms (configurable) and commits to your configured database (e.g., PostgreSQL, Redis). The settler writes:
+Batches execution results every 100ms (configurable) and commits to PostgreSQL, the source of truth, mirroring each batch to the Redis cache if one is configured. The settler writes:
 - Modified accounts
 - Transaction records
 - Block metadata (slot, blockhash, timestamp)
+
+The mirror is best-effort and covers only what the cache can serve: point lookups by pubkey, signature and slot, plus the chain tip. Ranges, history and counters are read from PostgreSQL, because a short answer from a partial mirror is indistinguishable from a complete one. A failed cache write drops the keys it would have updated so reads miss and resolve against PostgreSQL, and leaves the cached tip behind, which makes the next batch rebuild the cache.
 
 Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop.
 

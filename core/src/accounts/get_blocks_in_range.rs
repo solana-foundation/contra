@@ -1,11 +1,9 @@
 use {
     super::{
         postgres::PostgresAccountsDB,
-        redis::RedisAccountsDB,
         traits::{AccountsDB, BlockInfo},
     },
     anyhow::{Context, Result},
-    redis::AsyncCommands,
     sqlx::Row,
 };
 
@@ -18,8 +16,11 @@ pub async fn get_blocks_in_range(
         AccountsDB::Postgres(postgres_db) => {
             get_blocks_in_range_postgres(postgres_db, start_slot, end_slot).await
         }
+        // Served from the source of truth. The cached form skipped slots it had
+        // no entry for, which silently shortened the range; this path feeds the
+        // dedup rebuild, where a dropped block means a replay slips through.
         AccountsDB::Redis(redis_db) => {
-            get_blocks_in_range_redis(redis_db, start_slot, end_slot).await
+            get_blocks_in_range_postgres(&redis_db.fallback, start_slot, end_slot).await
         }
     }
 }
@@ -49,57 +50,6 @@ async fn get_blocks_in_range_postgres(
         let block = bincode::deserialize::<BlockInfo>(&data)
             .context("Failed to deserialize block in range query (likely pre-upgrade block data; wipe the DB or add a migration shim)")?;
         blocks.push(block);
-    }
-
-    Ok(blocks)
-}
-
-/// Maximum number of keys per Redis MGET command.
-/// Keeps individual commands bounded regardless of how large max_blockhashes grows.
-const MGET_CHUNK_SIZE: u64 = 1000;
-
-async fn get_blocks_in_range_redis(
-    db: &RedisAccountsDB,
-    start_slot: u64,
-    end_slot: u64,
-) -> Result<Vec<BlockInfo>> {
-    if start_slot > end_slot {
-        return Ok(Vec::new());
-    }
-
-    let mut conn = db.connection.clone();
-    let mut blocks = Vec::new();
-
-    // Issue MGET in fixed-size chunks so a single command stays bounded
-    // regardless of how large the slot range is.
-    let mut chunk_start = start_slot;
-    while chunk_start <= end_slot {
-        let chunk_end = (chunk_start + MGET_CHUNK_SIZE - 1).min(end_slot);
-
-        let keys: Vec<String> = (chunk_start..=chunk_end)
-            .map(|slot| format!("block:{}", slot))
-            .collect();
-
-        let values: Vec<Option<Vec<u8>>> = conn
-            .mget(&keys)
-            .await
-            .context("Failed to MGET blocks from Redis")?;
-
-        for (slot, maybe_bytes) in (chunk_start..=chunk_end).zip(values) {
-            let Some(bytes) = maybe_bytes else {
-                continue;
-            };
-            // A trailing field was added to BlockInfo, so a decode failure here most
-            // likely means pre-upgrade block data. This path feeds the dedup rebuild,
-            // so we fail closed (propagate) rather than silently drop the block and
-            // seed an incomplete cache; wipe the DB or add a migration shim to recover.
-            let block = bincode::deserialize::<BlockInfo>(&bytes).with_context(|| {
-                format!("Failed to deserialize block {slot} from Redis (likely pre-upgrade block data; wipe the DB or add a migration shim)")
-            })?;
-            blocks.push(block);
-        }
-
-        chunk_start = chunk_end + 1;
     }
 
     Ok(blocks)

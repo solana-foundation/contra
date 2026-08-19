@@ -81,9 +81,7 @@ groups:
                     params: [1]
               refId: C
 
-      # Core services (gateway, write-node, read-node, operators): a failing /health
-      # probe means a real outage, so keep it fast at 30s. Excludes the indexers,
-      # which flap benignly on Yellowstone reconnects and are gated separately below.
+      # A failing /health probe means a real outage: page fast (30s), all services.
       - uid: service-down-probe
         title: "Solana Private Channels service down (health probe failed)"
         condition: C
@@ -104,7 +102,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: probe_success{job="blackbox-http", instance!~"http://indexer-.*"}
+              expr: probe_success{job="blackbox-http"}
               instant: true
               refId: A
           - refId: C
@@ -121,52 +119,7 @@ groups:
                     params: [1]
               refId: C
 
-      # Indexers only: a brief /health "stalled" during a Yellowstone reconnect is
-      # self-healing (the stream drops, the indexer reconnects and gap-fills the
-      # missed slots losslessly in seconds). Those blips clear in <2m, so gate the
-      # indexer probe at 2m to page only on a sustained stall, not a routine
-      # reconnect. Scoped to the indexer instances so core-service outages above
-      # still page fast. A hard-down indexer process still pages via the scrape
-      # alert (up == 0), which does not flap this way.
-      - uid: service-down-probe-indexer
-        title: "Indexer down (health probe failed 2m+)"
-        condition: C
-        for: 2m
-        # No indexer probe series means this stack doesn't probe the indexers
-        # (e.g. a dev monitoring stack), not an indexer outage. A real down
-        # emits probe_success=0 and fires; this just avoids a permanent alert
-        # when the instance filter matches nothing.
-        noDataState: OK
-        execErrState: Error
-        annotations:
-          summary: "Indexer {{ $labels.instance }} health check failing for 2m+ (sustained stall, not a routine reconnect)"
-        labels:
-          severity: critical
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 60
-              to: 0
-            datasourceUid: prometheus
-            model:
-              expr: probe_success{job="blackbox-http", instance=~"http://indexer-.*"}
-              instant: true
-              refId: A
-          - refId: C
-            relativeTimeRange:
-              from: 0
-              to: 0
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator:
-                    type: lt
-                    params: [1]
-              refId: C
-
-      # Probe-pipeline health. The filtered probe rules above use noDataState OK so
+      # Probe-pipeline health. The probe rule above uses noDataState OK so
       # a stack that doesn't probe a given target set can't false-alert. The flip
       # side: a dead blackbox exporter (all probe_success series vanish) would then
       # look healthy. Watch the pipeline itself — up == 0 on the blackbox job means

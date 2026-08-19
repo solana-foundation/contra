@@ -397,6 +397,15 @@ mod tests {
             panic!("expected Postgres variant")
         };
         let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment. Unstamped,
+        // these reads would skip Redis instead of missing in it, which is not
+        // the path under test.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
         let cache_db = AccountsDB::Redis(redis_raw);
 
         let pubkey = Pubkey::new_unique();
@@ -474,12 +483,23 @@ mod tests {
             panic!("expected Postgres variant")
         };
         let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment, and this
+        // test needs the one cached entry to actually be served.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
 
         let owner = Pubkey::new_unique();
         let first = (Pubkey::new_unique(), 100u64);
         let second = (Pubkey::new_unique(), 200u64);
         let third = (Pubkey::new_unique(), 300u64);
         let absent = Pubkey::new_unique();
+        // The cached balance differs from the row behind it, so the assertion
+        // can tell a cache hit from a fallback read at the same position.
+        let second_cached_lamports = 250u64;
 
         for (pubkey, lamports) in [first, second, third] {
             pg_db
@@ -490,7 +510,10 @@ mod tests {
         // Only the middle account is cached, so the batch is a hit sandwiched
         // between two misses.
         redis_raw
-            .set_account(second.0, AccountSharedData::new(second.1, 0, &owner))
+            .set_account(
+                second.0,
+                AccountSharedData::new(second_cached_lamports, 0, &owner),
+            )
             .await;
         let cache_db = AccountsDB::Redis(redis_raw);
 
@@ -504,7 +527,12 @@ mod tests {
             .collect();
         assert_eq!(
             lamports,
-            vec![Some(first.1), Some(second.1), Some(third.1), None],
+            vec![
+                Some(first.1),
+                Some(second_cached_lamports),
+                Some(third.1),
+                None
+            ],
             "each result must stay on the key it was asked for"
         );
     }

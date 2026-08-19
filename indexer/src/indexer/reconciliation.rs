@@ -202,7 +202,7 @@ async fn check_channel_supply_invariant(
 
     if breaches > 0 {
         return Err(IndexerError::Reconciliation(
-            ReconciliationError::MismatchExceedsThreshold {
+            ReconciliationError::SupplyExceedsCustody {
                 count: breaches,
                 threshold: config.mismatch_threshold_raw,
             },
@@ -976,7 +976,7 @@ mod tests {
         )
         .await;
         match result {
-            Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+            Err(IndexerError::Reconciliation(ReconciliationError::SupplyExceedsCustody {
                 count,
                 ..
             })) => assert_eq!(count, 1),

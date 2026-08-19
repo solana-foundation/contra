@@ -79,10 +79,10 @@ const RECONCILE_RETRY_DELAY_MS: u64 = 10;
 
 /// Whether another fill could plausibly clear this failure.
 ///
-/// Only a balance mismatch can be, and only because the chain kept moving while startup
-/// was catching up, so the next fill may pull in the rows that explain it. Storage, RPC,
-/// configuration and corruption faults produce the same answer however many times they
-/// are retried, so they stop the boot on the spot instead of paying for two more fills.
+/// Only a custody-versus-ledger mismatch can be, and only because the chain kept moving
+/// while startup was catching up, so the next fill may pull in the rows that explain it.
+/// Everything else, a supply breach included, compares the same two numbers however many
+/// times it runs, so it stops the boot on the spot instead of paying for two more fills.
 #[cfg(feature = "datasource-rpc")]
 fn reconcile_error_may_clear(error: &IndexerError) -> bool {
     matches!(
@@ -617,6 +617,13 @@ mod tests {
                 ReconciliationError::Rpc {
                     mint: "mint".to_string(),
                     reason: "unreachable".to_string(),
+                },
+                false,
+            ),
+            (
+                ReconciliationError::SupplyExceedsCustody {
+                    count: 1,
+                    threshold: 0,
                 },
                 false,
             ),

@@ -534,7 +534,7 @@ async fn perform_operator_shutdown_stages(
 /// and the run only succeeds if it got that far. Pass `None` to keep the drain-and-close
 /// behaviour with no completeness claim.
 pub async fn cleanup_after_backfill(
-    checkpoint_handle: tokio::task::JoinHandle<()>,
+    mut checkpoint_handle: tokio::task::JoinHandle<()>,
     checkpoint_tx: mpsc::Sender<CheckpointMsg>,
     storage: Arc<Storage>,
     verify: Option<(ProgramType, u64)>,
@@ -549,13 +549,22 @@ pub async fn cleanup_after_backfill(
 
     match tokio::time::timeout(
         Duration::from_secs(config.checkpoint_drain_timeout_secs),
-        checkpoint_handle,
+        &mut checkpoint_handle,
     )
     .await
     {
         Ok(Ok(_)) => info!("Checkpoint writer drained successfully"),
         Ok(Err(e)) => warn!("Checkpoint writer error: {:?}", e),
-        Err(_) => warn!("Checkpoint writer drain timed out"),
+        Err(_) => {
+            // Timing out only stops waiting; the task keeps running unless it is cancelled.
+            // Both stages below would then race it: the read could miss a flush that lands
+            // moments later and call a finished backfill incomplete, and the close would
+            // pull the pool out from under a write still in flight. Cancelling first makes
+            // the checkpoint read afterwards a settled fact rather than a snapshot.
+            warn!("Checkpoint writer drain timed out; cancelling it before verifying");
+            checkpoint_handle.abort();
+            let _ = checkpoint_handle.await;
+        }
     }
 
     // Stage 2: Confirm the range was recorded, after the drain flushed the last batch and
@@ -733,6 +742,37 @@ mod tests {
         assert!(
             result.is_ok(),
             "an absent checkpoint must not fail a run that asked for no verification"
+        );
+    }
+
+    /// A writer that outlasts the drain timeout is cancelled, not left running.
+    ///
+    /// Waiting on a task and stopping it are different things, and only the second one makes
+    /// the stages that follow safe. The probe is an `Arc` the task owns: a cancelled task is
+    /// dropped and releases its clone, while a merely detached one keeps it alive, so the
+    /// strong count separates the two cases that otherwise look identical from out here.
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_after_backfill_cancels_a_writer_that_overruns_the_drain_timeout() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let (checkpoint_tx, _checkpoint_rx) = mpsc::channel::<CheckpointMsg>(1);
+
+        let probe = Arc::new(());
+        let held = probe.clone();
+        let checkpoint_handle = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        // Let the task reach its await point so it really owns the clone.
+        tokio::task::yield_now().await;
+        assert_eq!(Arc::strong_count(&probe), 2, "task must hold the probe");
+
+        let result = cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage, None).await;
+
+        assert!(result.is_ok(), "a drain timeout alone is not a failed run");
+        assert_eq!(
+            Arc::strong_count(&probe),
+            1,
+            "the writer must be cancelled before the checkpoint is read and the pool closed"
         );
     }
 

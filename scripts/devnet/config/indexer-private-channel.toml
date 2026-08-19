@@ -3,8 +3,10 @@
 
 [common]
 program_type = "withdraw"
-# Solana Private Channels gateway based on docker compose
-rpc_url = "http://gateway:8899"
+# Solana Private Channels gateway based on docker compose, on its internal
+# listener: no JWT is carried and getBlock is operator-only on the public one.
+# Compose overrides this with the read-node, which serves the same reads.
+rpc_url = "http://gateway:8904"
 # Optional archival fallback for rpc_url. Re-checks a Dead finality verdict (operator)
 # and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"

@@ -4,7 +4,7 @@ pub mod metrics;
 
 use crate::auth::{
     auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, AuthDecision,
+    forbidden_body, redacts_transaction_errors, AuthDecision,
 };
 use clap::Parser;
 use governor::clock::DefaultClock;
@@ -70,6 +70,18 @@ pub struct Args {
     #[arg(short, long, env = "GATEWAY_PORT", default_value = "8898")]
     pub port: u16,
 
+    /// Port for the internal listener, which serves the operator's own services:
+    /// no RBAC, no error redaction. Unset or blank means no internal listener.
+    ///
+    /// It must never be reachable from outside the mesh. Inside a container it
+    /// binds all interfaces like the main port; what keeps it internal is that
+    /// nothing publishes it to the host.
+    ///
+    /// Held as a string so a blank value is not a parse error: see
+    /// `configured_internal_port`.
+    #[arg(long, env = "GATEWAY_INTERNAL_PORT")]
+    pub internal_port: Option<String>,
+
     /// Write node URL (for send_transaction requests)
     #[arg(short, long, env = "GATEWAY_WRITE_URL")]
     pub write_url: String,
@@ -100,8 +112,8 @@ pub struct Args {
     #[arg(long, env = "AUTH_DATABASE_MAX_CONNECTIONS", default_value = "10")]
     pub auth_database_max_connections: u32,
 
-    /// Maximum number of concurrent client connections. Connections beyond this
-    /// are dropped so a flood cannot exhaust file descriptors or memory.
+    /// Maximum number of concurrent client connections per listener. Connections
+    /// beyond this are dropped so a flood cannot exhaust file descriptors or memory.
     #[arg(long, env = "GATEWAY_MAX_CONNECTIONS", default_value = "1024")]
     pub max_connections: NonZeroUsize,
 
@@ -168,11 +180,28 @@ pub struct Args {
     pub rate_limit_burst: NonZeroU32,
 }
 
+/// Which trust tier a listener serves. The gateway's RBAC is an application
+/// control on the public port; the internal port is a network boundary instead,
+/// and the two must not be confused.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Access {
+    /// Publicly reachable. RBAC is enforced and transaction errors are collapsed
+    /// for everyone but an Operator.
+    Public,
+    /// Reachable only from the internal network. No RBAC and raw errors: the
+    /// operator services carry no JWT, and their confirmation handling routes on
+    /// the exact `TransactionError` (an `AccountAlreadyInitialized` means a mint
+    /// is already there, an `UninitializedAccount` triggers the JIT mint init).
+    Internal,
+}
+
 /// Tunable resource limits for the serve loop and request handling.
 #[derive(Clone, Copy)]
 pub struct Limits {
-    /// Max concurrent client connections. Connections past this are dropped
-    /// so a flood cannot exhaust file descriptors or memory.
+    /// Max concurrent client connections per listener. Connections past this are
+    /// dropped so a flood cannot exhaust file descriptors or memory. Per
+    /// listener, not per process: with the internal listener enabled the process
+    /// accepts up to twice this, though only the public one is floodable.
     pub max_connections: NonZeroUsize,
     /// Max concurrent connections from a single client IP, so one host cannot
     /// consume the whole global connection budget.
@@ -329,6 +358,68 @@ impl Drop for IpConnGuard {
 /// to start.
 fn configured_secret(secret: Option<&str>) -> Option<&str> {
     secret.filter(|s| !s.trim().is_empty())
+}
+
+/// A blank `GATEWAY_INTERNAL_PORT` means "no internal listener", the same way a
+/// blank `JWT_SECRET` means "no auth". Compose substitutes an unset variable as
+/// the empty string, so an env file that predates the internal listener must
+/// leave the gateway running without one rather than fail to start.
+fn configured_internal_port(port: Option<&str>) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+    let Some(port) = port.map(str::trim).filter(|port| !port.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = port
+        .parse::<u16>()
+        .map_err(|e| format!("GATEWAY_INTERNAL_PORT is not a valid port number: {e}"))?;
+    Ok(Some(parsed))
+}
+
+/// Replaces every non-null transaction error with one constant marker.
+/// Transactions are indexed under every account they touched and their status is
+/// readable by anyone holding the signature, so distinct error codes let a
+/// caller who owns only the destination of a failed transfer binary-search the
+/// source's balance.
+///
+/// Covers both response shapes: `getSignaturesForAddress` returns a bare array,
+/// `getSignatureStatuses` wraps its entries in `result.value` and repeats the
+/// same error in a legacy `status` field. The marker is a valid
+/// `TransactionError` so clients still parse the page. A body with neither shape
+/// carries no error and passes through.
+fn redact_transaction_errors(body: Bytes) -> Bytes {
+    let Ok(mut json) = serde_json::from_slice::<Value>(&body) else {
+        warn!("History response was not JSON, forwarding it unchanged");
+        return body;
+    };
+    let entries = match json.get_mut("result") {
+        Some(Value::Array(entries)) => entries,
+        Some(result) => match result
+            .get_mut("value")
+            .and_then(|value| value.as_array_mut())
+        {
+            Some(entries) => entries,
+            None => return body,
+        },
+        None => return body,
+    };
+    for entry in entries {
+        if let Some(err) = entry.get_mut("err").filter(|err| !err.is_null()) {
+            *err = redacted_error();
+        }
+        // Leaving the legacy `status` untouched would hand back the same value
+        // under a different key.
+        if let Some(err) = entry
+            .get_mut("status")
+            .and_then(|status| status.get_mut("Err"))
+        {
+            *err = redacted_error();
+        }
+    }
+    Bytes::from(json.to_string())
+}
+
+/// The single error every collapsed transaction reports.
+fn redacted_error() -> Value {
+    serde_json::json!({ "InstructionError": [0, "GenericError"] })
 }
 
 impl Gateway {
@@ -568,8 +659,9 @@ impl Gateway {
 
     /// Enforces RBAC on gated methods.
     ///
-    /// Returns `Some(response)` if the request must be rejected, `None` if it
-    /// may proceed. No-ops immediately when auth is not configured.
+    /// Returns `Err(response)` if the request must be rejected. `Ok(redact)` if
+    /// it may proceed, where `redact` marks a response whose transaction errors
+    /// must be collapsed. No-ops immediately when auth is not configured.
     async fn enforce_auth(
         &self,
         auth_header: Option<&str>,
@@ -577,16 +669,24 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Option<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>> {
+    ) -> Result<bool, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
+    {
+        // Auth off, so nothing is redacted either. Every method is ungated in this
+        // mode, so a caller reads the balance straight from getTokenAccountBalance
+        // instead of inferring it from error codes. Redacting would also hit the
+        // operator services, since with no key we cannot tell who is an Operator.
         let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
             (Some(k), Some(db)) => (k, db),
-            _ => return None,
+            _ => return Ok(false),
         };
 
         let decision = check_request_auth(auth_header, decoding_key, method, params);
+        // Independent of the decision: authorizing the request says nothing
+        // about whether the caller may see why execution failed.
+        let redact = redacts_transaction_errors(auth_header, decoding_key, method);
 
         let (status, body) = match decision {
-            AuthDecision::Proceed => return None,
+            AuthDecision::Proceed => return Ok(redact),
             AuthDecision::Reject(status, body) => (status, body),
             AuthDecision::NeedsAccountFetch { user_id, pubkey } => {
                 let result = match self.fetch_account_for_auth(&pubkey).await {
@@ -612,7 +712,7 @@ impl Gateway {
                     ),
                 };
                 match result {
-                    AuthDecision::Proceed => return None,
+                    AuthDecision::Proceed => return Ok(redact),
                     AuthDecision::Reject(status, body) => (status, body),
                     AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
                 }
@@ -633,7 +733,7 @@ impl Gateway {
             &status.as_u16().to_string(),
             start.elapsed().as_secs_f64(),
         );
-        Some(self.error_response(status, Some(body)))
+        Err(self.error_response(status, Some(body)))
     }
 
     /// Build a JSON-RPC–style error body for 413 responses.
@@ -664,6 +764,7 @@ impl Gateway {
         req: Request<Incoming>,
         rate_key: IpAddr,
         rate_limiter: Arc<IpRateLimiter>,
+        access: Access,
     ) -> Result<
         Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
         hyper::Error,
@@ -743,8 +844,10 @@ impl Gateway {
 
         // Rate-limit only the JSON-RPC POST path. OPTIONS preflights, /health,
         // and /ready returned above, so a 429 here never blocks a CORS preflight
-        // or trips a health probe.
-        if rate_limiter.check_key(&rate_key).is_err() {
+        // or trips a health probe. The internal listener is exempt: it isn't
+        // reachable from outside the mesh, and one backfill batch alone issues
+        // more requests than the public per-IP burst allows.
+        if access == Access::Public && rate_limiter.check_key(&rate_key).is_err() {
             metrics::GATEWAY_REJECTED_TOTAL
                 .with_label_values(&["rate_limit"])
                 .inc();
@@ -890,13 +993,19 @@ impl Gateway {
         };
 
         // --- RBAC enforcement ---
+        // Skipped on the internal listener: the operator services carry no JWT,
+        // and they need the raw errors their confirmation handling routes on.
         let params = json.get("params").cloned().unwrap_or(Value::Null);
-        if let Some(rejection) = self
-            .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
-            .await
-        {
-            return Ok(rejection);
-        }
+        let redact_tx_errors = match access {
+            Access::Internal => false,
+            Access::Public => match self
+                .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
+                .await
+            {
+                Ok(redact) => redact,
+                Err(rejection) => return Ok(rejection),
+            },
+        };
 
         let (target_url, target_label) = if method == "sendTransaction" {
             info!("Routing sendTransaction to write node");
@@ -972,7 +1081,27 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                Ok(Response::from_parts(parts, body.boxed_unsync()))
+                if !redact_tx_errors {
+                    return Ok(Response::from_parts(parts, body.boxed_unsync()));
+                }
+
+                // Rewriting the page means buffering it instead of streaming.
+                let collected = match body.collect().await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(e) => {
+                        error!("Failed to read response from {}: {}", target_url, e);
+                        return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
+                    }
+                };
+                // Redaction changes the length, so let hyper re-frame the body.
+                parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                parts.headers.remove(hyper::header::TRANSFER_ENCODING);
+                Ok(Response::from_parts(
+                    parts,
+                    Full::new(redact_transaction_errors(collected))
+                        .map_err(|never| match never {})
+                        .boxed_unsync(),
+                ))
             }
             Err(e) => {
                 error!("Failed to forward request to {}: {}", target_url, e);
@@ -992,8 +1121,13 @@ impl Gateway {
 pub async fn serve(
     listener: TcpListener,
     gateway: Arc<Gateway>,
+    access: Access,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Gateway listening on http://{}", listener.local_addr()?);
+    info!(
+        "Gateway listening on http://{} ({:?})",
+        listener.local_addr()?,
+        access
+    );
 
     // Cap total concurrent connections. A connection past the cap is dropped
     // at once rather than queued, so a flood can't pile up resources.
@@ -1089,7 +1223,11 @@ pub async fn serve(
             let service = service_fn(move |req| {
                 let gateway = Arc::clone(&gateway);
                 let rate_limiter = Arc::clone(&rate_limiter);
-                async move { gateway.handle_request(req, rate_key, rate_limiter).await }
+                async move {
+                    gateway
+                        .handle_request(req, rate_key, rate_limiter, access)
+                        .await
+                }
             });
 
             // The timer is required for header_read_timeout to take effect; it
@@ -1108,6 +1246,14 @@ pub async fn serve(
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting PrivateChannel Gateway");
     info!("  Port: {}", args.port);
+    let internal_port = configured_internal_port(args.internal_port.as_deref())?;
+    info!(
+        "  Internal port: {}",
+        match internal_port {
+            Some(port) => port.to_string(),
+            None => "disabled".to_string(),
+        }
+    );
     info!("  Write URL: {}", args.write_url);
     info!("  Read URL: {}", args.read_url);
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
@@ -1181,10 +1327,18 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .with_limits(limits),
     );
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
-    let listener = TcpListener::bind(addr).await?;
+    let public = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], args.port))).await?;
 
-    serve(listener, gateway).await
+    let Some(internal_port) = internal_port else {
+        return serve(public, gateway, Access::Public).await;
+    };
+
+    let internal = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], internal_port))).await?;
+    tokio::try_join!(
+        serve(public, Arc::clone(&gateway), Access::Public),
+        serve(internal, gateway, Access::Internal),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1230,7 +1384,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            let _ = serve(listener, gateway).await;
+            let _ = serve(listener, gateway, Access::Public).await;
         });
 
         addr
@@ -1506,7 +1660,7 @@ mod tests {
             None,
         ));
         let handle = tokio::spawn(async move {
-            let _ = serve(listener, gateway).await;
+            let _ = serve(listener, gateway, Access::Public).await;
         });
 
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
@@ -1834,6 +1988,108 @@ mod tests {
         assert_eq!(rate_limit_key(v4), v4);
     }
 
+    /// Both legs of the balance probe (InsufficientFunds above the source
+    /// balance, MintMismatch at or below it) must come back indistinguishable.
+    #[test]
+    fn history_errors_collapse_to_one_marker() {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                {"signature": "sig1", "slot": 1, "err": {"InstructionError": [0, {"Custom": 1}]}},
+                {"signature": "sig2", "slot": 2, "err": {"InstructionError": [0, {"Custom": 3}]}},
+                {"signature": "sig3", "slot": 3, "err": null}
+            ]
+        })
+        .to_string();
+
+        let redacted: Value =
+            serde_json::from_slice(&redact_transaction_errors(Bytes::from(body))).unwrap();
+
+        let entries = redacted["result"].as_array().unwrap();
+        assert_eq!(
+            entries[0]["err"], entries[1]["err"],
+            "two different program errors must not stay distinguishable"
+        );
+        assert_eq!(
+            entries[0]["err"],
+            json!({"InstructionError": [0, "GenericError"]})
+        );
+        assert!(
+            entries[2]["err"].is_null(),
+            "a landed transaction keeps err: null"
+        );
+    }
+
+    /// Compose substitutes an unset variable as the empty string, so a blank
+    /// value must disable the internal listener rather than fail to start.
+    #[test]
+    fn blank_internal_port_disables_the_listener() {
+        assert_eq!(configured_internal_port(None).unwrap(), None);
+        assert_eq!(configured_internal_port(Some("")).unwrap(), None);
+        assert_eq!(configured_internal_port(Some("  ")).unwrap(), None);
+        assert_eq!(configured_internal_port(Some("8904")).unwrap(), Some(8904));
+        assert!(configured_internal_port(Some("not-a-port")).is_err());
+    }
+
+    /// `getSignatureStatuses` nests its entries and reports the error twice, so
+    /// both copies have to collapse or the probe just reads the other one.
+    #[test]
+    fn signature_status_errors_collapse_in_both_fields() {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "context": {"slot": 3},
+                "value": [
+                    {
+                        "slot": 1,
+                        "confirmations": null,
+                        "err": {"InstructionError": [0, {"Custom": 1}]},
+                        "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                        "confirmationStatus": "finalized"
+                    },
+                    {
+                        "slot": 2,
+                        "confirmations": null,
+                        "err": {"InstructionError": [0, {"Custom": 3}]},
+                        "status": {"Err": {"InstructionError": [0, {"Custom": 3}]}},
+                        "confirmationStatus": "finalized"
+                    },
+                    {
+                        "slot": 3,
+                        "confirmations": null,
+                        "err": null,
+                        "status": {"Ok": null},
+                        "confirmationStatus": "finalized"
+                    },
+                    null
+                ]
+            }
+        })
+        .to_string();
+
+        let redacted: Value =
+            serde_json::from_slice(&redact_transaction_errors(Bytes::from(body))).unwrap();
+
+        let entries = redacted["result"]["value"].as_array().unwrap();
+        let marker = json!({"InstructionError": [0, "GenericError"]});
+        assert_eq!(entries[0]["err"], marker);
+        assert_eq!(entries[1]["err"], marker);
+        assert_eq!(
+            entries[0]["status"]["Err"], marker,
+            "the legacy status field must not keep the real error"
+        );
+        assert_eq!(entries[1]["status"]["Err"], marker);
+        assert!(entries[2]["err"].is_null());
+        assert_eq!(
+            entries[2]["status"],
+            json!({"Ok": null}),
+            "a landed transaction keeps its Ok status"
+        );
+        assert!(entries[3].is_null(), "an unknown signature stays null");
+    }
+
     /// Shared secret for the ownership-fetch tests below, used by both the token
     /// minter and the gateway under test.
     const TEST_JWT_SECRET: &str = "test-gateway-secret";
@@ -1862,7 +2118,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = serve(listener, gateway).await;
+            let _ = serve(listener, gateway, Access::Public).await;
         });
 
         addr

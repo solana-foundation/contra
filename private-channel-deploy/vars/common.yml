@@ -40,6 +40,9 @@ write_port: 8900
 read_port: 8901
 streamer_port: 8902
 auth_port: 8903
+# Not host-side: the gateway's internal listener is never published, so it has
+# no health probe. Compose services reach it as http://gateway:<this>.
+gateway_internal_port: 8904
 
 # --- Health phase tuning ---
 # Per-service probe budget. With backoff inside the retry loop this gives

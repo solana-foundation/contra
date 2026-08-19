@@ -50,11 +50,25 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--port` | `GATEWAY_PORT` | `8898` | Listen port |
+| `--internal-port` | `GATEWAY_INTERNAL_PORT` | — | Internal listen port; unset means no internal listener |
 | `--write-url` | `GATEWAY_WRITE_URL` | — | Write node URL |
 | `--read-url` | `GATEWAY_READ_URL` | — | Read node URL |
 | `--cors-allowed-origin` | `GATEWAY_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
 
 Routes `sendTransaction` to the write node; all other RPC methods go to the read node.
+
+The internal port serves the operator's own services: no RBAC, no rate limiting,
+and transaction errors are not collapsed. It must never be published to the host.
+Compose gives it no `ports:` entry, which is the only thing keeping it internal.
+
+**Internal services must never use `GATEWAY_URL`.** They carry no JWT, so once
+RBAC is on the public port answers 401 to every gated read (`getBlock`,
+`getAccountInfo`, `getSignaturesForAddress`) and indexing or minting stalls while
+the stack still looks healthy. Use:
+
+- `GATEWAY_INTERNAL_URL` if the service also sends transactions, since only the
+  gateway routes writes to the write node.
+- `GATEWAY_READ_URL` if it only reads. The read node has no auth layer at all.
 
 ### Streamer
 

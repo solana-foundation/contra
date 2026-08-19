@@ -238,6 +238,11 @@ write-node (`8900`) and read-node (`8901`) RPC ports have **no node-side authent
 reference compose binds these node ports to loopback (`127.0.0.1`), so they are reachable from the host
 but not from other machines. RBAC is an application-layer control on the gateway, not a network boundary.
 
+The gateway also runs a second listener (`8904`) for the operator's own services, which carry no JWT. It
+has no RBAC and does not collapse transaction errors, and compose gives it no `ports:` entry at all, so it
+exists on the Docker network and nowhere else. Do not publish it: that absence is what keeps the errors
+the public port hides out of reach.
+
 ## Step 7: Configure the Instance (Whitelist Mint + Add Operator)
 
 With the services running, configure the instance from the Admin UI. Because the indexer is already streaming, the `AllowMint` and `AddOperator` events are indexed live — no backfill needed, and your first deposit won't be quarantined.

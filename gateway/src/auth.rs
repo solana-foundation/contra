@@ -72,8 +72,43 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 const ACCOUNT_GATED_METHODS: &[&str] = &[
     "getAccountInfo",
     "getTokenAccountBalance",
-    "getSignaturesForAddress",
+    GET_SIGNATURES_FOR_ADDRESS,
 ];
+
+/// Transaction history. Gated like the two above.
+pub const GET_SIGNATURES_FOR_ADDRESS: &str = "getSignaturesForAddress";
+
+/// Signature status lookup. Ungated, since any caller may poll a signature it
+/// already holds, but its response carries the same execution errors as a
+/// history page.
+const GET_SIGNATURE_STATUSES: &str = "getSignatureStatuses";
+
+/// Methods whose response carries per-transaction execution errors. A stored
+/// transaction is indexed under every account it touched, and its status is
+/// readable by anyone holding the signature, so neither method's authorization
+/// proves the caller may see which account made execution fail.
+const ERROR_BEARING_METHODS: &[&str] = &[GET_SIGNATURES_FOR_ADDRESS, GET_SIGNATURE_STATUSES];
+
+/// Whether `method`'s response must have its transaction errors collapsed before
+/// it reaches this caller. Only an Operator keeps the raw diagnostics; a User
+/// and an anonymous caller are treated alike, because the attack works with no
+/// token at all. Callers reaching the gateway's internal listener never get
+/// here: see `Access` in lib.rs.
+pub fn redacts_transaction_errors(
+    auth_header: Option<&str>,
+    decoding_key: &DecodingKey,
+    method: &str,
+) -> bool {
+    if !ERROR_BEARING_METHODS.contains(&method) {
+        return false;
+    }
+
+    let role = auth_header
+        .and_then(|header| verify_bearer(header, decoding_key))
+        .map(|claims| claims.role);
+
+    role != Some(Role::Operator)
+}
 
 // ---------------------------------------------------------------------------
 // Token program IDs
@@ -687,6 +722,51 @@ mod tests {
         assert!(matches!(
             decision,
             AuthDecision::NeedsAccountFetch { ref pubkey, .. } if pubkey == "SomePubkey"
+        ));
+    }
+
+    // ── redacts_transaction_errors ────────────────────────────────────────────
+
+    /// `getSignatureStatuses` is ungated, so the anonymous caller (the shape the
+    /// balance probe actually takes) must be redacted just like a User.
+    #[test]
+    fn error_bearing_methods_redact_for_everyone_but_operator() {
+        let user = format!("Bearer {}", forge_token(Role::User, 3600));
+        let operator = format!("Bearer {}", forge_token(Role::Operator, 3600));
+
+        for method in ["getSignaturesForAddress", "getSignatureStatuses"] {
+            assert!(redacts_transaction_errors(None, &decoding_key(), method));
+            assert!(redacts_transaction_errors(
+                Some(&user),
+                &decoding_key(),
+                method
+            ));
+            assert!(!redacts_transaction_errors(
+                Some(&operator),
+                &decoding_key(),
+                method
+            ));
+        }
+    }
+
+    /// An expired operator token is not an operator, so it must not unlock the
+    /// raw errors.
+    #[test]
+    fn expired_operator_token_still_redacts() {
+        let expired = format!("Bearer {}", forge_token(Role::Operator, -3600));
+        assert!(redacts_transaction_errors(
+            Some(&expired),
+            &decoding_key(),
+            "getSignatureStatuses"
+        ));
+    }
+
+    #[test]
+    fn methods_without_transaction_errors_are_untouched() {
+        assert!(!redacts_transaction_errors(
+            None,
+            &decoding_key(),
+            "getAccountInfo"
         ));
     }
 

@@ -2,9 +2,9 @@
 //!
 //! Reconnect gap repair replays from the durable checkpoint, so `run` must persist one
 //! before the Yellowstone stream can deliver anything. These tests pin the value it picks:
-//! the chain tip when no startup backfill resolved a boundary, and the boundary's floor
-//! when one did. Picking the top of the resolved range instead would durably claim the
-//! slots backfill has not fetched yet, which is the loss the anchor exists to prevent.
+//! the chain tip when no startup backfill resolved a boundary, and the checkpoint the fill
+//! itself committed when one did. Either way the anchor never names a slot nothing has
+//! read, which is the loss it exists to prevent.
 
 use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::{
@@ -184,10 +184,14 @@ async fn run_persists_tip_anchor_before_streaming() {
     ys.shutdown().await;
 }
 
-/// With startup backfill resolving a range, the anchor is that range's floor. The tip and
-/// the live start slot both sit above slots backfill has yet to fetch, so recording either
-/// would mark them handled and put them permanently out of reach. All three are plain u64,
-/// so nothing but this test stops the wrong one being passed.
+/// With startup backfill resolving a range, the anchor never claims a slot nothing has
+/// read. Startup fills the range and waits for its checkpoint before the stream starts, so
+/// by the time the anchor is needed the durable checkpoint is already the fill target and
+/// stands as the anchor: every slot beneath it is proven written, one at a time, by the
+/// gate that only advances across contiguous slots.
+///
+/// The live start slot sits one past the target and is still wrong to record, and it and
+/// the target are both plain u64, so nothing but this test stops the wrong one being used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_anchors_at_resolved_from_slot_not_the_tip() {
     init_tracing();
@@ -207,28 +211,32 @@ async fn run_anchors_at_resolved_from_slot_not_the_tip() {
         .expect_at_least(0)
         .create_async()
         .await;
+    // Every slot in the range must actually be fetched: the checkpoint the anchor comes
+    // from is only reachable once all of them are written.
+    let mut block_mocks = Vec::new();
     for slot in START_SLOT..=TIP {
-        let _block = rpc
-            .mock("POST", "/")
-            .match_body(Matcher::PartialJson(
-                json!({"method": "getBlock", "params": [slot]}),
-            ))
-            .with_status(200)
-            .with_body(
-                json!({
-                    "jsonrpc": "2.0",
-                    "result": {
-                        "blockhash": "TestBlockHash11111111111111111111111111111",
-                        "parentSlot": slot - 1,
-                        "transactions": []
-                    },
-                    "id": 1
-                })
-                .to_string(),
-            )
-            .expect_at_least(0)
-            .create_async()
-            .await;
+        block_mocks.push(
+            rpc.mock("POST", "/")
+                .match_body(Matcher::PartialJson(
+                    json!({"method": "getBlock", "params": [slot]}),
+                ))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash11111111111111111111111111111",
+                            "parentSlot": slot - 1,
+                            "transactions": []
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .expect_at_least(1)
+                .create_async()
+                .await,
+        );
     }
 
     let ys = MockYellowstoneServer::start().await;
@@ -254,11 +262,18 @@ async fn run_anchors_at_resolved_from_slot_not_the_tip() {
     let anchor = wait_for_anchor(&pool, "withdraw", 60).await;
     assert_eq!(
         anchor,
-        floor,
-        "the anchor must be the resolved range floor, not the tip ({TIP}) \
-         or the live start slot ({})",
+        TIP,
+        "the anchor must be the filled range's committed target, not the live start slot ({})",
         TIP + 1
     );
+    assert!(
+        anchor >= floor,
+        "the anchor must never fall below the range floor ({floor})"
+    );
+    // Proof the anchor was earned rather than assumed: every slot in the range was fetched.
+    for m in &block_mocks {
+        m.assert_async().await;
+    }
 
     handle.abort();
     ys.shutdown().await;

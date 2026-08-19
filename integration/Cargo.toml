@@ -112,6 +112,11 @@ path = "tests/indexer/reconnect_gap_fill_fail_closed.rs"
 name = "startup_anchor"
 path = "tests/indexer/startup_anchor.rs"
 
+# Startup ordering: backfill completes and commits before escrow reconciliation.
+[[test]]
+name = "startup_backfill_reconcile"
+path = "tests/indexer/startup_backfill_reconcile.rs"
+
 # Yellowstone inner_instructions + unknown-discriminator arms.
 [[test]]
 name = "yellowstone_inner_and_unknown"

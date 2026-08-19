@@ -144,4 +144,17 @@ pub enum CheckpointError {
 
     #[error("Invalid checkpoint: slot {slot} is before last checkpoint {last}")]
     InvalidCheckpoint { slot: u64, last: u64 },
+
+    /// `last` stays an Option so "stalled at slot N" and "no row was ever written" read
+    /// differently in the log: the first points at an unprocessed slot in the range, the
+    /// second at a checkpoint writer that never flushed. They need different responses.
+    #[error(
+        "Checkpoint for {program_type} reached {last:?}, never {target}, after {waited_secs}s"
+    )]
+    CommitTimeout {
+        program_type: String,
+        last: Option<u64>,
+        target: u64,
+        waited_secs: u64,
+    },
 }

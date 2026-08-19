@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Gated ticks with no frontier advance before a stall warning fires (~15s at 5s/tick).
 const STALL_WARN_TICKS: u32 = 3;
@@ -348,6 +348,87 @@ pub async fn get_last_checkpoint(
 
     info!("Last checkpoint for {:?}: {:?}", program_type, checkpoint);
     Ok(checkpoint)
+}
+
+/// Longest startup will wait for a filled range to become durable before giving up.
+///
+/// Sized as a fail-closed backstop rather than a tuning knob. By the time the wait starts
+/// every message has already been sent, and the instruction channel holds at most a
+/// thousand of them, so what remains is the processor draining that buffer plus one flush
+/// interval. Two minutes is far above that, and exceeding it means a slot is genuinely
+/// stuck rather than slow.
+pub const CHECKPOINT_COMMIT_TIMEOUT_SECS: u64 = 120;
+
+/// How often the wait re-reads the durable checkpoint.
+const CHECKPOINT_COMMIT_POLL_MS: u64 = 200;
+
+/// Wait until the durable checkpoint for `program_type` covers `target`.
+///
+/// This is the witness that a backfilled range is both processed and persisted. It is
+/// exact rather than approximate because the writer's gate seeds its frontier at the
+/// range floor and then advances only across contiguous slots, so the checkpoint cannot
+/// reach the target until every slot in between has been fully written.
+///
+/// A read failure is a database blip and is retried; an absent row means the writer has
+/// not flushed for the first time yet, which is normal on a fresh store, so it is also
+/// retried. Only the deadline ends this unsuccessfully, and it does so by failing the
+/// boot: continuing would compare on-chain custody against a ledger still missing a slot.
+pub async fn wait_for_checkpoint_commit(
+    storage: &Arc<Storage>,
+    program_type: ProgramType,
+    target: u64,
+    timeout: Duration,
+) -> Result<(), CheckpointError> {
+    let started = tokio::time::Instant::now();
+    let key = program_key(program_type);
+    let mut last: Option<u64> = None;
+    // Only a successful read tells us anything about the frontier. Without this, a store
+    // whose reads all fail would time out reporting "no row was ever written", sending an
+    // operator after a stalled writer when the real fault is an unreachable database.
+    let mut read_ok = false;
+
+    loop {
+        // Read the row directly rather than through get_last_checkpoint, whose per-call
+        // info log would emit hundreds of lines across a long wait.
+        match storage.get_committed_checkpoint(&key).await {
+            Ok(committed) => {
+                last = committed;
+                read_ok = true;
+                if committed.is_some_and(|slot| slot >= target) {
+                    info!(
+                        "Checkpoint for {:?} committed at {:?}, covering backfill target {}",
+                        program_type, committed, target
+                    );
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Checkpoint read failed while waiting for {:?} to reach {}, retrying: {}",
+                    program_type, target, e
+                );
+            }
+        }
+
+        let waited_secs = started.elapsed().as_secs();
+        if started.elapsed() >= timeout {
+            if !read_ok {
+                error!(
+                    "Checkpoint for {:?} was never readable while waiting for {}; the store \
+                     is unreachable rather than the frontier being stalled",
+                    program_type, target
+                );
+            }
+            return Err(CheckpointError::CommitTimeout {
+                program_type: key,
+                last,
+                target,
+                waited_secs,
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(CHECKPOINT_COMMIT_POLL_MS)).await;
+    }
 }
 
 #[cfg(test)]
@@ -743,6 +824,113 @@ mod tests {
 
         assert_eq!(escrow_checkpoint, Some(100));
         assert_eq!(withdraw_checkpoint, Some(200));
+    }
+
+    // ============================================================================
+    // wait_for_checkpoint_commit Tests
+    // ============================================================================
+
+    /// Target the wait tests aim at, and a timeout long enough that only a real
+    /// stall reaches it.
+    const WAIT_TARGET: u64 = 500;
+    const GENEROUS: Duration = Duration::from_secs(5);
+    const IMPATIENT: Duration = Duration::from_millis(400);
+
+    /// Set the escrow checkpoint after a short delay, standing in for the writer's flush.
+    fn commit_after(mock: MockStorage, slot: u64, delay: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            mock.set_checkpoint("escrow", slot);
+        })
+    }
+
+    /// Both end states belong in one test: a batch flush can land the frontier above the
+    /// target, so an equality check would wait forever on a checkpoint that already
+    /// covers everything the fill produced.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_returns_once_target_committed() {
+        for committed in [WAIT_TARGET, WAIT_TARGET + 5] {
+            let mock = MockStorage::new();
+            let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+            let writer = commit_after(mock, committed, Duration::from_millis(150));
+
+            let result =
+                wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, GENEROUS)
+                    .await;
+
+            assert!(
+                result.is_ok(),
+                "a committed checkpoint of {committed} must satisfy target {WAIT_TARGET}"
+            );
+            writer.await.unwrap();
+        }
+    }
+
+    /// A frontier one slot short means a slot in the range was never processed. Failing
+    /// the boot is the point: continuing would compare on-chain custody against a ledger
+    /// that is still missing a slot, which is the bug this wait exists to prevent.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_times_out_below_target() {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", WAIT_TARGET - 1);
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock));
+
+        let err = wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, IMPATIENT)
+            .await
+            .expect_err("a frontier below the target must not be accepted");
+
+        match err {
+            CheckpointError::CommitTimeout { last, target, .. } => {
+                assert_eq!(last, Some(WAIT_TARGET - 1));
+                assert_eq!(target, WAIT_TARGET);
+            }
+            other => panic!("expected CommitTimeout, got {other:?}"),
+        }
+    }
+
+    /// A database blip during the wait must not abort a boot that is one flush away from
+    /// succeeding.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_rides_out_transient_read_failures() {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", WAIT_TARGET);
+        mock.set_fail_times("get_committed_checkpoint", 2);
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock));
+
+        let result =
+            wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, GENEROUS).await;
+
+        assert!(
+            result.is_ok(),
+            "two failed reads must be retried, not treated as a stall: {result:?}"
+        );
+    }
+
+    /// A store with no row yet is normal for the first moments of a fresh boot, so the
+    /// wait polls on. It still has to end: absence forever is a stall like any other, and
+    /// reporting it as `None` rather than 0 tells an operator the writer never flushed.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_treats_absent_row_as_not_yet() {
+        let absent: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+        let err = wait_for_checkpoint_commit(&absent, ProgramType::Escrow, WAIT_TARGET, IMPATIENT)
+            .await
+            .expect_err("an absent row must not be read as a satisfied target");
+
+        match err {
+            CheckpointError::CommitTimeout { last, .. } => assert_eq!(last, None),
+            other => panic!("expected CommitTimeout, got {other:?}"),
+        }
+
+        let mock = MockStorage::new();
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+        let writer = commit_after(mock, WAIT_TARGET, Duration::from_millis(150));
+        assert!(
+            wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, GENEROUS)
+                .await
+                .is_ok(),
+            "a row written mid-wait must satisfy the target"
+        );
+        writer.await.unwrap();
     }
 
     // ============================================================================

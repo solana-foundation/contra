@@ -1,9 +1,11 @@
-use crate::config::ProgramType;
+use crate::config::{ProgramType, ReconciliationConfig};
 use crate::error::{DataSourceError, IndexerError, ReconciliationError};
 use crate::{
     indexer::{
-        checkpoint::CheckpointWriter, datasource::common::datasource::DataSource,
-        reconciliation::run_startup_reconciliation, transaction_processor::TransactionProcessor,
+        checkpoint::{CheckpointMsg, CheckpointWriter},
+        datasource::common::{datasource::DataSource, types::ProcessorMessage},
+        reconciliation::run_startup_reconciliation,
+        transaction_processor::TransactionProcessor,
     },
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer},
     storage::{PostgresDb, Storage},
@@ -11,7 +13,16 @@ use crate::{
 };
 
 #[cfg(feature = "datasource-rpc")]
-use crate::indexer::backfill::BackfillService;
+use crate::{
+    channel_utils::send_guaranteed,
+    error::BackfillError,
+    indexer::{
+        backfill::BackfillService,
+        checkpoint::{wait_for_checkpoint_commit, CHECKPOINT_COMMIT_TIMEOUT_SECS},
+    },
+};
+#[cfg(feature = "datasource-rpc")]
+use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
 use crate::indexer::backfill::ensure_startup_anchor;
@@ -22,10 +33,13 @@ use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
 #[cfg(feature = "datasource-yellowstone")]
 use crate::indexer::datasource::yellowstone::YellowstoneSource;
 use private_channel_metrics::HealthState;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "datasource-rpc")]
+use tracing::warn;
 use tracing::{error, info};
 
 /// Which side of the processor-vs-shutdown race fired.
@@ -52,6 +66,94 @@ async fn supervise(
     }
 }
 
+/// Reconcile attempts before a mismatch is treated as real rather than as a deposit that
+/// landed while startup was still catching up.
+#[cfg(feature = "datasource-rpc")]
+const RECONCILE_MAX_ATTEMPTS: u32 = 3;
+
+/// Pause between reconcile attempts, so the next one has new slots to pull in.
+#[cfg(all(feature = "datasource-rpc", not(test)))]
+const RECONCILE_RETRY_DELAY_MS: u64 = 2_000;
+#[cfg(all(feature = "datasource-rpc", test))]
+const RECONCILE_RETRY_DELAY_MS: u64 = 10;
+
+/// Compare on-chain escrow custody against the indexed ledger.
+///
+/// A non-escrow program has no custody to check and returns immediately. The instance id
+/// is validated once at startup, so its absence here can only mean a non-escrow program.
+async fn reconcile_escrow(
+    config: &ReconciliationConfig,
+    common_config: &PrivateChannelIndexerConfig,
+    storage: &Arc<Storage>,
+) -> Result<(), IndexerError> {
+    let Some(instance_id) = common_config.escrow_instance_id else {
+        return Ok(());
+    };
+
+    run_startup_reconciliation(
+        config,
+        common_config.program_type,
+        storage,
+        &common_config.rpc_url,
+        // For the escrow indexer, source_rpc_url is the channel (gateway) handle used
+        // only for the supply invariant; None skips it.
+        common_config.source_rpc_url.as_deref(),
+        &instance_id,
+    )
+    .await
+}
+
+/// Build the service that resolves and fills the startup range.
+#[cfg(feature = "datasource-rpc")]
+fn build_backfill_service(
+    storage: Arc<Storage>,
+    common_config: &PrivateChannelIndexerConfig,
+    indexer_config: &IndexerConfig,
+) -> Result<BackfillService, IndexerError> {
+    let rpc_polling_config =
+        indexer_config
+            .rpc_polling
+            .as_ref()
+            .ok_or_else(|| DataSourceError::InvalidConfig {
+                reason: "RPC polling config required for backfill".to_string(),
+            })?;
+
+    let rpc_poller = Arc::new(RpcPoller::new(
+        indexer_config.backfill.rpc_url.clone(),
+        rpc_polling_config.encoding,
+        rpc_polling_config.commitment,
+    ));
+
+    Ok(BackfillService::new(
+        storage,
+        rpc_poller,
+        common_config.program_type,
+        indexer_config.backfill.clone(),
+        common_config.escrow_instance_id,
+    ))
+}
+
+/// Spawn the processor that turns decoded instructions into rows and checkpoint updates.
+fn spawn_transaction_processor(
+    storage: Arc<Storage>,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
+    instruction_rx: mpsc::Receiver<ProcessorMessage>,
+    escrow_instance_id: Option<Pubkey>,
+    health: Option<Arc<HealthState>>,
+) -> tokio::task::JoinHandle<Result<(), IndexerError>> {
+    let mut transaction_processor = TransactionProcessor::new(storage, checkpoint_tx);
+    // Wire the escrow instance scope. Config validation guarantees Some for the
+    // Escrow program; None here means the Withdraw program, where no instance
+    // scoping applies.
+    if let Some(instance_id) = escrow_instance_id {
+        transaction_processor = transaction_processor.with_escrow_instance_id(instance_id);
+    }
+    if let Some(h) = health {
+        transaction_processor = transaction_processor.with_health(h);
+    }
+    tokio::spawn(transaction_processor.start(instruction_rx))
+}
+
 pub async fn run(
     common_config: PrivateChannelIndexerConfig,
     indexer_config: IndexerConfig,
@@ -75,61 +177,102 @@ pub async fn run(
     storage.init_schema().await?;
     info!("Storage initialized");
 
-    // 2. Startup reconciliation (escrow only, before any data processing).
+    // 2. Validate the escrow reconciliation wiring before doing any work.
     //
-    // Skip when running in backfill-only mode (backfill.enabled &&
-    // backfill.exit_after_backfill). In that mode the DB is intentionally
-    // incomplete — reconciling it against the current on-chain state would
-    // produce false positives and block the very operation that repairs the
-    // discrepancy. Concurrent backfill (exit_after_backfill = false) still
-    // runs reconciliation because the live datasource is about to start.
+    // Only the config check runs here. The reconciliation itself compares on-chain
+    // custody against the database, so it has to wait until backfill has finished
+    // importing whatever the database is missing; running it first compares live
+    // custody against a ledger that is knowingly stale. This check has no such
+    // dependency, so keeping it here makes a misconfiguration fail in milliseconds
+    // instead of after a full backfill.
     let backfill_only =
         indexer_config.backfill.enabled && indexer_config.backfill.exit_after_backfill;
-    if !backfill_only {
-        match (common_config.program_type, common_config.escrow_instance_id) {
-            (ProgramType::Escrow, Some(seed)) => {
-                run_startup_reconciliation(
-                    &indexer_config.reconciliation,
-                    common_config.program_type,
-                    &storage,
-                    &common_config.rpc_url,
-                    // For the escrow indexer, source_rpc_url is the channel (gateway)
-                    // handle used only for the supply invariant; None skips it.
-                    common_config.source_rpc_url.as_deref(),
-                    &seed,
-                )
-                .await?;
-            }
-            (ProgramType::Escrow, None) => {
-                return Err(IndexerError::Reconciliation(
-                    ReconciliationError::InvalidPubkey {
-                        pubkey: "<missing>".to_string(),
-                        reason: "escrow_instance_id is required for escrow reconciliation"
-                            .to_string(),
-                    },
-                ));
-            }
-            _ => {
-                info!("Startup reconciliation skipped (non-escrow program)");
-            }
+    match (common_config.program_type, common_config.escrow_instance_id) {
+        (ProgramType::Escrow, None) => {
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::InvalidPubkey {
+                    pubkey: "<missing>".to_string(),
+                    reason: "escrow_instance_id is required for escrow reconciliation".to_string(),
+                },
+            ));
         }
-    } else {
+        (ProgramType::Escrow, Some(_)) => {}
+        _ => {
+            info!("Startup reconciliation skipped (non-escrow program)");
+        }
+    }
+
+    if backfill_only {
         info!("Startup reconciliation skipped (backfill-only mode)");
+    } else if !indexer_config.backfill.enabled {
+        // No import is configured, so the ledger will not get any more complete than it
+        // is right now and the comparison is as meaningful here as anywhere.
+        reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage).await?;
     }
 
     // 3. Create channels
     let (instruction_tx, instruction_rx) = mpsc::channel(1000);
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
 
-    // 4. Resolve the backfill range, gate the checkpoint writer to it, then start
-    //    the writer. Checkpoint updates only begin once the processor starts further
-    //    below (step 8), so the gate is always in place before the first update —
-    //    no live-tip slot can slip past it and push the checkpoint over the gap.
-    let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
+    // 4a. Backfill-only mode is self-contained: it gates the writer to the fill range,
+    //     runs the fill and exits. Nothing below this point applies to it.
+    if backfill_only {
+        #[cfg(not(feature = "datasource-rpc"))]
+        return Err(DataSourceError::InvalidConfig {
+            reason: "Datasource rpc needs to be enabled for backfilling".to_string(),
+        }
+        .into());
+
+        #[cfg(feature = "datasource-rpc")]
+        {
+            let backfill_service =
+                build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
+
+            // Gate the writer to the fill range so a withheld (failed-write) slot stalls
+            // the checkpoint instead of being leapfrogged by a later one. No live stream,
+            // so a resolve failure fails closed rather than falling back to ungated.
+            let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
+            let range = backfill_service.resolve_range().await?;
+            if let Some((from_slot, target)) = range.gap {
+                checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
+            }
+            let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
+            info!("CheckpointWriter service started");
+            if let Some((from_slot, target)) = range.gap {
+                backfill_service
+                    .run_range(from_slot, target, instruction_tx.clone())
+                    .await?;
+            }
+            info!("Backfill completed, performing graceful cleanup...");
+            if let Err(e) = cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage).await
+            {
+                error!("Cleanup after backfill failed: {}", e);
+                return Err(IndexerError::ShutdownChannelSend);
+            }
+            return Ok(());
+        }
+    }
+
+    // 4b. Start the checkpoint writer ungated. When a fill runs below it arms the gate
+    //     in-band with a Regate that rides ahead of the slots it protects, which also
+    //     lets a second attempt re-arm over a range the first one did not cover.
+    let checkpoint_handle = CheckpointWriter::new(storage.clone()).start(checkpoint_rx);
+    info!("CheckpointWriter service started");
+
+    // 4c. Start the processor before any fill, because the fill blocks on a full
+    //     instruction channel and nothing else drains it. Until the datasource starts
+    //     the processor simply parks waiting for messages.
+    let mut processor_handle = spawn_transaction_processor(
+        storage.clone(),
+        checkpoint_tx.clone(),
+        instruction_rx,
+        common_config.escrow_instance_id,
+        health.clone(),
+    );
 
     // First slot the live RPC source must request, captured from the backfill range so
     // both producers share one boundary. None when backfill is disabled or resolves no
-    // range, in which case step 6 falls back to the configured from_slot.
+    // range, in which case the datasource falls back to the configured from_slot.
     #[cfg(feature = "datasource-rpc")]
     let mut rpc_live_start_slot: Option<u64> = None;
 
@@ -137,89 +280,38 @@ pub async fn run(
     #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
     let mut startup_anchor_hint: Option<u64> = None;
 
+    // Whether a startup fill ran ahead of the live stream, which is what opens the window
+    // the Yellowstone source has to repair on its very first connection.
+    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
+    let mut backfill_preceded_stream = false;
+
+    // 4d. Fill the missing range, wait for it to become durable, then reconcile.
+    //
+    // Reconciliation compares current on-chain custody against the indexed ledger, so it
+    // can only be trusted once the ledger has caught up. Waiting for the checkpoint, not
+    // merely for the fill to return, is what makes "caught up" verifiable: the gate only
+    // lets the checkpoint reach the target after every slot below it has been written.
+    //
+    // The loop exists because the chain keeps moving. A deposit landing between the range
+    // being resolved and custody being read is on-chain but not yet indexed, and at the
+    // default zero tolerance that is fatal. Each retry re-fills only the slots the
+    // previous attempt took to run, so the window shrinks quickly. A mismatch that
+    // backfilling cannot explain still fails the boot on the final attempt.
     if indexer_config.backfill.enabled {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
             reason: "Datasource rpc needs to be enabled for backfilling".to_string(),
-        });
+        }
+        .into());
 
         #[cfg(feature = "datasource-rpc")]
         {
-            use crate::error::DataSourceError;
+            let backfill_service =
+                build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
 
-            let rpc_polling_config = indexer_config.rpc_polling.as_ref().ok_or_else(|| {
-                DataSourceError::InvalidConfig {
-                    reason: "RPC polling config required for backfill".to_string(),
-                }
-            })?;
-            let rpc_poller = Arc::new(RpcPoller::new(
-                indexer_config.backfill.rpc_url.clone(),
-                rpc_polling_config.encoding,
-                rpc_polling_config.commitment,
-            ));
-
-            let backfill_service = BackfillService::new(
-                storage.clone(),
-                rpc_poller,
-                common_config.program_type,
-                indexer_config.backfill.clone(),
-                common_config.escrow_instance_id,
-            );
-
-            if indexer_config.backfill.exit_after_backfill {
-                // Backfill-only: gate the writer to the fill range so a withheld
-                // (failed-write) slot stalls the checkpoint instead of being
-                // leapfrogged by a later one. No live stream, so a resolve failure
-                // fails closed rather than falling back to ungated.
-                let range = backfill_service.resolve_range().await?;
-                if let Some((from_slot, target)) = range.gap {
-                    checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
-                }
-                let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
-                info!("CheckpointWriter service started");
-                if let Some((from_slot, target)) = range.gap {
-                    backfill_service
-                        .run_range(from_slot, target, instruction_tx.clone())
-                        .await?;
-                }
-                info!("Backfill completed, performing graceful cleanup...");
-                if let Err(e) =
-                    cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage).await
-                {
-                    error!("Cleanup after backfill failed: {}", e);
-                    return Err(IndexerError::ShutdownChannelSend);
-                }
-                return Ok(());
-            } else {
-                // Gate the writer to the range backfill will fill. resolve_range retries
-                // transient RPC failures; a persistent failure fails closed (see below).
-                match backfill_service.resolve_range().await {
-                    Ok(range) => {
-                        // Pin the live source to backfill's boundary so it resumes with
-                        // no hole and no overlap, whether or not there is a gap to fill.
-                        rpc_live_start_slot = Some(range.live_start_slot);
-                        // The floor, never the target: the range above it is not filled yet.
-                        #[cfg(feature = "datasource-yellowstone")]
-                        {
-                            startup_anchor_hint = Some(range.anchor);
-                        }
-                        if let Some((from_slot, target)) = range.gap {
-                            checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
-                            let instruction_tx_clone = instruction_tx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = backfill_service
-                                    .run_range(from_slot, target, instruction_tx_clone)
-                                    .await
-                                {
-                                    error!("Backfill failed: {}", e);
-                                } else {
-                                    info!("Backfill completed successfully");
-                                }
-                            });
-                        } else {
-                            info!("No backfill gap; checkpoint writer left ungated");
-                        }
-                    }
+            for attempt in 1..=RECONCILE_MAX_ATTEMPTS {
+                let range = match backfill_service.resolve_range().await {
+                    Ok(range) => range,
                     Err(e) => {
                         error!(
                             "Backfill range resolution failed after retries; refusing to start \
@@ -228,13 +320,71 @@ pub async fn run(
                         );
                         return Err(e);
                     }
+                };
+
+                // Pin the live source to backfill's boundary so it resumes with no hole
+                // and no overlap. Taken from the last attempt, which resolved highest.
+                rpc_live_start_slot = Some(range.live_start_slot);
+                // The floor, never the target: the range above it is not filled yet.
+                #[cfg(feature = "datasource-yellowstone")]
+                {
+                    startup_anchor_hint = Some(range.anchor);
                 }
+
+                if let Some((from_slot, target)) = range.gap {
+                    send_guaranteed(
+                        &instruction_tx,
+                        ProcessorMessage::Regate {
+                            program_type: common_config.program_type,
+                            from: from_slot,
+                            target,
+                        },
+                        "Regate (startup backfill)",
+                    )
+                    .await
+                    .map_err(|e| IndexerError::Backfill(BackfillError::ChannelSend(e)))?;
+
+                    backfill_service
+                        .run_range(from_slot, target, instruction_tx.clone())
+                        .await?;
+
+                    wait_for_checkpoint_commit(
+                        &storage,
+                        common_config.program_type,
+                        target,
+                        Duration::from_secs(CHECKPOINT_COMMIT_TIMEOUT_SECS),
+                    )
+                    .await?;
+                    info!("Backfill completed successfully");
+                } else {
+                    info!("No backfill gap; checkpoint writer left ungated");
+                }
+
+                match reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(e) if attempt < RECONCILE_MAX_ATTEMPTS => {
+                        warn!(
+                            "Startup reconciliation attempt {}/{} did not balance, retrying \
+                             after letting the chain move on: {}",
+                            attempt, RECONCILE_MAX_ATTEMPTS, e
+                        );
+                        // A retry is only worth anything once there are new slots to pull
+                        // in. Reconciling again against a range that has not moved would
+                        // compare the same two numbers and burn the attempt for nothing.
+                        tokio::time::sleep(Duration::from_millis(RECONCILE_RETRY_DELAY_MS)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            #[cfg(feature = "datasource-yellowstone")]
+            {
+                backfill_preceded_stream = true;
             }
         }
     }
-
-    let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
-    info!("CheckpointWriter service started");
 
     // 6. Start datasource
     let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
@@ -326,13 +476,24 @@ pub async fn run(
                 )
                 .await?;
 
-                source
+                let source = source
                     .with_gap_detection(
                         gap_rpc_poller,
                         indexer_config.backfill.max_gap_slots,
                         indexer_config.backfill.batch_size,
                     )
-                    .with_storage(storage.clone())
+                    .with_storage(storage.clone());
+
+                // A fill that ran to completion above leaves the slots produced since its
+                // target covered by neither it nor the stream, and the first streamed slot
+                // would carry the checkpoint straight over them. Arming the first
+                // connection replays that window instead. The anchor it needs was just
+                // guaranteed above.
+                if backfill_preceded_stream {
+                    source.with_first_connection_arming()
+                } else {
+                    source
+                }
             };
 
             let source = if let Some(h) = health.clone() {
@@ -364,20 +525,6 @@ pub async fn run(
     let datasource_handle = datasource
         .start(instruction_tx.clone(), cancellation_token.clone())
         .await?;
-
-    // 8. Start transaction processor
-    let mut transaction_processor =
-        TransactionProcessor::new(storage.clone(), checkpoint_tx.clone());
-    // Wire the escrow instance scope. Config validation guarantees Some for the
-    // Escrow program; None here means the Withdraw program, where no instance
-    // scoping applies.
-    if let Some(instance_id) = common_config.escrow_instance_id {
-        transaction_processor = transaction_processor.with_escrow_instance_id(instance_id);
-    }
-    if let Some(h) = health.clone() {
-        transaction_processor = transaction_processor.with_health(h);
-    }
-    let mut processor_handle = tokio::spawn(transaction_processor.start(instruction_rx));
 
     info!("Indexer started, waiting for shutdown signal...");
 

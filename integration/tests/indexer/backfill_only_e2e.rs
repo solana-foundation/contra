@@ -171,6 +171,33 @@ async fn wait_for_finalized_slot(rpc_url: &str, target: u64) {
     }
 }
 
+/// Block until `slot`'s block can actually be fetched.
+///
+/// Finalization alone is not enough: the validator will list a recent slot before its block
+/// is fully readable, and the fill refuses to checkpoint past a block it cannot read. Waiting
+/// on the fetch itself is what makes the range below deterministic.
+async fn wait_for_block_available(rpc_url: &str, slot: u64) {
+    let client = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::finalized());
+    let config = solana_client::rpc_config::RpcBlockConfig {
+        encoding: Some(UiTransactionEncoding::Json),
+        transaction_details: Some(solana_transaction_status::TransactionDetails::Full),
+        rewards: Some(false),
+        commitment: Some(CommitmentConfig::finalized()),
+        max_supported_transaction_version: Some(0),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if client.get_block_with_config(slot, config).await.is_ok() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for slot {slot} to become fetchable"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
 /// Submit one escrow deposit and return its signature and confirmed slot.
 async fn execute_deposit(
     client: &RpcClient,
@@ -243,9 +270,6 @@ async fn backfill_only_records_finalized_deposits_and_exits_clean(
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
     let user = &env.users[0];
 
-    // Everything before the first deposit is outside the repair range.
-    let start_slot = client.get_slot().await?;
-
     let (sig_a, slot_a) =
         execute_deposit(&client, user, &env.instance, &env.mint, DEPOSIT_AMOUNT_A).await?;
     let (sig_b, slot_b) =
@@ -253,6 +277,15 @@ async fn backfill_only_records_finalized_deposits_and_exits_clean(
 
     // Headroom past the last deposit so its block is finalized and inside the range.
     wait_for_finalized_slot(&rpc_url, slot_b + 3).await;
+    wait_for_block_available(&rpc_url, slot_a).await;
+    wait_for_block_available(&rpc_url, slot_b).await;
+
+    // Anchor the range at the first deposit rather than at whatever slot the validator
+    // happened to be on at startup. A freshly started validator lists its earliest slots
+    // without always serving their blocks, and the fill refuses to checkpoint past a block
+    // it cannot read, so a range reaching back that far fails on the ledger rather than on
+    // anything this test is about.
+    let start_slot = slot_a;
 
     let (common, indexer) =
         backfill_only_config(rpc_url.clone(), db_url.clone(), env.instance, start_slot);
@@ -331,10 +364,14 @@ async fn backfill_only_exits_nonzero_when_slot_writes_fail(
     let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
     let user = &env.users[0];
 
-    let start_slot = client.get_slot().await?;
     let (_sig, deposit_slot) =
         execute_deposit(&client, user, &env.instance, &env.mint, DEPOSIT_AMOUNT_A).await?;
     wait_for_finalized_slot(&rpc_url, deposit_slot + 3).await;
+    wait_for_block_available(&rpc_url, deposit_slot).await;
+
+    // Anchored at the deposit for the same reason as the test above: a range reaching back
+    // to the validator's first slots fails on unreadable blocks before it reaches this one.
+    let start_slot = deposit_slot;
 
     // Reject every insert. NOT VALID skips the scan of existing rows, and the schema
     // setup the run performs on boot leaves it in place because each statement is

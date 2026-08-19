@@ -1099,7 +1099,12 @@ async fn test_public_methods_pass_through_without_token() {
 
     let client = Client::new();
 
-    for method in &["sendTransaction", "getSlot", "getLatestBlockhash"] {
+    for method in &[
+        "sendTransaction",
+        "getSlot",
+        "getBlockHeight",
+        "getLatestBlockhash",
+    ] {
         let res = client
             .post(format!("http://{}", addr))
             .json(&json!({

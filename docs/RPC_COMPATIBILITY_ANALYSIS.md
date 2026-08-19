@@ -6,7 +6,7 @@ The JSON-RPC *API surface* SPC exposes is consistent with Solana's. Every implem
 
 That said, divergence shows up in three distinct buckets:
 
-1. **Coverage gaps.** SPC implements 23 of Solana's ~50 methods. See [section 5](#5-appendix-solana-rpc-methods-missing-from-spc) for the full list.
+1. **Coverage gaps.** SPC implements 24 of Solana's ~50 methods. See [section 5](#5-appendix-solana-rpc-methods-missing-from-spc) for the full list.
 2. **Internal functionality gaps in implemented methods.** Same wire shape, less behavior - `minContextSlot` accepted-and-ignored, `searchTransactionHistory` accepted-and-ignored, `simulateTransaction` not decoding base58 input etc.
 3. **Semantic contract divergences** `getRecentBlockhash` returns the Solana-legacy constant `lamports_per_signature = 5000` that doesn't reflect SPC's gasless model.
 
@@ -23,7 +23,7 @@ The gateway enforces RBAC on a fixed list of methods (`gateway/src/auth.rs`):
 - **Operator-only methods:** `getBlock`, `getTransaction`, `simulateTransaction`. Missing/invalid JWT → 401 with JSON-RPC body `{"error":{"code":-32001,"message":"Unauthorized: valid JWT required"}}`. User-role JWT → 403 with `-32003` ("operator role required").
 - **Account-gated methods:** `getAccountInfo`, `getTokenAccountBalance`, `getSignaturesForAddress`. JWT required. Operator role → pass through. User role → the gateway fetches the target account via an internal `getAccountInfo` and inspects bytes for the SPL Token owner field and looks the pubkey up in the auth service's Postgres `verified_wallets` table. Mismatch → 403, `-32002` ("account not owned by caller"). DB error → 500, `-32603`. Missing pubkey in params → 400, `-32602`. Read node unreachable, slow, or answering with an error → 503, `-32004`, which is retryable where 403 is not.
 - **Error-bearing methods:** `getSignaturesForAddress` and `getSignatureStatuses` also have their responses rewritten for every caller but an Operator. A stored transaction is indexed under every account it touched and its status is readable by anyone holding the signature, so neither method's authorization proves the caller may see *why* execution failed. Every non-null `err` is replaced with `InstructionError(0, GenericError)`, as is the legacy `status` field `getSignatureStatuses` repeats it in. This applies to the caller's own transactions too: a wallet polling the signature it just submitted sees the marker, so `confirmTransaction` reports that instead of the real reason and clients cannot distinguish insufficient funds from any other failure. Operators keep the raw error for diagnostics.
-- **All other methods (17 of them) are unauthenticated** even with auth on - they pass straight through to the read or write node.
+- **All other methods (18 of them) are unauthenticated** even with auth on - they pass straight through to the read or write node.
 
 None of this applies on the gateway's internal listener (`GATEWAY_INTERNAL_PORT`), which serves the operator's own services: no RBAC, raw errors. It is never published to the host, so no external caller can reach it.
 
@@ -50,6 +50,7 @@ Ordered from most divergent → closest match.
 | `getBlocks` | Max range 500_000 (matches Solana). When `end_slot` is omitted, SPC defaults to `start_slot + 500_000`; Solana defaults to latest slot. |
 | `getBlocksWithLimit` | Max limit 500_000 (matches Solana). `limit = 0` returns `[]`. Unauthenticated, like `getBlocks`: it discloses only which slots produced a block, never transaction contents. |
 | `getSlot` | `minContextSlot` ignored. Returns latest stored slot or 0. |
+| `getBlockHeight` | `minContextSlot` ignored. Returns the latest stored slot or 0, the same read as `getSlot`: SPC keeps slot and block height equal by construction, so the two can never disagree. This is the clock a client compares a stored `lastValidBlockHeight` against to prove a status-less signature can no longer land. |
 | `getEpochSchedule` | SPC's actual schedule (one infinite epoch): `slotsPerEpoch = u64::MAX`, `leaderScheduleSlotOffset = 0`, `warmup = false`, `firstNormalEpoch = 0`, `firstNormalSlot = 0`. Same wire shape as Solana; explorers doing epoch math will overflow. |
 | `getEpochInfo` | Reflects SPC's schedule faithfully - epoch always 0, `slotsInEpoch = u64::MAX`, `slotIndex` = current slot. |
 | `getSupply` | All zeros - SPC has no native token supply. Block-explorers will render "0 SOL". |
@@ -57,7 +58,7 @@ Ordered from most divergent → closest match.
 | `getSlotLeaders` | `[]` - SPC has no leader rotation. Jito-style "predict next leader" lookups get nothing. |
 | `isBlockhashValid` | Checks the Dedup stage's in-memory live-blockhash window via linear scan. Identical contract to Solana but window can be shorter than 150; older hashes return `false` indistinguishably from "never existed". |
 | `getRecentPerformanceSamples` | Real data from SPC's pipeline; default/max 720 (matches Solana). Numbers reflect SPC, not mainnet - by design. |
-| `getLatestBlockhash` | `lastValidBlockHeight = slot + max_blockhashes`, so it tracks the node's configured `transaction_expiration_ms / blocktime_ms` window rather than Solana's fixed 150. SPC keeps slot and block height equal by construction, and that equality is load-bearing: the operator reads the `getSignatureStatuses` context slot as a block height and compares it against this value. No `getBlockHeight` - clients call `getSlot` instead. |
+| `getLatestBlockhash` | `lastValidBlockHeight = slot + max_blockhashes`, so it tracks the node's configured `transaction_expiration_ms / blocktime_ms` window rather than Solana's fixed 150. SPC keeps slot and block height equal by construction, and that equality is load-bearing: the operator reads the `getSignatureStatuses` context slot as a block height and compares it against this value. |
 | `getSignatureStatuses` | `confirmation_status = Finalized`, `confirmations = None` on every found tx (correct under SPC's single timeline). `searchTransactionHistory` accepted but ignored. A storage or decode failure returns a `-32000` server error, never a `null` element, so a `null` means the signature is genuinely absent. A malformed signature fails the whole call with `-32602` invalid params, matching Solana, rather than nulling that one element. Max 256 sigs. |
 | `getBlock` **[auth]** | `maxSupportedTransactionVersion`, `transactionDetails`, `rewards`, `encoding` honoured. `rewards` always `[]`; `numPartitions` always `None` - both SPC-faithful. A transaction the node cannot read fails the whole call with `-32000` rather than returning a block that silently omits it, and a block the node cannot read returns `-32000` rather than a `null`, so a `null` means the slot genuinely holds no block. |
 | `getTransaction` **[auth]** | Real lookup. A storage or decode failure returns `-32000`, never a `null`. Only other difference from Solana is the JWT requirement. |
@@ -134,7 +135,6 @@ The list below enumerates the Solana JSON-RPC methods that have no SPC implement
 
 **Cluster / node state**
 
-- `getBlockHeight`
 - `getHealth`
 - `getVersion`
 - `getGenesisHash`

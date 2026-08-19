@@ -40,6 +40,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "sendTransaction",
     "getAccountInfo",
     "getSlot",
+    "getBlockHeight",
     "getBlock",
     "getTransaction",
     "getRecentBlockhash",
@@ -1612,6 +1613,15 @@ mod tests {
                 "{method} would be recorded under the \"unknown\" metric label"
             );
         }
+    }
+
+    /// Same metric-label check for the height read clients use to detect an expired blockhash.
+    #[test]
+    fn block_height_method_has_its_own_metric_label() {
+        assert!(
+            KNOWN_RPC_METHODS.contains(&"getBlockHeight"),
+            "getBlockHeight would be recorded under the \"unknown\" metric label"
+        );
     }
 
     #[tokio::test]

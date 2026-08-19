@@ -51,7 +51,7 @@ The deploy reads secrets from one of two backends, chosen automatically:
 
 Doppler setup (one time):
 
-1. Create a Doppler project and config, and add the `secrets.yml` keys as secrets. Doppler names are the UPPERCASE of the file keys: `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, `JWT_SECRET`, `GRAFANA_ADMIN_PASSWORD`, `SOLANA_KEYPAIR`, `GHCR_USER`, `GHCR_TOKEN`, `YELLOWSTONE_TOKEN`, `RPC_URL`. Two use their rendered `.env` names instead: `DEVNET_YELLOWSTONE_ENDPOINT` (optional; overrides `yellowstone_endpoint` from `vars/<env>.yml`) and `ALERT_WEBHOOK_URL` (the webhook; `NOTIFY_WEBHOOK` is also accepted).
+1. Create a Doppler project and config, and add the `secrets.yml` keys as secrets. Doppler names are the UPPERCASE of the file keys: `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, `JWT_SECRET`, `GRAFANA_ADMIN_PASSWORD`, `GHCR_USER`, `GHCR_TOKEN`, `YELLOWSTONE_TOKEN`, `RPC_URL`. Two use their rendered `.env` names instead: `DEVNET_YELLOWSTONE_ENDPOINT` (optional; overrides `yellowstone_endpoint` from `vars/<env>.yml`) and `ALERT_WEBHOOK_URL` (the webhook; `NOTIFY_WEBHOOK` is also accepted).
 2. Import your existing file in one shot (uppercases the keys, keeps values):
    ```bash
    # from private-channel-deploy/, with the doppler CLI installed + `doppler setup` done.

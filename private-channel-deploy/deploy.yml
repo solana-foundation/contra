@@ -72,7 +72,6 @@
         postgres_replication_password: "{{ _d.POSTGRES_REPLICATION_PASSWORD | default('') }}"
         jwt_secret: "{{ _d.JWT_SECRET | default('') }}"
         grafana_admin_password: "{{ _d.GRAFANA_ADMIN_PASSWORD | default('') }}"
-        solana_keypair: "{{ _d.SOLANA_KEYPAIR | default('') }}"
         ghcr_user: "{{ _d.GHCR_USER | default('') }}"
         ghcr_token: "{{ _d.GHCR_TOKEN | default('') }}"
         yellowstone_token: "{{ _d.YELLOWSTONE_TOKEN | default('') }}"

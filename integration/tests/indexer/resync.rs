@@ -124,6 +124,11 @@ async fn start_postgres_for_resync(
 }
 
 /// Source-RPC-only resync service (no channel reconciliation): legacy behavior.
+///
+/// An escrow rebuild is refused without an instance scope, since an unset scope
+/// filters out every escrow instruction and would rebuild an empty DB. These
+/// tests run against a bare validator with no escrow deposits, so the scope only
+/// has to be present; which key it names does not change the outcome.
 fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService {
     let rpc_poller = Arc::new(RpcPoller::new(
         rpc_url.clone(),
@@ -143,7 +148,7 @@ fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService 
         rpc_poller,
         ProgramType::Escrow,
         backfill_config,
-        None,
+        Some(Pubkey::new_unique()),
     )
 }
 

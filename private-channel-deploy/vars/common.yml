@@ -94,3 +94,12 @@ target_config_dir: "{{ host_data_dir }}/config"
 target_compose_file: "{{ target_config_dir }}/{{ compose_file }}"
 target_versions_env_file: "{{ target_config_dir }}/versions.env"
 target_override_file: "{{ target_config_dir }}/compose.override.yml"
+
+# --- Image signature verification (opt-in; see verify_image_signature) --------
+# verify_image_signature gates the cosign preflight check. Off here so existing
+# stacks are unaffected; set `verify_image_signature: true` in a stack's vars to
+# require a signed image. image_signer_identity is the cosign
+# --certificate-identity-regexp the image must have been signed by: our publish
+# workflow on main or a release tag.
+verify_image_signature: false
+image_signer_identity: '^https://github\.com/solana-foundation/solana-private-channels/\.github/workflows/publish-image\.yml@refs/(heads/main|tags/.*)$'

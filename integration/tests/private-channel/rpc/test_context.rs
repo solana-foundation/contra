@@ -57,6 +57,13 @@ impl PrivateChannelContext {
             .map_err(anyhow::Error::from)
     }
 
+    pub async fn get_block_height(&self) -> Result<u64> {
+        self.read_client
+            .get_block_height()
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     pub async fn get_blockhash(&self) -> Result<Hash> {
         let (blockhash, _) = self
             .read_client

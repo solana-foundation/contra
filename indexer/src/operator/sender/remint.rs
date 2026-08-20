@@ -4299,8 +4299,8 @@ mod tests {
         .await;
     }
 
-    /// A channel endpoint answers `getBlockHeight` with -32601, so it is never
-    /// mocked here: its absence from the script is part of every assertion.
+    /// The channel takes its height from the status response, so `getBlockHeight` is
+    /// never mocked here: its absence from the script is part of every assertion.
     #[tokio::test]
     async fn channel_absence_uses_response_context_slot() {
         let mut server = mockito::Server::new_async().await;

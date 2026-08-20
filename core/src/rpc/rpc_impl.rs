@@ -113,6 +113,12 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
         get_slot_impl(read_deps, _config).await
     }
 
+    // Block height equals slot here, so this reads the slot and cannot drift from getSlot.
+    async fn get_block_height(&self, _config: Option<RpcContextConfig>) -> RpcResult<u64> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_slot_impl(read_deps, _config).await
+    }
+
     async fn get_block(
         &self,
         slot: u64,

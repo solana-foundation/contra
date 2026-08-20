@@ -135,6 +135,66 @@ mod tests {
         assert_eq!(slot, 10);
     }
 
+    // ── get_block_height ──────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_height_tracks_get_slot() {
+        use super::api::PrivateChannelRpcServer;
+        let (db, _pg) = start_pg().await;
+        let mut rpc = rpc_impl::PrivateChannelRpcImpl::new(Some(make_read_deps(db)), None).await;
+
+        // A node with no blocks answers 0 on both reads instead of erroring.
+        let height = rpc.get_block_height(None).await.unwrap();
+        assert_eq!(height, rpc.get_slot(None).await.unwrap());
+        assert_eq!(height, 0);
+
+        rpc.read_deps
+            .as_mut()
+            .unwrap()
+            .accounts_db
+            .store_block(make_block_info(10, Hash::new_unique()))
+            .await
+            .unwrap();
+
+        // The two reads must stay equal: clients compare a height against a slot-scaled deadline.
+        let height = rpc.get_block_height(None).await.unwrap();
+        assert_eq!(height, rpc.get_slot(None).await.unwrap());
+        assert_eq!(height, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_height_crosses_stored_last_valid_block_height() {
+        use super::api::PrivateChannelRpcServer;
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(10, Hash::new_unique()))
+            .await
+            .unwrap();
+        let mut rpc = rpc_impl::PrivateChannelRpcImpl::new(Some(make_read_deps(db)), None).await;
+
+        // The deadline a client records when it signs against the current blockhash.
+        let last_valid_block_height = get_latest_blockhash_impl::get_latest_blockhash_impl(
+            rpc.read_deps.as_ref().unwrap(),
+            None,
+        )
+        .await
+        .unwrap()
+        .value
+        .last_valid_block_height;
+
+        rpc.read_deps
+            .as_mut()
+            .unwrap()
+            .accounts_db
+            .store_block(make_block_info(300, Hash::new_unique()))
+            .await
+            .unwrap();
+
+        // Past the deadline the client can prove a status-less signature can no longer land.
+        let height = rpc.get_block_height(None).await.unwrap();
+        assert_eq!(height, 300);
+        assert!(height > last_valid_block_height);
+    }
+
     // ── get_block_time ────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]

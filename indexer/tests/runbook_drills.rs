@@ -652,13 +652,23 @@ async fn drill_4_path_c_not_landed_recovery_flows() -> Result<(), Box<dyn std::e
     let runbook_path = workspace_root.join("docs/runbooks/withdrawal_manual_review.md");
     let runbook = std::fs::read_to_string(&runbook_path)
         .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
-    let branch_start = runbook
+    // Narrow to the Path C section first. A bare search for the bullet
+    // would silently follow a `Not burned` bullet added to any earlier
+    // path, and pass while Path C itself regressed.
+    let section_start = runbook
+        .find("\n## Path C ")
+        .expect("withdrawal_manual_review.md must contain a Path C section");
+    let section_len = runbook[section_start + 1..]
+        .find("\n## ")
+        .expect("Path C must be followed by another section heading");
+    let path_c = &runbook[section_start..section_start + 1 + section_len];
+    let branch_start = path_c
         .find("- Not burned")
         .expect("Path C Step 3 must contain a `Not burned` branch");
-    let branch_end = runbook[branch_start..]
+    let branch_end = path_c[branch_start..]
         .find("\n4. ")
         .expect("the `Not burned` branch must be followed by Step 4");
-    let branch = &runbook[branch_start..branch_start + branch_end];
+    let branch = &path_c[branch_start..branch_start + branch_end];
     assert!(
         branch.contains("do not re-arm"),
         "the `Not burned` branch must forbid re-arming; got:\n{branch}"

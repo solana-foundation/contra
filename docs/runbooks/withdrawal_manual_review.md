@@ -22,7 +22,7 @@ store.
 Pull the row's DB-side state:
 
 ```sql
-SELECT id, withdrawal_nonce, status, counterpart_signature,
+SELECT id, signature, withdrawal_nonce, status, counterpart_signature,
        remint_signatures, updated_at
   FROM transactions
  WHERE id = :transaction_id;
@@ -255,15 +255,16 @@ committing the row to manual review. Sub-triggers below; same recovery.
    ```
 3. **If `NOT_LANDED`:** withdrawal did not happen. The user's private channel tokens
    may or may not be burned (depends on the trigger sub-site). Confirm burn
-   state via channel read node before deciding:
+   state before deciding - `signature` is the originating PrivateChannel
+   burn, so `solana confirm -v <signature> --url <private-channel-rpc>`
+   settles it (same check as Path F Step 2):
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
    - Not burned → **do not re-arm.** Nothing backs the row: a re-arm
      releases escrowed target-chain funds against a burn that never
      happened, and neither the builder nor the escrow program can detect
-     it. Capture the row, its `signature` (the originating PrivateChannel
-     burn) and the burn-verification output in the incident record, then
-     mark the row terminal:
+     it. Capture the row, its `signature` and the `solana confirm` output
+     in the incident record, then mark the row terminal:
      ```sql
      UPDATE transactions SET status = 'failed', updated_at = NOW()
       WHERE id = :transaction_id;

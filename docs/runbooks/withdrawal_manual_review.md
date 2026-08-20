@@ -22,7 +22,7 @@ store.
 Pull the row's DB-side state:
 
 ```sql
-SELECT id, signature, withdrawal_nonce, status, counterpart_signature,
+SELECT id, signature, slot, withdrawal_nonce, status, counterpart_signature,
        remint_signatures, updated_at
   FROM transactions
  WHERE id = :transaction_id;
@@ -256,15 +256,25 @@ committing the row to manual review. Sub-triggers below; same recovery.
 3. **If `NOT_LANDED`:** withdrawal did not happen. The user's private channel tokens
    may or may not be burned (depends on the trigger sub-site). Confirm burn
    state before deciding - `signature` is the originating PrivateChannel
-   burn, so `solana confirm -v <signature> --url <private-channel-rpc>`
-   settles it (same check as Path F Step 2):
+   burn:
+   ```bash
+   solana confirm -v <signature> --url <private-channel-rpc>
+   ```
+   `Finalized` with no error means burned. A `not found` is **not** proof of
+   non-inclusion: it counts only if the endpoint's ledger covers the row's
+   `slot`, i.e. `getFirstAvailableBlock` is at or below it. A pruned,
+   non-archival or lagging node returns the same `not found` for a burn that
+   did land. The operator applies this exact floor check before calling a
+   signature dead by absence (`sender/remint.rs::coverage_verdict`); honor
+   it here.
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
-   - Not burned → **do not re-arm.** Nothing backs the row: a re-arm
-     releases escrowed target-chain funds against a burn that never
-     happened, and neither the builder nor the escrow program can detect
-     it. Capture the row, its `signature` and the `solana confirm` output
-     in the incident record, then mark the row terminal:
+   - Not burned, proven absent → **do not re-arm.** Nothing backs the
+     row: a re-arm releases escrowed target-chain funds against a burn
+     that never happened, and neither the builder nor the escrow program
+     can detect it. Capture the row, its `signature` and the
+     `solana confirm` output in the incident record, then mark the row
+     terminal:
      ```sql
      UPDATE transactions SET status = 'failed', updated_at = NOW()
       WHERE id = :transaction_id;
@@ -272,6 +282,11 @@ committing the row to manual review. Sub-triggers below; same recovery.
      No refund is owed - the user still holds their channel tokens.
      [Escalate](_escalation.md) (Tier 3): a row with no finalized burn
      means the ingestion or write path has a defect.
+   - Burn state unproven (RPC error, or `not found` with a ledger floor
+     above the row's `slot`) → stop. [Escalate](_escalation.md) (Tier 2).
+     Do not terminalize: marking a genuinely burned row `failed` strands
+     the user's tokens with no restoration path. Re-run once the endpoint
+     covers the slot, or from an archival node.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
 
@@ -297,7 +312,7 @@ re-arm.** The processor would reject the row identically on every tick.
 ### Step 1 - confirm the corruption
 
 ```sql
-SELECT id, signature, withdrawal_nonce, mint, amount, recipient,
+SELECT id, signature, slot, withdrawal_nonce, mint, amount, recipient,
        created_at, updated_at
   FROM transactions
  WHERE id = :transaction_id;
@@ -321,6 +336,11 @@ Otherwise proceed.
 solana confirm -v <signature> --url <private-channel-rpc>
 ```
 
+`not found` proves non-inclusion only if the endpoint's ledger covers the
+row's `slot` (`getFirstAvailableBlock` at or below it) - a pruned or
+lagging node returns the same `not found` for a burn that did land. Same
+rule as Path C Step 3.
+
 ### Step 3 - branch on burn verdict
 
 #### Burn landed
@@ -343,6 +363,14 @@ write-or-classify path has a defect. Capture the row, then delete:
 ```sql
 DELETE FROM transactions WHERE id = :transaction_id;
 ```
+
+#### Burn state unproven
+
+The RPC failed, or `not found` came back without ledger coverage of the
+row's `slot`. Stop. [Escalate](_escalation.md) (Tier 2). **Do not delete
+the row** - the burn may have landed, and this row is the only record of
+it. Re-run Step 2 once the endpoint covers the slot, or against an
+archival node.
 
 ## Path G - requeue cap exhausted (release never landed)
 
@@ -425,7 +453,8 @@ defect.
 ### Step 2 - confirm the burn, then escalate for refund
 
 `signature` is the originating PrivateChannel burn. Confirm whether the user's
-tokens were burned (channel read node). Burned, release can never land -> the
+tokens were burned (`solana confirm -v <signature> --url <private-channel-rpc>`,
+as in Path F Step 2). Burned, release can never land -> the
 user's funds are stuck and there is no automated recovery: forward rotation
 will not reopen the tree. [Escalate](_escalation.md) (Tier 1) for out-of-band
 restoration (manual `release_funds` to the depositor or a manual remint of the
@@ -436,8 +465,12 @@ UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
-If the burn did not land, there is no user impact; close the alert and mark
-`failed`.
+If the burn is proven not to have landed (`not found` with ledger coverage of
+the row's `slot`, per Path C Step 3), there is no user impact; close the alert
+and mark `failed`. If coverage cannot be established, do not close the alert:
+[escalate](_escalation.md) (Tier 2) to resolve the verdict first. The tree
+window is already closed, so a burned row closed as a non-event leaves the
+user's funds stuck with nobody looking.
 
 ### Step 3 - capture why the sender fell behind its own tree
 

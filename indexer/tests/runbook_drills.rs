@@ -677,8 +677,18 @@ async fn drill_4_path_c_not_landed_recovery_flows() -> Result<(), Box<dyn std::e
         !branch.contains("'pending'"),
         "the `Not burned` branch must contain no re-arm SQL; got:\n{branch}"
     );
+    // Terminalizing is only safe on a *proven* absence. `solana confirm`
+    // returns `not found` both for a burn that never happened and for one
+    // the endpoint no longer covers, so an unproven verdict has to escalate
+    // rather than mark the row failed - the same fence
+    // `sender/remint.rs::coverage_verdict` applies to absent signatures.
+    assert!(
+        branch.contains("Tier 2"),
+        "Step 3 must route an unproven burn verdict to Tier 2 instead of \
+         terminalizing a possibly-burned row; got:\n{branch}"
+    );
 
-    eprintln!("(2) not-burned branch: terminal, absent from pending queue, no re-arm in runbook.");
+    eprintln!("(2) not-burned branch: terminal only on proven absence, unproven escalates.");
     Ok(())
 }
 
@@ -1855,6 +1865,32 @@ async fn drill_16_withdrawal_manual_review_recovery_missing_nonce_flow(
         "manual_review",
         "Path F terminal SQL must NOT touch sibling manual_review rows"
     );
+
+    // ── Path F Step 3 must not DELETE on an unproven burn verdict ──
+    // `solana confirm` returns `not found` both for a burn that never
+    // happened and for one the endpoint no longer covers. This path's
+    // not-landed branch deletes the row, which is the only record of the
+    // burn, so an unproven verdict has to escalate instead.
+    let runbook_path = workspace_root.join("docs/runbooks/withdrawal_manual_review.md");
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
+    let section_start = runbook
+        .find("\n## Path F ")
+        .expect("withdrawal_manual_review.md must contain a Path F section");
+    let section_len = runbook[section_start + 1..]
+        .find("\n## ")
+        .expect("Path F must be followed by another section heading");
+    let path_f = &runbook[section_start..section_start + 1 + section_len];
+    let unproven_start = path_f
+        .find("Burn state unproven")
+        .expect("Path F must carry an unproven-burn branch, not just landed/not-landed");
+    let unproven = &path_f[unproven_start..];
+    assert!(
+        unproven.contains("Tier 2") && !unproven.contains("DELETE"),
+        "Path F's unproven-burn branch must escalate Tier 2 and must not \
+         delete the row; got:\n{unproven}"
+    );
+    eprintln!("OK   Path F § Step 3: unproven burn escalates without deleting");
 
     eprintln!("Path F triage substring + terminal SQL verified.");
     Ok(())

@@ -21,8 +21,9 @@ use {
     about = "PrivateChannel node that can run in read, write, or all-in-one mode"
 )]
 struct Args {
-    /// Node operation mode
-    #[arg(short, long, default_value = "aio", env = "PRIVATE_CHANNEL_MODE")]
+    /// Node operation mode. Required: a defaulted mode would silently start a
+    /// read deployment as a writer whenever the variable is dropped.
+    #[arg(short, long, env = "PRIVATE_CHANNEL_MODE")]
     mode: NodeMode,
 
     /// Port to listen on for RPC requests
@@ -255,6 +256,20 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
     info!("Mode: {:?}", args.mode);
+
+    // Legacy names that read like independent role switches but were never
+    // wired up. --mode is the only role control.
+    for var_name in [
+        "PRIVATE_CHANNEL_ENABLE_READ",
+        "PRIVATE_CHANNEL_ENABLE_WRITE",
+    ] {
+        if std::env::var_os(var_name).is_some() {
+            warn!(
+                "{} is set but not honored; the node role comes from --mode ({:?})",
+                var_name, args.mode
+            );
+        }
+    }
 
     if let Err(e) = run_node_with_args(args).await {
         error!("Node failed: {:?}", e);

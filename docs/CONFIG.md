@@ -14,7 +14,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--mode` | `PRIVATE_CHANNEL_MODE` | `aio` | Node mode: `read`, `write`, or `aio` (all-in-one) |
+| `--mode` | `PRIVATE_CHANNEL_MODE` | — | Node mode: `read`, `write`, or `aio` (all-in-one). Required, so a dropped variable fails startup instead of starting a read deployment as a writer |
 | `--port` | `PRIVATE_CHANNEL_PORT` | `8899` | RPC listen port |
 | `--sigverify-workers` | `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | `4` | Parallel signature verification threads |
 | `--sigverify-queue-size` | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded queue between dedup and sigverify |
@@ -34,7 +34,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--metrics` | `PRIVATE_CHANNEL_METRICS` | `false` | Enable Prometheus stage metrics server |
 | — | `PRIVATE_CHANNEL_METRICS_PORT` | `9090` | Port for the stage metrics server |
 
-**Startup validation:** The node rejects `blocktime_ms == 0`, `transaction_expiration_ms < blocktime_ms`, and any write-pipeline queue capacity of `0` (which would panic the channel constructors) to prevent misconfiguration.
+**Startup validation:** The node rejects a missing `--mode`, `blocktime_ms == 0`, `transaction_expiration_ms < blocktime_ms`, and any write-pipeline queue capacity of `0` (which would panic the channel constructors) to prevent misconfiguration.
 
 **Blockhash window and the operators:** the blockhash validity window (`transaction_expiration_ms / blocktime_ms`) bounds how much history an operator must see retained before it may call a channel signature dead. Operators read it off the node itself, seeding it at startup and re-reading it at each such verdict, so changing either setting needs no operator restart and no operator config. An operator that cannot read it warns and falls back to 150 at startup, then reports the verdict as uncertain rather than dead if the endpoint is still unreadable when one is needed.
 

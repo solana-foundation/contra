@@ -261,12 +261,16 @@ committing the row to manual review. Sub-triggers below; same recovery.
    solana confirm -v <signature> --url <private-channel-rpc>
    ```
    `Finalized` with no error means burned. A `not found` is **not** proof of
-   non-inclusion: it counts only if the endpoint's ledger covers the row's
-   `slot`, i.e. `getFirstAvailableBlock` is at or below it. A pruned,
-   non-archival or lagging node returns the same `not found` for a burn that
-   did land. The operator applies this exact floor check before calling a
-   signature dead by absence (`sender/remint.rs::coverage_verdict`); honor
-   it here.
+   non-inclusion. It counts only if the endpoint observed the row's `slot`,
+   which takes both bounds against `<private-channel-rpc>`:
+   `solana first-available-block` at or below the row's `slot`, else the slot
+   was pruned away, **and** `solana slot --commitment finalized` at or above
+   it, else the node never reached it. Either bound alone is worthless: a
+   pruned node and a lagging node return the same `not found` for a burn that
+   did land. The operator enforces both before calling a signature dead by
+   absence, the top via the blockhash-expiry check that produces
+   `DeadByAbsence` and the bottom via the ledger floor in
+   `sender/remint.rs::coverage_verdict`. Honor both here.
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
    - Not burned, proven absent → **do not re-arm.** Nothing backs the
@@ -282,8 +286,9 @@ committing the row to manual review. Sub-triggers below; same recovery.
      No refund is owed - the user still holds their channel tokens.
      [Escalate](_escalation.md) (Tier 3): a row with no finalized burn
      means the ingestion or write path has a defect.
-   - Burn state unproven (RPC error, or `not found` with a ledger floor
-     above the row's `slot`) → stop. [Escalate](_escalation.md) (Tier 2).
+   - Burn state unproven (RPC error, or `not found` with either bound
+     unmet: floor above the row's `slot`, or finalized tip below it) →
+     stop. [Escalate](_escalation.md) (Tier 2).
      Do not terminalize: marking a genuinely burned row `failed` strands
      the user's tokens with no restoration path. Re-run once the endpoint
      covers the slot, or from an archival node.
@@ -336,10 +341,10 @@ Otherwise proceed.
 solana confirm -v <signature> --url <private-channel-rpc>
 ```
 
-`not found` proves non-inclusion only if the endpoint's ledger covers the
-row's `slot` (`getFirstAvailableBlock` at or below it) - a pruned or
-lagging node returns the same `not found` for a burn that did land. Same
-rule as Path C Step 3.
+`not found` proves non-inclusion only if the endpoint observed the row's
+`slot`: first-available-block at or below it **and** finalized tip at or
+above it. A pruned node and a lagging node both return the same `not found`
+for a burn that did land. Same two bounds as Path C Step 3.
 
 ### Step 3 - branch on burn verdict
 

@@ -687,6 +687,16 @@ async fn drill_4_path_c_not_landed_recovery_flows() -> Result<(), Box<dyn std::e
         "Step 3 must route an unproven burn verdict to Tier 2 instead of \
          terminalizing a possibly-burned row; got:\n{branch}"
     );
+    // Coverage takes both bounds. A ledger floor below the row's slot only
+    // proves nothing was pruned; a node that never advanced to that slot
+    // returns the same `not found`. Dropping either bound silently restores
+    // the misclassification, so pin both.
+    let step_3 = &path_c[..branch_start];
+    assert!(
+        step_3.contains("first-available-block") && step_3.contains("--commitment finalized"),
+        "Step 3 must require both coverage bounds (ledger floor below the \
+         row's slot AND finalized tip above it); got:\n{step_3}"
+    );
 
     eprintln!("(2) not-burned branch: terminal only on proven absence, unproven escalates.");
     Ok(())

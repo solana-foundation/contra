@@ -19,7 +19,7 @@
 
 use chrono::Utc;
 use private_channel_indexer::{
-    storage::{PostgresDb, Storage},
+    storage::{PostgresDb, Storage, TransactionType},
     PostgresConfig,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -493,25 +493,35 @@ async fn drill_3_path_b_landed_marks_completed_with_signature(
     Ok(())
 }
 
-// ── Drill 4: Path C — ambiguous, NOT_LANDED → re-arm to pending ─────────────
+// ── Drill 4: Path C, NOT_LANDED - both Step 3 branches ──────────────────────
 //
-// Verifies that re-arming a `manual_review` withdrawal back to `pending`
-// preserves `withdrawal_nonce` — the on-chain SMT leaf is keyed on this,
-// and a re-attempt must hit the same leaf. Also verifies the schema's
-// unique-nonce-per-withdrawal constraint does not block re-arming (the
-// row keeps the same nonce; no new row is inserted).
+// Step 3 branches on whether the source-side burn landed, and the two
+// branches must stay asymmetric:
+//
+//   (1) Burned, no release -> re-arm to `pending`. The re-arm must preserve
+//       `withdrawal_nonce` (the on-chain leaf is keyed on it, so a
+//       re-attempt has to hit the same leaf), and the unique-nonce
+//       constraint must not block re-arming the same row.
+//   (2) Not burned -> terminal, never re-armed. Nothing backs such a row:
+//       `build_release_funds` reads mint/recipient/amount/nonce straight
+//       off it, and the escrow program cannot verify a burn on another
+//       chain, so a re-arm releases escrowed funds against a withdrawal
+//       that was never requested.
+//
+// Both branches sit in one drill so the asymmetry is visible in one place;
+// splitting them is how the runbook drifted into re-arming branch (2).
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn drill_4_path_c_not_landed_recovery_flows() -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "withdrawal_manual_review.md",
-        "Path C — ambiguous; NOT_LANDED branch (re-arm)",
+        "Path C - NOT_LANDED (Step 3 branches)",
     );
 
-    let (pool, _storage, _pg) = start_postgres().await?;
+    let (pool, storage, _pg) = start_postgres().await?;
 
+    // ── (1) Burned, no release -> re-arm to pending ────────────────────
     // Seed: row in manual_review with a specific nonce. Webhook
     // error_message would be e.g. "no signatures to verify — remint unsafe".
     let original_nonce: i64 = 42;
@@ -580,7 +590,85 @@ async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
         "nonce uniqueness must reject a second withdrawal with the same nonce"
     );
 
-    eprintln!("Path C NOT_LANDED re-arm verified; nonce identity preserved.");
+    eprintln!("(1) burned branch: re-arm verified; nonce identity preserved.");
+
+    // ── (2) Not burned -> terminal; never re-armed ─────────────────────
+    // A withdrawal row whose source burn never finalized has nothing
+    // backing it. The runbook marks it `failed`; this pins that the row
+    // leaves the executable queue and that the runbook offers no re-arm.
+    let unburned_nonce: i64 = 43;
+    let unburned_id = seed_withdrawal(
+        &pool,
+        "manual_review",
+        unburned_nonce,
+        Some("could not verify release landed ("),
+    )
+    .await?;
+    let sibling_nonce: i64 = 44;
+    let sibling_id = seed_withdrawal(&pool, "manual_review", sibling_nonce, None).await?;
+
+    eprintln!("simulated verification: release NOT_LANDED, source burn NOT landed");
+
+    sqlx::query("UPDATE transactions SET status = 'failed', updated_at = NOW() WHERE id = $1")
+        .bind(unburned_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, unburned_id).await?,
+        "failed",
+        "not-burned branch must terminalize the row, never re-arm it"
+    );
+    assert_eq!(
+        status_of(&pool, sibling_id).await?,
+        "manual_review",
+        "terminal SQL must be row-scoped and leave sibling manual_review rows alone"
+    );
+
+    // The assertion that carries the branch: the fetcher's own query must
+    // not return the row. Driven through the real storage method so a
+    // future change to the pending-selection SQL is caught here. The
+    // branch-(1) row is the positive control - it was re-armed, so the
+    // query must return it, which proves the absence check is not vacuous.
+    let queued = storage
+        .get_pending_db_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    assert!(
+        queued.iter().any(|txn| txn.id == id),
+        "the re-armed branch-(1) row must be in the fetcher's pending queue"
+    );
+    assert!(
+        !queued.iter().any(|txn| txn.id == unburned_id),
+        "a row with no source burn must never re-enter the executable withdrawal queue"
+    );
+
+    // The runbook text itself must offer no re-arm in this branch. Scoped
+    // to the branch: Paths A, C-burned and G all re-arm legitimately, so a
+    // whole-file scan would be meaningless here.
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let runbook_path = workspace_root.join("docs/runbooks/withdrawal_manual_review.md");
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
+    let branch_start = runbook
+        .find("- Not burned")
+        .expect("Path C Step 3 must contain a `Not burned` branch");
+    let branch_end = runbook[branch_start..]
+        .find("\n4. ")
+        .expect("the `Not burned` branch must be followed by Step 4");
+    let branch = &runbook[branch_start..branch_start + branch_end];
+    assert!(
+        branch.contains("do not re-arm"),
+        "the `Not burned` branch must forbid re-arming; got:\n{branch}"
+    );
+    assert!(
+        !branch.contains("'pending'"),
+        "the `Not burned` branch must contain no re-arm SQL; got:\n{branch}"
+    );
+
+    eprintln!("(2) not-burned branch: terminal, absent from pending queue, no re-arm in runbook.");
     Ok(())
 }
 

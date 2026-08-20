@@ -258,7 +258,19 @@ committing the row to manual review. Sub-triggers below; same recovery.
    state via channel read node before deciding:
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
-   - Not burned → no user impact; close the alert and re-arm.
+   - Not burned → **do not re-arm.** Nothing backs the row: a re-arm
+     releases escrowed target-chain funds against a burn that never
+     happened, and neither the builder nor the escrow program can detect
+     it. Capture the row, its `signature` (the originating PrivateChannel
+     burn) and the burn-verification output in the incident record, then
+     mark the row terminal:
+     ```sql
+     UPDATE transactions SET status = 'failed', updated_at = NOW()
+      WHERE id = :transaction_id;
+     ```
+     No refund is owed - the user still holds their channel tokens.
+     [Escalate](_escalation.md) (Tier 3): a row with no finalized burn
+     means the ingestion or write path has a defect.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
 
@@ -441,6 +453,8 @@ Capture in the incident record:
 - Full `error_message` content.
 - Trigger site (which row of the dispatch table).
 - On-chain verdict (`LANDED <sig>` / `NOT_LANDED` / `AMBIGUOUS`).
+- Burn verdict on the source side (`signature` + `solana confirm` output),
+  when the path branched on it.
 - Recovery action taken (SQL run, sig used, escalation path).
 - RPC endpoint used for verification.
 

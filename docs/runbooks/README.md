@@ -115,7 +115,7 @@ pins the relevant contract.
 | `drill_1_error_message_contracts_present_in_source` | both | Source contains every `error_message` substring the dispatch tables match on. |
 | `drill_2_path_a_data_error_recovery` | withdrawal | Triage SQL orders the trigger row first; recovery SQL reaches the documented end-state. |
 | `drill_3_path_b_landed_marks_completed_with_signature` | withdrawal | On `LANDED`, mark `completed` with the observed signature (prevents double-credit). |
-| `drill_4_path_c_not_landed_re_arms_with_same_nonce` | withdrawal | Re-arm preserves `withdrawal_nonce`; nonce-uniqueness index still enforces. |
+| `drill_4_path_c_not_landed_recovery_flows` | withdrawal | `withdrawal_manual_review.md` § Path C Step 3: burned branch re-arms preserving `withdrawal_nonce` (nonce-uniqueness index still enforces); not-burned branch terminalizes the row and never returns it to the fetcher's pending queue. |
 | `drill_5_halt_sweep_excludes_poison_only` | withdrawal | Bulk-quarantine flips every active withdrawal except the excluded poison id. |
 | `drill_6_recovery_query_skips_terminal_statuses` | withdrawal | Recovery query skips rows already resolved to a terminal status. |
 | `drill_7_halt_sweep_does_not_touch_terminals` | withdrawal | Bulk-quarantine leaves terminal-status rows alone. |

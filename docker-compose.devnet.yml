@@ -31,8 +31,8 @@ x-default-logging: &default-logging
 # All such services share one byte-identical image; per-service tags would be 8
 # copies of the same artifact differing only in compose metadata. Each service
 # overrides only `command:` (and per-service env). Pin in CI via
-# PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus,
-# grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
+# PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus
+# and grafana use their own Dockerfiles and keep their own build blocks.
 x-private-channel-app: &private-channel-app
   image: private-channel-app:${PRIVATE_CHANNEL_VERSION:-latest}
   build:
@@ -646,6 +646,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      - ALERT_CONTACT_TYPE=${ALERT_CONTACT_TYPE:-webhook}
     networks:
       - private-channel-network
     healthcheck:

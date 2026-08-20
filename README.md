@@ -178,7 +178,7 @@ Within the payment channel, transactions are processed through a **five-stage pi
 
 ### Solana Private Channels Escrow/Withdrawal Programs
 
-- **Solana Private Channels Escrow Program**: Mainnet token custody with SMT security (Program ID: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83`)
+- **Solana Private Channels Escrow Program**: Mainnet token custody with SMT security (Program ID: `9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU`)
 - **Solana Private Channels Withdrawal Program**: Channel withdrawal processing (token burning) (Program ID: `J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi`)
 
 ### Indexer
@@ -269,7 +269,6 @@ docker build --build-arg SOLANA_VERSION --build-arg PNPM_VERSION -f Dockerfile .
 docker build --build-arg SOLANA_VERSION --build-arg YELLOWSTONE_TAG -f validator.Dockerfile .
 docker build --build-arg GRAFANA_VERSION    -f Dockerfile.grafana    .
 docker build --build-arg PROMETHEUS_VERSION -f Dockerfile.prometheus .
-docker build --build-arg NODE_VERSION --build-arg PNPM_VERSION -f admin-ui/Dockerfile .
 ```
 
 `versions.env` is the single source of truth for every pinned version.
@@ -356,7 +355,7 @@ CI and local runs.
 | cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
 | cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
 | Solana CLI       | `3.1.13`   | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |
-| Node.js          | `24.7.0`   | Pinned in [`versions.env`](versions.env) (`NODE_VERSION`) for admin-ui Docker builds |
+| Node.js          | `24.x`     | Installed from NodeSource (`setup_24.x`) in the main [`Dockerfile`](Dockerfile) for the pnpm-based build steps |
 | pnpm             | `10.15.1`  | Pinned in [`versions.env`](versions.env) (`PNPM_VERSION`); also via `packageManager` in each `package.json` |
 | Grafana          | `11.4.0`   | Pinned in [`versions.env`](versions.env) (`GRAFANA_VERSION`) |
 | Prometheus       | `v3.0.1`   | Pinned in [`versions.env`](versions.env) (`PROMETHEUS_VERSION`) |
@@ -372,7 +371,7 @@ Container images used by integration tests (pulled automatically by
 
 Source of truth for tool versions:
 
-- **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`, `NODE_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `BLACKBOX_VERSION`
+- **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `BLACKBOX_VERSION`
 - Rust toolchain: [`rust-toolchain.toml`](rust-toolchain.toml)
 - Rust + `cargo-llvm-cov`: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
 - `cargo-nextest`: [`.github/workflows/rust.yml`](.github/workflows/rust.yml) (`Install cargo-nextest` step)

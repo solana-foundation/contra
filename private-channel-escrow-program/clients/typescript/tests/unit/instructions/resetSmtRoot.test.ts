@@ -215,7 +215,7 @@ describe('resetSmtRoot', () => {
 
             // Verify default privateChannelEscrowProgram is used
             const privateChannelEscrowProgramAccount = instruction.accounts[5];
-            expect(privateChannelEscrowProgramAccount.address).toBe('GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83');
+            expect(privateChannelEscrowProgramAccount.address).toBe('9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU');
         });
 
         it('should use provided PDAs when supplied (override auto-derivation)', async () => {

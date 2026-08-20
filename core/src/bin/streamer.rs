@@ -42,7 +42,7 @@ fn now_unix() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Escrow program discriminators (matches admin-ui/src/hooks/useActivityFeed.ts)
+// Escrow program discriminators (must match the escrow program's instruction layout)
 // ---------------------------------------------------------------------------
 const DISC_CREATE_INSTANCE: u8 = 0;
 const DISC_ALLOW_MINT: u8 = 1;
@@ -55,7 +55,7 @@ const DISC_RELEASE_FUNDS: u8 = 7;
 const DISC_RESET_SMT: u8 = 8;
 
 /// Known program IDs
-const ESCROW_PROGRAM_ID: &str = "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83";
+const ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 // ---------------------------------------------------------------------------

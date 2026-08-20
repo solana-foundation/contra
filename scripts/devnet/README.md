@@ -18,6 +18,13 @@ the operator. Keep them separate: `SetNewAdmin` only rewrites `Instance.admin`, 
 that is also the channel admin keeps its receipt-mint authority and its Operator PDA
 after a handover and can still drain escrow custody.
 
+The commands below read their signers from keypair files. Create them first:
+```bash
+mkdir -p keypairs
+solana-keygen new -o ./keypairs/escrow-admin.json -s --no-bip39-passphrase  # signs create_instance / add_operator / allow_mint
+solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase          # signs deposit / withdraw
+```
+
 Run all commands from project root:
 
 ## 1. Create Instance

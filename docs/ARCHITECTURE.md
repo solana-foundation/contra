@@ -39,7 +39,7 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 **Purpose**: Locks tokens in escrow for use within the payment channel.
 
-**Program ID**: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83` (Solana Devnet)
+**Program ID**: `9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU` (Solana Devnet)
 
 **Location**: [`private-channel-escrow-program/`](../private-channel-escrow-program/)
 

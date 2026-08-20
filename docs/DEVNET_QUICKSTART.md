@@ -93,8 +93,9 @@ The CLI tools read their signers from keypair files, so create them before runni
 ```shell
 mkdir -p keypairs
 
-# Admin keypair: owns the escrow instance, signs create_instance / allow_mint / add_operator
-solana-keygen new -o ./keypairs/admin.json -s --no-bip39-passphrase
+# Escrow admin keypair: the Instance.admin, signs create_instance / allow_mint / add_operator.
+# Keep it separate from the channel admin in ADMIN_PRIVATE_KEY (see Step 4)
+solana-keygen new -o ./keypairs/escrow-admin.json -s --no-bip39-passphrase
 
 # User keypair: holds the whitelisted token, signs deposit / withdraw
 solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
@@ -104,7 +105,7 @@ solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
 
 1. **Fund your admin keypair**  
 
-   - Ensure your admin keypair (`./keypairs/admin.json`) has Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
+   - Ensure your admin keypair (`./keypairs/escrow-admin.json`) has Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
 
 2. **Create Instance**  
 
@@ -113,7 +114,7 @@ solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
    ```shell
    cargo run --bin create_instance -- \
      https://api.devnet.solana.com \
-     ./keypairs/admin.json
+     ./keypairs/escrow-admin.json
    ```
 
    **Copy the printed Instance Address** — you'll need it for configuration.
@@ -240,7 +241,7 @@ Pick the mint you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii
 ```shell
 cargo run --bin allow_mint -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json \
+  ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <MINT_ADDRESS>
 ```
@@ -252,7 +253,7 @@ Run `add_operator` with your operator's public key (from Step 4):
 ```shell
 cargo run --bin add_operator -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json \
+  ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <OPERATOR_PUBKEY>
 ```

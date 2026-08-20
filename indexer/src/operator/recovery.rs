@@ -834,7 +834,12 @@ pub async fn boot_reconcile_processing(
 pub async fn boot_reconcile_landed_pending_remints(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
+    fallback_rpc_client: Option<&RpcClientWithRetry>,
 ) -> Result<(), OperatorError> {
+    // Same endpoint bundle the sweep uses: a pruned primary must not turn a
+    // landed release into an absence that leaves the row PendingRemint and
+    // refuses the boot validation.
+    let finality = RecoveryFinality::new(rpc_client, fallback_rpc_client);
     for row in storage.get_pending_remint_transactions().await? {
         let Some(nonce) = row.withdrawal_nonce else {
             continue;
@@ -867,7 +872,7 @@ pub async fn boot_reconcile_landed_pending_remints(
 
         // Only a finalized-success release consumed the nonce. Dead/Live are
         // correctly absent from the on-chain root, so leave them PendingRemint.
-        match classify_signatures(&FinalityRpc::solana(rpc_client, None), &signatures).await {
+        match classify_signatures(&finality.solana(), &signatures).await {
             SigFinality::Landed(sig) => match storage
                 .update_transaction_status(
                     row.id,
@@ -2798,7 +2803,7 @@ mod tests {
         let storage = Storage::Mock(mock.clone());
         let client = make_rpc_client(&server.url());
 
-        boot_reconcile_landed_pending_remints(&storage, &client)
+        boot_reconcile_landed_pending_remints(&storage, &client, None)
             .await
             .unwrap();
 
@@ -2845,7 +2850,7 @@ mod tests {
         let storage = Storage::Mock(mock.clone());
         let client = make_rpc_client(&server.url());
 
-        boot_reconcile_landed_pending_remints(&storage, &client)
+        boot_reconcile_landed_pending_remints(&storage, &client, None)
             .await
             .unwrap();
 

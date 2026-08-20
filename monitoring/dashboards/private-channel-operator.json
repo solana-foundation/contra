@@ -296,7 +296,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_remint_claim_lost_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_remint_claim_lost_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}} / claim lost",
           "refId": "A"
         }
@@ -322,7 +322,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_sender_lock_lost_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_sender_lock_lost_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}} / {{reason}}",
           "refId": "A"
         }

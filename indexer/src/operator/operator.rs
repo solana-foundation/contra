@@ -455,7 +455,7 @@ async fn run_withdraw_preflight(
     if let Err(e) = recovery::boot_reconcile_processing(
         storage,
         rpc_client,
-        fallback_rpc_client,
+        fallback_rpc_client.clone(),
         crate::config::ProgramType::Withdraw,
         Some(instance_pda),
         storage_tx,
@@ -470,7 +470,13 @@ async fn run_withdraw_preflight(
     // Pre-clear PendingRemint withdrawals that already landed so the validation
     // below doesn't refuse to start on a nonce the chain consumed but the row
     // hasn't recorded as Completed yet. Best-effort; validation is the gate.
-    if let Err(e) = recovery::boot_reconcile_landed_pending_remints(storage, rpc_client).await {
+    if let Err(e) = recovery::boot_reconcile_landed_pending_remints(
+        storage,
+        rpc_client,
+        fallback_rpc_client.as_deref(),
+    )
+    .await
+    {
         warn!(
             "Boot reconcile of landed pending remints failed, proceeding to SMT validation: {}",
             e

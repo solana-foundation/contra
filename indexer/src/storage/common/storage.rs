@@ -254,11 +254,14 @@ impl Storage {
         .await
     }
 
-    /// Return per-mint aggregate balances (completed deposits minus withdrawals) for startup reconciliation.
+    /// Return per-mint aggregate balances (completed deposits minus withdrawals) for
+    /// startup reconciliation, counting only what was indexed at or below `as_of_slot`.
     pub async fn get_mint_balances_for_reconciliation(
         &self,
+        as_of_slot: u64,
     ) -> Result<Vec<MintDbBalance>, StorageError> {
-        get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self).await
+        get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self, as_of_slot)
+            .await
     }
 
     /// Query escrow balances by mint for continuous reconciliation checks.
@@ -1194,9 +1197,14 @@ mod tests {
         }
 
         let balances = storage
-            .get_mint_balances_for_reconciliation()
+            .get_mint_balances_for_reconciliation(900)
             .await
             .unwrap();
+        assert_eq!(
+            mock.last_reconciliation_slot(),
+            Some(900),
+            "the slot bound must reach storage, not be dropped on the way"
+        );
         assert_eq!(balances.len(), 2);
         assert!(balances.iter().any(|b| b.mint_address == "usdc"
             && b.total_deposits == BigDecimal::from(10000u64)

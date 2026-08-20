@@ -25,6 +25,7 @@ use private_channel_indexer::{
     error::{IndexerError, ReconciliationError},
     indexer::run,
     storage::{PostgresDb, Storage},
+    test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes},
     DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
     StorageType,
 };
@@ -287,8 +288,65 @@ async fn mock_escrow_custody(rpc: &mut MockitoServer, holdings: &[(String, i64)]
         .await
 }
 
+/// A block whose one transaction is a top-level escrow Deposit, shaped the way the fill's
+/// decoder reads it: the instruction supplies the accounts, and the DepositEvent self-CPI
+/// that the program emits underneath it supplies the amount.
+///
+/// Account order is the Deposit instruction's own, so index 2 is the instance the indexer
+/// filters on and index 3 is the mint the row is recorded against.
+fn deposit_block_json(slot: u64, instance: Pubkey, mint: Pubkey, amount: u64) -> serde_json::Value {
+    const ESCROW_PROGRAM_INDEX: u8 = 11;
+
+    let mut account_keys: Vec<String> = (0..12).map(|_| Pubkey::new_unique().to_string()).collect();
+    account_keys[2] = instance.to_string();
+    account_keys[3] = mint.to_string();
+    account_keys[ESCROW_PROGRAM_INDEX as usize] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+
+    let ix_data = bs58::encode(deposit_ix_bytes(amount, None)).into_string();
+    let event_data = bs58::encode(deposit_event_bytes(amount)).into_string();
+
+    json!({
+        "blockhash": "TestBlockHash11111111111111111111111111111",
+        "parentSlot": slot - 1,
+        "transactions": [{
+            "transaction": {
+                "signatures": [format!("mocked_deposit_sig_{slot}")],
+                "message": {
+                    "accountKeys": account_keys,
+                    "instructions": [{
+                        "programIdIndex": ESCROW_PROGRAM_INDEX,
+                        "accounts": (0u8..12).collect::<Vec<u8>>(),
+                        "data": ix_data
+                    }]
+                }
+            },
+            "meta": {
+                "err": null,
+                "innerInstructions": [{
+                    "index": 0,
+                    "instructions": [{
+                        "programIdIndex": ESCROW_PROGRAM_INDEX,
+                        "accounts": Vec::<u8>::new(),
+                        "data": event_data,
+                        "stackHeight": 2
+                    }]
+                }]
+            }
+        }]
+    })
+}
+
 /// Mock the block enumeration and every block in the fill range, all empty.
 async fn mock_fill_range(rpc: &mut MockitoServer) -> Vec<mockito::Mock> {
+    mock_fill_range_carrying(rpc, None).await
+}
+
+/// Same, except one slot's block is replaced by `carrying`, so the fill has something to
+/// import rather than walking an empty range.
+async fn mock_fill_range_carrying(
+    rpc: &mut MockitoServer,
+    carrying: Option<(u64, serde_json::Value)>,
+) -> Vec<mockito::Mock> {
     let mut mocks = Vec::new();
     mocks.push(
         rpc.mock("POST", "/")
@@ -312,24 +370,21 @@ async fn mock_fill_range(rpc: &mut MockitoServer) -> Vec<mockito::Mock> {
             .await,
     );
     for slot in MOCK_START_SLOT..=MOCK_TIP {
+        let block = match &carrying {
+            Some((carried_slot, block)) if *carried_slot == slot => block.clone(),
+            _ => json!({
+                "blockhash": "TestBlockHash11111111111111111111111111111",
+                "parentSlot": slot - 1,
+                "transactions": []
+            }),
+        };
         mocks.push(
             rpc.mock("POST", "/")
                 .match_body(Matcher::PartialJson(
                     json!({"method": "getBlock", "params": [slot]}),
                 ))
                 .with_status(200)
-                .with_body(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "result": {
-                            "blockhash": "TestBlockHash11111111111111111111111111111",
-                            "parentSlot": slot - 1,
-                            "transactions": []
-                        },
-                        "id": 1
-                    })
-                    .to_string(),
-                )
+                .with_body(json!({"jsonrpc": "2.0", "result": block, "id": 1}).to_string())
                 .expect_at_least(1)
                 .create_async()
                 .await,
@@ -583,6 +638,83 @@ async fn unexplainable_mismatch_still_halts_startup() {
          otherwise the halt is still happening against an unrepaired ledger"
     );
 
+    chain.shutdown().await;
+}
+
+/// The claim the whole change rests on, deterministically: the fill imports the deposit
+/// that explains custody, and only then does reconciliation run and pass.
+///
+/// The database starts with no deposit at all while custody already holds one, which is
+/// the finding's own starting state. Nothing here is seeded to make the sums agree: the
+/// row has to arrive from the mocked block the fill walks, and the checkpoint has to reach
+/// the fill target before the comparison happens. Before the fix this configuration cannot
+/// boot, because reconciliation runs first and aborts on custody it cannot account for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fill_imports_the_deposit_that_explains_custody() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_backfill_import").await;
+
+    let instance = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let deposit_slot = MOCK_START_SLOT + 2;
+    seed_allowed_mint(&pool, &mint.to_string()).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _range = mock_fill_range_carrying(
+        &mut rpc,
+        Some((
+            deposit_slot,
+            deposit_block_json(deposit_slot, instance, mint, DEPOSIT_AMOUNT),
+        )),
+    )
+    .await;
+    // Custody holds exactly the deposit the block carries, so the two agree only once
+    // that block has been imported.
+    let _custody =
+        mock_escrow_custody(&mut rpc, &[(mint.to_string(), DEPOSIT_AMOUNT as i64)]).await;
+
+    let chain = MockRpcServer::start().await;
+    let mut handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    loop {
+        if checkpoint_of(&pool, "escrow").await == Some(MOCK_TIP as i64) {
+            break;
+        }
+        if handle.is_finished() {
+            panic!(
+                "startup exited instead of importing the deposit and reconciling: {:?}",
+                (&mut handle).await
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fill never committed through its target"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let (slot, amount) = deposit_row(&pool, &mint.to_string())
+        .await
+        .expect("the fill must have written the deposit the block carried");
+    assert_eq!(
+        slot, deposit_slot as i64,
+        "the deposit's own slot is recorded"
+    );
+    assert_eq!(
+        amount,
+        DEPOSIT_AMOUNT.to_string(),
+        "the amount must come from the deposit's own event"
+    );
+
+    // With the row imported the sums agree, so reconciliation passes and startup carries on.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !handle.is_finished(),
+        "custody explained by the imported deposit must not stop startup at threshold 0"
+    );
+
+    handle.abort();
     chain.shutdown().await;
 }
 

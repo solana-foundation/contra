@@ -36,18 +36,34 @@ impl std::fmt::Display for EscrowSweepError {
 
 impl std::error::Error for EscrowSweepError {}
 
+/// On-chain custody together with the slot the reading reflects.
+///
+/// The slot is what lets a caller compare this against a ledger bounded at the same
+/// point instead of against one that has drifted, so the two sides describe one instant.
+#[derive(Debug, Clone)]
+pub struct CustodySnapshot {
+    /// Per-mint custody; a mint absent from the map holds zero on-chain.
+    pub balances: HashMap<Pubkey, u64>,
+    /// Slot the whole snapshot is valid as of.
+    pub slot: u64,
+}
+
 /// Sum every token account owned by the escrow instance, grouped by mint, across
-/// the SPL Token and Token-2022 programs. The returned map is the on-chain
-/// custody snapshot; a mint absent from the map holds zero on-chain.
+/// the SPL Token and Token-2022 programs.
 pub async fn fetch_escrow_balances_by_mint(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
-) -> Result<HashMap<Pubkey, u64>, EscrowSweepError> {
+) -> Result<CustodySnapshot, EscrowSweepError> {
     let mut balances = HashMap::new();
     let token_programs = [spl_token::id(), spl_token_2022::id()];
+    // One call per token program, so the two readings can land on different slots.
+    // The lower one is the only slot both are known to cover: a balance from the
+    // higher reading may include a transfer the lower one had not yet seen, so
+    // claiming the higher slot would assert custody the snapshot cannot vouch for.
+    let mut snapshot_slot = u64::MAX;
 
     for token_program_id in token_programs {
-        let accounts = rpc_client
+        let response = rpc_client
             .with_retry(
                 "get_token_accounts_by_owner",
                 RetryPolicy::Idempotent,
@@ -60,7 +76,6 @@ pub async fn fetch_escrow_balances_by_mint(
                             CommitmentConfig::finalized(),
                         )
                         .await
-                        .map(|response| response.value)
                 },
             )
             .await
@@ -69,6 +84,9 @@ pub async fn fetch_escrow_balances_by_mint(
                     "Failed to fetch token accounts for program {token_program_id}: {e}"
                 ),
             })?;
+
+        snapshot_slot = snapshot_slot.min(response.context.slot);
+        let accounts = response.value;
 
         // The RPC may return accounts in binary (base64) or JSON-parsed form
         // depending on the requested encoding; handle both.
@@ -120,7 +138,10 @@ pub async fn fetch_escrow_balances_by_mint(
         }
     }
 
-    Ok(balances)
+    Ok(CustodySnapshot {
+        balances,
+        slot: snapshot_slot,
+    })
 }
 
 /// Read the channel-token supply for `mint` on the PrivateChannel chain. An
@@ -225,32 +246,43 @@ mod tests {
         )
     }
 
-    fn result_body(values: &[String]) -> String {
+    fn result_body(values: &[String], slot: u64) -> String {
         format!(
-            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":[{}]}},"id":1}}"#,
+            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{slot}}},"value":[{}]}},"id":1}}"#,
             values.join(",")
         )
     }
 
-    const EMPTY_BODY: &str =
-        r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":[]},"id":1}"#;
+    fn empty_body(slot: u64) -> String {
+        result_body(&[], slot)
+    }
 
     /// The sweep calls `get_token_accounts_by_owner` once per token program. Route the
     /// SPL Token call (matched by its program id in the request body) to `spl_accounts`
     /// and the Token-2022 call to an empty list so the two are not double-counted.
     async fn mock_sweep(server: &mut mockito::Server, spl_accounts: &[String]) {
+        mock_sweep_at_slots(server, spl_accounts, 1, 1).await;
+    }
+
+    /// Same routing, with the context slot of each call pinned separately.
+    async fn mock_sweep_at_slots(
+        server: &mut mockito::Server,
+        spl_accounts: &[String],
+        spl_slot: u64,
+        token_2022_slot: u64,
+    ) {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
             .with_status(200)
-            .with_body(result_body(spl_accounts))
+            .with_body(result_body(spl_accounts, spl_slot))
             .create_async()
             .await;
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
             .with_status(200)
-            .with_body(EMPTY_BODY)
+            .with_body(empty_body(token_2022_slot))
             .create_async()
             .await;
     }
@@ -273,7 +305,8 @@ mod tests {
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
-            .unwrap();
+            .unwrap()
+            .balances;
 
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[&mint1], 300, "same mint across accounts must sum");
@@ -288,7 +321,8 @@ mod tests {
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
-            .unwrap();
+            .unwrap()
+            .balances;
 
         assert_eq!(balances[&mint], 1_234, "base64 layout must unpack and sum");
     }
@@ -310,10 +344,31 @@ mod tests {
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
-            .unwrap();
+            .unwrap()
+            .balances;
 
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[&mint], 50);
+    }
+
+    /// The two per-program calls can land on different slots, and only the lower one is
+    /// covered by both. Claiming the higher would vouch for custody the earlier reading
+    /// never saw, which is exactly the drift the snapshot slot exists to prevent.
+    #[tokio::test]
+    async fn snapshot_slot_is_the_lower_of_the_two_sweeps() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 900, 880).await;
+
+        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.slot, 880,
+            "the snapshot can only claim the lower slot"
+        );
+        assert_eq!(snapshot.balances[&mint], 42);
     }
 
     #[tokio::test]
@@ -323,7 +378,8 @@ mod tests {
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
-            .unwrap();
+            .unwrap()
+            .balances;
 
         assert!(balances.is_empty());
     }

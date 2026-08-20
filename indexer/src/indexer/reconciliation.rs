@@ -12,8 +12,10 @@
 //! Only completed withdrawals (`release_funds`) reduce the ATA balance.
 //!
 //! Flow:
-//! 1. Sweep the escrow instance's on-chain token accounts, summed per mint.
-//! 2. Query the DB for per-mint aggregate balances (all deposits − completed withdrawals).
+//! 1. Sweep the escrow instance's on-chain token accounts, summed per mint, noting the
+//!    slot the reading is valid as of.
+//! 2. Query the DB for per-mint aggregate balances (all deposits − completed
+//!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
 //! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
 //!    error, emit alert, abort startup. Checked first: it reads the chain on both sides,
@@ -27,7 +29,7 @@ use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
     operator::{
-        escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint},
+        escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot},
         rpc_util::RpcClientWithRetry,
         RetryConfig,
     },
@@ -88,6 +90,63 @@ pub async fn run_startup_reconciliation(
         return Ok(());
     }
 
+    let snapshot = capture_custody_snapshot(rpc_url, instance_pda).await?;
+    reconcile_against_snapshot(
+        config,
+        program_type,
+        storage,
+        channel_rpc_url,
+        instance_pda,
+        &snapshot,
+    )
+    .await
+}
+
+/// Read the escrow's on-chain custody, along with the slot the reading is valid as of.
+///
+/// Callers that can catch their ledger up take this first and compare against it after,
+/// so the two sides of the comparison describe the same slot. Reading custody afterwards
+/// instead would measure a chain that has moved on from the ledger it is judged against.
+pub async fn capture_custody_snapshot(
+    rpc_url: &str,
+    instance_pda: &Pubkey,
+) -> Result<CustodySnapshot, IndexerError> {
+    let rpc_client = RpcClientWithRetry::with_retry_config(
+        rpc_url.to_string(),
+        RetryConfig::default(),
+        CommitmentConfig::finalized(),
+    );
+
+    let snapshot = fetch_escrow_balances_by_mint(&rpc_client, *instance_pda)
+        .await
+        .map_err(|e| ReconciliationError::Rpc {
+            mint: instance_pda.to_string(),
+            reason: e.reason,
+        })?;
+
+    info!(
+        instance_pda = %instance_pda,
+        snapshot_slot = snapshot.slot,
+        mint_count = snapshot.balances.len(),
+        "Captured on-chain escrow custody"
+    );
+    Ok(snapshot)
+}
+
+/// Compare a captured custody snapshot against the ledger as of the snapshot's slot.
+pub async fn reconcile_against_snapshot(
+    config: &ReconciliationConfig,
+    program_type: ProgramType,
+    storage: &Storage,
+    channel_rpc_url: Option<&str>,
+    instance_pda: &Pubkey,
+    snapshot: &CustodySnapshot,
+) -> Result<(), IndexerError> {
+    if program_type != ProgramType::Escrow {
+        info!("Startup reconciliation skipped (program_type is not Escrow)");
+        return Ok(());
+    }
+
     // The supply invariant must always run for an escrow indexer, so the channel
     // RPC is a hard config gate: a missing or blank one fails the boot even in empty state.
     let channel_rpc_url = channel_rpc_url
@@ -97,9 +156,9 @@ pub async fn run_startup_reconciliation(
             ReconciliationError::MissingChannelRpc,
         ))?;
 
-    let instance_pda = *instance_pda;
     info!(
         instance_pda = %instance_pda,
+        snapshot_slot = snapshot.slot,
         "Running startup reconciliation"
     );
 
@@ -108,26 +167,15 @@ pub async fn run_startup_reconciliation(
     // dedup hides anything they haven't already seen.
     log_orphan_deposit_rows_at_startup(storage).await;
 
-    let rpc_client = RpcClientWithRetry::with_retry_config(
-        rpc_url.to_string(),
-        RetryConfig::default(),
-        CommitmentConfig::finalized(),
-    );
-
-    // The on-chain sweep is the authoritative custody view.
-    let on_chain_balances = fetch_escrow_balances_by_mint(&rpc_client, instance_pda)
-        .await
-        .map_err(|e| ReconciliationError::Rpc {
-            mint: instance_pda.to_string(),
-            reason: e.reason,
-        })?;
-
+    // Bounded by the snapshot's slot so the ledger side answers for the same instant the
+    // custody side does. Without it, rows indexed after the reading would be counted
+    // against custody that never reflected them.
     let mint_balances = storage
-        .get_mint_balances_for_reconciliation()
+        .get_mint_balances_for_reconciliation(snapshot.slot)
         .await
         .map_err(ReconciliationError::Storage)?;
 
-    let results = build_reconciliation_set(&mint_balances, &on_chain_balances)?;
+    let results = build_reconciliation_set(&mint_balances, &snapshot.balances)?;
 
     if results.is_empty() {
         // Reached only when both the escrow sweep and the DB are genuinely empty, i.e. a truly-first deploy.

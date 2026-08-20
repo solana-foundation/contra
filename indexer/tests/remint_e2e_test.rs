@@ -383,7 +383,9 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
     // on-chain reality — the withdrawal never landed, so the escrow still holds
     // the full deposit. Counting a PendingRemint withdrawal would undercount
     // the escrow balance and produce a false reconciliation mismatch.
-    let pending = storage.get_mint_balances_for_reconciliation().await?;
+    let pending = storage
+        .get_mint_balances_for_reconciliation(u64::MAX)
+        .await?;
     let balance = pending
         .iter()
         .find(|b| b.mint_address == mint.to_string())
@@ -421,7 +423,9 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
     // The failed withdrawal is still NOT in total_withdrawals — FailedReminted
     // means the withdrawal never succeeded on-chain. The escrow still holds the
     // deposit. The user received their tokens back on PrivateChannel via remint.
-    let after_balances = storage.get_mint_balances_for_reconciliation().await?;
+    let after_balances = storage
+        .get_mint_balances_for_reconciliation(u64::MAX)
+        .await?;
     let after_balance = after_balances
         .iter()
         .find(|b| b.mint_address == mint.to_string())
@@ -474,7 +478,9 @@ async fn test_multiple_pending_remints_excluded_from_balance(
     }
 
     // All three PendingRemint withdrawals must be invisible to the balance query.
-    let balances = storage.get_mint_balances_for_reconciliation().await?;
+    let balances = storage
+        .get_mint_balances_for_reconciliation(u64::MAX)
+        .await?;
     let balance = balances
         .iter()
         .find(|b| b.mint_address == mint.to_string())

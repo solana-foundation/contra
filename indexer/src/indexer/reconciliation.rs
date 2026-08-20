@@ -38,7 +38,7 @@ use crate::{
     storage::Storage,
 };
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{error, info, warn};
 
 /// Per-mint result produced during reconciliation.
@@ -202,22 +202,107 @@ pub async fn reconcile_against_snapshot(
     Ok(())
 }
 
-/// Read channel-token supply per mint and fail startup if any mint's supply
-/// exceeds its on-chain custody beyond the threshold. Startup is quiescent, so a
-/// plain `mismatch_threshold_raw` compare suffices with no envelope/persistence.
+/// Readings a supply breach must appear in, consecutively, before it is believed.
+const SUPPLY_BREACH_CONFIRMATIONS: u32 = 3;
+
+/// Pause between those readings, so each one sees a genuinely later state of both chains.
+#[cfg(not(test))]
+const SUPPLY_BREACH_RECHECK_DELAY_MS: u64 = 500;
+#[cfg(test)]
+const SUPPLY_BREACH_RECHECK_DELAY_MS: u64 = 10;
+
+/// One mint whose channel supply was not covered by custody in a single reading.
+struct SupplyBreach {
+    mint: String,
+    key: Pubkey,
+    supply: u64,
+    custody: u64,
+    custody_slot: u64,
+    gap: u64,
+}
+
+/// Take one reading of every mint's channel supply and compare it against escrow custody.
 ///
-/// A per-mint supply read that errors is skipped with a warn rather than aborting
-/// the boot: the channel RPC (gateway) may not be ready yet, the runtime loop is
-/// the primary control, and a transient read must not crash-loop the indexer.
-/// Only a proven supply-over-custody breach is fatal.
+/// Supplies are read first and custody after, so the custody reading cannot be missing a
+/// deposit any supply read already saw. The frozen snapshot is folded in as a floor
+/// because custody also falls: a release between the two lowers the fresh reading, and
+/// judging against the higher of the two stops an ordinary withdrawal from looking like a
+/// breach. `only` restricts the reading to mints an earlier round already suspected.
+async fn measure_supply_breaches(
+    channel_rpc: &RpcClientWithRetry,
+    escrow_rpc_url: &str,
+    instance_pda: &Pubkey,
+    config: &ReconciliationConfig,
+    results: &[MintReconciliation],
+    only: Option<&HashSet<Pubkey>>,
+) -> Result<Vec<SupplyBreach>, IndexerError> {
+    // Same mint universe as the ledger comparison, so a mint is never dropped from the
+    // invariant just because it holds nothing on chain.
+    let mut supplies: Vec<(&MintReconciliation, Pubkey, u64)> = Vec::new();
+    for r in results {
+        let mint = r
+            .mint
+            .parse::<Pubkey>()
+            .map_err(|e| ReconciliationError::InvalidPubkey {
+                pubkey: r.mint.clone(),
+                reason: e.to_string(),
+            })?;
+        if only.is_some_and(|s| !s.contains(&mint)) {
+            continue;
+        }
+        match fetch_channel_supply(channel_rpc, &mint).await {
+            Ok(supply) => supplies.push((r, mint, supply)),
+            Err(e) => {
+                warn!(
+                    mint = %r.mint,
+                    reason = %e.reason,
+                    "Startup supply invariant: channel supply read failed, skipping this mint"
+                );
+            }
+        }
+    }
+
+    if supplies.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let custody = capture_custody_snapshot(escrow_rpc_url, instance_pda).await?;
+
+    let mut breaches = Vec::new();
+    for (r, mint, supply) in supplies {
+        let on_chain_custody = custody
+            .balances
+            .get(&mint)
+            .copied()
+            .unwrap_or(0)
+            .max(r.on_chain_actual);
+        let gap = supply.saturating_sub(on_chain_custody);
+        if gap > config.mismatch_threshold_raw {
+            breaches.push(SupplyBreach {
+                mint: r.mint.clone(),
+                key: mint,
+                supply,
+                custody: on_chain_custody,
+                custody_slot: custody.slot,
+                gap,
+            });
+        }
+    }
+    Ok(breaches)
+}
+
+/// Fail startup if any mint's channel supply exceeds the custody backing it.
 ///
-/// This deliberately does NOT reuse the frozen snapshot the ledger is judged against.
-/// That snapshot is deliberately old: it is taken before the catch-up so the ledger can be
-/// brought level with it. Supply, by contrast, is read now, and an operator running
-/// alongside startup can mint a deposit that landed after the snapshot. Judged against the
-/// snapshot that mint looks like supply with no backing, and startup would abort over a
-/// deposit that is sitting in custody on chain. A reading taken after the supply reads
-/// cannot be missing anything they saw.
+/// Supply and custody live on different chains and both keep moving, so no single pass can
+/// read them at one instant: a deposit minted between the readings, or a burn whose release
+/// has not landed yet, each make a healthy mint look short-changed for a moment. A breach
+/// is therefore believed only if it survives several consecutive readings, which is the
+/// same persistence rule the runtime invariant uses. A real insolvency does not heal
+/// between reads, so this costs nothing on a healthy boot and nothing in detection.
+///
+/// A per-mint supply read that errors is skipped with a warn rather than aborting the boot:
+/// the channel RPC (gateway) may not be ready yet, the runtime loop is the primary control,
+/// and a transient read must not crash-loop the indexer.
 async fn check_channel_supply_invariant(
     channel_rpc_url: &str,
     escrow_rpc_url: &str,
@@ -231,74 +316,63 @@ async fn check_channel_supply_invariant(
         CommitmentConfig::finalized(),
     );
 
-    // Same mint universe as the ledger comparison, so a mint is never dropped from the
-    // invariant just because it holds nothing on chain.
-    let mut supplies: Vec<(&MintReconciliation, Pubkey, u64)> = Vec::new();
-    for r in results {
-        let mint = r
-            .mint
-            .parse::<Pubkey>()
-            .map_err(|e| ReconciliationError::InvalidPubkey {
-                pubkey: r.mint.clone(),
-                reason: e.to_string(),
-            })?;
-        match fetch_channel_supply(&channel_rpc, &mint).await {
-            Ok(supply) => supplies.push((r, mint, supply)),
-            Err(e) => {
-                warn!(
-                    mint = %r.mint,
-                    reason = %e.reason,
-                    "Startup supply invariant: channel supply read failed, skipping this mint"
-                );
-            }
+    // Each round re-reads only what the previous one suspected, so a mint has to breach in
+    // every reading to survive to the end.
+    let mut suspects: Option<HashSet<Pubkey>> = None;
+    let mut confirmed: Vec<SupplyBreach> = Vec::new();
+
+    for attempt in 1..=SUPPLY_BREACH_CONFIRMATIONS {
+        let breaches = measure_supply_breaches(
+            &channel_rpc,
+            escrow_rpc_url,
+            instance_pda,
+            config,
+            results,
+            suspects.as_ref(),
+        )
+        .await?;
+
+        if breaches.is_empty() {
+            return Ok(());
         }
-    }
 
-    if supplies.is_empty() {
-        return Ok(());
-    }
+        suspects = Some(breaches.iter().map(|b| b.key).collect());
+        confirmed = breaches;
 
-    // Taken after every supply read, so it cannot be missing a deposit that backs one of
-    // them. A mint absent from it holds nothing, which is what a single sweep reported.
-    let custody = capture_custody_snapshot(escrow_rpc_url, instance_pda).await?;
-
-    let mut breaches = 0usize;
-    for (r, mint, supply) in supplies {
-        // Custody moves in both directions while these reads happen: a deposit raises it
-        // after the snapshot, and a release lowers it before the fresh sweep. Judging
-        // against the higher of the two means neither ordering can invent a breach, and a
-        // mint still fails when no reading of custody can account for its supply.
-        let on_chain_custody = custody
-            .balances
-            .get(&mint)
-            .copied()
-            .unwrap_or(0)
-            .max(r.on_chain_actual);
-        let gap = supply.saturating_sub(on_chain_custody);
-        if gap > config.mismatch_threshold_raw {
-            error!(
-                reconciliation_alert = true,
-                mint = %r.mint,
-                supply,
-                on_chain_custody,
-                custody_slot = custody.slot,
-                gap,
-                threshold = config.mismatch_threshold_raw,
-                "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
+        if attempt < SUPPLY_BREACH_CONFIRMATIONS {
+            warn!(
+                mint_count = confirmed.len(),
+                attempt,
+                confirmations = SUPPLY_BREACH_CONFIRMATIONS,
+                "Startup supply invariant: possible breach, re-reading before acting on it"
             );
-            breaches += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                SUPPLY_BREACH_RECHECK_DELAY_MS,
+            ))
+            .await;
         }
     }
 
-    if breaches > 0 {
-        return Err(IndexerError::Reconciliation(
-            ReconciliationError::SupplyExceedsCustody {
-                count: breaches,
-                threshold: config.mismatch_threshold_raw,
-            },
-        ));
+    for b in &confirmed {
+        error!(
+            reconciliation_alert = true,
+            mint = %b.mint,
+            supply = b.supply,
+            on_chain_custody = b.custody,
+            custody_slot = b.custody_slot,
+            gap = b.gap,
+            threshold = config.mismatch_threshold_raw,
+            confirmations = SUPPLY_BREACH_CONFIRMATIONS,
+            "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
+        );
     }
-    Ok(())
+
+    Err(IndexerError::Reconciliation(
+        ReconciliationError::SupplyExceedsCustody {
+            count: confirmed.len(),
+            threshold: config.mismatch_threshold_raw,
+        },
+    ))
 }
 
 /// Build the per-mint reconciliation set from the union of (DB mints) and
@@ -1095,6 +1169,16 @@ mod tests {
 
     /// getAccountInfo mock returning an SPL Mint blob with `supply`.
     async fn mock_channel_supply(server: &mut mockito::Server, supply: u64) {
+        mock_channel_supply_times(server, supply, None).await;
+    }
+
+    /// `times` caps how many reads this supply is served for, so a test can script one
+    /// reading followed by a different one.
+    async fn mock_channel_supply_times(
+        server: &mut mockito::Server,
+        supply: u64,
+        times: Option<usize>,
+    ) {
         use base64::Engine as _;
         use spl_token::solana_program::program_option::COption;
         use spl_token::solana_program::program_pack::Pack;
@@ -1110,16 +1194,56 @@ mod tests {
         let mut buf = vec![0u8; Mint::LEN];
         mint_state.pack_into_slice(&mut buf);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
-        server
+        let mock = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex("getAccountInfo".to_string()))
             .with_status(200)
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":100}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
                 prog = spl_token::id(),
-            ))
-            .create_async()
-            .await;
+            ));
+        match times {
+            Some(n) => mock.expect(n).create_async().await,
+            None => mock.create_async().await,
+        };
+    }
+
+    /// Supply and custody sit on different chains, so one reading can catch a mint mid
+    /// flight: minted here, not yet released there. Startup must re-read before acting,
+    /// or an operator working alongside it turns an ordinary boot into a fatal alert.
+    #[tokio::test]
+    async fn supply_breach_that_clears_on_a_re_read_is_not_fatal() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        // First reading catches supply above custody; the next one no longer does.
+        mock_channel_supply_times(&mut server, 1_200, Some(1)).await;
+        mock_channel_supply(&mut server, 1_000).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a breach that does not survive a re-read must not abort startup: {:?}",
+            result
+        );
     }
 
     #[tokio::test]

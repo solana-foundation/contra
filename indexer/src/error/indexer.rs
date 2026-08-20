@@ -56,6 +56,12 @@ pub enum ReconciliationError {
     #[error("{count} mint(s) have channel supply above escrow custody by more than {threshold} raw units; see logs for per-mint details")]
     SupplyExceedsCustody { count: usize, threshold: u64 },
 
+    /// The custody reading came from a slot the ledger has already passed, so the two
+    /// cannot be compared at a common point and any verdict would be guesswork. Usually a
+    /// lagging RPC node, which is why a re-read is worth trying before giving up.
+    #[error("custody was read at slot {snapshot_slot}, behind the committed checkpoint {committed}; the node is answering from behind the ledger")]
+    CustodyBehindLedger { snapshot_slot: u64, committed: u64 },
+
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 

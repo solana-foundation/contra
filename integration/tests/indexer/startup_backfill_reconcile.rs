@@ -243,6 +243,16 @@ async fn wait_for_block_servable(rpc_url: &str, slot: u64) {
 /// Answers every attempt's two token programs, so it is left uncounted rather than pinned
 /// to an exact hit count.
 async fn mock_escrow_custody(rpc: &mut MockitoServer, holdings: &[(String, i64)]) -> mockito::Mock {
+    mock_escrow_custody_at(rpc, holdings, MOCK_TIP).await
+}
+
+/// Same, with the slot the reading is reported as valid at. Startup fills up to that slot
+/// and no further, so a value below the tip is what leaves a band for the live source.
+async fn mock_escrow_custody_at(
+    rpc: &mut MockitoServer,
+    holdings: &[(String, i64)],
+    context_slot: u64,
+) -> mockito::Mock {
     let accounts: Vec<serde_json::Value> = holdings
         .iter()
         .map(|(mint, amount)| {
@@ -278,7 +288,7 @@ async fn mock_escrow_custody(rpc: &mut MockitoServer, holdings: &[(String, i64)]
         .with_body(
             json!({
                 "jsonrpc": "2.0",
-                "result": {"context": {"slot": MOCK_TIP}, "value": accounts},
+                "result": {"context": {"slot": context_slot}, "value": accounts},
                 "id": 1
             })
             .to_string(),
@@ -713,6 +723,173 @@ async fn the_fill_imports_the_deposit_that_explains_custody() {
         !handle.is_finished(),
         "custody explained by the imported deposit must not stop startup at threshold 0"
     );
+
+    handle.abort();
+    chain.shutdown().await;
+}
+
+/// Custody read from behind our own ledger must stop the boot, not produce a verdict.
+///
+/// The checkpoint says slots up to 899 are indexed while the custody read only speaks for
+/// slot 890. There is no slot at which the two can be compared: the ledger cannot be
+/// rewound and custody cannot be rolled forward. Comparing anyway would judge nine slots of
+/// indexed deposits against a custody view that predates them, which reads as an unbacked
+/// ledger and would look exactly like insolvency. Startup retries the read first, since a
+/// lagging node usually catches up, and fails closed when it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custody_read_from_behind_the_ledger_stops_startup() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_backfill_behind").await;
+
+    // A ledger that has already committed past where custody can speak for.
+    sqlx::query(
+        "INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
+         VALUES ('escrow', 899, NOW())
+         ON CONFLICT (program_type) DO UPDATE SET last_committed_slot = 899",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed checkpoint");
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _range = mock_fill_range(&mut rpc).await;
+    let _custody = mock_escrow_custody_at(&mut rpc, &[], 890).await;
+
+    let chain = MockRpcServer::start().await;
+    let handle = spawn_indexer(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        MOCK_START_SLOT,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must terminate rather than compare across a gap it cannot close")
+        .expect("run task must not panic");
+
+    match result {
+        Err(IndexerError::Reconciliation(ReconciliationError::CustodyBehindLedger {
+            snapshot_slot,
+            committed,
+        })) => {
+            assert_eq!(snapshot_slot, 890);
+            assert_eq!(committed, 899);
+        }
+        other => panic!("expected a fail-closed custody-behind-ledger halt, got {other:?}"),
+    }
+
+    chain.shutdown().await;
+}
+
+/// The fill stops where custody was measured, so the live source must resume from there
+/// and not from the chain tip.
+///
+/// Custody is read at a slot below the tip, which leaves a band of slots that the fill
+/// deliberately does not cover. Nothing else will ever read them: startup is finished with
+/// the range and the live source only walks forward from wherever it is told to start. A
+/// deposit is planted inside that band, so if the resume slot were taken from the resolved
+/// range, one past the tip, the deposit would be skipped and never indexed by anything.
+/// The row appearing is the proof that the two producers still meet with no hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_live_source_resumes_where_the_fill_stopped() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_backfill_resume").await;
+
+    let instance = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    // Custody is measured here; the fill covers up to it and stops.
+    let custody_slot = MOCK_TIP - 3;
+    // Above the fill's reach, so only the live source can bring it in.
+    let deposit_slot = MOCK_TIP - 1;
+    assert!(
+        deposit_slot > custody_slot,
+        "the deposit must sit in the band the fill skips"
+    );
+    seed_allowed_mint(&pool, &mint.to_string()).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    // The fill enumerates only up to the measured slot, so that shorter range needs its own
+    // listing; the tip-length one the other tests use would never be requested here.
+    let capped: Vec<u64> = (MOCK_START_SLOT..=custody_slot).collect();
+    let _capped_range = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [MOCK_START_SLOT, custody_slot]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": capped, "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // The live source enumerates its own batch before fetching it, starting one past the
+    // fill target and running to the tip: exactly the band under test.
+    let live: Vec<u64> = (custody_slot + 1..MOCK_TIP).collect();
+    let _live_range = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [custody_slot + 1, MOCK_TIP - 1]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": live, "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _range = mock_fill_range_carrying(
+        &mut rpc,
+        Some((
+            deposit_slot,
+            deposit_block_json(deposit_slot, instance, mint, DEPOSIT_AMOUNT),
+        )),
+    )
+    .await;
+    // Empty at the measured slot: the deposit has not happened yet as of then, so startup
+    // reconciles clean and the deposit is purely the live source's to find.
+    let _custody = mock_escrow_custody_at(&mut rpc, &[], custody_slot).await;
+
+    let chain = MockRpcServer::start().await;
+    let mut handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
+
+    // The fill stops at the measured slot, not the tip.
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    loop {
+        if checkpoint_of(&pool, "escrow").await == Some(custody_slot as i64) {
+            break;
+        }
+        if handle.is_finished() {
+            panic!(
+                "startup exited instead of filling to the measured slot: {:?}",
+                (&mut handle).await
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fill never committed through the slot custody was measured at"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Now the live source has to cover the band the fill left behind.
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    loop {
+        if let Some((slot, amount)) = deposit_row(&pool, &mint.to_string()).await {
+            assert_eq!(slot, deposit_slot as i64);
+            assert_eq!(amount, DEPOSIT_AMOUNT.to_string());
+            break;
+        }
+        if handle.is_finished() {
+            panic!(
+                "startup exited before the live source read the band: {:?}",
+                (&mut handle).await
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deposit above the fill target was never indexed, so the resume slot skipped it"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     handle.abort();
     chain.shutdown().await;

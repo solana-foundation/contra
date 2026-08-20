@@ -20,7 +20,9 @@ use crate::{
     error::BackfillError,
     indexer::{
         backfill::{BackfillService, StartupRange},
-        checkpoint::{wait_for_checkpoint_commit, CHECKPOINT_COMMIT_TIMEOUT_SECS},
+        checkpoint::{
+            get_last_checkpoint, wait_for_checkpoint_commit, CHECKPOINT_COMMIT_TIMEOUT_SECS,
+        },
     },
     operator::escrow_sweep::CustodySnapshot,
 };
@@ -80,17 +82,20 @@ const RECONCILE_RETRY_DELAY_MS: u64 = 2_000;
 #[cfg(all(feature = "datasource-rpc", test))]
 const RECONCILE_RETRY_DELAY_MS: u64 = 10;
 
-/// Whether another fill could plausibly clear this failure.
+/// Whether another attempt could plausibly clear this failure.
 ///
-/// Only a custody-versus-ledger mismatch can be, and only because the chain kept moving
-/// while startup was catching up, so the next fill may pull in the rows that explain it.
-/// Everything else, a supply breach included, compares the same two numbers however many
-/// times it runs, so it stops the boot on the spot instead of paying for two more fills.
+/// Two can. A custody-versus-ledger mismatch may be explained by rows the next fill pulls
+/// in. A custody reading from behind our own ledger is a node that has not caught up, and
+/// a fresh read usually lands ahead of it. Everything else, a supply breach included,
+/// compares the same numbers however many times it runs, so it stops the boot on the spot.
 #[cfg(feature = "datasource-rpc")]
 fn reconcile_error_may_clear(error: &IndexerError) -> bool {
     matches!(
         error,
-        IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold { .. })
+        IndexerError::Reconciliation(
+            ReconciliationError::MismatchExceedsThreshold { .. }
+                | ReconciliationError::CustodyBehindLedger { .. }
+        )
     )
 }
 
@@ -136,6 +141,7 @@ async fn reconcile_escrow_against(
         config,
         common_config.program_type,
         storage,
+        &common_config.rpc_url,
         common_config.source_rpc_url.as_deref(),
         &instance_id,
         snapshot,
@@ -416,39 +422,73 @@ pub async fn run(
                         let snapshot =
                             capture_custody_snapshot(&common_config.rpc_url, &instance_id).await?;
 
+                        // The ledger must not already sit above the reading it is about to
+                        // be judged by. If it does, the node is answering from behind us
+                        // and there is no slot at which the two can be compared, so refuse
+                        // rather than reach a verdict from an incomplete custody view.
+                        let committed = get_last_checkpoint(&storage, common_config.program_type)
+                            .await?
+                            .unwrap_or(0);
+                        if snapshot.slot < committed {
+                            let behind = IndexerError::Reconciliation(
+                                ReconciliationError::CustodyBehindLedger {
+                                    snapshot_slot: snapshot.slot,
+                                    committed,
+                                },
+                            );
+                            if attempt < RECONCILE_MAX_ATTEMPTS {
+                                warn!(
+                                    "Startup reconciliation attempt {}/{}: {}, re-reading",
+                                    attempt, RECONCILE_MAX_ATTEMPTS, behind
+                                );
+                                tokio::time::sleep(Duration::from_millis(RECONCILE_RETRY_DELAY_MS))
+                                    .await;
+                                continue;
+                            }
+                            return Err(behind);
+                        }
+
                         let range = resolve_startup_range(&backfill_service).await?;
 
-                        // Pin the live source to backfill's boundary so it resumes with no
-                        // hole and no overlap. Taken from the last attempt, which resolved
-                        // highest.
-                        rpc_live_start_slot = Some(range.live_start_slot);
                         // The floor, never the target: the range above it is not filled yet.
                         #[cfg(feature = "datasource-yellowstone")]
                         {
                             startup_anchor_hint = Some(range.anchor);
                         }
 
-                        if let Some((from_slot, target)) = range.gap {
+                        // Fill up to the snapshot's slot rather than the chain tip. Stopping
+                        // exactly where custody was measured is what makes the comparison
+                        // total: the ledger ends at that slot, custody describes that slot,
+                        // and there is no band of rows above it that the comparison would
+                        // have to leave unexamined.
+                        let ledger_end = if snapshot.slot > range.anchor {
                             arm_and_fill(
                                 &backfill_service,
                                 &instruction_tx,
                                 common_config.program_type,
-                                from_slot,
-                                target,
+                                range.anchor,
+                                snapshot.slot,
                             )
                             .await?;
 
                             wait_for_checkpoint_commit(
                                 &storage,
                                 common_config.program_type,
-                                target,
+                                snapshot.slot,
                                 Duration::from_secs(CHECKPOINT_COMMIT_TIMEOUT_SECS),
                             )
                             .await?;
                             info!("Backfill completed successfully");
+                            snapshot.slot
                         } else {
                             info!("No backfill gap; checkpoint writer left ungated");
-                        }
+                            range.anchor
+                        };
+
+                        // One past whatever the ledger now covers. The fill stopped short of
+                        // the tip, so the resolved live start would leave everything between
+                        // the two unread by either producer.
+                        rpc_live_start_slot = Some(ledger_end + 1);
 
                         match reconcile_escrow_against(
                             &indexer_config.reconciliation,
@@ -749,6 +789,14 @@ mod tests {
                     threshold: 0,
                 },
                 false,
+            ),
+            // A lagging node usually catches up, so this one is worth re-reading.
+            (
+                ReconciliationError::CustodyBehindLedger {
+                    snapshot_slot: 90,
+                    committed: 100,
+                },
+                true,
             ),
             (ReconciliationError::MissingChannelRpc, false),
             (

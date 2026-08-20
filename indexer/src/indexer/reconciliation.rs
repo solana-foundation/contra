@@ -95,6 +95,7 @@ pub async fn run_startup_reconciliation(
         config,
         program_type,
         storage,
+        rpc_url,
         channel_rpc_url,
         instance_pda,
         &snapshot,
@@ -138,6 +139,7 @@ pub async fn reconcile_against_snapshot(
     config: &ReconciliationConfig,
     program_type: ProgramType,
     storage: &Storage,
+    rpc_url: &str,
     channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
     snapshot: &CustodySnapshot,
@@ -192,7 +194,8 @@ pub async fn reconcile_against_snapshot(
     // means the same thing however far behind the ledger is. Reporting the ledger
     // mismatch ahead of it would hide the graver finding whenever both are true, and
     // would send startup back for another catch-up that cannot change this answer.
-    check_channel_supply_invariant(channel_rpc_url, config, &results).await?;
+    check_channel_supply_invariant(channel_rpc_url, rpc_url, instance_pda, config, &results)
+        .await?;
 
     classify_and_report(config, &results)?;
 
@@ -207,8 +210,18 @@ pub async fn reconcile_against_snapshot(
 /// the boot: the channel RPC (gateway) may not be ready yet, the runtime loop is
 /// the primary control, and a transient read must not crash-loop the indexer.
 /// Only a proven supply-over-custody breach is fatal.
+///
+/// This deliberately does NOT reuse the frozen snapshot the ledger is judged against.
+/// That snapshot is deliberately old: it is taken before the catch-up so the ledger can be
+/// brought level with it. Supply, by contrast, is read now, and an operator running
+/// alongside startup can mint a deposit that landed after the snapshot. Judged against the
+/// snapshot that mint looks like supply with no backing, and startup would abort over a
+/// deposit that is sitting in custody on chain. A reading taken after the supply reads
+/// cannot be missing anything they saw.
 async fn check_channel_supply_invariant(
     channel_rpc_url: &str,
+    escrow_rpc_url: &str,
+    instance_pda: &Pubkey,
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
 ) -> Result<(), IndexerError> {
@@ -218,7 +231,9 @@ async fn check_channel_supply_invariant(
         CommitmentConfig::finalized(),
     );
 
-    let mut breaches = 0usize;
+    // Same mint universe as the ledger comparison, so a mint is never dropped from the
+    // invariant just because it holds nothing on chain.
+    let mut supplies: Vec<(&MintReconciliation, Pubkey, u64)> = Vec::new();
     for r in results {
         let mint = r
             .mint
@@ -227,25 +242,46 @@ async fn check_channel_supply_invariant(
                 pubkey: r.mint.clone(),
                 reason: e.to_string(),
             })?;
-        let supply = match fetch_channel_supply(&channel_rpc, &mint).await {
-            Ok(s) => s,
+        match fetch_channel_supply(&channel_rpc, &mint).await {
+            Ok(supply) => supplies.push((r, mint, supply)),
             Err(e) => {
                 warn!(
                     mint = %r.mint,
                     reason = %e.reason,
                     "Startup supply invariant: channel supply read failed, skipping this mint"
                 );
-                continue;
             }
-        };
+        }
+    }
 
-        let gap = supply.saturating_sub(r.on_chain_actual);
+    if supplies.is_empty() {
+        return Ok(());
+    }
+
+    // Taken after every supply read, so it cannot be missing a deposit that backs one of
+    // them. A mint absent from it holds nothing, which is what a single sweep reported.
+    let custody = capture_custody_snapshot(escrow_rpc_url, instance_pda).await?;
+
+    let mut breaches = 0usize;
+    for (r, mint, supply) in supplies {
+        // Custody moves in both directions while these reads happen: a deposit raises it
+        // after the snapshot, and a release lowers it before the fresh sweep. Judging
+        // against the higher of the two means neither ordering can invent a breach, and a
+        // mint still fails when no reading of custody can account for its supply.
+        let on_chain_custody = custody
+            .balances
+            .get(&mint)
+            .copied()
+            .unwrap_or(0)
+            .max(r.on_chain_actual);
+        let gap = supply.saturating_sub(on_chain_custody);
         if gap > config.mismatch_threshold_raw {
             error!(
                 reconciliation_alert = true,
                 mint = %r.mint,
                 supply,
-                on_chain_custody = r.on_chain_actual,
+                on_chain_custody,
+                custody_slot = custody.slot,
                 gap,
                 threshold = config.mismatch_threshold_raw,
                 "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
@@ -969,6 +1005,90 @@ mod tests {
         assert!(
             result.is_ok(),
             "net (deposits - withdrawals) must match on-chain: {:?}",
+            result
+        );
+    }
+
+    /// A deposit that lands after the snapshot can be minted before the supply is read, so
+    /// judging supply against the frozen snapshot would call a fully backed mint a breach
+    /// and abort the boot. The snapshot is deliberately old; the supply check must read
+    /// custody for itself.
+    #[tokio::test]
+    async fn supply_invariant_is_not_fooled_by_custody_that_arrived_after_the_snapshot() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // Custody now holds the deposit backing the mint, and the channel has minted it.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_channel_supply(&mut server, 1_000).await;
+
+        // The snapshot predates the deposit: at that slot the escrow held nothing.
+        let snapshot = CustodySnapshot {
+            balances: HashMap::from([(mint, 0)]),
+            slot: 50,
+        };
+
+        let storage = Storage::Mock(MockStorage::new());
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let url = server.url();
+        let result = reconcile_against_snapshot(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &Pubkey::new_unique(),
+            &snapshot,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a mint backed by custody that arrived after the snapshot must not be a breach: {:?}",
+            result
+        );
+    }
+
+    /// The mirror case. A release lowers custody between the supply reads and the fresh
+    /// sweep, so the later reading is the one missing the backing. Judging against the
+    /// higher of the two readings is what keeps a routine withdrawal from aborting a boot.
+    #[tokio::test]
+    async fn supply_invariant_is_not_fooled_by_custody_released_after_the_snapshot() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // The fresh sweep sees the escrow already emptied by a release.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 0)]).await;
+        mock_channel_supply(&mut server, 1_000).await;
+
+        // The snapshot predates the release: at that slot custody still backed the supply.
+        let snapshot = CustodySnapshot {
+            balances: HashMap::from([(mint, 1_000)]),
+            slot: 50,
+        };
+
+        // The ledger matches the snapshot, so only the supply logic is under test here.
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let url = server.url();
+        let result = reconcile_against_snapshot(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &Pubkey::new_unique(),
+            &snapshot,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "custody released after the snapshot must not read as a supply breach: {:?}",
             result
         );
     }

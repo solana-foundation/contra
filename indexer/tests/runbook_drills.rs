@@ -342,7 +342,7 @@ fn drill_1_error_message_contracts_present_in_source() {
 //   1. Triage query returns rows in the right order (poison row first).
 //   2. Mark-failed SQL terminates the trigger row.
 //   3. Re-arm SQL flips collateral rows back to `pending`, leaves the
-//      trigger row alone.
+//      trigger row and every held row alone (`id <> ALL(:excluded_ids)`).
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -369,6 +369,12 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
         collateral_ids.push(id);
     }
 
+    // A row an earlier incident left held in `manual_review`: Path C Step 3
+    // could not prove its source burn either way, so it must not re-enter
+    // the queue. The halt sweep does not restamp `manual_review` rows, so
+    // held rows outlive their incident and land in this triage.
+    let held_id = seed_withdrawal(&pool, "manual_review", 6, None).await?;
+
     // ── Triage query (verbatim from runbook) ────────────────────────────
     let rows = sqlx::query(
         r#"
@@ -388,7 +394,7 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
         first_id, poison_id,
         "triage must return poison row first (oldest updated_at)"
     );
-    assert_eq!(rows.len(), 5, "all 5 manual_review rows visible");
+    assert_eq!(rows.len(), 6, "all 6 manual_review rows visible");
 
     // ── Mark trigger as failed (verbatim from runbook step 3) ──────────
     sqlx::query("UPDATE transactions SET status = 'failed', updated_at = NOW() WHERE id = $1")
@@ -402,16 +408,17 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
     // `error_message IS NULL` filter applies cleanly. (The DB schema has no
     // error_message column today; the runbook semantics rely on the alert
     // payload, but the recovery SQL itself is column-free for the dispatch.)
+    let excluded_ids = vec![poison_id, held_id];
     let updated = sqlx::query(
         r#"
         UPDATE transactions
            SET status = 'pending', updated_at = NOW()
          WHERE transaction_type = 'withdrawal'
            AND status = 'manual_review'
-           AND id <> $1
+           AND id <> ALL($1)
         "#,
     )
-    .bind(poison_id)
+    .bind(&excluded_ids[..])
     .execute(&pool)
     .await?;
     assert_eq!(
@@ -421,14 +428,20 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
     );
 
     // ── Post-state assertions ──────────────────────────────────────────
-    assert_eq!(count_status(&pool, "manual_review").await?, 0);
+    assert_eq!(count_status(&pool, "manual_review").await?, 1);
     assert_eq!(count_status(&pool, "failed").await?, 1);
     assert_eq!(count_status(&pool, "pending").await?, 4);
     for id in collateral_ids {
         assert_eq!(status_of(&pool, id).await?, "pending");
     }
+    assert_eq!(
+        status_of(&pool, held_id).await?,
+        "manual_review",
+        "a held row must survive Path A recovery; re-arming it would release \
+         escrowed funds against an unproven burn"
+    );
 
-    eprintln!("Path A recovery SQL verified end-to-end.");
+    eprintln!("Path A recovery SQL verified end-to-end; held row not re-armed.");
     Ok(())
 }
 

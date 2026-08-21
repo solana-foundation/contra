@@ -96,13 +96,16 @@ collateral.
       SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE transaction_type = 'withdrawal'
       AND status = 'manual_review'
-      AND id <> :poison_id;
+      AND id <> ALL(:excluded_ids);
    ```
+   `:excluded_ids` is `:poison_id` plus every row a prior escalation left
+   held in `manual_review` (each recorded in its own incident record).
+   Re-arming a held row releases escrowed funds against a burn nobody
+   proved happened.
    The `transactions` table does not store `error_message` - it lives in the
    alert payload only. Distinguishing trigger from collateral happens in
    triage (Step 2: oldest `updated_at` is the trigger), not in the re-arm
-   query. If you have *multiple* unresolved trigger rows from different
-   incidents, recover them one at a time and exclude each via `id <> :id`.
+   query.
 5. **Restart the withdraw operator** (Docker, from the repo root: `docker compose
    restart operator-private-channel`; or by container: `docker restart
    private-channel-operator-private-channel`). The fetcher picks up `pending` rows and
@@ -291,7 +294,9 @@ committing the row to manual review. Sub-triggers below; same recovery.
      stop. [Escalate](_escalation.md) (Tier 2).
      Do not terminalize: marking a genuinely burned row `failed` strands
      the user's tokens with no restoration path. Re-run once the endpoint
-     covers the slot, or from an archival node.
+     covers the slot, or from an archival node. Record the id as held in
+     the incident record - it stays in `manual_review`, so a later halt's
+     Path A Step 4 must exclude it.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
 
@@ -375,7 +380,9 @@ The RPC failed, or `not found` came back without ledger coverage of the
 row's `slot`. Stop. [Escalate](_escalation.md) (Tier 2). **Do not delete
 the row** - the burn may have landed, and this row is the only record of
 it. Re-run Step 2 once the endpoint covers the slot, or against an
-archival node.
+archival node. Record the id as held in the incident record, as in Path C
+Step 3: the row stays in `manual_review`, so a later halt's Path A Step 4
+must exclude it.
 
 ## Path G - requeue cap exhausted (release never landed)
 

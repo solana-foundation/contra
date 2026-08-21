@@ -205,6 +205,11 @@ pub async fn reconcile_against_snapshot(
 /// Readings a supply breach must appear in, consecutively, before it is believed.
 const SUPPLY_BREACH_CONFIRMATIONS: u32 = 3;
 
+/// Ceiling on reading rounds. A round whose supply read fails proves nothing either way,
+/// so it buys a replacement round instead of counting: a flaky RPC must not shorten the
+/// rule to fewer than SUPPLY_BREACH_CONFIRMATIONS real comparisons.
+const SUPPLY_BREACH_MAX_ROUNDS: u32 = SUPPLY_BREACH_CONFIRMATIONS * 2;
+
 /// Pause between those readings, so each one sees a genuinely later state of both chains.
 #[cfg(not(test))]
 const SUPPLY_BREACH_RECHECK_DELAY_MS: u64 = 500;
@@ -221,6 +226,14 @@ struct SupplyBreach {
     gap: u64,
 }
 
+/// What a single reading round learned: the mints it found breaching, and the mints it
+/// could not read at all. The two are kept apart because a read that failed is not
+/// evidence that a mint recovered, and only evidence of recovery may clear a breach.
+struct SupplyReading {
+    breaches: Vec<SupplyBreach>,
+    unread: HashSet<Pubkey>,
+}
+
 /// Take one reading of every mint's channel supply and compare it against escrow custody.
 ///
 /// Supplies are read first and custody after, so the custody reading cannot be missing a
@@ -235,10 +248,11 @@ async fn measure_supply_breaches(
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
     only: Option<&HashSet<Pubkey>>,
-) -> Result<Vec<SupplyBreach>, IndexerError> {
+) -> Result<SupplyReading, IndexerError> {
     // Same mint universe as the ledger comparison, so a mint is never dropped from the
     // invariant just because it holds nothing on chain.
     let mut supplies: Vec<(&MintReconciliation, Pubkey, u64)> = Vec::new();
+    let mut unread: HashSet<Pubkey> = HashSet::new();
     for r in results {
         let mint = r
             .mint
@@ -253,17 +267,21 @@ async fn measure_supply_breaches(
         match fetch_channel_supply(channel_rpc, &mint).await {
             Ok(supply) => supplies.push((r, mint, supply)),
             Err(e) => {
+                unread.insert(mint);
                 warn!(
                     mint = %r.mint,
                     reason = %e.reason,
-                    "Startup supply invariant: channel supply read failed, skipping this mint"
+                    "Startup supply invariant: channel supply read failed"
                 );
             }
         }
     }
 
     if supplies.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SupplyReading {
+            breaches: Vec::new(),
+            unread,
+        });
     }
 
     let custody = capture_custody_snapshot(escrow_rpc_url, instance_pda).await?;
@@ -288,7 +306,7 @@ async fn measure_supply_breaches(
             });
         }
     }
-    Ok(breaches)
+    Ok(SupplyReading { breaches, unread })
 }
 
 /// Fail startup if any mint's channel supply exceeds the custody backing it.
@@ -300,9 +318,11 @@ async fn measure_supply_breaches(
 /// same persistence rule the runtime invariant uses. A real insolvency does not heal
 /// between reads, so this costs nothing on a healthy boot and nothing in detection.
 ///
-/// A per-mint supply read that errors is skipped with a warn rather than aborting the boot:
-/// the channel RPC (gateway) may not be ready yet, the runtime loop is the primary control,
-/// and a transient read must not crash-loop the indexer.
+/// A supply read that errors is skipped with a warn rather than aborting the boot: the
+/// channel RPC (gateway) may not be ready yet, the runtime loop is the primary control, and
+/// a transient read must not crash-loop the indexer. Once a mint has breached, though, the
+/// same silence means the opposite. Nothing has retracted the breach, so it keeps its
+/// suspect status and the boot fails if no later round ever reads it clean.
 async fn check_channel_supply_invariant(
     channel_rpc_url: &str,
     escrow_rpc_url: &str,
@@ -319,10 +339,13 @@ async fn check_channel_supply_invariant(
     // Each round re-reads only what the previous one suspected, so a mint has to breach in
     // every reading to survive to the end.
     let mut suspects: Option<HashSet<Pubkey>> = None;
-    let mut confirmed: Vec<SupplyBreach> = Vec::new();
+    // Per mint: its latest breach numbers, and how many readings have shown that breach.
+    // Counted per mint because the rule is about one mint's own history; a shared counter
+    // would let a mint seen breaching once ride out on rounds other mints supplied.
+    let mut standing: BTreeMap<Pubkey, (SupplyBreach, u32)> = BTreeMap::new();
 
-    for attempt in 1..=SUPPLY_BREACH_CONFIRMATIONS {
-        let breaches = measure_supply_breaches(
+    for round in 1..=SUPPLY_BREACH_MAX_ROUNDS {
+        let reading = measure_supply_breaches(
             &channel_rpc,
             escrow_rpc_url,
             instance_pda,
@@ -332,18 +355,52 @@ async fn check_channel_supply_invariant(
         )
         .await?;
 
-        if breaches.is_empty() {
+        // A suspect the node would not answer for is not evidence that it recovered, so it
+        // stays a suspect. A mint with no breach behind it is still skipped on a failed
+        // read: the channel RPC may simply not be up yet this early in the boot.
+        let unresolved: HashSet<Pubkey> = match suspects.as_ref() {
+            Some(prior) => reading.unread.intersection(prior).copied().collect(),
+            None => HashSet::new(),
+        };
+
+        if reading.breaches.is_empty() && unresolved.is_empty() {
             return Ok(());
         }
 
-        suspects = Some(breaches.iter().map(|b| b.key).collect());
-        confirmed = breaches;
+        // Carry forward only what this round still holds against: a mint read cleanly here
+        // is out, whatever an earlier round said about it.
+        let mut still: HashSet<Pubkey> = reading.breaches.iter().map(|b| b.key).collect();
+        still.extend(unresolved.iter().copied());
+        standing.retain(|mint, _| still.contains(mint));
 
-        if attempt < SUPPLY_BREACH_CONFIRMATIONS {
+        // A breach reading advances that mint's count; a round that could not read it
+        // neither advances nor resets it, having shown nothing either way.
+        for b in reading.breaches {
+            match standing.get_mut(&b.key) {
+                Some((detail, readings)) => {
+                    *detail = b;
+                    *readings += 1;
+                }
+                None => {
+                    standing.insert(b.key, (b, 1));
+                }
+            }
+        }
+        suspects = Some(still);
+
+        if standing
+            .values()
+            .any(|(_, readings)| *readings >= SUPPLY_BREACH_CONFIRMATIONS)
+        {
+            break;
+        }
+
+        if round < SUPPLY_BREACH_MAX_ROUNDS {
             warn!(
-                mint_count = confirmed.len(),
-                attempt,
-                confirmations = SUPPLY_BREACH_CONFIRMATIONS,
+                mint_count = standing.len(),
+                round,
+                required = SUPPLY_BREACH_CONFIRMATIONS,
+                unresolved = unresolved.len(),
                 "Startup supply invariant: possible breach, re-reading before acting on it"
             );
             tokio::time::sleep(std::time::Duration::from_millis(
@@ -353,7 +410,9 @@ async fn check_channel_supply_invariant(
         }
     }
 
-    for b in &confirmed {
+    // `readings` is per mint, so a mint that ran out of rounds while unreadable is visibly
+    // weaker evidence than one that breached in every reading, though both stop the boot.
+    for (b, readings) in standing.values() {
         error!(
             reconciliation_alert = true,
             mint = %b.mint,
@@ -362,14 +421,15 @@ async fn check_channel_supply_invariant(
             custody_slot = b.custody_slot,
             gap = b.gap,
             threshold = config.mismatch_threshold_raw,
-            confirmations = SUPPLY_BREACH_CONFIRMATIONS,
+            readings,
+            required = SUPPLY_BREACH_CONFIRMATIONS,
             "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
         );
     }
 
     Err(IndexerError::Reconciliation(
         ReconciliationError::SupplyExceedsCustody {
-            count: confirmed.len(),
+            count: standing.len(),
             threshold: config.mismatch_threshold_raw,
         },
     ))
@@ -1208,6 +1268,20 @@ mod tests {
         };
     }
 
+    /// A channel-supply read the node refuses outright. Uses -32601 so the retry wrapper
+    /// treats it as permanent and answers immediately instead of backing off five times.
+    async fn mock_channel_supply_failure(server: &mut mockito::Server) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("getAccountInfo".to_string()))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+            )
+            .create_async()
+            .await;
+    }
+
     /// Supply and custody sit on different chains, so one reading can catch a mint mid
     /// flight: minted here, not yet released there. Startup must re-read before acting,
     /// or an operator working alongside it turns an ordinary boot into a fatal alert.
@@ -1242,6 +1316,171 @@ mod tests {
         assert!(
             result.is_ok(),
             "a breach that does not survive a re-read must not abort startup: {:?}",
+            result
+        );
+    }
+
+    /// A channel-supply read scoped to one mint, so a test can script the two mints of a
+    /// round independently. `times` caps how many reads this answer is served for.
+    async fn mock_supply_for_mint(
+        server: &mut mockito::Server,
+        mint: &Pubkey,
+        supply: u64,
+        times: Option<usize>,
+    ) -> mockito::Mock {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        use spl_token::state::Mint;
+
+        let mint_state = Mint {
+            mint_authority: COption::Some(Pubkey::new_unique()),
+            supply,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut buf = vec![0u8; Mint::LEN];
+        mint_state.pack_into_slice(&mut buf);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("getAccountInfo".to_string()),
+                mockito::Matcher::Regex(mint.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":100}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                prog = spl_token::id(),
+            ));
+        match times {
+            Some(n) => mock.expect(n).create_async().await,
+            None => mock.create_async().await,
+        }
+    }
+
+    /// Same scoping for a read the node refuses outright.
+    async fn mock_supply_failure_for_mint(
+        server: &mut mockito::Server,
+        mint: &Pubkey,
+        times: Option<usize>,
+    ) -> mockito::Mock {
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("getAccountInfo".to_string()),
+                mockito::Matcher::Regex(mint.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+            );
+        match times {
+            Some(n) => mock.expect(n).create_async().await,
+            None => mock.create_async().await,
+        }
+    }
+
+    /// A confirmation round that cannot read the mint has learned nothing. Reading that
+    /// silence as "the breach cleared" would let an insolvent channel boot whenever the
+    /// channel RPC failed right after the first reading caught it.
+    #[tokio::test]
+    async fn supply_breach_is_not_cleared_by_a_failed_re_read() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        // First reading catches supply above custody; every re-read then fails outright.
+        mock_channel_supply_times(&mut server, 1_200, Some(1)).await;
+        mock_channel_supply_failure(&mut server).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "an unreadable suspect must not clear the breach: {:?}",
+            result
+        );
+    }
+
+    /// The rule is about one mint's own history. With a counter shared across mints, two
+    /// suspects taking turns to breach reach three rounds between them, and a mint seen
+    /// breaching once gets closed out as confirmed on readings that were never about it.
+    #[tokio::test]
+    async fn one_mint_cannot_confirm_a_breach_on_another_mints_readings() {
+        let mut server = mockito::Server::new_async().await;
+        let alpha = Pubkey::new_unique();
+        let beta = Pubkey::new_unique();
+        mock_escrow_sweep(
+            &mut server,
+            &[(alpha.to_string(), 1_000), (beta.to_string(), 1_000)],
+        )
+        .await;
+
+        // Both breach on round 1, so both stay suspects. From there they take turns, and
+        // three rounds pass with a breach in each while neither mint has three of its own.
+        mock_supply_for_mint(&mut server, &alpha, 1_200, Some(2)).await;
+        mock_supply_failure_for_mint(&mut server, &alpha, None).await;
+
+        mock_supply_for_mint(&mut server, &beta, 1_200, Some(1)).await;
+        mock_supply_failure_for_mint(&mut server, &beta, Some(1)).await;
+        mock_supply_for_mint(&mut server, &beta, 1_200, Some(1)).await;
+        // Only reached if the loop kept going past the third round.
+        let beyond_round_three = mock_supply_for_mint(&mut server, &beta, 1_200, None).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![
+            make_mint_balance(&alpha.to_string(), 1_000, 0),
+            make_mint_balance(&beta.to_string(), 1_000, 0),
+        ]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+
+        beyond_round_three.assert_async().await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "a suspect that is never read clean still stops the boot: {:?}",
             result
         );
     }

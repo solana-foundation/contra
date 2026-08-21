@@ -48,19 +48,54 @@ pub struct CustodySnapshot {
     pub slot: u64,
 }
 
+/// Attempts allowed to get both token-program sweeps to answer at the same slot.
+const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 3;
+
 /// Sum every token account owned by the escrow instance, grouped by mint, across
 /// the SPL Token and Token-2022 programs.
+///
+/// The two programs need one call each, so their readings can land on different slots and
+/// the merged balances would then hold activity the lower slot never saw. No single slot
+/// describes such a snapshot honestly, and labelling it with the lower one understates the
+/// custody it carries, so the sweep is simply taken again until both calls answer at the
+/// same slot. Back-to-back finalized reads normally agree on the first try.
 pub async fn fetch_escrow_balances_by_mint(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
 ) -> Result<CustodySnapshot, EscrowSweepError> {
+    let mut attempt = 1;
+    loop {
+        let (balances, low, high) = sweep_once(rpc_client, escrow_instance_id).await?;
+        if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
+            attempt += 1;
+            continue;
+        }
+        if low != high {
+            // Out of attempts. The lower slot is the only one both readings are known to
+            // cover, so it stays the label; the caller's own retry gets the next chance.
+            warn!(
+                low_slot = low,
+                high_slot = high,
+                "Escrow sweep: token programs kept answering at different slots"
+            );
+        }
+        return Ok(CustodySnapshot {
+            balances,
+            slot: low,
+        });
+    }
+}
+
+/// One pass over both token programs. Returns the merged balances plus the lowest and
+/// highest slot the two responses reported, which agree when the pass saw one instant.
+async fn sweep_once(
+    rpc_client: &RpcClientWithRetry,
+    escrow_instance_id: Pubkey,
+) -> Result<(HashMap<Pubkey, u64>, u64, u64), EscrowSweepError> {
     let mut balances = HashMap::new();
     let token_programs = [spl_token::id(), spl_token_2022::id()];
-    // One call per token program, so the two readings can land on different slots.
-    // The lower one is the only slot both are known to cover: a balance from the
-    // higher reading may include a transfer the lower one had not yet seen, so
-    // claiming the higher slot would assert custody the snapshot cannot vouch for.
-    let mut snapshot_slot = u64::MAX;
+    let mut lowest_slot = u64::MAX;
+    let mut highest_slot = 0u64;
 
     for token_program_id in token_programs {
         let response = rpc_client
@@ -85,7 +120,8 @@ pub async fn fetch_escrow_balances_by_mint(
                 ),
             })?;
 
-        snapshot_slot = snapshot_slot.min(response.context.slot);
+        lowest_slot = lowest_slot.min(response.context.slot);
+        highest_slot = highest_slot.max(response.context.slot);
         let accounts = response.value;
 
         // The RPC may return accounts in binary (base64) or JSON-parsed form
@@ -138,10 +174,7 @@ pub async fn fetch_escrow_balances_by_mint(
         }
     }
 
-    Ok(CustodySnapshot {
-        balances,
-        slot: snapshot_slot,
-    })
+    Ok((balances, lowest_slot, highest_slot))
 }
 
 /// Read the channel-token supply for `mint` on the PrivateChannel chain. An
@@ -271,20 +304,38 @@ mod tests {
         spl_slot: u64,
         token_2022_slot: u64,
     ) {
-        server
+        mock_sweep_at_slots_times(server, spl_accounts, spl_slot, token_2022_slot, None).await;
+    }
+
+    /// `times` caps how many sweeps this pair is served for, so a test can script one pass
+    /// followed by a different one.
+    async fn mock_sweep_at_slots_times(
+        server: &mut mockito::Server,
+        spl_accounts: &[String],
+        spl_slot: u64,
+        token_2022_slot: u64,
+        times: Option<usize>,
+    ) {
+        let spl = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
             .with_status(200)
-            .with_body(result_body(spl_accounts, spl_slot))
-            .create_async()
-            .await;
-        server
+            .with_body(result_body(spl_accounts, spl_slot));
+        let token_2022 = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
             .with_status(200)
-            .with_body(empty_body(token_2022_slot))
-            .create_async()
-            .await;
+            .with_body(empty_body(token_2022_slot));
+        match times {
+            Some(n) => {
+                spl.expect(n).create_async().await;
+                token_2022.expect(n).create_async().await;
+            }
+            None => {
+                spl.create_async().await;
+                token_2022.create_async().await;
+            }
+        };
     }
 
     #[tokio::test]
@@ -351,9 +402,9 @@ mod tests {
         assert_eq!(balances[&mint], 50);
     }
 
-    /// The two per-program calls can land on different slots, and only the lower one is
-    /// covered by both. Claiming the higher would vouch for custody the earlier reading
-    /// never saw, which is exactly the drift the snapshot slot exists to prevent.
+    /// When the two calls will not settle on one slot, the lower one is all the snapshot
+    /// can claim: the higher reading may hold custody the earlier call never saw, and
+    /// claiming its slot would vouch for exactly the drift the slot exists to prevent.
     #[tokio::test]
     async fn snapshot_slot_is_the_lower_of_the_two_sweeps() {
         let mut server = mockito::Server::new_async().await;
@@ -367,6 +418,36 @@ mod tests {
         assert_eq!(
             snapshot.slot, 880,
             "the snapshot can only claim the lower slot"
+        );
+        assert_eq!(snapshot.balances[&mint], 42);
+    }
+
+    /// A deposit finalizing between the two calls leaves the merged balances holding
+    /// activity the lower slot never saw, so labelling them with it understates custody
+    /// and reconciliation reads the difference as a mismatch. Taking the sweep again is
+    /// enough, because the skew lasts only as long as the gap between the two calls.
+    #[tokio::test]
+    async fn sweep_is_retaken_until_both_token_programs_answer_at_one_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // First pass straddles a slot boundary; the next one lands inside a single slot.
+        mock_sweep_at_slots_times(
+            &mut server,
+            &[json_parsed_account(mint, 42)],
+            900,
+            880,
+            Some(1),
+        )
+        .await;
+        mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 905, 905).await;
+
+        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshot.slot, 905,
+            "a re-read that agrees must replace the straddled pass"
         );
         assert_eq!(snapshot.balances[&mint], 42);
     }

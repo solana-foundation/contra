@@ -134,7 +134,7 @@ Batches execution results every 100ms (configurable) and commits to PostgreSQL, 
 - Transaction records
 - Block metadata (slot, blockhash, timestamp)
 
-The mirror is best-effort and covers only what the cache can serve: point lookups by pubkey, signature and slot, plus the chain tip. Ranges, history and counters are read from PostgreSQL, because a short answer from a partial mirror is indistinguishable from a complete one. A failed cache write drops the keys it would have updated so reads miss and resolve against PostgreSQL, and leaves the cached tip behind, which makes the next batch rebuild the cache.
+The mirror is best-effort and covers only what the cache can serve: point lookups by pubkey, signature and slot, plus the chain tip. Ranges, history and counters are read from PostgreSQL, because a short answer from a partial mirror is indistinguishable from a complete one. A failed cache write drops the keys it would have updated so reads miss and resolve against PostgreSQL, and leaves the cached tip behind, which makes the next batch rebuild the cache. It is also bounded: a cache that has not answered within the budget is abandoned for that block, and one that keeps failing is left alone for a cooldown, then probed with a PING off the block path and rebuilt before it is mirrored to again.
 
 Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop.
 

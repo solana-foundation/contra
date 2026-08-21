@@ -14,6 +14,8 @@
 //! reads whose key families are never mirrored, which only the Postgres fallback
 //! can do.
 //!
+//! The last one covers the writer giving up on a cache that keeps failing.
+//!
 //! Redis as the accounts database itself is rejected at startup, so there is no
 //! Redis-only variant to cover here; see `accounts::traits` for that.
 //!
@@ -80,6 +82,17 @@ async fn wait_for_first_block(url: &str) {
         sleep(Duration::from_millis(100)).await;
     }
     panic!("node never produced a block at {url}");
+}
+
+/// Poll `getSlot` until the node has committed `target`.
+async fn wait_for_slot(client: &RpcClient, target: u64) {
+    for _ in 0..100 {
+        if client.get_slot().await.unwrap_or(0) >= target {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("node never reached slot {target}");
 }
 
 /// Exercise the settle worker's Redis init block + the per-batch best-effort
@@ -311,6 +324,105 @@ async fn read_path_serves_through_a_redis_cache() -> Result<()> {
     assert!(
         cached_slot.is_some(),
         "the settler must mirror to the cache the read path uses"
+    );
+
+    handles.shutdown().await;
+    Ok(())
+}
+
+/// Once the cache has been given up on, the settler must stop touching Redis
+/// altogether until its cooldown is up. The tip is corrupted rather than the
+/// server stopped, so the marker below can still be read back.
+///
+/// The pause half only: the twenty blocks waited out below are a couple of
+/// seconds against a `CACHE_MIRROR_COOLDOWN` of a minute, so no probe runs here.
+/// Recovery is covered by `a_given_up_cache_is_mirrored_to_again_without_a_restart`
+/// in core, which drives the settle worker with a cooldown short enough to watch.
+///
+/// That leaves this test asserting the cooldown is worth its name: drop it to
+/// under a second and a probe lands inside this window, purges the keyspace and
+/// takes the marker with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn settler_stops_touching_a_cache_it_has_given_up_on() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
+    let redis = Redis::default()
+        .with_tag("7")
+        .start()
+        .await
+        .expect("start redis");
+    let redis_host = redis.get_host().await.expect("redis host");
+    let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
+    let redis_url = format!("redis://{redis_host}:{redis_port}");
+
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.redis_cache_url = Some(redis_url.clone());
+    let handles = run_node(config).await.expect("run_node");
+    let url = format!("http://127.0.0.1:{port}");
+
+    // Mirror normally first, so the corruption below lands on a running settler
+    // rather than on its startup alignment.
+    wait_for_first_block(&url).await;
+
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+
+    // The tip is read as a u64, so a value that is not one fails every
+    // continuity check from here on without Redis being down.
+    let _: () = redis::cmd("SET")
+        .arg("latest_slot")
+        .arg("not-a-slot")
+        .query_async(&mut conn)
+        .await
+        .expect("corrupt the cached tip");
+
+    // Failures are counted per block, so wait out more blocks than the limit.
+    let client = RpcClient::new(url.clone());
+    let corrupted_at = client.get_slot().await.expect("getSlot");
+    wait_for_slot(&client, corrupted_at + 10).await;
+
+    // A tip a settler still holding the cache would mirror against, and a marker
+    // on the key that mirror would overwrite. Reads never write either.
+    let repaired_at = client.get_slot().await.expect("getSlot");
+    let _: () = redis::cmd("SET")
+        .arg("latest_slot")
+        .arg(repaired_at)
+        .query_async(&mut conn)
+        .await
+        .expect("repair the cached tip");
+    let _: () = redis::cmd("SET")
+        .arg("latest_blockhash")
+        .arg("untouched")
+        .query_async(&mut conn)
+        .await
+        .expect("mark the cached tip");
+
+    wait_for_slot(&client, repaired_at + 10).await;
+
+    // A settler still attached would have overwritten this mirroring the next
+    // batch, or purged it condemning a cache it could not line up with.
+    let cached_blockhash: Option<String> = redis::cmd("GET")
+        .arg("latest_blockhash")
+        .query_async(&mut conn)
+        .await
+        .expect("redis get");
+    assert_eq!(
+        cached_blockhash.as_deref(),
+        Some("untouched"),
+        "a cache the settler has given up on must not be written to inside its cooldown"
     );
 
     handles.shutdown().await;

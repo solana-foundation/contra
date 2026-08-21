@@ -246,6 +246,22 @@ fn init_logging(log_level: &str, json_logs: bool) {
 
 #[tokio::main]
 async fn main() {
+    // Legacy names that read like independent role switches but were never
+    // wired up. Checked before parsing, and printed to stderr, because clap
+    // exits on a missing --mode before any logging exists.
+    for var_name in [
+        "PRIVATE_CHANNEL_ENABLE_READ",
+        "PRIVATE_CHANNEL_ENABLE_WRITE",
+    ] {
+        if std::env::var_os(var_name).is_some() {
+            eprintln!(
+                "warning: {} is set but not honored; the node role comes from \
+                 --mode / PRIVATE_CHANNEL_MODE",
+                var_name
+            );
+        }
+    }
+
     let args = Args::parse();
 
     // Initialize logging
@@ -256,20 +272,6 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
     info!("Mode: {:?}", args.mode);
-
-    // Legacy names that read like independent role switches but were never
-    // wired up. --mode is the only role control.
-    for var_name in [
-        "PRIVATE_CHANNEL_ENABLE_READ",
-        "PRIVATE_CHANNEL_ENABLE_WRITE",
-    ] {
-        if std::env::var_os(var_name).is_some() {
-            warn!(
-                "{} is set but not honored; the node role comes from --mode ({:?})",
-                var_name, args.mode
-            );
-        }
-    }
 
     if let Err(e) = run_node_with_args(args).await {
         error!("Node failed: {:?}", e);
@@ -298,5 +300,25 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the removal of `--mode`'s `aio` default: restoring it would let a
+    /// read deployment start as a writer whenever the variable is dropped.
+    #[test]
+    fn mode_is_required() {
+        let err = Args::try_parse_from([
+            "private-channel-node",
+            "--accountsdb-connection-url",
+            "postgres://localhost/private_channel",
+        ])
+        .expect_err("a node with no mode must not start");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--mode"));
     }
 }

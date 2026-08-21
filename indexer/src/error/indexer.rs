@@ -13,6 +13,12 @@ pub enum IndexerError {
     #[error("Channel send failed during shutdown")]
     ShutdownChannelSend,
 
+    #[error("Checkpoint channel closed; cannot persist slot progress")]
+    CheckpointChannelClosed,
+
+    #[error("Transaction processor task panicked")]
+    ProcessorPanicked,
+
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),
 
@@ -47,8 +53,20 @@ pub enum ReconciliationError {
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 
+    #[error(
+        "source_rpc_url (channel RPC) required for the escrow indexer: the startup \
+         supply invariant reads channel-token supply from it and must always run"
+    )]
+    MissingChannelRpc,
+
     #[error("DB net balance for mint {mint} exceeds u64::MAX ({net}); the escrow ATA cannot hold this, so the DB is corrupt")]
     DbBalanceOverflow { mint: String, net: String },
+
+    /// The pre-drop consumed-set could not be built completely (channel unreachable,
+    /// pagination failed, or a legacy-scheme memo could not be reconciled). Resync
+    /// aborts before any destruction so the live DB is left intact.
+    #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
+    ConsumedSetUnavailable { reason: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)
@@ -65,9 +83,6 @@ pub enum DataSourceError {
 
     #[error("Commitment level parse error: {value}")]
     InvalidCommitment { value: String },
-
-    #[error("Gap fill failed: {reason}")]
-    GapFillFailed { reason: String },
 }
 
 /// Errors specific to backfill operations
@@ -82,6 +97,12 @@ pub enum BackfillError {
         #[source]
         source: DataSourceRpcError,
     },
+
+    #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
+    MissingMeta { slot: u64, signature: String },
+
+    #[error("Slot {slot} is unavailable: a block exists here that this endpoint will not serve, so its contents are unknown")]
+    SlotUnavailable { slot: u64 },
 
     // Channel errors
     #[error("Channel send failed: {0}")]

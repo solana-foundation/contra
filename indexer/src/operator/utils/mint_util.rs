@@ -1,4 +1,5 @@
 use crate::error::{AccountError, OperatorError};
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::MintStatusAtSlot;
 use crate::storage::Storage;
@@ -99,7 +100,14 @@ impl MintCache {
             return Ok(metadata.clone());
         }
 
-        if let Some(m) = self.storage.get_mint(&mint_str).await? {
+        // Retry a transient DB blip before falling through to the RPC leg, so a
+        // brief outage does not surface as Transient and strand the withdrawal.
+        // transaction_id=-1: no per-call txn context here; retries log by op name.
+        let db_mint = with_storage_backoff("mint metadata read", -1, || {
+            self.storage.get_mint(&mint_str)
+        })
+        .await?;
+        if let Some(m) = db_mint {
             let token_program =
                 Pubkey::from_str(&m.token_program).map_err(|e| OperatorError::InvalidPubkey {
                     pubkey: m.token_program.clone(),
@@ -141,7 +149,11 @@ impl MintCache {
             return Ok(*flags);
         }
 
-        let db_mint = self.storage.get_mint(&mint_str).await?;
+        // transaction_id=-1: no per-call txn context here; retries log by op name.
+        let db_mint = with_storage_backoff("mint extension-flag read", -1, || {
+            self.storage.get_mint(&mint_str)
+        })
+        .await?;
         if let Some(ref m) = db_mint {
             if let (Some(p), Some(d)) = (m.is_pausable, m.has_permanent_delegate) {
                 self.extension_flags_cache.insert(mint_str, (p, d));
@@ -458,6 +470,33 @@ mod tests {
         let metadata2 = cache.get_mint_metadata(&mint).await.unwrap();
         assert_eq!(metadata2, metadata1);
         assert_eq!(cache.cache_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_mint_metadata_retries_transient_db_error() {
+        let mint = create_test_mint();
+        let mock = MockStorage::new();
+        mock.mints.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: TOKEN_PROGRAM_ID.to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(false),
+            },
+        );
+        // Two transient blips then success: the read backoff must ride them out.
+        mock.set_fail_times("get_mint", 2);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut cache = MintCache::new(storage);
+
+        let metadata = cache.get_mint_metadata(&mint).await.unwrap();
+        assert_eq!(metadata.token_program, TOKEN_PROGRAM_ID);
+        assert_eq!(metadata.decimals, 6);
+        assert_eq!(mock.calls("get_mint"), 3, "two failures + one success");
     }
 
     #[tokio::test]

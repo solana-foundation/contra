@@ -11,3 +11,6 @@ pub use execution::*;
 pub use sequencer::*;
 pub use settle::*;
 pub use sigverify::*;
+
+#[cfg(test)]
+mod sponsor_replay_test;

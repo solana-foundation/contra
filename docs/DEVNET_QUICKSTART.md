@@ -93,8 +93,9 @@ The CLI tools read their signers from keypair files, so create them before runni
 ```shell
 mkdir -p keypairs
 
-# Admin keypair: owns the escrow instance, signs create_instance / allow_mint / add_operator
-solana-keygen new -o ./keypairs/admin.json -s --no-bip39-passphrase
+# Escrow admin keypair: the Instance.admin, signs create_instance / allow_mint / add_operator.
+# Keep it separate from the channel admin in ADMIN_PRIVATE_KEY (see Step 4)
+solana-keygen new -o ./keypairs/escrow-admin.json -s --no-bip39-passphrase
 
 # User keypair: holds the whitelisted token, signs deposit / withdraw
 solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
@@ -104,7 +105,7 @@ solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
 
 1. **Fund your admin keypair**  
 
-   - Ensure your admin keypair (`./keypairs/admin.json`) has Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
+   - Ensure your admin keypair (`./keypairs/escrow-admin.json`) has Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
 
 2. **Create Instance**  
 
@@ -113,7 +114,7 @@ solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
    ```shell
    cargo run --bin create_instance -- \
      https://api.devnet.solana.com \
-     ./keypairs/admin.json
+     ./keypairs/escrow-admin.json
    ```
 
    **Copy the printed Instance Address** — you'll need it for configuration.
@@ -121,6 +122,8 @@ solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase
 ## Step 4: Generate Operator Keypair
 
 The operator keypair signs transactions for minting on the Solana Private Channels payment channel and releasing from escrow.
+
+Generate a **new** keypair here. It must not be the wallet that created the instance in Step 3, which is the escrow `Instance.admin`. `SetNewAdmin` only rewrites `Instance.admin`, so a key that is also the operator keeps its receipt-mint authority and its Operator PDA after a handover and can still drain escrow custody.
 
 ```shell
 # Generate a new keypair
@@ -222,6 +225,11 @@ write-node (`8900`) and read-node (`8901`) RPC ports have **no node-side authent
 reference compose binds these node ports to loopback (`127.0.0.1`), so they are reachable from the host
 but not from other machines. RBAC is an application-layer control on the gateway, not a network boundary.
 
+The gateway also runs a second listener (`8904`) for the operator's own services, which carry no JWT. It
+has no RBAC and does not collapse transaction errors, and compose gives it no `ports:` entry at all, so it
+exists on the Docker network and nowhere else. Do not publish it: that absence is what keeps the errors
+the public port hides out of reach.
+
 ## Step 7: Configure the Instance (Whitelist Mint + Add Operator)
 
 With the services running, configure the instance using the CLI tools in [`scripts/devnet/`](../scripts/devnet/README.md). Because the indexer is already streaming, the `AllowMint` and `AddOperator` events are indexed live — no backfill needed, and your first deposit won't be quarantined.
@@ -233,7 +241,7 @@ Pick the mint you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii
 ```shell
 cargo run --bin allow_mint -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json \
+  ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <MINT_ADDRESS>
 ```
@@ -245,7 +253,7 @@ Run `add_operator` with your operator's public key (from Step 4):
 ```shell
 cargo run --bin add_operator -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json \
+  ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <OPERATOR_PUBKEY>
 ```

@@ -103,6 +103,11 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")]
     accountsdb_connection_url: String,
 
+    /// Optional Redis cache in front of the read path. Misses fall through to
+    /// the accounts database.
+    #[arg(long, env = "PRIVATE_CHANNEL_REDIS_CACHE_URL")]
+    redis_cache_url: Option<String>,
+
     /// Admin public keys that can bypass certain restrictions (comma-separated base58 strings)
     /// Example: --admin-keys "11111111111111111111111111111111,22222222222222222222222222222222"
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
@@ -193,6 +198,9 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         execution_results_capacity: args.execution_results_capacity,
         max_svm_workers: args.max_svm_workers,
         accountsdb_connection_url: args.accountsdb_connection_url,
+        // Blank means no cache. Without this the env var set to "" reads as a
+        // URL and the read node refuses to start.
+        redis_cache_url: args.redis_cache_url.filter(|url| !url.trim().is_empty()),
         admin_keys,
         transaction_expiration_ms: args.transaction_expiration_ms,
         blocktime_ms: args.blocktime_ms,

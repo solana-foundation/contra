@@ -36,6 +36,21 @@ pub enum ProgramError {
     #[error("Tree rotation pending: {in_flight_count} in-flight transactions must settle before rotating")]
     RotationPending { in_flight_count: usize },
 
+    #[error("Tree rotation to index {target_tree_index} no longer owed: chain is at {onchain_tree_index}")]
+    RotationNotOwed {
+        target_tree_index: u64,
+        onchain_tree_index: u64,
+    },
+
+    #[error("Tree rotation to index {target_tree_index} not submitted: a gate read failed")]
+    RotationGateUnavailable { target_tree_index: u64 },
+
+    #[error("Tree rotation to index {target_tree_index} not submitted: nonce {blocking_nonce} on the closing tree is still unreleased")]
+    RotationBlockedByLowerNonce {
+        target_tree_index: u64,
+        blocking_nonce: u64,
+    },
+
     #[error("Transaction nonce {nonce} expects tree_index {expected_tree_index} but current local tree_index is {current_tree_index}")]
     TreeIndexMismatch {
         nonce: u64,

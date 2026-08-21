@@ -23,7 +23,9 @@ use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
     operator::{
-        escrow_sweep::fetch_escrow_balances_by_mint, rpc_util::RpcClientWithRetry, RetryConfig,
+        escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint},
+        rpc_util::RpcClientWithRetry,
+        RetryConfig,
     },
     storage::common::amount::{net_to_u64, NetBalance},
     storage::common::models::MintDbBalance,
@@ -74,12 +76,22 @@ pub async fn run_startup_reconciliation(
     program_type: ProgramType,
     storage: &Storage,
     rpc_url: &str,
+    channel_rpc_url: Option<&str>,
     instance_pda: &Pubkey,
 ) -> Result<(), IndexerError> {
     if program_type != ProgramType::Escrow {
         info!("Startup reconciliation skipped (program_type is not Escrow)");
         return Ok(());
     }
+
+    // The supply invariant must always run for an escrow indexer, so the channel
+    // RPC is a hard config gate: a missing or blank one fails the boot even in empty state.
+    let channel_rpc_url = channel_rpc_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(IndexerError::Reconciliation(
+            ReconciliationError::MissingChannelRpc,
+        ))?;
 
     let instance_pda = *instance_pda;
     info!(
@@ -124,7 +136,79 @@ pub async fn run_startup_reconciliation(
         "Comparing DB totals against on-chain escrow balances"
     );
 
-    classify_and_report(config, &results)
+    classify_and_report(config, &results)?;
+
+    // Independent supply invariant: the minted channel-token supply must not
+    // exceed on-chain custody.
+    check_channel_supply_invariant(channel_rpc_url, config, &results).await?;
+
+    Ok(())
+}
+
+/// Read channel-token supply per mint and fail startup if any mint's supply
+/// exceeds its on-chain custody beyond the threshold. Startup is quiescent, so a
+/// plain `mismatch_threshold_raw` compare suffices with no envelope/persistence.
+///
+/// A per-mint supply read that errors is skipped with a warn rather than aborting
+/// the boot: the channel RPC (gateway) may not be ready yet, the runtime loop is
+/// the primary control, and a transient read must not crash-loop the indexer.
+/// Only a proven supply-over-custody breach is fatal.
+async fn check_channel_supply_invariant(
+    channel_rpc_url: &str,
+    config: &ReconciliationConfig,
+    results: &[MintReconciliation],
+) -> Result<(), IndexerError> {
+    let channel_rpc = RpcClientWithRetry::with_retry_config(
+        channel_rpc_url.to_string(),
+        RetryConfig::default(),
+        CommitmentConfig::finalized(),
+    );
+
+    let mut breaches = 0usize;
+    for r in results {
+        let mint = r
+            .mint
+            .parse::<Pubkey>()
+            .map_err(|e| ReconciliationError::InvalidPubkey {
+                pubkey: r.mint.clone(),
+                reason: e.to_string(),
+            })?;
+        let supply = match fetch_channel_supply(&channel_rpc, &mint).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    mint = %r.mint,
+                    reason = %e.reason,
+                    "Startup supply invariant: channel supply read failed, skipping this mint"
+                );
+                continue;
+            }
+        };
+
+        let gap = supply.saturating_sub(r.on_chain_actual);
+        if gap > config.mismatch_threshold_raw {
+            error!(
+                reconciliation_alert = true,
+                mint = %r.mint,
+                supply,
+                on_chain_custody = r.on_chain_actual,
+                gap,
+                threshold = config.mismatch_threshold_raw,
+                "RECONCILIATION ALERT: channel token supply exceeds escrow custody"
+            );
+            breaches += 1;
+        }
+    }
+
+    if breaches > 0 {
+        return Err(IndexerError::Reconciliation(
+            ReconciliationError::MismatchExceedsThreshold {
+                count: breaches,
+                threshold: config.mismatch_threshold_raw,
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Build the per-mint reconciliation set from the union of (DB mints) and
@@ -615,10 +699,39 @@ mod tests {
             ProgramType::Withdraw,
             &storage,
             "http://localhost:8899",
+            None,
             &seed,
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn escrow_without_channel_rpc_is_fatal() {
+        // The supply invariant must always run, so a missing channel RPC fails the
+        // escrow indexer boot rather than silently skipping the check.
+        let mut server = mockito::Server::new_async().await;
+        mock_escrow_sweep(&mut server, &[]).await;
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let storage = Storage::Mock(MockStorage::new());
+        let seed = Pubkey::new_unique();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &server.url(),
+            None,
+            &seed,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::MissingChannelRpc
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -636,6 +749,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -664,6 +778,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -699,6 +814,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -725,6 +841,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -755,6 +872,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -790,6 +908,7 @@ mod tests {
             ProgramType::Escrow,
             &storage,
             &server.url(),
+            Some(&server.url()),
             &seed,
         )
         .await;
@@ -798,5 +917,99 @@ mod tests {
             "net (deposits - withdrawals) must match on-chain: {:?}",
             result
         );
+    }
+
+    /// getAccountInfo mock returning an SPL Mint blob with `supply`.
+    async fn mock_channel_supply(server: &mut mockito::Server, supply: u64) {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        use spl_token::state::Mint;
+
+        let mint_state = Mint {
+            mint_authority: COption::Some(Pubkey::new_unique()),
+            supply,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut buf = vec![0u8; Mint::LEN];
+        mint_state.pack_into_slice(&mut buf);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex("getAccountInfo".to_string()))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":100}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                prog = spl_token::id(),
+            ))
+            .create_async()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_supply_exceeds_custody_is_fatal() {
+        // Custody sweep and channel supply share one server, routed by method.
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // custody 1000, ledger 1000 (balanced); but minted supply 1200 -> gap 200.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_channel_supply(&mut server, 1_200).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        match result {
+            Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+                count,
+                ..
+            })) => assert_eq!(count, 1),
+            other => panic!("supply over custody must block startup, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_supply_within_custody_passes() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        // Supply equals custody: the invariant holds.
+        mock_channel_supply(&mut server, 1_000).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        assert!(result.is_ok(), "supply <= custody must pass: {:?}", result);
     }
 }

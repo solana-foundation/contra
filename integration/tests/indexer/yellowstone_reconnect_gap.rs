@@ -22,21 +22,10 @@ use std::time::Duration;
 use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlockMeta,
-};
 
-fn block_meta(slot: u64) -> SubscribeUpdate {
-    SubscribeUpdate {
-        filters: vec!["all_blocks_meta".to_string()],
-        update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
-            slot,
-            blockhash: format!("hash-{slot}"),
-            ..Default::default()
-        })),
-        created_at: None,
-    }
-}
+#[path = "yellowstone_helpers.rs"]
+mod yellowstone_helpers;
+use yellowstone_helpers::empty_block;
 
 fn empty_block_json() -> serde_json::Value {
     json!({
@@ -58,18 +47,27 @@ async fn gap_fill_runs_after_drop_stream() {
     // In-process mockito RPC backend for the RpcPoller backfill path.
     let mut rpc_mock = MockitoServer::new_async().await;
 
-    // Chain tip = 106. Anchor = checkpoint-1 = 100 → backfill 101..=106.
-    let _slot_mock = rpc_mock
+    // The fill targets the observed resume slot (106 below), not a tip probe, so
+    // no getSlot mock is needed. Anchor = checkpoint-1 = 100 => backfill 101..=106.
+    // Empty blocks => only SlotComplete markers. Slot 101 was also streamed;
+    // replay is harmless thanks to idempotent inserts in prod.
+    // v2 enumerates the batch before fetching it, so this mock is required even
+    // though nothing here is absent. Unmocked, mockito answers 501 with an empty
+    // body, which becomes a decode error the gap-fill retry loop swallows.
+    let _enumeration = rpc_mock
         .mock("POST", "/")
-        .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [101, 106]}),
+        ))
         .with_status(200)
-        .with_body(json!({"jsonrpc": "2.0", "result": 106, "id": 1}).to_string())
+        .with_body(
+            json!({"jsonrpc": "2.0", "result": [101, 102, 103, 104, 105, 106], "id": 1})
+                .to_string(),
+        )
         .expect_at_least(1)
         .create_async()
         .await;
 
-    // Empty blocks → only SlotComplete markers. Slot 101 was also streamed;
-    // replay is harmless thanks to idempotent inserts in prod.
     let mut block_mocks = Vec::new();
     for slot in 101u64..=106u64 {
         let m = rpc_mock
@@ -124,8 +122,8 @@ async fn gap_fill_runs_after_drop_stream() {
         .expect("yellowstone source start");
 
     // Phase 1: deliver slots 100, 101 pre-disconnect.
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(100)));
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(101)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(101)));
 
     // Collect both initial slots.
     let mut seen: HashSet<u64> = HashSet::new();
@@ -142,12 +140,15 @@ async fn gap_fill_runs_after_drop_stream() {
         }
     }
 
-    // Phase 2: drop the stream → source reads checkpoint and backfills 101..=106.
+    // Phase 2: drop the stream. On resubscribe the first live block (106) becomes the
+    // gate target, and the concurrent backfill fills 101..=106.
     server.drop_stream();
 
-    // Phase 3: queue 107,108 to prove streaming resumes post-backfill.
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(107)));
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(108)));
+    // Phase 3: queue 106,107,108. The 106 resume slot sets the fill target; 107,108
+    // prove streaming continues past the backfilled window.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(106)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(107)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(108)));
 
     // Expect 101..=106 from inclusive backfill + 107,108 from resumed stream.
     let deadline_phase2 = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -187,11 +188,12 @@ async fn gap_fill_runs_after_drop_stream() {
     server.shutdown().await;
 }
 
-/// Error path: fresh system (checkpoint=0) must skip reconnect gap-fill —
-/// no RPC backfill calls, no spurious SlotCompletes. Startup backfill (when
-/// configured) is responsible for initial catch-up, not the reconnect path.
+/// The bug, end to end. With no durable anchor there is no lower bound to replay from, so
+/// the slot the replacement stream resumes at must be withheld. Forwarding it is what used
+/// to carry the checkpoint over the slots that arrived while nothing was listening, and
+/// once the checkpoint passed them nothing revisited them on any later restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fresh_system_reconnect_does_not_gap_fill() {
+async fn reconnect_without_anchor_withholds_live_slots() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
@@ -199,8 +201,13 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
 
     let mut rpc_mock = MockitoServer::new_async().await;
 
-    // No getBlock mocks — any call would panic mockito's matcher. getSlot is
-    // tolerated (the reconnect path may probe it before checking checkpoint).
+    // Any repair attempt would land here; without an anchor none may be made.
+    let no_blocks = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlock"})))
+        .expect(0)
+        .create_async()
+        .await;
     let _slot_mock = rpc_mock
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
@@ -218,7 +225,7 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         CommitmentLevel::Confirmed,
     ));
 
-    // No checkpoint seeded → get_last_checkpoint returns 0 → skip path.
+    // No checkpoint seeded, so the source has never recorded a recovery anchor.
     let storage: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
 
     let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(64);
@@ -239,26 +246,111 @@ async fn fresh_system_reconnect_does_not_gap_fill() {
         .await
         .expect("yellowstone source start");
 
-    // Stream one slot, drop, give the reconnect path time to run.
-    server.enqueue(UpdateMatcher, Update::ok(block_meta(100)));
-    let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
-    server.drop_stream();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The first connection is a cold start and forwards its block without arming.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("slot 100 must be forwarded on the first connection");
+    assert!(
+        matches!(
+            first,
+            Some(ProcessorMessage::SlotComplete { slot: 100, .. })
+        ),
+        "expected SlotComplete for slot 100, got {first:?}"
+    );
 
-    // Drain the channel — only the streamed slot 100 should appear, never
-    // any backfill SlotCompletes (which would mean we contacted the RPC).
-    let mut all_slots = vec![];
-    while let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
-        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
-    {
-        all_slots.push(slot);
+    // Drop, then resume at a later slot. Slot 101 is the value-bearing slot nobody saw.
+    server.drop_stream();
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(102)));
+
+    // Hold well past the 5s retry backoff: a regression forwards 102 almost immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut leaked = vec![];
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            leaked.push(slot);
+        }
     }
 
-    let unexpected: Vec<_> = all_slots.iter().filter(|&&s| s != 100).collect();
     assert!(
-        unexpected.is_empty(),
-        "fresh system must NOT trigger gap-fill; unexpected slots: {:?}",
-        unexpected
+        leaked.is_empty(),
+        "no slot may be forwarded without a durable anchor; leaked: {leaked:?}"
+    );
+    no_blocks.assert_async().await;
+    assert!(
+        server.call_count("subscribe") >= 2,
+        "the source resubscribes; the withheld block, not a blocked resubscribe, is the guard"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    server.shutdown().await;
+}
+
+/// Silent-stall watchdog: a stream that stays open but stops emitting (no FIN, no
+/// error, no server ping) must be force-reconnected. This is the prod failure that
+/// wedged the escrow indexer for ~12h: `stream.next()` blocked forever because
+/// nothing tripped the reconnect path. The mock holds the stream open once its
+/// queue drains, so an empty queue past the stall window reproduces it exactly.
+/// No gap detection here — this isolates the watchdog from the backfill path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stall_watchdog_forces_reconnect_on_silent_stream() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    let server = MockYellowstoneServer::start().await;
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(64);
+    let cancel = CancellationToken::new();
+
+    // Short watchdog so the test drives the reconnect without the 60s prod wait.
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_stall_timeout(Duration::from_millis(300));
+
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // Deliver one slot so the first connection is streaming, then stop: the mock
+    // holds the stream open and silent, arming the watchdog.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+    assert!(
+        matches!(
+            first,
+            Ok(Some(ProcessorMessage::SlotComplete { slot: 100, .. }))
+        ),
+        "expected slot 100 before the stall; got {first:?}"
+    );
+
+    // Watchdog (300ms) fires, then the Err path backs off 5s before resubscribing,
+    // so allow generous headroom for the second handshake.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while server.call_count("subscribe") < 2 {
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "silent stream must force a reconnect; subscribe count stuck at {}",
+                server.call_count("subscribe")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        server.call_count("subscribe") >= 2,
+        "watchdog should resubscribe after a silent stall; got {}",
+        server.call_count("subscribe")
     );
 
     cancel.cancel();

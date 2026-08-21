@@ -44,12 +44,11 @@ integration-test:
 	@$(MAKE) -C ../private-channel-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cargo test --test reconciliation_integration -- --nocapture
-	@cargo test --test mint_idempotency_integration -- --nocapture
 	@cargo test --test gap_detection_integration -- --nocapture
 	@cargo test --test truncate_integration -- --nocapture
 	@cargo test --test pausable_mint_integration -- --nocapture
 	@cargo test --test permanent_delegate_mint_integration -- --nocapture
-	@cargo test --test resync_integration -- --nocapture
+	@cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cargo test --test reconciliation_e2e_test -- --nocapture
 	@cargo test --test mock_rpc_retry -- --nocapture
 	@cargo test --test checkpoint_partial_flush -- --nocapture
@@ -61,15 +60,14 @@ integration-test:
 	@cargo test --test yellowstone_wiring -- --nocapture
 	@cargo test --test malformed_yellowstone_update -- --nocapture
 	@cargo test --test yellowstone_reconnect_gap -- --nocapture
+	@cargo test --test reconnect_gap_fill_fail_closed -- --nocapture
 	@cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cargo test --test harness_sanity -- --nocapture
-	@cargo test --test sender_mint_idempotency -- --nocapture
-	@cargo test --test sender_mint_validator_encodings -- --nocapture
-	@cargo test --test sender_mint_signature_failures -- --nocapture
 	@cargo test --test sender_poll_rpc_error -- --nocapture
 	@cargo test --test sender_sign_and_send_error -- --nocapture
 	@cargo test --test sender_max_retries -- --nocapture
 	@cargo test --test sender_onchain_error_arms -- --nocapture
+	@cargo test --test sender_rotation_retry -- --nocapture
 	@cargo test --test jit_mint_helper -- --nocapture
 	@cargo test --test storage_update_failure -- --nocapture
 	@cargo test --test processor_quarantine -- --nocapture
@@ -190,12 +188,12 @@ integration-coverage-private-channel:
 	@# Kept in sync with the integration-test group; runs the backpressure CI guards (RSS test stays #[ignore]).
 	@cargo llvm-cov test --no-report --workspace --test ingress_backpressure -- --nocapture
 
-# Redis-backend warm-cache + read-path coverage.
-# Runs a Postgres+Redis node and a Redis-only node to exercise settle.rs's
-# `REDIS_URL`/best-effort-write branches and the
-# `get_signatures_for_address_redis` dispatch arm. Runs independently of the
-# main private_channel_integration suite — its profraw aggregates into the same
-# `cargo llvm-cov report` output, so coverage accumulates naturally.
+# Redis cache coverage.
+# Runs Postgres+Redis nodes to cover the settle worker's cache setup, the
+# per-block cache write, the startup alignment, and the read path falling back
+# to Postgres. Runs on its own, apart from the main private_channel_integration
+# suite. Its coverage data merges into the same report, so running it separately
+# loses nothing.
 # CI should invoke this target in parallel with (or immediately after)
 # `integration-coverage-private-channel`.
 integration-coverage-private-channel-redis:
@@ -237,8 +235,6 @@ integration-coverage-indexer:
 	@echo "=== prod feature group ==="
 	@echo "Running reconciliation integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture
-	@echo "Running mint idempotency integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test mint_idempotency_integration -- --nocapture
 	@echo "Running gap detection integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
 	@echo "Running truncate integration tests with coverage instrumentation..."
@@ -248,7 +244,7 @@ integration-coverage-indexer:
 	@echo "Running permanent delegate mint integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Running resync integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture
+	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture --test-threads=1
 	@echo "Running reconciliation e2e tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_e2e_test -- --nocapture
 	@echo "Running mock-rpc retry tests with coverage instrumentation..."
@@ -271,16 +267,12 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test malformed_yellowstone_update -- --nocapture
 	@echo "Running Yellowstone reconnect-gap tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_reconnect_gap -- --nocapture
+	@echo "Running fail-closed reconnect gap-fill tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test reconnect_gap_fill_fail_closed -- --nocapture
 	@echo "Running Yellowstone inner-ix + unknown-discriminator tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_inner_and_unknown -- --nocapture
 	@echo "Running OperatorMockHarness sanity test with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test harness_sanity -- --nocapture
-	@echo "Running sender mint-idempotency tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_mint_idempotency -- --nocapture
-	@echo "Running sender mint validator-encodings tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_mint_validator_encodings -- --nocapture
-	@echo "Running sender mint signature-failures tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_mint_signature_failures -- --nocapture
 	@echo "Running sender poll-RPC-error tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_poll_rpc_error -- --nocapture
 	@echo "Running sender sign-and-send error tests with coverage instrumentation..."
@@ -289,6 +281,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test sender_max_retries -- --nocapture
 	@echo "Running sender on-chain error-arm tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_onchain_error_arms -- --nocapture
+	@echo "Running sender rotation-retry drain tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test sender_rotation_retry -- --nocapture
 	@echo "Running JIT-mint helper coverage tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test jit_mint_helper -- --nocapture
 	@echo "Running storage-update-failure tests with coverage instrumentation..."

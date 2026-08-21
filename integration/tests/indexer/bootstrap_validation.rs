@@ -44,6 +44,7 @@ async fn run_rejects_escrow_without_instance_id() {
         storage_type: StorageType::Postgres,
         rpc_url: "http://127.0.0.1:1".to_string(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: PostgresConfig {
             database_url: db_url,
             max_connections: 2,

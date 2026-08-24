@@ -318,7 +318,7 @@ pub async fn run(
                 // before the stream can deliver anything. Failing here refuses to start,
                 // which beats streaming past a window that could never be recovered: once a
                 // later slot is checkpointed, the slots below it stop being reachable.
-                ensure_startup_anchor(
+                let anchor = ensure_startup_anchor(
                     &storage,
                     common_config.program_type,
                     &gap_rpc_poller,
@@ -326,7 +326,13 @@ pub async fn run(
                 )
                 .await?;
 
+                // Startup owns everything below its live boundary, so the first stream only
+                // replays above it. With no backfill the anchor is that boundary itself.
+                let startup_floor =
+                    rpc_live_start_slot.map_or(anchor, |slot| slot.saturating_sub(1));
+
                 source
+                    .with_startup_floor(startup_floor)
                     .with_gap_detection(
                         gap_rpc_poller,
                         indexer_config.backfill.max_gap_slots,

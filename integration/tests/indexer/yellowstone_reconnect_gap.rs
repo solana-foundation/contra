@@ -1,9 +1,5 @@
-//! Reconnect-gap recovery for `YellowstoneSource`.
-//!
-//! After a Yellowstone disconnect, the source reads the durable checkpoint
-//! from storage and passes `checkpoint - 1`
-//! to `fill_slot_range` so the boundary slot is replayed via RPC. Tx/mint
-//! inserts are idempotent, so replaying is safe.
+//! Gap recovery for `YellowstoneSource`. On the first live block of any connection, cold start or
+//! reconnect, it replays from `checkpoint - 1`; inserts are idempotent, so refetching is safe.
 
 use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::config::ProgramType;
@@ -188,12 +184,10 @@ async fn gap_fill_runs_after_drop_stream() {
     server.shutdown().await;
 }
 
-/// The bug, end to end. With no durable anchor there is no lower bound to replay from, so
-/// the slot the replacement stream resumes at must be withheld. Forwarding it is what used
-/// to carry the checkpoint over the slots that arrived while nothing was listening, and
-/// once the checkpoint passed them nothing revisited them on any later restart.
+/// The bug, end to end. With no anchor there is no lower bound, so the resuming slot must be
+/// withheld; forwarding it is what carried the checkpoint over slots nothing was listening for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reconnect_without_anchor_withholds_live_slots() {
+async fn cold_start_without_anchor_withholds_live_slots() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
@@ -246,20 +240,28 @@ async fn reconnect_without_anchor_withholds_live_slots() {
         .await
         .expect("yellowstone source start");
 
-    // The first connection is a cold start and forwards its block without arming.
+    // Phase 1: the cold start must withhold too; hold well past the 5s arm backoff.
     server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
-    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("slot 100 must be forwarded on the first connection");
+    let cold_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut cold_leaked = vec![];
+    while tokio::time::Instant::now() < cold_deadline {
+        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            cold_leaked.push(slot);
+        }
+    }
     assert!(
-        matches!(
-            first,
-            Some(ProcessorMessage::SlotComplete { slot: 100, .. })
-        ),
-        "expected SlotComplete for slot 100, got {first:?}"
+        cold_leaked.is_empty(),
+        "the first connection may not forward without a durable anchor; leaked: {cold_leaked:?}"
+    );
+    assert_eq!(
+        server.remaining_scripted(),
+        0,
+        "slot 100 must have been delivered to the source and withheld, not left unsent"
     );
 
-    // Drop, then resume at a later slot. Slot 101 is the value-bearing slot nobody saw.
+    // Phase 2: drop and resume at 102, the slot that would carry the checkpoint over 101.
     server.drop_stream();
     server.enqueue(UpdateMatcher, Update::ok(empty_block(102)));
 
@@ -279,9 +281,12 @@ async fn reconnect_without_anchor_withholds_live_slots() {
         "no slot may be forwarded without a durable anchor; leaked: {leaked:?}"
     );
     no_blocks.assert_async().await;
-    assert!(
-        server.call_count("subscribe") >= 2,
-        "the source resubscribes; the withheld block, not a blocked resubscribe, is the guard"
+    // Waiting for an anchor parks inside the live connection, so the drop is never seen and
+    // nothing resubscribes. Phase 1 already proved the block reached the source and was held.
+    assert_eq!(
+        server.call_count("subscribe"),
+        1,
+        "the anchor wait holds the connection open instead of cycling it"
     );
 
     cancel.cancel();

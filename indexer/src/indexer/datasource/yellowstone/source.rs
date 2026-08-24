@@ -53,6 +53,8 @@ pub struct YellowstoneSource {
     batch_size: usize,
     #[cfg(feature = "datasource-rpc")]
     storage: Option<Arc<Storage>>,
+    #[cfg(feature = "datasource-rpc")]
+    startup_floor: Option<u64>,
     health: Option<Arc<private_channel_metrics::HealthState>>,
     /// Silent-stream watchdog window. Defaults to STREAM_STALL_TIMEOUT; overridable
     /// (mainly so tests can drive the reconnect path without a 120s wait).
@@ -81,6 +83,8 @@ impl YellowstoneSource {
             batch_size: 0,
             #[cfg(feature = "datasource-rpc")]
             storage: None,
+            #[cfg(feature = "datasource-rpc")]
+            startup_floor: None,
             health: None,
             stall_timeout: STREAM_STALL_TIMEOUT,
         }
@@ -110,11 +114,18 @@ impl YellowstoneSource {
         self
     }
 
-    /// Storage holds the durable checkpoint that anchors reconnect backfill.
-    /// Without it, reconnect gap-fill is a no-op.
+    /// Holds the durable checkpoint that anchors gap repair; without it the gate never arms.
     #[cfg(feature = "datasource-rpc")]
     pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Highest slot startup already owns, taken once by whichever connection arms the gate first.
+    /// It raises that gate's target so a cold start cannot narrow a startup gate, and bounds the fill.
+    #[cfg(feature = "datasource-rpc")]
+    pub fn with_startup_floor(mut self, slot: u64) -> Self {
+        self.startup_floor = Some(slot);
         self
     }
 }
@@ -158,6 +169,7 @@ enum GapFillOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn fill_reconnect_gap_to<F, Fut>(
     target: u64,
+    floor: Option<u64>,
     get_checkpoint: F,
     rpc_poller: &RpcPoller,
     max_gap_slots: u64,
@@ -177,36 +189,38 @@ where
             return GapFillOutcome::Cancelled;
         }
 
-        // Re-read every cycle so an operator resync moves the anchor without a restart.
-        let checkpoint = match get_checkpoint().await {
-            Ok(Some(slot)) => slot,
-            // No anchor means no lower bound to replay from, so resolving here would let
-            // the caller forward live slots over an interval nothing has covered. Retry
-            // instead: startup writes an anchor before any live block, so this only shows
-            // up if the checkpoint row was destroyed underneath a running indexer.
-            Ok(None) => {
-                error!(
-                    "Reconnect gap-fill: no durable checkpoint anchor for {:?}; holding the \
-                     checkpoint rather than skipping the gap",
-                    program_type
-                );
-                record_missing_anchor(program_type);
-                if backoff_cancelled(cancel, backoff).await {
-                    return GapFillOutcome::Cancelled;
+        // A cold start is handed the slot startup already owns, so there is nothing to derive.
+        let checkpoint = match floor {
+            Some(slot) => slot,
+            // Re-read every cycle so an operator resync moves the anchor without a restart.
+            None => match get_checkpoint().await {
+                Ok(Some(slot)) => slot,
+                // With no anchor there is no lower bound to replay from, so resolving here
+                // would forward live slots over an interval nobody read. Retry instead.
+                Ok(None) => {
+                    error!(
+                        "Reconnect gap-fill: no durable checkpoint anchor for {:?}; holding the \
+                         checkpoint rather than skipping the gap",
+                        program_type
+                    );
+                    record_missing_anchor(program_type);
+                    if backoff_cancelled(cancel, backoff).await {
+                        return GapFillOutcome::Cancelled;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(e) => {
-                warn!(
-                    "Reconnect gap-fill: checkpoint read failed, retrying: {}",
-                    e
-                );
-                record_gap_fill_error(program_type);
-                if backoff_cancelled(cancel, backoff).await {
-                    return GapFillOutcome::Cancelled;
+                Err(e) => {
+                    warn!(
+                        "Reconnect gap-fill: checkpoint read failed, retrying: {}",
+                        e
+                    );
+                    record_gap_fill_error(program_type);
+                    if backoff_cancelled(cancel, backoff).await {
+                        return GapFillOutcome::Cancelled;
+                    }
+                    continue;
                 }
-                continue;
-            }
+            },
         };
 
         let gap = match validate_gap(target, checkpoint, max_gap_slots) {
@@ -281,8 +295,8 @@ where
     }
 }
 
-/// Context threaded to `connect_and_stream` so it can, on the first live block of a
-/// reconnect, observe the resume slot and arm the gate + concurrent backfill.
+/// What `connect_and_stream` needs to arm the gate and backfill on a connection's first block.
+/// Built once per source task; `None` when storage or the poller is missing, disabling repair.
 #[cfg(feature = "datasource-rpc")]
 struct ReconnectGapCtx {
     poller: Arc<RpcPoller>,
@@ -293,9 +307,8 @@ struct ReconnectGapCtx {
     escrow_instance_id: Option<Pubkey>,
 }
 
-/// Arm the reconnect gate over `(checkpoint, t_sub]` carrying `from` so the writer anchors
-/// the fold at the durable checkpoint, then spawn a bounded backfill (one in-flight; any
-/// prior is aborted). Sent before the first live block so the gate wins the FIFO race.
+/// Gate the checkpoint up to the slot this stream opened at, or to `floor` when that is higher,
+/// then spawn a backfill for the window. Sent first so the gate beats that block's SlotComplete.
 #[cfg(feature = "datasource-rpc")]
 /// Returns whether it is safe to forward the block that triggered this arm. `false`
 /// means cancellation ended the wait before the gate was armed, so the caller must NOT
@@ -304,20 +317,22 @@ struct ReconnectGapCtx {
 /// the gate is armed and the block is safe to hand on.
 async fn arm_reconnect_gap(
     t_sub: u64,
+    floor: Option<u64>,
     ctx: &ReconnectGapCtx,
     tx: &InstructionSender,
     cancel: &CancellationToken,
     backoff: Duration,
     prev: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<bool, DataSourceRpcError> {
+    // Never below what startup still owes, so its gate is widened rather than narrowed.
+    let target = floor.map_or(t_sub, |slot| t_sub.max(slot));
+
     // Resolve the anchor before arming, because the gate seeds its frontier from it.
     let checkpoint = loop {
         match get_last_checkpoint(&ctx.storage, ctx.program_type).await {
             Ok(Some(slot)) => break slot,
-            // An anchor at slot zero is a real anchor and gets repaired like any other.
-            // Absence is different: without a lower bound there is nothing to replay
-            // from, so forwarding this block would let its SlotComplete carry the
-            // checkpoint over slots no one has read. Wait for an anchor instead.
+            // Slot zero is a real anchor and repairs like any other, but absence has no lower
+            // bound, so forwarding here would carry the checkpoint over unread slots. Hold.
             Ok(None) => {
                 error!(
                     "Reconnect gap: no durable checkpoint anchor for {:?}; withholding live \
@@ -344,7 +359,7 @@ async fn arm_reconnect_gap(
         ProcessorMessage::Regate {
             program_type: ctx.program_type,
             from: checkpoint,
-            target: t_sub,
+            target,
         },
         "Regate (yellowstone)",
     )
@@ -369,7 +384,8 @@ async fn arm_reconnect_gap(
 
     let handle = tokio::spawn(async move {
         fill_reconnect_gap_to(
-            t_sub,
+            target,
+            floor,
             || get_last_checkpoint(&storage, program_type),
             &poller,
             max_gap_slots,
@@ -450,9 +466,11 @@ impl DataSource for YellowstoneSource {
         let batch_size = self.batch_size;
         #[cfg(feature = "datasource-rpc")]
         let storage = self.storage.clone();
+        #[cfg(feature = "datasource-rpc")]
+        let startup_floor = self.startup_floor;
 
         let handle = tokio::spawn(async move {
-            // Reconnect gate context, built once; None disables reconnect gating.
+            // Gap gate context, built once; None disables gap gating for this source.
             #[cfg(feature = "datasource-rpc")]
             let gap_ctx_opt = match (rpc_poller, storage) {
                 (Some(poller), Some(storage)) => Some(ReconnectGapCtx {
@@ -465,29 +483,18 @@ impl DataSource for YellowstoneSource {
                 }),
                 _ => None,
             };
-            // One in-flight reconnect backfill, owned here and superseded on each reconnect.
+            // One in-flight gap backfill, owned here and superseded on each connection.
             #[cfg(feature = "datasource-rpc")]
             let mut backfill_handle: Option<tokio::task::JoinHandle<()>> = None;
-            // True once some connection has subscribed. Only later connections arm the
-            // reconnect gate; the first stream is a cold start that startup backfill
-            // already covers. A connect that fails before subscribing does not count.
+            // Taken by whichever connection arms first; every later one anchors on the checkpoint.
             #[cfg(feature = "datasource-rpc")]
-            let mut ever_streamed = false;
+            let mut startup_floor = startup_floor;
 
             loop {
                 if cancellation_token.is_cancelled() {
                     info!("Yellowstone source received cancellation signal, stopping...");
                     break;
                 }
-
-                #[cfg(feature = "datasource-rpc")]
-                let gap_ctx = if ever_streamed {
-                    gap_ctx_opt.as_ref()
-                } else {
-                    None
-                };
-                #[cfg(feature = "datasource-rpc")]
-                let mut subscribed = false;
 
                 match connect_and_stream(
                     &endpoint,
@@ -499,11 +506,11 @@ impl DataSource for YellowstoneSource {
                     health.as_ref(),
                     stall_timeout,
                     #[cfg(feature = "datasource-rpc")]
-                    gap_ctx,
+                    gap_ctx_opt.as_ref(),
                     #[cfg(feature = "datasource-rpc")]
                     &mut backfill_handle,
                     #[cfg(feature = "datasource-rpc")]
-                    &mut subscribed,
+                    &mut startup_floor,
                 )
                 .await
                 {
@@ -532,11 +539,6 @@ impl DataSource for YellowstoneSource {
                         }
                     }
                 }
-
-                #[cfg(feature = "datasource-rpc")]
-                if subscribed {
-                    ever_streamed = true;
-                }
             }
 
             info!("Yellowstone source stopped gracefully");
@@ -561,13 +563,12 @@ async fn connect_and_stream(
     cancellation_token: CancellationToken,
     health: Option<&Arc<private_channel_metrics::HealthState>>,
     stall_timeout: std::time::Duration,
-    // Present only on reconnects (after the first connection). When set, the first
-    // live block arms the gate + backfill so the residual window cannot be leapfrogged.
+    // Set on every connection, the first one included, so that connection's first live block
+    // gates the window below it. A process start and a stream resume are the same event here.
     #[cfg(feature = "datasource-rpc")] gap_ctx: Option<&ReconnectGapCtx>,
     #[cfg(feature = "datasource-rpc")] backfill_handle: &mut Option<tokio::task::JoinHandle<()>>,
-    // Set true once this connection subscribes, so the caller can tell a real streaming
-    // session apart from a connect failure that never reached the reconnect-gating state.
-    #[cfg(feature = "datasource-rpc")] subscribed: &mut bool,
+    // The slot startup already owns, consumed by whichever connection arms the gate first.
+    #[cfg(feature = "datasource-rpc")] startup_floor: &mut Option<u64>,
 ) -> Result<(), DataSourceError> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())
         .map_err(|e| DataSourceRpcError::Protocol {
@@ -633,13 +634,7 @@ async fn connect_and_stream(
             reason: e.to_string(),
         })?;
 
-    // A subscribe handshake succeeded; from here the next connection is a reconnect.
-    #[cfg(feature = "datasource-rpc")]
-    {
-        *subscribed = true;
-    }
-
-    // Arm the reconnect gate on the first live block of this connection only.
+    // Arm the gap gate on the first live block of this connection only.
     #[cfg(feature = "datasource-rpc")]
     let mut armed = false;
 
@@ -690,15 +685,15 @@ async fn connect_and_stream(
                         block.transactions.len()
                     );
 
-                    // First live block after a reconnect: observe the resume slot and
-                    // arm the gate + concurrent backfill BEFORE forwarding this block,
-                    // so its SlotComplete cannot leapfrog the still-unfilled window.
+                    // Arm the gate and backfill BEFORE forwarding this block, so its
+                    // SlotComplete cannot leapfrog the window still unfilled underneath it.
                     #[cfg(feature = "datasource-rpc")]
                     if let Some(ctx) = gap_ctx {
                         if !armed {
                             armed = true;
                             let safe_to_forward = arm_reconnect_gap(
                                 block.slot,
+                                startup_floor.take(),
                                 ctx,
                                 &tx,
                                 &cancellation_token,
@@ -858,6 +853,7 @@ mod tests {
 
         let outcome = fill_reconnect_gap_to(
             100,
+            None,
             checkpoint_ok(100),
             &poller,
             1000,
@@ -895,6 +891,7 @@ mod tests {
 
         let outcome = fill_reconnect_gap_to(
             103,
+            None,
             checkpoint_ok(100),
             &poller,
             1000,
@@ -933,6 +930,7 @@ mod tests {
         let mut handle = tokio::spawn(async move {
             fill_reconnect_gap_to(
                 100,
+                None,
                 checkpoint_absent(),
                 &poller,
                 1000,
@@ -983,6 +981,7 @@ mod tests {
 
         let outcome = fill_reconnect_gap_to(
             3,
+            None,
             checkpoint_ok(0),
             &poller,
             1000,
@@ -1034,6 +1033,7 @@ mod tests {
         // target == checkpoint => no gap once the read heals.
         let outcome = fill_reconnect_gap_to(
             100,
+            None,
             get_checkpoint,
             &poller,
             1000,
@@ -1087,6 +1087,7 @@ mod tests {
         let mut handle = tokio::spawn(async move {
             fill_reconnect_gap_to(
                 103,
+                None,
                 checkpoint_ok(100),
                 &poller,
                 1000,
@@ -1150,6 +1151,7 @@ mod tests {
         let mut handle = tokio::spawn(async move {
             fill_reconnect_gap_to(
                 200,
+                None,
                 checkpoint_ok(100),
                 &poller,
                 10,
@@ -1199,6 +1201,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             fill_reconnect_gap_to(
                 103,
+                None,
                 get_checkpoint,
                 &poller,
                 1000,
@@ -1238,7 +1241,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        arm_reconnect_gap(103, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        arm_reconnect_gap(103, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
@@ -1263,6 +1266,94 @@ mod tests {
         assert_eq!(slots, vec![100, 101, 102, 103]);
     }
 
+    /// A lagging provider can open the stream below the slot startup backfill is still filling.
+    /// Gating there would free the checkpoint over that range, so the floor has to win.
+    #[tokio::test]
+    async fn arm_cold_start_raises_target_to_the_startup_floor() {
+        let mut server = Server::new_async().await;
+        let no_blocks = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({"method": "getBlock"})))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let ctx = test_gap_ctx(&server, storage_with_checkpoint(100), 1000);
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let mut prev: Option<tokio::task::JoinHandle<()>> = None;
+
+        // Startup owns up to 110; the stream opened at 103, seven slots behind it.
+        arm_reconnect_gap(103, Some(110), &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut msgs = vec![];
+        while let Some(m) = rx.recv().await {
+            msgs.push(m);
+        }
+        prev.unwrap().await.unwrap();
+
+        assert!(
+            matches!(
+                msgs[0],
+                ProcessorMessage::Regate {
+                    from: 100,
+                    target: 110,
+                    ..
+                }
+            ),
+            "the gate must widen to the floor, not narrow to the resume slot: {:?}",
+            msgs[0]
+        );
+        // Startup backfill covers everything up to the floor, so this fill has nothing to do.
+        assert_eq!(msgs.len(), 1, "no slot may be refetched below the floor");
+        no_blocks.assert_async().await;
+    }
+
+    /// The checkpoint can sit far below the floor, so replaying from it would refetch slots
+    /// startup owns or that start_slot meant to skip. The fill anchors on the floor instead.
+    #[tokio::test]
+    async fn cold_start_fill_starts_at_the_floor_not_the_checkpoint() {
+        let mut server = Server::new_async().await;
+        let _enum = mock_dense_range(&mut server, 100, 103);
+        let _blocks: Vec<_> = (100..=103)
+            .map(|s| mock_get_block_success(&mut server, s))
+            .collect();
+
+        let poller = test_poller(&server);
+        let (tx, mut rx) = mpsc::channel(256);
+        let cancel = CancellationToken::new();
+
+        let outcome = fill_reconnect_gap_to(
+            103,
+            Some(100),
+            checkpoint_ok(10),
+            &poller,
+            1000,
+            10,
+            ProgramType::Escrow,
+            None,
+            &tx,
+            &cancel,
+            TEST_BACKOFF,
+        )
+        .await;
+        drop(tx);
+
+        assert_eq!(outcome, GapFillOutcome::Resolved);
+        let mut slots = vec![];
+        while let Some(ProcessorMessage::SlotComplete { slot, .. }) = rx.recv().await {
+            slots.push(slot);
+        }
+        assert_eq!(
+            slots,
+            vec![100, 101, 102, 103],
+            "the fill must start at the floor, not walk up from checkpoint 10"
+        );
+    }
+
     /// No anchor means the block is unsafe to forward; letting it through was the bug.
     #[tokio::test]
     async fn arm_reconnect_gap_missing_anchor_withholds_block() {
@@ -1282,7 +1373,7 @@ mod tests {
         cancel.cancel();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        let safe = arm_reconnect_gap(103, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        let safe = arm_reconnect_gap(103, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
@@ -1326,7 +1417,7 @@ mod tests {
         cancel.cancel();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        let safe = arm_reconnect_gap(103, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        let safe = arm_reconnect_gap(103, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
@@ -1357,13 +1448,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        arm_reconnect_gap(1000, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        arm_reconnect_gap(1000, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         let first = prev.as_ref().unwrap().abort_handle();
         assert!(!first.is_finished(), "first backfill is still in flight");
 
-        arm_reconnect_gap(1000, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        arm_reconnect_gap(1000, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
 

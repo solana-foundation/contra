@@ -20,7 +20,8 @@
 //! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
 //!    error, emit alert, abort startup. Checked first: it reads the chain on both sides,
 //!    so it is unaffected by how far behind the DB is and can never be repaired by
-//!    indexing more slots.
+//!    indexing more slots. A supply that cannot be read at all aborts too, since an
+//!    unreadable channel and a solvent one look the same from here.
 //! 5. If any |on_chain - db_expected| > threshold → log error, emit alert, abort startup.
 //! 6. If any mismatch ≤ threshold (but > 0) → log warning, continue.
 //! 7. If all balanced (or both sides empty) → log info, continue.
@@ -318,11 +319,10 @@ async fn measure_supply_breaches(
 /// same persistence rule the runtime invariant uses. A real insolvency does not heal
 /// between reads, so this costs nothing on a healthy boot and nothing in detection.
 ///
-/// A supply read that errors is skipped with a warn rather than aborting the boot: the
-/// channel RPC (gateway) may not be ready yet, the runtime loop is the primary control, and
-/// a transient read must not crash-loop the indexer. Once a mint has breached, though, the
-/// same silence means the opposite. Nothing has retracted the breach, so it keeps its
-/// suspect status and the boot fails if no later round ever reads it clean.
+/// A supply read that errors buys another round rather than being written off. The rounds
+/// give a gateway that is still coming up time to answer, but a mint that stays unreadable
+/// to the end stops the boot: an unreadable channel hides an existing breach exactly as
+/// well as a healthy one does, and nothing here can tell the two apart.
 async fn check_channel_supply_invariant(
     channel_rpc_url: &str,
     escrow_rpc_url: &str,
@@ -355,13 +355,10 @@ async fn check_channel_supply_invariant(
         )
         .await?;
 
-        // A suspect the node would not answer for is not evidence that it recovered, so it
-        // stays a suspect. A mint with no breach behind it is still skipped on a failed
-        // read: the channel RPC may simply not be up yet this early in the boot.
-        let unresolved: HashSet<Pubkey> = match suspects.as_ref() {
-            Some(prior) => reading.unread.intersection(prior).copied().collect(),
-            None => HashSet::new(),
-        };
+        // A mint the node would not answer for proves nothing either way, so it stays a
+        // suspect and buys another round. Later rounds only ask about suspects, so whatever
+        // came back unread is already the set still owed an answer.
+        let unresolved = &reading.unread;
 
         if reading.breaches.is_empty() && unresolved.is_empty() {
             return Ok(());
@@ -371,6 +368,7 @@ async fn check_channel_supply_invariant(
         // is out, whatever an earlier round said about it.
         let mut still: HashSet<Pubkey> = reading.breaches.iter().map(|b| b.key).collect();
         still.extend(unresolved.iter().copied());
+        let unresolved_count = unresolved.len();
         standing.retain(|mint, _| still.contains(mint));
 
         // A breach reading advances that mint's count; a round that could not read it
@@ -400,7 +398,7 @@ async fn check_channel_supply_invariant(
                 mint_count = standing.len(),
                 round,
                 required = SUPPLY_BREACH_CONFIRMATIONS,
-                unresolved = unresolved.len(),
+                unresolved = unresolved_count,
                 "Startup supply invariant: possible breach, re-reading before acting on it"
             );
             tokio::time::sleep(std::time::Duration::from_millis(
@@ -427,11 +425,27 @@ async fn check_channel_supply_invariant(
         );
     }
 
+    if !standing.is_empty() {
+        return Err(IndexerError::Reconciliation(
+            ReconciliationError::SupplyExceedsCustody {
+                count: standing.len(),
+                threshold: config.mismatch_threshold_raw,
+            },
+        ));
+    }
+
+    // Left over: mints that never breached but were never readable either. The invariant
+    // did not run for them, and an unreadable gateway looks exactly like a healthy one from
+    // here, so the boot stops instead of vouching for custody it never measured.
+    let unverified = suspects.map(|s| s.len()).unwrap_or(0);
+    error!(
+        reconciliation_alert = true,
+        mint_count = unverified,
+        rounds = SUPPLY_BREACH_MAX_ROUNDS,
+        "RECONCILIATION ALERT: channel supply unreadable, the supply invariant did not run"
+    );
     Err(IndexerError::Reconciliation(
-        ReconciliationError::SupplyExceedsCustody {
-            count: standing.len(),
-            threshold: config.mismatch_threshold_raw,
-        },
+        ReconciliationError::SupplyInvariantUnverified { count: unverified },
     ))
 }
 
@@ -991,6 +1005,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        // Healthy supply, so the ledger comparison stays the thing under test.
+        mock_channel_supply(&mut server, 0).await;
 
         let storage = Storage::Mock(MockStorage::new());
         let config = ReconciliationConfig {
@@ -1024,6 +1040,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        // Healthy supply, so the ledger comparison stays the thing under test.
+        mock_channel_supply(&mut server, 1_000).await;
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
@@ -1051,6 +1069,8 @@ mod tests {
         let mint = Pubkey::new_unique();
         // DB expects 1000, on-chain has 1005 => mismatch 5 <= threshold 10 => ok
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_005)]).await;
+        // Healthy supply, so the ledger comparison stays the thing under test.
+        mock_channel_supply(&mut server, 1_000).await;
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
@@ -1082,6 +1102,8 @@ mod tests {
         let mint = Pubkey::new_unique();
         // DB expects 1000, on-chain has 1020 => mismatch 20 > threshold 10 => err
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_020)]).await;
+        // Healthy supply, so the ledger comparison stays the thing under test.
+        mock_channel_supply(&mut server, 1_000).await;
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
@@ -1118,6 +1140,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        // Healthy supply, so the ledger comparison stays the thing under test.
+        mock_channel_supply(&mut server, 1_000).await;
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1500, 500)]);
@@ -1421,6 +1445,48 @@ mod tests {
                 ))
             ),
             "an unreadable suspect must not clear the breach: {:?}",
+            result
+        );
+    }
+
+    /// A gateway that answers nothing leaves the invariant unrun, and an unreadable channel
+    /// looks exactly like a solvent one from here. Startup must stop rather than vouch for
+    /// custody it never measured.
+    #[tokio::test]
+    async fn supply_that_is_never_readable_stops_startup() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // Custody and ledger agree, so only the unreadable supply can decide this.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+        mock_channel_supply_failure(&mut server).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyInvariantUnverified { count: 1 }
+                ))
+            ),
+            "an unreadable supply must stop the boot, not pass it: {:?}",
             result
         );
     }

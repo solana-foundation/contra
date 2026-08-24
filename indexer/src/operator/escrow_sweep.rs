@@ -48,8 +48,10 @@ pub struct CustodySnapshot {
     pub slot: u64,
 }
 
-/// Attempts allowed to get both token-program sweeps to answer at the same slot.
-const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 3;
+/// Attempts allowed to get both token-program sweeps to answer at the same slot. Set
+/// generously because running out is fatal, not a fallback: back-to-back finalized reads
+/// agree almost every time, so needing five means something is genuinely wrong.
+const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 5;
 
 /// Sum every token account owned by the escrow instance, grouped by mint, across
 /// the SPL Token and Token-2022 programs.
@@ -57,8 +59,13 @@ const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 3;
 /// The two programs need one call each, so their readings can land on different slots and
 /// the merged balances would then hold activity the lower slot never saw. No single slot
 /// describes such a snapshot honestly, and labelling it with the lower one understates the
-/// custody it carries, so the sweep is simply taken again until both calls answer at the
-/// same slot. Back-to-back finalized reads normally agree on the first try.
+/// custody it carries, so the sweep is taken again until both calls answer at the same
+/// slot. Back-to-back finalized reads normally agree on the first try.
+///
+/// If they never agree, the sweep fails rather than hand back a slot the balances do not
+/// match: a caller that bounds its ledger read by that slot would compare two different
+/// moments and call an ordinary channel broken. A caller that ignores the slot sees only a
+/// skipped round, which its own retry covers.
 pub async fn fetch_escrow_balances_by_mint(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
@@ -71,13 +78,17 @@ pub async fn fetch_escrow_balances_by_mint(
             continue;
         }
         if low != high {
-            // Out of attempts. The lower slot is the only one both readings are known to
-            // cover, so it stays the label; the caller's own retry gets the next chance.
             warn!(
                 low_slot = low,
                 high_slot = high,
+                attempts = SWEEP_SLOT_AGREEMENT_ATTEMPTS,
                 "Escrow sweep: token programs kept answering at different slots"
             );
+            return Err(EscrowSweepError {
+                reason: format!(
+                    "token program sweeps never settled on one slot after                      {SWEEP_SLOT_AGREEMENT_ATTEMPTS} attempts (last spread {low}..{high});                      custody cannot be pinned to a single point"
+                ),
+            });
         }
         return Ok(CustodySnapshot {
             balances,
@@ -402,24 +413,24 @@ mod tests {
         assert_eq!(balances[&mint], 50);
     }
 
-    /// When the two calls will not settle on one slot, the lower one is all the snapshot
-    /// can claim: the higher reading may hold custody the earlier call never saw, and
-    /// claiming its slot would vouch for exactly the drift the slot exists to prevent.
+    /// When the two calls never settle on one slot, no slot describes the merged balances.
+    /// Handing back the lower one would let a caller bound its ledger at a point the
+    /// balances overshoot, so the sweep fails instead of guessing.
     #[tokio::test]
-    async fn snapshot_slot_is_the_lower_of_the_two_sweeps() {
+    async fn sweep_fails_when_the_two_programs_never_agree_on_a_slot() {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 900, 880).await;
 
-        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
-            .await
-            .unwrap();
+        let result =
+            fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique()).await;
 
-        assert_eq!(
-            snapshot.slot, 880,
-            "the snapshot can only claim the lower slot"
+        let err = result.expect_err("a snapshot with no coherent slot must not be returned");
+        assert!(
+            err.reason.contains("never settled on one slot"),
+            "unexpected reason: {}",
+            err.reason
         );
-        assert_eq!(snapshot.balances[&mint], 42);
     }
 
     /// A deposit finalizing between the two calls leaves the merged balances holding

@@ -19,7 +19,9 @@ mod helpers;
 mod setup;
 
 use mockito::{Matcher, Server as MockitoServer};
-use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+// The indexer decides what counts as an escrow instruction by this constant, so a
+// synthetic block has to carry the same id or the fill sees nothing to import.
+use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{
     config::{BackfillConfig, ReconciliationConfig, RpcPollingConfig},
     error::{IndexerError, ReconciliationError},
@@ -46,7 +48,7 @@ use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
-use test_utils::mock_rpc::MockRpcServer;
+use test_utils::mock_rpc::{MockRpcServer, Reply};
 use test_utils::validator_helper::start_test_validator_no_geyser;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -124,7 +126,11 @@ fn deposit_ix(user: &Keypair, instance: Pubkey, mint: Pubkey, amount: u64) -> In
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(spl_associated_token_account::ID)
         .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .private_channel_escrow_program(
+            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID
+                .parse()
+                .expect("the parser's escrow program id must be a valid pubkey"),
+        )
         .amount(amount)
         .instruction()
 }
@@ -148,14 +154,25 @@ async fn wait_for_finalized_custody(rpc_url: &str, ata: &Pubkey, expected: u64) 
     }
 }
 
+/// Answer the startup supply invariant with "no channel mint exists yet".
+///
+/// An absent mint account reads as zero supply, which can never exceed custody, so the
+/// invariant passes for every mint and these tests keep testing the custody comparison.
+/// An unanswered read is no longer harmless: startup refuses to boot on a supply it could
+/// not check. Answering absence rather than a fabricated mint keeps any other reader on
+/// this RPC seeing the truth, and the queue is stocked well past what a run consumes.
+fn mock_empty_channel_supply(rpc: &MockRpcServer) {
+    let reply = Reply::result(json!({"context": {"slot": 1}, "value": null}));
+    rpc.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 4096));
+}
+
 /// Spawn `run` on the ordinary recovery configuration and hand back its result.
 ///
 /// `mismatch_threshold_raw` is deliberately 0, the shipped default, because the whole
 /// finding is that this configuration cannot boot. `start_slot` is the bottom of the slice
 /// the indexer missed, so the fill has exactly that slice to recover. The channel RPC is
-/// an unscripted mock: it answers every method with an error, which makes the supply
-/// invariant skip each mint with a warning and leaves the custody comparison as the only
-/// thing that can fail the boot.
+/// scripted with an empty supply, which satisfies the supply invariant without ever
+/// tripping it and leaves the custody comparison as the only thing that can fail the boot.
 fn spawn_indexer(
     postgres: PostgresConfig,
     rpc_url: String,
@@ -532,6 +549,7 @@ async fn deposit_finalized_while_down_is_backfilled_then_reconciles() {
     wait_for_block_servable(&validator.rpc_url(), start_slot).await;
 
     let channel = MockRpcServer::start().await;
+    mock_empty_channel_supply(&channel);
     let mut handle = spawn_indexer(
         postgres,
         validator.rpc_url(),
@@ -616,6 +634,7 @@ async fn unexplainable_mismatch_still_halts_startup() {
     // Only the supply invariant reads this, and it errors on every method, so each mint
     // is skipped with a warning and the custody comparison is what fails the boot.
     let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
 
     let handle = spawn_indexer(
         postgres,
@@ -684,6 +703,7 @@ async fn the_fill_imports_the_deposit_that_explains_custody() {
         mock_escrow_custody(&mut rpc, &[(mint.to_string(), DEPOSIT_AMOUNT as i64)]).await;
 
     let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
     let mut handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
@@ -756,6 +776,7 @@ async fn custody_read_from_behind_the_ledger_stops_startup() {
     let _custody = mock_escrow_custody_at(&mut rpc, &[], 890).await;
 
     let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
     let handle = spawn_indexer(
         postgres,
         rpc.url(),
@@ -849,6 +870,7 @@ async fn the_live_source_resumes_where_the_fill_stopped() {
     let _custody = mock_escrow_custody_at(&mut rpc, &[], custody_slot).await;
 
     let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
     let mut handle = spawn_indexer(postgres, rpc.url(), chain.url(), instance, MOCK_START_SLOT);
 
     // The fill stops at the measured slot, not the tip.
@@ -917,6 +939,7 @@ async fn matching_ledger_reconciles_after_the_fill_and_startup_continues() {
     let _custody = mock_escrow_custody(&mut rpc, &[(mint.clone(), PHANTOM_AMOUNT)]).await;
 
     let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
     let mut handle = spawn_indexer(
         postgres,
         rpc.url(),

@@ -56,6 +56,12 @@ pub enum ReconciliationError {
     #[error("{count} mint(s) have channel supply above escrow custody by more than {threshold} raw units; see logs for per-mint details")]
     SupplyExceedsCustody { count: usize, threshold: u64 },
 
+    /// Channel supply could not be read at all, so the invariant never ran. Startup stops
+    /// rather than proceed unchecked: an unreadable gateway hides an existing breach just
+    /// as well as a healthy channel does, and the two are indistinguishable from here.
+    #[error("channel supply for {count} mint(s) was unreadable across every attempt; the supply invariant did not run, so custody cannot be vouched for")]
+    SupplyInvariantUnverified { count: usize },
+
     /// The custody reading came from a slot the ledger has already passed, so the two
     /// cannot be compared at a common point and any verdict would be guesswork. Usually a
     /// lagging RPC node, which is why a re-read is worth trying before giving up.

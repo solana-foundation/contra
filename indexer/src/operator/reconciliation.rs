@@ -569,7 +569,7 @@ async fn fetch_on_chain_balances(
     fetch_escrow_balances_by_mint(rpc_client, escrow_instance_id)
         .await
         .map(|snapshot| snapshot.balances)
-        .map_err(|e| OperatorError::RpcError(e.reason))
+        .map_err(|e| OperatorError::RpcError(e.to_string()))
 }
 
 /// Sends webhook alerts for balance mismatches with retry logic

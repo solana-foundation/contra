@@ -30,7 +30,9 @@ use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
     operator::{
-        escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot},
+        escrow_sweep::{
+            fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot, SweepFailure,
+        },
         rpc_util::RpcClientWithRetry,
         RetryConfig,
     },
@@ -121,9 +123,22 @@ pub async fn capture_custody_snapshot(
 
     let snapshot = fetch_escrow_balances_by_mint(&rpc_client, *instance_pda)
         .await
-        .map_err(|e| ReconciliationError::Rpc {
-            mint: instance_pda.to_string(),
-            reason: e.reason,
+        .map_err(|e| match e {
+            // Kept distinct so the caller's retry can take another sweep: this one says the
+            // node never held still, not that custody could not be read.
+            SweepFailure::SlotUnsettled {
+                attempts,
+                low,
+                high,
+            } => ReconciliationError::CustodySlotUnsettled {
+                attempts,
+                low,
+                high,
+            },
+            SweepFailure::Read(e) => ReconciliationError::Rpc {
+                mint: instance_pda.to_string(),
+                reason: e.reason,
+            },
         })?;
 
     info!(

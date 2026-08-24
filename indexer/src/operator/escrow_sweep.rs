@@ -36,6 +36,36 @@ impl std::fmt::Display for EscrowSweepError {
 
 impl std::error::Error for EscrowSweepError {}
 
+/// Why a custody sweep could not produce a snapshot.
+///
+/// Kept apart from a plain read failure because the two deserve different answers: a slot
+/// the calls never settled on is a property of that attempt, not of the chain, so sweeping
+/// again can fix it, while a failing read usually cannot.
+#[derive(Debug, Clone)]
+pub enum SweepFailure {
+    /// An RPC call or an account decode failed.
+    Read(EscrowSweepError),
+    /// The two token-program calls never answered at the same slot, so no single slot
+    /// describes the merged balances.
+    SlotUnsettled { attempts: u32, low: u64, high: u64 },
+}
+
+impl std::fmt::Display for SweepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SweepFailure::Read(e) => write!(f, "{e}"),
+            SweepFailure::SlotUnsettled {
+                attempts,
+                low,
+                high,
+            } => write!(
+                f,
+                "token program sweeps never settled on one slot after {attempts} attempts (last spread {low}..{high})"
+            ),
+        }
+    }
+}
+
 /// On-chain custody together with the slot the reading reflects.
 ///
 /// The slot is what lets a caller compare this against a ledger bounded at the same
@@ -64,15 +94,17 @@ const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 5;
 ///
 /// If they never agree, the sweep fails rather than hand back a slot the balances do not
 /// match: a caller that bounds its ledger read by that slot would compare two different
-/// moments and call an ordinary channel broken. A caller that ignores the slot sees only a
-/// skipped round, which its own retry covers.
+/// moments and call an ordinary channel broken. The failure is reported as its own kind so
+/// a caller can sweep again, since the skew belongs to the attempt rather than the chain.
 pub async fn fetch_escrow_balances_by_mint(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
-) -> Result<CustodySnapshot, EscrowSweepError> {
+) -> Result<CustodySnapshot, SweepFailure> {
     let mut attempt = 1;
     loop {
-        let (balances, low, high) = sweep_once(rpc_client, escrow_instance_id).await?;
+        let (balances, low, high) = sweep_once(rpc_client, escrow_instance_id)
+            .await
+            .map_err(SweepFailure::Read)?;
         if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
             attempt += 1;
             continue;
@@ -84,10 +116,10 @@ pub async fn fetch_escrow_balances_by_mint(
                 attempts = SWEEP_SLOT_AGREEMENT_ATTEMPTS,
                 "Escrow sweep: token programs kept answering at different slots"
             );
-            return Err(EscrowSweepError {
-                reason: format!(
-                    "token program sweeps never settled on one slot after                      {SWEEP_SLOT_AGREEMENT_ATTEMPTS} attempts (last spread {low}..{high});                      custody cannot be pinned to a single point"
-                ),
+            return Err(SweepFailure::SlotUnsettled {
+                attempts: SWEEP_SLOT_AGREEMENT_ATTEMPTS,
+                low,
+                high,
             });
         }
         return Ok(CustodySnapshot {
@@ -427,10 +459,34 @@ mod tests {
 
         let err = result.expect_err("a snapshot with no coherent slot must not be returned");
         assert!(
-            err.reason.contains("never settled on one slot"),
-            "unexpected reason: {}",
-            err.reason
+            matches!(err, SweepFailure::SlotUnsettled { .. }),
+            "the caller has to be able to tell this apart from a read failure: {err:?}"
         );
+    }
+
+    /// The failure has to be its own kind, not a generic read error: startup retries a
+    /// sweep that would not settle, because the node was moving under it, and gives up on
+    /// one that could not be read at all.
+    #[tokio::test]
+    async fn a_slot_that_never_settles_is_reported_apart_from_a_read_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 900, 880).await;
+
+        let err = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+            .await
+            .expect_err("a snapshot with no coherent slot must not be returned");
+
+        match err {
+            SweepFailure::SlotUnsettled { low, high, .. } => {
+                assert_eq!(
+                    (low, high),
+                    (880, 900),
+                    "the spread is reported as measured"
+                );
+            }
+            other => panic!("a slot disagreement must not look like a read failure: {other:?}"),
+        }
     }
 
     /// A deposit finalizing between the two calls leaves the merged balances holding
@@ -569,7 +625,14 @@ mod tests {
         let result =
             fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique()).await;
 
-        let err = result.expect_err("malformed account must error").reason;
-        assert!(err.contains("tokenAmount"), "unexpected error: {err}");
+        let err = result.expect_err("malformed account must error");
+        let SweepFailure::Read(read) = &err else {
+            panic!("a decode failure is a read failure, not a slot disagreement: {err:?}");
+        };
+        assert!(
+            read.reason.contains("tokenAmount"),
+            "unexpected error: {}",
+            read.reason
+        );
     }
 }

@@ -62,6 +62,13 @@ pub enum ReconciliationError {
     #[error("channel supply for {count} mint(s) was unreadable across every attempt; the supply invariant did not run, so custody cannot be vouched for")]
     SupplyInvariantUnverified { count: usize },
 
+    /// The two token-program sweeps never answered at the same slot, so the custody
+    /// numbers describe no single point and cannot be compared against a ledger bounded at
+    /// one. Usually a load-balanced endpoint answering from nodes at different heights,
+    /// which is why another sweep is worth trying before giving up.
+    #[error("custody sweeps never settled on one slot after {attempts} attempts (last spread {low}..{high}); custody cannot be pinned to a single point")]
+    CustodySlotUnsettled { attempts: u32, low: u64, high: u64 },
+
     /// The custody reading came from a slot the ledger has already passed, so the two
     /// cannot be compared at a common point and any verdict would be guesswork. Usually a
     /// lagging RPC node, which is why a re-read is worth trying before giving up.

@@ -95,6 +95,7 @@ fn reconcile_error_may_clear(error: &IndexerError) -> bool {
         IndexerError::Reconciliation(
             ReconciliationError::MismatchExceedsThreshold { .. }
                 | ReconciliationError::CustodyBehindLedger { .. }
+                | ReconciliationError::CustodySlotUnsettled { .. }
         )
     )
 }
@@ -419,8 +420,31 @@ pub async fn run(
             match common_config.escrow_instance_id {
                 Some(instance_id) => {
                     for attempt in 1..=RECONCILE_MAX_ATTEMPTS {
+                        // A sweep that never settled on one slot gets the same second
+                        // chance a mismatch does: the node was moving under it, and the
+                        // next sweep may catch it still. Anything else is fatal here.
                         let snapshot =
-                            capture_custody_snapshot(&common_config.rpc_url, &instance_id).await?;
+                            match capture_custody_snapshot(&common_config.rpc_url, &instance_id)
+                                .await
+                            {
+                                Ok(snapshot) => snapshot,
+                                Err(e)
+                                    if attempt < RECONCILE_MAX_ATTEMPTS
+                                        && reconcile_error_may_clear(&e) =>
+                                {
+                                    warn!(
+                                        "Startup reconciliation attempt {}/{} could not take a \
+                                     custody snapshot, re-reading: {}",
+                                        attempt, RECONCILE_MAX_ATTEMPTS, e
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(
+                                        RECONCILE_RETRY_DELAY_MS,
+                                    ))
+                                    .await;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            };
 
                         // The ledger must not already sit above the reading it is about to
                         // be judged by. If it does, the node is answering from behind us

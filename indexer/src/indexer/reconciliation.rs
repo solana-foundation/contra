@@ -227,8 +227,10 @@ const SUPPLY_BREACH_CONFIRMATIONS: u32 = 3;
 const SUPPLY_BREACH_MAX_ROUNDS: u32 = SUPPLY_BREACH_CONFIRMATIONS * 2;
 
 /// Pause between those readings, so each one sees a genuinely later state of both chains.
+/// Sized for a withdrawal in flight: the burn and the release finalize on separate chains
+/// moments apart, and the readings have to span that gap or all of them land inside it.
 #[cfg(not(test))]
-const SUPPLY_BREACH_RECHECK_DELAY_MS: u64 = 500;
+const SUPPLY_BREACH_RECHECK_DELAY_MS: u64 = 2_000;
 #[cfg(test)]
 const SUPPLY_BREACH_RECHECK_DELAY_MS: u64 = 10;
 
@@ -253,10 +255,12 @@ struct SupplyReading {
 /// Take one reading of every mint's channel supply and compare it against escrow custody.
 ///
 /// Supplies are read first and custody after, so the custody reading cannot be missing a
-/// deposit any supply read already saw. The frozen snapshot is folded in as a floor
-/// because custody also falls: a release between the two lowers the fresh reading, and
-/// judging against the higher of the two stops an ordinary withdrawal from looking like a
-/// breach. `only` restricts the reading to mints an earlier round already suspected.
+/// deposit any supply read already saw. Custody is judged on this round's reading alone.
+/// The frozen snapshot is never mixed in: it only ages, so using it as a floor would let a
+/// mint that lost its backing after the snapshot keep answering with custody it no longer
+/// holds. A release landing between the two reads can still make one round look short, and
+/// the repeated readings above are what settle that. `only` restricts the reading to mints
+/// an earlier round already suspected.
 async fn measure_supply_breaches(
     channel_rpc: &RpcClientWithRetry,
     escrow_rpc_url: &str,
@@ -304,12 +308,7 @@ async fn measure_supply_breaches(
 
     let mut breaches = Vec::new();
     for (r, mint, supply) in supplies {
-        let on_chain_custody = custody
-            .balances
-            .get(&mint)
-            .copied()
-            .unwrap_or(0)
-            .max(r.on_chain_actual);
+        let on_chain_custody = custody.balances.get(&mint).copied().unwrap_or(0);
         let gap = supply.saturating_sub(on_chain_custody);
         if gap > config.mismatch_threshold_raw {
             breaches.push(SupplyBreach {
@@ -1223,16 +1222,18 @@ mod tests {
         );
     }
 
-    /// The mirror case. A release lowers custody between the supply reads and the fresh
-    /// sweep, so the later reading is the one missing the backing. Judging against the
-    /// higher of the two readings is what keeps a routine withdrawal from aborting a boot.
+    /// The mirror case. A withdrawal burns on the channel and releases on Solana, and for
+    /// a moment a reading can catch the release without the burn. Custody is short in that
+    /// one reading only, so the re-read is what has to clear it.
     #[tokio::test]
-    async fn supply_invariant_is_not_fooled_by_custody_released_after_the_snapshot() {
+    async fn custody_released_before_its_burn_is_visible_clears_on_a_re_read() {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
-        // The fresh sweep sees the escrow already emptied by a release.
+        // The fresh sweep sees the escrow already emptied by the release.
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 0)]).await;
-        mock_channel_supply(&mut server, 1_000).await;
+        // First reading still predates the burn; the next one sees the supply gone too.
+        mock_channel_supply_times(&mut server, 1_000, Some(1)).await;
+        mock_channel_supply(&mut server, 0).await;
 
         // The snapshot predates the release: at that slot custody still backed the supply.
         let snapshot = CustodySnapshot {
@@ -1261,7 +1262,55 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "custody released after the snapshot must not read as a supply breach: {:?}",
+            "a release read ahead of its burn must not abort the boot: {:?}",
+            result
+        );
+    }
+
+    /// Custody that is gone and stays gone is the insolvency this gate exists to catch,
+    /// and a snapshot taken while the backing was still there must not answer for it. The
+    /// snapshot only ages, so letting it stand in for custody would excuse the breach on
+    /// every reading and pass the boot for good.
+    #[tokio::test]
+    async fn a_healthy_snapshot_cannot_excuse_custody_that_is_gone() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // Escrow is empty on every reading, and the supply was never burned against it.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 0)]).await;
+        mock_channel_supply(&mut server, 1_000).await;
+
+        // Taken while custody still backed the supply, so the ledger comparison passes.
+        let snapshot = CustodySnapshot {
+            balances: HashMap::from([(mint, 1_000)]),
+            slot: 50,
+        };
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let url = server.url();
+        let result = reconcile_against_snapshot(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &Pubkey::new_unique(),
+            &snapshot,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "supply standing over an empty escrow must stop the boot: {:?}",
             result
         );
     }

@@ -146,6 +146,10 @@ private-channel-admin truncate --keep-slots 100000
 private-channel-admin truncate --keep-slots 100000 --dry-run
 ```
 
+Truncation deletes in batches, and each batch commits the new retention floor
+(`getFirstAvailableBlock`) in the same transaction as its deletions. A partial or
+aborted run therefore never advertises history it has already removed.
+
 ### Makefile Targets
 
 **Source**: [`Makefile`](../Makefile)

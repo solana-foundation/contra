@@ -734,6 +734,142 @@ async fn completed_withdrawal_nonces_empty() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+// ── unreleased withdrawal nonce bounds ───────────────────────────────────────
+
+/// Insert a withdrawal, then force its status and nonce to exactly what the
+/// case under test needs. Both are set directly because the insert trigger picks
+/// the nonce and every row starts `pending`.
+async fn seed_withdrawal(
+    pool: &PgPool,
+    storage: &Storage,
+    tag: &str,
+    nonce: i64,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let row = make_db_transaction(tag, TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&row).await?;
+    sqlx::query("UPDATE transactions SET status = $2::transaction_status, withdrawal_nonce = $3 WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .bind(nonce)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The split the rotation gate depends on: a released or written-off nonce can
+/// never need its window again, everything else still might.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_counts_live_and_ignores_terminal(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let live = [
+        "pending",
+        "processing",
+        "parked",
+        "pending_remint",
+        "manual_review",
+    ];
+    // Nonces are chosen well above whatever the insert trigger hands out, since
+    // the column is uniquely indexed and the trigger numbers rows from zero.
+    for (offset, status) in live.iter().enumerate() {
+        seed_withdrawal(&pool, &storage, status, 1_010 + offset as i64, status).await?;
+    }
+    // Terminal rows sit on both sides of the live range, so including any of
+    // them by mistake would move a bound and fail this.
+    for (offset, status) in ["completed", "failed", "failed_reminted"]
+        .iter()
+        .enumerate()
+    {
+        seed_withdrawal(&pool, &storage, status, 1_000 + offset as i64, status).await?;
+        seed_withdrawal(
+            &pool,
+            &storage,
+            &format!("{status}_high"),
+            1_100 + offset as i64,
+            status,
+        )
+        .await?;
+    }
+
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        Some((1_010, 1_014)),
+        "bounds must span the live withdrawals and nothing else"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_ignores_deposits_and_null_nonces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let deposit = make_db_transaction("dep", TransactionType::Deposit);
+    storage.insert_db_transaction(&deposit).await?;
+
+    let orphan = make_db_transaction("null_nonce", TransactionType::Withdrawal);
+    let orphan_id = storage.insert_db_transaction(&orphan).await?;
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(orphan_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        None,
+        "neither a deposit nor a NULL nonce may set a bound"
+    );
+
+    seed_withdrawal(&pool, &storage, "live", 1_007, "pending").await?;
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        Some((1_007, 1_007)),
+        "only the live withdrawal that carries a nonce counts"
+    );
+    Ok(())
+}
+
+/// The floor is what lets the rotation gate ignore nonces whose window already
+/// closed, so the SQL has to apply it to both aggregates.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_honours_the_floor() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    seed_withdrawal(&pool, &storage, "stranded", 1_003, "manual_review").await?;
+    seed_withdrawal(&pool, &storage, "waiting", 1_011, "pending").await?;
+    seed_withdrawal(&pool, &storage, "later", 1_020, "parked").await?;
+
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(1_010).await?,
+        Some((1_011, 1_020)),
+        "a nonce below the floor sets neither bound"
+    );
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(1_021).await?,
+        None,
+        "a floor above every live nonce leaves nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_none_when_no_live_rows() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    assert_eq!(storage.unreleased_withdrawal_nonce_bounds(0).await?, None);
+
+    seed_withdrawal(&pool, &storage, "done", 1_001, "completed").await?;
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        None,
+        "an all-terminal table owes nothing"
+    );
+    Ok(())
+}
+
 // ── set_pending_remint status guard ──────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

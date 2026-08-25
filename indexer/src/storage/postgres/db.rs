@@ -2246,6 +2246,44 @@ impl PostgresDb {
         Ok(count)
     }
 
+    /// Lowest and highest withdrawal nonce at or above `min_nonce` that still
+    /// owes a release.
+    ///
+    /// The status set is the complement of the terminal ones. `completed` was
+    /// released, `failed` and `failed_reminted` were written off or refunded, and
+    /// none of the three can ever need their generation's window again, so the
+    /// rotation is free to move past them. Everything else may still have to land
+    /// on the bitmap as it stands today, `manual_review` included, because a human
+    /// can still resolve one of those rows into a release.
+    ///
+    /// Both aggregates are NULL together when nothing matches, and MIN/MAX skip
+    /// NULL nonces on their own, so a row without one contributes no bound.
+    pub async fn unreleased_withdrawal_nonce_bounds_internal(
+        &self,
+        min_nonce: i64,
+    ) -> Result<Option<(i64, i64)>, sqlx::Error> {
+        let bounds: (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+            r#"
+            SELECT MIN({nonce}), MAX({nonce}) FROM transactions
+            WHERE {ttype} = $1
+              AND {nonce} >= $2
+              AND {status} IN ('pending', 'processing', 'parked', 'pending_remint', 'manual_review')
+            "#,
+            nonce = transaction_cols::WITHDRAWAL_NONCE,
+            ttype = transaction_cols::TRANSACTION_TYPE,
+            status = transaction_cols::STATUS,
+        ))
+        .bind(TransactionType::Withdrawal)
+        .bind(min_nonce)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(match bounds {
+            (Some(lowest), Some(highest)) => Some((lowest, highest)),
+            _ => None,
+        })
+    }
+
     pub async fn get_completed_withdrawal_nonces_internal(
         &self,
         min_nonce: i64,

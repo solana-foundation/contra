@@ -76,9 +76,18 @@ the deposit ones do not.
 - Generation: `nonce / NONCES_PER_GENERATION`. A nonce outside the bitmap's
   current generation is refused with `NonceOutsideCurrentGeneration`.
 - Rotation: `RotateBitmapBuilder` (escrow program) clears every bit and
-  advances the generation. Triggered automatically when a nonce hits the
-  `NONCES_PER_GENERATION` boundary; no admin CLI entrypoint exists today.
-  Nonces from a rotated-past generation can never be released.
+  advances the generation. The sender arms one on a timer, whenever the lowest
+  withdrawal nonce that still owes a release belongs to a later generation than
+  the bitmap is on; no admin CLI entrypoint exists today. Nonces from a
+  rotated-past generation can never be released.
+- A withdrawal that is not yet terminal and sits **inside the generation the
+  bitmap is currently on** holds the rotation back, `manual_review` included, so
+  an unresolved row stalls every withdrawal in later generations. A row from an
+  already-rotated-past generation does not: its window shut and no rotation
+  reopens it.
+  `private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}`
+  counts a block that has persisted for five minutes, not an ordinary boundary
+  crossing, and the log names the blocking nonce.
 
 ## On-chain references
 

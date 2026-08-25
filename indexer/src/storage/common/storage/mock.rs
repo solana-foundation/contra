@@ -39,6 +39,9 @@ pub struct MockStorage {
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `observed_releases` table, keyed by withdrawal nonce.
     pub observed_releases: Arc<Mutex<HashMap<i64, DbObservedRelease>>>,
+    /// Nonce floors the rotation gate has asked for, oldest first. Tests read
+    /// this to pin how much of the table each pass has to aggregate over.
+    pub unreleased_bounds_floors: Arc<Mutex<Vec<i64>>>,
 }
 
 impl MockStorage {
@@ -552,6 +555,41 @@ impl MockStorage {
             .filter(|t| t.status == TransactionStatus::PendingRemint)
             .cloned()
             .collect())
+    }
+
+    pub async fn unreleased_withdrawal_nonce_bounds(
+        &self,
+        min_nonce: i64,
+    ) -> Result<Option<(i64, i64)>, StorageError> {
+        self.unreleased_bounds_floors
+            .lock()
+            .unwrap()
+            .push(min_nonce);
+        self.check_should_fail("unreleased_withdrawal_nonce_bounds")?;
+        let pending = self.pending_transactions.lock().unwrap();
+        // Mirror the SQL's complement-of-terminal status set.
+        let nonces: Vec<i64> = pending
+            .iter()
+            .filter(|txn| {
+                txn.transaction_type == TransactionType::Withdrawal
+                    && matches!(
+                        txn.status,
+                        TransactionStatus::Pending
+                            | TransactionStatus::Processing
+                            | TransactionStatus::Parked
+                            | TransactionStatus::PendingRemint
+                            | TransactionStatus::ManualReview
+                    )
+            })
+            // A NULL nonce is skipped by MIN/MAX, so it sets no bound here either.
+            .filter_map(|txn| txn.withdrawal_nonce)
+            .filter(|nonce| *nonce >= min_nonce)
+            .collect();
+
+        Ok(match (nonces.iter().min(), nonces.iter().max()) {
+            (Some(lowest), Some(highest)) => Some((*lowest, *highest)),
+            _ => None,
+        })
     }
 
     pub async fn quarantine_active_withdrawals(

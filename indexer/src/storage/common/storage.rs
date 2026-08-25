@@ -43,6 +43,7 @@ pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
 pub mod try_requeue_processing;
 pub mod try_unpark_to_processing;
+pub mod unreleased_withdrawal_nonce_bounds;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -548,6 +549,18 @@ impl Storage {
         signature: &str,
     ) -> Result<(), StorageError> {
         delete_release_signature::delete_release_signature(self, transaction_id, signature).await
+    }
+
+    /// Lowest and highest withdrawal nonce at or above `min_nonce` that still
+    /// owes a release, or `None` when none do. Drives the rotation gate: the low
+    /// bound says whether the current generation is finished with, the high
+    /// bound whether any work is waiting beyond it.
+    pub async fn unreleased_withdrawal_nonce_bounds(
+        &self,
+        min_nonce: i64,
+    ) -> Result<Option<(i64, i64)>, StorageError> {
+        unreleased_withdrawal_nonce_bounds::unreleased_withdrawal_nonce_bounds(self, min_nonce)
+            .await
     }
 
     /// Drop release signatures whose parent transaction is no longer
@@ -1697,5 +1710,141 @@ mod tests {
             vec![1],
             "only the row with a usable signature set may be returned"
         );
+    }
+
+    // ── unreleased withdrawal nonce bounds ───────────────────────────
+
+    /// Seed a withdrawal at `nonce` in `status` into the mock's row table.
+    fn seed_withdrawal(mock: &MockStorage, id: i64, nonce: Option<i64>, status: TransactionStatus) {
+        let mut txn = make_db_transaction();
+        txn.id = id;
+        txn.transaction_type = TransactionType::Withdrawal;
+        txn.withdrawal_nonce = nonce;
+        txn.status = status;
+        mock.pending_transactions.lock().unwrap().push(txn);
+    }
+
+    /// Every status that still owes a release, and every status that does not.
+    /// One list drives both the inclusion and the exclusion tests so the two can
+    /// never drift apart, and it is the same split the SQL encodes.
+    const LIVE_STATUSES: [TransactionStatus; 5] = [
+        TransactionStatus::Pending,
+        TransactionStatus::Processing,
+        TransactionStatus::Parked,
+        TransactionStatus::PendingRemint,
+        TransactionStatus::ManualReview,
+    ];
+    const TERMINAL_STATUSES: [TransactionStatus; 3] = [
+        TransactionStatus::Completed,
+        TransactionStatus::Failed,
+        TransactionStatus::FailedReminted,
+    ];
+
+    /// A released or written-off nonce can never need its window again, so it
+    /// must not hold the rotation back.
+    #[tokio::test]
+    async fn nonce_bounds_ignores_terminal_statuses() {
+        for (offset, status) in TERMINAL_STATUSES.into_iter().enumerate() {
+            let (storage, mock) = make_mock_storage();
+            seed_withdrawal(&mock, offset as i64 + 1, Some(5), status);
+            assert_eq!(
+                storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+                None,
+                "{status:?} is terminal and must not count as unreleased"
+            );
+        }
+    }
+
+    /// Rotating past any of these closes the only window their release can land in.
+    #[tokio::test]
+    async fn nonce_bounds_counts_every_live_status() {
+        for (offset, status) in LIVE_STATUSES.into_iter().enumerate() {
+            let (storage, mock) = make_mock_storage();
+            seed_withdrawal(&mock, offset as i64 + 1, Some(7), status);
+            assert_eq!(
+                storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+                Some((7, 7)),
+                "{status:?} still owes a release and must count"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nonce_bounds_none_when_no_live_rows() {
+        let (storage, mock) = make_mock_storage();
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            None,
+            "an empty table owes nothing"
+        );
+
+        for (offset, status) in TERMINAL_STATUSES.into_iter().enumerate() {
+            seed_withdrawal(&mock, offset as i64 + 1, Some(offset as i64), status);
+        }
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            None,
+            "an all-terminal table owes nothing"
+        );
+    }
+
+    /// Deposits carry no nonce and a NULL nonce cannot be compared to a
+    /// generation, so neither may contribute a bound.
+    #[tokio::test]
+    async fn nonce_bounds_ignores_deposits_and_null_nonces() {
+        let (storage, mock) = make_mock_storage();
+
+        let mut deposit = make_db_transaction();
+        deposit.id = 1;
+        deposit.withdrawal_nonce = Some(1);
+        mock.pending_transactions.lock().unwrap().push(deposit);
+        seed_withdrawal(&mock, 2, None, TransactionStatus::Pending);
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            None,
+            "neither a deposit nor a NULL nonce may set a bound"
+        );
+
+        seed_withdrawal(&mock, 3, Some(4), TransactionStatus::Pending);
+        seed_withdrawal(&mock, 4, Some(9), TransactionStatus::Parked);
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            Some((4, 9)),
+            "bounds span only the live withdrawals that carry a nonce"
+        );
+    }
+
+    /// The floor is what lets the rotation gate ignore nonces whose window has
+    /// already closed, so it has to exclude them from both bounds.
+    #[tokio::test]
+    async fn nonce_bounds_honours_the_floor() {
+        let (storage, mock) = make_mock_storage();
+        seed_withdrawal(&mock, 1, Some(3), TransactionStatus::ManualReview);
+        seed_withdrawal(&mock, 2, Some(11), TransactionStatus::Pending);
+        seed_withdrawal(&mock, 3, Some(20), TransactionStatus::Parked);
+
+        assert_eq!(
+            storage
+                .unreleased_withdrawal_nonce_bounds(10)
+                .await
+                .unwrap(),
+            Some((11, 20)),
+            "a nonce below the floor sets neither bound"
+        );
+        assert_eq!(
+            storage
+                .unreleased_withdrawal_nonce_bounds(21)
+                .await
+                .unwrap(),
+            None,
+            "a floor above every live nonce leaves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_bounds_respects_should_fail() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_should_fail("unreleased_withdrawal_nonce_bounds", true);
+        assert!(storage.unreleased_withdrawal_nonce_bounds(0).await.is_err());
     }
 }

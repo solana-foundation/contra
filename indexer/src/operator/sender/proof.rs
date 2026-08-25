@@ -1,8 +1,12 @@
 use crate::error::OperatorError;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
 use crate::operator::sender::mint;
-use crate::operator::{ReleaseFundsBuilderWithNonce, TransactionKind};
+use crate::operator::{
+    find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
+    ReleaseFundsBuilderWithNonce, SignerUtil, TransactionKind,
+};
 use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
+use private_channel_metrics::MetricLabel;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{error, info, warn};
@@ -139,6 +143,163 @@ fn generation_mismatch(nonce: u64, nonce_generation: u64, chain_generation: u64)
     .into()
 }
 
+/// Five minutes at the origination interval. A boundary crossing looks blocked
+/// while the closing generation's last row settles, and that clears itself.
+const ROTATION_BLOCKED_ALERT_PASSES: u32 = 60;
+
+/// Arm a rotation when the chain's generation is behind the work waiting on it.
+///
+/// The only thing that starts a rotation. Driven by state, not by a particular
+/// row reaching the processor, so it still fires when that row was quarantined,
+/// swept aside, or never existed. Arming is all it does: the in-flight barrier
+/// decides when the rotation is sent, and binds the generation then.
+pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
+    // Only the withdraw role has an escrow instance whose bitmap can rotate.
+    let Some(instance_pda) = state.instance_pda else {
+        return;
+    };
+
+    // One already armed or sent owns this window; a second would pay twice and
+    // race the re-arm path holding the first.
+    if state.pending_rotation.is_some() || state.rotation_in_flight.is_some() {
+        return;
+    }
+
+    // The cache lags the chain but never leads it, so nothing below its window
+    // waits on a rotation. Bounding by it keeps the usual idle pass off the
+    // whole nonce history.
+    let cached_floor = state
+        .cached_generation
+        .map(|cached| cached.saturating_mul(NONCES_PER_GENERATION))
+        .unwrap_or(0);
+    let Some((_, highest)) = read_unreleased_bounds(state, cached_floor).await else {
+        return;
+    };
+
+    // Everything waiting is still inside that window, so nothing needs a
+    // rotation and the chain need not be read to say so.
+    if state
+        .cached_generation
+        .is_some_and(|cached| highest / NONCES_PER_GENERATION <= cached)
+    {
+        return;
+    }
+
+    let chain_generation = match state.refresh_generation().await {
+        Ok(generation) => generation,
+        Err(e) => {
+            warn!("Not arming a rotation: could not read the current generation: {e}");
+            return;
+        }
+    };
+
+    // Measured from the window the chain is on, since that is the only one a
+    // rotation closes. A nonce below it is already past saving, and waiting on
+    // one would stall every withdrawal behind it forever.
+    let window_floor = chain_generation.saturating_mul(NONCES_PER_GENERATION);
+    let Some((lowest, highest)) = read_unreleased_bounds(state, window_floor).await else {
+        return;
+    };
+
+    let lowest_generation = lowest / NONCES_PER_GENERATION;
+    let highest_generation = highest / NONCES_PER_GENERATION;
+
+    if lowest_generation > chain_generation {
+        info!(
+            chain_generation,
+            lowest_generation, "Chain is behind the waiting withdrawals, arming a rotation"
+        );
+        state.pending_rotation = Some(build_rotation(instance_pda));
+        state.rotation_blocked_passes = 0;
+        return;
+    }
+
+    // Nothing is waiting past the window the chain is on, so nothing is blocked.
+    if highest_generation <= chain_generation {
+        state.rotation_blocked_passes = 0;
+        return;
+    }
+
+    // Withholding is correct here, but only a human clears it, so report it.
+    // Once per threshold, not once per block: a counter that stops ticking lets
+    // the alert resolve while the stall is still running.
+    state.rotation_blocked_passes = state.rotation_blocked_passes.saturating_add(1);
+    if !state
+        .rotation_blocked_passes
+        .is_multiple_of(ROTATION_BLOCKED_ALERT_PASSES)
+    {
+        return;
+    }
+
+    crate::metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[
+            state.program_type.as_label(),
+            "rotation_blocked_by_lower_nonce",
+        ])
+        .inc();
+    warn!(
+        chain_generation,
+        blocking_nonce = lowest,
+        highest_waiting_nonce = highest,
+        "Rotation withheld: a lower nonce still owes a release on the current generation"
+    );
+}
+
+/// Bounds of the unreleased nonces at or above `min_nonce`, or `None` when there
+/// are none, the read failed, or the rows are unusable. Every `None` means the
+/// same to the caller: arm nothing, since arming blind could rotate past a
+/// release that can then never land.
+async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(u64, u64)> {
+    let Ok(floor) = i64::try_from(min_nonce) else {
+        error!(
+            min_nonce,
+            "Not arming a rotation: the nonce floor does not fit"
+        );
+        return None;
+    };
+
+    let bounds = match state
+        .storage
+        .unreleased_withdrawal_nonce_bounds(floor)
+        .await
+    {
+        Ok(bounds) => bounds?,
+        Err(e) => {
+            warn!("Not arming a rotation: could not read the unreleased nonces: {e}");
+            return None;
+        }
+    };
+
+    match (u64::try_from(bounds.0), u64::try_from(bounds.1)) {
+        (Ok(lowest), Ok(highest)) => Some((lowest, highest)),
+        _ => {
+            error!(
+                lowest = bounds.0,
+                highest = bounds.1,
+                "Not arming a rotation: an unreleased nonce is negative"
+            );
+            None
+        }
+    }
+}
+
+/// A rotation for `instance_pda`, with every account derived rather than carried
+/// over from whatever built it. `expected_generation` is deliberately left unset:
+/// the submit path binds it from a fresh read, which is the only moment the value
+/// is still current.
+fn build_rotation(instance_pda: Pubkey) -> Box<RotateBitmapBuilder> {
+    let operator_pubkey = SignerUtil::get_operator_pubkey();
+    let mut builder = RotateBitmapBuilder::new();
+    builder
+        .payer(SignerUtil::get_admin_pubkey())
+        .operator(operator_pubkey)
+        .instance(instance_pda)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&instance_pda))
+        .operator_pda(find_operator_pda(&instance_pda, &operator_pubkey))
+        .event_authority(find_event_authority_pda());
+    Box::new(builder)
+}
+
 /// Check if pending rotation can now be processed.
 /// Returns the RotateBitmap builder if ready to execute.
 ///
@@ -227,8 +388,9 @@ mod tests {
     use super::*;
     use crate::error::ProgramError;
     use crate::operator::sender::test_support::{
-        mock_bitmap_account, mock_bitmap_read_failure, mock_bitmap_sequence,
-        mock_with_processing_row, push_processing_row, row_status, sender_state,
+        ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
+        mock_bitmap_read_failure, mock_bitmap_sequence, mock_with_processing_row,
+        push_processing_row, push_withdrawal_with_nonce, row_status, sender_state,
         sender_state_with_storage,
     };
     use crate::operator::sender::transaction::handle_nonce_outside_generation;
@@ -238,7 +400,8 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
     use solana_sdk::signature::Signature;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
@@ -394,6 +557,433 @@ mod tests {
 
         assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
         assert!(state.pending_rotation.is_some(), "should NOT be taken yet");
+    }
+
+    // ── originate_rotation_if_needed ─────────────────────────────────
+
+    /// A withdraw-role state whose storage holds exactly the seeded rows.
+    fn originator_state(url: &str, rows: &[(i64, i64, TransactionStatus)]) -> SenderState {
+        ensure_test_signer();
+        let mock = MockStorage::new();
+        for (id, nonce, status) in rows {
+            push_withdrawal_with_nonce(&mock, *id, *nonce, *status);
+        }
+        let mut state = sender_state_with_storage(url, mock);
+        state.instance_pda = Some(Pubkey::new_unique());
+        state
+    }
+
+    fn blocked_count() -> f64 {
+        crate::metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["escrow", "rotation_blocked_by_lower_nonce"])
+            .get()
+    }
+
+    /// The whole point of the driver: work waiting in the next generation with
+    /// nothing left owing in this one is what a rotation is for, and no
+    /// particular row has to survive for the driver to see it.
+    // Forces the admin-signer statics, and `signer_util`'s tests clear that
+    // env while they run, so this has to be ordered against them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn originates_when_lowest_unreleased_is_in_a_later_generation() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(
+            state.pending_rotation.is_some(),
+            "a generation the chain has not opened yet must arm a rotation"
+        );
+    }
+
+    /// The current window still owes a release, so rotating would close the only
+    /// window that release can land in.
+    #[tokio::test]
+    async fn does_not_originate_when_lowest_unreleased_is_in_the_current_generation() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(&server.url(), &[(1, 1, TransactionStatus::Pending)]);
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(state.pending_rotation.is_none());
+    }
+
+    #[tokio::test]
+    async fn does_not_originate_when_nothing_is_unreleased() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(&server.url(), &[]);
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "a rotation nothing is waiting on buys nothing"
+        );
+    }
+
+    /// One rotation advances one generation, so a gap wider than that has to be
+    /// closed by the driver firing again rather than by a single larger step.
+    // Forces the admin-signer statics, and `signer_util`'s tests clear that
+    // env while they run, so this has to be ordered against them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn originates_again_after_a_rotation_when_the_gap_spans_generations() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(
+                1,
+                2 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+
+        originate_rotation_if_needed(&mut state).await;
+        assert!(state.pending_rotation.is_some(), "first rotation arms");
+
+        // Stand in for that rotation landing: the arm clears and the chain moves on.
+        state.pending_rotation = None;
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        state.rpc_client = std::sync::Arc::new(
+            crate::operator::utils::rpc_util::RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            ),
+        );
+        state.cached_generation = Some(1);
+
+        originate_rotation_if_needed(&mut state).await;
+        assert!(
+            state.pending_rotation.is_some(),
+            "a two-generation gap needs a second rotation"
+        );
+    }
+
+    /// Crossing a boundary always looks blocked for a moment: the first row of
+    /// the next generation arrives while the last of the current one is still
+    /// settling, and that resolves itself. Reporting it would page an operator
+    /// for ordinary traffic, so the signal has to wait for the block to persist.
+    // Reads a process-wide counter, so it has to be ordered against the other
+    // tests that assert on it.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn an_ordinary_boundary_crossing_is_not_reported_as_blocked() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[
+                (1, 2, TransactionStatus::Processing),
+                (2, NONCES_PER_GENERATION as i64, TransactionStatus::Pending),
+            ],
+        );
+
+        let before = blocked_count();
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(state.pending_rotation.is_none(), "the gate must withhold");
+        assert_eq!(
+            blocked_count(),
+            before,
+            "a block that has just started is ordinary traffic, not an incident"
+        );
+    }
+
+    /// The stall this driver must not hide: later work is queued up but a lower
+    /// nonce still owes a release, so the rotation is correctly withheld and the
+    /// operator has to be told rather than left reading a quiet log. Only once
+    /// the block outlasts the settling window, since nothing but a human
+    /// resolving that row clears it from there.
+    // Reads a process-wide counter, so it has to be ordered against the other
+    // tests that assert on it.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn a_block_that_persists_is_reported() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[
+                (1, 2, TransactionStatus::ManualReview),
+                (2, NONCES_PER_GENERATION as i64, TransactionStatus::Pending),
+            ],
+        );
+
+        let before = blocked_count();
+        for _ in 0..ROTATION_BLOCKED_ALERT_PASSES {
+            originate_rotation_if_needed(&mut state).await;
+        }
+
+        assert!(state.pending_rotation.is_none(), "the gate must withhold");
+        assert_eq!(
+            blocked_count(),
+            before + 1.0,
+            "the pass that crosses the threshold must report exactly once"
+        );
+    }
+
+    /// A counter that ticks once and then goes quiet lets an alert resolve while
+    /// the stall it was raised for is still running. The block is only cleared by
+    /// a human resolving the nonce that holds it, which can take far longer than
+    /// any evaluation window, so the report has to keep repeating for as long as
+    /// the rotation is still being withheld.
+    // Reads a process-wide counter, so it has to be ordered against the other
+    // tests that assert on it.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn a_block_that_outlasts_the_first_report_keeps_reporting() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[
+                (1, 2, TransactionStatus::ManualReview),
+                (2, NONCES_PER_GENERATION as i64, TransactionStatus::Pending),
+            ],
+        );
+
+        let before = blocked_count();
+        for _ in 0..(ROTATION_BLOCKED_ALERT_PASSES * 3) {
+            originate_rotation_if_needed(&mut state).await;
+        }
+
+        assert!(state.pending_rotation.is_none(), "the gate must withhold");
+        assert_eq!(
+            blocked_count(),
+            before + 3.0,
+            "a block three thresholds long must report once per threshold"
+        );
+    }
+
+    /// The gate runs on a timer for the life of the process, so the pass that
+    /// finds nothing to do must not aggregate the whole nonce history. The cache
+    /// lags the chain but never leads it, so its own window is a floor the query
+    /// can be bounded by without hiding anything the gate would have acted on.
+    #[tokio::test]
+    async fn the_quiet_pass_reads_only_from_the_cached_window() {
+        let mut server = mockito::Server::new_async().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let _bitmap = mock_bitmap_account_counted(&mut server, 4, reads.clone());
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(
+                1,
+                4 * NONCES_PER_GENERATION as i64 + 1,
+                TransactionStatus::Pending,
+            )],
+        );
+        state.cached_generation = Some(4);
+        let floors = match state.storage.as_ref() {
+            crate::storage::Storage::Mock(mock) => mock.unreleased_bounds_floors.clone(),
+            _ => unreachable!("the originator harness is built on the mock"),
+        };
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert_eq!(
+            *floors.lock().unwrap(),
+            vec![4 * NONCES_PER_GENERATION as i64],
+            "the quiet pass must ask only about the cached window, and only once"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "a cache that already covers the waiting work must cost no RPC"
+        );
+        assert!(state.pending_rotation.is_none());
+    }
+
+    /// Nothing is known at boot, so the cache cannot be trusted to skip and the
+    /// chain has to be read before the gate can answer either way.
+    // Forces the admin-signer statics, and `signer_util`'s tests clear that
+    // env while they run, so this has to be ordered against them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reads_fresh_when_the_cached_generation_is_none() {
+        let mut server = mockito::Server::new_async().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let _bitmap = mock_bitmap_account_counted(&mut server, 0, reads.clone());
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        state.cached_generation = None;
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "an unknown cache must be settled against the chain"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "the fresh read shows the chain behind the waiting work"
+        );
+    }
+
+    /// A rotation already armed or already sent owns the window it moves. A
+    /// second would pay for the same rotation twice and fight the re-arm path
+    /// that is holding the first.
+    #[tokio::test]
+    async fn does_not_originate_while_a_rotation_is_armed_or_in_flight() {
+        for already_in_flight in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let reads = Arc::new(AtomicUsize::new(0));
+            let _bitmap = mock_bitmap_account_counted(&mut server, 0, reads.clone());
+
+            let mut state = originator_state(
+                &server.url(),
+                &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+            );
+            if already_in_flight {
+                state.rotation_in_flight = Some(rotation_builder());
+            } else {
+                state.pending_rotation = Some(rotation_builder());
+            }
+
+            originate_rotation_if_needed(&mut state).await;
+
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                0,
+                "a rotation already under way must end the pass before any read"
+            );
+        }
+    }
+
+    /// An unread gate is not a passed gate: arming without knowing what is still
+    /// owed could rotate past a nonce whose release can then never land.
+    #[tokio::test]
+    async fn does_not_originate_when_the_storage_read_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        match state.storage.as_ref() {
+            crate::storage::Storage::Mock(mock) => {
+                mock.set_should_fail("unreleased_withdrawal_nonce_bounds", true)
+            }
+            _ => unreachable!("the originator harness is built on the mock"),
+        }
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "a gate that could not be read must arm nothing"
+        );
+    }
+
+    /// Only the withdraw role has an escrow instance whose bitmap can rotate, so
+    /// the escrow sender must not read, arm, or report anything.
+    #[tokio::test]
+    async fn does_not_originate_for_the_escrow_role() {
+        let mut server = mockito::Server::new_async().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let _bitmap = mock_bitmap_account_counted(&mut server, 0, reads.clone());
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        state.instance_pda = None;
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(state.pending_rotation.is_none(), "no bitmap, no rotation");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "the escrow role must not read a bitmap it does not have"
+        );
+    }
+
+    /// A live nonce below the chain's generation is already past saving: its
+    /// window shut and no rotation reopens it. Holding the rotation for it would
+    /// buy that row nothing and would stall every withdrawal behind it forever,
+    /// so the gate has to look at the current window rather than at the lowest
+    /// live nonce anywhere. Reachable on the first deploy, because the rotation
+    /// this replaces fired regardless of what was unresolved below it.
+    // Forces the admin-signer statics, and `signer_util`'s tests clear that
+    // env while they run, so this has to be ordered against them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn originates_despite_a_nonce_stranded_below_the_current_generation() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[
+                (1, 1, TransactionStatus::ManualReview),
+                (
+                    2,
+                    2 * NONCES_PER_GENERATION as i64,
+                    TransactionStatus::Pending,
+                ),
+            ],
+        );
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(
+            state.pending_rotation.is_some(),
+            "a nonce whose window already closed must not hold the rotation back"
+        );
+    }
+
+    /// Arming is all the driver does. The barrier that protects bits from being
+    /// erased under an in-flight release still decides when it is sent.
+    #[tokio::test]
+    async fn arming_does_not_submit_while_the_barrier_is_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        state.in_flight_withdrawals.insert(3);
+
+        originate_rotation_if_needed(&mut state).await;
+        assert!(state.pending_rotation.is_some(), "the driver still arms");
+
+        assert!(
+            take_pending_rotation_if_ready(&mut state).await.is_none(),
+            "the in-flight barrier still holds the rotation back"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "the arm survives for a later tick"
+        );
     }
 
     // ── cleanup_failed_transaction ───────────────────────────────────

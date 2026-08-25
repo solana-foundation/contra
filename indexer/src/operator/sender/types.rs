@@ -169,6 +169,10 @@ pub struct SenderState {
     pub rotation_in_flight: Option<Box<RotateBitmapBuilder>>,
     /// Times that rotation has been put back on the tick, so a hopeless one stops being retried.
     pub rotation_rearm_attempts: u32,
+    /// Consecutive gate passes that withheld a rotation. Crossing a boundary
+    /// looks blocked for a moment even when nothing is wrong, so the report
+    /// waits for the count rather than firing on the first pass.
+    pub rotation_blocked_passes: u32,
     pub mint_builders: HashMap<i64, MintToBuilder>,
     pub mint_cache: MintCache,
     pub retry_max_attempts: u32,

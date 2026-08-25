@@ -147,6 +147,20 @@ pub mod test_hooks {
         )
         .await
     }
+
+    /// Drives one pass of the rotation driver: reads what is still unreleased,
+    /// compares it against the chain, and arms a rotation if one is owed.
+    pub async fn originate_rotation_if_needed(state: &mut SenderState) {
+        super::proof::originate_rotation_if_needed(state).await
+    }
+
+    /// Takes an armed rotation once the in-flight barrier allows it, which is
+    /// what the periodic tick does before submitting one.
+    pub async fn take_pending_rotation_if_ready(
+        state: &mut SenderState,
+    ) -> Option<Box<private_channel_escrow_program_client::instructions::RotateBitmapBuilder>> {
+        super::proof::take_pending_rotation_if_ready(state).await
+    }
 }
 
 use crate::error::OperatorError;
@@ -163,7 +177,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-use proof::take_pending_rotation_if_ready;
+use proof::{originate_rotation_if_needed, take_pending_rotation_if_ready};
 use transaction::{
     handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
     send_and_confirm, GenerationWindow,
@@ -176,6 +190,12 @@ use types::{PollTaskResult, SenderState};
 /// small-integer advisory locks on a shared database.
 const ESCROW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_45_53_43_52; // "SND_ESCR"
 const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
+
+/// How often the driver asks whether a rotation is owed. A generation covers
+/// tens of thousands of nonces, so this is slow on purpose: the cost of a late
+/// rotation is one interval of extra wait for withdrawals that are already
+/// parked, and the cost of a fast one is a database read on every tick forever.
+const ROTATION_ORIGINATION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Advisory-lock key per operator role. Distinct keys so an escrow and a
 /// withdraw sender never contend on the same lock if they share a database.
@@ -243,6 +263,11 @@ pub async fn run_sender(
 
     // Periodic check for pending rotation (every 500ms)
     let mut rotation_check_interval = interval(Duration::from_millis(500));
+
+    // Rotation is needed once per generation of nonces, so the check that starts
+    // one runs far more slowly than the one that submits it. The slower cadence
+    // also paces re-origination after a rotation has used up its send budget.
+    let mut rotation_origination_interval = interval(ROTATION_ORIGINATION_INTERVAL);
 
     // Channel for the poll task to deliver batched confirmation results back to the sender loop.
     let (poll_result_tx, mut poll_result_rx) = mpsc::channel(32);
@@ -320,6 +345,10 @@ pub async fn run_sender(
                 if !to_route.is_empty() {
                     route_poll_results(&mut state, to_route, &storage_tx).await;
                 }
+            }
+
+            _ = rotation_origination_interval.tick() => {
+                originate_rotation_if_needed(&mut state).await;
             }
 
             _ = rotation_check_interval.tick() => {

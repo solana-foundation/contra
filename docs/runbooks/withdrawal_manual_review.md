@@ -49,6 +49,31 @@ have prefixes.
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
 
+## An unresolved row holds the bitmap rotation
+
+Before triaging, understand the clock you are on. The withdrawal bitmap covers
+one generation of nonces at a time, and the operator will not rotate it past a
+withdrawal that is not yet terminal. `manual_review` counts as not terminal,
+because a human can still resolve one of these rows into a release.
+
+So a row left in `manual_review` inside the generation the chain is currently on
+blocks the rotation into the next one, and every withdrawal with a higher nonce
+parks and waits. Those withdrawals are not lost and nothing is at risk, but they
+do not settle until this row reaches `completed`, `failed`, or `failed_reminted`.
+
+Confirm that is what is happening:
+
+```
+private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}
+```
+
+A rising count means the operator wants to rotate and has been held back for
+more than five minutes. It stays flat while a boundary is merely being crossed,
+so a count that moves is a row someone has to resolve, not ordinary traffic. The
+accompanying WARN log names the blocking nonce, which is the row to resolve
+first. Resolving it is what releases the block; no rotation command exists and
+none is needed.
+
 ## Path A.halting - build error that halted the pipeline
 
 The trigger row's data is bad in a way that makes it unreleasable (NULL

@@ -165,9 +165,9 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
         return;
     }
 
-    // The cache lags the chain but never leads it, so nothing below its window
-    // waits on a rotation. Bounding by it keeps the usual idle pass off the
-    // whole nonce history.
+    // Start the search at the cached generation so the usual pass, which finds
+    // nothing to do, skips the older nonces instead of scanning all of them. The
+    // cache sits at or behind the chain, and a refused release corrects it if not.
     let cached_floor = state
         .cached_generation
         .map(|cached| cached.saturating_mul(NONCES_PER_GENERATION))

@@ -121,7 +121,7 @@ spl-associated-token-account = "7.0.0"
 spl-memo = "6.0.0"
 spl-token = "8.0.0"
 spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 tempfile = "3.14"
 testcontainers = "0.25"
 testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }

@@ -136,6 +136,8 @@ Batches execution results every 100ms (configurable) and commits to PostgreSQL, 
 
 The mirror is best-effort and covers only what the cache can serve: point lookups by pubkey, signature and slot, plus the chain tip. Ranges, history and counters are read from PostgreSQL, because a short answer from a partial mirror is indistinguishable from a complete one. A failed cache write drops the keys it would have updated so reads miss and resolve against PostgreSQL, and leaves the cached tip behind, which makes the next batch rebuild the cache.
 
+The settler also caps the settled account bytes it buffers between ticks. Once a tick's buffer reaches that budget it stops draining the executor queue, so the executor's bounded send applies backpressure upstream rather than letting one commit grow without limit. Blocks are still produced only on the tick, never early, and the executor splits an oversized batch into byte-bounded messages so a single already-executed batch cannot overshoot the budget. The commit itself binds each column as one array parameter, so bounding the buffer is what bounds the bind; the driver is held at sqlx 0.8 or later, where an oversized bind fails loudly instead of being truncated by the binary protocol's length prefix.
+
 Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop.
 
 **Location**: [`core/src/stages/settle.rs`](../core/src/stages/settle.rs)

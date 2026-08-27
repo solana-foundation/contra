@@ -39,6 +39,8 @@ have prefixes.
 | (empty `error_message`, status flipped without a quarantine update) | A.halting (collateral row) | yes | `quarantine_all_active_withdrawals` |
 | `mint paused:` | A.non-halting | no | pre-flight |
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
+| `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
+| `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
@@ -113,13 +115,21 @@ collateral.
 6. **Confirm recovery** by watching for new `Completed` webhooks for
    the re-armed rows.
 
-## Path A.non-halting - pre-flight bail (paused mint, escrow drain)
+## Path A.non-halting - row-specific bail (allowlist gate, paused mint, escrow drain)
 
-The pre-flight check (`processor.rs::check_withdrawal_preflights`) bailed
-on a row whose mint is paused or whose target ATA does not have enough
-on-chain balance. The processor quarantined **only this row** and
-**continued the loop** - there is no halt and no collateral. Other
-withdrawals are unaffected.
+One of two checks bailed on this row. `processor.rs::check_withdrawal_mint_supported`
+runs first and emits `unsupported withdrawal mint:`;
+`processor.rs::check_withdrawal_preflights` runs after it and emits
+`mint paused:`, `insufficient escrow balance:`, and
+`withdrawal mint absent on target chain:`. Either way the processor parked
+**only this row** and **continued the loop** - there is no halt and no
+collateral. Other withdrawals are unaffected.
+
+Note that parking is not a refund. `WithdrawFunds` burns the user's channel
+tokens before the row exists, and a row parked here never reaches the
+sender, so the compensating remint that normally restores those tokens
+after a permanent release failure never runs. Every disposition below has
+to say explicitly what the user is owed.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for this row. Expected: `NOT_LANDED` (pre-flight aborted before send).
@@ -133,6 +143,32 @@ withdrawals are unaffected.
    - `insufficient escrow balance:` - check the escrow ATA balance vs.
      the row's amount. A permanent delegate may have drained the ATA. If
      the deficit is permanent, refund out-of-band; do not re-arm.
+   - `unsupported withdrawal mint:` - the escrow never allowlisted this mint,
+     so no escrowed funds back the row. Confirm with
+     `SELECT * FROM mints WHERE mint_address = :mint;` (no row) and compare
+     the checkpoint quoted in the message against
+     `SELECT slot FROM indexer_state WHERE program_type = 'escrow';`. If the
+     checkpoint is current or absent, the mint is genuinely unsupported: do
+     not re-arm, and mark `failed`. No escrowed funds back the row, but the
+     user's channel tokens were burned to create it, so decide and record
+     whether to restore them by an admin mint on the channel. If the
+     escrow indexer is instead behind the slot that allowed the mint, fix the
+     backfill first, then re-arm. If the parked row's `withdrawal_nonce` is a
+     multiple of the tree size, marking it `failed` releases later withdrawals
+     onto a tree generation that was never rotated, so rotate before you
+     terminalize it; this applies to any terminalized boundary row, not just
+     this one. [Escalate](_escalation.md) (Tier 3) either
+     way: a burn of an unsupported mint means one was created or distributed
+     on the channel without a matching `AllowMint`.
+   - `withdrawal mint absent on target chain:` - the mint is allowlisted but
+     has no account on the target chain. Check `solana account <mint> --url
+     <target-rpc>` **and** confirm `rpc_url` points at the cluster the escrow
+     is deployed on; a wrong cluster makes every mint read as absent and is the
+     more common cause. If the cluster is wrong, correct `rpc_url`, restart the
+     operator, and re-arm the parked rows. If the cluster is right and the
+     account is genuinely gone, do not re-arm; refund out-of-band, and note
+     that the channel tokens were burned too. [Escalate](_escalation.md)
+     (Tier 2).
 3. **If the condition has cleared, re-arm just this row:**
    ```sql
    UPDATE transactions

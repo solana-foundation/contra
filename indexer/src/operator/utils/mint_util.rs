@@ -6,6 +6,7 @@ use crate::storage::Storage;
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::request::RpcError;
+use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
@@ -14,12 +15,28 @@ use spl_token_2022::extension::{
 };
 use spl_token_2022::state::Mint as Token2022MintState;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::warn;
 
 const DECIMALS_OFFSET: usize = 44;
+
+/// Reads a mint, telling "absent" apart from "could not read"; `get_account` merges both.
+/// Uses the client's commitment so a new mint is not mistaken for one that never existed.
+async fn read_target_mint_account(
+    rpc: &RpcClientWithRetry,
+    mint: &Pubkey,
+) -> Result<Account, OperatorError> {
+    let response = rpc
+        .get_account_with_context(mint, rpc.rpc_client.commitment())
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("get_account({mint}): {e}")))?;
+
+    response
+        .value
+        .ok_or_else(|| AccountError::TargetMintMissing { pubkey: *mint }.into())
+}
 
 /// `getTokenAccountBalance` returns `RpcResponseError { code: -32602, ... }`
 /// when the ATA does not exist. The lowercased substring match is a fallback
@@ -48,6 +65,10 @@ pub struct MintCache {
     rpc_client: Option<Arc<RpcClientWithRetry>>,
     cache: HashMap<String, MintMetadata>,
     extension_flags_cache: HashMap<String, (bool, bool)>,
+    /// Mints with a real `mints` row, written only by the storage read below.
+    /// The allowlist gate reads this, not `cache`, which the RPC fallback also fills.
+    /// Rows are never deleted, so a stale entry cannot open the gate; a miss re-reads.
+    db_backed: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +84,7 @@ impl MintCache {
             rpc_client: None,
             cache: HashMap::new(),
             extension_flags_cache: HashMap::new(),
+            db_backed: HashSet::new(),
         }
     }
 
@@ -72,6 +94,7 @@ impl MintCache {
             rpc_client: Some(rpc_client),
             cache: HashMap::new(),
             extension_flags_cache: HashMap::new(),
+            db_backed: HashSet::new(),
         }
     }
 
@@ -80,50 +103,62 @@ impl MintCache {
         self.rpc_client.as_deref()
     }
 
-    /// Basic mint metadata (decimals + token program). Cache → DB → RPC
-    /// fallback only when no DB row exists.
-    ///
-    /// Opportunistically warms `extension_flags_cache` on both the DB-hit
-    /// and RPC-fallback branches: the DB row already carries the flags if
-    /// they've been resolved before, and the RPC fallback's
-    /// `fetch_mint_from_rpc` returns them as a by-product of parsing the
-    /// mint account. This saves the subsequent `get_extension_flags` call
-    /// on the withdrawal pre-flight a second DB round-trip (or, on the
-    /// RPC-fallback path, a second RPC parse of the same mint).
-    pub async fn get_mint_metadata(
+    /// Basic mint metadata from storage only. `Ok(None)` means the indexer has no
+    /// row for this mint, which is an answer rather than a reason to reach across
+    /// chains. A hit warms both caches, so a later read costs no second round trip.
+    pub async fn get_mint_metadata_from_db(
         &mut self,
         mint: &Pubkey,
-    ) -> Result<MintMetadata, OperatorError> {
+    ) -> Result<Option<MintMetadata>, OperatorError> {
         let mint_str = mint.to_string();
 
-        if let Some(metadata) = self.cache.get(&mint_str) {
-            return Ok(metadata.clone());
+        if self.db_backed.contains(&mint_str) {
+            if let Some(metadata) = self.cache.get(&mint_str) {
+                return Ok(Some(metadata.clone()));
+            }
         }
 
-        // Retry a transient DB blip before falling through to the RPC leg, so a
-        // brief outage does not surface as Transient and strand the withdrawal.
+        // Retry a transient DB blip before answering, so a brief outage does not
+        // surface as a missing mint and strand the withdrawal.
         // transaction_id=-1: no per-call txn context here; retries log by op name.
         let db_mint = with_storage_backoff("mint metadata read", -1, || {
             self.storage.get_mint(&mint_str)
         })
         .await?;
-        if let Some(m) = db_mint {
-            let token_program =
-                Pubkey::from_str(&m.token_program).map_err(|e| OperatorError::InvalidPubkey {
-                    pubkey: m.token_program.clone(),
-                    reason: e.to_string(),
-                })?;
-            let metadata = MintMetadata {
-                token_program,
-                decimals: m.decimals as u8,
-            };
-            self.cache.insert(mint_str.clone(), metadata.clone());
-            if let (Some(p), Some(d)) = (m.is_pausable, m.has_permanent_delegate) {
-                self.extension_flags_cache.insert(mint_str, (p, d));
-            }
+
+        let Some(m) = db_mint else {
+            return Ok(None);
+        };
+
+        let token_program =
+            Pubkey::from_str(&m.token_program).map_err(|e| OperatorError::InvalidPubkey {
+                pubkey: m.token_program.clone(),
+                reason: e.to_string(),
+            })?;
+        let metadata = MintMetadata {
+            token_program,
+            decimals: m.decimals as u8,
+        };
+        self.cache.insert(mint_str.clone(), metadata.clone());
+        self.db_backed.insert(mint_str.clone());
+        if let (Some(p), Some(d)) = (m.is_pausable, m.has_permanent_delegate) {
+            self.extension_flags_cache.insert(mint_str, (p, d));
+        }
+        Ok(Some(metadata))
+    }
+
+    /// Basic mint metadata (decimals + token program), served from cache, then DB,
+    /// then RPC only when no DB row exists. Both the DB and RPC branches warm
+    /// `extension_flags_cache` where they can, sparing the pre-flight a second read.
+    pub async fn get_mint_metadata(
+        &mut self,
+        mint: &Pubkey,
+    ) -> Result<MintMetadata, OperatorError> {
+        if let Some(metadata) = self.get_mint_metadata_from_db(mint).await? {
             return Ok(metadata);
         }
 
+        let mint_str = mint.to_string();
         let rpc = self.rpc_client.as_ref().ok_or_else(|| {
             OperatorError::RpcError(format!(
                 "MintCache needs RPC for unknown mint {mint_str}, but no RPC client is configured",
@@ -203,10 +238,8 @@ impl MintCache {
             OperatorError::RpcError("check_paused requires an RPC client".to_string())
         })?;
 
-        let account = rpc
-            .get_account(mint)
-            .await
-            .map_err(|_| AccountError::AccountNotFound { pubkey: *mint })?;
+        // Same split as the metadata fetch: an absent mint is deterministic, an unreachable node is not.
+        let account = read_target_mint_account(rpc, mint).await?;
 
         let state =
             StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(|_| {
@@ -262,10 +295,7 @@ impl MintCache {
         mint: &Pubkey,
         rpc: &RpcClientWithRetry,
     ) -> Result<(MintMetadata, (bool, bool)), OperatorError> {
-        let account = rpc
-            .get_account(mint)
-            .await
-            .map_err(|_| AccountError::AccountNotFound { pubkey: *mint })?;
+        let account = read_target_mint_account(rpc, mint).await?;
 
         let token_program = account.owner;
 
@@ -368,12 +398,15 @@ mod tests {
     use base64::Engine;
     use solana_client::nonblocking::rpc_client::RpcClient;
     use solana_client::rpc_request::RpcRequest;
+    use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
+    use std::time::Duration;
 
     impl MintCache {
         pub fn clear(&mut self) {
             self.cache.clear();
+            self.db_backed.clear();
         }
 
         pub fn cache_size(&self) -> usize {
@@ -906,5 +939,203 @@ mod tests {
         // Should error on invalid owner
         let result = cache.get_mint_metadata(&mint).await;
         assert!(result.is_err());
+    }
+
+    /// The allowlist answer must come from storage, never from an entry the RPC
+    /// fallback left behind, or a mint the indexer has no row for would read as
+    /// allowlisted for the rest of the process and open the gate silently.
+    #[tokio::test]
+    async fn metadata_from_db_ignores_an_rpc_resolved_entry() {
+        let mint = Pubkey::new_unique();
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            create_mock_account_response(&TOKEN_PROGRAM_ID, 9),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache =
+            MintCache::with_rpc(storage, Arc::new(RpcClientWithRetry::new_mocked(mocks)));
+
+        cache
+            .get_mint_metadata(&mint)
+            .await
+            .expect("rpc fallback resolves the mint");
+
+        assert!(
+            cache
+                .get_mint_metadata_from_db(&mint)
+                .await
+                .unwrap()
+                .is_none(),
+            "an RPC-resolved mint must not satisfy the allowlist read"
+        );
+    }
+
+    /// An RPC that answers successfully but reports the account as absent.
+    fn rpc_reporting_absent_account() -> RpcClientWithRetry {
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            serde_json::json!({"context": {"slot": 1}, "value": null}),
+        );
+        RpcClientWithRetry::new_mocked(mocks)
+    }
+
+    /// An RPC endpoint that fails at the transport layer on every attempt.
+    async fn rpc_failing_transport(server: &mut mockito::ServerGuard) -> RpcClientWithRetry {
+        server
+            .mock("POST", "/")
+            .with_status(500)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 2,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    #[tokio::test]
+    async fn mint_metadata_rpc_fallback_absent_account_is_target_mint_missing() {
+        let mint = create_test_mint();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
+
+        let err = cache.get_mint_metadata(&mint).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Account(AccountError::TargetMintMissing { pubkey }) if pubkey == mint
+            ),
+            "absent mint must be deterministic, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_metadata_rpc_fallback_transport_error_is_rpc_error() {
+        let mut server = mockito::Server::new_async().await;
+        let rpc = rpc_failing_transport(&mut server).await;
+        let mint = create_test_mint();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let err = cache.get_mint_metadata(&mint).await.unwrap_err();
+
+        assert!(
+            matches!(err, OperatorError::RpcError(_)),
+            "a reachability failure must stay transient, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_paused_absent_account_is_target_mint_missing() {
+        let mint = create_test_mint();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
+
+        let err = cache.check_paused(&mint).await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Account(AccountError::TargetMintMissing { pubkey }) if pubkey == mint
+            ),
+            "absent mint must be deterministic, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_from_db_returns_none_without_touching_rpc() {
+        let mint = create_test_mint();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::new(storage);
+
+        let found = cache
+            .get_mint_metadata_from_db(&mint)
+            .await
+            .expect("a missing row is an answer, not a failure");
+
+        assert!(found.is_none(), "no row means the mint is not allowlisted");
+    }
+
+    /// A miss is never remembered, so a mint allowlisted after the operator started
+    /// is picked up on the next read instead of needing a restart.
+    #[tokio::test]
+    async fn metadata_from_db_sees_a_row_added_after_a_miss() {
+        let mint = create_test_mint();
+        let mock = MockStorage::new();
+        let rows = mock.mints.clone();
+        let mut cache = MintCache::new(Arc::new(Storage::Mock(mock)));
+
+        assert!(
+            cache
+                .get_mint_metadata_from_db(&mint)
+                .await
+                .unwrap()
+                .is_none(),
+            "no row yet"
+        );
+
+        rows.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: TOKEN_PROGRAM_ID.to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(false),
+            },
+        );
+
+        assert!(
+            cache
+                .get_mint_metadata_from_db(&mint)
+                .await
+                .unwrap()
+                .is_some(),
+            "a later AllowMint must be visible without clearing the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_from_db_hit_warms_both_caches() {
+        let mint = create_test_mint();
+        let storage = create_test_storage_with_mint(&mint, &TOKEN_PROGRAM_ID, 6);
+        let mut cache = MintCache::new(storage);
+
+        let found = cache.get_mint_metadata_from_db(&mint).await.unwrap();
+        assert_eq!(found.expect("row is present").decimals, 6);
+        assert_eq!(cache.cache_size(), 1, "metadata cache must be warmed");
+
+        // No RPC client is configured, so these only succeed if the DB read warmed them.
+        cache.get_mint_metadata(&mint).await.unwrap();
+        assert_eq!(
+            cache.get_extension_flags(&mint).await.unwrap(),
+            (false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn check_paused_transport_error_is_rpc_error() {
+        let mut server = mockito::Server::new_async().await;
+        let rpc = rpc_failing_transport(&mut server).await;
+        let mint = create_test_mint();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let err = cache.check_paused(&mint).await.unwrap_err();
+
+        assert!(
+            matches!(err, OperatorError::RpcError(_)),
+            "a reachability failure must stay transient, got: {err:?}"
+        );
     }
 }

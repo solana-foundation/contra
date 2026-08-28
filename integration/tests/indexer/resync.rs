@@ -295,6 +295,17 @@ fn script_channel_empty(mock: &MockRpcServer) {
     }
 }
 
+/// Answer the startup supply invariant with "no channel mint exists yet".
+///
+/// An absent mint account reads as zero supply, which can never exceed custody, so the
+/// invariant passes and the custody comparison stays the only thing under test. Startup
+/// now refuses to boot on a supply it could not read, so leaving the read unscripted
+/// would fail the boot rather than be ignored.
+fn script_channel_empty_supply(mock: &MockRpcServer) {
+    let reply = Reply::result(json!({"context": {"slot": 1}, "value": null}));
+    mock.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 256));
+}
+
 /// Place the single serviced mint on page 2: page 1 is a full `CHANNEL_PAGE_LIMIT`
 /// page of fillers so the `before` cursor advances, then page 2 carries the memo.
 fn script_channel_consumed_on_page2(
@@ -1095,6 +1106,7 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
     // A single reconciling run against an empty channel is enough: the AllowMint
     // is replayed (genesis precedes setup) and the deposit row is rebuilt.
     script_channel_empty(&mock);
+    script_channel_empty_supply(&mock);
     h.run().await.expect("resync should succeed");
 
     assert_eq!(

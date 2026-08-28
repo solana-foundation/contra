@@ -53,6 +53,8 @@ pub struct YellowstoneSource {
     batch_size: usize,
     #[cfg(feature = "datasource-rpc")]
     storage: Option<Arc<Storage>>,
+    #[cfg(feature = "datasource-rpc")]
+    arm_first_connection: bool,
     health: Option<Arc<private_channel_metrics::HealthState>>,
     /// Silent-stream watchdog window. Defaults to STREAM_STALL_TIMEOUT; overridable
     /// (mainly so tests can drive the reconnect path without a 120s wait).
@@ -81,6 +83,8 @@ impl YellowstoneSource {
             batch_size: 0,
             #[cfg(feature = "datasource-rpc")]
             storage: None,
+            #[cfg(feature = "datasource-rpc")]
+            arm_first_connection: false,
             health: None,
             stall_timeout: STREAM_STALL_TIMEOUT,
         }
@@ -115,6 +119,20 @@ impl YellowstoneSource {
     #[cfg(feature = "datasource-rpc")]
     pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Repair the window below the first streamed slot as well as later reconnects.
+    ///
+    /// The first connection normally skips this, on the grounds that startup catch-up
+    /// covers everything below it. That only holds while the catch-up runs alongside the
+    /// stream. When it runs to completion first, the slots produced between its target
+    /// and the first streamed slot belong to neither, and the first streamed slot would
+    /// carry the checkpoint straight over them. Callers that complete their catch-up
+    /// before starting the stream must set this so that window is replayed instead.
+    #[cfg(feature = "datasource-rpc")]
+    pub fn with_first_connection_arming(mut self) -> Self {
+        self.arm_first_connection = true;
         self
     }
 }
@@ -450,6 +468,8 @@ impl DataSource for YellowstoneSource {
         let batch_size = self.batch_size;
         #[cfg(feature = "datasource-rpc")]
         let storage = self.storage.clone();
+        #[cfg(feature = "datasource-rpc")]
+        let arm_first_connection = self.arm_first_connection;
 
         let handle = tokio::spawn(async move {
             // Reconnect gate context, built once; None disables reconnect gating.
@@ -468,11 +488,13 @@ impl DataSource for YellowstoneSource {
             // One in-flight reconnect backfill, owned here and superseded on each reconnect.
             #[cfg(feature = "datasource-rpc")]
             let mut backfill_handle: Option<tokio::task::JoinHandle<()>> = None;
-            // True once some connection has subscribed. Only later connections arm the
-            // reconnect gate; the first stream is a cold start that startup backfill
-            // already covers. A connect that fails before subscribing does not count.
+            // True once some connection has subscribed, which is what makes a connection
+            // arm the reconnect gate. A connect that fails before subscribing does not
+            // count. Seeded true when the caller finished its catch-up before starting
+            // the stream, because then the first connection also has a window below it to
+            // repair rather than a cold start someone else already covered.
             #[cfg(feature = "datasource-rpc")]
-            let mut ever_streamed = false;
+            let mut ever_streamed = arm_first_connection;
 
             loop {
                 if cancellation_token.is_cancelled() {

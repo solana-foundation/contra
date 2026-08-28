@@ -906,12 +906,37 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     w2.amount = TokenAmount(9999);
     storage.insert_db_transaction(&w2).await?;
 
-    let balances = storage.get_mint_balances_for_reconciliation().await?;
+    // A later deposit, above the bound the assertions below use.
+    let mut d3 = make_db_transaction("recon_d3", TransactionType::Deposit);
+    d3.mint = mint.to_string();
+    d3.amount = TokenAmount(700);
+    d3.slot = 200;
+    storage.insert_db_transaction(&d3).await?;
+
+    let balances = storage
+        .get_mint_balances_for_reconciliation(u64::MAX)
+        .await?;
     assert_eq!(balances.len(), 1);
-    // Deposits: 500 (pending) + 300 (completed) = 800  (all statuses)
-    assert_eq!(balances[0].total_deposits, BigDecimal::from(800u64));
+    // Deposits: 500 (pending) + 300 (completed) + 700 (later slot) = 1500 (all statuses)
+    assert_eq!(balances[0].total_deposits, BigDecimal::from(1500u64));
     // Withdrawals: only completed = 100
     assert_eq!(balances[0].total_withdrawals, BigDecimal::from(100u64));
+
+    // Bounded at the earlier rows' slot: the later deposit is excluded.
+    let at_100 = storage.get_mint_balances_for_reconciliation(100).await?;
+    assert_eq!(at_100[0].total_deposits, BigDecimal::from(800u64));
+    assert_eq!(at_100[0].total_withdrawals, BigDecimal::from(100u64));
+
+    // Below every row: the mint must still be reported, at zero. If the bound moved to a
+    // WHERE clause the mint would vanish here and drop out of the comparison entirely.
+    let at_99 = storage.get_mint_balances_for_reconciliation(99).await?;
+    assert_eq!(
+        at_99.len(),
+        1,
+        "a mint with no rows in range must still appear"
+    );
+    assert_eq!(at_99[0].total_deposits, BigDecimal::from(0u64));
+    assert_eq!(at_99[0].total_withdrawals, BigDecimal::from(0u64));
     Ok(())
 }
 

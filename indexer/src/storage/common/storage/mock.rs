@@ -28,6 +28,10 @@ pub struct MockStorage {
     pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
+    /// Slot the last reconciliation balance read was bounded by, so a test can prove the
+    /// bound reached storage. The stored balances are pre-aggregated with no slot of
+    /// their own, so the mock records the bound rather than applying it.
+    pub last_reconciliation_slot: std::sync::Arc<Mutex<Option<u64>>>,
     pub pending_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
     pub inserted_transactions: std::sync::Arc<Mutex<Vec<Vec<DbTransaction>>>>,
     pub inserted_single_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
@@ -567,8 +571,15 @@ impl MockStorage {
 
     pub async fn get_mint_balances_for_reconciliation(
         &self,
+        as_of_slot: u64,
     ) -> Result<Vec<MintDbBalance>, StorageError> {
+        *self.last_reconciliation_slot.lock().unwrap() = Some(as_of_slot);
         Ok(self.mint_balances.lock().unwrap().clone())
+    }
+
+    /// Slot the last reconciliation balance read was bounded by.
+    pub fn last_reconciliation_slot(&self) -> Option<u64> {
+        *self.last_reconciliation_slot.lock().unwrap()
     }
 
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {

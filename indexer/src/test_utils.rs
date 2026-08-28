@@ -139,7 +139,7 @@ pub mod rpc_blocks {
 /// self-CPI. Centralised here so the escrow parser tests and the decoder tests
 /// build the exact same bytes against one source of truth (the `pub(crate)`
 /// escrow constants), rather than each re-encoding the layout.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-mock-storage"))]
 pub mod escrow_fixtures {
     use crate::indexer::datasource::common::parser::escrow::{
         DEPOSIT, DEPOSIT_EVENT_DISCRIMINATOR, EVENT_IX_TAG_LE,

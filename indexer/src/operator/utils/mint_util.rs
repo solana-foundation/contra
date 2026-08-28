@@ -822,9 +822,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_ata_balance_treats_a_missing_account_as_zero() {
+        let mut server = mockito::Server::new_async().await;
+        // The JSON-RPC code Solana returns for a token account that does not exist.
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"could not find account"},"id":1}"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let balance = cache
+            .get_ata_balance(&Pubkey::new_unique())
+            .await
+            .expect("a missing ATA is a zero balance, not a transient failure");
+        assert_eq!(balance, 0);
+    }
+
+    #[tokio::test]
     async fn check_paused_errors_without_rpc() {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::new(storage);
+        let cache = MintCache::new(storage);
 
         let err = cache
             .check_paused(&create_test_mint())
@@ -1090,7 +1125,7 @@ mod tests {
         let rpc = rpc_failing_transport(&mut server).await;
         let mint = create_test_mint();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc));
 
         let err = cache.check_paused(&mint).await.unwrap_err();
 

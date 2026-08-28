@@ -3,7 +3,9 @@ use crate::rpc::{
     error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     WriteDeps,
 };
-use crate::transactions::is_allowed_program_instruction;
+use crate::transactions::{
+    has_address_table_lookups, is_allowed_program_instruction, ADDRESS_LOOKUP_UNSUPPORTED,
+};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bincode::Options;
 use jsonrpsee::core::RpcResult;
@@ -56,6 +58,15 @@ pub async fn send_transaction_impl(
             )
         })?;
 
+    if has_address_table_lookups(&versioned_tx.message) {
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            ADDRESS_LOOKUP_UNSUPPORTED,
+        ));
+    }
+
+    // Every remaining v0 message declares no lookups, so an empty loaded set is
+    // the true resolution rather than a stand-in for one.
     let runtime_tx = RuntimeTransaction::try_create(
         versioned_tx,
         MessageHash::Compute,
@@ -129,7 +140,8 @@ mod tests {
     use crate::stage_metrics::{NoopMetrics, PrometheusMetrics, SharedMetrics};
     use solana_sdk::{
         hash::Hash,
-        instruction::Instruction,
+        instruction::{CompiledInstruction, Instruction},
+        message::{v0, v0::MessageAddressTableLookup, MessageHeader, VersionedMessage},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
         transaction::{SanitizedTransaction, Transaction},
@@ -139,9 +151,43 @@ mod tests {
 
     const TEST_INGRESS_CAP: usize = 4;
 
-    fn encode_tx(tx: &Transaction) -> String {
+    // Generic over the transaction type so legacy and versioned cases share it.
+    fn encode_tx<T: serde::Serialize>(tx: &T) -> String {
         let bytes = bincode::serialize(tx).unwrap();
         STANDARD.encode(&bytes)
+    }
+
+    /// Builds a v0 transaction whose static keys are [payer, spl_token], plus
+    /// `num_lookups` declared lookup tables. With `ix_uses_lookup` the
+    /// instruction indexes a key only a resolved lookup table could supply.
+    fn v0_tx(num_lookups: usize, ix_uses_lookup: bool) -> VersionedTransaction {
+        let payer = Keypair::new();
+        let address_table_lookups: Vec<MessageAddressTableLookup> = (0..num_lookups)
+            .map(|_| MessageAddressTableLookup {
+                account_key: Pubkey::new_unique(),
+                writable_indexes: vec![0],
+                readonly_indexes: vec![],
+            })
+            .collect();
+        // Index 2 is the first lookup-supplied key; index 0 is the static payer.
+        let accounts = if ix_uses_lookup { vec![2] } else { vec![0] };
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer.pubkey(), spl_token::id()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts,
+                // SPL Token Transfer: tag 3 followed by a u64 amount.
+                data: vec![3, 1, 0, 0, 0, 0, 0, 0, 0],
+            }],
+            address_table_lookups,
+        });
+        VersionedTransaction::try_new(message, &[&payer]).unwrap()
     }
 
     /// Returns WriteDeps and the receiver (must be held alive for happy-path tests).
@@ -435,6 +481,54 @@ mod tests {
         assert!(
             err.to_string().contains("ingress channel closed"),
             "expected closed-channel error, got: {err}"
+        );
+    }
+
+    // A declared lookup table is never resolved here, so the message's account
+    // indices would outrun its own key list. Reject before anything is built.
+    #[tokio::test]
+    async fn v0_address_table_lookup_rejected() {
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&v0_tx(1, true)), None)
+            .await
+            .expect_err("a v0 tx declaring address table lookups must be rejected");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), ADDRESS_LOOKUP_UNSUPPORTED);
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
+        );
+    }
+
+    // The guard must not catch ordinary v0 traffic, which is what modern
+    // clients emit by default. Rejecting the loader outright would break this.
+    #[tokio::test]
+    async fn v0_without_lookups_still_accepted() {
+        let (deps, rx) = make_write_deps();
+
+        let result = send_transaction_impl(&deps, encode_tx(&v0_tx(0, false)), None).await;
+        assert!(
+            result.is_ok(),
+            "a lookup-free v0 tx must still be admitted: {result:?}"
+        );
+        assert_eq!(rx.len(), 1, "the accepted tx must reach the ingress queue");
+    }
+
+    // Declaring a table still changes the account key set a real validator
+    // builds, so the message is rejected even when no instruction indexes it.
+    #[tokio::test]
+    async fn v0_unreferenced_lookup_rejected() {
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&v0_tx(1, false)), None)
+            .await
+            .expect_err("a declared lookup must be rejected even when unused");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.message(), ADDRESS_LOOKUP_UNSUPPORTED);
+        assert!(
+            rx.is_empty(),
+            "rejected tx must not reach the ingress queue"
         );
     }
 }

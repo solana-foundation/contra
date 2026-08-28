@@ -413,6 +413,7 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     run_blocks_in_range_boundaries_test(private_channel_ctx).await;
     run_sig_statuses_search_depth_test(private_channel_ctx).await;
     run_send_transaction_errors_test(private_channel_ctx).await;
+    run_address_lookup_rejection_test(private_channel_ctx).await;
     run_simulate_transaction_preflight_test(private_channel_ctx).await;
     run_simulate_transaction_account_writes_test(private_channel_ctx).await;
 

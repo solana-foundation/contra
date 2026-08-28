@@ -169,6 +169,18 @@ The AdminVM (used for operator mint operations) only supports SPL Token `Initial
 
 Solana Private Channels does not support deploying arbitrary BPF programs. The supported program set is fixed at compile time. The instruction allowlist is currently hardcoded to SPL Token instructions.
 
+### No Address Lookup Tables
+
+The address lookup table program is not in the instruction allowlist, so no lookup
+table account can be created or read here. A v0 transaction whose message declares
+`address_table_lookups` is therefore rejected at RPC admission with `-32602`, by
+both `sendTransaction` and `simulateTransaction`. Resolving such a message is
+impossible without the table it names, and admitting it unresolved would produce a
+transaction whose instruction account indices point past its own account key list.
+Legacy transactions and v0 transactions that declare no lookups are unaffected.
+
+**Source**: [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs), [`core/src/rpc/simulate_transaction_impl.rs`](../core/src/rpc/simulate_transaction_impl.rs) (enforcement); [`core/src/transactions.rs`](../core/src/transactions.rs) (predicate)
+
 ### No Precompiles
 
 Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Transactions that reference precompile addresses will fail.

@@ -2492,8 +2492,15 @@ impl PostgresDb {
     ///   `release_funds` call actually moves tokens out of the ATA.
     ///
     /// Mints with no transactions still appear (with totals = 0) because of the LEFT JOIN.
+    ///
+    /// `as_of_slot` bounds the totals to what was indexed at or below that slot, so the
+    /// answer describes the ledger at one point rather than at whatever moment the query
+    /// happened to run. The bound sits in the JOIN, not a WHERE clause, because moving it
+    /// to WHERE would discard the NULL rows the LEFT JOIN produces for a mint with no
+    /// qualifying transactions and silently drop that mint from the comparison.
     pub async fn get_mint_balances_for_reconciliation_internal(
         &self,
+        as_of_slot: i64,
     ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
         sqlx::query_as::<_, MintDbBalance>(
             r#"
@@ -2509,10 +2516,11 @@ impl PostgresDb {
                     0
                 )::NUMERIC AS total_withdrawals
             FROM mints m
-            LEFT JOIN transactions t ON t.mint = m.mint_address
+            LEFT JOIN transactions t ON t.mint = m.mint_address AND t.slot <= $1
             GROUP BY m.mint_address, m.token_program
             "#,
         )
+        .bind(as_of_slot)
         .fetch_all(&self.pool)
         .await
     }

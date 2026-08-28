@@ -15,6 +15,8 @@
 // this same test binary so they share compile state.
 #[path = "test_truncate_backup_failure.rs"]
 mod backup_failure;
+#[path = "test_truncate_floor_atomicity.rs"]
+mod floor_atomicity;
 #[path = "test_truncate_lock_contention.rs"]
 mod lock_contention;
 

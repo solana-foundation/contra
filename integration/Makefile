@@ -50,6 +50,7 @@ integration-test:
 	@cargo test --test permanent_delegate_mint_integration -- --nocapture
 	@cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cargo test --test reconciliation_e2e_test -- --nocapture
+	@cargo test --test startup_backfill_reconcile -- --nocapture
 	@cargo test --test mock_rpc_retry -- --nocapture
 	@cargo test --test checkpoint_partial_flush -- --nocapture
 	@cargo test --test remint_recovery -- --nocapture
@@ -247,6 +248,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture --test-threads=1
 	@echo "Running reconciliation e2e tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_e2e_test -- --nocapture
+	@echo "Running startup backfill/reconcile ordering tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test startup_backfill_reconcile -- --nocapture
 	@echo "Running mock-rpc retry tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test mock_rpc_retry -- --nocapture
 	@echo "Running checkpoint partial-flush tests with coverage instrumentation..."

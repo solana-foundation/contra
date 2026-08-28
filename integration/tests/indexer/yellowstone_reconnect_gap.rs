@@ -362,3 +362,133 @@ async fn stall_watchdog_forces_reconnect_on_silent_stream() {
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
     server.shutdown().await;
 }
+
+/// Startup catch-up that finishes before the stream starts leaves a window between its
+/// target and the first streamed slot. Nothing covers that window: the catch-up is done
+/// and the stream begins above it, so the first streamed slot would carry the checkpoint
+/// straight over it. With first-connection arming the source replays it instead.
+///
+/// Without the flag the source treats connection one as a cold start, emits no Regate,
+/// and slots 102 to 109 are lost while the checkpoint jumps to 110.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_connection_arms_when_startup_backfill_anchored() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    let mut rpc_mock = MockitoServer::new_async().await;
+
+    // The window the startup fill did not reach: anchor 101, first streamed slot 110.
+    let _enumeration = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [101, 110]}),
+        ))
+        .with_status(200)
+        .with_body(
+            json!({
+                "jsonrpc": "2.0",
+                "result": [101, 102, 103, 104, 105, 106, 107, 108, 109, 110],
+                "id": 1
+            })
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let mut block_mocks = Vec::new();
+    for slot in 101u64..=110u64 {
+        let m = rpc_mock
+            .mock("POST", "/")
+            .match_body(Matcher::PartialJson(
+                json!({"method": "getBlock", "params": [slot]}),
+            ))
+            .with_status(200)
+            .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string())
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        block_mocks.push(m);
+    }
+
+    let server = MockYellowstoneServer::start().await;
+
+    let rpc_poller = Arc::new(RpcPoller::new(
+        rpc_mock.url(),
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Confirmed,
+    ));
+
+    // The checkpoint a completed startup fill would have committed.
+    let mock_storage = MockStorage::new();
+    mock_storage.set_checkpoint("escrow", 101);
+    let storage: Arc<Storage> = Arc::new(Storage::Mock(mock_storage));
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(256);
+    let cancel = CancellationToken::new();
+
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_gap_detection(rpc_poller, 1_000, 16)
+    .with_storage(storage);
+
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // One connection only, no drop: the very first streamed slot must trigger the repair.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(110)));
+
+    let mut regate: Option<(u64, u64)> = None;
+    let mut seen: HashSet<u64> = HashSet::new();
+    let wanted: HashSet<u64> = (102u64..=110u64).collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while regate.is_none() || !wanted.is_subset(&seen) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "timed out; regate: {:?}, seen: {:?}, missing: {:?}",
+                regate,
+                seen,
+                wanted.difference(&seen).collect::<Vec<_>>()
+            );
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) => {
+                seen.insert(slot);
+            }
+            Ok(Some(ProcessorMessage::Regate { from, target, .. })) => {
+                regate = Some((from, target));
+            }
+            Ok(Some(_)) => {}
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        regate,
+        Some((101, 110)),
+        "the gate must be armed from the durable anchor up to the first streamed slot"
+    );
+    assert!(
+        wanted.is_subset(&seen),
+        "every slot in the uncovered window must be replayed; seen: {seen:?}"
+    );
+    assert_eq!(
+        server.call_count("subscribe"),
+        1,
+        "the repair must happen on the first connection, without a reconnect"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    server.shutdown().await;
+}

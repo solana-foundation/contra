@@ -8,7 +8,7 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::{AccountSettlements, ExecutedBatch},
+        stages::{retained_bytes_of, AccountSettlements, ExecutedBatch},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
@@ -26,7 +26,7 @@ use {
     },
     solana_svm::{
         transaction_error_metrics::TransactionErrorMetrics,
-        transaction_processing_result::ProcessedTransaction,
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
         transaction_processor::{
             LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
             TransactionProcessingConfig, TransactionProcessingEnvironment,
@@ -153,15 +153,24 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                                     // Bounded send applies backpressure; race shutdown so a full
                                     // settler queue never wedges executor exit. Owned values only,
                                     // no lock guard is held across this await.
-                                    tokio::select! {
-                                        send_result = execution_results_tx.send((admin_results, execution_result.admin_transactions, execution_result.admin_generation)) => {
-                                            if let Err(e) = send_result {
-                                                metrics.executor_results_send_failed("admin");
-                                                error!("Failed to send admin results: {:?}", e);
-                                                break;
-                                            }
+                                    match send_results_chunked(
+                                        &execution_results_tx,
+                                        admin_results,
+                                        execution_result.admin_transactions,
+                                        execution_result.admin_generation,
+                                        MAX_SEND_CHUNK_BYTES,
+                                        &shutdown_token,
+                                        &metrics,
+                                    )
+                                    .await
+                                    {
+                                        SendOutcome::Sent => {}
+                                        SendOutcome::ChannelClosed => {
+                                            metrics.executor_results_send_failed("admin");
+                                            error!("Failed to send admin results: channel closed");
+                                            break;
                                         }
-                                        _ = shutdown_token.cancelled() => {
+                                        SendOutcome::ShuttingDown => {
                                             info!("Executor shutdown while sending admin results");
                                             return;
                                         }
@@ -176,15 +185,24 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             if !execution_result.regular_transactions.is_empty() {
                                 if let Some(regular_results) = execution_result.regular_results {
                                     let len = execution_result.regular_transactions.len();
-                                    tokio::select! {
-                                        send_result = execution_results_tx.send((regular_results, execution_result.regular_transactions, execution_result.regular_generation)) => {
-                                            if let Err(e) = send_result {
-                                                metrics.executor_results_send_failed("regular");
-                                                error!("Failed to send regular results: {:?}", e);
-                                                break;
-                                            }
+                                    match send_results_chunked(
+                                        &execution_results_tx,
+                                        regular_results,
+                                        execution_result.regular_transactions,
+                                        execution_result.regular_generation,
+                                        MAX_SEND_CHUNK_BYTES,
+                                        &shutdown_token,
+                                        &metrics,
+                                    )
+                                    .await
+                                    {
+                                        SendOutcome::Sent => {}
+                                        SendOutcome::ChannelClosed => {
+                                            metrics.executor_results_send_failed("regular");
+                                            error!("Failed to send regular results: channel closed");
+                                            break;
                                         }
-                                        _ = shutdown_token.cancelled() => {
+                                        SendOutcome::ShuttingDown => {
                                             info!("Executor shutdown while sending regular results");
                                             return;
                                         }
@@ -316,6 +334,144 @@ fn merge_svm_outputs(
     }
 
     merged
+}
+
+/// Cap on retained account bytes in one message to the settler.
+/// This bounds a message built from several transactions. One transaction is
+/// never divided, so bounding that case is an admission problem, tracked apart.
+pub(crate) const MAX_SEND_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// A chunk must never exceed the settler budget it is measured against.
+const _: () = assert!(MAX_SEND_CHUNK_BYTES <= crate::stages::MAX_BUFFERED_SETTLE_BYTES);
+
+/// Outcome of a settler send, mirroring the caller's three existing paths.
+pub(crate) enum SendOutcome {
+    Sent,
+    ChannelClosed,
+    ShuttingDown,
+}
+
+/// Where to split a batch, as end-exclusive index ranges over its transactions.
+/// A chunk closes just before the transaction that would exceed the cap, so an
+/// oversized one travels alone and no transaction is ever split across messages.
+fn chunk_ranges_by_bytes(
+    results: &[TransactionProcessingResult],
+    transactions: &[SanitizedTransaction],
+    cap: usize,
+) -> Vec<std::ops::Range<usize>> {
+    // A length mismatch is the settler's error to report, so send the batch whole.
+    if results.len() != transactions.len() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut buffered = 0usize;
+    for (index, (result, transaction)) in results.iter().zip(transactions.iter()).enumerate() {
+        let bytes = retained_bytes_of(result, transaction);
+        if index > start && buffered + bytes > cap {
+            ranges.push(start..index);
+            start = index;
+            buffered = 0;
+        }
+        buffered += bytes;
+    }
+    if start < results.len() {
+        ranges.push(start..results.len());
+    }
+    ranges
+}
+
+/// Send one batch, racing the shutdown token exactly as the inline send did.
+async fn send_one(
+    results_tx: &mpsc::Sender<ExecutedBatch>,
+    batch: ExecutedBatch,
+    shutdown_token: &CancellationToken,
+) -> SendOutcome {
+    tokio::select! {
+        send_result = results_tx.send(batch) => {
+            match send_result {
+                Ok(()) => SendOutcome::Sent,
+                Err(_) => SendOutcome::ChannelClosed,
+            }
+        }
+        _ = shutdown_token.cancelled() => SendOutcome::ShuttingDown,
+    }
+}
+
+/// Send results to the settler in byte-bounded messages.
+/// A batch under the cap is sent untouched, so ordinary traffic only pays the byte
+/// sum. When split, the real generation rides the last chunk and earlier ones get zero.
+async fn send_results_chunked(
+    results_tx: &mpsc::Sender<ExecutedBatch>,
+    output: LoadAndExecuteSanitizedTransactionsOutput,
+    transactions: Vec<SanitizedTransaction>,
+    generation: u64,
+    cap: usize,
+    shutdown_token: &CancellationToken,
+    metrics: &SharedMetrics,
+) -> SendOutcome {
+    let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
+    if ranges.len() <= 1 {
+        return send_one(
+            results_tx,
+            (output, transactions, generation),
+            shutdown_token,
+        )
+        .await;
+    }
+
+    metrics.executor_results_chunked(ranges.len());
+
+    let LoadAndExecuteSanitizedTransactionsOutput {
+        mut processing_results,
+        error_metrics,
+        execute_timings,
+        balance_collector,
+    } = output;
+    let mut transactions = transactions;
+    // Batch-wide telemetry has no per-chunk meaning, so it rides the first message.
+    let mut head = Some((error_metrics, execute_timings, balance_collector));
+
+    let last = ranges.len() - 1;
+    let mut sent = 0usize;
+    for (position, range) in ranges.iter().enumerate() {
+        let take = range.end - range.start;
+        let (error_metrics, execute_timings, balance_collector) =
+            head.take().unwrap_or_else(|| {
+                (
+                    TransactionErrorMetrics::default(),
+                    ExecuteTimings::default(),
+                    None,
+                )
+            });
+        let chunk = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: processing_results.drain(..take).collect(),
+            error_metrics,
+            execute_timings,
+            balance_collector,
+        };
+        let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
+        // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
+        let chunk_generation = if position == last { generation } else { 0 };
+        match send_one(
+            results_tx,
+            (chunk, chunk_transactions, chunk_generation),
+            shutdown_token,
+        )
+        .await
+        {
+            SendOutcome::Sent => sent += take,
+            other => {
+                // Report what actually landed; the caller only counts a whole batch.
+                if sent > 0 {
+                    metrics.executor_results_sent(sent);
+                }
+                return other;
+            }
+        }
+    }
+
+    SendOutcome::Sent
 }
 
 /// Execute regular transactions across multiple worker threads.
@@ -801,7 +957,8 @@ pub async fn execute_batch(
 mod tests {
     use super::*;
     use crate::{
-        accounts::bob::BOB, stage_metrics::NoopMetrics, test_helpers::start_test_postgres,
+        accounts::bob::BOB, stage_metrics::NoopMetrics, stages::retained_account_bytes,
+        test_helpers::start_test_postgres,
     };
     use solana_sdk::account::AccountSharedData;
     use solana_sdk::{
@@ -811,7 +968,6 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::Transaction,
     };
-    use solana_svm::transaction_processing_result::TransactionProcessingResult;
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
     use solana_svm_callback::TransactionProcessingCallback;
     use std::collections::{HashSet, LinkedList};
@@ -954,6 +1110,132 @@ mod tests {
     /// A successful single-tx Executed output carrying `accounts`.
     fn executed_with(accounts: Vec<(Pubkey, AccountSharedData)>) -> TransactionProcessingResult {
         executed_with_status(Ok(()), accounts)
+    }
+
+    /// One transfer per requested size, carrying those bytes on its writable slot.
+    fn sized_batch(
+        sizes: &[usize],
+    ) -> (Vec<TransactionProcessingResult>, Vec<SanitizedTransaction>) {
+        let mut results = Vec::new();
+        let mut txs = Vec::new();
+        for size in sizes {
+            let from = Keypair::new();
+            let to = Pubkey::new_unique();
+            txs.push(transfer(&from, &to, 100));
+            results.push(executed_with(vec![
+                (
+                    from.pubkey(),
+                    AccountSharedData::new(1, *size, &Pubkey::default()),
+                ),
+                (to, AccountSharedData::new(1, 0, &Pubkey::default())),
+            ]));
+        }
+        (results, txs)
+    }
+
+    /// Wrap processing results in the SVM output shape the send helper consumes.
+    fn output_of(
+        processing_results: Vec<TransactionProcessingResult>,
+    ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results,
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+        }
+    }
+
+    /// A chunk over the cap is no bound at all, and dropping or reordering a
+    /// transaction corrupts the block's signature list. Both are asserted on every
+    /// row, since an unsplit batch can regress just as easily as a split one.
+    #[test]
+    fn chunk_ranges_by_bytes_respects_cap_and_preserves_order() {
+        let cap = 1000usize;
+        let cases: Vec<(&str, Vec<usize>, usize)> = vec![
+            ("all small stays unsplit", vec![10, 10, 10, 10], 1),
+            ("exact fit stays unsplit", vec![500, 500], 1),
+            ("one byte over splits", vec![500, 501], 2),
+            ("single oversized tx sits alone", vec![5000], 1),
+            ("oversized in the middle isolates", vec![10, 5000, 10], 3),
+            ("empty yields no chunks", vec![], 0),
+        ];
+
+        for (name, sizes, expected_chunks) in cases {
+            let (results, txs) = sized_batch(&sizes);
+            let ranges = chunk_ranges_by_bytes(&results, &txs, cap);
+            assert_eq!(ranges.len(), expected_chunks, "chunk count for {}", name);
+
+            let mut next = 0usize;
+            for r in &ranges {
+                assert_eq!(r.start, next, "gap or overlap in {}", name);
+                assert!(r.end > r.start, "empty chunk in {}", name);
+                next = r.end;
+            }
+            assert_eq!(next, sizes.len(), "chunks must cover every tx in {}", name);
+
+            for r in &ranges {
+                if r.end - r.start > 1 {
+                    let bytes = retained_account_bytes(&results[r.clone()], &txs[r.clone()]);
+                    assert!(bytes <= cap, "chunk over cap in {}: {}", name, bytes);
+                }
+            }
+        }
+    }
+
+    /// The one assertion standing between the split and a data-loss bug. If a
+    /// non-final chunk carried the real generation, BOB would treat undrained writes
+    /// as durable and drop them, so only the last chunk may advance the watermark.
+    #[tokio::test]
+    async fn chunked_send_stamps_generation_on_final_chunk_only() {
+        let cap = 1000usize;
+        let shutdown = CancellationToken::new();
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        // Each transaction alone exceeds the cap, so this splits into three.
+        let (results, txs) = sized_batch(&[5000, 5000, 5000]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            42,
+            cap,
+            &shutdown,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+
+        let mut gens = Vec::new();
+        while let Ok((_, _, g)) = rx.try_recv() {
+            gens.push(g);
+        }
+        assert_eq!(
+            gens,
+            vec![0, 0, 42],
+            "only the final chunk may carry the generation"
+        );
+
+        // Under the cap the batch goes as one message, still stamped.
+        let (results, txs) = sized_batch(&[10, 10]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            7,
+            cap,
+            &shutdown,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+
+        let mut gens = Vec::new();
+        while let Ok((_, _, g)) = rx.try_recv() {
+            gens.push(g);
+        }
+        assert_eq!(gens, vec![7], "an unsplit batch stays one message");
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.

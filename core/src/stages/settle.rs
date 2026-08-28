@@ -61,6 +61,44 @@ pub struct AccountSettlements {
     pub accounts: Vec<(Pubkey, AccountSettlement)>,
 }
 
+/// Cap on buffered account bytes before the settler stops draining the executor.
+/// Far below Postgres' 1 GB limit for one bytea, and small enough that committing
+/// a full buffer still finishes inside the stage health margin.
+pub(crate) const MAX_BUFFERED_SETTLE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Account bytes a batch keeps in memory once buffered for settlement.
+/// Rolled-back and zero-lamport writes count too, because the buffer still holds
+/// them, so this can never read below what the upsert ends up binding.
+pub(crate) fn retained_account_bytes(
+    results: &[TransactionProcessingResult],
+    transactions: &[SanitizedTransaction],
+) -> usize {
+    results
+        .iter()
+        .zip(transactions.iter())
+        .map(|(result, transaction)| retained_bytes_of(result, transaction))
+        .sum()
+}
+
+/// The same count for a single transaction, so the send-side chunker can size
+/// one at a time instead of re-walking the whole batch.
+pub(crate) fn retained_bytes_of(
+    result: &TransactionProcessingResult,
+    transaction: &SanitizedTransaction,
+) -> usize {
+    let Ok(ProcessedTransaction::Executed(executed)) = result else {
+        return 0;
+    };
+    executed
+        .loaded_transaction
+        .accounts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| transaction.is_writable(*index))
+        .map(|(_, (_, account))| account.data().len())
+        .sum()
+}
+
 struct SettleResult {
     slot: u64,
     blockhash: Hash,
@@ -314,6 +352,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 _ => None,
             };
             let mut processing_results = Vec::new();
+            // Settled bytes since the last block; gates the recv arm below.
+            let mut buffered_account_bytes = 0usize;
 
             // High-water mark of executor generations buffered so far. It is
             // worker-loop state rather than settle state because it describes
@@ -364,6 +404,9 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     // whatever has accumulated since the last tick.
                     _ = blocktime_interval.tick() => {
                         let num_results = processing_results.len();
+                        if buffered_account_bytes >= MAX_BUFFERED_SETTLE_BYTES {
+                            metrics.settler_backpressure_engaged();
+                        }
                         match settle_transactions(
                             last_block.clone(),
                             &mut accounts_db,
@@ -389,6 +432,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     blockhash: settle_result.blockhash,
                                 });
                                 processing_results.clear();
+                                buffered_account_bytes = 0;
+                                metrics.settler_buffered_account_bytes(0);
                                 debug!(
                                     "Settled {} transactions in slot {}, blockhash {}",
                                     num_results,
@@ -436,8 +481,11 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         }
                     }
 
-                    // Accumulate execution results — never flush here, just buffer.
-                    result = execution_results_rx.recv() => {
+                    // Buffer execution results, never settle them here.
+                    // Over budget, this arm switches off and the queue backs up,
+                    // which parks the executor until the tick below drains us.
+                    result = execution_results_rx.recv(),
+                        if buffered_account_bytes < MAX_BUFFERED_SETTLE_BYTES => {
                         match result {
                             Some((svm_output, transactions, generation)) => {
                                 heartbeat.record_input();
@@ -447,6 +495,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     break;
                                 }
                                 debug!("Extending {} processing results", svm_output.processing_results.len());
+                                // Measured before the extend consumes both vectors.
+                                buffered_account_bytes += retained_account_bytes(
+                                    &svm_output.processing_results,
+                                    &transactions,
+                                );
+                                metrics.settler_buffered_account_bytes(buffered_account_bytes);
                                 processing_results.extend(svm_output.processing_results.into_iter().zip(transactions.into_iter()));
                                 // Fold only once the batch is buffered, so the watermark can
                                 // never cover a batch that was rejected above and therefore
@@ -504,6 +558,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     }
                 }
                 processing_results.clear();
+                buffered_account_bytes = 0;
+                metrics.settler_buffered_account_bytes(buffered_account_bytes);
             }
 
             info!("Settle worker stopped");
@@ -879,6 +935,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
+    use crate::stage_metrics::PrometheusMetrics;
 
     /// Settle `results` and capture the accounts published on the broadcast
     /// channel (the path the worker consumes), returning them with the result so
@@ -957,6 +1014,571 @@ mod tests {
 
     fn sig(byte: u8) -> Signature {
         Signature::from([byte; 64])
+    }
+
+    /// One batch whose single writable account carries `bytes` of data.
+    fn sized_settle_batch(
+        bytes: usize,
+    ) -> (
+        LoadAndExecuteSanitizedTransactionsOutput,
+        Vec<SanitizedTransaction>,
+    ) {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let executed = make_executed(vec![
+            (
+                from.pubkey(),
+                AccountSharedData::new(1, bytes, &Pubkey::default()),
+            ),
+            (to, AccountSharedData::new(1, 0, &Pubkey::default())),
+        ]);
+        (
+            LoadAndExecuteSanitizedTransactionsOutput {
+                processing_results: vec![Ok(executed)],
+                error_metrics: Default::default(),
+                execute_timings: Default::default(),
+                balance_collector: None,
+            },
+            vec![tx],
+        )
+    }
+
+    /// Highest value currently reported by one settler gauge family.
+    fn settler_gauge(name: &str) -> f64 {
+        private_channel_metrics::prometheus::gather()
+            .into_iter()
+            .filter(|mf| mf.name() == name)
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .map(|m| m.get_gauge().value())
+            .fold(0.0, f64::max)
+    }
+
+    /// Sum of one settler counter family, sampled as a delta by the callers.
+    fn settler_metric(name: &str) -> f64 {
+        private_channel_metrics::prometheus::gather()
+            .into_iter()
+            .filter(|mf| mf.name() == name)
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .map(|m| m.get_counter().value())
+            .sum()
+    }
+
+    /// A batch whose writable account carries `bytes` but whose tx rolled back.
+    fn failed_sized_settle_batch(
+        bytes: usize,
+    ) -> (
+        LoadAndExecuteSanitizedTransactionsOutput,
+        Vec<SanitizedTransaction>,
+    ) {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let executed = make_failed_executed(vec![
+            (
+                from.pubkey(),
+                AccountSharedData::new(1, bytes, &Pubkey::default()),
+            ),
+            (to, AccountSharedData::new(1, 0, &Pubkey::default())),
+        ]);
+        (
+            LoadAndExecuteSanitizedTransactionsOutput {
+                processing_results: vec![Ok(executed)],
+                error_metrics: Default::default(),
+                execute_timings: Default::default(),
+                balance_collector: None,
+            },
+            vec![tx],
+        )
+    }
+
+    /// Unread receivers held alive; dropping the address-index one is fatal.
+    struct SettlerSinks {
+        _blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
+        _address_signatures_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
+    }
+
+    /// Settler on a throwaway Postgres, with the channels the assertions read.
+    #[allow(clippy::type_complexity)]
+    async fn settler_under_test(
+        url: String,
+        blocktime_ms: u64,
+        capacity: usize,
+        metrics: SharedMetrics,
+        shutdown: CancellationToken,
+    ) -> (
+        mpsc::Sender<ExecutedBatch>,
+        mpsc::UnboundedReceiver<AccountSettlements>,
+        WorkerHandle,
+        SettlerSinks,
+    ) {
+        let (exec_tx, exec_rx) = mpsc::channel(capacity);
+        let (settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, address_signatures_rx) = mpsc::channel(64);
+        let handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            blocktime_ms,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown,
+            metrics,
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+        (
+            exec_tx,
+            settled_accounts_rx,
+            handle,
+            SettlerSinks {
+                _blockhashes_rx: blockhashes_rx,
+                _address_signatures_rx: address_signatures_rx,
+            },
+        )
+    }
+
+    /// The finding itself: unguarded, the settler drains forever and one tick can
+    /// bind an unbounded array. Guarded, the channel backs up and parks the
+    /// executor instead, so a full channel here means the fix is working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_stops_draining_when_byte_budget_exceeded() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        // A long blocktime means no tick rescues the buffer during the test.
+        let (exec_tx, _rx, _h, _sinks) =
+            settler_under_test(url, 60_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        // An eighth of the budget each, so the guard trips before all of them fit.
+        let batch_bytes = MAX_BUFFERED_SETTLE_BYTES / 8;
+        let mut blocked = false;
+        for _ in 0..64 {
+            let (output, txs) = sized_settle_batch(batch_bytes);
+            match exec_tx.try_send((output, txs, 1)) {
+                Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    blocked = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected send error: {:?}", e),
+            }
+        }
+        assert!(
+            blocked,
+            "settler must stop draining once the byte budget is reached"
+        );
+        shutdown.cancel();
+    }
+
+    /// A guard that never reopens is a wedge; this also proves the counter resets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_resumes_draining_after_tick_flush() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, mut settled_rx, _h, _sinks) =
+            settler_under_test(url, 50, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        let batch_bytes = MAX_BUFFERED_SETTLE_BYTES / 4;
+        let mut delivered = 0;
+        for _ in 0..12 {
+            let (output, txs) = sized_settle_batch(batch_bytes);
+            if tokio::time::timeout(Duration::from_secs(10), exec_tx.send((output, txs, 1)))
+                .await
+                .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+        assert!(
+            delivered >= 8,
+            "ticks must drain the buffer and reopen the guard, delivered {}",
+            delivered
+        );
+
+        let settled = tokio::time::timeout(Duration::from_secs(10), settled_rx.recv()).await;
+        assert!(
+            settled.is_ok(),
+            "settlements must still flow under backpressure"
+        );
+        shutdown.cancel();
+    }
+
+    /// Pins the claimed bound: the budget plus the one message already accepted
+    /// when the guard shut. Only the upper bound is asserted, because the gauge is
+    /// a process-global static another settler may also be writing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn buffered_bytes_stay_within_budget_plus_one_batch() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        // No tick while sampling, and a one-slot channel blocks sends until a drain.
+        let (exec_tx, _rx, _h, _sinks) = settler_under_test(
+            url,
+            600_000,
+            1,
+            Arc::new(PrometheusMetrics),
+            shutdown.clone(),
+        )
+        .await;
+
+        let batch_bytes = MAX_BUFFERED_SETTLE_BYTES / 4;
+        let feeder = tokio::spawn(async move {
+            for _ in 0..16 {
+                let (output, txs) = sized_settle_batch(batch_bytes);
+                if exec_tx.send((output, txs, 1)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Poll while the settler drains, so the peak is observed rather than raced.
+        let mut peak = 0f64;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            peak = peak.max(settler_gauge(
+                "private_channel_settler_buffered_account_bytes",
+            ));
+            if peak >= MAX_BUFFERED_SETTLE_BYTES as f64 {
+                break;
+            }
+        }
+
+        feeder.abort();
+        assert!(peak > 0.0, "the gauge must be observed moving");
+        assert!(
+            peak <= (MAX_BUFFERED_SETTLE_BYTES + batch_bytes) as f64,
+            "buffer {} exceeded budget {} plus one batch {}",
+            peak,
+            MAX_BUFFERED_SETTLE_BYTES,
+            batch_bytes
+        );
+        shutdown.cancel();
+    }
+
+    /// A rolled-back transaction still pins what it allocated. Metering only
+    /// successful writes would let a caller allocate megabytes, fail the
+    /// transaction, and fill the heap while the guard read zero.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rolled_back_allocations_still_engage_the_guard() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, _h, _sinks) =
+            settler_under_test(url, 600_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        let batch_bytes = MAX_BUFFERED_SETTLE_BYTES / 8;
+        let mut blocked = false;
+        for _ in 0..64 {
+            let (output, txs) = failed_sized_settle_batch(batch_bytes);
+            match exec_tx.try_send((output, txs, 1)) {
+                Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    blocked = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected send error: {:?}", e),
+            }
+        }
+        assert!(
+            blocked,
+            "rolled-back allocations must count toward the byte budget"
+        );
+        shutdown.cancel();
+    }
+
+    /// Ordinary traffic must never trip the guard, catching any units error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn normal_traffic_never_engages_backpressure() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+        let before = settler_metric("private_channel_settler_backpressure_engaged_total");
+
+        let (exec_tx, mut settled_rx, _h, _sinks) = settler_under_test(
+            url,
+            50,
+            RESULTS_CAP,
+            Arc::new(PrometheusMetrics),
+            shutdown.clone(),
+        )
+        .await;
+
+        for _ in 0..20 {
+            let (output, txs) = sized_settle_batch(128);
+            exec_tx.send((output, txs, 1)).await.unwrap();
+        }
+        let settled = tokio::time::timeout(Duration::from_secs(10), settled_rx.recv()).await;
+        assert!(settled.is_ok(), "ordinary traffic must settle");
+
+        let after = settler_metric("private_channel_settler_backpressure_engaged_total");
+        assert_eq!(
+            before, after,
+            "small batches must never engage backpressure"
+        );
+        shutdown.cancel();
+    }
+
+    /// If the watermark acknowledged an undrained batch, BOB would mark a
+    /// non-durable account clean and lose the write. The generation must only ever
+    /// describe what the settler actually committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generation_watermark_excludes_undrained_batches() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, mut settled_rx, _h, _sinks) =
+            settler_under_test(url, 400, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        // Generation 1 saturates the buffer on its own.
+        let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES + 4096);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+
+        // Generation 2 cannot be drained while the guard is shut.
+        let (output2, txs2) = sized_settle_batch(4096);
+        let _ = exec_tx.try_send((output2, txs2, 2));
+
+        let settlements = tokio::time::timeout(Duration::from_secs(10), settled_rx.recv())
+            .await
+            .expect("a tick must fire")
+            .expect("feedback channel stays open");
+        assert_eq!(
+            settlements.generation, 1,
+            "the watermark must not acknowledge an undrained batch"
+        );
+        shutdown.cancel();
+    }
+
+    /// Backpressure must not read as a stall, or the health valve would restart
+    /// the node under load, which is worse than the bug being fixed. The tick keeps
+    /// recording progress while the guard is shut, so health must hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_stays_healthy_while_backpressured() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, exec_rx) = mpsc::channel(1);
+        let (settled_accounts_tx, mut settled_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _bh_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _as_rx) = mpsc::channel(64);
+        let heartbeat = crate::health::StageHeartbeat::new();
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: Arc::clone(&heartbeat),
+        })
+        .await;
+
+        // Half the budget each, fed continuously, so the guard keeps re-engaging.
+        let feeder = tokio::spawn(async move {
+            loop {
+                let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES / 2);
+                if exec_tx.send((output, txs, 1)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Progress is only recorded by a completed tick, so wait for the first.
+        let first = tokio::time::timeout(Duration::from_secs(60), settled_rx.recv()).await;
+        assert!(first.is_ok(), "settler must produce a first block");
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(
+                heartbeat.is_healthy(),
+                "settler must stay healthy while backpressured"
+            );
+        }
+
+        feeder.abort();
+        shutdown.cancel();
+    }
+
+    /// The final flush must commit a saturated buffer and reset the counter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_flush_commits_saturated_buffer() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks) =
+            settler_under_test(url, 60_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES + 4096);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        shutdown.cancel();
+        let exited = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
+        assert!(exited.is_ok(), "final flush must exit promptly");
+    }
+
+    /// Account holding `len` bytes of data, funded so it is not a tombstone.
+    fn sized_account(len: usize) -> AccountSharedData {
+        AccountSharedData::new(1, len, &Pubkey::default())
+    }
+
+    /// A transfer's account list: 0 and 1 writable, 2 the read-only program slot.
+    fn transfer_accounts(
+        from: Pubkey,
+        to: Pubkey,
+        first: AccountSharedData,
+        second: AccountSharedData,
+        readonly: AccountSharedData,
+    ) -> Vec<(Pubkey, AccountSharedData)> {
+        vec![
+            (from, first),
+            (to, second),
+            (Pubkey::new_unique(), readonly),
+        ]
+    }
+
+    /// Each row is one way the meter could drift from what the buffer retains.
+    #[test]
+    fn retained_account_bytes_counts_what_the_buffer_holds() {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let fp = from.pubkey();
+
+        let readonly = sized_account(4096);
+        let empty = sized_account(0);
+
+        let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
+            load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
+            rollback_accounts: RollbackAccounts::FeePayerOnly {
+                fee_payer_account: AccountSharedData::new(900, 0, &Pubkey::default()),
+            },
+            fee_details: Default::default(),
+        }));
+
+        let cases: Vec<(&str, TransactionProcessingResult, usize)> = vec![
+            (
+                "writable, successful, funded",
+                Ok(make_executed(transfer_accounts(
+                    fp,
+                    to,
+                    sized_account(4096),
+                    empty.clone(),
+                    readonly.clone(),
+                ))),
+                4096,
+            ),
+            (
+                "read-only slot is excluded",
+                Ok(make_executed(transfer_accounts(
+                    fp,
+                    to,
+                    empty.clone(),
+                    empty.clone(),
+                    readonly.clone(),
+                ))),
+                0,
+            ),
+            (
+                "a rolled-back tx still holds what it allocated",
+                Ok(make_failed_executed(transfer_accounts(
+                    fp,
+                    to,
+                    sized_account(4096),
+                    empty.clone(),
+                    readonly.clone(),
+                ))),
+                4096,
+            ),
+            (
+                "a zero-lamport account still occupies its bytes",
+                Ok(make_executed(transfer_accounts(
+                    fp,
+                    to,
+                    AccountSharedData::new(0, 4096, &Pubkey::default()),
+                    empty.clone(),
+                    readonly.clone(),
+                ))),
+                4096,
+            ),
+            ("fees-only writes nothing", Ok(fees_only), 0),
+            (
+                "failed transaction writes nothing",
+                Err(solana_transaction_error::TransactionError::AccountNotFound),
+                0,
+            ),
+            (
+                "both writable slots are summed",
+                Ok(make_executed(transfer_accounts(
+                    fp,
+                    to,
+                    sized_account(4096),
+                    sized_account(8192),
+                    readonly.clone(),
+                ))),
+                12288,
+            ),
+        ];
+
+        for (name, result, expected) in cases {
+            let got =
+                retained_account_bytes(std::slice::from_ref(&result), std::slice::from_ref(&tx));
+            assert_eq!(got, expected, "row: {}", name);
+        }
+    }
+
+    /// The meter sums per batch while the settler dedupes by pubkey, so it may
+    /// over-count but never under-count. Under-counting would let the buffer pass
+    /// the budget unnoticed, which is exactly what the guard exists to stop.
+    #[test]
+    fn meter_never_undercounts_what_the_settler_writes() {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let fp = from.pubkey();
+
+        // The same pubkey written twice collapses to one entry downstream.
+        let results = vec![
+            Ok(make_executed(transfer_accounts(
+                fp,
+                to,
+                sized_account(4096),
+                sized_account(0),
+                sized_account(4096),
+            ))),
+            Ok(make_executed(transfer_accounts(
+                fp,
+                to,
+                sized_account(4096),
+                sized_account(0),
+                sized_account(4096),
+            ))),
+        ];
+        let txs = vec![tx.clone(), tx.clone()];
+
+        let metered = retained_account_bytes(&results, &txs);
+        let settled_unique = 4096;
+
+        assert_eq!(metered, 8192, "the meter sums per transaction");
+        assert!(
+            metered >= settled_unique,
+            "the meter must never report fewer bytes than the settler writes"
+        );
     }
 
     #[test]

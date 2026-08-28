@@ -1199,11 +1199,11 @@ mod tests {
             .unwrap();
         assert_eq!(balances.len(), 2);
         assert!(balances.iter().any(|b| b.mint_address == "usdc"
-            && b.total_deposits == BigDecimal::from(10000u64)
-            && b.total_withdrawals == BigDecimal::from(5000u64)));
+            && b.total_deposits == 10000u64
+            && b.total_withdrawals == 5000u64));
         assert!(balances.iter().any(|b| b.mint_address == "usdt"
-            && b.total_deposits == BigDecimal::from(8000u64)
-            && b.total_withdrawals == BigDecimal::from(3000u64)));
+            && b.total_deposits == 8000u64
+            && b.total_withdrawals == 3000u64));
     }
 
     #[tokio::test]

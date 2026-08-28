@@ -8,8 +8,9 @@
 //! operator down so a supervisor would restart it. The row was only parked after
 //! the restart budget ran out, so one unsupported mint cost several restarts.
 //!
-//! This test seeds a withdrawal for a mint that has no `mints` row and asserts the
-//! row is parked deterministically while the operator keeps running:
+//! This test seeds a withdrawal for a mint the escrow never allowlisted, so no
+//! `AllowedMint` account exists for it, and asserts the row is parked
+//! deterministically while the operator keeps running:
 //!   1. Spin up Postgres + Solana test validator
 //!   2. Set up the escrow instance + operator
 //!   3. Insert a withdrawal whose mint was never allowlisted
@@ -176,7 +177,7 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
 
     // 2. Instance + operator, with the environment's own mint allowlisted so the
     // gate has something to accept. The withdrawal below names a different mint
-    // that is deliberately left out of `mints`, which is the condition under test.
+    // that is deliberately never allowlisted, which is the condition under test.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
     storage

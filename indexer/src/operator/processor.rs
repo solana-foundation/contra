@@ -1,6 +1,5 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
-use crate::indexer::checkpoint::get_last_checkpoint;
 use crate::metrics;
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawalRemintInfo,
@@ -466,12 +465,11 @@ pub async fn run_processor(
     }
 }
 
-/// Reject a withdrawal whose mint the escrow never allowlisted. A `mints` row is
-/// the predicate: only an indexed allow writes one and nothing removes it. Running
-/// before the metadata read keeps the rejection independent of the target chain.
+/// Reject a withdrawal the escrow would not accept a release for. The predicate is
+/// the on-chain `AllowedMint` account, the same one `release_funds` requires, so a
+/// row that fails here could never have landed and a row that passes is not blocked.
 async fn check_withdrawal_mint_supported(
     processor_state: &mut ProcessorState,
-    storage: &Arc<Storage>,
     transaction: &DbTransaction,
 ) -> Result<Option<BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
@@ -479,29 +477,47 @@ async fn check_withdrawal_mint_supported(
         reason: e.to_string(),
     })?;
 
-    // A hit also warms the cache, so the metadata read that follows is free.
-    if processor_state
-        .mint_cache
-        .get_mint_metadata_from_db(&mint)
-        .await?
-        .is_some()
-    {
+    // A verdict already recorded for this mint stands for the process lifetime, so a
+    // busy mint costs one allowlist read rather than one per withdrawal. An admin
+    // blocking a mint mid-run is caught on the next restart.
+    if processor_state.mint_cache.has_existence_floor(&mint) {
         return Ok(None);
     }
 
-    // The checkpoint only shapes the message. An incomplete backfill and a bogus
-    // mint both leave us without permission to release, so the difference is for
-    // an operator to resolve and must not change what happens here.
-    let indexed = match get_last_checkpoint(storage, ProgramType::Escrow).await {
-        Ok(Some(slot)) => format!("escrow indexed through slot {slot}"),
-        Ok(None) => "escrow allowlist never checkpointed".to_string(),
-        Err(_) => "escrow checkpoint unknown".to_string(),
-    };
+    let allowed_mint_pda = processor_state
+        .release_funds_state
+        .as_mut()
+        .ok_or(OperatorError::MissingBuilder)?
+        .get_allowed_mint_pda(&mint);
 
-    Ok(Some(BailReason::new(
-        metrics::BAIL_REASON_UNSUPPORTED_MINT,
-        format!("unsupported withdrawal mint: {mint} ({indexed})"),
-    )))
+    let rpc = processor_state
+        .mint_cache
+        .rpc_client()
+        .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
+    let response = rpc
+        .get_account_with_context(&allowed_mint_pda, rpc.rpc_client.commitment())
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("get_account({allowed_mint_pda}): {e}")))?;
+
+    // Owned by anything else means the address collides with an unrelated account
+    // rather than carrying the escrow's permission, which release would reject.
+    let allowed = response
+        .value
+        .is_some_and(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
+    if !allowed {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_UNSUPPORTED_MINT,
+            format!("unsupported withdrawal mint: {mint} (no escrow allowlist account)"),
+        )));
+    }
+
+    // Creating that account required the escrow to read the mint, so the mint existed
+    // at or before this slot. Later mint reads bind to it, which is what lets a
+    // missing mint be permanent instead of a node that has not caught up.
+    processor_state
+        .mint_cache
+        .record_existence_floor(&mint, response.context.slot);
+    Ok(None)
 }
 
 /// Build the release_funds TransactionBuilder for a single withdrawal.
@@ -627,8 +643,9 @@ async fn check_withdrawal_preflights(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
 ) -> Result<Option<BailReason>, OperatorError> {
-    // A mint the target chain does not have will never appear by retrying, so it
-    // becomes a bail rather than travelling the transient path and restarting us.
+    // The reads below only report a mint absent once the node has passed the slot that
+    // allowlisted it, so the account was closed rather than merely not yet visible.
+    // That is not fixed by retrying, so it parks the row instead of restarting us.
     match check_withdrawal_preflights_inner(processor_state, transaction).await {
         Err(OperatorError::Account(AccountError::TargetMintMissing { pubkey })) => {
             Ok(Some(BailReason::new(
@@ -725,10 +742,10 @@ pub async fn process_release_funds(
         let mut rotation_dispatched = false;
 
         let outcome: Result<RowOutcome, OperatorError> = async {
-            // Settle whether the mint is supported before anything reads the
-            // target chain, so an unsupported mint is rejected from storage alone.
+            // Settle whether the escrow will accept a release for this mint before
+            // building one, so a mint it would reject costs no further work.
             if let Some(bail) =
-                check_withdrawal_mint_supported(processor_state, &storage, &transaction).await?
+                check_withdrawal_mint_supported(processor_state, &transaction).await?
             {
                 park_row(&storage_tx, pt_label, &transaction, bail).await;
                 return Ok(RowOutcome::ParkedBeforeRotation);
@@ -1418,6 +1435,8 @@ mod tests {
         };
 
         let mint_pubkey = Pubkey::new_unique();
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
         let recipient = Pubkey::new_unique();
         {
             let mock_storage = match storage.as_ref() {
@@ -1492,6 +1511,8 @@ mod tests {
         };
 
         let mint_pubkey = Pubkey::new_unique();
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
         let recipient = Pubkey::new_unique();
         {
             let mock_storage = match storage.as_ref() {
@@ -1594,6 +1615,8 @@ mod tests {
         };
 
         let mint_pubkey = Pubkey::new_unique();
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
         let recipient = Pubkey::new_unique();
         {
             let Storage::Mock(mock_storage) = storage.as_ref() else {
@@ -1771,6 +1794,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -1841,6 +1866,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2133,6 +2160,8 @@ mod tests {
         };
 
         let mint_pubkey = Pubkey::new_unique();
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
         {
             let mock_storage = match storage.as_ref() {
                 Storage::Mock(m) => m,
@@ -2200,13 +2229,17 @@ mod tests {
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
 
+        // The gate is not this test's subject; treat the mint as already proved.
+        let mint_pubkey = Pubkey::new_unique();
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, _sender_rx) = mpsc::channel(10);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let txn = make_db_transaction(
             1,
-            &Pubkey::new_unique().to_string(),
+            &mint_pubkey.to_string(),
             &Pubkey::new_unique().to_string(),
             None, // <- the poison: withdrawals should never have a NULL nonce
             crate::storage::common::models::TransactionType::Withdrawal,
@@ -2579,6 +2612,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2643,6 +2678,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         // Pass 1: the pre-flight cannot reach an RPC, so the row is requeued to Pending.
         let (ftx1, frx1) = mpsc::channel::<DbTransaction>(4);
@@ -2729,6 +2766,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -3045,6 +3084,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(16);
@@ -3554,6 +3595,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -3662,6 +3705,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -4300,6 +4345,8 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: mint_cache_over_absent_chain(storage.clone()),
         };
+        // The gate is not this test's subject; treat the mint as already proved.
+        ps.mint_cache.record_existence_floor(&mint, 1);
 
         let txn = make_db_transaction(
             77,
@@ -4343,25 +4390,35 @@ mod tests {
         })
     }
 
-    /// Seed the escrow indexer's committed checkpoint.
-    fn seed_escrow_checkpoint(storage: &Arc<Storage>, slot: u64) {
-        let mock_storage = match storage.as_ref() {
-            Storage::Mock(m) => m,
-            _ => unreachable!("test helper expects Storage::Mock"),
-        };
-        mock_storage
-            .committed_checkpoints
-            .lock()
-            .unwrap()
-            .insert("escrow".to_string(), slot);
+    /// Mocked `getAccountInfo` reply for an escrow-owned AllowedMint account.
+    fn allowed_mint_account_response(slot: u64) -> serde_json::Value {
+        serde_json::json!({
+            "context": {"slot": slot},
+            "value": {
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode([2u8, 255u8]), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
     }
 
-    /// A withdrawal processor with no RPC client behind its mint cache.
-    fn processor_state_without_rpc(storage: &Arc<Storage>) -> ProcessorState {
+    /// A withdrawal processor whose target chain answers every account read with
+    /// `response`, which for these tests is the allowlist account the gate reads.
+    fn processor_state_answering(
+        storage: &Arc<Storage>,
+        response: serde_json::Value,
+    ) -> ProcessorState {
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, response);
         ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::new_mocked(mocks)),
+            ),
         }
     }
 
@@ -4376,54 +4433,25 @@ mod tests {
         )
     }
 
-    /// A mint the indexer has never recorded is parked, and the reason names the
-    /// checkpoint so an operator can tell a bogus mint from an incomplete backfill.
+    /// No escrow allowlist account means the escrow program would reject the
+    /// release, so the row is parked rather than retried forever.
     #[tokio::test]
     async fn process_release_funds_unsupported_mint_routes_to_manual_review() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        seed_escrow_checkpoint(&storage, 500);
-        let mut ps = processor_state_without_rpc(&storage);
+        let mut ps = processor_state_answering(&storage, absent_account_response());
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
 
-        assert!(
-            outcome.is_ok(),
-            "an unsupported mint must not exit the task"
-        );
+        assert!(outcome.is_ok(), "one bad mint must not end the loop");
         let update = update.expect("row must be routed to ManualReview");
         assert_eq!(update.status, TransactionStatus::ManualReview);
-        let msg = update.error_message.expect("error_message must be set");
-        assert!(
-            msg.contains("unsupported withdrawal mint:")
-                && msg.contains(&mint.to_string())
-                && msg.contains("500"),
-            "unexpected error_message: {msg}"
-        );
-        assert!(builder.is_none(), "no builder may be dispatched");
-    }
-
-    /// With no escrow checkpoint at all the row is still parked, and the reason
-    /// says the allowlist has never been indexed rather than implying a slot.
-    #[tokio::test]
-    async fn process_release_funds_unsupported_mint_without_checkpoint_says_so() {
-        let mint = Pubkey::new_unique();
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let mut ps = processor_state_without_rpc(&storage);
-
-        let (outcome, update, _) =
-            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
-
-        assert!(outcome.is_ok());
-        let msg = update
-            .expect("row must be routed to ManualReview")
+        assert!(update
             .error_message
-            .expect("error_message must be set");
-        assert!(
-            msg.contains("unsupported withdrawal mint:") && msg.contains("never checkpointed"),
-            "unexpected error_message: {msg}"
-        );
+            .expect("error_message must be set")
+            .contains("unsupported withdrawal mint:"));
+        assert!(builder.is_none(), "nothing may be dispatched");
     }
 
     /// An allowlisted mint passes the gate untouched.
@@ -4432,8 +4460,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         insert_mint_row(&storage, &mint);
-        seed_escrow_checkpoint(&storage, 500);
-        let mut ps = processor_state_without_rpc(&storage);
+        let mut ps = processor_state_answering(&storage, allowed_mint_account_response(500));
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -4446,138 +4473,89 @@ mod tests {
         );
     }
 
-    /// A mint that was allowlisted and later blocked stays withdrawable, or the
-    /// escrowed funds behind it would be stranded.
+    /// Passing the gate records the slot the allowlist account was seen at, which is
+    /// what later lets a missing mint account be permanent rather than node lag.
     #[tokio::test]
-    async fn process_release_funds_blocked_mint_still_withdrawable() {
+    async fn process_release_funds_allowlist_hit_records_the_existence_floor() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let mut ps = processor_state_answering(&storage, allowed_mint_account_response(500));
+
+        let (outcome, _, _) = run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(
+            ps.mint_cache.has_existence_floor(&mint),
+            "the gate must record what it proved"
+        );
+    }
+
+    /// `BlockMint` closes the allowlist account and `release_funds` requires it, so a
+    /// blocked mint's release can never land. Parking makes that visible instead of
+    /// dispatching a transaction the escrow program is certain to reject.
+    #[tokio::test]
+    async fn process_release_funds_blocked_mint_parks_rather_than_dispatching() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         insert_mint_row(&storage, &mint);
         seed_mint_status(&storage, &mint, "blocked", 50);
-        seed_escrow_checkpoint(&storage, 500);
-        let mut ps = processor_state_without_rpc(&storage);
+        let mut ps = processor_state_answering(&storage, absent_account_response());
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
 
         assert!(outcome.is_ok());
-        assert!(update.is_none(), "a blocked mint must not be quarantined");
-        assert!(
-            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
-            "a blocked mint must still be releasable"
-        );
-    }
-
-    /// An unreadable allowlist is not a verdict about the mint. The row is left
-    /// alive for a retry rather than terminalized on a database outage.
-    #[tokio::test]
-    async fn process_release_funds_unreadable_allowlist_is_transient() {
-        let mint = Pubkey::new_unique();
-        let mock = MockStorage::new();
-        let txn = seed_processing_withdrawal(
-            &mock,
-            9,
-            5,
-            &mint,
-            &Pubkey::new_unique(),
-            SeededMint::Absent,
-        );
-        mock.set_should_fail("get_mint", true);
-        let storage = Arc::new(Storage::Mock(mock.clone()));
-        let mut ps = processor_state_without_rpc(&storage);
-
-        let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
-
-        assert!(
-            matches!(outcome, Err(OperatorError::Storage(_))),
-            "a database outage must stay transient, got: {outcome:?}"
-        );
-        assert!(
-            update.is_none(),
-            "an unreadable allowlist must not quarantine"
-        );
-        assert!(builder.is_none());
-        let after = mock.pending_transactions.lock().unwrap();
-        assert_eq!(
-            after[0].status,
-            TransactionStatus::Pending,
-            "row must be requeued for another attempt"
-        );
-    }
-
-    /// An unreadable checkpoint changes the wording of the reason and nothing else.
-    #[tokio::test]
-    async fn process_release_funds_unreadable_checkpoint_still_parks_the_row() {
-        let mint = Pubkey::new_unique();
-        let mock = MockStorage::new();
-        mock.set_should_fail("get_committed_checkpoint", true);
-        let storage = Arc::new(Storage::Mock(mock));
-        let mut ps = processor_state_without_rpc(&storage);
-
-        let (outcome, update, builder) =
-            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
-
-        assert!(outcome.is_ok());
-        let msg = update
-            .expect("row must be routed to ManualReview")
-            .error_message
-            .expect("error_message must be set");
-        assert!(
-            msg.contains("unsupported withdrawal mint:") && msg.contains("checkpoint unknown"),
-            "unexpected error_message: {msg}"
-        );
-        assert!(builder.is_none());
-    }
-
-    /// The gate reaches its verdict from storage alone, so an operator with no
-    /// RPC configured still rejects the row instead of failing on the missing client.
-    #[tokio::test]
-    async fn process_release_funds_unsupported_mint_needs_no_rpc() {
-        let mint = Pubkey::new_unique();
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        seed_escrow_checkpoint(&storage, 7);
-        let mut ps = processor_state_without_rpc(&storage);
-
-        let (outcome, update, _) =
-            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
-
-        assert!(outcome.is_ok(), "the gate must not depend on an RPC client");
         assert_eq!(
             update.expect("row must be parked").status,
             TransactionStatus::ManualReview
         );
+        assert!(
+            builder.is_none(),
+            "a release that cannot land is not dispatched"
+        );
     }
 
-    /// The allowlist is the authority. A mint that exists on the target chain but
-    /// was never allowlisted is still rejected, which is what makes the gate
-    /// independent of whether the chain is reachable.
+    /// An account squatting the allowlist address carries no escrow permission, so
+    /// presence alone must not open the gate.
     #[tokio::test]
-    async fn process_release_funds_unsupported_mint_ignores_live_target_chain() {
+    async fn process_release_funds_foreign_owned_allowlist_account_is_rejected() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        seed_escrow_checkpoint(&storage, 500);
+        insert_mint_row(&storage, &mint);
+        let mut ps = processor_state_answering(&storage, spl_mint_account_response(6));
 
-        let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, spl_mint_account_response(6));
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::with_rpc(
-                storage.clone(),
-                Arc::new(RpcClientWithRetry::new_mocked(mocks)),
-            ),
-        };
-
-        let (outcome, update, builder) =
+        let (outcome, update, _) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
 
         assert!(outcome.is_ok());
         assert_eq!(
             update.expect("row must be parked").status,
             TransactionStatus::ManualReview,
-            "a live target-chain account must not override the allowlist"
+            "only an escrow-owned account grants permission"
         );
-        assert!(builder.is_none());
+    }
+
+    /// A node we cannot reach is not a verdict about the mint, so the row must stay
+    /// eligible rather than be parked on an unanswered question.
+    #[tokio::test]
+    async fn process_release_funds_unreadable_allowlist_is_transient() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (outcome, update, _) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(
+            matches!(outcome, Err(OperatorError::RpcError(_))),
+            "an unreadable allowlist must stay transient, got: {outcome:?}"
+        );
+        assert!(update.is_none(), "no verdict means no park");
     }
 
     /// A boundary nonce whose mint is unsupported must not dispatch a rotation,
@@ -4586,8 +4564,7 @@ mod tests {
     async fn process_release_funds_unsupported_boundary_mint_skips_rotation() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        seed_escrow_checkpoint(&storage, 500);
-        let mut ps = processor_state_without_rpc(&storage);
+        let mut ps = processor_state_answering(&storage, absent_account_response());
 
         let (outcome, update, builder) = run_one_withdrawal(
             &mut ps,
@@ -4631,13 +4608,11 @@ mod tests {
             SeededMint::Resolved,
         );
         let storage = Arc::new(Storage::Mock(mock.clone()));
-        seed_escrow_checkpoint(&storage, 500);
 
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
-        };
+        // The head's mint has no allowlist account; the sibling's is already proved,
+        // so only the head reaches the gate.
+        let mut ps = processor_state_answering(&storage, absent_account_response());
+        ps.mint_cache.record_existence_floor(&good_mint, 1);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);

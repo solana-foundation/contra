@@ -18,14 +18,20 @@ use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use sqlx::PgPool;
 use std::time::Duration;
-use test_utils::mock_yellowstone::MockYellowstoneServer;
+use test_utils::mock_yellowstone::{MockYellowstoneServer, Update, UpdateMatcher};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+
+#[path = "yellowstone_helpers.rs"]
+mod yellowstone_helpers;
+use yellowstone_helpers::empty_block;
 
 /// Chain tip both tests' mock RPC reports.
 const TIP: u64 = 900;
 /// First slot to process when backfill is on, so the floor 897 stays distinct from the tip.
 const START_SLOT: u64 = 898;
+/// Slot the cold-start stream opens at, well above the tip so a real window sits under it.
+const COLD_START_TIP: u64 = 910;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -131,6 +137,90 @@ async fn mock_get_slot(rpc: &mut MockitoServer, slot: u64) -> mockito::Mock {
         .with_body(json!({"jsonrpc": "2.0", "result": slot, "id": 1}).to_string())
         .create_async()
         .await
+}
+
+fn empty_block_json() -> serde_json::Value {
+    json!({
+        "blockhash": "TestBlockHash11111111111111111111111111111",
+        "parentSlot": 0,
+        "transactions": []
+    })
+}
+
+async fn mock_block_ok(rpc: &mut MockitoServer, slot: u64) -> mockito::Mock {
+    rpc.mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlock", "params": [slot]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string())
+        .create_async()
+        .await
+}
+
+/// The enumeration lists this slot as a producer but getBlock will not serve it, so the
+/// poller reports it unavailable and the fill stalls with the gate still closed.
+async fn mock_block_pruned(rpc: &mut MockitoServer, slot: u64) -> mockito::Mock {
+    rpc.mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlock", "params": [slot]}),
+        ))
+        .with_status(200)
+        .with_body(
+            json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32009, "message": "Slot was skipped" },
+                "id": 1
+            })
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await
+}
+
+async fn wait_for_subscribes(ys: &MockYellowstoneServer, n: usize, secs: u64) {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        while ys.call_count("subscribe") < n {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "expected {} subscribe handshakes, got {}",
+            n,
+            ys.call_count("subscribe")
+        )
+    });
+}
+
+async fn wait_until_matched(mock: &mockito::Mock, secs: u64, what: &str) {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        while !mock.matched_async().await {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+async fn wait_for_checkpoint(pool: &PgPool, program: &str, want: u64, secs: u64) {
+    let mut last = None;
+    let reached = tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            last = anchor_of(pool, program).await;
+            if last == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "checkpoint never reached {want}; last was {last:?}"
+    );
 }
 
 /// The shipped Yellowstone deployment runs with backfill disabled. Nothing resolves a
@@ -259,6 +349,85 @@ async fn run_anchors_at_resolved_from_slot_not_the_tip() {
          or the live start slot ({})",
         TIP + 1
     );
+
+    handle.abort();
+    ys.shutdown().await;
+}
+
+/// With backfill disabled nothing fills the window between the anchor and the slot the stream
+/// opens at, so without cold-start arming the first live block checkpoints straight over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_gates_the_first_block_when_backfill_is_disabled() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("cold_start_no_backfill").await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    // No backfill resolves a boundary, so the anchor and the floor are both the tip.
+    let _slot = mock_get_slot(&mut rpc, TIP).await;
+    // The fill replays the anchor itself, so its range starts one slot below.
+    let produced: Vec<u64> = (TIP - 1..=COLD_START_TIP).collect();
+    let _enumeration = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlocks"})))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": produced, "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    for slot in TIP + 1..=COLD_START_TIP {
+        let _block = mock_block_ok(&mut rpc, slot).await;
+    }
+    // Holds the window open so the gate can be observed doing its job.
+    let pruned = mock_block_pruned(&mut rpc, TIP).await;
+
+    let ys = MockYellowstoneServer::start().await;
+
+    let backfill = BackfillConfig {
+        enabled: false,
+        exit_after_backfill: false,
+        rpc_url: rpc.url(),
+        batch_size: 100,
+        max_gap_slots: 1_000,
+        start_slot: None,
+    };
+    let indexer = indexer_config(ys.url(), backfill);
+    let common = common_config(postgres, rpc.url());
+
+    // Surface a startup failure instead of letting it look like a missing anchor.
+    let handle = tokio::spawn(async move {
+        if let Err(e) = run(common, indexer, None).await {
+            eprintln!("indexer run exited: {e}");
+        }
+    });
+
+    assert_eq!(wait_for_anchor(&pool, "withdraw", 60).await, TIP);
+
+    // One connection, no drop: everything below is about the very first stream.
+    wait_for_subscribes(&ys, 1, 30).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(COLD_START_TIP)));
+
+    // A fill was attempted, so the cold start armed even with backfill switched off.
+    wait_until_matched(&pruned, 30, "a cold-start gap-fill attempt").await;
+    assert_eq!(
+        ys.call_count("subscribe"),
+        1,
+        "the gate must arm on the first connection, with no reconnect involved"
+    );
+
+    // The live block landed, but the checkpoint may not pass the window under it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            anchor_of(&pool, "withdraw").await,
+            Some(TIP),
+            "checkpoint must never advance past the unfilled cold-start window"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Heal the boundary; the fill closes the window and the gate hands off.
+    let _healed = mock_block_ok(&mut rpc, TIP).await;
+    wait_for_checkpoint(&pool, "withdraw", COLD_START_TIP, 60).await;
 
     handle.abort();
     ys.shutdown().await;

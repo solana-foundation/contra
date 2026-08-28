@@ -30,7 +30,9 @@ use crate::{
 use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
-use crate::indexer::backfill::ensure_startup_anchor;
+use crate::indexer::backfill::{
+    ensure_startup_anchor, latest_slot_with_retry, resolve_startup_floor,
+};
 
 #[cfg(feature = "datasource-rpc")]
 use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
@@ -666,9 +668,10 @@ pub async fn run(
                 .await?;
 
                 // Startup owns everything below its live boundary, so the first stream only
-                // replays above it. With no backfill the anchor is that boundary itself.
-                let startup_floor =
-                    rpc_live_start_slot.map_or(anchor, |slot| slot.saturating_sub(1));
+                // replays above it. Checked against the chain the endpoint actually serves,
+                // because a floor past the tip would gate on slots that never arrive.
+                let tip = latest_slot_with_retry(&gap_rpc_poller).await?;
+                let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor, tip)?;
 
                 source
                     .with_startup_floor(startup_floor)

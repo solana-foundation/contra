@@ -279,6 +279,29 @@ pub async fn ensure_startup_anchor(
     Ok(anchor)
 }
 
+/// Highest slot startup owns, one below the live boundary, or the anchor with no backfill.
+/// Bounded both ways: the first gate waits on this slot, so above the tip it waits forever.
+#[cfg(feature = "datasource-yellowstone")]
+pub fn resolve_startup_floor(
+    live_start_slot: Option<u64>,
+    anchor: u64,
+    tip: u64,
+) -> Result<u64, IndexerError> {
+    let floor = live_start_slot.map_or(anchor, |slot| slot.saturating_sub(1));
+
+    if floor > tip || floor < anchor {
+        return Err(DataSourceError::InvalidConfig {
+            reason: format!(
+                "startup floor {floor} is outside the recoverable range [{anchor}, {tip}]; \
+                 check backfill.from_slot against the chain the RPC endpoint serves"
+            ),
+        }
+        .into());
+    }
+
+    Ok(floor)
+}
+
 /// Resolved startup boundary shared by both producers. Backfill fills `gap` and the
 /// live RPC source resumes at `live_start_slot`, so the two meet with no hole and no
 /// overlap: `live_start_slot` is one past the highest slot backfill covers (or one past
@@ -584,6 +607,58 @@ mod tests {
 
         assert!(result.is_err(), "a failed anchor write must abort startup");
         assert_eq!(stored_checkpoint(&storage).await, None);
+    }
+
+    // ============================================================================
+    // resolve_startup_floor Tests
+    // ============================================================================
+
+    /// Backfill owns everything below the live boundary, so the floor sits one slot under it.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[test]
+    fn startup_floor_is_the_slot_below_the_live_boundary() {
+        assert_eq!(
+            resolve_startup_floor(Some(1_001), 500, 2_000).unwrap(),
+            1_000
+        );
+    }
+
+    /// With no backfill there is no range to inherit and the anchor is the boundary itself.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[test]
+    fn startup_floor_falls_back_to_the_anchor() {
+        assert_eq!(resolve_startup_floor(None, 500, 2_000).unwrap(), 500);
+    }
+
+    /// A from_slot set past the chain would gate on slots that can never be produced, which
+    /// freezes the checkpoint for good. Refuse to start rather than stall silently.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[test]
+    fn startup_floor_rejects_a_boundary_above_the_chain_tip() {
+        let err = resolve_startup_floor(Some(9_001), 500, 2_000).unwrap_err();
+        assert!(
+            err.to_string().contains("9000"),
+            "the error must name the rejected floor: {err}"
+        );
+    }
+
+    /// The tip is read after the boundary is resolved, so equality is the normal case for a
+    /// deployment starting at the tip and must not be mistaken for a misconfiguration.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[test]
+    fn startup_floor_accepts_a_boundary_at_the_chain_tip() {
+        assert_eq!(
+            resolve_startup_floor(Some(2_001), 500, 2_000).unwrap(),
+            2_000
+        );
+    }
+
+    /// The anchor is the lowest slot startup owns, so a floor under it means the two were
+    /// derived from different ranges and the fill would replay below the durable checkpoint.
+    #[cfg(feature = "datasource-yellowstone")]
+    #[test]
+    fn startup_floor_rejects_a_boundary_below_the_anchor() {
+        assert!(resolve_startup_floor(Some(401), 500, 2_000).is_err());
     }
 
     // ============================================================================

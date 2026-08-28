@@ -317,15 +317,17 @@ struct ReconnectGapCtx {
 /// the gate is armed and the block is safe to hand on.
 async fn arm_reconnect_gap(
     t_sub: u64,
-    floor: Option<u64>,
+    floor: &mut Option<u64>,
     ctx: &ReconnectGapCtx,
     tx: &InstructionSender,
     cancel: &CancellationToken,
     backoff: Duration,
     prev: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<bool, DataSourceRpcError> {
+    // Held rather than taken: every path that leaves without a gate must return it unspent.
+    let floor_slot = *floor;
     // Never below what startup still owes, so its gate is widened rather than narrowed.
-    let target = floor.map_or(t_sub, |slot| t_sub.max(slot));
+    let target = floor_slot.map_or(t_sub, |slot| t_sub.max(slot));
 
     // Resolve the anchor before arming, because the gate seeds its frontier from it.
     let checkpoint = loop {
@@ -385,7 +387,7 @@ async fn arm_reconnect_gap(
     let handle = tokio::spawn(async move {
         fill_reconnect_gap_to(
             target,
-            floor,
+            floor_slot,
             || get_last_checkpoint(&storage, program_type),
             &poller,
             max_gap_slots,
@@ -399,6 +401,8 @@ async fn arm_reconnect_gap(
         .await;
     });
     *prev = Some(handle);
+    // The gate is set and the fill owns the range, so no later connection may claim it again.
+    *floor = None;
     Ok(true)
 }
 
@@ -693,7 +697,7 @@ async fn connect_and_stream(
                             armed = true;
                             let safe_to_forward = arm_reconnect_gap(
                                 block.slot,
-                                startup_floor.take(),
+                                startup_floor,
                                 ctx,
                                 &tx,
                                 &cancellation_token,
@@ -1241,7 +1245,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        arm_reconnect_gap(103, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        arm_reconnect_gap(103, &mut None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
@@ -1284,9 +1288,17 @@ mod tests {
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
         // Startup owns up to 110; the stream opened at 103, seven slots behind it.
-        arm_reconnect_gap(103, Some(110), &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
-            .await
-            .unwrap();
+        arm_reconnect_gap(
+            103,
+            &mut Some(110),
+            &ctx,
+            &tx,
+            &cancel,
+            TEST_BACKOFF,
+            &mut prev,
+        )
+        .await
+        .unwrap();
         drop(tx);
 
         let mut msgs = vec![];
@@ -1310,6 +1322,57 @@ mod tests {
         // Startup backfill covers everything up to the floor, so this fill has nothing to do.
         assert_eq!(msgs.len(), 1, "no slot may be refetched below the floor");
         no_blocks.assert_async().await;
+    }
+
+    /// Only one connection may spend the floor, so a completed arm has to clear it.
+    #[tokio::test]
+    async fn arm_clears_the_startup_floor_once_the_gate_is_set() {
+        let mut server = Server::new_async().await;
+        let _no_blocks = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({"method": "getBlock"})))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let ctx = test_gap_ctx(&server, storage_with_checkpoint(100), 1000);
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let mut prev: Option<tokio::task::JoinHandle<()>> = None;
+        let mut floor = Some(110);
+
+        let armed = arm_reconnect_gap(103, &mut floor, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+            .await
+            .unwrap();
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        prev.unwrap().await.unwrap();
+
+        assert!(armed);
+        assert_eq!(floor, None, "a spent floor must not be reused");
+    }
+
+    /// An arm that gives up leaves no gate behind, so the next connection still needs the
+    /// floor. Dropping it there would let that connection gate below what startup owes.
+    #[tokio::test]
+    async fn arm_keeps_the_startup_floor_when_it_cannot_arm() {
+        use crate::storage::common::storage::mock::MockStorage;
+
+        let server = Server::new_async().await;
+        // No checkpoint to anchor on, so the arm parks until cancellation ends it.
+        let ctx = test_gap_ctx(&server, Arc::new(Storage::Mock(MockStorage::new())), 1000);
+        let (tx, _rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut prev: Option<tokio::task::JoinHandle<()>> = None;
+        let mut floor = Some(110);
+
+        let armed = arm_reconnect_gap(103, &mut floor, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+            .await
+            .unwrap();
+
+        assert!(!armed, "no gate was set");
+        assert_eq!(floor, Some(110), "the floor must survive for the next arm");
     }
 
     /// The checkpoint can sit far below the floor, so replaying from it would refetch slots
@@ -1373,7 +1436,7 @@ mod tests {
         cancel.cancel();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        let safe = arm_reconnect_gap(103, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        let safe = arm_reconnect_gap(103, &mut None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
@@ -1417,7 +1480,7 @@ mod tests {
         cancel.cancel();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        let safe = arm_reconnect_gap(103, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        let safe = arm_reconnect_gap(103, &mut None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         drop(tx);
@@ -1448,13 +1511,13 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut prev: Option<tokio::task::JoinHandle<()>> = None;
 
-        arm_reconnect_gap(1000, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        arm_reconnect_gap(1000, &mut None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
         let first = prev.as_ref().unwrap().abort_handle();
         assert!(!first.is_finished(), "first backfill is still in flight");
 
-        arm_reconnect_gap(1000, None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
+        arm_reconnect_gap(1000, &mut None, &ctx, &tx, &cancel, TEST_BACKOFF, &mut prev)
             .await
             .unwrap();
 

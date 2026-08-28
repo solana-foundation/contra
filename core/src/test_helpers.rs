@@ -67,6 +67,18 @@ pub(crate) async fn start_test_postgres_raw() -> (
     crate::accounts::PostgresAccountsDB,
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
 ) {
+    let (db, container, _url) = start_test_postgres_with_url().await;
+    (db, container)
+}
+
+/// Same as `start_test_postgres_raw`, but also hands back the connection URL so a
+/// test can open further independent pools against the same database.
+#[cfg(test)]
+pub(crate) async fn start_test_postgres_with_url() -> (
+    crate::accounts::PostgresAccountsDB,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+) {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
 
@@ -83,7 +95,7 @@ pub(crate) async fn start_test_postgres_raw() -> (
     let db = crate::accounts::PostgresAccountsDB::new(&url, false)
         .await
         .unwrap();
-    (db, container)
+    (db, container, url)
 }
 
 /// Synchronously insert `address_signatures` rows that `write_batch` would

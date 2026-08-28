@@ -43,6 +43,9 @@ pub trait StageMetrics: Send + Sync {
     fn bob_settlement_divergences(&self, count: usize);
 
     // Settler
+    fn executor_results_chunked(&self, chunks: usize);
+    fn settler_buffered_account_bytes(&self, bytes: usize);
+    fn settler_backpressure_engaged(&self);
     fn settler_txs_settled(&self, count: usize);
     fn settler_settle_duration_ms(&self, ms: f64);
     fn settler_db_write_duration_ms(&self, ms: f64);
@@ -141,6 +144,15 @@ impl StageMetrics for NoopMetrics {
     }
     fn bob_settlement_divergences(&self, count: usize) {
         debug!("bob: settlement_divergences={}", count);
+    }
+    fn executor_results_chunked(&self, n: usize) {
+        debug!("executor: results split into {} chunks", n);
+    }
+    fn settler_buffered_account_bytes(&self, bytes: usize) {
+        debug!("settler: buffered_account_bytes={}", bytes);
+    }
+    fn settler_backpressure_engaged(&self) {
+        debug!("settler: backpressure engaged");
     }
     fn settler_txs_settled(&self, n: usize) {
         debug!("settler: settled {}", n);
@@ -275,6 +287,12 @@ counter_vec!(
     &[]
 );
 counter_vec!(
+    EXECUTOR_RESULTS_CHUNKED,
+    "private_channel_executor_results_chunked_total",
+    "Execution results split into byte-bounded chunks before the settler send",
+    &[]
+);
+counter_vec!(
     EXECUTOR_RESULTS_SEND_FAILED,
     "private_channel_executor_results_send_failed_total",
     "Failed to send execution results",
@@ -302,6 +320,12 @@ counter_vec!(
     SETTLER_TXS_SETTLED,
     "private_channel_settler_txs_settled_total",
     "Transactions settled to DB",
+    &[]
+);
+counter_vec!(
+    SETTLER_BACKPRESSURE_ENGAGED,
+    "private_channel_settler_backpressure_engaged_total",
+    "Ticks that flushed a settle buffer already at or over its byte budget",
     &[]
 );
 counter_vec!(
@@ -350,6 +374,12 @@ gauge_vec!(
     BOB_CACHE_BYTES,
     "private_channel_bob_cache_bytes",
     "Approx resident account-data bytes in the BOB cache; refreshed at sweep cadence",
+    &[]
+);
+gauge_vec!(
+    SETTLER_BUFFERED_ACCOUNT_BYTES,
+    "private_channel_settler_buffered_account_bytes",
+    "Settled account-data bytes buffered since the last block, against the byte budget",
     &[]
 );
 
@@ -515,6 +545,21 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc_by(count as f64);
     }
+    fn executor_results_chunked(&self, n: usize) {
+        EXECUTOR_RESULTS_CHUNKED
+            .with_label_values(&[] as &[&str])
+            .inc_by(n as f64);
+    }
+    fn settler_buffered_account_bytes(&self, bytes: usize) {
+        SETTLER_BUFFERED_ACCOUNT_BYTES
+            .with_label_values(&[] as &[&str])
+            .set(bytes as f64);
+    }
+    fn settler_backpressure_engaged(&self) {
+        SETTLER_BACKPRESSURE_ENGAGED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn settler_txs_settled(&self, n: usize) {
         SETTLER_TXS_SETTLED
             .with_label_values(&[] as &[&str])
@@ -596,10 +641,13 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_DROPPED_EXPIRED_BH,
         EXECUTOR_CONSERVATION_REJECTED,
         SETTLER_TXS_SETTLED,
+        SETTLER_BACKPRESSURE_ENGAGED,
+        EXECUTOR_RESULTS_CHUNKED,
         BOB_CACHE_EVICTED,
         BOB_CACHE_ENTRIES,
         BOB_CACHE_DIRTY_ENTRIES,
         BOB_CACHE_BYTES,
+        SETTLER_BUFFERED_ACCOUNT_BYTES,
         // Executor latency histograms
         EXECUTOR_BATCH_DURATION,
         EXECUTOR_PRELOAD_DURATION,

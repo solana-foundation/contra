@@ -80,6 +80,31 @@ pub enum ReconciliationError {
     #[error("{count} mint(s) exceed mismatch threshold of {threshold} raw units; see logs for per-mint details")]
     MismatchExceedsThreshold { count: usize, threshold: u64 },
 
+    /// Minted channel supply is above the custody backing it. Kept separate from a
+    /// custody-versus-ledger mismatch because no amount of indexing changes either side
+    /// of this comparison: it reads the chain twice and never touches the database.
+    #[error("{count} mint(s) have channel supply above escrow custody by more than {threshold} raw units; see logs for per-mint details")]
+    SupplyExceedsCustody { count: usize, threshold: u64 },
+
+    /// Channel supply could not be read at all, so the invariant never ran. Startup stops
+    /// rather than proceed unchecked: an unreadable gateway hides an existing breach just
+    /// as well as a healthy channel does, and the two are indistinguishable from here.
+    #[error("channel supply for {count} mint(s) was unreadable across every attempt; the supply invariant did not run, so custody cannot be vouched for")]
+    SupplyInvariantUnverified { count: usize },
+
+    /// The two token-program sweeps never answered at the same slot, so the custody
+    /// numbers describe no single point and cannot be compared against a ledger bounded at
+    /// one. Usually a load-balanced endpoint answering from nodes at different heights,
+    /// which is why another sweep is worth trying before giving up.
+    #[error("custody sweeps never settled on one slot after {attempts} attempts (last spread {low}..{high}); custody cannot be pinned to a single point")]
+    CustodySlotUnsettled { attempts: u32, low: u64, high: u64 },
+
+    /// The custody reading came from a slot the ledger has already passed, so the two
+    /// cannot be compared at a common point and any verdict would be guesswork. Usually a
+    /// lagging RPC node, which is why a re-read is worth trying before giving up.
+    #[error("custody was read at slot {snapshot_slot}, behind the committed checkpoint {committed}; the node is answering from behind the ledger")]
+    CustodyBehindLedger { snapshot_slot: u64, committed: u64 },
+
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 
@@ -174,4 +199,17 @@ pub enum CheckpointError {
 
     #[error("Invalid checkpoint: slot {slot} is before last checkpoint {last}")]
     InvalidCheckpoint { slot: u64, last: u64 },
+
+    /// `last` stays an Option so "stalled at slot N" and "no row was ever written" read
+    /// differently in the log: the first points at an unprocessed slot in the range, the
+    /// second at a checkpoint writer that never flushed. They need different responses.
+    #[error(
+        "Checkpoint for {program_type} reached {last:?}, never {target}, after {waited_secs}s"
+    )]
+    CommitTimeout {
+        program_type: String,
+        last: Option<u64>,
+        target: u64,
+        waited_secs: u64,
+    },
 }

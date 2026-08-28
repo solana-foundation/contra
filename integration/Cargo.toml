@@ -117,6 +117,11 @@ path = "tests/indexer/startup_anchor.rs"
 name = "backfill_only_e2e"
 path = "tests/indexer/backfill_only_e2e.rs"
 
+# Startup ordering: backfill completes and commits before escrow reconciliation.
+[[test]]
+name = "startup_backfill_reconcile"
+path = "tests/indexer/startup_backfill_reconcile.rs"
+
 # Yellowstone inner_instructions + unknown-discriminator arms.
 [[test]]
 name = "yellowstone_inner_and_unknown"

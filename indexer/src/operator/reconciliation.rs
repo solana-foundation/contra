@@ -564,9 +564,12 @@ async fn fetch_on_chain_balances(
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
 ) -> Result<HashMap<Pubkey, u64>, OperatorError> {
+    // Runtime reconciliation compares against live DB totals, so it wants the balances
+    // only; the snapshot slot matters to startup, which bounds its ledger read by it.
     fetch_escrow_balances_by_mint(rpc_client, escrow_instance_id)
         .await
-        .map_err(|e| OperatorError::RpcError(e.reason))
+        .map(|snapshot| snapshot.balances)
+        .map_err(|e| OperatorError::RpcError(e.to_string()))
 }
 
 /// Sends webhook alerts for balance mismatches with retry logic

@@ -240,7 +240,9 @@ pub async fn simulate_transaction(
     )
     .await;
     let noop: SharedMetrics = std::sync::Arc::new(NoopMetrics);
-    let execution_result = execute_batch(batch, &mut execution_deps, &noop).await;
+    let execution_result = execute_batch(batch, &mut execution_deps, &noop)
+        .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, e.to_string()))?;
 
     let result = if let Some(regular_results) = execution_result.regular_results {
         regular_results

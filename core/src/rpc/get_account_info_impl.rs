@@ -34,9 +34,14 @@ pub async fn get_account_info_impl(
         .unwrap_or(0);
 
     // Precompiles short-circuit the DB; everything else reads from AccountsDB.
+    // A store that cannot answer is a server error, not a null account.
     let account_data = match precompiles::get(&pubkey) {
         Some(account) => Some(account),
-        None => read_deps.accounts_db.get_account_shared_data(&pubkey).await,
+        None => read_deps
+            .accounts_db
+            .get_account_shared_data(&pubkey)
+            .await
+            .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, e.to_string()))?,
     };
 
     let encoding = config.encoding.unwrap_or(UiAccountEncoding::Base64);

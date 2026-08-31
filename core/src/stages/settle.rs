@@ -1384,6 +1384,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown,
             metrics,
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -1640,6 +1641,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: Arc::clone(&heartbeat),
         })
         .await;

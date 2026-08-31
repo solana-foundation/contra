@@ -217,7 +217,7 @@ counter_vec!(
 counter_vec!(
     REDIS_CACHE_WRITE_FAILED,
     "private_channel_redis_cache_write_failed_total",
-    "Best-effort Redis cache writes that failed after Postgres had committed",
+    "Batches the Redis cache did not take after Postgres had committed: write failed, budget elapsed, or lease renewal refused",
     &[]
 );
 counter_vec!(

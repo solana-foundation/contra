@@ -342,6 +342,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 redis_cache_url: config.redis_cache_url.clone(),
                 blocktime_ms: config.blocktime_ms,
+                cache_mirror_cooldown: crate::stages::settle::CACHE_MIRROR_COOLDOWN,
                 perf_sample_period_secs: config.perf_sample_period_secs,
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),

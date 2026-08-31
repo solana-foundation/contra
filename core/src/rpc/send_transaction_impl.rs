@@ -101,6 +101,13 @@ pub async fn send_transaction_impl(
     // Get the signature before sending to channel
     let signature = sanitized_tx.signature().to_string();
 
+    // Admission closes the moment shutdown starts, so a signature is never
+    // handed out for a transaction the pipeline has already stopped reading.
+    if write_deps.shutdown_token.is_cancelled() {
+        warn!("Refused transaction {}: node is shutting down", signature);
+        return Err(node_at_capacity());
+    }
+
     // Fail fast on a full ingress queue: shedding frees the RPC connection slot
     // immediately rather than parking it, so a memory-DoS can't become a
     // connection-exhaustion DoS. The shed surfaces a distinct retryable code.
@@ -153,7 +160,32 @@ mod tests {
         metrics: SharedMetrics,
     ) -> (WriteDeps, async_channel::Receiver<SanitizedTransaction>) {
         let (dedup_tx, rx) = async_channel::bounded(TEST_INGRESS_CAP);
-        (WriteDeps { dedup_tx, metrics }, rx)
+        (
+            WriteDeps {
+                dedup_tx,
+                metrics,
+                shutdown_token: tokio_util::sync::CancellationToken::new(),
+            },
+            rx,
+        )
+    }
+
+    /// A shutting-down node must refuse admission rather than acknowledge work
+    /// no stage will read: the accept loop stops first, but in-flight
+    /// connections are served by detached tasks that can still reach this path.
+    #[tokio::test]
+    async fn shutting_down_refuses_admission_without_enqueueing() {
+        let (deps, rx) = make_write_deps();
+        deps.shutdown_token.cancel();
+
+        let err = send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+            .await
+            .expect_err("a shutting-down node must not accept transactions");
+        assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
+        assert!(
+            rx.is_empty(),
+            "nothing may be enqueued after shutdown starts"
+        );
     }
 
     fn spl_tx() -> Transaction {

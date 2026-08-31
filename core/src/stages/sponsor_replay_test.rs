@@ -93,7 +93,6 @@ async fn sponsor_cannot_replay_spl_transfer_under_varied_first_signature() {
         input_rx: dedup_rx,
         settled_blockhashes_rx: blockhash_rx,
         output_tx,
-        shutdown_token: shutdown.clone(),
         initial_live_blockhashes: LinkedList::new(),
         initial_dedup_cache: HashMap::new(),
         metrics: Arc::new(NoopMetrics),

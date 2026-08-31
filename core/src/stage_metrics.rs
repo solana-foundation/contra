@@ -47,6 +47,8 @@ pub trait StageMetrics: Send + Sync {
     fn settler_buffered_account_bytes(&self, bytes: usize);
     fn settler_backpressure_engaged(&self);
     fn settler_txs_settled(&self, count: usize);
+    fn settler_settle_retried(&self);
+    fn settler_discarded_transactions(&self, count: usize);
     fn settler_settle_duration_ms(&self, ms: f64);
     fn settler_db_write_duration_ms(&self, ms: f64);
     fn settler_processing_duration_ms(&self, ms: f64);
@@ -156,6 +158,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn settler_txs_settled(&self, n: usize) {
         debug!("settler: settled {}", n);
+    }
+    fn settler_settle_retried(&self) {
+        debug!("settler: settle retried");
+    }
+    fn settler_discarded_transactions(&self, n: usize) {
+        debug!("settler: discarded {}", n);
     }
     fn settler_settle_duration_ms(&self, ms: f64) {
         debug!("settler: settle_duration={:.3}ms", ms);
@@ -326,6 +334,18 @@ counter_vec!(
     SETTLER_BACKPRESSURE_ENGAGED,
     "private_channel_settler_backpressure_engaged_total",
     "Ticks that flushed a settle buffer already at or over its byte budget",
+    &[]
+);
+counter_vec!(
+    SETTLER_SETTLE_RETRIED,
+    "private_channel_settler_settle_retried_total",
+    "Settle attempts that failed and were retried",
+    &[]
+);
+counter_vec!(
+    SETTLER_DISCARDED_TRANSACTIONS,
+    "private_channel_settler_discarded_transactions_total",
+    "Executed transactions dropped because settlement could not be committed",
     &[]
 );
 counter_vec!(
@@ -562,6 +582,16 @@ impl StageMetrics for PrometheusMetrics {
     }
     fn settler_txs_settled(&self, n: usize) {
         SETTLER_TXS_SETTLED
+            .with_label_values(&[] as &[&str])
+            .inc_by(n as f64);
+    }
+    fn settler_settle_retried(&self) {
+        SETTLER_SETTLE_RETRIED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn settler_discarded_transactions(&self, n: usize) {
+        SETTLER_DISCARDED_TRANSACTIONS
             .with_label_values(&[] as &[&str])
             .inc_by(n as f64);
     }

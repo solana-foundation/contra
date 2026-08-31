@@ -10,7 +10,6 @@ use {
         sync::{Arc, RwLock},
     },
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
     tracing::{info, warn},
 };
 
@@ -19,7 +18,6 @@ pub struct DedupArgs {
     pub input_rx: mpsc::Receiver<SanitizedTransaction>,
     pub settled_blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
     pub output_tx: mpsc::Sender<SanitizedTransaction>,
-    pub shutdown_token: CancellationToken,
     /// Pre-populated from DB on startup; empty on a fresh node.
     pub initial_live_blockhashes: LinkedList<Hash>,
     /// Pre-populated from DB on startup; empty on a fresh node.
@@ -198,7 +196,6 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
         mut input_rx,
         mut settled_blockhashes_rx,
         output_tx,
-        shutdown_token,
         initial_live_blockhashes,
         initial_dedup_cache,
         metrics,
@@ -224,14 +221,11 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                 max_blockhashes,
             );
 
+            // Exits when the input closes, never on a shutdown signal: waiting on
+            // the settled-blockhash channel instead would deadlock, because the
+            // settler cannot finish until this stage drains into it.
             tokio::select! {
                 biased;
-
-                // Shutdown signal — checked first so shutdown is prompt.
-                _ = shutdown_token.cancelled() => {
-                    info!("Dedup received shutdown signal");
-                    break;
-                }
 
                 // Blockhash updates have priority over transaction processing.
                 // When both channels are ready, `biased` ensures we ingest new
@@ -468,19 +462,16 @@ mod tests {
         mpsc::Sender<SanitizedTransaction>,
         mpsc::UnboundedSender<Hash>,
         mpsc::Receiver<SanitizedTransaction>,
-        CancellationToken,
     ) {
         let (input_tx, input_rx) = mpsc::channel(TEST_INGRESS_CAP);
         let (bh_tx, bh_rx) = mpsc::unbounded_channel();
         let (output_tx, output_rx) = mpsc::channel(64);
-        let shutdown = CancellationToken::new();
 
         let args = DedupArgs {
             max_blockhashes: 8,
             input_rx,
             settled_blockhashes_rx: bh_rx,
             output_tx,
-            shutdown_token: shutdown.clone(),
             initial_live_blockhashes: LinkedList::new(),
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
@@ -490,14 +481,14 @@ mod tests {
             start_dedup(args).await;
         });
 
-        (input_tx, bh_tx, output_rx, shutdown)
+        (input_tx, bh_tx, output_rx)
     }
 
     // --- live dedup stage tests ---
 
     #[tokio::test]
     async fn unknown_blockhash_rejected() {
-        let (input_tx, bh_tx, mut output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let live_bh = Hash::new_unique();
         bh_tx.send(live_bh).unwrap();
@@ -514,14 +505,14 @@ mod tests {
             "tx with unknown blockhash should not be forwarded"
         );
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     // An identical resubmit (same message, same signature) is still deduped, so
     // the re-key does not regress the original duplicate-drop behavior.
     #[tokio::test]
     async fn identical_resubmit_rejected() {
-        let (input_tx, bh_tx, mut output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -538,7 +529,7 @@ mod tests {
         let second = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(second.is_err(), "duplicate tx should not be forwarded");
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     // Two distinct transfers under the same live blockhash have different
@@ -546,7 +537,7 @@ mod tests {
     // against false-positive dedup of legitimate distinct transactions.
     #[tokio::test]
     async fn distinct_messages_both_forwarded() {
-        let (input_tx, bh_tx, mut output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -574,7 +565,7 @@ mod tests {
             "second distinct tx must also be forwarded, not deduped"
         );
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     // Regression for the first-signature replay: a second variant that shares
@@ -582,7 +573,7 @@ mod tests {
     // dropped as a duplicate. Fails on signature-keyed dedup, which forwards it.
     #[tokio::test]
     async fn varied_signature_same_message_rejected() {
-        let (input_tx, bh_tx, mut output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -612,12 +603,12 @@ mod tests {
             "second variant sharing the message must be deduped"
         );
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     #[tokio::test]
     async fn valid_transaction_forwarded() {
-        let (input_tx, bh_tx, mut output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -637,12 +628,12 @@ mod tests {
             other => panic!("expected forwarded tx, got {:?}", other),
         }
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     #[tokio::test]
     async fn expired_blockhash_evicted() {
-        let (input_tx, bh_tx, mut output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let mut hashes = Vec::new();
         for _ in 0..9 {
@@ -669,7 +660,7 @@ mod tests {
             "tx using latest blockhash should be forwarded"
         );
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     // --- build_dedup_state unit tests ---
@@ -884,7 +875,7 @@ mod tests {
         async_channel::Sender<SanitizedTransaction>,
         mpsc::UnboundedSender<Hash>,
         mpsc::Receiver<SanitizedTransaction>,
-        CancellationToken,
+        tokio_util::sync::CancellationToken,
     ) {
         use crate::stages::sigverify::{start_sigverify_workerpool, SigverifyArgs};
 
@@ -892,7 +883,7 @@ mod tests {
         let (dedup_tx, dedup_rx) = mpsc::channel(64);
         let (sequencer_tx, sequencer_rx) = mpsc::channel(64);
         let (bh_tx, bh_rx) = mpsc::unbounded_channel();
-        let shutdown = CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
 
         start_sigverify_workerpool(SigverifyArgs {
             num_workers: 2,
@@ -905,14 +896,12 @@ mod tests {
         })
         .await;
 
-        let shutdown_dedup = shutdown.clone();
         tokio::spawn(async move {
             start_dedup(DedupArgs {
                 max_blockhashes: 8,
                 input_rx: dedup_rx,
                 settled_blockhashes_rx: bh_rx,
                 output_tx: sequencer_tx,
-                shutdown_token: shutdown_dedup,
                 initial_live_blockhashes: LinkedList::new(),
                 initial_dedup_cache: HashMap::new(),
                 metrics: Arc::new(NoopMetrics),
@@ -930,7 +919,7 @@ mod tests {
     // before verification (the pre-verify poisoning DoS).
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_tx_does_not_poison_dedup() {
-        let (ingress_tx, bh_tx, mut sequencer_rx, shutdown) = start_test_pipeline().await;
+        let (ingress_tx, bh_tx, mut sequencer_rx, _shutdown) = start_test_pipeline().await;
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -958,14 +947,14 @@ mod tests {
             other => panic!("valid tx must not be deduped by a dropped invalid tx: {other:?}"),
         }
 
-        shutdown.cancel();
+        drop(ingress_tx);
     }
 
     // A single valid transaction traverses the full reorder: ingress -> sigverify
     // -> dedup -> sequencer. Pins the channel retype and stage wiring.
     #[tokio::test(flavor = "multi_thread")]
     async fn valid_tx_flows_sigverify_to_sequencer() {
-        let (ingress_tx, bh_tx, mut sequencer_rx, shutdown) = start_test_pipeline().await;
+        let (ingress_tx, bh_tx, mut sequencer_rx, _shutdown) = start_test_pipeline().await;
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -982,7 +971,7 @@ mod tests {
             other => panic!("valid tx must reach the sequencer: {other:?}"),
         }
 
-        shutdown.cancel();
+        drop(ingress_tx);
     }
 
     // --- persistence roundtrip (Postgres-gated) ---
@@ -1043,5 +1032,36 @@ mod tests {
             hashes.contains(&mh),
             "cache must hold the message hash, keyed by the referenced blockhash"
         );
+    }
+
+    /// Dedup exits when its input closes even while the settler is still alive
+    /// and its blockhash channel is still open. Waiting on that channel instead
+    /// would deadlock the drain: the settler cannot finish until dedup has
+    /// drained into the sequencer, and dedup would be waiting on the settler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dedup_exits_on_input_close_without_waiting_on_blockhashes() {
+        let (input_tx, bh_tx, _output_rx) = start_test_dedup();
+
+        // Held open for the whole test, standing in for a settler still running.
+        let live = Hash::new_unique();
+        bh_tx.send(live).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (probe_tx, mut probe_rx) = mpsc::channel::<()>(1);
+        let watcher = tokio::spawn(async move {
+            // Closing dedup's input is the only signal it should need.
+            drop(input_tx);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = probe_tx.send(()).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), probe_rx.recv())
+                .await
+                .is_ok(),
+            "dedup must not block the drain on the settled-blockhash channel"
+        );
+        drop(bh_tx);
+        let _ = watcher.await;
     }
 }

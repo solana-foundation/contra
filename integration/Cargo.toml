@@ -12,6 +12,14 @@ name = "ingress_backpressure"
 path = "tests/private-channel/test_ingress_backpressure.rs"
 
 [[test]]
+name = "ordered_shutdown_e2e"
+path = "tests/private-channel/test_ordered_shutdown_e2e.rs"
+
+[[test]]
+name = "settle_retry_recovery"
+path = "tests/private-channel/test_settle_retry_recovery.rs"
+
+[[test]]
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
 

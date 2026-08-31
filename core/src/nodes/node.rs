@@ -29,6 +29,13 @@ use {
     tracing::{error, info, warn},
 };
 
+/// Total time the whole pipeline gets to drain on shutdown. A saturated drain
+/// measures well under a second, but the settler may already be inside a commit
+/// that runs to its own bound before it gives up, so this covers that worst case
+/// plus the cascade and still leaves room under the container default stop grace
+/// period for the process to exit.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(8);
+
 /// RPC→dedup ingress queue capacity. Sized so steady state never sheds.
 pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
 /// sigverify→sequencer queue capacity (mirrors the sigverify queue size).
@@ -289,7 +296,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 input_rx: dedup_rx,
                 settled_blockhashes_rx,
                 output_tx: sequencer_tx,
-                shutdown_token: shutdown_token.clone(),
                 initial_live_blockhashes,
                 initial_dedup_cache,
                 metrics: Arc::clone(&config.metrics),
@@ -304,7 +310,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 batch_deadline_ms: config.batch_deadline_ms,
                 rx: sequencer_rx,
                 batch_tx,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: sequencer_hb,
             })
@@ -317,7 +322,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 settled_accounts_rx,
                 execution_results_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 max_svm_workers: config.max_svm_workers,
                 heartbeat: executor_hb,
@@ -358,7 +362,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 rows_rx: addr_sig_rx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 flush_chunk_size: ADDR_SIG_FLUSH_CHUNK,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: addr_index_writer_hb,
             })
@@ -369,6 +372,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 Some(WriteDeps {
                     dedup_tx: ingress_tx,
                     metrics: Arc::clone(&config.metrics),
+                    shutdown_token: shutdown_token.clone(),
                 }),
                 live_blockhashes,
             )
@@ -474,15 +478,22 @@ impl NodeHandles {
     pub async fn shutdown(self) {
         info!("Shutting down node...");
 
-        // Cancel the token - this signals all services to shutdown
+        // Closes admission. Every stage after the ingress edge exits when its
+        // own input closes, so cancelling here starts a drain that walks the
+        // pipeline in order rather than stopping all stages at once.
         self.shutdown_token.cancel();
 
-        // Wait for all workers to finish
+        // One deadline for the whole drain, not one per worker: the workers are
+        // awaited in pipeline order, so a per-worker budget would multiply by
+        // the number of stages and overrun the container's stop grace period,
+        // which kills the process mid-drain and loses what the order preserved.
+        let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
         for worker in self.workers {
-            match tokio::time::timeout(Duration::from_secs(5), worker.handle).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, worker.handle).await {
                 Ok(Ok(_)) => info!("{} stopped gracefully", worker.name),
                 Ok(Err(e)) => error!("{} error: {:?}", worker.name, e),
-                Err(_) => warn!("{} shutdown timeout", worker.name),
+                Err(_) => warn!("{} did not drain within the shutdown deadline", worker.name),
             }
         }
 

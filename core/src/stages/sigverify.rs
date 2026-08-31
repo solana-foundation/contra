@@ -177,25 +177,18 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                 match result {
                                     SigverifyResult::Valid(_) => {
                                         metrics.sigverify_forwarded();
-                                        // Bounded send applies backpressure; race shutdown so a
-                                        // full dedup queue never wedges worker exit.
-                                        tokio::select! {
-                                            send_result = tx.send(transaction) => {
-                                                match send_result {
-                                                    Ok(_) => {
-                                                        debug!("Worker {} sent transaction to dedup", worker_id);
-                                                    }
-                                                    Err(_) => {
-                                                        warn!(
-                                                            "Worker {} failed to send to dedup - channel closed",
-                                                            worker_id
-                                                        );
-                                                        break;
-                                                    }
-                                                }
+                                        // A verified transaction in hand is finished, never
+                                        // abandoned: dedup drains until this stage drops its
+                                        // sender, so waiting here cannot wedge the exit.
+                                        match tx.send(transaction).await {
+                                            Ok(_) => {
+                                                debug!("Worker {} sent transaction to dedup", worker_id);
                                             }
-                                            _ = shutdown.cancelled() => {
-                                                debug!("Worker {} shutdown while sending to dedup", worker_id);
+                                            Err(_) => {
+                                                warn!(
+                                                    "Worker {} failed to send to dedup - channel closed",
+                                                    worker_id
+                                                );
                                                 break;
                                             }
                                         }
@@ -230,7 +223,8 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                         }
                     }
 
-                    // Handle shutdown signal
+                    // Ingress edge: this is where the drain starts. Dropping the
+                    // sender here is what closes the next stage, and so on down.
                     _ = shutdown.cancelled() => {
                         debug!("Worker {} received shutdown signal", worker_id);
                         break;
@@ -746,10 +740,10 @@ mod tests {
     // A full sequencer queue with no consumer must not wedge worker shutdown:
     // the worker's send is raced against the shutdown token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sigverify_worker_exits_on_shutdown_with_full_sequencer() {
-        let sequencer_cap = SEQ_CAP;
+    async fn a_verified_transaction_is_never_abandoned_on_shutdown() {
+        // Capacity one, so the worker's second send has to wait for room.
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(256);
-        let (sequencer_tx, _sequencer_rx) = mpsc::channel(sequencer_cap);
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(1);
         let shutdown = CancellationToken::new();
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
@@ -763,25 +757,44 @@ mod tests {
         })
         .await;
 
-        // Fill the sequencer queue so the worker's next send blocks. Never drain.
-        for _ in 0..(sequencer_cap + 4) {
+        let mut expected = Vec::new();
+        for _ in 0..2 {
             let payer = Keypair::new();
-            let from_ata = Pubkey::new_unique();
-            let to_ata = Pubkey::new_unique();
-            let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
-            sigverify_tx
-                .send(sanitize(&[ix], &payer, &[&payer]))
-                .await
-                .unwrap();
+            let ix = spl_transfer_ix(
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &payer.pubkey(),
+            );
+            let tx = sanitize(&[ix], &payer, &[&payer]);
+            expected.push(*tx.signature());
+            sigverify_tx.send(tx).await.unwrap();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
+        // Shutdown starts while a verified transaction is parked on a full send.
         shutdown.cancel();
+        drop(sigverify_tx);
+
+        let mut seen = Vec::new();
+        while seen.len() < expected.len() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sequencer_rx.recv()).await
+            {
+                Ok(Some(tx)) => seen.push(*tx.signature()),
+                _ => break,
+            }
+        }
+        for sig in expected {
+            assert!(
+                seen.contains(&sig),
+                "verified transaction {sig} was dropped instead of delivered"
+            );
+        }
+
         for h in handles {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), h.handle).await;
             assert!(
                 result.is_ok(),
-                "worker must exit promptly even with a full sequencer queue"
+                "worker must exit once its work is delivered"
             );
         }
     }

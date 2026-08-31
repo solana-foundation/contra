@@ -1019,13 +1019,14 @@ mod tests {
     /// A trailing run the endpoint cannot witness is undetermined, so live polling
     /// must fail closed and retry it rather than emit SlotComplete over it.
     #[tokio::test]
-    async fn unwitnessed_tail_does_not_emit_slot_complete_and_retries() {
+    async fn a_range_with_no_produced_block_does_not_emit_slot_complete_and_retries() {
         let mut server = Server::new_async().await;
 
-        // Chain tip 105 => get_slots_to_process(100, 10) returns [100..=104].
+        // Chain tip 105 => get_slots_to_process(100, 10) looks at [100..=104].
         let _m_slot = mock_get_slot(&mut server, 105);
-        // Nothing produced in the range and nothing listed past it: no witness exists.
-        // Expect >=2 of each, proving the range is retried rather than advanced past.
+        // Nothing produced in the range, so there is nothing provable to walk.
+        // Expect >=2 enumerations, proving the range is retried rather than
+        // advanced past.
         let m_enum = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -1036,15 +1037,16 @@ mod tests {
             .with_body(json!({ "jsonrpc": "2.0", "result": [], "id": 1 }).to_string())
             .expect_at_least(2)
             .create();
+        // The walk is never asked to prove slots past the last produced block, so
+        // no tail witness is looked up at all.
         let m_witness = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
-                "method": "getBlocksWithLimit",
-                "params": [105]
+                "method": "getBlocksWithLimit"
             })))
             .with_status(200)
             .with_body(json!({ "jsonrpc": "2.0", "result": [], "id": 1 }).to_string())
-            .expect_at_least(2)
+            .expect(0)
             .create();
         let no_fetch = server
             .mock("POST", "/")

@@ -371,7 +371,9 @@ impl RpcPoller {
             })
     }
 
-    /// Get slot range to process, returning (slots, chain_tip)
+    /// Get slot range to process, returning (slots, chain_tip). The range ends on
+    /// a produced block: a tail is proven by the next block's parent link, and the
+    /// tip is a tick that usually carries none.
     pub async fn get_slots_to_process(
         &self,
         from_slot: u64,
@@ -383,8 +385,20 @@ impl RpcPoller {
             return Ok((vec![], latest_slot));
         }
 
-        let to_slot = std::cmp::min(from_slot + max_slots as u64, latest_slot);
-        Ok(((from_slot..to_slot).collect(), latest_slot))
+        // The same window the batch would have covered, so the enumeration here is
+        // the one the walk needs rather than an extra range.
+        let window_end = std::cmp::min(from_slot + max_slots as u64, latest_slot).saturating_sub(1);
+        if window_end < from_slot {
+            return Ok((vec![], latest_slot));
+        }
+        let produced = self.get_blocks(from_slot, window_end).await?;
+
+        // Nothing produced in the window yet, so there is nothing provable to
+        // walk. The next poll asks again from the same place.
+        match produced.iter().max() {
+            Some(&last) => Ok(((from_slot..=last).collect(), latest_slot)),
+            None => Ok((vec![], latest_slot)),
+        }
     }
 }
 
@@ -1031,7 +1045,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_slots_to_process_normal() {
         let mut server = Server::new_async().await;
-        let _m = mock_rpc_success(&mut server, "150").await;
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[100, 110, 129]);
 
         let poller = poller(&server);
         let result = poller.get_slots_to_process(100, 30).await;
@@ -1041,6 +1056,42 @@ mod tests {
         assert_eq!(slots.len(), 30);
         assert_eq!(slots[0], 100);
         assert_eq!(slots[29], 129);
+        assert_eq!(chain_tip, 150);
+    }
+
+    /// The chain tip is a tick and usually carries no block, so the walk has to
+    /// stop at the last produced one. Ending anywhere else leaves a tail that no
+    /// parent link can prove and the source refuses to advance past.
+    #[tokio::test]
+    async fn get_slots_to_process_ends_on_a_produced_block() {
+        let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[100, 110, 120]);
+
+        let poller = poller(&server);
+        let (slots, chain_tip) = poller.get_slots_to_process(100, 30).await.unwrap();
+
+        assert_eq!(slots.first(), Some(&100));
+        assert_eq!(
+            slots.last(),
+            Some(&120),
+            "the range must end on the last produced block, not on the tip"
+        );
+        assert_eq!(chain_tip, 150);
+    }
+
+    /// A long idle stretch produces nothing inside the window. There is nothing
+    /// provable to walk, so the poller waits rather than claiming the slots.
+    #[tokio::test]
+    async fn get_slots_to_process_waits_when_the_window_produced_nothing() {
+        let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[]);
+
+        let poller = poller(&server);
+        let (slots, chain_tip) = poller.get_slots_to_process(100, 30).await.unwrap();
+
+        assert!(slots.is_empty());
         assert_eq!(chain_tip, 150);
     }
 

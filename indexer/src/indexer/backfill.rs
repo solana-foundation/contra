@@ -62,6 +62,28 @@ fn calculate_batches(from_slot: u64, to_slot: u64, batch_size: usize) -> Vec<Vec
     batches
 }
 
+/// How far back to look for the last produced block. The idle heartbeat caps the
+/// gap between blocks at a handful of slots, so this is generous; finding none
+/// means the chain is not producing and the tip is left as it was.
+const PRODUCER_LOOKBACK_SLOTS: u64 = 1_000;
+
+/// The highest slot at or below `tip` that produced a block, floored at `floor`.
+/// Falls back to `tip` when the lookback window holds no block at all, which
+/// leaves the caller exactly where it was before.
+async fn last_produced_at_or_below(rpc_poller: &RpcPoller, floor: u64, tip: u64) -> u64 {
+    if tip <= floor {
+        return tip;
+    }
+    let start = std::cmp::max(floor, tip.saturating_sub(PRODUCER_LOOKBACK_SLOTS));
+    match rpc_poller.get_blocks(start, tip).await {
+        Ok(produced) => produced.into_iter().max().unwrap_or(tip),
+        Err(e) => {
+            warn!("Could not list produced blocks up to slot {tip}: {e}");
+            tip
+        }
+    }
+}
+
 async fn fetch_blocks_with_retry(
     rpc_poller: &RpcPoller,
     slots: &[u64],
@@ -366,7 +388,11 @@ impl BackfillService {
             last_checkpoint
         };
 
-        let current_slot = latest_slot_with_retry(&self.rpc_poller).await?;
+        let chain_tip = latest_slot_with_retry(&self.rpc_poller).await?;
+        // Backfill stops at the last produced block. A slot is proven by the next
+        // block's parent link, and the tip is a tick that usually carries none, so
+        // ending there leaves a tail nothing can witness.
+        let current_slot = last_produced_at_or_below(&self.rpc_poller, from_slot, chain_tip).await;
 
         // One past the highest slot backfill covers (gap) or the durable checkpoint
         // (no gap); max guards against an RPC node lagging behind the checkpoint.
@@ -445,6 +471,36 @@ mod tests {
     // ============================================================================
     // Startup anchor Tests
     // ============================================================================
+
+    /// The tip is a tick and usually carries no block, so backfill has to stop at
+    /// the last produced one. Ending above it leaves a tail no parent link can
+    /// witness, and the walk fails closed on every retry.
+    #[tokio::test]
+    async fn last_produced_stops_at_the_last_block_below_the_tip() {
+        let mut server = Server::new_async().await;
+        let _m = crate::test_utils::rpc_mocks::mock_get_blocks(&mut server, 0, 19, &[0, 10]);
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        assert_eq!(last_produced_at_or_below(&poller, 0, 19).await, 10);
+    }
+
+    /// A lookup that cannot be answered leaves the caller exactly where it was,
+    /// so an RPC hiccup narrows nothing and loses nothing.
+    #[tokio::test]
+    async fn last_produced_falls_back_to_the_tip_when_the_listing_fails() {
+        let server = Server::new_async().await;
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        assert_eq!(last_produced_at_or_below(&poller, 0, 19).await, 19);
+    }
 
     /// Mock RPC plus a store either seeded with a checkpoint or left empty.
     async fn anchor_fixture(

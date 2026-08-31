@@ -389,8 +389,12 @@ pub fn start_floor(
 /// leave the source its own default of the chain tip.
 ///
 /// A checkpoint is exclusive, so the next unprocessed slot sits one above it. A configured
-/// start is already inclusive and passes through untouched, which keeps slot zero distinct
-/// from slot one on a ledger that has never been indexed.
+/// start is already inclusive and passes through untouched, keeping it distinct from the
+/// slot above it on a ledger that has never been indexed.
+///
+/// Genesis is floored to slot one because proving a slot empty needs a predecessor to
+/// anchor on, and slot zero has none. Starting there would retry forever on any endpoint
+/// that no longer serves the genesis block, and no program is deployed that early anyway.
 pub fn live_resume_slot(
     last_checkpoint: Option<u64>,
     configured_start: Option<u64>,
@@ -398,6 +402,7 @@ pub fn live_resume_slot(
     last_checkpoint
         .map(|checkpoint| checkpoint.saturating_add(1))
         .or(configured_start)
+        .map(|slot| slot.max(1))
 }
 
 /// Longest startup will wait for a filled range to become durable before giving up.
@@ -837,8 +842,8 @@ mod tests {
             (
                 None,
                 Some(0),
-                Some(0),
-                "genesis start survives the round trip",
+                Some(1),
+                "genesis has no predecessor slot to anchor a proof on",
             ),
             (
                 None,

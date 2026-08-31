@@ -9,6 +9,7 @@ use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
 use private_channel_metrics::MetricLabel;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::transaction::{classify_generation, park_release_for_rotation, GenerationWindow};
@@ -143,9 +144,17 @@ fn generation_mismatch(nonce: u64, nonce_generation: u64, chain_generation: u64)
     .into()
 }
 
-/// Five minutes at the origination interval. A boundary crossing looks blocked
-/// while the closing generation's last row settles, and that clears itself.
-const ROTATION_BLOCKED_ALERT_PASSES: u32 = 60;
+/// How long a withheld rotation has to persist before it is reported. A boundary
+/// crossing looks blocked while the closing generation's last row settles, and
+/// that clears itself, so the report waits it out.
+const ROTATION_BLOCKED_ALERT_AFTER: Duration = Duration::from_secs(300);
+
+/// The same threshold counted in passes, since that is what the driver has. Derived
+/// so that retuning the interval moves the passes with it instead of quietly
+/// retiming an alert the runbooks describe in minutes.
+const ROTATION_BLOCKED_ALERT_PASSES: u32 = (ROTATION_BLOCKED_ALERT_AFTER.as_millis()
+    / super::ROTATION_ORIGINATION_INTERVAL.as_millis())
+    as u32;
 
 /// Arm a rotation when the chain's generation is behind the work waiting on it.
 ///
@@ -188,6 +197,7 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     let chain_generation = match state.refresh_generation().await {
         Ok(generation) => generation,
         Err(e) => {
+            report_read_failure(state);
             warn!("Not arming a rotation: could not read the current generation: {e}");
             return;
         }
@@ -251,6 +261,7 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
 /// release that can then never land.
 async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(u64, u64)> {
     let Ok(floor) = i64::try_from(min_nonce) else {
+        report_read_failure(state);
         error!(
             min_nonce,
             "Not arming a rotation: the nonce floor does not fit"
@@ -265,6 +276,7 @@ async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(
     {
         Ok(bounds) => bounds?,
         Err(e) => {
+            report_read_failure(state);
             warn!("Not arming a rotation: could not read the unreleased nonces: {e}");
             return None;
         }
@@ -273,6 +285,7 @@ async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(
     match (u64::try_from(bounds.0), u64::try_from(bounds.1)) {
         (Ok(lowest), Ok(highest)) => Some((lowest, highest)),
         _ => {
+            report_read_failure(state);
             error!(
                 lowest = bounds.0,
                 highest = bounds.1,
@@ -281,6 +294,18 @@ async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(
             None
         }
     }
+}
+
+/// A read the driver needed and did not get. Every one of these withholds a
+/// rotation, so an outage long enough to matter wedges the next generation; the
+/// counter is what separates that from the far more common idle pass.
+fn report_read_failure(state: &SenderState) {
+    crate::metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[
+            state.program_type.as_label(),
+            "rotation_origination_read_failed",
+        ])
+        .inc();
 }
 
 /// A rotation for `instance_pda`, with every account derived rather than carried
@@ -577,6 +602,24 @@ mod tests {
         crate::metrics::OPERATOR_TRANSACTION_ERRORS
             .with_label_values(&["escrow", "rotation_blocked_by_lower_nonce"])
             .get()
+    }
+
+    fn read_failure_count() -> f64 {
+        crate::metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["escrow", "rotation_origination_read_failed"])
+            .get()
+    }
+
+    /// The runbooks promise the withheld-rotation alert fires after five minutes,
+    /// but the threshold is a pass count and the passes come from a timer in
+    /// another file. Changing either without this would move the alert silently.
+    #[test]
+    fn the_blocked_alert_reports_after_five_minutes() {
+        assert_eq!(
+            super::super::ROTATION_ORIGINATION_INTERVAL * ROTATION_BLOCKED_ALERT_PASSES,
+            std::time::Duration::from_secs(300),
+            "the interval must divide five minutes exactly"
+        );
     }
 
     /// The whole point of the driver: work waiting in the next generation with
@@ -877,7 +920,12 @@ mod tests {
     }
 
     /// An unread gate is not a passed gate: arming without knowing what is still
-    /// owed could rotate past a nonce whose release can then never land.
+    /// owed could rotate past a nonce whose release can then never land. A
+    /// database outage therefore wedges every later generation, so the withhold
+    /// has to move a counter rather than pass as an ordinary idle tick.
+    // Reads a process-wide counter, so it has to be ordered against the other
+    // tests that assert on it.
+    #[serial_test::serial]
     #[tokio::test]
     async fn does_not_originate_when_the_storage_read_fails() {
         let mut server = mockito::Server::new_async().await;
@@ -894,11 +942,47 @@ mod tests {
             _ => unreachable!("the originator harness is built on the mock"),
         }
 
+        let before = read_failure_count();
         originate_rotation_if_needed(&mut state).await;
 
         assert!(
             state.pending_rotation.is_none(),
             "a gate that could not be read must arm nothing"
+        );
+        assert_eq!(
+            read_failure_count(),
+            before + 1.0,
+            "a stall this driver cannot see past must be visible on the dashboards"
+        );
+    }
+
+    /// The same stall from the other read: the chain's generation is what the
+    /// bounds are measured against, so an RPC outage withholds every rotation
+    /// just as a database one does and has to be just as visible.
+    // Reads a process-wide counter, so it has to be ordered against the other
+    // tests that assert on it.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn does_not_originate_when_the_generation_read_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_read_failure(&mut server);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+
+        let before = read_failure_count();
+        originate_rotation_if_needed(&mut state).await;
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "an unreadable chain generation must arm nothing"
+        );
+        assert_eq!(
+            read_failure_count(),
+            before + 1.0,
+            "a stall this driver cannot see past must be visible on the dashboards"
         );
     }
 

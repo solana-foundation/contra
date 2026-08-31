@@ -21,7 +21,8 @@ use crate::{
     indexer::{
         backfill::{BackfillService, StartupRange},
         checkpoint::{
-            get_last_checkpoint, wait_for_checkpoint_commit, CHECKPOINT_COMMIT_TIMEOUT_SECS,
+            get_last_checkpoint, start_floor, wait_for_checkpoint_commit, BACKFILL_START_SETTING,
+            CHECKPOINT_COMMIT_TIMEOUT_SECS, RPC_POLLING_START_SETTING,
         },
     },
     operator::escrow_sweep::CustodySnapshot,
@@ -157,8 +158,8 @@ async fn resolve_startup_range(
 ) -> Result<StartupRange, IndexerError> {
     backfill_service.resolve_range().await.inspect_err(|e| {
         error!(
-            "Backfill range resolution failed after retries; refusing to start rather than \
-             running ungated past the unfilled gap: {}",
+            "Backfill range resolution failed; refusing to start rather than running ungated \
+             past the unfilled gap: {}",
             e
         );
     })
@@ -415,6 +416,16 @@ pub async fn run(
             let backfill_service =
                 build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
 
+            // Settle the configured floor before any network call. It reads one config
+            // field and one row, so surfacing it first keeps a misconfiguration from
+            // being reported as whatever RPC failure happened to be hit on the way.
+            start_floor(
+                BACKFILL_START_SETTING,
+                common_config.program_type,
+                get_last_checkpoint(&storage, common_config.program_type).await?,
+                indexer_config.backfill.start_slot,
+            )?;
+
             // Only an escrow indexer has custody to compare against, so only it has a
             // reason to hold the stream back until the fill is durable.
             match common_config.escrow_instance_id {
@@ -597,10 +608,29 @@ pub async fn run(
                 }
             })?;
 
+            // A fill is what recovers slots below wherever the stream starts. Without one
+            // the stream is the only producer, so it has to resume from the checkpoint
+            // rather than the tip it would otherwise default to.
+            let live_start_slot = match rpc_live_start_slot {
+                Some(resolved) => Some(resolved),
+                None => {
+                    let checkpoint =
+                        get_last_checkpoint(&storage, common_config.program_type).await?;
+                    let floor = start_floor(
+                        RPC_POLLING_START_SETTING,
+                        common_config.program_type,
+                        checkpoint,
+                        rpc_config.from_slot,
+                    )?;
+                    // Nothing indexed and nothing configured leaves the source its own
+                    // default, since there is no history below the tip to miss.
+                    (checkpoint.is_some() || rpc_config.from_slot.is_some()).then_some(floor + 1)
+                }
+            };
+
             let mut source = RpcPollingSource::new(
                 common_config.rpc_url.clone(),
-                // Resume on backfill's boundary when it ran; otherwise the configured start.
-                rpc_live_start_slot.or(rpc_config.from_slot),
+                live_start_slot,
                 rpc_config.poll_interval_ms,
                 rpc_config.error_retry_interval_ms,
                 rpc_config.batch_size,

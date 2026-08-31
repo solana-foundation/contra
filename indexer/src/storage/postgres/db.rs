@@ -500,9 +500,12 @@ impl PostgresDb {
         // Create indexer_state table for checkpoint tracking
         sqlx::query(
             r#"
+            -- last_committed_slot stays nullable so only the checkpoint writer can claim
+            -- a slot. A default would let a row created for a rotation target read back
+            -- as "indexed through genesis" on a ledger nothing has ever indexed.
             CREATE TABLE IF NOT EXISTS indexer_state (
                 program_type TEXT PRIMARY KEY,
-                last_committed_slot BIGINT NOT NULL DEFAULT 0,
+                last_committed_slot BIGINT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -521,6 +524,17 @@ impl PostgresDb {
         // shows the tree reached it, so a crash leaves the rotation re-armable.
         sqlx::query(
             "ALTER TABLE indexer_state ADD COLUMN IF NOT EXISTS owed_rotation_target BIGINT",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Widen an already-created table. Rows written before this still hold their
+        // defaulted zero, which no migration can tell apart from a real genesis
+        // checkpoint, so this only stops new phantom rows being made.
+        sqlx::query(
+            "ALTER TABLE indexer_state
+                ALTER COLUMN last_committed_slot DROP DEFAULT,
+                ALTER COLUMN last_committed_slot DROP NOT NULL",
         )
         .execute(&self.pool)
         .await?;
@@ -1230,13 +1244,14 @@ impl PostgresDb {
         &self,
         program_type: &str,
     ) -> Result<Option<u64>, sqlx::Error> {
-        let result: Option<(i64,)> =
+        // A row can exist with no slot yet, so an unset column reads as absence too.
+        let result: Option<(Option<i64>,)> =
             sqlx::query_as("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
                 .bind(program_type)
                 .fetch_optional(&self.pool)
                 .await?;
 
-        Ok(result.map(|(slot,)| slot as u64))
+        Ok(result.and_then(|(slot,)| slot).map(|slot| slot as u64))
     }
 
     pub async fn update_committed_checkpoint_internal(

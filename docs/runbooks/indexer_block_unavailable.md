@@ -140,7 +140,10 @@ skipped, and there should not be.
 ### What NOT to do
 
 - Do not raise the indexer's `start_slot` past the wedged slot to unstick it.
-  That is exactly the silent data loss the fail-closed behaviour prevents.
+  That is exactly the silent data loss the fail-closed behaviour prevents. The
+  indexer now enforces this: a start slot above the durable checkpoint refuses to
+  boot, see
+  [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
 - Do not point the indexer at a non-archival peer hoping it differs. A
   load-balanced peer can answer identically, which turns the restart into a
   no-op and burns time.

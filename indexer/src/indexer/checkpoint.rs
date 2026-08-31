@@ -66,10 +66,10 @@ impl CheckpointState {
         }
     }
 
-    /// Gated state seeded at backfill's effective `from_slot`. Seeding the frontier
-    /// from `from_slot` (not a bare DB read) is required because a configured
-    /// `start_slot` can push `from_slot` above the stored checkpoint; seeding lower
-    /// would stall the frontier on slots that backfill will never emit.
+    /// Gated state seeded at backfill's effective `from_slot`. Seeding from `from_slot`
+    /// (not a bare DB read) is required when nothing has ever been indexed, because a
+    /// configured start slot puts the floor above zero and seeding lower would stall the
+    /// frontier on slots that backfill will never emit.
     fn gated(from_slot: u64, target: u64) -> Self {
         Self {
             frontier: from_slot,
@@ -348,6 +348,41 @@ pub async fn get_last_checkpoint(
 
     info!("Last checkpoint for {:?}: {:?}", program_type, checkpoint);
     Ok(checkpoint)
+}
+
+/// Config key naming the first slot startup backfill should fill.
+pub const BACKFILL_START_SETTING: &str = "indexer.backfill.start_slot";
+
+/// Config key naming the first slot the RPC polling source should request.
+pub const RPC_POLLING_START_SETTING: &str = "indexer.rpc_polling.start_slot";
+
+/// Exclusive floor a configured start slot may set, or an error naming the slots it would
+/// skip.
+///
+/// A durable checkpoint is evidence of what was actually processed; a configured start slot
+/// is only intent. Intent may initialise a ledger that has never been indexed, but letting
+/// it advance past evidence would drop the slots in between with nothing recording them.
+pub fn start_floor(
+    setting: &'static str,
+    program_type: ProgramType,
+    last_checkpoint: Option<u64>,
+    configured_start: Option<u64>,
+) -> Result<u64, CheckpointError> {
+    match (last_checkpoint, configured_start) {
+        // A start slot is inclusive and a checkpoint exclusive, so compare one below it.
+        // Equal means resuming exactly where we stopped, which skips nothing.
+        (Some(checkpoint), Some(start_slot)) if start_slot.saturating_sub(1) > checkpoint => {
+            Err(CheckpointError::StartSlotAheadOfCheckpoint {
+                setting,
+                program_type: program_type.as_label(),
+                start_slot,
+                checkpoint,
+            })
+        }
+        (Some(checkpoint), _) => Ok(checkpoint),
+        // Never indexed, so the configured start picks the floor, else catch up from genesis.
+        (None, configured) => Ok(configured.unwrap_or(0).saturating_sub(1)),
+    }
 }
 
 /// Longest startup will wait for a filled range to become durable before giving up.
@@ -762,6 +797,90 @@ mod tests {
         writer.flush_checkpoints(&mut pending).await;
 
         assert!(pending.is_empty());
+    }
+
+    // ============================================================================
+    // start_floor Tests
+    // ============================================================================
+
+    /// Every reachable pairing of a stored checkpoint and a configured start slot.
+    ///
+    /// One table covers both callers because they ask the same question of different
+    /// config keys, so a rule that holds here holds at each call site.
+    #[test]
+    fn start_floor_matrix() {
+        // (checkpoint, configured start, expected floor or None for a refusal, why)
+        type Case = (Option<u64>, Option<u64>, Option<u64>, &'static str);
+
+        let cases: [Case; 10] = [
+            (Some(100), Some(200), None, "skips 101..=199"),
+            (Some(100), Some(102), None, "skips exactly one slot"),
+            (
+                Some(100),
+                Some(101),
+                Some(100),
+                "resumes exactly, skips nothing",
+            ),
+            (Some(100), Some(50), Some(100), "checkpoint wins"),
+            (Some(100), None, Some(100), "no configured start"),
+            (Some(0), Some(1), Some(0), "genesis checkpoint resumed"),
+            (Some(0), Some(2), None, "slot zero is a real checkpoint"),
+            (
+                None,
+                Some(200),
+                Some(199),
+                "empty ledger, start above the tip",
+            ),
+            (None, Some(0), Some(0), "no underflow at genesis"),
+            (None, None, Some(0), "catch up from genesis"),
+        ];
+
+        for (checkpoint, configured, want, why) in cases {
+            let got = start_floor(
+                BACKFILL_START_SETTING,
+                ProgramType::Withdraw,
+                checkpoint,
+                configured,
+            );
+            match want {
+                Some(floor) => assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&floor),
+                    "checkpoint {checkpoint:?} start {configured:?} ({why})"
+                ),
+                None => assert!(
+                    matches!(got, Err(CheckpointError::StartSlotAheadOfCheckpoint { .. })),
+                    "checkpoint {checkpoint:?} start {configured:?} must refuse ({why})"
+                ),
+            }
+        }
+    }
+
+    /// The refusal names the offending key, which is how an operator knows which knob
+    /// to change and how the runbook routes to the right remedy.
+    #[test]
+    fn start_floor_error_names_the_setting_and_program() {
+        let err = start_floor(
+            RPC_POLLING_START_SETTING,
+            ProgramType::Escrow,
+            Some(100),
+            Some(200),
+        )
+        .expect_err("a start slot above the checkpoint must refuse");
+
+        let CheckpointError::StartSlotAheadOfCheckpoint {
+            setting,
+            program_type,
+            start_slot,
+            checkpoint,
+        } = err
+        else {
+            panic!("expected StartSlotAheadOfCheckpoint, got {err:?}");
+        };
+        assert_eq!(setting, "indexer.rpc_polling.start_slot");
+        assert_eq!(program_type, "escrow");
+        assert_eq!(start_slot, 200);
+        assert_eq!(checkpoint, 100);
     }
 
     // ============================================================================

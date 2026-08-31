@@ -6467,6 +6467,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-util 0.7.16",
  "tower-http",

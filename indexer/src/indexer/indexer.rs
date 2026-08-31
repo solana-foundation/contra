@@ -21,8 +21,8 @@ use crate::{
     indexer::{
         backfill::{BackfillService, StartupRange},
         checkpoint::{
-            get_last_checkpoint, start_floor, wait_for_checkpoint_commit, BACKFILL_START_SETTING,
-            CHECKPOINT_COMMIT_TIMEOUT_SECS, RPC_POLLING_START_SETTING,
+            get_last_checkpoint, live_resume_slot, start_floor, wait_for_checkpoint_commit,
+            BACKFILL_START_SETTING, CHECKPOINT_COMMIT_TIMEOUT_SECS, RPC_POLLING_START_SETTING,
         },
     },
     operator::escrow_sweep::CustodySnapshot,
@@ -616,15 +616,13 @@ pub async fn run(
                 None => {
                     let checkpoint =
                         get_last_checkpoint(&storage, common_config.program_type).await?;
-                    let floor = start_floor(
+                    start_floor(
                         RPC_POLLING_START_SETTING,
                         common_config.program_type,
                         checkpoint,
                         rpc_config.from_slot,
                     )?;
-                    // Nothing indexed and nothing configured leaves the source its own
-                    // default, since there is no history below the tip to miss.
-                    (checkpoint.is_some() || rpc_config.from_slot.is_some()).then_some(floor + 1)
+                    live_resume_slot(checkpoint, rpc_config.from_slot)
                 }
             };
 

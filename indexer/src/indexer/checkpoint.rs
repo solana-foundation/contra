@@ -385,6 +385,21 @@ pub fn start_floor(
     }
 }
 
+/// Inclusive slot a live stream with no fill behind it must resume from, or `None` to
+/// leave the source its own default of the chain tip.
+///
+/// A checkpoint is exclusive, so the next unprocessed slot sits one above it. A configured
+/// start is already inclusive and passes through untouched, which keeps slot zero distinct
+/// from slot one on a ledger that has never been indexed.
+pub fn live_resume_slot(
+    last_checkpoint: Option<u64>,
+    configured_start: Option<u64>,
+) -> Option<u64> {
+    last_checkpoint
+        .map(|checkpoint| checkpoint.saturating_add(1))
+        .or(configured_start)
+}
+
 /// Longest startup will wait for a filled range to become durable before giving up.
 ///
 /// Sized as a fail-closed backstop rather than a tuning knob. By the time the wait starts
@@ -807,6 +822,60 @@ mod tests {
     ///
     /// One table covers both callers because they ask the same question of different
     /// config keys, so a rule that holds here holds at each call site.
+    #[test]
+    fn live_resume_slot_matrix() {
+        // (checkpoint, configured start, expected inclusive start, why)
+        type Case = (Option<u64>, Option<u64>, Option<u64>, &'static str);
+
+        let cases: [Case; 7] = [
+            (
+                None,
+                None,
+                None,
+                "nothing known, source keeps its own default",
+            ),
+            (
+                None,
+                Some(0),
+                Some(0),
+                "genesis start survives the round trip",
+            ),
+            (
+                None,
+                Some(200),
+                Some(200),
+                "configured start passes through inclusive",
+            ),
+            (
+                Some(100),
+                None,
+                Some(101),
+                "resume one above the exclusive checkpoint",
+            ),
+            (
+                Some(100),
+                Some(50),
+                Some(101),
+                "checkpoint wins over a lower start",
+            ),
+            (
+                Some(100),
+                Some(101),
+                Some(101),
+                "checkpoint and start agree",
+            ),
+            (Some(0), Some(0), Some(1), "slot zero already processed"),
+        ];
+
+        for (checkpoint, configured, want, why) in cases {
+            assert_eq!(
+                live_resume_slot(checkpoint, configured),
+                want,
+                "checkpoint {checkpoint:?} start {configured:?} ({why})"
+            );
+        }
+    }
+
     #[test]
     fn start_floor_matrix() {
         // (checkpoint, configured start, expected floor or None for a refusal, why)

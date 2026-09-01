@@ -939,7 +939,12 @@ mod tests {
                 Some(100),
                 "one slot below the checkpoint still warns",
             ),
-            (Some(0), Some(0), Some(0), "genesis start matches genesis checkpoint"),
+            (
+                Some(0),
+                Some(0),
+                Some(0),
+                "genesis start matches genesis checkpoint",
+            ),
             (Some(100), None, Some(100), "no configured start"),
             (Some(0), Some(1), Some(0), "genesis checkpoint resumed"),
             (Some(0), Some(2), None, "slot zero is a real checkpoint"),

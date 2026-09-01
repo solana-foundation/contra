@@ -890,7 +890,6 @@ mod tests {
             admin_keys: vec![],
             rx: ingress_rx,
             output_tx: dedup_tx,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })

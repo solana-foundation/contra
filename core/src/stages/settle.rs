@@ -531,7 +531,14 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 // Both announcements are attempted before the
                                 // commit returns, so stopping here cannot leave
                                 // this block half-announced.
-                                if settle_result.publisher_gone {
+                                //
+                                // A drain retires dedup and the executor ahead of
+                                // this stage, so their channels closing is the
+                                // expected end state and must not cut the drain
+                                // short while the executor is still feeding us.
+                                // Outside a drain it means a stage died, which
+                                // still stops the node.
+                                if settle_result.publisher_gone && !shutdown_token.is_cancelled() {
                                     break;
                                 }
                             }
@@ -875,6 +882,7 @@ async fn settle_with_retry(
 }
 
 /// Settle transactions: Update accounts database with changes
+#[allow(clippy::too_many_arguments)]
 async fn settle_transactions(
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
@@ -1598,24 +1606,33 @@ mod tests {
         }
     }
 
-    /// Make every commit at `slot` fail, the way a storage-side error would.
-    async fn block_slot(pool: &sqlx::PgPool, slot: u64) {
+    /// Make every slot above the current tip fail to commit, the way a
+    /// storage-side error would, and return that tip.
+    ///
+    /// A constraint aimed at one slot races the settler, which mints an empty
+    /// block every tick and may already have passed it. Capping the whole table
+    /// cannot race: whatever slot comes next is above the cap and fails.
+    async fn block_slots_above_tip(pool: &sqlx::PgPool) -> u64 {
+        let tip: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+            .fetch_one(pool)
+            .await
+            .expect("read tip");
+        let tip = tip.unwrap_or(0) as u64;
         sqlx::query(&format!(
-            "ALTER TABLE blocks ADD CONSTRAINT test_no_slot_{slot} CHECK (slot <> {slot})"
+            "ALTER TABLE blocks ADD CONSTRAINT test_slot_ceiling CHECK (slot <= {tip}) NOT VALID"
         ))
         .execute(pool)
         .await
         .expect("add blocking constraint");
+        tip
     }
 
-    /// Lift the block put in place by `block_slot`.
-    async fn unblock_slot(pool: &sqlx::PgPool, slot: u64) {
-        sqlx::query(&format!(
-            "ALTER TABLE blocks DROP CONSTRAINT test_no_slot_{slot}"
-        ))
-        .execute(pool)
-        .await
-        .expect("drop blocking constraint");
+    /// Lift the ceiling so commits succeed again.
+    async fn unblock_slots(pool: &sqlx::PgPool) {
+        sqlx::query("ALTER TABLE blocks DROP CONSTRAINT test_slot_ceiling")
+            .execute(pool)
+            .await
+            .expect("drop blocking constraint");
     }
 
     /// Seconds since the epoch, for comparing against a committed block time.
@@ -1951,16 +1968,16 @@ mod tests {
 
         // Genesis is slot 0, so the first block carrying our batch is slot 1.
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
-        block_slot(&pool, 1).await;
+        let tip = block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
         exec_tx.send((output, txs, 1)).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(600)).await;
-        unblock_slot(&pool, 1).await;
+        unblock_slots(&pool).await;
 
         assert!(
-            await_block(&pool, 1, Duration::from_secs(20)).await,
+            await_block(&pool, tip + 1, Duration::from_secs(20)).await,
             "the batch must land once the failure clears"
         );
         shutdown.cancel();
@@ -1982,7 +1999,7 @@ mod tests {
             settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
-        block_slot(&pool, 1).await;
+        let tip = block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
         exec_tx.send((output, txs, 1)).await.unwrap();
@@ -1991,13 +2008,14 @@ mod tests {
         // would be several seconds later than one pinned at the first.
         tokio::time::sleep(Duration::from_millis(3500)).await;
         let unblocked_at = unix_secs();
-        unblock_slot(&pool, 1).await;
+        unblock_slots(&pool).await;
 
-        assert!(await_block(&pool, 1, Duration::from_secs(20)).await);
-        let raw: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = 1")
+        assert!(await_block(&pool, tip + 1, Duration::from_secs(20)).await);
+        let raw: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = $1")
+            .bind((tip + 1) as i64)
             .fetch_one(pool.as_ref())
             .await
-            .expect("read block 1");
+            .expect("read the blocked block");
         let block: BlockInfo = bincode::deserialize(&raw).expect("decode block 1");
         let block_time = block.block_time.expect("block time present");
         assert!(
@@ -2064,7 +2082,7 @@ mod tests {
             settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
-        block_slot(&pool, 1).await;
+        block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
         exec_tx.send((output, txs, 1)).await.unwrap();
@@ -2093,7 +2111,7 @@ mod tests {
             settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
-        block_slot(&pool, 1).await;
+        block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
         exec_tx.send((output, txs, 1)).await.unwrap();
@@ -2170,7 +2188,7 @@ mod tests {
             settler_under_test(url, 100, 4, metrics, shutdown.clone()).await;
 
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
-        block_slot(&pool, 1).await;
+        let tip = block_slots_above_tip(&pool).await;
 
         // Buffered before the tick that fails.
         let (output, txs) = sized_settle_batch(1024);
@@ -2194,7 +2212,7 @@ mod tests {
             "both the buffered and the queued transaction must be recorded"
         );
         assert!(
-            !await_block(&pool, 1, Duration::from_millis(200)).await,
+            !await_block(&pool, tip + 1, Duration::from_millis(200)).await,
             "no block may exist for a batch that was discarded"
         );
         shutdown.cancel();

@@ -68,10 +68,6 @@ pub struct WriteDeps {
     /// RPC ingress sender feeding the sigverify worker pool (the first stage).
     pub dedup_tx: async_channel::Sender<SanitizedTransaction>,
     pub metrics: SharedMetrics,
-    /// Cancelled on shutdown, which closes admission. Connections are served by
-    /// detached tasks that outlive the accept loop, so refusing here is the only
-    /// way to stop handing out signatures for work no stage will read.
-    pub shutdown_token: tokio_util::sync::CancellationToken,
 }
 
 /// RPC implementation for PrivateChannel

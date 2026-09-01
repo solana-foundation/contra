@@ -137,6 +137,9 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+    /// Closed first on shutdown, which is what refuses admission. `None` on a
+    /// read node, which has no write pipeline to close.
+    ingress_tx: Option<async_channel::Sender<SanitizedTransaction>>,
 }
 
 /// How long a read node waits out a cache stamped for another deployment. Worth
@@ -282,7 +285,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 admin_keys: config.admin_keys.clone(),
                 rx: ingress_rx,
                 output_tx: dedup_tx,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: sigverify_hb,
             })
@@ -372,7 +374,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 Some(WriteDeps {
                     dedup_tx: ingress_tx,
                     metrics: Arc::clone(&config.metrics),
-                    shutdown_token: shutdown_token.clone(),
                 }),
                 live_blockhashes,
             )
@@ -423,6 +424,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         NodeMode::Write => None,
     };
 
+    // The admission handle, kept so shutdown can close it before anything else.
+    let ingress_tx = write_deps.as_ref().map(|deps| deps.dedup_tx.clone());
+
     let rpc_config = RpcServiceConfig {
         port: config.port,
         max_connections: config.max_connections,
@@ -450,6 +454,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     Ok(NodeHandles {
         workers,
         shutdown_token,
+        ingress_tx,
     })
 }
 
@@ -481,6 +486,13 @@ impl NodeHandles {
         // Closes admission. Every stage after the ingress edge exits when its
         // own input closes, so cancelling here starts a drain that walks the
         // pipeline in order rather than stopping all stages at once.
+        // Closed before the token so admission stops first. A closed channel
+        // still hands its buffered transactions to sigverify, so this refuses
+        // new work without discarding anything already accepted. Reversed, the
+        // stages would start unwinding while admission was still open.
+        if let Some(ref ingress_tx) = self.ingress_tx {
+            ingress_tx.close();
+        }
         self.shutdown_token.cancel();
 
         // One deadline for the whole drain, not one per worker: the workers are
@@ -488,22 +500,80 @@ impl NodeHandles {
         // the number of stages and overrun the container's stop grace period,
         // which kills the process mid-drain and loses what the order preserved.
         let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
-        for worker in self.workers {
+        let mut overran = false;
+        for mut worker in self.workers {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, worker.handle).await {
+            match tokio::time::timeout(remaining, &mut worker.handle).await {
                 Ok(Ok(_)) => info!("{} stopped gracefully", worker.name),
                 Ok(Err(e)) => error!("{} error: {:?}", worker.name, e),
-                Err(_) => warn!("{} did not drain within the shutdown deadline", worker.name),
+                Err(_) => {
+                    // Dropping a JoinHandle detaches the task rather than
+                    // stopping it, so an in-process restart would leave this
+                    // stage holding its pool and channels beside the new one.
+                    worker.handle.abort();
+                    overran = true;
+                    warn!(
+                        "{} did not drain within the deadline and was aborted",
+                        worker.name
+                    );
+                }
             }
         }
 
-        info!("Node shutdown complete");
+        if overran {
+            warn!("Node shutdown finished with at least one stage aborted mid-drain");
+        } else {
+            info!("Node shutdown complete");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A worker that outlives the drain must be stopped, not merely stopped
+    /// waiting on. A dropped JoinHandle leaves the task running, so an
+    /// in-process restart would put a second pipeline on the same database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_overruns_the_drain_is_aborted() {
+        // Set when the task is dropped, which only happens if it was aborted.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&stopped));
+        let stuck = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await
+        });
+        let handles = NodeHandles {
+            workers: vec![WorkerHandle::new("Stuck".to_string(), stuck)],
+            shutdown_token: CancellationToken::new(),
+            ingress_tx: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(2),
+            "shutdown must return once the drain deadline passes"
+        );
+
+        // Abort is asynchronous, so give the runtime a moment to drop the task.
+        for _ in 0..50 {
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the overrunning worker was left running after shutdown returned");
+    }
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_blocktime() {

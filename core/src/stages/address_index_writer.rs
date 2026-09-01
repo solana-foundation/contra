@@ -76,7 +76,12 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
                 break;
             }
             heartbeat.record_input();
-            metrics.address_signatures_queue_depth(rows_rx.len());
+            // From permits, not `len()`: that one subtracts a closed flag from
+            // the queue position and underflows when the settler drops its
+            // sender right after this drained the last batch, which is how an
+            // ordered drain normally ends.
+            let depth = rows_rx.max_capacity().saturating_sub(rows_rx.capacity());
+            metrics.address_signatures_queue_depth(depth);
 
             for batch in buf.drain(..) {
                 flat.extend(batch);

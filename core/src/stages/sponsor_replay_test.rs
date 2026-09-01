@@ -82,7 +82,6 @@ async fn sponsor_cannot_replay_spl_transfer_under_varied_first_signature() {
         admin_keys: vec![],
         rx: ingress_rx,
         output_tx: dedup_tx,
-        shutdown_token: shutdown.clone(),
         metrics: Arc::new(NoopMetrics),
         heartbeat: StageHeartbeat::new(),
     })

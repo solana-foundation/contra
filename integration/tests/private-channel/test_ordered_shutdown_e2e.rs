@@ -175,6 +175,10 @@ impl Loader {
 
 /// Transactions admitted but not yet settled. A drain test is only meaningful
 /// when this is non-zero at the moment shutdown is called.
+///
+/// The counters are process-global and cumulative across every node this binary
+/// starts, so this is only meaningful as a delta against a baseline taken while
+/// the node under test was still idle.
 fn in_flight() -> f64 {
     metric_total("private_channel_dedup_received_total")
         - metric_total("private_channel_settler_txs_settled_total")
@@ -221,6 +225,27 @@ async fn assert_all_queryable(client: &RpcClient, accepted: &[Signature]) {
             missing.push(*sig);
         }
     }
+    // Only on failure, and worth the lines: loss is always a stage dropping work,
+    // and the counters say which one without another twenty-minute run.
+    if !missing.is_empty() {
+        println!(
+            "stage totals: sigverify_fwd={} sigverify_rej={} dedup_recv={} dedup_fwd={} \
+             dedup_dup={} dedup_unknown_bh={} seq_emitted={} exec_sent={} exec_expired={} \
+             exec_send_failed={} settled={} discarded={}",
+            metric_total("private_channel_sigverify_forwarded_total"),
+            metric_total("private_channel_sigverify_rejected_total"),
+            metric_total("private_channel_dedup_received_total"),
+            metric_total("private_channel_dedup_forwarded_total"),
+            metric_total("private_channel_dedup_dropped_duplicate_total"),
+            metric_total("private_channel_dedup_dropped_unknown_bh_total"),
+            metric_total("private_channel_sequencer_transactions_emitted_total"),
+            metric_total("private_channel_executor_results_sent_total"),
+            metric_total("private_channel_executor_dropped_expired_bh_total"),
+            metric_total("private_channel_executor_results_send_failed_total"),
+            metric_total("private_channel_settler_txs_settled_total"),
+            metric_total("private_channel_settler_discarded_transactions_total"),
+        );
+    }
     assert!(
         missing.is_empty(),
         "{} of {} accepted transactions were lost across shutdown: {:?}",
@@ -244,6 +269,7 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
     let client = RpcClient::new_with_commitment(url.clone(), CommitmentConfig::processed());
 
     let discarded_before = metric_total("private_channel_settler_discarded_transactions_total");
+    let in_flight_before = in_flight();
 
     let loader = Loader::spawn(&url, 4).await;
     sleep(Duration::from_secs(2)).await;
@@ -251,7 +277,7 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
     // Guards against a vacuous pass: if the pipeline had already settled
     // everything, the drain would never be exercised and this test would prove
     // nothing. Sampled immediately before the shutdown it is about to survive.
-    let carried = in_flight();
+    let carried = in_flight() - in_flight_before;
     assert!(
         carried > 0.0,
         "shutdown landed on an empty pipeline, so the drain was never exercised"
@@ -260,14 +286,15 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
 
     handles.shutdown().await;
 
-    // Admission must be closed once shutdown has started.
-    let after_shutdown = client
-        .send_transaction(&memo_tx(solana_sdk::hash::Hash::default(), 9_999))
-        .await;
-    assert!(
-        after_shutdown.is_err(),
-        "a shut-down node must not acknowledge new transactions"
-    );
+    // Only that it is refused, not how. The accept loop has already exited, so a
+    // client opening a fresh connection is turned away at the transport and
+    // never reaches admission. Which error admission itself returns is pinned by
+    // the send_transaction_impl unit tests instead.
+    let err = client
+        .send_transaction(&memo_tx(solana_sdk::hash::Hash::new_unique(), 9_999))
+        .await
+        .expect_err("a shut-down node must not acknowledge new transactions");
+    println!("post-shutdown submission refused with: {err}");
 
     let accepted = loader.finish();
     assert!(
@@ -308,12 +335,13 @@ async fn a_saturated_pipeline_still_drains_within_the_deadline() {
     let (handles, url) = start_node(load_config(db_url.clone(), free_port())).await;
 
     let discarded_before = metric_total("private_channel_settler_discarded_transactions_total");
+    let in_flight_before = in_flight();
 
     // More submitters than the first test, to hold every queue at capacity.
     let loader = Loader::spawn(&url, 8).await;
     sleep(Duration::from_secs(3)).await;
 
-    let carried = in_flight();
+    let carried = in_flight() - in_flight_before;
     assert!(
         carried > 0.0,
         "pipeline was not saturated, so the deadline was never tested"

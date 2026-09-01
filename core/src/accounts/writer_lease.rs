@@ -26,7 +26,8 @@ const LEASE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// does not reset a returned connection, so a pooled lock would never free.
 pub struct WriterLease {
     stop: CancellationToken,
-    heartbeat: JoinHandle<()>,
+    /// Taken by `release`, which is the only path that awaits the heartbeat.
+    heartbeat: Option<JoinHandle<()>>,
 }
 
 /// Does this session still hold the lease?
@@ -139,15 +140,35 @@ impl WriterLease {
         ));
 
         info!("Writer lease acquired");
-        Ok(Self { stop, heartbeat })
+        Ok(Self {
+            stop,
+            heartbeat: Some(heartbeat),
+        })
     }
 
     /// Give the lease up so a replacement node can start immediately.
-    pub async fn release(self) {
+    pub async fn release(mut self) {
         self.stop.cancel();
-        if let Err(e) = self.heartbeat.await {
-            warn!("Writer lease heartbeat did not stop cleanly: {}", e);
+        if let Some(heartbeat) = self.heartbeat.take() {
+            if let Err(e) = heartbeat.await {
+                warn!("Writer lease heartbeat did not stop cleanly: {}", e);
+            }
         }
+    }
+
+    /// Keep the lock until this process exits, for a shutdown that could not prove
+    /// every worker had stopped. Releasing it there would let a replacement start
+    /// while a detached worker can still commit.
+    pub fn hold(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WriterLease {
+    /// A lease dropped on an error path still has to free the lock, so cancel and
+    /// let the heartbeat unlock and close the session on its way out.
+    fn drop(&mut self) {
+        self.stop.cancel();
     }
 }
 
@@ -197,6 +218,29 @@ mod tests {
         WriterLease::acquire(&url, shutdown)
             .await
             .expect("the lease must be available again after a release");
+    }
+
+    /// A failed startup drops the lease instead of releasing it, and that must
+    /// still free the lock, or the next write node in this process is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_lease_dropped_without_release_still_frees_the_lock() {
+        let (_db, _pg, url) = start_test_postgres_with_url().await;
+        let shutdown = CancellationToken::new();
+
+        drop(
+            WriterLease::acquire(&url, shutdown.clone())
+                .await
+                .expect("the first lease must be granted"),
+        );
+
+        // The unlock runs on the heartbeat task, so it lands a moment later.
+        for _ in 0..50 {
+            if WriterLease::acquire(&url, shutdown.clone()).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("a dropped lease must free the lock");
     }
 
     /// Advisory locks are per database, so two deployments sharing one Postgres

@@ -492,6 +492,7 @@ impl NodeHandles {
         self.shutdown_token.cancel();
 
         // Wait for all workers to finish
+        let mut all_stopped = true;
         for worker in self.workers {
             // A worker already observed exiting has been polled to completion, and
             // awaiting it a second time panics.
@@ -502,15 +503,23 @@ impl NodeHandles {
             match tokio::time::timeout(Duration::from_secs(5), worker.handle).await {
                 Ok(Ok(_)) => info!("{} stopped gracefully", worker.name),
                 Ok(Err(e)) => error!("{} error: {:?}", worker.name, e),
-                Err(_) => warn!("{} shutdown timeout", worker.name),
+                Err(_) => {
+                    warn!("{} shutdown timeout", worker.name);
+                    all_stopped = false;
+                }
             }
         }
 
-        // Released after the workers, so a settler still draining keeps the lease.
-        // A worker that outlives the join timeout is the gap: a replacement node
-        // could take the lease while that worker is still committing.
+        // A worker past the join timeout is detached rather than stopped, so it can
+        // still commit. Handing the lease over then would let a replacement start
+        // from the old tip and be killed by the first slot that worker writes.
         if let Some(lease) = self.writer_lease {
-            lease.release().await;
+            if all_stopped {
+                lease.release().await;
+            } else {
+                warn!("Holding the writer lease: a worker did not stop in time");
+                lease.hold();
+            }
         }
 
         info!("Node shutdown complete");
@@ -520,6 +529,69 @@ impl NodeHandles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build handles around one worker so shutdown can be driven directly; that
+    /// is the only way to exercise a worker which refuses to stop.
+    fn handles_with(
+        worker: WorkerHandle,
+        token: CancellationToken,
+        lease: WriterLease,
+    ) -> NodeHandles {
+        NodeHandles {
+            workers: vec![worker],
+            shutdown_token: token,
+            writer_lease: Some(lease),
+        }
+    }
+
+    /// The clean path: every worker stops, so the lease is handed over at once and
+    /// a replacement node can start immediately.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_releases_the_lease_when_every_worker_stops() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone())
+            .await
+            .expect("the lease must be granted");
+
+        let watched = token.clone();
+        let worker = WorkerHandle::new(
+            "Tidy".to_string(),
+            tokio::spawn(async move { watched.cancelled().await }),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        WriterLease::acquire(&url, CancellationToken::new())
+            .await
+            .expect("a stopped node must hand the lease over");
+    }
+
+    /// A worker that outlives the join timeout is detached, not stopped, so it can
+    /// still commit. Handing the lease over then would let a replacement start from
+    /// the old tip and be killed by the first slot the detached worker writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_keeps_the_lease_when_a_worker_outlives_the_join_timeout() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone())
+            .await
+            .expect("the lease must be granted");
+
+        let worker = WorkerHandle::new(
+            "Stubborn".to_string(),
+            tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        assert!(
+            WriterLease::acquire(&url, CancellationToken::new())
+                .await
+                .is_err(),
+            "the lease must stay held while a worker could still be committing"
+        );
+    }
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_blocktime() {

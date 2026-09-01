@@ -290,14 +290,17 @@
     # deploy an app image that wasn't built + signed by our publish workflow
     # (.github/workflows/publish-image.yml). cosign resolves the tag to its
     # digest and checks the keyless signature (Fulcio cert identity + Rekor), so
-    # a tampered, unsigned, or foreign image fails preflight before any pull.
+    # a tampered, unsigned, or foreign image fails before any pull.
     # Off by default; set `verify_image_signature: true` on stacks that pull the
     # signed org image from GHCR.
+    # Tagged `deploy` as well as `preflight` so the gate still runs when an
+    # operator invokes the deploy phase standalone (`--tags deploy`); otherwise
+    # the phase-4 pull below would fetch the mutable tag unverified.
     - name: Verify app image signature (cosign)
       when: verify_image_signature | default(false) | bool
       delegate_to: localhost
       run_once: true
-      tags: [ preflight ]
+      tags: [ preflight, deploy ]
       block:
       - name: Probe cosign on the control node
         ansible.builtin.command: cosign version

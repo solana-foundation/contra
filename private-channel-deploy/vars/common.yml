@@ -80,6 +80,10 @@ notify_webhook: ""
 #   alert_webhook_url: <slack incoming webhook URL>   # treat as a secret
 alert_contact_type: "webhook"
 alert_webhook_url: "http://localhost:9/no-op"
+# External URL Grafana uses when generating links (alert notifications, share
+# links). Defaults to localhost; override per stack with the box's reachable
+# Grafana address, e.g. grafana_root_url: "http://<external-ip>:3001".
+grafana_root_url: "http://localhost:3000"
 
 # --- Build-arg pins, mirrored from versions.env so renders stay reproducible ---
 # Shipped to the target during PHASE 3 RENDER and passed to compose via --env-file.

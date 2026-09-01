@@ -27,6 +27,18 @@ pub struct AddressSignatureRow {
     pub signature: Vec<u8>,
 }
 
+/// Refusal message for a batch whose block does not extend the stored ledger.
+/// Names both causes: a second write-capable node, or this node retrying a slot
+/// whose commit it never saw land. The log line is what an operator sees first.
+fn stale_tip_error(slot: u64) -> String {
+    format!(
+        "Refusing to commit slot {}: a block at or above it is already stored. \
+         Either a second write-capable node is running against this database, or \
+         this batch retries a slot that already committed.",
+        slot
+    )
+}
+
 /// Bulk-insert into address_signatures inside an active PG tx.
 pub(crate) async fn upsert_address_signature_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -216,8 +228,9 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
 
-    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
-    // via this path and MVCC returns the caller's own last commit.
+    // Read-modify-write inside BEGIN…COMMIT: the settler always extends the tip by
+    // one slot, so the block insert below lets only one writer commit that slot and
+    // a rejected writer's increment rolls back with the rest of its batch.
     if tx_count > 0 {
         let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT value FROM metadata WHERE key = 'transaction_count'",
@@ -244,15 +257,30 @@ async fn write_batch_postgres(
 
     // ── Block info: at most 2 queries (block row + latest_blockhash) ──
     if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        sqlx::query(
-            "INSERT INTO blocks (slot, data) VALUES ($1, $2)
-                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data",
+        // A block may only extend the stored ledger. The WHERE clause rejects a
+        // writer whose tip has already been passed, and the slot primary key
+        // rejects a second writer racing this one for the same slot.
+        let inserted = sqlx::query(
+            "INSERT INTO blocks (slot, data)
+                 SELECT $1, $2
+                 WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot >= $1)",
         )
         .bind(block_info.slot as i64)
         .bind(block_data)
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("Failed to store block: {}", e))?;
+        .map_err(|e| match &e {
+            // 23505 = unique_violation: the racing writer committed first.
+            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
+                stale_tip_error(block_info.slot)
+            }
+            _ => format!("Failed to store block: {}", e),
+        })?;
+
+        // No row inserted means a block at or above this slot was already stored.
+        if inserted.rows_affected() == 0 {
+            return Err(stale_tip_error(block_info.slot));
+        }
 
         sqlx::query(
             "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)

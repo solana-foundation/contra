@@ -2,7 +2,7 @@ use {
     crate::{
         accounts::{
             address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
-            redis::RedisAccountsDB, AccountsDB,
+            redis::RedisAccountsDB, writer_lease::WriterLease, AccountsDB,
         },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
@@ -130,6 +130,9 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+    /// Held for the node's lifetime by write-capable modes, released on shutdown
+    /// so a replacement node can start straight away.
+    writer_lease: Option<WriterLease>,
 }
 
 /// How long a read node waits out a cache stamped for another deployment. Worth
@@ -198,6 +201,16 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
+
+    // Taken after config validation so a bad config still fails without touching
+    // Postgres, and before any write-path work so a duplicate node is refused
+    // before it repairs indexes or serves RPC. Losing the lease later cancels the
+    // same token, so the node stops rather than running on without it.
+    let writer_lease = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+        Some(WriterLease::acquire(&config.accountsdb_connection_url, shutdown_token.clone()).await?)
+    } else {
+        None
+    };
 
     // Heartbeat registry — populated for stages that actually run, consumed by /health.
     let mut heartbeats = crate::health::HeartbeatRegistry::new();
@@ -446,6 +459,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     Ok(NodeHandles {
         workers,
         shutdown_token,
+        writer_lease,
     })
 }
 
@@ -479,11 +493,24 @@ impl NodeHandles {
 
         // Wait for all workers to finish
         for worker in self.workers {
+            // A worker already observed exiting has been polled to completion, and
+            // awaiting it a second time panics.
+            if worker.handle.is_finished() {
+                info!("{} already stopped", worker.name);
+                continue;
+            }
             match tokio::time::timeout(Duration::from_secs(5), worker.handle).await {
                 Ok(Ok(_)) => info!("{} stopped gracefully", worker.name),
                 Ok(Err(e)) => error!("{} error: {:?}", worker.name, e),
                 Err(_) => warn!("{} shutdown timeout", worker.name),
             }
+        }
+
+        // Released after the workers, so a settler still draining keeps the lease.
+        // A worker that outlives the join timeout is the gap: a replacement node
+        // could take the lease while that worker is still committing.
+        if let Some(lease) = self.writer_lease {
+            lease.release().await;
         }
 
         info!("Node shutdown complete");

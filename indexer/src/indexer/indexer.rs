@@ -31,7 +31,7 @@ use crate::{
 use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
-use crate::indexer::backfill::ensure_startup_anchor;
+use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
 
 #[cfg(feature = "datasource-rpc")]
 use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
@@ -381,11 +381,6 @@ pub async fn run(
     #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
     let mut startup_anchor_hint: Option<u64> = None;
 
-    // Whether a startup fill ran ahead of the live stream, which is what opens the window
-    // the Yellowstone source has to repair on its very first connection.
-    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
-    let mut backfill_preceded_stream = false;
-
     // 4d. Fill the missing range. An escrow indexer waits for that fill to become durable
     // and reconciles before the stream starts; every other program type keeps the fill
     // alongside the stream, as it was before, since it has no custody to compare against
@@ -552,13 +547,6 @@ pub async fn run(
                             Err(e) => return Err(e),
                         }
                     }
-
-                    // Only this path leaves a window between the fill and the first
-                    // streamed slot; a concurrent fill still covers the cold start itself.
-                    #[cfg(feature = "datasource-yellowstone")]
-                    {
-                        backfill_preceded_stream = true;
-                    }
                 }
                 None => {
                     let range = resolve_startup_range(&backfill_service).await?;
@@ -697,7 +685,7 @@ pub async fn run(
                 // before the stream can deliver anything. Failing here refuses to start,
                 // which beats streaming past a window that could never be recovered: once a
                 // later slot is checkpointed, the slots below it stop being reachable.
-                ensure_startup_anchor(
+                let anchor = ensure_startup_anchor(
                     &storage,
                     common_config.program_type,
                     &gap_rpc_poller,
@@ -705,24 +693,18 @@ pub async fn run(
                 )
                 .await?;
 
-                let source = source
+                // Startup owns everything below its live boundary, so the first stream only
+                // replays above it. With no backfill the anchor is that boundary itself.
+                let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor)?;
+
+                source
+                    .with_startup_floor(startup_floor)
                     .with_gap_detection(
                         gap_rpc_poller,
                         indexer_config.backfill.max_gap_slots,
                         indexer_config.backfill.batch_size,
                     )
-                    .with_storage(storage.clone());
-
-                // A fill that ran to completion above leaves the slots produced since its
-                // target covered by neither it nor the stream, and the first streamed slot
-                // would carry the checkpoint straight over them. Arming the first
-                // connection replays that window instead. The anchor it needs was just
-                // guaranteed above.
-                if backfill_preceded_stream {
-                    source.with_first_connection_arming()
-                } else {
-                    source
-                }
+                    .with_storage(storage.clone())
             };
 
             let source = if let Some(h) = health.clone() {

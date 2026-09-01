@@ -1,8 +1,12 @@
 use {
     crate::{
         accounts::{
-            postgres::PostgresAccountsDB, redis::RedisAccountsDB, redis_coherence,
-            traits::BlockInfo, write_batch::AddressSignatureRow, AccountsDB,
+            postgres::PostgresAccountsDB,
+            redis::{RedisAccountsDB, CACHE_FAILURE_LIMIT},
+            redis_coherence,
+            traits::BlockInfo,
+            write_batch::AddressSignatureRow,
+            AccountsDB,
         },
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
@@ -33,6 +37,20 @@ use {
 };
 
 const SETTLE_START_DELAY_MS: u64 = 1000;
+
+/// How long the Redis mirror may hold the settle path, sized against the default
+/// 100ms blocktime. Smaller than the transport timeout, so this is what fires.
+const CACHE_MIRROR_BUDGET: Duration = Duration::from_millis(100);
+
+/// How long a cache given up on is left alone before the settler probes it.
+/// Longer than the lease, so readers have dropped it by then whether or not the
+/// eviction that gave it up landed.
+pub const CACHE_MIRROR_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How long a probe may take. Off the block path, so it can cover the reconnect
+/// a cache that has been away needs rather than failing a healthy one for being
+/// slow to answer the first time.
+const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A single account that has been settled
 /// We need to track if the account was deleted so we can tombstone it
@@ -102,6 +120,19 @@ pub(crate) fn retained_bytes_of(
 struct SettleResult {
     slot: u64,
     blockhash: Hash,
+    /// An announcement found no consumer. Not an error: the block is
+    /// committed, and the caller still owes it the bookkeeping.
+    publisher_gone: bool,
+}
+
+/// The channels a committed block is announced on, ahead of any cache work.
+struct BlockPublishers<'a> {
+    /// Advances the dedup window. Until dedup holds the hash, transactions
+    /// built on it are dropped.
+    blockhashes: &'a mpsc::UnboundedSender<Hash>,
+    /// Acks the commit to BOB, which unpins the settled accounts.
+    accounts: &'a mpsc::UnboundedSender<AccountSettlements>,
+    address_signatures: &'a mpsc::Sender<Vec<AddressSignatureRow>>,
 }
 
 #[derive(Debug)]
@@ -213,6 +244,10 @@ pub struct SettleArgs {
     /// cannot stop mirroring a cache that readers still trust.
     pub redis_cache_url: Option<String>,
     pub blocktime_ms: u64,
+    /// How long a cache given up on is left alone before it is probed again. A
+    /// field so a test can drive a give-up and its recovery without waiting out
+    /// the production one.
+    pub cache_mirror_cooldown: Duration,
     pub perf_sample_period_secs: u64,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
@@ -228,6 +263,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         accountsdb_connection_url,
         redis_cache_url,
         blocktime_ms,
+        cache_mirror_cooldown,
         perf_sample_period_secs,
         shutdown_token,
         metrics,
@@ -243,6 +279,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             accountsdb_connection_url: String,
             redis_cache_url: Option<String>,
             blocktime_ms: u64,
+            cache_mirror_cooldown: Duration,
             perf_sample_period_secs: u64,
             shutdown_token: CancellationToken,
             metrics: SharedMetrics,
@@ -274,12 +311,23 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             info!("Redis cache enabled");
                             Some(r)
                         }
+                        // Connecting is what builds the handle, so there is
+                        // nothing here to hold paused and nothing for a probe to
+                        // pick up: unlike an alignment failure, this one costs
+                        // the cache until the node is restarted.
                         Ok(Err(e)) => {
-                            warn!("Redis unavailable ({}), running Postgres-only", e);
+                            warn!(
+                                "Redis unavailable ({}), running Postgres-only until restarted",
+                                e
+                            );
+                            metrics.redis_cache_disabled();
                             None
                         }
                         Err(_) => {
-                            warn!("Redis connection timed out, running Postgres-only");
+                            warn!(
+                                "Redis connection timed out, running Postgres-only until restarted"
+                            );
+                            metrics.redis_cache_disabled();
                             None
                         }
                     }
@@ -314,8 +362,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             }
 
             // Align the cache with Postgres before the first dual-write. Failing
-            // to verify it means the cache cannot be trusted, so drop it and run
-            // Postgres-only rather than write a second ledger into it.
+            // to verify it means the cache cannot be trusted, so run Postgres-only
+            // rather than write a second ledger into it.
             redis_db = match redis_db {
                 Some(redis) => {
                     match warm_redis_cache(&postgres_db, &redis, last_slot, last_blockhash).await {
@@ -326,18 +374,23 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             Some(redis)
                         }
                         Err(e) => {
-                            error!("Redis cache alignment failed, running Postgres-only: {}", e);
+                            error!(
+                                "Redis cache alignment failed, running Postgres-only until it is probed: {}",
+                                e
+                            );
                             metrics.redis_cache_disabled();
                             // The failure may have come before the stamp was
                             // cleared, leaving a stamped cache whose tip is about
-                            // to stop advancing. Nothing else will ever clear it:
-                            // dropping the handle here means no further continuity
-                            // checks run, so read nodes would serve those frozen
-                            // values indefinitely.
+                            // to stop advancing, and read nodes would serve those
+                            // frozen values until its lease ran out.
                             if let Err(e) = redis_coherence::clear_deployment_id(&redis).await {
                                 error!("Could not take the Redis cache out of service: {}", e);
                             }
-                            None
+                            // Held paused rather than dropped, so the probe that
+                            // recovers a cache lost at runtime also recovers one
+                            // that could not be verified at boot.
+                            redis.pause_mirroring(cache_mirror_cooldown);
+                            Some(redis)
                         }
                     }
                 }
@@ -403,6 +456,22 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     // Blocktime tick: unconditionally produce a block with
                     // whatever has accumulated since the last tick.
                     _ = blocktime_interval.tick() => {
+                        // A cooldown that has run out earns a probe, off the block
+                        // path. Claimed first, so a cooldown lapsing under a slow
+                        // probe cannot start a second one, and re-armed so the
+                        // cache stays out of the mirror until a probe lifts it.
+                        if let Some(paused) =
+                            redis_db.as_ref().filter(|redis| redis.pause_has_lapsed())
+                        {
+                            if paused.try_begin_probe() {
+                                paused.pause_mirroring(cache_mirror_cooldown);
+                                tokio::spawn(probe_paused_cache(
+                                    paused.clone(),
+                                    Arc::clone(&metrics),
+                                ));
+                            }
+                        }
+
                         let num_results = processing_results.len();
                         if buffered_account_bytes >= MAX_BUFFERED_SETTLE_BYTES {
                             metrics.settler_backpressure_engaged();
@@ -413,10 +482,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             redis_db.as_mut(),
                             &processing_results,
                             &metrics,
-                            Some(&address_signatures_tx),
+                            Some(BlockPublishers {
+                                blockhashes: &settled_blockhashes_tx,
+                                accounts: &settled_accounts_tx,
+                                address_signatures: &address_signatures_tx,
+                            }),
                             highest_generation,
-                            Some(&settled_accounts_tx),
-                            Some(&settled_blockhashes_tx),
                         )
                         .await
                         {
@@ -440,6 +511,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     settle_result.slot,
                                     settle_result.blockhash
                                 );
+                                // Both announcements are attempted before the
+                                // commit returns, so stopping here cannot leave
+                                // this block half-announced.
+                                if settle_result.publisher_gone {
+                                    break;
+                                }
                             }
                             Err(SettleError::AddressIndexWriterGone) => {
                                 anyhow::bail!(
@@ -450,6 +527,23 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 error!("Failed to settle transactions: {}", msg);
                                 break;
                             }
+                        }
+
+                        // Cheaper to stop mirroring than to pay the budget every
+                        // block, but a failover must not cost the cache for the
+                        // life of the node: the probe above brings back one that
+                        // recovers.
+                        if let Some(failing) = redis_db.as_ref().filter(|redis| {
+                            !redis.is_mirroring_paused() && redis.has_failed_too_often()
+                        }) {
+                            failing.pause_mirroring(cache_mirror_cooldown);
+                            warn!(
+                                "Redis cache failed {} batches it never made up, leaving it alone for {:?}",
+                                CACHE_FAILURE_LIMIT, cache_mirror_cooldown
+                            );
+                            metrics.redis_cache_disabled();
+                            // Readers off now, not when the lease runs out.
+                            take_cache_out_of_service(failing.clone());
                         }
                     }
 
@@ -528,10 +622,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     redis_db.as_mut(),
                     &processing_results,
                     &metrics,
-                    Some(&address_signatures_tx),
+                    Some(BlockPublishers {
+                        blockhashes: &settled_blockhashes_tx,
+                        accounts: &settled_accounts_tx,
+                        address_signatures: &address_signatures_tx,
+                    }),
                     highest_generation,
-                    Some(&settled_accounts_tx),
-                    Some(&settled_blockhashes_tx),
                 )
                 .await
                 {
@@ -574,6 +670,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             accountsdb_connection_url,
             redis_cache_url,
             blocktime_ms,
+            cache_mirror_cooldown,
             perf_sample_period_secs,
             shutdown_token,
             metrics,
@@ -609,19 +706,16 @@ fn compute_blockhash(
 }
 
 /// Settle transactions: Update accounts database with changes
-#[allow(clippy::too_many_arguments)]
 async fn settle_transactions(
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
     redis_db: Option<&mut RedisAccountsDB>,
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
     metrics: &crate::stage_metrics::SharedMetrics,
-    address_signatures_tx: Option<&mpsc::Sender<Vec<AddressSignatureRow>>>,
+    publishers: Option<BlockPublishers<'_>>,
     // High-water mark of executor generations covered by this commit. Read at
     // the call site so it can never fold in a batch buffered after the flush.
     generation: u64,
-    settled_accounts_tx: Option<&mpsc::UnboundedSender<AccountSettlements>>,
-    settled_blockhashes_tx: Option<&mpsc::UnboundedSender<Hash>>,
 ) -> Result<SettleResult, SettleError> {
     let t_total = tokio::time::Instant::now();
     // Preallocate per-tick collections from the known result count so the hot
@@ -764,32 +858,32 @@ async fn settle_transactions(
         .await?;
     let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Publish the settled accounts and the new blockhash immediately after the
-    // durable Postgres commit and BEFORE any best-effort, post-commit work
-    // (the bounded address-index send and the Redis cache write).
-    //
-    // Both sends are non-fatal (warn-only): a send error can only mean that
-    // consumer already exited. The node supervisor turns any worker exit into
-    // a full graceful shutdown, so the settler must not self-abort here.
-    if let Some(tx) = settled_accounts_tx {
-        if let Err(e) = tx.send(AccountSettlements {
-            generation,
-            accounts: accounts_vec.clone(),
-        }) {
-            warn!("Failed to publish settled accounts: {:?}", e);
+    // Both announcements go out before any optional work: the ack unpins the
+    // settled accounts in BOB and the hash is what RPC advertises. A cache stall
+    // after this point can no longer hold the acceptance window behind the
+    // committed state.
+    let mut publisher_gone = false;
+    if let Some(ref publishers) = publishers {
+        if publishers
+            .accounts
+            .send(AccountSettlements {
+                generation,
+                accounts: accounts_vec.clone(),
+            })
+            .is_err()
+        {
+            warn!("Failed to publish the settled accounts");
+            publisher_gone = true;
         }
-    }
-    if let Some(tx) = settled_blockhashes_tx {
-        if let Err(e) = tx.send(next_blockhash) {
-            warn!("Failed to publish settled blockhash to dedup: {:?}", e);
+        if publishers.blockhashes.send(next_blockhash).is_err() {
+            warn!("Failed to publish the settled blockhash to dedup");
+            publisher_gone = true;
         }
-    }
 
-    // Closed channel = writer gone; escalate to exit.
-    if let Some(tx) = address_signatures_tx {
+        // Closed channel = writer gone; escalate to exit.
         if !addr_sig_rows.is_empty() {
             let send_t0 = tokio::time::Instant::now();
-            match tx.send(addr_sig_rows).await {
+            match publishers.address_signatures.send(addr_sig_rows).await {
                 Ok(()) => {
                     metrics.address_signatures_send_blocked_ms(
                         send_t0.elapsed().as_secs_f64() * 1000.0,
@@ -805,89 +899,42 @@ async fn settle_transactions(
     // Phase 3: Redis write best-effort (non-fatal)
     let t_redis_start = tokio::time::Instant::now();
     if let Some(redis) = redis_db {
-        // Checked before the write, because the write advances the cached tip
-        // and the tip is what shows a batch was missed.
-        let may_mirror = match redis_coherence::ensure_cache_continuity(redis, next_slot).await {
-            Ok(redis_coherence::CacheStatus::InService) => true,
-            // A purge is already walking this cache. Writing to it would renew
-            // the lease and put back into service the stale keys that purge has
-            // not reached yet, and starting a second one would supersede it.
-            Ok(redis_coherence::CacheStatus::Rebuilding) => false,
-            // The check has already cleared the stamp, so nothing is served from
-            // the cache until the rebuild finishes and stamps it again. Spawned
-            // because purging a large keyspace costs far more than a blocktime.
-            //
-            // Mirroring stops until that rebuild is done. The purge would sweep
-            // most of what this wrote anyway, and a successful write renews the
-            // lease, which would put the stale keys the purge has not reached
-            // yet straight back into service.
-            Ok(redis_coherence::CacheStatus::Condemned) => {
-                metrics.redis_cache_condemned();
-                let rebuilding = redis.clone();
-                let rebuild_metrics = Arc::clone(metrics);
-                let generation = redis.condemnation_generation();
-                tokio::spawn(async move {
-                    match redis_coherence::rebuild_cache(&rebuilding, generation).await {
-                        Ok(()) => rebuild_metrics.redis_cache_purged(),
-                        Err(e) => {
-                            warn!("Redis cache rebuild failed, it stays out of service: {}", e)
-                        }
-                    }
-                });
-                false
-            }
-            // Whether a batch was missed is now unknown, so this write must not
-            // happen: it would advance the cached tip over any gap that does
-            // exist, erasing the only evidence of it. Skipping leaves the tip
-            // where it is, so the next check that succeeds still sees the gap.
-            //
-            // Blocks keep being produced either way, so the cache has to stop
-            // being served now rather than whenever its lease runs out. This
-            // often fails too, since the check just failed against the same
-            // Redis, and the lease is what covers that.
-            Err(e) => {
-                warn!("Skipping the Redis cache write, continuity unknown: {}", e);
-                if let Err(e) = redis_coherence::clear_deployment_id(redis).await {
-                    warn!("Could not take the Redis cache out of service: {}", e);
-                }
-                false
-            }
-        };
-
-        if may_mirror {
-            match crate::accounts::write_batch::write_batch_redis(
+        let mirrored = tokio::time::timeout(
+            CACHE_MIRROR_BUDGET,
+            mirror_batch_to_cache(
                 redis,
+                next_slot,
                 &accounts_vec,
                 transactions_for_db,
-                Some(block_info),
-            )
-            .await
-            {
-                // Renewing only on a mirrored batch is what ties trust to
-                // maintenance: a writer that stops mirroring stops extending the
-                // lease, whether or not it is still able to reach Redis to say
-                // so.
-                Ok(()) => {
-                    if let Err(e) =
-                        redis_coherence::stamp_deployment_id(redis, redis.deployment_id()).await
-                    {
-                        warn!("Failed to renew the Redis cache lease: {}", e);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
-                        e
-                    );
-                    metrics.redis_cache_write_failed();
-                    // The account keys this batch should have updated still hold
-                    // pre-batch balances. Drop them now so reads miss and resolve
-                    // against Postgres, rather than waiting for the next batch to
-                    // notice the tip did not advance and rebuild the whole cache.
-                    crate::accounts::write_batch::invalidate_batch_redis(redis, &accounts_vec)
-                        .await;
-                }
+                block_info,
+                metrics,
+            ),
+        )
+        .await;
+
+        // One accounting event per batch, here rather than inside the attempt,
+        // so a batch cannot be counted twice.
+        let failed = match mirrored {
+            Ok(MirrorOutcome::Mirrored) => {
+                redis.record_cache_success();
+                false
             }
+            Ok(MirrorOutcome::Skipped) => false,
+            Ok(MirrorOutcome::Failed) => true,
+            // Dropped mid-command, so the tip may or may not have moved. The
+            // next continuity check rebuilds if a gap opened.
+            Err(_) => {
+                warn!(
+                    "Redis cache write exceeded its {:?} budget, abandoning this batch",
+                    CACHE_MIRROR_BUDGET
+                );
+                take_cache_out_of_service(redis.clone());
+                true
+            }
+        };
+        if failed {
+            metrics.redis_cache_write_failed();
+            redis.record_cache_failure();
         }
     }
     let t_redis_ms = t_redis_start.elapsed().as_secs_f64() * 1000.0;
@@ -905,7 +952,211 @@ async fn settle_transactions(
     Ok(SettleResult {
         slot: next_slot,
         blockhash: next_blockhash,
+        publisher_gone,
     })
+}
+
+/// How long a spawned eviction may run. Off the block path, so it can outlast a
+/// mirror budget.
+const CACHE_EVICTION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Clears the deployment stamp, so read nodes stop serving the cache.
+///
+/// Spawned because callers get here having just watched Redis fail; awaiting it
+/// would put that back on the block path. The lease is the backstop if it never
+/// lands, and a late one costs a block of Postgres reads.
+fn take_cache_out_of_service(redis: RedisAccountsDB) {
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            CACHE_EVICTION_TIMEOUT,
+            redis_coherence::clear_deployment_id(&redis),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Could not take the Redis cache out of service: {}", e),
+            Err(_) => warn!("Timed out taking the Redis cache out of service"),
+        }
+    });
+}
+
+/// Empties a condemned cache and stamps it back into service. Spawned, because
+/// purging a large keyspace costs far more than a blocktime.
+fn rebuild_in_background(redis: &RedisAccountsDB, metrics: &SharedMetrics) {
+    metrics.redis_cache_condemned();
+    let rebuilding = redis.clone();
+    let rebuild_metrics = Arc::clone(metrics);
+    let generation = redis.condemnation_generation();
+    tokio::spawn(async move {
+        match redis_coherence::rebuild_cache(&rebuilding, generation).await {
+            Ok(()) => rebuild_metrics.redis_cache_purged(),
+            Err(e) => {
+                // The batch that condemned was skipped rather than failed, so
+                // this is the only thing that counts a cache which cannot be
+                // purged at all. Without it such a cache condemns every block
+                // and is never given up on.
+                rebuilding.record_cache_failure();
+                warn!("Redis cache rebuild failed, it stays out of service: {}", e);
+            }
+        }
+    });
+}
+
+/// Finds out whether a cache the settler gave up on can be used again, and puts
+/// it back on the mirror path when it can.
+///
+/// Spawned by a caller that has claimed the probe and re-armed the cooldown.
+/// Nothing here is on the block path, and the pause outlives the probe, so a
+/// probe that hangs costs a block nothing and no batch is offered to a cache that
+/// has not passed one.
+///
+/// A PING and not a batch, because a cache that answers reads but cannot take a
+/// batch inside the budget would otherwise cost a block on every cooldown. What
+/// answers is condemned before it is trusted again, since it holds pre-pause
+/// values and a tip that eviction could have taken is no longer proof of that.
+async fn probe_paused_cache(redis: RedisAccountsDB, metrics: SharedMetrics) {
+    let probe = async {
+        let mut conn = redis.connection.clone();
+        let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+        pong.context("cache did not answer a PING")?;
+
+        // Only a condemnation this probe made is proof that this pause's cache is
+        // being purged. A rebuild already holding the claim is purging for an
+        // older condemnation, and resuming on it would mirror into whatever that
+        // purge has not reached.
+        let condemned = redis_coherence::condemn_cache(&redis, "was given up on and answers again")
+            .await?
+            == redis_coherence::CacheStatus::Condemned;
+        if condemned {
+            rebuild_in_background(&redis, &metrics);
+        }
+        anyhow::Ok(condemned)
+    };
+
+    // Cancelling part-way through is safe: the rebuild claim is released on
+    // drop, and the cache stays paused for the next probe either way.
+    match tokio::time::timeout(CACHE_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(true)) => {
+            redis.resume_mirroring();
+            info!("Redis cache answers again, mirroring resumes once it is rebuilt");
+        }
+        Ok(Ok(false)) => {
+            info!("Redis cache is still being rebuilt, leaving it alone until the next probe")
+        }
+        Ok(Err(e)) => warn!("Redis cache is still unusable, leaving it alone: {:#}", e),
+        Err(_) => warn!(
+            "Redis cache did not finish a probe in {:?}, leaving it alone",
+            CACHE_PROBE_TIMEOUT
+        ),
+    }
+    // Released however the probe ended, or nothing would probe this cache again.
+    redis.finish_probe();
+}
+
+/// What a mirror attempt did. Returned, not recorded here, so the caller counts
+/// the batch once even when it ran out of budget.
+enum MirrorOutcome {
+    /// In the cache, lease renewed.
+    Mirrored,
+    /// Not mirrored on purpose: the cache is being rebuilt. Redis is fine.
+    Skipped,
+    /// The cache could not take the batch.
+    Failed,
+}
+
+/// Mirrors a committed batch into the cache. Nothing here is fatal; Postgres
+/// already holds it. Its own function so the caller can bound the whole phase.
+async fn mirror_batch_to_cache(
+    redis: &mut RedisAccountsDB,
+    slot: u64,
+    accounts_vec: &[(Pubkey, AccountSettlement)],
+    transactions_for_db: Vec<(
+        Signature,
+        &SanitizedTransaction,
+        u64,
+        i64,
+        &ProcessedTransaction,
+    )>,
+    block_info: BlockInfo,
+    metrics: &SharedMetrics,
+) -> MirrorOutcome {
+    // A cache given up on is left alone until its cooldown is up: paying the
+    // mirror budget every block is what it was given up on for. Not a failure,
+    // so the tally stays where the give-up left it.
+    if redis.is_mirroring_paused() {
+        return MirrorOutcome::Skipped;
+    }
+
+    // Checked before the write, because the write advances the cached tip
+    // and the tip is what shows a batch was missed.
+    match redis_coherence::ensure_cache_continuity(redis, slot).await {
+        Ok(redis_coherence::CacheStatus::InService) => {}
+        // A purge is already walking this cache. Writing to it would renew
+        // the lease and put back into service the stale keys that purge has
+        // not reached yet, and starting a second one would supersede it.
+        Ok(redis_coherence::CacheStatus::Rebuilding) => return MirrorOutcome::Skipped,
+        // The check has already cleared the stamp, so nothing is served from
+        // the cache until the rebuild finishes and stamps it again. Spawned
+        // because purging a large keyspace costs far more than a blocktime.
+        //
+        // Mirroring stops until that rebuild is done. The purge would sweep
+        // most of what this wrote anyway, and a successful write renews the
+        // lease, which would put the stale keys the purge has not reached
+        // yet straight back into service.
+        Ok(redis_coherence::CacheStatus::Condemned) => {
+            rebuild_in_background(redis, metrics);
+            return MirrorOutcome::Skipped;
+        }
+        // Whether a batch was missed is now unknown, so this write must not
+        // happen: it would advance the cached tip over any gap that does
+        // exist, erasing the only evidence of it. Skipping leaves the tip
+        // where it is, so the next check that succeeds still sees the gap.
+        //
+        // Blocks keep being produced either way, so the cache has to stop
+        // being served now rather than whenever its lease runs out. That
+        // often fails too, since the check just failed against the same
+        // Redis, and the lease is what covers that.
+        Err(e) => {
+            warn!("Skipping the Redis cache write, continuity unknown: {}", e);
+            take_cache_out_of_service(redis.clone());
+            return MirrorOutcome::Failed;
+        }
+    }
+
+    match crate::accounts::write_batch::write_batch_redis(
+        redis,
+        accounts_vec,
+        transactions_for_db,
+        Some(block_info),
+    )
+    .await
+    {
+        // Renewing only on a mirrored batch is what ties trust to
+        // maintenance: a writer that stops mirroring stops extending the
+        // lease, whether or not it is still able to reach Redis to say
+        // so.
+        Ok(()) => match redis_coherence::stamp_deployment_id(redis, redis.deployment_id()).await {
+            Ok(()) => MirrorOutcome::Mirrored,
+            // A failure even though the write landed: the tip advanced, so no
+            // continuity check will notice the lease lapsing.
+            Err(e) => {
+                warn!("Failed to renew the Redis cache lease: {}", e);
+                MirrorOutcome::Failed
+            }
+        },
+        Err(e) => {
+            warn!(
+                "Best-effort Redis cache write failed (non-fatal, Postgres succeeded): {}",
+                e
+            );
+            // The account keys this batch should have updated still hold
+            // pre-batch balances. Drop them now so reads miss and resolve
+            // against Postgres, rather than waiting for the next batch to
+            // notice the tip did not advance and rebuild the whole cache.
+            crate::accounts::write_batch::invalidate_batch_redis(redis, accounts_vec).await;
+            MirrorOutcome::Failed
+        }
+    }
 }
 
 #[cfg(test)]
@@ -946,16 +1197,22 @@ mod tests {
         results: &[(TransactionProcessingResult, SanitizedTransaction)],
     ) -> (SettleResult, Vec<(Pubkey, AccountSettlement)>) {
         let (accounts_tx, mut accounts_rx) = mpsc::unbounded_channel();
+        // Live but undrained: this helper only asserts on the accounts channel,
+        // and a dropped receiver would fail the send and flip `publisher_gone`.
+        let (blockhashes_tx, _blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(RESULTS_CAP);
         let result = settle_transactions(
             last_block,
             db,
             None,
             results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
+            Some(BlockPublishers {
+                blockhashes: &blockhashes_tx,
+                accounts: &accounts_tx,
+                address_signatures: &address_signatures_tx,
+            }),
             0,
-            Some(&accounts_tx),
-            None,
         )
         .await
         .expect("settle_transactions succeeded");
@@ -1127,6 +1384,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown,
             metrics,
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -1383,6 +1641,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: Arc::clone(&heartbeat),
         })
         .await;
@@ -1658,8 +1917,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -1677,8 +1934,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -1721,8 +1976,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -1756,8 +2009,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -2122,8 +2373,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -2152,8 +2401,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -2359,6 +2606,7 @@ mod tests {
             perf_sample_period_secs: 60,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -2391,6 +2639,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -2423,6 +2672,60 @@ mod tests {
         assert!(blockhash.is_ok(), "should receive blockhash within timeout");
 
         shutdown.cancel();
+    }
+
+    /// Losing dedup must not leave the batch buffered for the final flush to
+    /// commit again under the same slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_committed_block_is_not_settled_twice_when_dedup_is_gone() {
+        let (db, pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, mut address_signatures_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+
+        let worker = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // Dedup and the settler share one shutdown token and dedup exits first,
+        // which leaves the settler publishing into a dropped receiver.
+        drop(settled_blockhashes_rx);
+
+        // Buffered well before the first tick, which waits out the start delay,
+        // so the tick that finds dedup gone has a batch to commit.
+        let (output, transactions) = one_account_batch();
+        exec_tx.send((output, transactions, 1)).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), worker.handle)
+            .await
+            .expect("the settler must exit once dedup is gone")
+            .expect("the settler task must not panic");
+
+        assert_eq!(
+            db.get_transaction_count().await.unwrap(),
+            1,
+            "the committed batch must be counted once, not committed again by the final flush"
+        );
+        assert!(
+            address_signatures_rx.try_recv().is_ok(),
+            "a committed block's address rows must still be shipped"
+        );
     }
 
     /// Drain feedback until a message actually carries settled accounts. The
@@ -2488,6 +2791,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -2528,6 +2832,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -2580,6 +2885,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -2691,8 +2997,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -2726,8 +3030,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -2798,8 +3100,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -2904,8 +3204,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -3218,8 +3516,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -3275,17 +3571,20 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
 
-        let stamped: Option<Vec<u8>> = conn.get(stamp_key).await.unwrap();
-        assert_eq!(
-            stamped, None,
-            "a cache whose continuity cannot be checked must stop being served"
-        );
+        // The eviction is spawned, so it lands within a moment rather than
+        // before the settle returns.
+        for _ in 0..30 {
+            let stamped: Option<Vec<u8>> = conn.get(stamp_key).await.unwrap();
+            if stamped.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("a cache whose continuity cannot be checked must stop being served");
     }
 
     /// Settling a batch far ahead of the cached tip is what an outage looks like
@@ -3327,8 +3626,6 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
-            None,
-            None,
         )
         .await
         .unwrap();
@@ -3341,6 +3638,1010 @@ mod tests {
         assert_eq!(
             stamped, None,
             "a cache that missed batches must stop being served"
+        );
+    }
+
+    /// RPC advertises the hash the moment Postgres commits, so a dedup window
+    /// that trails the cache write rejects transactions built on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_publishes_the_blockhash_before_the_cache_write() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Stamped and one slot back, so the mirror is reached rather than skipped.
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let last_slot = 200u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", last_slot).await.unwrap();
+
+        // Redis accepts the connection and then stops answering it.
+        let pause = Duration::from_secs(5);
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(pause.as_millis() as u64)
+            .arg("ALL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let (blockhashes_tx, mut blockhashes_rx) = mpsc::unbounded_channel();
+        let (accounts_tx, _accounts_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(16);
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let settling = tokio::spawn(async move {
+            settle_transactions(
+                Some(LastBlock {
+                    slot: last_slot,
+                    blockhash: Hash::new_unique(),
+                }),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[(Ok(executed), tx)],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                Some(BlockPublishers {
+                    blockhashes: &blockhashes_tx,
+                    accounts: &accounts_tx,
+                    address_signatures: &address_signatures_tx,
+                }),
+                0,
+            )
+            .await
+            .expect("the commit must succeed with the cache unreachable")
+        });
+
+        // Ordering, not speed: the paused cache always burns its whole budget,
+        // so how much is left after the publish says which side it was on. The
+        // timeout only stops a lost publish hanging the test.
+        let published = tokio::time::timeout(Duration::from_secs(5), blockhashes_rx.recv())
+            .await
+            .expect("the blockhash must be published");
+        let published_at = tokio::time::Instant::now();
+        let settled = settling.await.unwrap();
+        let cache_work_left = published_at.elapsed();
+
+        assert!(
+            cache_work_left >= CACHE_MIRROR_BUDGET / 2,
+            "the publish must come before the cache work, but only {cache_work_left:?} of it was left afterwards"
+        );
+        assert_eq!(
+            published,
+            Some(settled.blockhash),
+            "the published hash must be the one that was committed"
+        );
+    }
+
+    /// BOB unpins the settled accounts on this ack, so an ack that trails the
+    /// cache write holds the acceptance window behind committed state for the
+    /// whole budget even though Postgres is healthy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_publishes_the_accounts_ack_before_the_cache_write() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Stamped and one slot back, so the mirror is reached rather than skipped.
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let last_slot = 200u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", last_slot).await.unwrap();
+
+        // Redis accepts the connection and then stops answering it.
+        let pause = Duration::from_secs(5);
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(pause.as_millis() as u64)
+            .arg("ALL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let (blockhashes_tx, _blockhashes_rx) = mpsc::unbounded_channel();
+        let (accounts_tx, mut accounts_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(16);
+
+        let generation = 7u64;
+        let written = Pubkey::new_unique();
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            written,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let settling = tokio::spawn(async move {
+            settle_transactions(
+                Some(LastBlock {
+                    slot: last_slot,
+                    blockhash: Hash::new_unique(),
+                }),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[(Ok(executed), tx)],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                Some(BlockPublishers {
+                    blockhashes: &blockhashes_tx,
+                    accounts: &accounts_tx,
+                    address_signatures: &address_signatures_tx,
+                }),
+                generation,
+            )
+            .await
+            .expect("the commit must succeed with the cache unreachable")
+        });
+
+        // Ordering, not speed: the paused cache always burns its whole budget,
+        // so how much is left after the ack says which side it was on. The
+        // timeout only stops a lost ack hanging the test.
+        let acked = tokio::time::timeout(Duration::from_secs(5), accounts_rx.recv())
+            .await
+            .expect("the accounts ack must be published")
+            .expect("the accounts channel must stay open");
+        let acked_at = tokio::time::Instant::now();
+        settling.await.unwrap();
+        let cache_work_left = acked_at.elapsed();
+
+        assert!(
+            cache_work_left >= CACHE_MIRROR_BUDGET / 2,
+            "the ack must come before the cache work, but only {cache_work_left:?} of it was left afterwards"
+        );
+        assert_eq!(
+            acked.generation, generation,
+            "the ack must carry the generation the call site read"
+        );
+        assert!(
+            acked.accounts.iter().any(|(key, _)| *key == written),
+            "the ack must carry the accounts this batch committed"
+        );
+    }
+
+    /// Optional work must never hold the settle path past its budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_gives_up_on_a_cache_that_stops_answering() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Stamped and one slot back, so the mirror is reached rather than skipped.
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let last_slot = 200u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", last_slot).await.unwrap();
+
+        // What a settle costs on this machine, so the assertion below measures
+        // the cache and not the Postgres commit under it.
+        let healthy_started = tokio::time::Instant::now();
+        let healthy = settle_transactions(
+            Some(LastBlock {
+                slot: last_slot,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        let healthy_took = healthy_started.elapsed();
+
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(30_000u64)
+            .arg("ALL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let started = tokio::time::Instant::now();
+        let settled = settle_transactions(
+            Some(LastBlock {
+                slot: healthy.slot,
+                blockhash: healthy.blockhash,
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+        let waited = started.elapsed();
+
+        assert!(
+            waited < healthy_took + CACHE_MIRROR_BUDGET * 2,
+            "the cache must not hold the settle path past its budget, waited {waited:?} against a healthy {healthy_took:?}"
+        );
+        assert!(
+            pg_db.get_block(settled.slot).await.unwrap().is_some(),
+            "the block must be committed whatever the cache did"
+        );
+    }
+
+    /// A cache left holding pre-batch values while blocks keep coming must stop
+    /// being served, budget overrun included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timed_out_mirror_takes_the_cache_out_of_service() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let stamp_key = redis_coherence::DEPLOYMENT_ID_KEY;
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let last_slot = 200u64;
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", last_slot).await.unwrap();
+
+        // Reads still served, so the check passes and only the mirror's write
+        // hangs. Short enough that the pause lifts while the eviction retries.
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(500u64)
+            .arg("WRITE")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let executed = make_executed(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        settle_transactions(
+            Some(LastBlock {
+                slot: last_slot,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[(Ok(executed), tx)],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // The eviction is spawned, so it lands once the pause lifts rather than
+        // before the settle returns.
+        for _ in 0..30 {
+            let stamped: Option<Vec<u8>> = conn.get(stamp_key).await.unwrap();
+            if stamped.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("a cache that could not be mirrored must stop being served");
+    }
+
+    /// Paying the budget once is the cost of finding out Redis is down. Paying
+    /// it every block is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cache_that_keeps_timing_out_is_given_up_on() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", 200u64).await.unwrap();
+
+        // Longer than every batch below can spend on its budget, so the cache
+        // stays unresponsive for the whole run.
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(30_000u64)
+            .arg("ALL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let mut last = LastBlock {
+            slot: 200,
+            blockhash: Hash::new_unique(),
+        };
+        for attempt in 1..=CACHE_FAILURE_LIMIT {
+            let settled = settle_transactions(
+                Some(last.clone()),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            last = LastBlock {
+                slot: settled.slot,
+                blockhash: settled.blockhash,
+            };
+
+            assert_eq!(
+                redis_raw.has_failed_too_often(),
+                attempt == CACHE_FAILURE_LIMIT,
+                "the cache must be given up on at exactly {CACHE_FAILURE_LIMIT} failures, not at {attempt}"
+            );
+        }
+    }
+
+    /// A batch counts once however many ways it failed, so the limit means the
+    /// number of batches it says. Locks the arithmetic, not any one route to
+    /// double counting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_unmirrored_batch_counts_as_one_failure() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // A tip that is not a u64 fails the continuity check on every batch,
+        // with Redis otherwise perfectly reachable.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
+
+        let mut last = LastBlock {
+            slot: 200,
+            blockhash: Hash::new_unique(),
+        };
+        for _ in 0..CACHE_FAILURE_LIMIT - 1 {
+            let settled = settle_transactions(
+                Some(last.clone()),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            last = LastBlock {
+                slot: settled.slot,
+                blockhash: settled.blockhash,
+            };
+        }
+
+        assert!(
+            !redis_raw.has_failed_too_often(),
+            "{} batches must not reach a limit of {CACHE_FAILURE_LIMIT}",
+            CACHE_FAILURE_LIMIT - 1
+        );
+    }
+
+    /// A cache failing two batches in three is broken without ever failing three
+    /// in a row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_intermittently_failing_cache_is_still_given_up_on() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        let mut conn = redis_raw.connection.clone();
+        let mut last = LastBlock {
+            slot: 200,
+            blockhash: Hash::new_unique(),
+        };
+        // Never two failures in a row after the first pair, and never enough
+        // successes to be a healthy cache either.
+        for mirrors in [false, false, true, false, false] {
+            // A tip one slot back is readable and contiguous, so the batch
+            // mirrors. One that is not a u64 fails the continuity check.
+            let tip = if mirrors {
+                last.slot.to_string()
+            } else {
+                "not-a-slot".to_string()
+            };
+            let _: () = conn.set("latest_slot", tip).await.unwrap();
+
+            let settled = settle_transactions(
+                Some(last.clone()),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            last = LastBlock {
+                slot: settled.slot,
+                blockhash: settled.blockhash,
+            };
+        }
+
+        assert!(
+            redis_raw.has_failed_too_often(),
+            "a cache failing more batches than it takes must still be given up on"
+        );
+    }
+
+    /// A write that landed without renewing the lease is not a mirrored batch:
+    /// the tip advanced so nothing condemns, and readers drop the cache anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_that_cannot_renew_the_lease_counts_as_a_failure() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", 200u64).await.unwrap();
+
+        // The write half of a mirror is plain SETs and stays permitted. Only the
+        // lease renewal is refused, which is the half a reader depends on.
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg("default")
+            .arg("-setex")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let mut last = LastBlock {
+            slot: 200,
+            blockhash: Hash::new_unique(),
+        };
+        for _ in 0..CACHE_FAILURE_LIMIT {
+            let settled = settle_transactions(
+                Some(last.clone()),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            last = LastBlock {
+                slot: settled.slot,
+                blockhash: settled.blockhash,
+            };
+        }
+
+        let cached_tip: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(
+            cached_tip,
+            Some(last.slot),
+            "the write half must have landed for this test to be about the renewal"
+        );
+        assert!(
+            redis_raw.has_failed_too_often(),
+            "a batch that could not renew the lease must count as a failure"
+        );
+    }
+
+    /// A cache that misses one batch and then keeps up must not be dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mirrored_batch_pays_back_a_failure() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // The tip is read as a u64, so a value that is not one fails the
+        // continuity check with Redis perfectly reachable.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
+
+        let failed = settle_transactions(
+            Some(LastBlock {
+                slot: 200,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // A readable tip one slot back, so the next batch mirrors.
+        let _: () = conn.set("latest_slot", failed.slot).await.unwrap();
+        settle_transactions(
+            Some(LastBlock {
+                slot: failed.slot,
+                blockhash: failed.blockhash,
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let cached_tip: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(
+            cached_tip,
+            Some(failed.slot + 1),
+            "the second batch must actually have been mirrored"
+        );
+        assert!(
+            !redis_raw.has_failed_too_often(),
+            "a mirrored batch must pay back the failure before it"
+        );
+    }
+
+    /// A cache given up on must cost nothing until its cooldown is up: neither
+    /// the mirror budget nor another failure counted against it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_paused_mirror_leaves_the_cache_alone() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // A tip that is not a u64 fails the continuity check, so every batch
+        // below would count a failure if the mirror were reached at all.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
+
+        redis_raw.pause_mirroring(Duration::from_secs(60));
+
+        let mut last = LastBlock {
+            slot: 200,
+            blockhash: Hash::new_unique(),
+        };
+        for _ in 0..CACHE_FAILURE_LIMIT {
+            let settled = settle_transactions(
+                Some(last.clone()),
+                &mut pg_db,
+                Some(&mut redis_raw),
+                &[],
+                &(Arc::new(NoopMetrics) as SharedMetrics),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            last = LastBlock {
+                slot: settled.slot,
+                blockhash: settled.blockhash,
+            };
+        }
+
+        let tip: Option<String> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(
+            tip.as_deref(),
+            Some("not-a-slot"),
+            "a paused mirror must not write to the cache"
+        );
+        assert!(
+            !redis_raw.has_failed_too_often(),
+            "a batch the mirror was never offered must not count as a failure"
+        );
+    }
+
+    /// A failover must not cost the cache for the life of the node. What comes
+    /// back holds pre-pause values, so it is rebuilt before a batch is trusted
+    /// to it, and only then mirrored to again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_cache_is_rebuilt_before_it_is_mirrored_to() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        // A stale key and a tip frozen where mirroring stopped, as a cache the
+        // settler gave up on is left.
+        let stale_pubkey = Pubkey::new_unique();
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn
+            .set(format!("account:{}", stale_pubkey), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+        let _: () = conn.set("latest_slot", 200u64).await.unwrap();
+
+        for _ in 0..CACHE_FAILURE_LIMIT {
+            redis_raw.record_cache_failure();
+        }
+        // A cooldown with no time left, as the settler finds one it is owed a
+        // probe for.
+        redis_raw.pause_mirroring(Duration::ZERO);
+        assert!(
+            redis_raw.has_failed_too_often() && redis_raw.pause_has_lapsed(),
+            "the cache must be given up on and due a probe for this test to mean anything"
+        );
+
+        probe_paused_cache(redis_raw.clone(), Arc::new(NoopMetrics) as SharedMetrics).await;
+        assert!(
+            !redis_raw.is_mirroring_paused(),
+            "a probe that found the cache answering must lift the pause"
+        );
+        assert!(
+            !redis_raw.has_failed_too_often(),
+            "a probe that found the cache answering must clear the failures that took it off the mirror path"
+        );
+
+        // The rebuild is spawned, so it lands after the probe returns.
+        let mut rebuilt = false;
+        for _ in 0..30 {
+            let stale: bool = conn
+                .exists(format!("account:{}", stale_pubkey))
+                .await
+                .unwrap();
+            let stamped: Option<Vec<u8>> =
+                conn.get(redis_coherence::DEPLOYMENT_ID_KEY).await.unwrap();
+            if !stale && stamped.as_ref() == Some(&deployment_id) {
+                rebuilt = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            rebuilt,
+            "a resumed cache must be purged and stamped back into service"
+        );
+
+        // The purge took the tip with it, so this batch mirrors into an empty
+        // cache rather than one it has to be contiguous with.
+        let mirrored = settle_transactions(
+            Some(LastBlock {
+                slot: 500,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+
+        let tip: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(
+            tip,
+            Some(mirrored.slot),
+            "the batch after the rebuild must be mirrored"
+        );
+    }
+
+    /// The claim the cooldown exists for: a node that has given up on its cache
+    /// picks it back up on its own, with no restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_given_up_cache_is_mirrored_to_again_without_a_restart() {
+        let (pg_db, pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
+        // A handle of this test's own, for raw key access. The settler builds
+        // its own, which is the one that gives up and probes.
+        let (redis_db, redis) = start_test_redis(postgres_db.clone()).await;
+        let redis_url = format!(
+            "redis://{}:{}",
+            redis.get_host().await.unwrap(),
+            redis.get_host_port_ipv4(6379).await.unwrap()
+        );
+        let mut conn = redis_db.connection.clone();
+
+        let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+
+        let _worker = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: Some(redis_url),
+            blocktime_ms: 100,
+            // Short enough to watch a give-up and its recovery inside one test.
+            cache_mirror_cooldown: Duration::from_millis(300),
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // Wait for the settler to be mirroring, so the corruption below lands on
+        // a running mirror rather than on the startup alignment.
+        let mut mirroring_at = None;
+        for _ in 0..100 {
+            let tip: Option<u64> = conn.get("latest_slot").await.unwrap_or(None);
+            if let Some(tip) = tip {
+                mirroring_at = Some(tip);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mirroring_at =
+            mirroring_at.expect("the settler must mirror before the cache is broken");
+
+        // The tip is read as a u64, so this fails every continuity check from
+        // here on without Redis being down, and the settler gives up on it.
+        let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
+
+        // Only the probe gets past this: it has the bad tip purged, and the
+        // batch after that writes a real one.
+        let mut recovered = None;
+        for _ in 0..100 {
+            let tip: Option<u64> = conn.get("latest_slot").await.unwrap_or(None);
+            if let Some(tip) = tip.filter(|slot| *slot > mirroring_at) {
+                recovered = Some(tip);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let recovered =
+            recovered.expect("a cache given up on must be mirrored to again without a restart");
+
+        // Still mirroring, not just the one batch that followed the rebuild.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let tip: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert!(
+            tip.is_some_and(|slot| slot > recovered),
+            "the cache must keep taking batches after it comes back, tip {tip:?} against {recovered}"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// A cache that cannot be verified at boot must not cost the node its cache
+    /// for the life of the process either. Same cooldown, same probe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cache_unverifiable_at_boot_is_mirrored_to_once_it_recovers() {
+        let (pg_db, pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
+        let (redis_db, redis) = start_test_redis(postgres_db.clone()).await;
+        let redis_url = format!(
+            "redis://{}:{}",
+            redis.get_host().await.unwrap(),
+            redis.get_host_port_ipv4(6379).await.unwrap()
+        );
+        let mut conn = redis_db.connection.clone();
+
+        // A ledger key with no stamp beside it, so alignment has to purge, and
+        // writes refused for long enough that it cannot.
+        let _: () = conn
+            .set(format!("account:{}", Pubkey::new_unique()), vec![1u8, 2, 3])
+            .await
+            .unwrap();
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(3_000u64)
+            .arg("WRITE")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+
+        let _worker = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: Some(redis_url),
+            blocktime_ms: 100,
+            cache_mirror_cooldown: Duration::from_millis(300),
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // A dropped handle would never write this, however healthy Redis got.
+        let mut mirrored = false;
+        for _ in 0..150 {
+            let tip: Option<u64> = conn.get("latest_slot").await.unwrap_or(None);
+            if tip.is_some() {
+                mirrored = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            mirrored,
+            "a cache that failed its boot alignment must be mirrored to once it recovers"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// A probe that finds a rebuild already purging the cache must not resume on
+    /// it. That purge belongs to an older condemnation, so mirroring into what it
+    /// has not reached yet is how pre-pause keys get stamped back into service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_does_not_resume_on_a_rebuild_it_did_not_start() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Redis is healthy, so only the held claim can stop this probe: a purge
+        // that started before the pause is still walking the keyspace.
+        assert!(
+            redis_raw.try_begin_rebuild(),
+            "the rebuild claim must be free for this test to hold it"
+        );
+
+        redis_raw.pause_mirroring(Duration::ZERO);
+        assert!(redis_raw.try_begin_probe());
+        probe_paused_cache(redis_raw.clone(), Arc::new(NoopMetrics) as SharedMetrics).await;
+
+        assert!(
+            redis_raw.is_mirroring_paused(),
+            "a probe must not resume mirroring on a purge it did not start"
+        );
+        assert!(
+            redis_raw.try_begin_probe(),
+            "the probe must release its claim so the next cooldown can probe again"
+        );
+    }
+
+    /// A probe is more than its PING: a cache that answers one and then refuses
+    /// the write that takes it out of service must not come back on the strength
+    /// of the PING alone, and must leave the next probe able to run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_that_cannot_take_the_cache_out_of_service_leaves_it_paused() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Reads stay served, so the PING passes and only the stamp clear behind
+        // it hangs.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(5_000u64)
+            .arg("WRITE")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        redis_raw.pause_mirroring(Duration::ZERO);
+        assert!(redis_raw.try_begin_probe());
+        probe_paused_cache(redis_raw.clone(), Arc::new(NoopMetrics) as SharedMetrics).await;
+
+        // Lapsed and still paused: only a probe that got all the way through
+        // lifts a pause, so neither the mirror path nor the final flush can
+        // offer this cache a batch.
+        assert!(
+            redis_raw.pause_has_lapsed() && redis_raw.is_mirroring_paused(),
+            "a probe that could not finish must leave the cache paused"
+        );
+        assert!(
+            redis_raw.try_begin_probe(),
+            "the probe must release its claim so the next cooldown can probe again"
         );
     }
 
@@ -3538,6 +4839,7 @@ mod tests {
             perf_sample_period_secs: 1, // fires after 1s
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -3600,6 +4902,7 @@ mod tests {
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -3679,10 +4982,12 @@ mod tests {
                 None,
                 &results,
                 &metrics,
-                Some(&addr_sig_tx),
+                Some(BlockPublishers {
+                    blockhashes: &settled_blockhashes_tx,
+                    accounts: &settled_accounts_tx,
+                    address_signatures: &addr_sig_tx,
+                }),
                 0,
-                Some(&settled_accounts_tx),
-                Some(&settled_blockhashes_tx),
             )
             .await;
             (r, db)
@@ -3740,10 +5045,12 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
-            Some(&addr_sig_tx),
+            Some(BlockPublishers {
+                blockhashes: &settled_blockhashes_tx,
+                accounts: &settled_accounts_tx,
+                address_signatures: &addr_sig_tx,
+            }),
             0,
-            Some(&settled_accounts_tx),
-            Some(&settled_blockhashes_tx),
         )
         .await
         .unwrap();
@@ -3763,6 +5070,7 @@ mod tests {
 
         let (settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
         // Drop both consumers before calling.
         drop(settled_accounts_rx);
         drop(settled_blockhashes_rx);
@@ -3774,10 +5082,12 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
+            Some(BlockPublishers {
+                blockhashes: &settled_blockhashes_tx,
+                accounts: &settled_accounts_tx,
+                address_signatures: &addr_sig_tx,
+            }),
             0,
-            Some(&settled_accounts_tx),
-            Some(&settled_blockhashes_tx),
         )
         .await;
 
@@ -3785,7 +5095,12 @@ mod tests {
             result.is_ok(),
             "send failures to gone consumers must be non-fatal"
         );
-        let slot = result.unwrap().slot;
+        let settled = result.unwrap();
+        assert!(
+            settled.publisher_gone,
+            "a gone consumer must be reported so the caller can wind down"
+        );
+        let slot = settled.slot;
         // The block must be durable despite the broadcast failures.
         let block = db.get_block(slot).await.unwrap();
         assert!(block.is_some(), "block committed to Postgres");
@@ -3798,6 +5113,7 @@ mod tests {
 
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
 
         settle_transactions(
             None,
@@ -3805,10 +5121,12 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
+            Some(BlockPublishers {
+                blockhashes: &settled_blockhashes_tx,
+                accounts: &settled_accounts_tx,
+                address_signatures: &addr_sig_tx,
+            }),
             0,
-            Some(&settled_accounts_tx),
-            Some(&settled_blockhashes_tx),
         )
         .await
         .unwrap();
@@ -3860,6 +5178,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             blocktime_ms,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),

@@ -69,6 +69,29 @@ const LEDGER_FIXED_KEYS: [&str; 5] = [
 /// Keys per SCAN round. Bounds how long one round blocks the Redis event loop.
 const SCAN_COUNT: usize = 512;
 
+/// Holds the claim on a rebuild until it is handed to one. Releasing on drop
+/// covers the caller cancelling this part-way through: a claim left held makes
+/// every later batch see a rebuild that is not running, and nothing says so.
+struct RebuildClaim<'a> {
+    redis_db: &'a RedisAccountsDB,
+    handed_over: bool,
+}
+
+impl RebuildClaim<'_> {
+    /// The rebuild is about to be started, and releases the claim when it ends.
+    fn hand_over(mut self) {
+        self.handed_over = true;
+    }
+}
+
+impl Drop for RebuildClaim<'_> {
+    fn drop(&mut self) {
+        if !self.handed_over {
+            self.redis_db.finish_rebuild();
+        }
+    }
+}
+
 /// Whether the cache may still be written to and served.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CacheStatus {
@@ -195,30 +218,42 @@ pub(crate) async fn ensure_cache_continuity(
         return Ok(CacheStatus::InService);
     }
 
-    // A condemned cache is not mirrored to, so its tip stays where it is and
-    // every later batch lands here too. The rebuild already running covers them
-    // all: nothing is written to the cache while it runs, so no new gap can open
-    // behind it. Condemning again would purge the whole keyspace once per block
-    // and, worse, would bump the generation and supersede that rebuild, leaving
-    // nothing to stamp the cache back into service.
+    condemn_cache(
+        redis_db,
+        &format!("missed at least one batch (cached tip {cached_slot}, now settling {slot})"),
+    )
+    .await
+}
+
+/// Takes the cache out of service and claims the rebuild it owes, naming
+/// `reason` in the log. The caller runs that rebuild off the block-production
+/// path.
+///
+/// `Rebuilding` when a purge already holds the claim: a condemned cache is not
+/// mirrored to, so its tip stays where it is and every later batch lands here
+/// too. The rebuild already running covers them all, since nothing is written to
+/// the cache while it runs, so no new gap can open behind it. Condemning again
+/// would purge the whole keyspace once per block and, worse, would bump the
+/// generation and supersede that rebuild, leaving nothing to stamp the cache back
+/// into service.
+pub(crate) async fn condemn_cache(redis_db: &RedisAccountsDB, reason: &str) -> Result<CacheStatus> {
     if !redis_db.try_begin_rebuild() {
         return Ok(CacheStatus::Rebuilding);
     }
+    // The caller only rebuilds on `Condemned`, so every other way out of here
+    // has to release the claim, or nothing would ever purge the cache.
+    let claim = RebuildClaim {
+        redis_db,
+        handed_over: false,
+    };
 
-    warn!(
-        "Redis cache missed at least one batch (cached tip {}, now settling {}), rebuilding it",
-        cached_slot, slot
-    );
+    warn!("Redis cache {}, rebuilding it", reason);
     // Recorded before the stamp is cleared so a rebuild started for this
     // condemnation cannot be handed a generation that already looks stale.
     redis_db.record_condemnation();
-    if let Err(e) = clear_deployment_id(redis_db).await {
-        // The caller only rebuilds on `Condemned`, so returning an error here
-        // would leave the claim held by a condemnation that never produced a
-        // rebuild, and nothing would ever purge the cache.
-        redis_db.finish_rebuild();
-        return Err(e);
-    }
+    clear_deployment_id(redis_db).await?;
+
+    claim.hand_over();
     Ok(CacheStatus::Condemned)
 }
 
@@ -563,6 +598,54 @@ mod tests {
             redis_db.condemnation_generation(),
             generation,
             "re-condemning would supersede the rebuild in flight"
+        );
+    }
+
+    /// The caller bounds this check, so it can be cancelled part-way through. A
+    /// claim left held then stops mirroring silently and forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_continuity_check_releases_the_rebuild_claim() {
+        let (redis_db, postgres_db, _pg, _redis) = start_cache().await;
+        let deployment_id = read_deployment_id(&postgres_db).await.unwrap();
+        stamp_deployment_id(&redis_db, &deployment_id)
+            .await
+            .unwrap();
+
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("latest_slot", 100u64).await.unwrap();
+
+        // Reads are still served, so the check gets its tip and takes the claim.
+        // Only the write that clears the stamp hangs, which is where the
+        // cancellation has to land.
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(5_000u64)
+            .arg("WRITE")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(250),
+            ensure_cache_continuity(&redis_db, 200),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the check must still be inside the stamp clear for this test to mean anything"
+        );
+        // Recorded just after the claim is taken, so this separates a
+        // cancellation inside the claimed region from one that ran out of time
+        // on the tip read before reaching it.
+        assert_eq!(
+            redis_db.condemnation_generation(),
+            1,
+            "the check must have got past the claim for this test to mean anything"
+        );
+
+        assert!(
+            redis_db.try_begin_rebuild(),
+            "a cancelled check must leave the rebuild claim free"
         );
     }
 

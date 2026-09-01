@@ -686,6 +686,30 @@ mod tests {
         assert_eq!(state.lag(), 0);
     }
 
+    /// A cold-start regate carries a lower `from` and a higher target than the startup gate.
+    /// The widened gate must still fold contiguously, so neither end lets a slot through.
+    #[test]
+    fn regate_over_open_startup_gate_widens_without_skipping() {
+        let mut state = CheckpointState::gated(FROM, T0);
+        // Startup backfill is mid-flight: the gate to T0 is still open.
+        assert_eq!(drive(&mut state, &[FROM + 1, FROM + 2, FROM + 3]), FROM + 3);
+
+        // Cold start arms from the durable checkpoint, which sits below from_slot.
+        state.regate(FROM - 10, T0 + 20);
+        assert_eq!(
+            state.frontier,
+            FROM + 3,
+            "a lower from never pulls the frontier back over the unfilled startup range"
+        );
+
+        // The resume slot alone is a hole away from the frontier, so it cannot move it.
+        assert_eq!(drive(&mut state, &[T0 + 20]), FROM + 3);
+
+        // Only the full contiguous run up to the widened target hands off.
+        let rest: Vec<u64> = (FROM + 4..=T0 + 20).collect();
+        assert_eq!(drive(&mut state, &rest), T0 + 20);
+    }
+
     /// The writer's Regate handling re-gates the correct per-program state: after
     /// record_regate the gated frontier stays put and lag reflects the new target.
     #[test]

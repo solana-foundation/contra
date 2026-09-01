@@ -1,14 +1,34 @@
 use {
     super::postgres::PostgresAccountsDB,
     anyhow::Result,
-    redis::{aio::ConnectionManager, AsyncCommands, RedisResult},
+    redis::{
+        aio::{ConnectionManager, ConnectionManagerConfig},
+        AsyncCommands, RedisResult,
+    },
     solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
-    std::sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+    std::{
+        sync::{
+            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
     },
+    tokio::time::Instant,
 };
+
+/// How long a command may go unanswered before it fails. Redis can accept a
+/// connection and then stop answering it. Covers a reply on a live connection,
+/// not the reconnect before one, so the settle path bounds its own work too.
+const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long a connection attempt may take. Covers the manager's reconnects too.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How far the failure tally may climb before the writer stops mirroring. One
+/// that keeps failing costs the mirror budget every block, and a mirrored batch
+/// pays a failure back, so a cache that keeps up never approaches this.
+pub(crate) const CACHE_FAILURE_LIMIT: u32 = 3;
 
 #[derive(Clone)]
 pub struct RedisAccountsDB {
@@ -35,6 +55,17 @@ pub struct RedisAccountsDB {
     /// not mirrored to, so its tip stays frozen and every later batch sees the
     /// same discontinuity; without this, each one would condemn again.
     rebuilding: Arc<AtomicBool>,
+    /// Mirror attempts that failed and have not been paid back by one that
+    /// landed, shared across clones like the counters above.
+    cache_failures: Arc<AtomicU32>,
+    /// When the settler may next mirror to this cache, `None` while it is
+    /// mirroring. Shared across clones of the settler's handle like the counters
+    /// above; a read node builds its own handle and takes no part in this.
+    mirror_paused_until: Arc<Mutex<Option<Instant>>>,
+    /// Whether a probe of this cache is already running. One at a time, so a
+    /// cooldown lapsing under a slow probe cannot start a second one that
+    /// resumes on work the first has not finished.
+    probing: Arc<AtomicBool>,
 }
 
 impl RedisAccountsDB {
@@ -50,7 +81,10 @@ impl RedisAccountsDB {
 
         let client = redis::Client::open(redis_url)
             .map_err(|_| format!("Failed to create Redis client for {}", sanitized_url))?;
-        let connection = ConnectionManager::new(client)
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(CONNECTION_TIMEOUT)
+            .set_response_timeout(RESPONSE_TIMEOUT);
+        let connection = ConnectionManager::new_with_config(client, config)
             .await
             .map_err(|_| format!("Failed to connect to Redis at {}", sanitized_url))?;
 
@@ -64,6 +98,9 @@ impl RedisAccountsDB {
             deployment_id,
             condemnations: Arc::new(AtomicU64::new(0)),
             rebuilding: Arc::new(AtomicBool::new(false)),
+            cache_failures: Arc::new(AtomicU32::new(0)),
+            mirror_paused_until: Arc::new(Mutex::new(None)),
+            probing: Arc::new(AtomicBool::new(false)),
         };
         Ok(db)
     }
@@ -101,6 +138,72 @@ impl RedisAccountsDB {
     /// again, so it would never recover.
     pub(crate) fn finish_rebuild(&self) {
         self.rebuilding.store(false, Ordering::SeqCst);
+    }
+
+    /// Records a batch that could not be mirrored.
+    pub(crate) fn record_cache_failure(&self) {
+        self.cache_failures.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Records a mirrored batch, which pays off one failure. One at a time, not
+    /// a reset: a cache failing two batches in three is broken, and a reset
+    /// would let it cost the mirror budget forever.
+    pub(crate) fn record_cache_success(&self) {
+        let _ = self
+            .cache_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                Some(failures.saturating_sub(1))
+            });
+    }
+
+    /// Whether the cache has failed often enough to be given up on.
+    pub(crate) fn has_failed_too_often(&self) -> bool {
+        self.cache_failures.load(Ordering::SeqCst) >= CACHE_FAILURE_LIMIT
+    }
+
+    /// Whether the settler is leaving this cache alone. A lapsed cooldown still
+    /// counts: only a probe that found the cache usable lifts a pause, so no
+    /// batch can be offered to one that has not passed a probe.
+    pub(crate) fn is_mirroring_paused(&self) -> bool {
+        self.mirror_paused_until.lock().unwrap().is_some()
+    }
+
+    /// Whether a pause has run its course, leaving the cache owed a probe.
+    pub(crate) fn pause_has_lapsed(&self) -> bool {
+        self.mirror_paused_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| Instant::now() >= until)
+    }
+
+    /// Claims the right to probe this cache, returning false when a probe already
+    /// holds it. Checking and claiming in one step, so two probes cannot both
+    /// decide the cache is theirs to bring back.
+    pub(crate) fn try_begin_probe(&self) -> bool {
+        self.probing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Releases the claim. Called however the probe ended: one left held would
+    /// stop the cache ever being probed again.
+    pub(crate) fn finish_probe(&self) {
+        self.probing.store(false, Ordering::SeqCst);
+    }
+
+    /// Stops mirroring for `cooldown`. Taken as an argument so tests need not
+    /// wait out the production one.
+    pub(crate) fn pause_mirroring(&self, cooldown: Duration) {
+        let until = Instant::now() + cooldown;
+        *self.mirror_paused_until.lock().unwrap() = Some(until);
+    }
+
+    /// Puts the cache back on the mirror path. The failure tally goes with it:
+    /// it counted batches against a cache the probe has just had purged, and
+    /// left standing it would give up on that one a block later.
+    pub(crate) fn resume_mirroring(&self) {
+        self.cache_failures.store(0, Ordering::SeqCst);
+        *self.mirror_paused_until.lock().unwrap() = None;
     }
 
     /// Reads a cached value and the deployment stamp in one round trip, yielding
@@ -164,5 +267,54 @@ impl TransactionProcessingCallback for RedisAccountsDB {
                 super::account_matches_owners::account_matches_owners(&db, &account, &owners).await
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            accounts::traits::AccountsDB,
+            test_helpers::{start_test_postgres, start_test_redis},
+        },
+        std::time::Duration,
+    };
+
+    /// A Redis that accepts the connection and then stops answering must fail
+    /// the command, not hang on it. `CLIENT PAUSE` is exactly that failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unresponsive_redis_fails_the_command_rather_than_hanging() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        // Long enough that a command with no bound of its own outlives every
+        // assertion below.
+        let pause = Duration::from_secs(5);
+        let mut control = redis_db.connection.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(pause.as_millis() as u64)
+            .arg("ALL")
+            .query_async(&mut control)
+            .await
+            .expect("CLIENT PAUSE must be accepted before the pause takes effect");
+
+        let started = tokio::time::Instant::now();
+        let mut conn = redis_db.connection.clone();
+        let answer: RedisResult<Option<u64>> = conn.get("latest_slot").await;
+        let waited = started.elapsed();
+
+        assert!(
+            answer.is_err(),
+            "an unanswered command must fail, got {answer:?} after {waited:?}"
+        );
+        assert!(
+            waited < pause,
+            "the failure must come from our own timeout, not from the pause lifting, waited {waited:?}"
+        );
     }
 }

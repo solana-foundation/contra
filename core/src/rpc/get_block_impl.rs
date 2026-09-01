@@ -1,4 +1,7 @@
-use crate::rpc::ReadDeps;
+use crate::rpc::{
+    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    ReadDeps,
+};
 use jsonrpsee::core::RpcResult;
 use serde_json::{json, Value};
 use solana_rpc_client_types::config::{RpcBlockConfig, RpcEncodingConfigWrapper};
@@ -10,18 +13,35 @@ pub async fn get_block_impl(
     slot: u64,
     config: Option<RpcEncodingConfigWrapper<RpcBlockConfig>>,
 ) -> RpcResult<Option<Value>> {
-    // Get block data using the trait method
-    let block_info = match read_deps.accounts_db.get_block(slot).await {
-        Some(block) => block,
-        None => return Ok(None),
+    // A lookup failure is an error, never a "not found": the indexer's slot
+    // classifier reads an absent block as a slot it may checkpoint past.
+    let block_info =
+        read_deps.accounts_db.get_block(slot).await.map_err(|e| {
+            custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get block: {}", e))
+        })?;
+    let Some(block_info) = block_info else {
+        return Ok(None);
     };
 
     let config = config.map(|c| c.convert_to_current()).unwrap_or_default();
 
-    // Get transactions for this block
+    // Get transactions for this block. A lookup *failure* errors out rather than
+    // encoding a block that silently drops a transaction it could not read. A row
+    // that is genuinely gone is still skipped: truncation deletes transactions while
+    // their block row can survive, so erroring there would break reads of pruned blocks.
     let mut transactions: Vec<TransactionWithStatusMeta> = Vec::new();
     for sig in &block_info.transaction_signatures {
-        if let Some(stored_tx) = read_deps.accounts_db.get_transaction(sig).await {
+        let stored = read_deps
+            .accounts_db
+            .get_transaction(sig)
+            .await
+            .map_err(|e| {
+                custom_error(
+                    JSON_RPC_SERVER_ERROR,
+                    format!("Failed to get block transaction: {}", e),
+                )
+            })?;
+        if let Some(stored_tx) = stored {
             transactions.push(stored_tx.transaction_with_status_meta());
         }
     }

@@ -1,40 +1,55 @@
 pub use super::models::*;
+pub use try_requeue_prebroadcast::RequeueOutcome;
 
 pub mod bump_pending_remint_finality_attempt;
+pub mod claim_and_persist_signature;
+pub mod claim_remint_attempt;
+pub mod clear_owed_rotation_target;
 pub mod close;
 pub mod count_pending_transactions;
 pub mod delete_release_signatures;
+pub mod delete_remint_signatures;
 pub mod drop_tables;
 pub mod gc_stale_release_signatures;
+pub mod gc_stale_remint_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
 pub mod get_escrow_balances_by_mint;
+pub mod get_in_flight_amounts_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
+pub mod get_owed_rotation_target;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
+pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
+pub mod get_transaction_status;
+pub mod has_active_withdrawal_below;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
+pub mod lowest_unreleased_withdrawal_below;
 pub mod quarantine_all_active_withdrawals;
+pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod sender_lock;
 pub mod set_mint_extension_flags;
+pub mod set_owed_rotation_target;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
+pub mod try_requeue_prebroadcast;
 pub mod try_requeue_processing;
 pub mod try_unpark_to_processing;
 pub mod update_committed_checkpoint;
@@ -135,6 +150,38 @@ impl Storage {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
     }
 
+    /// Tree generation the sender owes the chain; `None` if none is owed.
+    pub async fn get_owed_rotation_target(
+        &self,
+        program_type: &str,
+    ) -> Result<Option<u64>, StorageError> {
+        get_owed_rotation_target::get_owed_rotation_target(self, program_type).await
+    }
+
+    /// Record the owed tree generation before its rotation is dispatched.
+    pub async fn set_owed_rotation_target(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), StorageError> {
+        set_owed_rotation_target::set_owed_rotation_target(self, program_type, target_tree_index)
+            .await
+    }
+
+    /// Retire the owed rotation once a chain read proved the target landed.
+    pub async fn clear_owed_rotation_target(
+        &self,
+        program_type: &str,
+        target_tree_index: u64,
+    ) -> Result<(), StorageError> {
+        clear_owed_rotation_target::clear_owed_rotation_target(
+            self,
+            program_type,
+            target_tree_index,
+        )
+        .await
+    }
+
     /// Terminal status write; `Ok(false)` if row already off Processing.
     pub async fn update_transaction_status(
         &self,
@@ -142,6 +189,7 @@ impl Storage {
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, StorageError> {
         update_transaction_status::update_transaction_status(
             self,
@@ -149,6 +197,7 @@ impl Storage {
             status,
             counterpart_signature,
             processed_at,
+            release_signatures,
         )
         .await
     }
@@ -205,11 +254,14 @@ impl Storage {
         .await
     }
 
-    /// Return per-mint aggregate balances (completed deposits minus withdrawals) for startup reconciliation.
+    /// Return per-mint aggregate balances (completed deposits minus withdrawals) for
+    /// startup reconciliation, counting only what was indexed at or below `as_of_slot`.
     pub async fn get_mint_balances_for_reconciliation(
         &self,
+        as_of_slot: u64,
     ) -> Result<Vec<MintDbBalance>, StorageError> {
-        get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self).await
+        get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self, as_of_slot)
+            .await
     }
 
     /// Query escrow balances by mint for continuous reconciliation checks.
@@ -217,6 +269,30 @@ impl Storage {
     /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
+    }
+
+    /// Per-mint sum of every unsettled transaction amount (pending / processing /
+    /// parked / pending_remint), used as the in-flight envelope by the runtime
+    /// reconciliation halt decision.
+    pub async fn get_in_flight_amounts_by_mint(
+        &self,
+    ) -> Result<Vec<MintInFlightAmount>, StorageError> {
+        get_in_flight_amounts_by_mint::get_in_flight_amounts_by_mint(self).await
+    }
+
+    /// Set the durable reconciliation halt flag. Idempotent.
+    pub async fn set_reconciliation_halt(&self, reason: &str) -> Result<(), StorageError> {
+        reconciliation_halt::set_reconciliation_halt(self, reason).await
+    }
+
+    /// Return the halt info when the flag is set, else `None` (not halted).
+    pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {
+        reconciliation_halt::is_reconciliation_halted(self).await
+    }
+
+    /// Clear the halt so both operators' fetchers resume (manual/runbook use).
+    pub async fn clear_reconciliation_halt(&self) -> Result<(), StorageError> {
+        reconciliation_halt::clear_reconciliation_halt(self).await
     }
 
     /// `transactions.id` for every `deposit` row whose mint was not in
@@ -243,6 +319,20 @@ impl Storage {
         transaction_type: TransactionType,
     ) -> Result<i64, StorageError> {
         count_pending_transactions::count_pending_transactions(self, transaction_type).await
+    }
+
+    pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
+        has_active_withdrawal_below::has_active_withdrawal_below(self, nonce).await
+    }
+
+    /// Lowest withdrawal nonce below `nonce` that still owes a release; `None` if all
+    /// lower nonces are terminal. Counts `Processing` where `has_active_withdrawal_below`
+    /// does not, so it holds on the sender's submit path across a restart.
+    pub async fn lowest_unreleased_withdrawal_below(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        lowest_unreleased_withdrawal_below::lowest_unreleased_withdrawal_below(self, nonce).await
     }
 
     /// Get completed withdrawal nonces in the given range [min_nonce, max_nonce)
@@ -312,13 +402,34 @@ impl Storage {
         get_pending_remint_transactions::get_pending_remint_transactions(self).await
     }
 
+    /// Current status of one row, or `None` if it does not exist. Used to
+    /// resolve which state a guarded write committed when its result was lost.
+    pub async fn get_transaction_status(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Option<TransactionStatus>, StorageError> {
+        get_transaction_status::get_transaction_status(self, transaction_id).await
+    }
+
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means
-    /// another sender holds it, so the caller must refuse to start.
+    /// another sender holds it, so the caller must refuse to start. The guard
+    /// heartbeats the lock and cancels `operator_token` if ownership stops being
+    /// provable; a zero `heartbeat_interval` disables probing.
     pub async fn try_acquire_sender_lock(
         &self,
         key: i64,
+        program_type: &'static str,
+        operator_token: tokio_util::sync::CancellationToken,
+        heartbeat_interval: std::time::Duration,
     ) -> Result<Option<sender_lock::SenderLockGuard>, StorageError> {
-        sender_lock::try_acquire_sender_lock(self, key).await
+        sender_lock::try_acquire_sender_lock(
+            self,
+            key,
+            program_type,
+            operator_token,
+            heartbeat_interval,
+        )
+        .await
     }
 
     /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.
@@ -336,14 +447,22 @@ impl Storage {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
 
-    /// Stale `Processing` rows past the threshold (used by recovery).
+    /// Stale `Processing` rows of one type past the threshold (used by recovery).
+    /// Type-scoped so each operator only recovers rows whose broadcasts target
+    /// the chain its RPC client points at.
     pub async fn get_stale_processing_transactions(
         &self,
+        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_stale_processing_transactions::get_stale_processing_transactions(self, threshold, limit)
-            .await
+        get_stale_processing_transactions::get_stale_processing_transactions(
+            self,
+            transaction_type,
+            threshold,
+            limit,
+        )
+        .await
     }
 
     /// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
@@ -356,26 +475,46 @@ impl Storage {
             .await
     }
 
+    /// Cap-gated CAS `Processing` → `Pending` for sender-side pre-broadcast failures
+    /// where the sender owns the Processing row. Enforces the requeue cap inside the
+    /// write; see `RequeueOutcome`.
+    pub async fn try_requeue_prebroadcast(
+        &self,
+        transaction_id: i64,
+        max_attempts: i32,
+    ) -> Result<RequeueOutcome, StorageError> {
+        try_requeue_prebroadcast::try_requeue_prebroadcast(self, transaction_id, max_attempts).await
+    }
+
     /// CAS `Processing`/`Parked` → `Parked`; `Ok(false)` if the row is neither.
     pub async fn try_park_processing(&self, transaction_id: i64) -> Result<bool, StorageError> {
         try_park_processing::try_park_processing(self, transaction_id).await
     }
 
-    /// CAS `Parked` → `Processing`; `Ok(false)` if the row is not `Parked`.
+    /// CAS `Parked` to `Processing`, returning the winner's post-update
+    /// `updated_at` as the sender's fresh release-claim lease. `Ok(None)` if the
+    /// row is not `Parked`.
     pub async fn try_unpark_to_processing(
         &self,
         transaction_id: i64,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
         try_unpark_to_processing::try_unpark_to_processing(self, transaction_id).await
     }
 
-    /// Stale `Parked` rows older than the threshold, oldest-first.
+    /// Stale `Parked` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_parked_transactions(
         &self,
+        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_stale_parked_transactions::get_stale_parked_transactions(self, threshold, limit).await
+        get_stale_parked_transactions::get_stale_parked_transactions(
+            self,
+            transaction_type,
+            threshold,
+            limit,
+        )
+        .await
     }
 
     /// CAS `Parked` → `Pending` on `updated_at`; `Ok(false)` if stale.
@@ -388,17 +527,21 @@ impl Storage {
     }
 
     /// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.
+    /// `release_signatures` durably records the full broadcast attempt list on an
+    /// SMT-confirmed release; `None` leaves any existing value intact (COALESCE).
     pub async fn try_complete_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
         counterpart_signature: Option<String>,
+        release_signatures: Option<Vec<String>>,
     ) -> Result<bool, StorageError> {
         try_complete_processing::try_complete_processing(
             self,
             transaction_id,
             expected_updated_at,
             counterpart_signature,
+            release_signatures,
         )
         .await
     }
@@ -424,21 +567,48 @@ impl Storage {
         transaction_id: i64,
         signature: String,
         last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
     ) -> Result<(), StorageError> {
         insert_release_signature::insert_release_signature(
             self,
             transaction_id,
             signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
     }
 
-    /// Stored release signatures for a transaction as (signature, lvbh).
+    /// Atomically claim a `Processing` row (CAS on `updated_at`) and persist its
+    /// broadcast signature in one transaction. `Ok(Some(lease))` means the sender
+    /// still owns the row and may broadcast; the returned lease is the row's new
+    /// `updated_at`, which a later re-claim must present. `Ok(None)` means the row
+    /// was demoted or re-locked, so the builder must be dropped without
+    /// broadcasting. Shared by the deposit mint and the withdrawal release.
+    pub async fn claim_and_persist_signature(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        signature: String,
+        last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StorageError> {
+        claim_and_persist_signature::claim_and_persist_signature(
+            self,
+            transaction_id,
+            expected_updated_at,
+            signature,
+            last_valid_block_height,
+            blockhash_slot,
+        )
+        .await
+    }
+
+    /// Stored release signatures for a transaction, newest journal order.
     pub async fn get_release_signatures(
         &self,
         transaction_id: i64,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
+    ) -> Result<Vec<StoredSig>, StorageError> {
         get_release_signatures::get_release_signatures(self, transaction_id).await
     }
 
@@ -447,10 +617,54 @@ impl Storage {
         delete_release_signatures::delete_release_signatures(self, transaction_id).await
     }
 
-    /// Drop release signatures whose parent transaction is no longer
-    /// `Processing`. Returns the number of rows removed.
+    /// Drop release signatures only for genuinely terminal parents (completed,
+    /// failed, failed_reminted). Every non-terminal row keeps its write-ahead
+    /// evidence so the pre-mint gate can re-verify it. Returns the rows removed.
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
         gc_stale_release_signatures::gc_stale_release_signatures(self).await
+    }
+
+    /// Claim the exclusive right to broadcast one remint attempt for a
+    /// transaction, persisting the signature write-ahead in the same step.
+    /// `superseded_signatures` are prior attempts the caller has already proven
+    /// dead on-chain. `Ok(false)` means another sender owns the live attempt,
+    /// so the caller must not broadcast.
+    pub async fn claim_remint_attempt(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+        blockhash_slot: Option<i64>,
+        superseded_signatures: &[String],
+    ) -> Result<bool, StorageError> {
+        claim_remint_attempt::claim_remint_attempt(
+            self,
+            transaction_id,
+            signature,
+            last_valid_block_height,
+            blockhash_slot,
+            superseded_signatures,
+        )
+        .await
+    }
+
+    /// Stored remint signatures for a transaction, newest journal order.
+    pub async fn get_remint_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<StoredSig>, StorageError> {
+        get_remint_signatures::get_remint_signatures(self, transaction_id).await
+    }
+
+    /// Delete all stored remint signatures for a transaction.
+    pub async fn delete_remint_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        delete_remint_signatures::delete_remint_signatures(self, transaction_id).await
+    }
+
+    /// Drop remint signatures whose parent transaction is no longer
+    /// `PendingRemint`. Returns the number of rows removed.
+    pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
+        gc_stale_remint_signatures::gc_stale_remint_signatures(self).await
     }
 }
 
@@ -568,7 +782,7 @@ mod tests {
     // ── lock + drain filtering ───────────────────────────────────────
 
     #[tokio::test]
-    async fn get_and_lock_drains_matched_leaves_rest() {
+    async fn get_and_lock_marks_processing_and_leaves_pending() {
         let (storage, mock) = make_mock_storage();
         {
             let mut pending = mock.pending_transactions.lock().unwrap();
@@ -587,18 +801,111 @@ mod tests {
             .get_and_lock_pending_transactions(TransactionType::Deposit, 2)
             .await
             .unwrap();
-        assert_eq!(locked.len(), 2);
+        assert_eq!(locked.len(), 2, "two Pending deposits are locked");
 
-        // 1 deposit + 1 withdrawal remain
+        // Rows stay in the store (now Processing) so a later claim's CAS can find
+        // them, mirroring Postgres; nothing is drained.
         {
-            let remaining = mock.pending_transactions.lock().unwrap();
-            assert_eq!(remaining.len(), 2);
+            let all = mock.pending_transactions.lock().unwrap();
+            assert_eq!(all.len(), 4, "locking keeps rows in place, none removed");
+            let processing = all
+                .iter()
+                .filter(|t| t.status == TransactionStatus::Processing)
+                .count();
+            assert_eq!(processing, 2, "the two locked deposits are now Processing");
         }
+
+        // A second lock returns only the still-Pending deposit, not the Processing ones.
         let locked2 = storage
             .get_and_lock_pending_transactions(TransactionType::Deposit, 10)
             .await
             .unwrap();
-        assert_eq!(locked2.len(), 1);
+        assert_eq!(
+            locked2.len(),
+            1,
+            "only the remaining Pending deposit re-locks"
+        );
+    }
+
+    // ── claim_and_persist_signature disposition matrix ────────────────
+
+    /// Seed one row directly with an explicit type, status and `updated_at` so
+    /// the claim CAS can be exercised against each disposition.
+    fn seed_claim_row(
+        mock: &MockStorage,
+        id: i64,
+        transaction_type: TransactionType,
+        status: TransactionStatus,
+        updated_at: chrono::DateTime<Utc>,
+    ) {
+        let mut row = make_db_transaction();
+        row.id = id;
+        row.transaction_type = transaction_type;
+        row.status = status;
+        row.updated_at = updated_at;
+        mock.pending_transactions.lock().unwrap().push(row);
+    }
+
+    /// The claim is the single gate both the deposit mint and the withdrawal
+    /// release pass before broadcasting, so it is pinned for both row types: it
+    /// succeeds only on the exact `Processing` incarnation the caller was handed,
+    /// and every other disposition aborts without persisting a signature. A lost
+    /// claim on the withdrawal side is what makes a recovery demote safe against
+    /// a live sender.
+    #[tokio::test]
+    async fn claim_and_persist_signature_disposition_matrix() {
+        // (label, seeded status, token offset from the presented one, claimable)
+        let dispositions = [
+            ("owned", TransactionStatus::Processing, 0, true),
+            ("demoted", TransactionStatus::Pending, 0, false),
+            ("token stale", TransactionStatus::Processing, 30, false),
+            ("terminal", TransactionStatus::Completed, 0, false),
+        ];
+
+        for txn_type in [TransactionType::Deposit, TransactionType::Withdrawal] {
+            for (id, (label, status, skew_secs, claimable)) in dispositions.iter().enumerate() {
+                let (storage, mock) = make_mock_storage();
+                let id = id as i64 + 1;
+                let presented = Utc::now();
+                let seeded = presented + chrono::Duration::seconds(*skew_secs);
+                seed_claim_row(&mock, id, txn_type, *status, seeded);
+
+                let case = format!("{txn_type:?}/{label}");
+                let signature = format!("sig-{case}");
+                let claimed = storage
+                    .claim_and_persist_signature(id, presented, signature.clone(), 100, None)
+                    .await
+                    .unwrap();
+                let persisted = storage.get_release_signatures(id).await.unwrap();
+
+                if !claimable {
+                    assert!(claimed.is_none(), "{case}: must not be claimable");
+                    assert!(
+                        persisted.is_empty(),
+                        "{case}: no signature may be persisted on a lost claim"
+                    );
+                    continue;
+                }
+
+                let lease = claimed.expect("{case}: owning the incarnation must claim");
+                assert_eq!(
+                    persisted.len(),
+                    1,
+                    "{case}: the signature must be persisted"
+                );
+                assert_eq!(
+                    persisted[0].signature, signature,
+                    "{case}: signature mismatch"
+                );
+
+                let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
+                assert_ne!(after, presented, "{case}: a claim must bump updated_at");
+                assert_eq!(
+                    lease, after,
+                    "{case}: the lease must equal the row's new updated_at so it is usable as the next CAS token"
+                );
+            }
+        }
     }
 
     // ── status update recording ──────────────────────────────────────
@@ -613,6 +920,7 @@ mod tests {
                 TransactionStatus::Completed,
                 Some("sig_abc".to_string()),
                 now,
+                None,
             )
             .await
             .unwrap();
@@ -629,9 +937,80 @@ mod tests {
         let (storage, mock) = make_mock_storage();
         mock.set_should_fail("update_transaction_status", true);
         assert!(storage
-            .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now())
+            .update_transaction_status(1, TransactionStatus::Completed, None, Utc::now(), None)
             .await
             .is_err());
+    }
+
+    // Durable release_signatures on completion
+
+    /// try_complete_processing with a release-signature list persists the
+    /// array alongside the single counterpart_signature.
+    #[tokio::test]
+    async fn try_complete_processing_persists_release_signatures() {
+        let (storage, mock) = make_mock_storage();
+        let now = Utc::now();
+        {
+            let mut txn = make_db_transaction();
+            txn.id = 1;
+            txn.status = TransactionStatus::Processing;
+            txn.updated_at = now;
+            mock.pending_transactions.lock().unwrap().push(txn);
+        }
+
+        let ok = storage
+            .try_complete_processing(
+                1,
+                now,
+                Some("s1".to_string()),
+                Some(vec!["s1".to_string(), "s2".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+
+        assert_eq!(
+            mock.completed_release_signatures.lock().unwrap().get(&1),
+            Some(&vec!["s1".to_string(), "s2".to_string()])
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0]
+                .counterpart_signature
+                .as_deref(),
+            Some("s1")
+        );
+    }
+
+    /// A None release-signature list is COALESCE-guarded and never wipes an
+    /// existing array.
+    #[tokio::test]
+    async fn try_complete_processing_none_preserves_existing_release_signatures() {
+        let (storage, mock) = make_mock_storage();
+        let now = Utc::now();
+        {
+            let mut txn = make_db_transaction();
+            txn.id = 2;
+            txn.status = TransactionStatus::Processing;
+            txn.updated_at = now;
+            mock.pending_transactions.lock().unwrap().push(txn);
+        }
+        // An array already recorded (e.g. a prior write).
+        mock.completed_release_signatures
+            .lock()
+            .unwrap()
+            .insert(2, vec!["old1".to_string(), "old2".to_string()]);
+
+        let ok = storage
+            .try_complete_processing(2, now, Some("cp".to_string()), None)
+            .await
+            .unwrap();
+        assert!(ok);
+
+        assert_eq!(
+            mock.completed_release_signatures.lock().unwrap().get(&2),
+            Some(&vec!["old1".to_string(), "old2".to_string()]),
+            "None must not clobber an existing array"
+        );
     }
 
     // ── storage dispatch coverage ────────────────────────────────────
@@ -818,16 +1197,21 @@ mod tests {
         }
 
         let balances = storage
-            .get_mint_balances_for_reconciliation()
+            .get_mint_balances_for_reconciliation(900)
             .await
             .unwrap();
+        assert_eq!(
+            mock.last_reconciliation_slot(),
+            Some(900),
+            "the slot bound must reach storage, not be dropped on the way"
+        );
         assert_eq!(balances.len(), 2);
         assert!(balances.iter().any(|b| b.mint_address == "usdc"
-            && b.total_deposits == BigDecimal::from(10000u64)
-            && b.total_withdrawals == BigDecimal::from(5000u64)));
+            && b.total_deposits == 10000u64
+            && b.total_withdrawals == 5000u64));
         assert!(balances.iter().any(|b| b.mint_address == "usdt"
-            && b.total_deposits == BigDecimal::from(8000u64)
-            && b.total_withdrawals == BigDecimal::from(3000u64)));
+            && b.total_deposits == 8000u64
+            && b.total_withdrawals == 3000u64));
     }
 
     #[tokio::test]
@@ -945,6 +1329,45 @@ mod tests {
             .unwrap();
         let val = storage.get_committed_checkpoint("escrow").await.unwrap();
         assert_eq!(val, Some(42));
+    }
+
+    #[tokio::test]
+    async fn dispatch_owed_rotation_target_via_mock() {
+        let (storage, _mock) = make_mock_storage();
+        assert!(storage
+            .get_owed_rotation_target("withdraw")
+            .await
+            .unwrap()
+            .is_none());
+
+        storage
+            .set_owed_rotation_target("withdraw", 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_owed_rotation_target("withdraw").await.unwrap(),
+            Some(7)
+        );
+
+        // A clear naming a different target must leave the owed one alone.
+        storage
+            .clear_owed_rotation_target("withdraw", 6)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_owed_rotation_target("withdraw").await.unwrap(),
+            Some(7)
+        );
+
+        storage
+            .clear_owed_rotation_target("withdraw", 7)
+            .await
+            .unwrap();
+        assert!(storage
+            .get_owed_rotation_target("withdraw")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -1420,5 +1843,127 @@ mod tests {
         assert_eq!(poison.status, TransactionStatus::Processing);
         let sibling = rows.iter().find(|t| t.id == 43).unwrap();
         assert_eq!(sibling.status, TransactionStatus::ManualReview);
+    }
+
+    // ── reconciliation halt flag ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_then_is_halted_returns_reason() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        let info = storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halt should be set");
+        assert_eq!(info.reason, "mint X insolvent");
+    }
+
+    #[tokio::test]
+    async fn absent_is_not_halted() {
+        let (storage, _mock) = make_mock_storage();
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_unsets() {
+        let (storage, _mock) = make_mock_storage();
+        storage.set_reconciliation_halt("reason").await.unwrap();
+        storage.clear_reconciliation_halt().await.unwrap();
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_is_idempotent_on_conflict() {
+        let (storage, _mock) = make_mock_storage();
+        storage.set_reconciliation_halt("first").await.unwrap();
+        storage.set_reconciliation_halt("second").await.unwrap();
+        let info = storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halt should still be set");
+        assert_eq!(info.reason, "second", "re-set overwrites the reason");
+    }
+
+    // ── in-flight envelope query ──────────────────────────────────────
+
+    fn in_flight_txn(id: i64, mint: &str, amount: u64, status: TransactionStatus) -> DbTransaction {
+        let mut t = make_db_transaction();
+        t.id = id;
+        t.mint = mint.to_string();
+        t.amount = TokenAmount(amount);
+        t.status = status;
+        t
+    }
+
+    #[tokio::test]
+    async fn in_flight_sums_only_in_flight_statuses() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(in_flight_txn(1, "mint_a", 100, TransactionStatus::Pending));
+            db.push(in_flight_txn(
+                2,
+                "mint_a",
+                200,
+                TransactionStatus::Processing,
+            ));
+            db.push(in_flight_txn(3, "mint_a", 400, TransactionStatus::Parked));
+            db.push(in_flight_txn(
+                4,
+                "mint_a",
+                800,
+                TransactionStatus::PendingRemint,
+            ));
+            // Terminal statuses must be excluded from the envelope.
+            db.push(in_flight_txn(5, "mint_a", 1, TransactionStatus::Completed));
+            db.push(in_flight_txn(6, "mint_a", 2, TransactionStatus::Failed));
+            db.push(in_flight_txn(
+                7,
+                "mint_a",
+                4,
+                TransactionStatus::ManualReview,
+            ));
+        }
+        let rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mint_address, "mint_a");
+        assert_eq!(rows[0].in_flight_amount, BigDecimal::from(1500u64));
+    }
+
+    #[tokio::test]
+    async fn in_flight_groups_per_mint() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(in_flight_txn(1, "mint_a", 100, TransactionStatus::Pending));
+            db.push(in_flight_txn(
+                2,
+                "mint_b",
+                250,
+                TransactionStatus::Processing,
+            ));
+        }
+        let mut rows = storage.get_in_flight_amounts_by_mint().await.unwrap();
+        rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].mint_address, "mint_a");
+        assert_eq!(rows[0].in_flight_amount, BigDecimal::from(100u64));
+        assert_eq!(rows[1].mint_address, "mint_b");
+        assert_eq!(rows[1].in_flight_amount, BigDecimal::from(250u64));
+    }
+
+    #[tokio::test]
+    async fn in_flight_empty_is_absent() {
+        let (storage, _mock) = make_mock_storage();
+        assert!(storage
+            .get_in_flight_amounts_by_mint()
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

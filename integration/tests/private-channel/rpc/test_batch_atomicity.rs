@@ -138,6 +138,7 @@ fn slot_block_info(slot: u64) -> BlockInfo {
         block_time: Some(0),
         transaction_signatures: vec![],
         transaction_recent_blockhashes: vec![],
+        transaction_message_hashes: vec![],
     }
 }
 
@@ -219,7 +220,7 @@ async fn test_write_batch_constraint_injection() {
 
     // The block row itself must not exist.
     assert!(
-        db.get_block(2).await.is_none(),
+        db.get_block(2).await.unwrap().is_none(),
         "slot 2 block must not exist after the rolled-back write_batch"
     );
 
@@ -374,7 +375,7 @@ async fn test_write_batch_process_kill_simulation() {
 
     // The block row must not exist.
     assert!(
-        db.get_block(2).await.is_none(),
+        db.get_block(2).await.unwrap().is_none(),
         "slot 2 block must not exist — Postgres rolled back on connection kill"
     );
 
@@ -432,7 +433,7 @@ async fn test_store_block_atomicity() {
 
     // The block row that was written before the failure must have been rolled back.
     assert!(
-        db.get_block(1).await.is_none(),
+        db.get_block(1).await.unwrap().is_none(),
         "slot 1 block must not exist — the blocks insert was rolled back with the failed metadata update"
     );
 
@@ -447,7 +448,7 @@ async fn test_store_block_atomicity() {
         .expect("store_block must succeed after constraint is removed");
 
     assert!(
-        db.get_block(1).await.is_some(),
+        db.get_block(1).await.unwrap().is_some(),
         "slot 1 block must exist after the clean store_block"
     );
 }

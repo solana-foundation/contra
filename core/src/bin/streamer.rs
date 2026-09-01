@@ -560,19 +560,32 @@ async fn poll_loop(
         }
 
         for slot in &blocks {
+            // A stream drop is a missed notification, not a verdict, so every read
+            // failure below is logged and skipped like an absence but named apart.
             let block_info: BlockInfo = match accounts_db.get_block(*slot).await {
-                Some(info) => info,
-                None => {
+                Ok(Some(info)) => info,
+                Ok(None) => {
                     warn!("Block {} listed but not found", slot);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Failed to read block {}: {}", slot, e);
                     continue;
                 }
             };
 
             for sig in &block_info.transaction_signatures {
                 let stored_tx = match accounts_db.get_transaction(sig).await {
-                    Some(tx) => tx,
-                    None => {
+                    Ok(Some(tx)) => tx,
+                    Ok(None) => {
                         warn!("Transaction {} not found in block {}", sig, slot);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to read transaction {} in block {}: {}",
+                            sig, slot, e
+                        );
                         continue;
                     }
                 };

@@ -34,6 +34,7 @@ fn base_config(mode: NodeMode) -> NodeConfig {
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 1,
         accountsdb_connection_url: "postgres://unused/private_channel".to_string(),
+        redis_cache_url: None,
         admin_keys: vec![Keypair::new().pubkey()],
         transaction_expiration_ms: 1_000,
         blocktime_ms: 100,

@@ -15,6 +15,13 @@ pub enum AppError {
     Conflict(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// Client is over its per-IP or per-username budget on the credential routes.
+    #[error("too many requests")]
+    TooManyRequests,
+    /// Password hashing is at its concurrency cap. Shedding here keeps the
+    /// runtime responsive instead of queueing work without bound.
+    #[error("service unavailable")]
+    Unavailable,
     /// Wraps unexpected internal failures. The message is logged but never sent to the client.
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
@@ -29,6 +36,8 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            AppError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             AppError::Internal(e) => {
                 error!("internal error: {e}");
                 (

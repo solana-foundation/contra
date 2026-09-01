@@ -73,6 +73,7 @@ impl DbTransactionWriter {
                 update.status,
                 update.counterpart_signature.clone(),
                 update.processed_at.unwrap_or_else(Utc::now),
+                update.release_signatures.clone(),
             )
             .await
         {
@@ -196,6 +197,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: false,
+            release_signatures: None,
         }
     }
 
@@ -375,6 +377,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: Some("remint_sig_abc".to_string()),
             remint_attempted: true,
+            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -408,6 +411,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: true,
+            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -442,6 +446,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: false,
+            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -476,6 +481,7 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: true,
+            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;

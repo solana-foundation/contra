@@ -36,6 +36,11 @@ use {
 /// period for the process to exit.
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(8);
 
+/// How long an aborted worker gets to actually end. Short because cancellation
+/// lands at the next await point, and bounded because a task without one never
+/// ends and would otherwise hold the drain open indefinitely.
+const ABORT_GRACE: Duration = Duration::from_secs(2);
+
 /// RPC→dedup ingress queue capacity. Sized so steady state never sheds.
 pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
 /// sigverify→sequencer queue capacity (mirrors the sigverify queue size).
@@ -512,10 +517,25 @@ impl NodeHandles {
                     // stage holding its pool and channels beside the new one.
                     worker.handle.abort();
                     overran = true;
-                    warn!(
-                        "{} did not drain within the deadline and was aborted",
-                        worker.name
-                    );
+
+                    // `abort()` only schedules cancellation, so wait for the task
+                    // to actually end. Bounded, because a task that never yields
+                    // cannot be cancelled at all and must not hold the drain open
+                    // past the container's stop grace period.
+                    let stopped = tokio::time::timeout(ABORT_GRACE, &mut worker.handle)
+                        .await
+                        .is_ok();
+                    if stopped {
+                        warn!(
+                            "{} did not drain within the deadline and was aborted",
+                            worker.name
+                        );
+                    } else {
+                        error!(
+                            "{} ignored the abort and is still running; an in-process restart would overlap it",
+                            worker.name
+                        );
+                    }
                 }
             }
         }
@@ -565,14 +585,34 @@ mod tests {
             "shutdown must return once the drain deadline passes"
         );
 
-        // Abort is asynchronous, so give the runtime a moment to drop the task.
-        for _ in 0..50 {
-            if stopped.load(Ordering::SeqCst) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("the overrunning worker was left running after shutdown returned");
+        // Checked with no grace period: `abort()` only schedules cancellation, so
+        // returning before the task is gone lets a replacement pipeline overlap
+        // the old one, which is the whole reason for aborting at all.
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the overrunning worker was still running when shutdown returned"
+        );
+    }
+
+    /// A task with no await point cannot be cancelled, so waiting on it must not
+    /// hold the drain open past its budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uncancellable_worker_does_not_extend_the_drain() {
+        let spinning = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let handles = NodeHandles {
+            workers: vec![WorkerHandle::new("Spinning".to_string(), spinning)],
+            shutdown_token: CancellationToken::new(),
+            ingress_tx: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(3),
+            "shutdown waited on a task that can never be cancelled"
+        );
     }
 
     #[tokio::test]

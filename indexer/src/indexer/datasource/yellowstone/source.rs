@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocks,
-    SubscribeRequestPing, SubscribeUpdateTransactionInfo,
+    SubscribeRequestFilterSlots, SubscribeRequestPing, SubscribeUpdateTransactionInfo,
 };
 
 use crate::channel_utils::send_guaranteed;
@@ -616,8 +616,20 @@ async fn connect_and_stream(
         },
     );
 
+    // Slots carry the point the stream resumed at, which is what the gap gate arms on. Blocks
+    // are program-filtered, so waiting for one would measure idle time instead of the outage.
+    let mut slots = HashMap::new();
+    slots.insert(
+        "private_channel_slots".to_string(),
+        SubscribeRequestFilterSlots {
+            // Same commitment as the blocks, so the armed target is a slot they can reach.
+            filter_by_commitment: Some(true),
+            interslot_updates: Some(false),
+        },
+    );
+
     let subscribe_request = SubscribeRequest {
-        slots: HashMap::new(),
+        slots,
         accounts: HashMap::new(),
         transactions: HashMap::new(),
         transactions_status: HashMap::new(),
@@ -676,6 +688,33 @@ async fn connect_and_stream(
                     None => break,
                     Some(message) => match message {
             Ok(msg) => match msg.update_oneof {
+                // Where this stream actually resumed, so the gap is the outage and nothing
+                // else. Slots carry no transactions, so none is forwarded from here.
+                Some(UpdateOneof::Slot(slot_update)) => {
+                    #[cfg(feature = "datasource-rpc")]
+                    if let Some(ctx) = gap_ctx {
+                        if !armed {
+                            armed = true;
+                            let safe_to_forward = arm_reconnect_gap(
+                                slot_update.slot,
+                                startup_floor,
+                                ctx,
+                                &tx,
+                                &cancellation_token,
+                                RECONNECT_GAP_RETRY_BACKOFF,
+                                backfill_handle,
+                            )
+                            .await
+                            .map_err(DataSourceError::Rpc)?;
+                            // Cancelled mid-arm, so stop rather than stream on ungated.
+                            if !safe_to_forward {
+                                break;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "datasource-rpc"))]
+                    let _ = slot_update;
+                }
                 Some(UpdateOneof::Block(block)) => {
                     metrics::INDEXER_CHAIN_TIP_SLOT
                         .with_label_values(&[program_type.as_label()])

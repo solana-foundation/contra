@@ -43,6 +43,22 @@ pub async fn run(
         },
     ));
 
+    // Optional destination fallback for recovery and the boot pre-flight to
+    // re-check a Dead verdict. Empty means unset (env renders "") and maps to None.
+    let normalized_fallback_url = common_config
+        .fallback_rpc_url
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let fallback_rpc_client = normalized_fallback_url.map(|url| {
+        Arc::new(RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig::default(),
+            CommitmentConfig {
+                commitment: config.rpc_commitment,
+            },
+        ))
+    });
+
     // The withdraw operator's compensating remint MintTo must broadcast on the source
     // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
     // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
@@ -56,6 +72,54 @@ pub async fn run(
                 .to_string(),
         ));
     }
+
+    // A detected reconciliation mismatch must never degrade to a silent log, so
+    // the escrow operator refuses to start without an alert webhook. Blank or
+    // whitespace (env renders an unset var as "") counts as unset, mirroring the
+    // fallback_rpc_url normalization above. Placed before any task spawns, so the
+    // early return needs no writer drain.
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && config
+            .reconciliation_webhook_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(OperatorError::WebhookError(
+            "reconciliation_webhook_url required for Escrow operator: a reconciliation \
+             mismatch must always alert, never silently log"
+                .to_string(),
+        ));
+    }
+
+    // The runtime solvency check must always run, so the escrow operator refuses to
+    // start without the Solana custody RPC it reads balances from (blank counts as unset).
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && common_config
+            .source_rpc_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+    {
+        return Err(OperatorError::RpcError(
+            "source_rpc_url required for Escrow operator: the supply-vs-custody \
+             reconciliation reads Solana custody from it and must always run"
+                .to_string(),
+        ));
+    }
+
+    // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require an
+    // independent, same-cluster, reachable fallback before starting.
+    validate_withdraw_fallback(
+        common_config.program_type,
+        &rpc_client,
+        fallback_rpc_client.as_deref(),
+        &common_config.rpc_url,
+        normalized_fallback_url,
+    )
+    .await?;
 
     // Initialize source RPC client if configured
     let source_rpc_client = common_config.source_rpc_url.as_ref().map(|url| {
@@ -100,6 +164,7 @@ pub async fn run(
             let preflight = run_withdraw_preflight(
                 &storage,
                 &rpc_client,
+                fallback_rpc_client.clone(),
                 preflight_instance,
                 &storage_tx,
                 &cancellation_token,
@@ -157,6 +222,7 @@ pub async fn run(
     // the sender uses for status updates.
     let processor_storage = storage.clone();
     let processor_rpc = rpc_client.clone();
+    let processor_fallback_rpc = fallback_rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
     let processor_storage_tx = storage_tx.clone();
     let processor_handle = tokio::spawn(async move {
@@ -168,6 +234,7 @@ pub async fn run(
             instance_pda,
             processor_storage,
             processor_rpc,
+            processor_fallback_rpc,
             processor_source_rpc,
         )
         .await;
@@ -191,6 +258,7 @@ pub async fn run(
             config.retry_max_attempts,
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
+            sender::SENDER_LOCK_HEARTBEAT_INTERVAL,
         )
         .await
         {
@@ -202,29 +270,44 @@ pub async fn run(
     // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
     let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
     {
-        if let Some(reconciliation_escrow) = common_config.escrow_instance_id {
-            let reconciliation_storage = storage.clone();
-            let reconciliation_config = config.clone();
-            let reconciliation_rpc = source_rpc_client
-                .clone()
-                .unwrap_or_else(|| rpc_client.clone());
-            let reconciliation_token = cancellation_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = reconciliation::run_reconciliation(
-                    reconciliation_storage,
-                    reconciliation_config,
-                    reconciliation_rpc,
-                    reconciliation_escrow,
-                    reconciliation_token,
-                )
-                .await
-                {
-                    tracing::error!("Reconciliation error: {}", e);
-                }
-            })
-        } else {
-            warn!("Skipping reconciliation: escrow_instance_id is not configured");
-            tokio::spawn(async {})
+        // Both are guaranteed present for a validated escrow config: source_rpc_url
+        // is enforced above and escrow_instance_id by config validation. Fail loud
+        // rather than silently skip if that ever regresses.
+        match (common_config.escrow_instance_id, source_rpc_client.clone()) {
+            (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
+                let reconciliation_storage = storage.clone();
+                let reconciliation_config = config.clone();
+                // Custody (Solana escrow ATAs) is read from source_rpc_client;
+                // channel-token supply lives on rpc_url (the PrivateChannel chain
+                // the escrow operator mints to). Custody must never be read from
+                // rpc_client: the escrow ATAs do not exist on the channel, so it
+                // would read 0 and trip a false halt.
+                let reconciliation_channel_rpc = rpc_client.clone();
+                let reconciliation_health = health.clone();
+                let reconciliation_token = cancellation_token.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = reconciliation::run_reconciliation(
+                        reconciliation_storage,
+                        reconciliation_config,
+                        reconciliation_rpc,
+                        reconciliation_channel_rpc,
+                        reconciliation_escrow,
+                        reconciliation_health,
+                        reconciliation_token,
+                    )
+                    .await
+                    {
+                        tracing::error!("Reconciliation error: {}", e);
+                    }
+                })
+            }
+            _ => {
+                return Err(OperatorError::RpcError(
+                    "escrow reconciliation requires both escrow_instance_id and \
+                     source_rpc_url; one is missing after startup validation"
+                        .to_string(),
+                ));
+            }
         }
     } else {
         tokio::spawn(async {})
@@ -234,13 +317,17 @@ pub async fn run(
     let recovery_handle = {
         let recovery_storage = storage.clone();
         let recovery_rpc = rpc_client.clone();
+        let recovery_fallback = fallback_rpc_client.clone();
         let recovery_program_type = common_config.program_type;
+        let recovery_instance_pda = instance_pda;
         let recovery_token = cancellation_token.clone();
         tokio::spawn(async move {
             if let Err(e) = recovery::run_recovery_worker(
                 recovery_storage,
                 recovery_rpc,
+                recovery_fallback,
                 recovery_program_type,
+                recovery_instance_pda,
                 recovery_storage_tx,
                 recovery_token,
             )
@@ -351,9 +438,11 @@ pub async fn run(
 
 /// Reconcile in-flight releases, then validate the local SMT against the on-chain root.
 /// Only a genuine `SmtRootMismatch` returns `Err` (refuse to start).
+#[allow(clippy::too_many_arguments)]
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,
+    fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     instance_pda: solana_sdk::pubkey::Pubkey,
     storage_tx: &mpsc::Sender<sender::TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
@@ -366,7 +455,9 @@ async fn run_withdraw_preflight(
     if let Err(e) = recovery::boot_reconcile_processing(
         storage,
         rpc_client,
+        fallback_rpc_client.clone(),
         crate::config::ProgramType::Withdraw,
+        Some(instance_pda),
         storage_tx,
         cancellation_token,
         MAX_RECONCILE_PASSES,
@@ -379,7 +470,13 @@ async fn run_withdraw_preflight(
     // Pre-clear PendingRemint withdrawals that already landed so the validation
     // below doesn't refuse to start on a nonce the chain consumed but the row
     // hasn't recorded as Completed yet. Best-effort; validation is the gate.
-    if let Err(e) = recovery::boot_reconcile_landed_pending_remints(storage, rpc_client).await {
+    if let Err(e) = recovery::boot_reconcile_landed_pending_remints(
+        storage,
+        rpc_client,
+        fallback_rpc_client.as_deref(),
+    )
+    .await
+    {
         warn!(
             "Boot reconcile of landed pending remints failed, proceeding to SMT validation: {}",
             e
@@ -411,6 +508,58 @@ async fn run_withdraw_preflight(
     }
 }
 
+/// Withdraw-only gate for the Solana fallback: a missing fallback only warns (the on-chain SMT gate is the release-side
+/// authority), but a configured fallback must be independent, same-cluster (equal genesis hash), and reachable, else
+/// refuse to start. Archival depth is left to the per-attempt ledger-floor check.
+async fn validate_withdraw_fallback(
+    program_type: crate::config::ProgramType,
+    rpc_client: &RpcClientWithRetry,
+    fallback: Option<&RpcClientWithRetry>,
+    rpc_url: &str,
+    fallback_url: Option<&str>,
+) -> Result<(), OperatorError> {
+    if program_type != crate::config::ProgramType::Withdraw {
+        return Ok(());
+    }
+
+    // A missing fallback is no longer refuse-to-start: the on-chain SMT gate is
+    // now the authority for a release-side Dead, so a second corroborating
+    // endpoint is defense-in-depth, not a correctness precondition. Warn so a
+    // single-endpoint deploy is visible, then start.
+    let (Some(fallback), Some(fallback_url)) = (fallback, fallback_url) else {
+        warn!(
+            "withdraw operator started without a fallback_rpc_url: release-side Dead is gated by \
+             the on-chain SMT root; a second endpoint is recommended defense-in-depth"
+        );
+        return Ok(());
+    };
+
+    if fallback_url == rpc_url {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url must differ from rpc_url: an independent endpoint, not the same node"
+                .to_string(),
+        ));
+    }
+
+    // getGenesisHash doubles as a reachability probe for each endpoint.
+    let primary_genesis = rpc_client
+        .get_genesis_hash()
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("rpc_url unreachable at startup: {e}")))?;
+    let fallback_genesis = fallback.get_genesis_hash().await.map_err(|e| {
+        OperatorError::RpcError(format!("fallback_rpc_url unreachable at startup: {e}"))
+    })?;
+
+    if primary_genesis != fallback_genesis {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url is on a different cluster than rpc_url (genesis hash mismatch)"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Log + metric for a critical task that exited before cancellation.
 ///
 /// We don't abort the process here — the caller falls through to
@@ -430,6 +579,7 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProgramType;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::operator::utils::smt_util::SmtState;
     use crate::storage::common::storage::mock::MockStorage;
@@ -437,6 +587,7 @@ mod tests {
     use base64::Engine;
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::Instance;
+    use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
     use std::time::Duration;
 
@@ -508,7 +659,15 @@ mod tests {
         let client = Arc::new(client);
         let (storage_tx, _rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
         let token = CancellationToken::new();
-        run_withdraw_preflight(&storage, &client, Pubkey::new_unique(), &storage_tx, &token).await
+        run_withdraw_preflight(
+            &storage,
+            &client,
+            None,
+            Pubkey::new_unique(),
+            &storage_tx,
+            &token,
+        )
+        .await
     }
 
     /// Matching local and on-chain roots: the pre-flight passes and the operator starts.
@@ -553,6 +712,149 @@ mod tests {
                 ))
             ),
             "a real mismatch must refuse to start: {result:?}"
+        );
+    }
+
+    // ── withdraw fallback startup gate ───────────────────────────────
+
+    /// Register a `getGenesisHash` reply of `hash` (base58) on `server`.
+    fn mock_genesis(server: &mut mockito::ServerGuard, hash: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":"{hash}","id":0}}"#))
+            .create()
+    }
+
+    /// S1: a withdraw operator with no fallback now warns and starts (previously
+    /// refused). The SMT gate is the authority for a release-side Dead.
+    #[tokio::test]
+    async fn withdraw_missing_fallback_warns_and_starts() {
+        let primary = make_rpc_client("http://localhost:8899");
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            None,
+            "http://localhost:8899",
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "missing fallback must now warn and start: {result:?}"
+        );
+    }
+
+    /// A fallback whose URL equals rpc_url is not independent; refuse to start.
+    #[tokio::test]
+    async fn withdraw_fallback_same_url_refuses_start() {
+        let primary = make_rpc_client("http://localhost:8899");
+        let fallback = make_rpc_client("http://localhost:8899");
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            "http://localhost:8899",
+            Some("http://localhost:8899"),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// Two reachable endpoints on different clusters (differing genesis) refuse.
+    #[tokio::test]
+    async fn withdraw_fallback_different_genesis_refuses_start() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let _p = mock_genesis(&mut primary_server, &Hash::new_unique().to_string());
+        let _f = mock_genesis(&mut fallback_server, &Hash::new_unique().to_string());
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            &primary_server.url(),
+            Some(&fallback_server.url()),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// An unreachable fallback (genesis RPC error) refuses to start.
+    #[tokio::test]
+    async fn withdraw_fallback_unreachable_refuses_start() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let _p = mock_genesis(&mut primary_server, &Hash::new_unique().to_string());
+        let _f = fallback_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"down"},"id":0}"#)
+            .create();
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            &primary_server.url(),
+            Some(&fallback_server.url()),
+        )
+        .await;
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// Independent, same-cluster, reachable fallback: the gate passes.
+    #[tokio::test]
+    async fn withdraw_valid_fallback_passes() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let mut fallback_server = mockito::Server::new_async().await;
+        let genesis = Hash::new_unique().to_string();
+        let _p = mock_genesis(&mut primary_server, &genesis);
+        let _f = mock_genesis(&mut fallback_server, &genesis);
+
+        let primary = make_rpc_client(&primary_server.url());
+        let fallback = make_rpc_client(&fallback_server.url());
+        let result = validate_withdraw_fallback(
+            ProgramType::Withdraw,
+            &primary,
+            Some(&fallback),
+            &primary_server.url(),
+            Some(&fallback_server.url()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "matching genesis + distinct URLs must pass: {result:?}"
+        );
+    }
+
+    /// The mandatory-fallback rule is withdraw-only: an escrow operator with no
+    /// fallback passes the gate untouched.
+    #[tokio::test]
+    async fn escrow_no_fallback_passes() {
+        let primary = make_rpc_client("http://localhost:8899");
+        let result = validate_withdraw_fallback(
+            ProgramType::Escrow,
+            &primary,
+            None,
+            "http://localhost:8899",
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "escrow must not require a fallback: {result:?}"
         );
     }
 }

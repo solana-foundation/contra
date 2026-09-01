@@ -172,6 +172,18 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .execute(pool)
     .await?;
 
+    // Identifies this database, so a Redis cache carrying another deployment's
+    // ledger keys can be recognised and purged instead of served. DO NOTHING
+    // keeps an existing database's identifier stable across restarts; a fresh
+    // database, or one restored from a different ledger, gets a different one.
+    sqlx::query(
+        "INSERT INTO metadata (key, value) VALUES ('deployment_id', $1)
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind(&rand::random::<[u8; 16]>()[..])
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         r#"
             CREATE TABLE IF NOT EXISTS performance_samples (
@@ -216,6 +228,29 @@ mod tests {
     use solana_svm_callback::TransactionProcessingCallback;
 
     const ENV_VAR: &str = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS";
+
+    /// `create_tables` runs on every boot, so the deployment id must be minted
+    /// once and then left alone. Re-minting it would make the Redis cache look
+    /// like it belonged to another ledger and purge it on every restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deployment_id_survives_reopening_the_database() {
+        // Both handles point at the same database, and the second one re-runs
+        // create_tables, which is exactly what a restart does.
+        let (first, second, _pg) = start_test_postgres_with_new_instance().await;
+
+        let first_id = crate::accounts::redis_coherence::read_deployment_id(&first)
+            .await
+            .unwrap();
+        let second_id = crate::accounts::redis_coherence::read_deployment_id(&second)
+            .await
+            .unwrap();
+
+        assert_eq!(first_id.len(), 16, "deployment id must be 16 bytes");
+        assert_eq!(
+            first_id, second_id,
+            "re-running create_tables must not re-mint the deployment id"
+        );
+    }
 
     /// Snapshot the env var, run `body`, restore. `serial_test` prevents
     /// concurrent tests from racing on the shared process env.

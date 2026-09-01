@@ -1,11 +1,19 @@
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
 use private_channel_auth::config::Config;
-use private_channel_auth::{build_app, db, jwt::JwtConfig, pool_status::PoolStatus, AppState};
+use private_channel_auth::{
+    build_app, db,
+    jwt::JwtConfig,
+    password::PasswordWorker,
+    pool_status::PoolStatus,
+    throttle::{self, AuthThrottle},
+    AppState,
+};
 
 /// How often the background task purges expired and used challenge rows.
 /// Challenge TTL is 10 minutes, so hourly is more than sufficient.
@@ -35,10 +43,19 @@ async fn main() {
     info!("Schema initialized");
 
     let pool_status = PoolStatus::new_healthy();
+    let auth_throttle = Arc::new(AuthThrottle::new(
+        config.auth_rate_limit_per_second,
+        config.auth_rate_limit_burst,
+        config.auth_username_attempts_per_minute,
+    ));
+    throttle::spawn_pruner(auth_throttle.clone());
+
     let state = AppState {
         pool,
         jwt: Arc::new(JwtConfig::new(&config.jwt_secret)),
         pool_status: pool_status.clone(),
+        passwords: PasswordWorker::new(config.argon2_max_concurrency),
+        throttle: auth_throttle,
     };
 
     // Periodically remove expired and used challenges so the table doesn't grow unboundedly.
@@ -64,5 +81,11 @@ async fn main() {
         .await
         .expect("failed to bind");
 
-    axum::serve(listener, app).await.expect("server error");
+    // Connect info is required by the per-IP throttle.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server error");
 }

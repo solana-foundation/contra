@@ -13,6 +13,12 @@ pub enum IndexerError {
     #[error("Channel send failed during shutdown")]
     ShutdownChannelSend,
 
+    #[error("Checkpoint channel closed; cannot persist slot progress")]
+    CheckpointChannelClosed,
+
+    #[error("Transaction processor task panicked")]
+    ProcessorPanicked,
+
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),
 
@@ -44,11 +50,48 @@ pub enum ReconciliationError {
     #[error("{count} mint(s) exceed mismatch threshold of {threshold} raw units; see logs for per-mint details")]
     MismatchExceedsThreshold { count: usize, threshold: u64 },
 
+    /// Minted channel supply is above the custody backing it. Kept separate from a
+    /// custody-versus-ledger mismatch because no amount of indexing changes either side
+    /// of this comparison: it reads the chain twice and never touches the database.
+    #[error("{count} mint(s) have channel supply above escrow custody by more than {threshold} raw units; see logs for per-mint details")]
+    SupplyExceedsCustody { count: usize, threshold: u64 },
+
+    /// Channel supply could not be read at all, so the invariant never ran. Startup stops
+    /// rather than proceed unchecked: an unreadable gateway hides an existing breach just
+    /// as well as a healthy channel does, and the two are indistinguishable from here.
+    #[error("channel supply for {count} mint(s) was unreadable across every attempt; the supply invariant did not run, so custody cannot be vouched for")]
+    SupplyInvariantUnverified { count: usize },
+
+    /// The two token-program sweeps never answered at the same slot, so the custody
+    /// numbers describe no single point and cannot be compared against a ledger bounded at
+    /// one. Usually a load-balanced endpoint answering from nodes at different heights,
+    /// which is why another sweep is worth trying before giving up.
+    #[error("custody sweeps never settled on one slot after {attempts} attempts (last spread {low}..{high}); custody cannot be pinned to a single point")]
+    CustodySlotUnsettled { attempts: u32, low: u64, high: u64 },
+
+    /// The custody reading came from a slot the ledger has already passed, so the two
+    /// cannot be compared at a common point and any verdict would be guesswork. Usually a
+    /// lagging RPC node, which is why a re-read is worth trying before giving up.
+    #[error("custody was read at slot {snapshot_slot}, behind the committed checkpoint {committed}; the node is answering from behind the ledger")]
+    CustodyBehindLedger { snapshot_slot: u64, committed: u64 },
+
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
 
+    #[error(
+        "source_rpc_url (channel RPC) required for the escrow indexer: the startup \
+         supply invariant reads channel-token supply from it and must always run"
+    )]
+    MissingChannelRpc,
+
     #[error("DB net balance for mint {mint} exceeds u64::MAX ({net}); the escrow ATA cannot hold this, so the DB is corrupt")]
     DbBalanceOverflow { mint: String, net: String },
+
+    /// The pre-drop consumed-set could not be built completely (channel unreachable,
+    /// pagination failed, or a legacy-scheme memo could not be reconciled). Resync
+    /// aborts before any destruction so the live DB is left intact.
+    #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
+    ConsumedSetUnavailable { reason: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)
@@ -65,9 +108,6 @@ pub enum DataSourceError {
 
     #[error("Commitment level parse error: {value}")]
     InvalidCommitment { value: String },
-
-    #[error("Gap fill failed: {reason}")]
-    GapFillFailed { reason: String },
 }
 
 /// Errors specific to backfill operations
@@ -82,6 +122,12 @@ pub enum BackfillError {
         #[source]
         source: DataSourceRpcError,
     },
+
+    #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
+    MissingMeta { slot: u64, signature: String },
+
+    #[error("Slot {slot} is unavailable: a block exists here that this endpoint will not serve, so its contents are unknown")]
+    SlotUnavailable { slot: u64 },
 
     // Channel errors
     #[error("Channel send failed: {0}")]
@@ -123,4 +169,17 @@ pub enum CheckpointError {
 
     #[error("Invalid checkpoint: slot {slot} is before last checkpoint {last}")]
     InvalidCheckpoint { slot: u64, last: u64 },
+
+    /// `last` stays an Option so "stalled at slot N" and "no row was ever written" read
+    /// differently in the log: the first points at an unprocessed slot in the range, the
+    /// second at a checkpoint writer that never flushed. They need different responses.
+    #[error(
+        "Checkpoint for {program_type} reached {last:?}, never {target}, after {waited_secs}s"
+    )]
+    CommitTimeout {
+        program_type: String,
+        last: Option<u64>,
+        target: u64,
+        waited_secs: u64,
+    },
 }

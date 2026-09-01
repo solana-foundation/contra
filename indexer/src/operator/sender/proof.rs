@@ -2,7 +2,6 @@ use crate::error::{OperatorError, ProgramError};
 use crate::operator::sender::mint;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::{ReleaseFundsBuilderWithNonce, SIBLING_PROOF_SIZE};
-use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use tracing::{error, info, warn};
@@ -48,6 +47,7 @@ impl SenderSMTState {
             transaction_id: Some(transaction_id),
             withdrawal_nonce: Some(nonce),
             trace_id: Some(trace_id),
+            deposit_claim_lease: None,
         };
         self.nonce_to_builder.insert(nonce, (ctx, builder.clone()));
 
@@ -92,24 +92,23 @@ impl SenderSMTState {
     }
 }
 
-/// Check if pending rotation can now be processed
-/// Returns the ResetSmtRoot builder if ready to execute
-pub fn take_pending_rotation_if_ready(state: &mut SenderState) -> Option<Box<ResetSmtRootBuilder>> {
-    state.pending_rotation.as_ref()?;
-
-    // Check if all in-flight transactions are settled
-    let has_in_flight = if let Some(ref smt_state) = state.smt_state {
-        !smt_state.nonce_to_builder.is_empty()
-    } else {
-        false
-    };
-
-    if !has_in_flight {
-        info!("All in-flight transactions settled, rotation ready to execute");
-        state.pending_rotation.take()
-    } else {
-        None
+/// Check if the armed rotation can be submitted now: no in-flight release can
+/// still change the tree under it. Purely local; whether the chain still needs the
+/// rotation is a separate unconditional read on the submit path.
+///
+/// Not a take. The reset carries no DB row and no withdrawal nonce, so
+/// `pending_rotation` is the only record that the tree still owes a rotation. It
+/// is cleared only where the chain shows it landed.
+pub(super) fn pending_rotation_due(state: &SenderState) -> bool {
+    if state.pending_rotation.is_none() {
+        return false;
     }
+
+    let has_in_flight = state
+        .smt_state
+        .as_ref()
+        .is_some_and(|smt_state| !smt_state.nonce_to_builder.is_empty());
+    !has_in_flight
 }
 
 /// Rebuild transaction with regenerated SMT proof and retry
@@ -153,12 +152,20 @@ pub(super) async fn rebuild_with_regenerated_proof(
         );
     }
 
+    // The live lease is what this nonce owns right now; a rebuild inherits it
+    // rather than the token the original builder arrived with.
+    let Some(fetched_updated_at) = state.release_leases.get(&nonce).copied() else {
+        error!("No ownership lease held for nonce {nonce}; refusing to rebuild");
+        return None;
+    };
+
     let builder_with_nonce = Box::new(ReleaseFundsBuilderWithNonce {
         builder,
         nonce,
         transaction_id,
         trace_id,
         remint_info,
+        fetched_updated_at,
     });
 
     match smt_state.handle_release_funds_transaction(
@@ -195,6 +202,8 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
         // Note: when called from handle_permanent_failure, remint_cache is
         // already drained. This removal is defensive for any other call site.
         state.remint_cache.remove(&nonce);
+        // The builder is gone, so the lease it held no longer speaks for anyone.
+        state.release_leases.remove(&nonce);
     }
 
     mint::cleanup_mint_builder(state, nonce.map(|n| n as i64));
@@ -203,11 +212,14 @@ pub(super) fn cleanup_failed_transaction(state: &mut SenderState, nonce: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::utils::instruction_util::ResetSmtRootBuilderWithTarget;
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
-    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::instructions::{
+        ReleaseFundsBuilder, ResetSmtRootBuilder,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -227,6 +239,7 @@ mod tests {
         SenderState {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc.clone(),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -241,6 +254,7 @@ mod tests {
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -250,6 +264,11 @@ mod tests {
     fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id,
+            source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                &format!("remint-sig-{transaction_id}"),
+                0,
+                None,
+            ),
             trace_id: trace_id.to_string(),
             mint: Pubkey::new_unique(),
             user: Pubkey::new_unique(),
@@ -284,28 +303,35 @@ mod tests {
         b
     }
 
-    // ── take_pending_rotation_if_ready ────────────────────────────────
+    // ── pending_rotation_due ──────────────────────────────────────────
 
     #[test]
-    fn rotation_returns_none_when_no_pending() {
-        let mut state = make_sender_state();
-        assert!(take_pending_rotation_if_ready(&mut state).is_none());
+    fn rotation_not_due_when_none_armed() {
+        let state = make_sender_state();
+        assert!(!pending_rotation_due(&state));
     }
 
+    /// Due, and still armed afterwards: the check must not consume the rotation,
+    /// or a failed submission would leave nothing to retry.
     #[test]
-    fn rotation_returns_builder_when_no_inflight() {
+    fn rotation_due_and_stays_armed_without_smt_state() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
         // No smt_state means no in-flight
-        let result = take_pending_rotation_if_ready(&mut state);
-        assert!(result.is_some());
-        assert!(state.pending_rotation.is_none(), "should be taken");
+        assert!(pending_rotation_due(&state));
+        assert!(state.pending_rotation.is_some(), "must stay armed");
     }
 
     #[test]
-    fn rotation_blocked_by_inflight_transactions() {
+    fn rotation_not_due_while_inflight() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
 
         // Add smt_state with an in-flight nonce
         let mut smt = make_smt_state(0);
@@ -313,22 +339,26 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder
             .insert(0, (ctx, ReleaseFundsBuilder::new()));
         state.smt_state = Some(smt);
 
-        assert!(take_pending_rotation_if_ready(&mut state).is_none());
-        assert!(state.pending_rotation.is_some(), "should NOT be taken yet");
+        assert!(!pending_rotation_due(&state));
+        assert!(state.pending_rotation.is_some(), "must stay armed");
     }
 
     #[test]
-    fn rotation_ready_after_inflight_cleared() {
+    fn rotation_due_after_inflight_cleared() {
         let mut state = make_sender_state();
-        state.pending_rotation = Some(Box::new(ResetSmtRootBuilder::new()));
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index: 1,
+        }));
         state.smt_state = Some(make_smt_state(0)); // empty nonce_to_builder
 
-        assert!(take_pending_rotation_if_ready(&mut state).is_some());
+        assert!(pending_rotation_due(&state));
     }
 
     // ── cleanup_failed_transaction ───────────────────────────────────
@@ -342,6 +372,7 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(5),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder
             .insert(5, (ctx, ReleaseFundsBuilder::new()));
@@ -387,6 +418,7 @@ mod tests {
             transaction_id: 1,
             trace_id: "t".to_string(),
             remint_info: Some(make_test_remint_info(1, "t")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let result =
@@ -412,6 +444,7 @@ mod tests {
             transaction_id: 1,
             trace_id: "t".to_string(),
             remint_info: Some(make_test_remint_info(1, "t")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let result =
@@ -429,6 +462,7 @@ mod tests {
             transaction_id: 42,
             trace_id: "trace-42".to_string(),
             remint_info: Some(make_test_remint_info(42, "trace-42")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let result = smt.handle_release_funds_transaction(
@@ -464,6 +498,7 @@ mod tests {
                 transaction_id: nonce as i64,
                 trace_id: format!("t-{nonce}"),
                 remint_info: Some(make_test_remint_info(nonce as i64, &format!("t-{nonce}"))),
+                fetched_updated_at: chrono::Utc::now(),
             });
             smt.handle_release_funds_transaction(bwn, Pubkey::new_unique(), vec![], None, None)
                 .unwrap();
@@ -535,9 +570,12 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder.insert(0, (ctx, builder));
         state.smt_state = Some(smt);
+        // A rebuild inherits the lease the nonce already holds.
+        state.release_leases.insert(0, chrono::Utc::now());
 
         let fee_payer = Pubkey::new_unique();
         let ix = InstructionWithSigners {
@@ -565,9 +603,11 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder.insert(0, (ctx, builder));
         state.smt_state = Some(smt);
+        state.release_leases.insert(0, chrono::Utc::now());
 
         // Seed remint_cache so rebuild can propagate it
         let remint = make_test_remint_info(1, "t");

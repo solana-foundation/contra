@@ -4,6 +4,7 @@ pub mod mint_util;
 pub mod rpc_util;
 pub mod signer_util;
 pub mod smt_util;
+pub mod storage_util;
 pub mod transaction_util;
 
 pub use account_util::*;

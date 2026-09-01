@@ -54,6 +54,7 @@ pub async fn run_dedup_persistence_test(db_url: String) {
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url: db_url,
+        redis_cache_url: None,
         admin_keys: vec![operator.pubkey()],
         transaction_expiration_ms: 15_000,
         blocktime_ms: 100,

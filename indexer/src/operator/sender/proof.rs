@@ -169,8 +169,10 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     };
 
     // One already armed or sent owns this window; a second would pay twice and
-    // race the re-arm path holding the first.
+    // race the re-arm path holding the first. A rotation on its way is also the
+    // end of any block, since the block is precisely the absence of one.
     if state.pending_rotation.is_some() || state.rotation_in_flight.is_some() {
+        state.rotation_blocked_passes = 0;
         return;
     }
 
@@ -181,8 +183,13 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
         .cached_generation
         .map(|cached| cached.saturating_mul(NONCES_PER_GENERATION))
         .unwrap_or(0);
-    let Some((_, highest)) = read_unreleased_bounds(state, cached_floor).await else {
-        return;
+    let highest = match read_unreleased_bounds(state, cached_floor).await {
+        Ok(Some((_, highest))) => highest,
+        Ok(None) => {
+            state.rotation_blocked_passes = 0;
+            return;
+        }
+        Err(BoundsUnavailable) => return,
     };
 
     // Everything waiting is still inside that window, so nothing needs a
@@ -191,6 +198,7 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
         .cached_generation
         .is_some_and(|cached| highest / NONCES_PER_GENERATION <= cached)
     {
+        state.rotation_blocked_passes = 0;
         return;
     }
 
@@ -207,8 +215,13 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     // rotation closes. A nonce below it is already past saving, and waiting on
     // one would stall every withdrawal behind it forever.
     let window_floor = chain_generation.saturating_mul(NONCES_PER_GENERATION);
-    let Some((lowest, highest)) = read_unreleased_bounds(state, window_floor).await else {
-        return;
+    let (lowest, highest) = match read_unreleased_bounds(state, window_floor).await {
+        Ok(Some(bounds)) => bounds,
+        Ok(None) => {
+            state.rotation_blocked_passes = 0;
+            return;
+        }
+        Err(BoundsUnavailable) => return,
     };
 
     let lowest_generation = lowest / NONCES_PER_GENERATION;
@@ -232,7 +245,8 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
 
     // Withholding is correct here, but only a human clears it, so report it.
     // Once per threshold, not once per block: a counter that stops ticking lets
-    // the alert resolve while the stall is still running.
+    // the alert resolve while the stall is still running. Every pass that
+    // establishes no block clears the streak, so this counts consecutive ones.
     state.rotation_blocked_passes = state.rotation_blocked_passes.saturating_add(1);
     if !state
         .rotation_blocked_passes
@@ -255,18 +269,25 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     );
 }
 
-/// Bounds of the unreleased nonces at or above `min_nonce`, or `None` when there
-/// are none, the read failed, or the rows are unusable. Every `None` means the
-/// same to the caller: arm nothing, since arming blind could rotate past a
-/// release that can then never land.
-async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(u64, u64)> {
+/// The gate could not be read. Distinct from reading it and finding nothing,
+/// because an unread gate is only ever evidence of an outage: it may not arm a
+/// rotation, and it may not be taken for proof that a block has cleared.
+struct BoundsUnavailable;
+
+/// Bounds of the unreleased nonces at or above `min_nonce`, `None` when there are
+/// none, and an error when the answer is unknown. Arming needs the bounds, so
+/// both of the other two withhold; only `None` proves nothing is owed.
+async fn read_unreleased_bounds(
+    state: &SenderState,
+    min_nonce: u64,
+) -> Result<Option<(u64, u64)>, BoundsUnavailable> {
     let Ok(floor) = i64::try_from(min_nonce) else {
         report_read_failure(state);
         error!(
             min_nonce,
             "Not arming a rotation: the nonce floor does not fit"
         );
-        return None;
+        return Err(BoundsUnavailable);
     };
 
     let bounds = match state
@@ -274,16 +295,17 @@ async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(
         .unreleased_withdrawal_nonce_bounds(floor)
         .await
     {
-        Ok(bounds) => bounds?,
+        Ok(Some(bounds)) => bounds,
+        Ok(None) => return Ok(None),
         Err(e) => {
             report_read_failure(state);
             warn!("Not arming a rotation: could not read the unreleased nonces: {e}");
-            return None;
+            return Err(BoundsUnavailable);
         }
     };
 
     match (u64::try_from(bounds.0), u64::try_from(bounds.1)) {
-        (Ok(lowest), Ok(highest)) => Some((lowest, highest)),
+        (Ok(lowest), Ok(highest)) => Ok(Some((lowest, highest))),
         _ => {
             report_read_failure(state);
             error!(
@@ -291,7 +313,7 @@ async fn read_unreleased_bounds(state: &SenderState, min_nonce: u64) -> Option<(
                 highest = bounds.1,
                 "Not arming a rotation: an unreleased nonce is negative"
             );
-            None
+            Err(BoundsUnavailable)
         }
     }
 }
@@ -610,15 +632,21 @@ mod tests {
             .get()
     }
 
-    /// The runbooks promise the withheld-rotation alert fires after five minutes,
-    /// but the threshold is a pass count and the passes come from a timer in
-    /// another file. Changing either without this would move the alert silently.
+    /// Two ways the documented threshold can drift from the one that ships, kept
+    /// apart so a failure says which. The runbooks name five minutes, and the
+    /// passes are that threshold divided by an interval from another file, a
+    /// division that only lands on it exactly if the interval divides it.
     #[test]
     fn the_blocked_alert_reports_after_five_minutes() {
         assert_eq!(
+            ROTATION_BLOCKED_ALERT_AFTER,
+            Duration::from_secs(300),
+            "the runbooks document five minutes; change them with this"
+        );
+        assert_eq!(
             super::super::ROTATION_ORIGINATION_INTERVAL * ROTATION_BLOCKED_ALERT_PASSES,
-            std::time::Duration::from_secs(300),
-            "the interval must divide five minutes exactly"
+            ROTATION_BLOCKED_ALERT_AFTER,
+            "the interval must divide the threshold exactly"
         );
     }
 
@@ -672,6 +700,76 @@ mod tests {
         assert!(
             state.pending_rotation.is_none(),
             "a rotation nothing is waiting on buys nothing"
+        );
+    }
+
+    /// The streak has to count consecutive blocked passes, not blocked passes
+    /// ever seen. A block that clears and a later unrelated one are two
+    /// incidents, and carrying the first count into the second would report the
+    /// second within one pass of starting rather than after the settling window.
+    #[tokio::test]
+    async fn a_pass_that_sees_no_block_clears_the_streak() {
+        // Every way the driver can finish a pass having established that nothing
+        // is being withheld, short of the two that already clear it.
+        for case in [
+            "nothing live at all",
+            "a rotation already armed",
+            "everything waiting inside the cached window",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+            let rows: &[(i64, i64, TransactionStatus)] = match case {
+                "nothing live at all" => &[],
+                _ => &[(1, 1, TransactionStatus::Pending)],
+            };
+            let mut state = originator_state(&server.url(), rows);
+            match case {
+                "a rotation already armed" => state.pending_rotation = Some(rotation_builder()),
+                "everything waiting inside the cached window" => state.cached_generation = Some(0),
+                _ => {}
+            }
+            state.rotation_blocked_passes = ROTATION_BLOCKED_ALERT_PASSES - 1;
+
+            originate_rotation_if_needed(&mut state).await;
+
+            assert_eq!(
+                state.rotation_blocked_passes, 0,
+                "{case}: a pass that saw no block must not leave the next one primed to report"
+            );
+        }
+    }
+
+    /// A read that failed establishes nothing, so it must not be mistaken for a
+    /// pass that saw the block clear. Clearing the streak on an outage would
+    /// restart the settling window every time the database blinked, and a stall
+    /// spanning those blinks would never reach the threshold to be reported.
+    // Reads a process-wide counter, so it has to be ordered against the other
+    // tests that assert on it.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn a_pass_that_could_not_read_leaves_the_streak_alone() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        match state.storage.as_ref() {
+            crate::storage::Storage::Mock(mock) => {
+                mock.set_should_fail("unreleased_withdrawal_nonce_bounds", true)
+            }
+            _ => unreachable!("the originator harness is built on the mock"),
+        }
+        state.rotation_blocked_passes = ROTATION_BLOCKED_ALERT_PASSES - 1;
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert_eq!(
+            state.rotation_blocked_passes,
+            ROTATION_BLOCKED_ALERT_PASSES - 1,
+            "an unread pass must neither count as a block nor clear one"
         );
     }
 

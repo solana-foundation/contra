@@ -69,15 +69,22 @@ A release is accepted only when `nonce_generation` equals the bitmap's stored
 
 ### Rotation
 
-When a nonce reaches the generation boundary the operator sends `RotateBitmap`,
-which clears every bit and advances `generation` by one:
+The operator sends `RotateBitmap`, which clears every bit and advances
+`generation` by one:
 
 ```rust
-// Operator-only instruction (dispatched automatically at the boundary)
+// Operator-only instruction (dispatched automatically, see below)
 RotateBitmap {
     expected_generation: 0, // must equal the stored generation
 }
 ```
+
+Rotation is driven by state, not by any particular withdrawal. On a timer the
+sender compares the bitmap's generation against the lowest withdrawal nonce that
+still owes a release. When that nonce belongs to a later generation, the current
+window is finished with and a rotation is armed. The same comparison also
+withholds the rotation while a lower nonce is still unresolved, since rotating
+past it would close the only window its release could ever land in.
 
 `expected_generation` makes rotation non-idempotent: a replayed rotation is
 rejected with `UnexpectedGeneration` rather than skipping a whole generation of

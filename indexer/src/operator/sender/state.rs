@@ -60,6 +60,7 @@ impl SenderState {
             rotation_retry_attempts: 0,
             rotation_in_flight: None,
             rotation_rearm_attempts: 0,
+            rotation_blocked_passes: 0,
             mint_cache,
             mint_builders: HashMap::new(),
             retry_max_attempts,

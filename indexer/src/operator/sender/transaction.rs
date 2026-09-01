@@ -398,6 +398,9 @@ fn rearm_failed_rotation(state: &mut SenderState, error_msg: &str) {
              unopened generation stays unreleasable until a rotation lands."
         );
         state.rotation_in_flight = None;
+        // The driver starts a fresh rotation once nothing is in flight, and a
+        // count left at the limit would abandon that one on its first failure.
+        state.rotation_rearm_attempts = 0;
     };
 
     let Some(builder) = state.rotation_in_flight.clone() else {
@@ -5335,6 +5338,31 @@ mod tests {
         assert_eq!(
             state.rotation_retry_attempts, 0,
             "the re-armed rotation needs its send budget back"
+        );
+    }
+
+    /// Abandoning a rotation has to hand the next one a full budget. The driver
+    /// starts a fresh rotation once nothing is in flight, so a re-arm count left
+    /// at the limit would abandon that one on its first failure, and every one
+    /// after it, with no retries at all.
+    #[tokio::test]
+    async fn abandoning_a_rotation_returns_the_re_arm_budget() {
+        let mut state = make_sender_state();
+        // Rotation is a withdraw-role concern, and the escrow label is what the
+        // give-up metric test measures, so stay off its series.
+        state.program_type = ProgramType::Withdraw;
+        state.rotation_in_flight = Some(rotation_builder());
+        state.rotation_rearm_attempts = MAX_ROTATION_REARMS;
+
+        rearm_failed_rotation(&mut state, "send failed");
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "the rotation at its limit must be abandoned, not re-armed"
+        );
+        assert_eq!(
+            state.rotation_rearm_attempts, 0,
+            "the next rotation must start on a full re-arm budget"
         );
     }
 

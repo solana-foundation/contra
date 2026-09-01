@@ -7,17 +7,14 @@ use crate::operator::instruction_util::{
 use crate::operator::sender::TransactionStatusUpdate;
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
-    bitmap_constants::NONCES_PER_GENERATION, fetch_bitmap_generation, find_allowed_mint_pda,
-    find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
+    find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
     MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
 };
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
-use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, RotateBitmapBuilder,
-};
+use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
 use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
@@ -436,27 +433,6 @@ async fn build_release_funds(
     )))
 }
 
-/// Build the rotation TransactionBuilder for a nonce landing on the
-/// NONCES_PER_GENERATION boundary (normal, non-poison path).
-///
-/// `expected_generation` is left unset here: the sender fills it from a fresh
-/// read once the in-flight withdrawals have settled, which is the only moment
-/// the value is still guaranteed to be current.
-fn build_scheduled_rotation(
-    admin_pubkey: Pubkey,
-    release_funds_state: &ReleaseFundsState,
-) -> TransactionBuilder {
-    let mut rotation_builder = RotateBitmapBuilder::new();
-    rotation_builder
-        .payer(admin_pubkey)
-        .operator(release_funds_state.operator_pubkey)
-        .instance(release_funds_state.instance_pda)
-        .withdrawal_bitmap(release_funds_state.withdrawal_bitmap_pda)
-        .operator_pda(release_funds_state.operator_pda)
-        .event_authority(release_funds_state.event_authority_pda);
-    TransactionBuilder::RotateBitmap(Box::new(rotation_builder))
-}
-
 /// Token-2022 pre-flight for a withdrawal.
 ///
 /// Returns:
@@ -542,65 +518,16 @@ pub async fn process_release_funds(
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
         let outcome: Result<(), OperatorError> = async {
-            // Build the withdrawal first so (a) rotation + withdrawal dispatch
-            // are atomic from the sender's perspective, and (b) row-data
-            // poison (e.g. NULL nonce, unparseable pubkey) surfaces here as
-            // an `InvalidBuilder` for the classifier to halt the pipeline on.
-            // Build also warms `MintCache.cache`, so the pre-flight below
-            // doesn't pay an extra DB/RPC round-trip for `get_mint_metadata`.
+            // Build first so row-data poison, such as a NULL nonce or an
+            // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
+            // classifier to halt the pipeline on. Building also warms
+            // `MintCache.cache`, so the pre-flight below does not pay an extra
+            // database or RPC round-trip for `get_mint_metadata`.
             let release_funds_tx = build_release_funds(processor_state, &transaction).await?;
-
-            // Rotate on a boundary nonce BEFORE the pre-flight, so a boundary row
-            // that quarantines below still leaves later withdrawals in the new
-            // generation.
-            //
-            // Skip if the chain has already rotated. A re-armed boundary row
-            // reprocesses the same nonce, and rotating twice would advance past
-            // a whole generation of nonces that could then never be released.
-            if let Some(nonce_i64) = transaction.withdrawal_nonce {
-                let nonce = nonce_i64 as u64;
-                if nonce > 0 && nonce.is_multiple_of(NONCES_PER_GENERATION) {
-                    let target_generation = nonce / NONCES_PER_GENERATION;
-                    let release_funds_state = processor_state
-                        .release_funds_state
-                        .as_ref()
-                        .ok_or(OperatorError::MissingBuilder)?;
-                    let bitmap_pda = release_funds_state.withdrawal_bitmap_pda;
-                    let rpc_client = processor_state.mint_cache.rpc_client().ok_or_else(|| {
-                        OperatorError::RpcError(
-                            "generation read requires an RPC client".to_string(),
-                        )
-                    })?;
-                    let onchain_generation =
-                        fetch_bitmap_generation(rpc_client, &bitmap_pda).await?;
-                    if onchain_generation < target_generation {
-                        info!(
-                            nonce,
-                            target_generation,
-                            "Generation boundary detected, dispatching RotateBitmap"
-                        );
-                        let rotation_tx = build_scheduled_rotation(
-                            processor_state.admin_pubkey,
-                            release_funds_state,
-                        );
-                        send_guaranteed(&sender_tx, rotation_tx, "rotate bitmap")
-                            .await
-                            .map_err(OperatorError::ChannelSend)?;
-                    } else {
-                        info!(
-                            nonce,
-                            target_generation,
-                            onchain_generation,
-                            "Boundary already rotated on-chain, skipping RotateBitmap"
-                        );
-                    }
-                }
-            }
 
             // Pre-flight for Token-2022 pause / permanent-delegate drain. These
             // are row-specific, so bails route to ManualReview and continue the
-            // loop rather than halting the pipeline (reserved for poison rows);
-            // the rotation above already fired, so later withdrawals proceed.
+            // loop rather than halting the pipeline (reserved for poison rows).
             // It is best-effort: a delegate can still drain between this read and
             // the on-chain CPI, leaving that to the sender retry path. RPC errors
             // bubble up as Transient and restart the task.
@@ -784,6 +711,7 @@ pub async fn process_deposit_funds(
 mod tests {
     use super::*;
     use crate::error::{AccountError, StorageError, TransactionError};
+    use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
     use crate::operator::find_allowed_mint_pda;
     use crate::operator::rpc_util::RpcClientWithRetry;
     use crate::operator::utils::account_util::bitmap_account_bytes;
@@ -1094,11 +1022,11 @@ mod tests {
         assert_eq!(b.trace_id, "trace-1");
     }
 
-    /// When the nonce lands exactly on NONCES_PER_GENERATION, a RotateBitmap must
-    /// be dispatched before the boundary ReleaseFunds, or that release is refused
-    /// as belonging to a generation the bitmap has not opened yet.
+    /// A boundary nonce is an ordinary withdrawal here. Rotation is driven from
+    /// the bitmap's own state elsewhere, so coupling it back to one row would
+    /// reintroduce a single point of failure for every withdrawal after it.
     #[tokio::test]
-    async fn process_release_funds_rotation_sends_rotate_first() {
+    async fn boundary_nonce_dispatches_only_the_release() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
 
@@ -1160,32 +1088,24 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        // First message must be RotateBitmap: rotation happens before the boundary withdrawal
-        let msg1 = sender_rx.recv().await.unwrap();
-        assert!(
-            matches!(msg1, TransactionBuilder::RotateBitmap(_)),
-            "expected RotateBitmap first, got: {:?}",
-            std::mem::discriminant(&msg1)
-        );
-
-        // Second message must be the ReleaseFunds for the boundary nonce itself
-        let msg2 = sender_rx.recv().await.unwrap();
-        let TransactionBuilder::ReleaseFunds(b) = msg2 else {
-            panic!("expected ReleaseFunds second, got a different variant");
+        let msg = sender_rx.recv().await.unwrap();
+        let TransactionBuilder::ReleaseFunds(b) = msg else {
+            panic!("a boundary nonce must dispatch its release and nothing else");
         };
         assert_eq!(b.nonce, NONCES_PER_GENERATION);
         assert_eq!(b.transaction_id, 1);
 
-        // No further messages — exactly two were sent
-        assert!(sender_rx.try_recv().is_err(), "unexpected third message");
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "the processor must not dispatch a rotation"
+        );
     }
 
-    /// Regression for the boundary-quarantine wedge: a boundary nonce whose
-    /// pre-flight bails (here, escrow underfunded) must STILL rotate the tree
-    /// first. Otherwise the rotation is skipped and every later-tree withdrawal
-    /// wedges on a tree-index mismatch. The boundary row itself is quarantined.
+    /// A boundary nonce that bails its pre-flight is quarantined like any other
+    /// row and dispatches nothing at all. Nothing here is owed to the bitmap, so
+    /// the row's fate cannot decide whether a later generation ever opens.
     #[tokio::test]
-    async fn process_release_funds_boundary_quarantine_still_rotates() {
+    async fn boundary_row_preflight_bail_dispatches_nothing() {
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
 
@@ -1204,9 +1124,8 @@ mod tests {
         );
         let storage = Arc::new(Storage::Mock(mock));
 
-        // Instance on tree 0 (rotation needed); escrow balance 500 < amount 1000.
+        // Escrow balance 500 is short of the 1000 the withdrawal needs.
         let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, bitmap_account_response(0));
         mocks.insert(
             RpcRequest::GetTokenAccountBalance,
             serde_json::json!({
@@ -1247,16 +1166,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Rotation fired despite the bail...
-        let msg = sender_rx.recv().await.unwrap();
-        assert!(
-            matches!(msg, TransactionBuilder::RotateBitmap(_)),
-            "expected RotateBitmap to be dispatched before the pre-flight bail"
-        );
-        // ...and no ReleaseFunds for the quarantined boundary row.
         assert!(
             sender_rx.try_recv().is_err(),
-            "boundary row must not be released, only the rotation is sent"
+            "a bailed row must dispatch nothing, not even on a boundary nonce"
         );
 
         // The boundary row is quarantined to ManualReview.
@@ -1268,67 +1180,10 @@ mod tests {
             .contains("insufficient escrow balance"));
     }
 
-    /// A re-armed boundary row (manual-review recovery) reprocesses the same
-    /// nonce. If the tree was already rotated on-chain, the rotation must be
-    /// skipped, otherwise it advances the tree a second time and skips a whole
-    /// generation. The withdrawal itself still proceeds.
-    #[tokio::test]
-    async fn process_release_funds_boundary_already_rotated_skips_reset() {
-        let mint_pubkey = Pubkey::new_unique();
-        let recipient = Pubkey::new_unique();
-
-        let mock = MockStorage::new();
-        let storage = Arc::new(Storage::Mock(mock));
-        insert_mint_row(&storage, &mint_pubkey);
-
-        // Instance already on tree 1 == boundary target, so no rotation is owed.
-        let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, bitmap_account_response(1));
-        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
-
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
-        };
-
-        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
-        let (sender_tx, mut sender_rx) = mpsc::channel(10);
-        let (storage_tx, _storage_rx) = mpsc::channel(10);
-
-        let txn = make_db_transaction(
-            1,
-            &mint_pubkey.to_string(),
-            &recipient.to_string(),
-            Some(NONCES_PER_GENERATION as i64),
-            TransactionType::Withdrawal,
-        );
-        fetcher_tx.send(txn).await.unwrap();
-        drop(fetcher_tx);
-
-        process_release_funds(
-            &mut ps,
-            fetcher_rx,
-            sender_tx,
-            storage_tx,
-            storage,
-            ProgramType::Withdraw,
-        )
-        .await
-        .unwrap();
-
-        // The only message is the withdrawal, no redundant RotateBitmap.
-        let msg = sender_rx.recv().await.unwrap();
-        let TransactionBuilder::ReleaseFunds(b) = msg else {
-            panic!("expected ReleaseFunds, got RotateBitmap or another variant");
-        };
-        assert_eq!(b.nonce, NONCES_PER_GENERATION);
-        assert!(sender_rx.try_recv().is_err(), "no second message expected");
-    }
-
     /// A mint field that cannot be parsed as a Pubkey halts the pipeline.
-    /// The poison row is marked ManualReview, no rotation is dispatched,
-    /// and subsequent active withdrawals are quarantined.
+    /// The poison row is marked ManualReview and subsequent active withdrawals
+    /// are quarantined. A boundary nonce is no exception: nothing it could have
+    /// dispatched is load-bearing for the bitmap any more.
     #[tokio::test]
     async fn process_release_funds_invalid_mint_quarantines_and_halts() {
         let mock = MockStorage::new();
@@ -2070,13 +1925,12 @@ mod tests {
         assert_eq!(nonces, vec![1, 2, 3]);
     }
 
-    /// A boundary nonce where the builder build itself fails must NOT
-    /// dispatch the rotation — build_release_funds runs first, and an
-    /// error short-circuits before the rotation send.  This locks in the
-    /// §4.7 reorder: no sender-visible side effect without a successful
-    /// builder.
+    /// A poison boundary row is quarantined and the pipeline halts, with nothing
+    /// reaching the sender. The row used to owe the bitmap a rotation, so its
+    /// death took every later generation with it; now it owes nothing and only
+    /// its own release is lost.
     #[tokio::test]
-    async fn process_release_funds_boundary_poison_never_dispatches_rotation() {
+    async fn boundary_poison_row_quarantines_and_dispatches_nothing() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let mut ps = ProcessorState {
@@ -2089,7 +1943,8 @@ mod tests {
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
-        // Mint is bad → build_release_funds fails → rotation never dispatched.
+        // An unparseable mint makes build_release_funds fail, which is the
+        // deterministic poison the quarantine path exists for.
         let txn = make_db_transaction(
             1,
             "not_a_valid_pubkey",
@@ -2114,7 +1969,6 @@ mod tests {
         let update = storage_rx.recv().await.expect("quarantine fired");
         assert_eq!(update.status, TransactionStatus::ManualReview);
 
-        // Sender must be empty — no rotation, no release.
         assert!(
             sender_rx.try_recv().is_err(),
             "no dispatch should happen when build_release_funds fails"

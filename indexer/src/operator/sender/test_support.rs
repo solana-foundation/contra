@@ -19,8 +19,26 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+
+/// Install an in-memory admin signer once per test process.
+///
+/// Anything that builds a real instruction reaches `SignerUtil`, which panics
+/// when no signer is configured. The key itself is never checked, so a fresh
+/// throwaway keypair is enough to let those paths run.
+pub(super) fn ensure_test_signer() {
+    static INIT_TEST_SIGNER: Once = Once::new();
+    INIT_TEST_SIGNER.call_once(|| {
+        let keypair = solana_sdk::signer::keypair::Keypair::new();
+        std::env::set_var("ADMIN_SIGNER", "memory");
+        std::env::set_var(
+            "ADMIN_PRIVATE_KEY",
+            bs58::encode(keypair.to_bytes()).into_string(),
+        );
+    });
+}
 
 /// A `SenderState` pointed at `rpc_url`, with mock storage and no instance.
 pub(super) fn sender_state(rpc_url: &str) -> SenderState {
@@ -54,6 +72,7 @@ pub(super) fn sender_state_with_storage(rpc_url: &str, mock: MockStorage) -> Sen
         rotation_retry_attempts: 0,
         rotation_in_flight: None,
         rotation_rearm_attempts: 0,
+        rotation_blocked_passes: 0,
         mint_builders: HashMap::new(),
         mint_cache: MintCache::new(storage),
         retry_max_attempts: 3,
@@ -97,6 +116,18 @@ pub(super) fn mock_with_parked_row(transaction_id: i64) -> MockStorage {
         .unwrap()
         .push(withdrawal_row(transaction_id, TransactionStatus::Parked));
     mock
+}
+
+/// Seed a withdrawal that carries `nonce`, which is what the rotation gate reads.
+pub(super) fn push_withdrawal_with_nonce(
+    mock: &MockStorage,
+    transaction_id: i64,
+    nonce: i64,
+    status: TransactionStatus,
+) {
+    let mut row = withdrawal_row(transaction_id, status);
+    row.withdrawal_nonce = Some(nonce);
+    mock.pending_transactions.lock().unwrap().push(row);
 }
 
 /// The status of `transaction_id` in `mock`, or `None` if it holds no such row.
@@ -187,6 +218,28 @@ pub(super) fn mock_bitmap_account(
         ))
         .with_status(200)
         .with_body(bitmap_account_response(generation, consumed))
+        .create()
+}
+
+/// Same as `mock_bitmap_account`, but counts how many reads the sender actually
+/// made, so a test can prove a read was skipped rather than merely unused.
+pub(super) fn mock_bitmap_account_counted(
+    server: &mut mockito::ServerGuard,
+    generation: u64,
+    reads: Arc<AtomicUsize>,
+) -> mockito::Mock {
+    let body = bitmap_account_response(generation, &[]);
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getAccountInfo""#.into(),
+        ))
+        .with_status(200)
+        .with_body_from_request(move |_| {
+            reads.fetch_add(1, Ordering::SeqCst);
+            body.clone().into_bytes()
+        })
+        .expect_at_least(0)
         .create()
 }
 

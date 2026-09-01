@@ -494,8 +494,18 @@ async fn check_withdrawal_mint_supported(
         .mint_cache
         .rpc_client()
         .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
+
+    // A null only proves "never allowlisted" if the node has caught up. Anchor on the
+    // tip it reports and require the read to answer at or past it, so a lagging backend
+    // errors instead of denying an allowlist entry it simply has not seen yet.
+    let commitment = rpc.rpc_client.commitment();
+    let (ref_slot, _) = rpc
+        .get_latest_blockhash_with_context(commitment)
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?;
+
     let response = rpc
-        .get_account_with_context(&allowed_mint_pda, rpc.rpc_client.commitment())
+        .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(ref_slot))
         .await
         .map_err(|e| OperatorError::RpcError(format!("get_account({allowed_mint_pda}): {e}")))?;
 
@@ -4556,6 +4566,65 @@ mod tests {
             "an unreadable allowlist must stay transient, got: {outcome:?}"
         );
         assert!(update.is_none(), "no verdict means no park");
+    }
+
+    /// A node behind the anchor slot must not be able to answer the allowlist read at
+    /// all: its null would deny a mint the escrow did allow, parking a burned row.
+    #[tokio::test]
+    async fn process_release_funds_lagging_allowlist_read_is_transient() {
+        let mut server = mockito::Server::new_async().await;
+        // Anchor the gate at slot 500, then refuse to serve there as a lagging node does.
+        let _anchor = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":500},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":600}},"id":1}"#,
+            )
+            .create();
+        let _lagging = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""minContextSlot"\s*:\s*500"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32016,"message":"Minimum context slot has not been reached"},"id":1}"#,
+            )
+            .expect_at_least(1)
+            .create();
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::utils::rpc_util::RetryConfig {
+                        max_attempts: 1,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(2),
+                    },
+                    solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                )),
+            ),
+        };
+
+        let (outcome, update, _) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&Pubkey::new_unique(), 5)).await;
+
+        assert!(
+            matches!(outcome, Err(OperatorError::RpcError(_))),
+            "a node that cannot answer at the anchor slot must stay transient, got: {outcome:?}"
+        );
+        assert!(
+            update.is_none(),
+            "a lagging node is not a verdict, so no park"
+        );
     }
 
     /// A boundary nonce whose mint is unsupported must not dispatch a rotation,

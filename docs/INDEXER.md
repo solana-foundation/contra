@@ -16,7 +16,7 @@ Real-time block streaming via gRPC (requires a gRPC endpoint). Handles both Escr
 
 **2. RPC Polling (Mainnet or Solana Private Channels)**
 
-Polls `getBlock` RPC sequentially with higher latency (~1-5 seconds) and no special infrastructure required.
+Enumerates the producing slots in each batch with `getBlocks`, then fetches only those blocks in parallel with `getBlock`. Higher latency (~1-5 seconds) but no special infrastructure required.
 
 **Location**: [`indexer/src/indexer/datasource/rpc_polling/`](../indexer/src/indexer/datasource/rpc_polling/)
 
@@ -32,11 +32,20 @@ Alternative datasource using the Vixen parsing framework for instruction decodin
 Recovers missed slots on indexer restart or network issues:
 1. Read last processed slot from database (`indexer_state` table)
 2. Query RPC for current slot
-3. If gap > threshold:
-   - Parallelize RPC batch fetching (configurable batch size)
+3. If gap > threshold, for each batch of slots:
+   - Enumerate which slots in the batch produced a block (`getBlocks`)
+   - Fetch only those blocks in parallel (configurable batch size)
+   - Walk their `parentSlot` links to prove the remaining slots empty; a slot that
+     cannot be proven empty aborts the batch rather than being checkpointed past
    - Process blocks in order
    - Update checkpoint per slot via `CheckpointWriter` (driven by `SlotComplete` events)
-4. Switch to real-time mode (Yellowstone or polling)
+4. For the Yellowstone datasource, persist a startup anchor before the live stream runs, so a
+   durable checkpoint always exists: every connection, the first one included, replays from it up
+   to the slot the stream opened at, and withholds live slots rather than advancing the checkpoint
+   without one. The anchor is the resolved backfill range's floor, or the current chain tip when
+   backfill is disabled. RPC polling has no reconnect repair and writes no anchor; it resumes from
+   its configured start slot
+5. Switch to real-time mode (Yellowstone or polling)
 
 **Location**: [`indexer/src/indexer/backfill.rs`](../indexer/src/indexer/backfill.rs)
 
@@ -91,7 +100,7 @@ Submits transactions to the respective cluster with:
 
 #### Reconciliation
 
-Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database.
+Runs alongside the three-stage pipeline to detect and resolve discrepancies between on-chain state and the indexer database. Runtime reconciliation checks a single on-chain invariant, `channel_supply <= custody`, over finalized reads and fails closed on a proven insolvency: an insolvency-direction gap exceeding the in-flight envelope for three consecutive finalized ticks trips a durable DB halt flag that freezes both operators' fetchers (plus quarantine + forced-unhealthy + mandatory webhook); recovery is manual per [`docs/runbooks/reconciliation_halt_runbook.md`](runbooks/reconciliation_halt_runbook.md). The custody-vs-ledger comparison now runs only at startup, where it also enforces the same supply invariant before the pipeline boots.
 
 **Location**: [`indexer/src/operator/reconciliation.rs`](../indexer/src/operator/reconciliation.rs), [`indexer/src/indexer/reconciliation.rs`](../indexer/src/indexer/reconciliation.rs)
 

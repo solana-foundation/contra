@@ -40,6 +40,9 @@ write_port: 8900
 read_port: 8901
 streamer_port: 8902
 auth_port: 8903
+# Not host-side: the gateway's internal listener is never published, so it has
+# no health probe. Compose services reach it as http://gateway:<this>.
+gateway_internal_port: 8904
 
 # --- Health phase tuning ---
 # Per-service probe budget. With backoff inside the retry loop this gives
@@ -68,6 +71,12 @@ reset_state: false
 # NOT wiped in lockstep, or the indexer will reconcile stale rows against an
 # empty chain.
 validator_reset: true
+
+# --- Archival RPC fallback ---
+# Cross-env default for the archival Solana RPC that re-checks a Dead finality
+# verdict. Empty by default; REQUIRED off localnet (set per-env in vars/<env>.yml)
+# since the withdraw operator refuses to start without it.
+fallback_rpc_url: ""
 
 # --- Optional notification webhook posted from the report phase ---
 notify_webhook: ""

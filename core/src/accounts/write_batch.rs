@@ -272,6 +272,35 @@ async fn write_batch_postgres(
     Ok(addr_sig_rows)
 }
 
+/// Drops the cache keys a failed `write_batch_redis` left holding pre-batch
+/// values, so reads miss and resolve against Postgres rather than being served
+/// something stale.
+///
+/// Only the account keys need it. A new `tx:` or `block:` key had no previous
+/// value, so a skipped write leaves it absent, which already reads as a miss.
+/// `latest_slot` and `latest_blockhash` are stale for at most one block, until
+/// the next successful write overwrites them. An account key, by contrast, keeps
+/// its pre-batch balance until that account is next touched, which may be never.
+///
+/// This narrows the window rather than being the only repair: the failed write
+/// also left the cached tip behind, so the next batch's continuity check takes
+/// the whole cache out of service and rebuilds it.
+pub(crate) async fn invalidate_batch_redis(
+    db: &mut RedisAccountsDB,
+    account_settlements: &[(Pubkey, AccountSettlement)],
+) {
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+
+    for (pubkey, _) in account_settlements {
+        pipe.del(format!("account:{}", pubkey));
+    }
+
+    if let Err(e) = pipe.query_async::<()>(&mut db.connection).await {
+        warn!("Failed to invalidate Redis keys after a failed cache write: {e}");
+    }
+}
+
 pub(crate) async fn write_batch_redis(
     db: &mut RedisAccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],
@@ -300,30 +329,17 @@ pub(crate) async fn write_batch_redis(
         }
     }
 
-    // Store transactions and build the address→signatures index used by
-    // getSignaturesForAddress. For each account key touched by the transaction
-    // we ZADD one entry to a per-address sorted set:
-    //   key:    addr_sigs:{pubkey}
-    //   score:  tx_slot as f64  (enables ZRANGE BYSCORE REV ordering by recency)
-    //   member: hex-encoded signature (preserves byte ordering for same-slot DESC sort)
-    // Mirrors what address_signatures does in Postgres.
-    // redis-rs 0.27: zadd(key, member, score) — member first, score second.
-    let tx_count = transactions.len();
+    // Only the families a read can actually be served from are mirrored:
+    // point lookups by pubkey, signature and slot, plus the chain tip. The
+    // address index, slot index and transaction counter used to be written here
+    // too, but nothing reads them from the cache any more: a range, a history
+    // or a counter cannot express a cache miss, so those reads go straight to
+    // Postgres. Writing them was work whose only effect was to be purged later.
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         let key = format!("tx:{}", signature);
         let serialized = bincode::serialize(&stored_tx).unwrap();
         pipe.set(key, serialized);
-
-        for pubkey in transaction.message().account_keys().iter() {
-            let addr_key = format!("addr_sigs:{}", pubkey);
-            pipe.zadd(addr_key, hex::encode(signature.as_ref()), tx_slot as f64);
-        }
-    }
-
-    // Increment transaction count
-    if tx_count > 0 {
-        pipe.incr("transaction_count", tx_count);
     }
 
     // Store block info and update latest slot
@@ -333,12 +349,6 @@ pub(crate) async fn write_batch_redis(
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
         pipe.set(key, serialized);
-        // Index all slots in a sorted set (score = slot value) for two purposes:
-        // 1. getBlocks: ZRANGE block_slot_index start end BYSCORE for O(log N + M) range queries.
-        // 2. getFirstAvailableBlock: ZRANGE block_slot_index 0 0 returns the minimum slot.
-        // ZADD is idempotent for the same (member, score) pair, so replays are safe.
-        // redis-rs 0.27: zadd(key, member, score) — member first, score second.
-        pipe.zadd("block_slot_index", block.slot, block.slot as f64);
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

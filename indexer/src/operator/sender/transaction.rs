@@ -1,10 +1,14 @@
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::TransactionError;
-use crate::error::{OperatorError, ProgramError};
+use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
+use crate::operator::recovery::{load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
-use crate::operator::utils::instruction_util::TransactionBuilder;
+use crate::operator::utils::instruction_util::{
+    mint_extra_error_checks_policy, TransactionBuilder,
+};
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
     build_and_sign, check_transaction_status, send_signed, ConfirmationResult,
@@ -14,23 +18,23 @@ use crate::operator::{
     sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, RpcClientWithRetry,
 };
 use crate::storage::common::models::TransactionStatus;
-use crate::storage::common::storage::Storage;
+use crate::storage::common::storage::{RequeueOutcome, Storage};
 use chrono::Utc;
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
-use solana_rpc_client_api::client_error::ErrorKind;
-use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use super::mint::{cleanup_mint_builder, try_jit_mint_initialization, JitOutcome};
-use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
+use super::proof::{
+    cleanup_failed_transaction, pending_rotation_due, rebuild_with_regenerated_proof,
+};
 use super::types::{
     InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
-    SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
+    SendDurability, SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
 };
 
 use std::sync::Arc;
@@ -125,10 +129,35 @@ impl SenderState {
                     compute_budget,
                 })
             }
-            TransactionBuilder::ResetSmtRoot(mut builder) => {
-                // Bind the reset to our local tree index so the on-chain program
-                // rejects a replay. Initialize SMT state first in case a reset is
-                // the first thing we process after a restart.
+            TransactionBuilder::ResetSmtRoot(rotation) => {
+                // Arm first: nothing below is infallible, and a dropped builder is a
+                // lost rotation. Cleared only where the chain shows it landed.
+                let target_tree_index = rotation.target_tree_index;
+                self.pending_rotation = Some(rotation);
+
+                // Every submit passes this gate, and it runs before the fallible SMT
+                // init so a rotation the chain already completed is disarmed even while
+                // that init is failing (right after a reset lands the DB is behind, so
+                // validate_smt_root reports a root mismatch).
+                match check_rotation_against_chain(self, target_tree_index).await {
+                    RotationCheck::Landed { onchain_index } => {
+                        self.disarm_rotation(target_tree_index).await;
+                        return Err(ProgramError::RotationNotOwed {
+                            target_tree_index,
+                            onchain_tree_index: onchain_index,
+                        }
+                        .into());
+                    }
+                    RotationCheck::Unavailable => {
+                        return Err(
+                            ProgramError::RotationGateUnavailable { target_tree_index }.into()
+                        )
+                    }
+                    RotationCheck::Owed => {}
+                }
+
+                // Initialize SMT state in case a reset is the first thing we process
+                // after a restart.
                 if self.smt_state.is_none() {
                     self.initialize_smt_state().await?;
                 }
@@ -137,7 +166,6 @@ impl SenderState {
                     .as_ref()
                     .ok_or(ProgramError::SmtNotInitialized)?;
                 let in_flight_count = smt.nonce_to_builder.len();
-                let expected_current_tree_index = smt.smt_state.tree_index();
 
                 if in_flight_count > 0 {
                     info!(
@@ -145,15 +173,69 @@ impl SenderState {
                         in_flight_count
                     );
 
-                    self.pending_rotation = Some(builder);
-
                     return Err(ProgramError::RotationPending { in_flight_count }.into());
                 }
 
-                // No in-flight transactions - process immediately
-                builder.expected_current_tree_index(expected_current_tree_index);
+                // Never close a tree a lower nonce still has to release on: that release can
+                // only land while the chain holds its tree, so rotating past it strands an
+                // already-burned withdrawal.
+                //
+                // The processor applies this same rule at dispatch but excludes Processing
+                // rows, covering those with the sender's in-flight map instead. That map does
+                // not survive a restart while the owed target now does, so the durable check
+                // runs here, fresh on every attempt.
+                //
+                // Below the in-flight check on purpose: a release the sender just confirmed
+                // leaves that map before its Completed write reaches the database, so the
+                // in-memory answer is both free and fresher, and normal pacing takes the
+                // quiet RotationPending branch rather than this one.
+                //
+                // Checked both ways: a saturating multiply would wrap to -1 as an i64 and
+                // make the query match nothing, turning this gate into a no-op on exactly
+                // the corrupt target it should refuse to act on.
+                let Some(boundary_nonce) = target_tree_index
+                    .checked_mul(MAX_TREE_LEAVES as u64)
+                    .and_then(|nonce| i64::try_from(nonce).ok())
+                else {
+                    error!("Owed rotation target {target_tree_index} has no boundary nonce");
+                    return Err(ProgramError::RotationGateUnavailable { target_tree_index }.into());
+                };
+                match self
+                    .storage
+                    .lowest_unreleased_withdrawal_below(boundary_nonce)
+                    .await
+                {
+                    Ok(Some(blocking_nonce)) => {
+                        return Err(ProgramError::RotationBlockedByLowerNonce {
+                            target_tree_index,
+                            blocking_nonce: blocking_nonce as u64,
+                        }
+                        .into())
+                    }
+                    Ok(None) => {}
+                    // Fail closed: an unevaluated gate is not a passed gate.
+                    Err(e) => {
+                        error!("Unreleased-nonce gate read failed: {e}");
+                        return Err(
+                            ProgramError::RotationGateUnavailable { target_tree_index }.into()
+                        );
+                    }
+                }
+
+                // Bind the reset to the generation before the target so the program's
+                // replay guard rejects a reset that already landed. Sourcing this from
+                // chain would make that guard compare chain against chain. The gate
+                // above returned Owed, so the chain is below the target and it is at
+                // least 1.
+                let rotation = self
+                    .pending_rotation
+                    .as_mut()
+                    .expect("armed at the top of this arm");
+                rotation
+                    .builder
+                    .expected_current_tree_index(target_tree_index - 1);
                 Ok(InstructionWithSigners {
-                    instructions: vec![builder.instruction()],
+                    instructions: vec![rotation.builder.instruction()],
                     fee_payer,
                     signers,
                     compute_budget,
@@ -174,7 +256,18 @@ pub async fn handle_transaction_submission(
         transaction_id: tx_builder.transaction_id(),
         withdrawal_nonce: tx_builder.withdrawal_nonce(),
         trace_id: tx_builder.trace_id(),
+        deposit_claim_lease: None,
     };
+
+    // A submitted builder always carries the token for the incarnation it owns,
+    // so arming the lease from it is correct on a first arrival and on a re-entry
+    // after a park or a rotation wait alike.
+    if let TransactionBuilder::ReleaseFunds(builder_with_nonce) = &tx_builder {
+        state.release_leases.insert(
+            builder_with_nonce.nonce,
+            builder_with_nonce.fetched_updated_at,
+        );
+    }
 
     // For a withdrawal, which tree does its nonce belong to? None for other txs.
     let release_tree_index = match &tx_builder {
@@ -228,9 +321,15 @@ pub async fn handle_transaction_submission(
                 // proof ordering requires at-most-one in-flight withdrawal at a time.
                 match &tx_builder {
                     TransactionBuilder::Mint(_) | TransactionBuilder::InitializeMint(_) => {
-                        // Only a real user-fund Mint persists write-ahead; InitializeMint
-                        // mints no balance and is on-chain idempotent, so it is excluded.
-                        let persist = matches!(tx_builder, TransactionBuilder::Mint(_));
+                        // A user-fund Mint is Recoverable (persisted write-ahead, re-minted
+                        // by recovery on failure); InitializeMint mints no balance and is
+                        // on-chain idempotent, so it is Terminal.
+                        let durability = match &tx_builder {
+                            TransactionBuilder::Mint(b) => SendDurability::Recoverable {
+                                deposit_expected_updated_at: b.fetched_updated_at,
+                            },
+                            _ => SendDurability::Terminal,
+                        };
                         spawn_fire_and_store(
                             state,
                             instruction,
@@ -239,7 +338,7 @@ pub async fn handle_transaction_submission(
                             retry_policy,
                             extra_error_checks_policy,
                             storage_tx.clone(),
-                            persist,
+                            durability,
                         );
                     }
                     _ => {
@@ -265,6 +364,94 @@ pub async fn handle_transaction_submission(
     .await;
 }
 
+/// Drive the rotation the sender owes the chain. Called on the rotation tick.
+///
+/// The reset has no DB row and no nonce, so `pending_rotation` is its only record.
+/// It stays armed across the whole submission, which is what makes a pre-broadcast
+/// or pre-confirmation failure retry here instead of dropping the rotation and
+/// stranding the boundary withdrawal.
+pub(super) async fn drive_pending_rotation(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    if !pending_rotation_due(state) {
+        return;
+    }
+    let Some(rotation) = state.pending_rotation.clone() else {
+        return;
+    };
+
+    info!(
+        target_tree_index = rotation.target_tree_index,
+        "Driving owed ResetSmtRoot"
+    );
+    // The submit path reads the chain before every attempt, so an earlier attempt that
+    // landed with its confirmation lost is settled there rather than resent, and this
+    // may disarm without sending anything.
+    handle_transaction_submission(
+        state,
+        TransactionBuilder::ResetSmtRoot(rotation),
+        storage_tx,
+    )
+    .await;
+
+    // Still armed means the chain has not reached the target. Kept armed so the next
+    // tick retries, and logged because a reset has no row to escalate.
+    if state.pending_rotation.is_some() {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "rotation_not_landed"])
+            .inc();
+        warn!("ResetSmtRoot did not land, rotation stays armed for retry");
+    }
+}
+
+/// Outcome of reading the chain to decide whether a rotation is still owed.
+enum RotationCheck {
+    /// Chain is behind the target, so the rotation still has to be sent.
+    Owed,
+    /// Chain reached the target: a reset already landed, by this process or an earlier
+    /// one. Local SMT has been synced forward if it was behind.
+    Landed { onchain_index: u64 },
+    /// The tree index could not be read. Nothing is known and nothing was changed.
+    Unavailable,
+}
+
+/// Read the on-chain tree index and report whether the rotation to `target_tree_index`
+/// is still owed. Short of a confirmed reset, this is the only proof one landed.
+///
+/// The target comes from the boundary withdrawal's nonce, never from chain, which is
+/// what makes this check meaningful: comparing a chain read against a local index that
+/// was itself seeded from chain can only ever say "no change".
+///
+/// Only ever moves the local index forward. A lagging backend behind a load-balanced
+/// endpoint can answer with an older index, and rewinding on that would clear the
+/// current tree's nonces, since reset() empties the tree.
+async fn check_rotation_against_chain(
+    state: &mut SenderState,
+    target_tree_index: u64,
+) -> RotationCheck {
+    let onchain_index = match state.fetch_onchain_tree_index().await {
+        Ok(onchain_index) => onchain_index,
+        Err(e) => {
+            error!("Tree index read failed: {e}, local SMT left unchanged");
+            return RotationCheck::Unavailable;
+        }
+    };
+
+    if onchain_index < target_tree_index {
+        debug!("On-chain tree_index {onchain_index} short of target {target_tree_index}");
+        return RotationCheck::Owed;
+    }
+
+    if let Some(ref mut smt_state) = state.smt_state {
+        if smt_state.smt_state.tree_index() < onchain_index {
+            warn!("Synced local SMT forward to on-chain tree_index {onchain_index}");
+            smt_state.smt_state.reset(onchain_index);
+        }
+    }
+    RotationCheck::Landed { onchain_index }
+}
+
 /// Route a `handle_transaction_builder` error to its non-success path; separate from `handle_transaction_submission` so it is testable without real signers.
 pub(super) async fn route_builder_error(
     state: &mut SenderState,
@@ -278,6 +465,46 @@ pub(super) async fn route_builder_error(
             info!(
                 "Rotation pending, waiting for {} in-flight txs to settle",
                 in_flight_count
+            );
+        }
+        OperatorError::Program(ProgramError::RotationNotOwed {
+            target_tree_index,
+            onchain_tree_index,
+        }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "reset_tree_already_advanced"])
+                .inc();
+            info!(
+                target_tree_index,
+                onchain_tree_index, "Rotation already completed on-chain, disarmed"
+            );
+        }
+        OperatorError::Program(ProgramError::RotationGateUnavailable { target_tree_index }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "rotation_gate_unavailable"])
+                .inc();
+            warn!(
+                target_tree_index,
+                "Rotation gate unreadable, rotation stays armed and was not submitted"
+            );
+        }
+        // Distinct from the unavailable case above: the gate was read and says the
+        // closing tree still owes a release. Resolving that nonce is what unblocks it,
+        // so it gets its own label rather than reading as a chain or RPC problem.
+        OperatorError::Program(ProgramError::RotationBlockedByLowerNonce {
+            target_tree_index,
+            blocking_nonce,
+        }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    state.program_type.as_label(),
+                    "rotation_blocked_by_lower_nonce",
+                ])
+                .inc();
+            warn!(
+                target_tree_index,
+                blocking_nonce,
+                "Rotation withheld: a lower nonce still owes a release on the closing tree"
             );
         }
         OperatorError::Program(ProgramError::TreeIndexMismatch {
@@ -295,6 +522,7 @@ pub(super) async fn route_builder_error(
                         transaction_id: Some(builder_with_nonce.transaction_id),
                         withdrawal_nonce: Some(builder_with_nonce.nonce),
                         trace_id: Some(builder_with_nonce.trace_id),
+                        deposit_claim_lease: None,
                     },
                     builder_with_nonce.builder,
                 ));
@@ -302,22 +530,72 @@ pub(super) async fn route_builder_error(
                 error!("TreeIndexMismatch for non-ReleaseFunds transaction");
             }
         }
+        // Transient lazy-init read failure: RPC instance fetch (AccountNotFound)
+        // or DB nonce read (Storage) from validate_smt_root. The `smt_state.is_none()`
+        // guard bounds this to the pre-init window: the nonce is inserted into the SMT
+        // (proof.rs) and signing both happen only after init sets smt_state to Some, and
+        // it never reverts. So None proves nothing was mutated or broadcast and the
+        // requeue is safe. A Storage/Account error once initialized falls through to
+        // fail-closed. Requeue Pending for a bounded retry instead of freezing it for
+        // recovery to quarantine.
+        e @ OperatorError::Account(AccountError::AccountNotFound { .. })
+        | e @ OperatorError::Storage(_)
+            if state.smt_state.is_none() =>
+        {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "smt_init_transient_error"])
+                .inc();
+            match (ctx.withdrawal_nonce, ctx.transaction_id) {
+                // requeue_or_fail_prebroadcast requires no stashed signature for the
+                // nonce; confirm it here as send_and_confirm does. The smt_state guard
+                // above already implies it, but check explicitly so the contract does
+                // not rely on that reasoning holding.
+                (Some(nonce), Some(transaction_id))
+                    if state
+                        .pending_signatures
+                        .get(&nonce)
+                        .is_none_or(|sigs| sigs.is_empty()) =>
+                {
+                    warn!(
+                        transaction_id,
+                        nonce, "Transient SMT init failure; requeueing withdrawal to Pending: {e}"
+                    );
+                    let reason = format!(
+                        "SMT init failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                    );
+                    requeue_or_fail_prebroadcast(
+                        state,
+                        ctx,
+                        storage_tx,
+                        nonce,
+                        transaction_id,
+                        &reason,
+                    )
+                    .await;
+                }
+                _ => {
+                    // No nonce/transaction_id, or a stashed signature exists: cannot
+                    // safely requeue, so leave Processing for recovery.
+                    error!("Transient SMT init failure not safe to requeue; leaving row Processing: {e}");
+                }
+            }
+        }
+        // Fail closed: root mismatch (DB behind chain, a release may have landed),
+        // uninitialized tree, malformed instance, missing instance, or any Account/
+        // Storage error that reached here after init (smt_state.is_some(), so the
+        // transient arm above did not match). Auto-replay could mask a needed DB
+        // resync, so leave Processing for recovery.
         e @ OperatorError::Program(ProgramError::SmtRootMismatch { .. })
         | e @ OperatorError::Program(ProgramError::SmtNotInitialized)
         | e @ OperatorError::Account(_)
         | e @ OperatorError::Storage(_) => {
-            // SMT-init-class failure: a root mismatch, an uninitialized tree, an
-            // RPC/account error fetching the instance, or a DB error reading the
-            // completed nonces during lazy init. The local SMT stays
-            // uninitialized, so this row never released: leave it Processing for
-            // the recovery worker and never mark it Failed.
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[state.program_type.as_label(), "smt_init_error"])
                 .inc();
             error!(
                 transaction_id = ctx.transaction_id,
                 nonce = ctx.withdrawal_nonce.map(|n| n as i64),
-                "SMT init failed; leaving row Processing for recovery: {}",
+                "SMT init failed (fail-closed); leaving row Processing for recovery: {}",
                 e
             );
         }
@@ -331,40 +609,89 @@ pub(super) async fn route_builder_error(
     }
 }
 
-/// Persist a broadcast signature write-ahead (DB only), fail-closed: `Err(())` means
-/// "do not broadcast". On persist failure we count the error, log it with ids, and
-/// return early so the caller aborts before sending; the row stays Processing for the
-/// recovery worker to reconcile against the chain.
-pub(super) async fn persist_signature_or_abort(
-    storage: &Storage,
-    pt: &str,
+/// Verdict of the pre-broadcast ownership claim on a release.
+enum ReleaseClaim {
+    /// The row is still the incarnation we were handed; `lease` is the token the
+    /// next claim for this nonce must present.
+    Owned(chrono::DateTime<Utc>),
+    /// Another writer reached the row first. Never broadcast.
+    Lost,
+    /// The claim write itself failed, so ownership is unknown. Never broadcast.
+    Failed,
+}
+
+/// Claim the `Processing` incarnation this release was handed and persist its
+/// broadcast signature write-ahead, both in one storage transaction. Fail-closed:
+/// only `Owned` authorizes a send.
+///
+/// A withdrawal nonce is consumed on broadcast, so this claim is what lets the
+/// recovery sweep re-arm a signatureless row at all: recovery CASes the same
+/// `updated_at` column, so a demote and a claim can never both win. Presenting
+/// the lease rather than a bare status check is deliberate, since a row that was
+/// demoted and re-fetched is `Processing` again and would pass a status test.
+async fn claim_release_or_abort(
+    state: &SenderState,
     transaction_id: i64,
+    nonce: u64,
     signature: &Signature,
     last_valid_block_height: u64,
-) -> Result<(), ()> {
-    if let Err(e) = storage
-        .insert_release_signature(
+    blockhash_slot: u64,
+) -> ReleaseClaim {
+    let pt = state.program_type.as_label();
+
+    // Defensive: submission arms the lease for every release it dispatches, so a
+    // missing one means we cannot prove ownership and must not pay out.
+    let Some(expected_updated_at) = state.release_leases.get(&nonce).copied() else {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt, "release_missing_claim_lease"])
+            .inc();
+        error!(
             transaction_id,
+            nonce, "No ownership lease held for release; aborting before broadcast"
+        );
+        return ReleaseClaim::Lost;
+    };
+
+    match state
+        .storage
+        .claim_and_persist_signature(
+            transaction_id,
+            expected_updated_at,
             signature.to_string(),
             last_valid_block_height as i64,
+            i64::try_from(blockhash_slot).ok(),
         )
         .await
     {
-        metrics::OPERATOR_TRANSACTION_ERRORS
-            .with_label_values(&[pt, "pre_send_persist_error"])
-            .inc();
-        let abort = TransactionError::PreSendPersistFailed {
-            reason: e.to_string(),
-        };
-        error!(
-            transaction_id,
-            signature = %signature,
-            "Aborting before broadcast, leaving row Processing for recovery: {}",
-            abort
-        );
-        return Err(());
+        Ok(Some(lease)) => ReleaseClaim::Owned(lease),
+        Ok(None) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "release_claim_lost"])
+                .inc();
+            warn!(
+                transaction_id,
+                nonce,
+                signature = %signature,
+                "Release ownership lost before broadcast; dropping stale builder without releasing"
+            );
+            ReleaseClaim::Lost
+        }
+        Err(e) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "pre_send_persist_error"])
+                .inc();
+            let abort = TransactionError::PreSendPersistFailed {
+                reason: e.to_string(),
+            };
+            error!(
+                transaction_id,
+                signature = %signature,
+                "Aborting before broadcast, leaving row Processing for recovery: {}",
+                abort
+            );
+            ReleaseClaim::Failed
+        }
     }
-    Ok(())
 }
 
 /// Sign, send, confirm, and handle the result
@@ -411,7 +738,7 @@ pub(super) async fn send_and_confirm(
     let send_start = std::time::Instant::now();
 
     // Build and sign before broadcasting so the signature can be persisted write-ahead.
-    let (transaction, signature, last_valid_block_height) =
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
         match build_and_sign(&state.rpc_client, instruction.clone()).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -422,25 +749,75 @@ pub(super) async fn send_and_confirm(
                     .with_label_values(&[pt, "build_sign_error"])
                     .inc();
                 error!("Failed to build/sign transaction: {}", e);
-                handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await;
+                // build_and_sign failed before a signature existed. A withdrawal
+                // with no signature stashed from an earlier attempt provably never
+                // broadcast, so requeue it for an automatic retry; the attempt cap
+                // above bounds the loop. With stashed signatures (Retry recursion
+                // after a broadcast) or no nonce (ResetSmtRoot), keep the
+                // permanent-failure path.
+                match (ctx.withdrawal_nonce, ctx.transaction_id) {
+                    (Some(nonce), Some(transaction_id))
+                        if state
+                            .pending_signatures
+                            .get(&nonce)
+                            .is_none_or(|sigs| sigs.is_empty()) =>
+                    {
+                        let reason = format!(
+                            "build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                        );
+                        requeue_or_fail_prebroadcast(
+                            state,
+                            ctx,
+                            storage_tx,
+                            nonce,
+                            transaction_id,
+                            &reason,
+                        )
+                        .await;
+                    }
+                    _ => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
+                }
                 return;
             }
         };
 
     // A withdrawal nonce is consumed on broadcast, so a release that lands must already
-    // have a durable signature record for crash recovery to reconcile against.
-    if let (Some(_nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
-        if persist_signature_or_abort(
-            &state.storage,
-            pt,
+    // have a durable signature record for crash recovery to reconcile against, and this
+    // sender must still own the row it is about to pay out.
+    if let (Some(nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
+        match claim_release_or_abort(
+            state,
             txid,
+            nonce,
             &signature,
             last_valid_block_height,
+            blockhash_slot,
         )
         .await
-        .is_err()
         {
-            return;
+            // Each attempt presents the previous claim's token, so adopt the new one
+            // before any retry re-enters here.
+            ReleaseClaim::Owned(lease) => {
+                state.release_leases.insert(nonce, lease);
+            }
+            ReleaseClaim::Lost | ReleaseClaim::Failed => {
+                // Either the row is not ours or its write just failed, so do not
+                // attempt another DB write here. With no stashed signature this nonce
+                // provably never broadcast, so the Stage-1 SMT/builder/retry/remint
+                // mutations describe a nonce the chain never accepted; roll them back
+                // so later withdrawals in this tree build on a root the chain agrees
+                // with. A stashed signature (retry recursion after a broadcast) means a
+                // real tx may land, so leave state intact for recovery. Row stays
+                // Processing either way.
+                if state
+                    .pending_signatures
+                    .get(&nonce)
+                    .is_none_or(|sigs| sigs.is_empty())
+                {
+                    cleanup_failed_transaction(state, Some(nonce));
+                }
+                return;
+            }
         }
     }
 
@@ -461,6 +838,7 @@ pub(super) async fn send_and_confirm(
                     .push(PendingSig {
                         signature,
                         last_valid_block_height,
+                        blockhash_slot: Some(blockhash_slot),
                     });
             }
 
@@ -588,17 +966,53 @@ pub(super) fn handle_confirmation_result<'a>(
                 );
                 match try_jit_mint_initialization(state, txn_id, instruction.clone()).await {
                     JitOutcome::Retry(new_instruction) => {
-                        info!("JIT verdict: Retry — re-issuing mint instruction");
-                        send_and_confirm(
-                            state,
-                            new_instruction,
-                            compute_unit_price,
-                            ctx,
-                            retry_policy,
-                            extra_error_checks_policy,
-                            storage_tx,
-                        )
-                        .await;
+                        let Some(lease) = ctx.deposit_claim_lease else {
+                            metrics::OPERATOR_TRANSACTION_ERRORS
+                                .with_label_values(&[pt, "jit_missing_claim_lease"])
+                                .inc();
+                            warn!(
+                                transaction_id = txn_id,
+                                "JIT retry missing deposit claim lease; leaving row Processing for recovery",
+                            );
+                            return;
+                        };
+                        // Journal the retry signature through the ownership claim before broadcast.
+                        // Awaited inline since this rare retry is already off the hot path.
+                        match Arc::clone(&state.semaphore).try_acquire_owned() {
+                            Ok(permit) => {
+                                info!(
+                                    "JIT verdict: Retry - re-issuing mint via write-ahead fire-and-store for txn {}",
+                                    txn_id
+                                );
+                                fire_and_store_task(
+                                    state.rpc_client.clone(),
+                                    state.storage.clone(),
+                                    state.in_flight.clone(),
+                                    state.program_type,
+                                    new_instruction,
+                                    compute_unit_price,
+                                    ctx.clone(),
+                                    retry_policy,
+                                    mint_extra_error_checks_policy(),
+                                    storage_tx.clone(),
+                                    SendDurability::Recoverable {
+                                        deposit_expected_updated_at: lease,
+                                    },
+                                    permit,
+                                )
+                                .await;
+                            }
+                            Err(_) => {
+                                metrics::OPERATOR_TRANSACTION_ERRORS
+                                    .with_label_values(&[pt, "in_flight_cap_exceeded"])
+                                    .inc();
+                                warn!(
+                                    "In-flight cap reached - deferring JIT retry for txn {}; \
+                                     row left Processing for recovery",
+                                    txn_id
+                                );
+                            }
+                        }
                     }
                     JitOutcome::ManualReview(reason) => {
                         metrics::OPERATOR_TRANSACTION_ERRORS
@@ -616,6 +1030,7 @@ pub(super) fn handle_confirmation_result<'a>(
                                 error_message: Some(reason),
                                 remint_signature: None,
                                 remint_attempted: false,
+                                release_signatures: None,
                             },
                             "transaction status update",
                         )
@@ -629,8 +1044,12 @@ pub(super) fn handle_confirmation_result<'a>(
                         cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                         state.mint_builders.remove(&txn_id);
                     }
-                    JitOutcome::PermanentFailure(reason) => {
-                        handle_permanent_failure(state, ctx, storage_tx, &reason).await;
+                    // Only deposits reach this block: the guard above proves a
+                    // cached mint builder, and those are cached for the deposit
+                    // mint alone. So there is no nonce-keyed state to unwind
+                    // and no withdrawal remint to compensate here.
+                    JitOutcome::Transient(reason) => {
+                        requeue_deposit_after_jit(state, txn_id, &signature, &reason).await;
                     }
                 }
             }
@@ -652,6 +1071,16 @@ pub(super) fn handle_confirmation_result<'a>(
                     metrics::OPERATOR_TRANSACTION_ERRORS
                         .with_label_values(&[pt, "confirmation_timeout"])
                         .inc();
+                    // A reset carries neither id nor nonce, so send_and_confirm's
+                    // per-nonce attempt cap does not apply and re-sending here would loop
+                    // unpaced until it lands. The armed rotation is retried on the
+                    // rotation tick instead, which re-reads the on-chain tree index
+                    // before each attempt. Both fields must be None: a deposit also has
+                    // no nonce, and its retry does belong on this path.
+                    if ctx.transaction_id.is_none() && ctx.withdrawal_nonce.is_none() {
+                        warn!("Confirmation timed out for reset, leaving it to the rotation tick");
+                        return;
+                    }
                     warn!("Confirmation failed for idempotent operation - retrying (nonce protects against duplicates)");
                     send_and_confirm(
                         state,
@@ -671,21 +1100,22 @@ pub(super) fn handle_confirmation_result<'a>(
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "reset_tree_already_advanced"])
                     .inc();
-                // Rejected because a reset already advanced the tree on-chain. Sync
-                // local SMT to the authoritative index. On fetch failure, leave it
-                // unchanged rather than guess; a restart re-syncs from chain.
-                // smt_state is always Some here: the reset submit path initializes
-                // it before sending, and nothing clears it back to None.
-                match state.fetch_onchain_tree_index().await {
-                    Ok(idx) => {
-                        if let Some(ref mut smt_state) = state.smt_state {
-                            smt_state.smt_state.reset(idx);
-                            warn!("ResetSmtRoot rejected - synced local SMT to on-chain tree_index {idx}");
-                        }
+                // Rejected because the chain is not one generation below the target this
+                // attempt bound, normally because a reset already landed. Only a chain
+                // that reached the target proves that; anything else (including a lagging
+                // read) leaves the local SMT alone and keeps the rotation armed to rebind
+                // on the next attempt.
+                if let Some(target_tree_index) = state
+                    .pending_rotation
+                    .as_ref()
+                    .map(|rotation| rotation.target_tree_index)
+                {
+                    if matches!(
+                        check_rotation_against_chain(state, target_tree_index).await,
+                        RotationCheck::Landed { .. }
+                    ) {
+                        state.disarm_rotation(target_tree_index).await;
                     }
-                    Err(e) => error!(
-                        "ResetSmtRoot rejected but tree index re-fetch failed: {e} - local SMT left unchanged"
-                    ),
                 }
             }
             Ok(ConfirmationResult::Failed(program_error)) => {
@@ -723,6 +1153,7 @@ pub(super) async fn handle_success(
         state.retry_counts.remove(&nonce);
         state.remint_cache.remove(&nonce);
         state.pending_signatures.remove(&nonce);
+        state.release_leases.remove(&nonce);
         info!("Cleaned up state for withdrawal_nonce {}", nonce);
 
         metrics::OPERATOR_MINTS_SENT
@@ -741,6 +1172,7 @@ pub(super) async fn handle_success(
                     error_message: None,
                     remint_signature: None,
                     remint_attempted: false,
+                    release_signatures: None,
                 },
                 "transaction status update",
             )
@@ -769,42 +1201,29 @@ pub(super) async fn handle_success(
                 error_message: None,
                 remint_signature: None,
                 remint_attempted: false,
+                release_signatures: None,
             },
             "transaction status update",
         )
         .await
         .ok();
     }
-    // Handle ResetSmtRoot (no transaction_id) - update local SMT tree index
-    else if let Some(ref mut smt_state) = state.smt_state {
-        let new_tree_index = smt_state.smt_state.tree_index() + 1;
-        smt_state.smt_state.reset(new_tree_index);
-        info!(
-            "Tree rotation complete! Updated local SMT to tree_index {}",
-            new_tree_index
-        );
+    // Handle ResetSmtRoot (no transaction_id) - the owed rotation landed, so move the
+    // local SMT to the target it just proved and disarm it. Disarming does not depend on
+    // a local SMT being present, or a confirmed reset could leave the rotation owed.
+    // InitializeMint has no id either but never arrives here: it confirms inline in the
+    // JIT path, so a reset is the only thing this branch can be.
+    else if let Some(target_tree_index) = state
+        .pending_rotation
+        .as_ref()
+        .map(|rotation| rotation.target_tree_index)
+    {
+        state.disarm_rotation(target_tree_index).await;
+        if let Some(ref mut smt_state) = state.smt_state {
+            smt_state.smt_state.reset(target_tree_index);
+        }
+        info!("Tree rotation complete! Updated local SMT to tree_index {target_tree_index}");
     }
-}
-
-/// Handle permanent transaction failure with deferred remint for withdrawals.
-///
-/// For withdrawal transactions: removes remint info from cache, runs cleanup
-/// (which removes the nonce from SMT and builder caches), then queues a deferred
-/// remint that will execute after the Solana finality window passes. This prevents
-/// double-spend if the original withdrawal lands on-chain after our polling window.
-///
-/// For non-withdrawal transactions: delegates to send_fatal_error.
-/// Whether a send failure came back as an explicit RPC rejection from the node
-/// (preflight simulation failure, blockhash errors, etc.). Such a response means the
-/// transaction was never submitted to the cluster, so failing fast is safe. A transport
-/// or IO error instead leaves the outcome ambiguous (the request may have reached the
-/// cluster), so a persisted mint defers to recovery rather than risk stranding a landed one.
-fn send_rejected_by_node(e: &TransactionError) -> bool {
-    matches!(
-        e,
-        TransactionError::Rpc(err)
-            if matches!(&err.kind, ErrorKind::RpcError(RpcError::RpcResponseError { .. }))
-    )
 }
 
 /// Leave a persisted transaction Processing after an uncertain terminal outcome.
@@ -826,6 +1245,163 @@ fn leave_processing_for_recovery(
     );
 }
 
+/// Bounded pre-broadcast requeue for a withdrawal with no stashed signature (caller
+/// confirms that). Rolls back the nonce's local SMT, then does one cap-gated write:
+/// requeue Processing → Pending under the cap, else escalate to ManualReview. The cap
+/// lives in the write, so no separate counter read can fail and loop the row forever.
+/// Keeps `retry_counts` so `send_and_confirm`'s attempt cap still bounds the loop.
+pub(super) async fn requeue_or_fail_prebroadcast(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    nonce: u64,
+    transaction_id: i64,
+    reason_at_cap: &str,
+) {
+    let pt = state.program_type.as_label();
+
+    // Nothing broadcast; the next attempt re-inserts the nonce. Runs regardless of outcome.
+    if let Some(ref mut smt_state) = state.smt_state {
+        if smt_state.smt_state.remove_nonce(nonce) {
+            warn!("Rolled back SMT state for nonce {nonce} after pre-broadcast failure");
+        } else {
+            // Builder inserted this nonce before build/sign ran, so a miss means
+            // the local SMT disagrees with the row being requeued.
+            error!("Nonce {nonce} missing from local SMT during pre-broadcast rollback");
+        }
+        smt_state.nonce_to_builder.remove(&nonce);
+    }
+
+    match state
+        .storage
+        .try_requeue_prebroadcast(transaction_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            // Re-inserted by handle_transaction_builder on the next attempt.
+            state.remint_cache.remove(&nonce);
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeued"])
+                .inc();
+            info!(
+                transaction_id,
+                nonce, attempts, "Requeued withdrawal to Pending after pre-broadcast failure"
+            );
+        }
+        Ok(RequeueOutcome::AtCap) => {
+            // Keep remint_cache: handle_permanent_failure consumes it to route a
+            // no-signature withdrawal to ManualReview, not a bare Failed.
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+                .inc();
+            handle_permanent_failure(state, ctx, storage_tx, reason_at_cap).await;
+        }
+        Ok(RequeueOutcome::NotProcessing) => {
+            state.remint_cache.remove(&nonce);
+            warn!(
+                transaction_id,
+                nonce, "Pre-broadcast requeue skipped: row no longer Processing"
+            );
+        }
+        Err(e) => {
+            // Write failed, nothing requeued: row stays Processing for recovery. No
+            // loop, since a loop needs a successful requeue.
+            state.remint_cache.remove(&nonce);
+            warn!(
+                transaction_id,
+                nonce, "Pre-broadcast requeue write failed, row left Processing for recovery: {e}"
+            );
+        }
+    }
+}
+
+/// Re-arm a deposit whose JIT mint initialization could not be completed yet.
+/// The `mint_to` was already broadcast and failed on chain, and its signature is
+/// still journaled; the helper only adds an `InitializeMint`, which moves no
+/// balance and is idempotent, so re-arming sends nothing value-bearing. The
+/// re-mint is authorized by the processor's journal gate, which re-mints only
+/// once the stored attempt is proven dead, so bypassing that gate here would
+/// allow a double mint. No status is written on any branch: the cap, a raced row
+/// and a failed write all leave the row to the recovery sweep, which classifies
+/// the deposit on-chain before escalating to a human.
+pub(super) async fn requeue_deposit_after_jit(
+    state: &mut SenderState,
+    txn_id: i64,
+    signature: &Signature,
+    reason: &str,
+) {
+    let pt = state.program_type.as_label();
+    metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[pt, "mint_jit_transient"])
+        .inc();
+
+    // The row leaves this task on every branch below and the next pickup builds
+    // its own builder, so the cached one would only go stale here.
+    state.mint_builders.remove(&txn_id);
+
+    match state
+        .storage
+        .try_requeue_prebroadcast(txn_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeued"])
+                .inc();
+            warn!(
+                transaction_id = txn_id,
+                attempts, "JIT verdict: transient - requeued deposit to Pending: {reason}"
+            );
+        }
+        // The capped write still matches the row, so its `updated_at` trigger
+        // fires and the staleness clock restarts. That delays the recovery
+        // sweep by one window, which is the cost of keeping the cap inside a
+        // single statement rather than reading the counter separately.
+        Ok(RequeueOutcome::AtCap) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+                .inc();
+            leave_processing_for_recovery(
+                pt,
+                Some(txn_id),
+                signature,
+                &format!("JIT mint initialization still failing at the requeue cap ({reason})"),
+            );
+        }
+        // Someone else advanced the row, so it is not Processing and the
+        // recovery sweep will not look at it. Reporting it as left-for-recovery
+        // would send an on-call after a reconciliation that never runs.
+        Ok(RequeueOutcome::NotProcessing) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "mint_jit_requeue_raced"])
+                .inc();
+            warn!(
+                transaction_id = txn_id,
+                signature = %signature,
+                "JIT requeue skipped, row no longer Processing and now owned elsewhere: {reason}",
+            );
+        }
+        Err(e) => leave_processing_for_recovery(
+            pt,
+            Some(txn_id),
+            signature,
+            &format!("JIT requeue write failed ({e}); underlying verdict: {reason}"),
+        ),
+    }
+}
+
+/// Handle permanent transaction failure with deferred remint for withdrawals.
+///
+/// For withdrawal transactions: removes remint info from cache, runs cleanup
+/// (which removes the nonce from SMT and builder caches), then queues a deferred
+/// remint that will execute after the Solana finality window passes. This prevents
+/// double-spend if the original withdrawal lands on-chain after our polling window.
+/// If the PendingRemint write cannot be confirmed, the cache entries go back and
+/// the row is left to recovery; a row that reads back PendingRemint is driven from
+/// here. No terminal status is written on a row whose state stays unresolved: only
+/// recovery, which classifies the release on-chain first, may escalate one.
+///
+/// For non-withdrawal transactions: delegates to send_fatal_error.
 pub(super) async fn handle_permanent_failure(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -837,8 +1413,10 @@ pub(super) async fn handle_permanent_failure(
         .withdrawal_nonce
         .and_then(|nonce| state.remint_cache.remove(&nonce));
 
-    // Collect stashed signatures for finality check
-    let signatures = ctx
+    // Clear the per-nonce stash. It is no longer what the finality gate reads,
+    // so it is only in-memory bookkeeping here, restored below if this failure
+    // cannot be handed off.
+    let stashed = ctx
         .withdrawal_nonce
         .and_then(|nonce| state.pending_signatures.remove(&nonce))
         .unwrap_or_default();
@@ -851,34 +1429,71 @@ pub(super) async fn handle_permanent_failure(
         return;
     };
 
-    // Zero signatures means sign_and_send itself failed — we have nothing to verify.
-    // The RPC may have broadcast the tx before erroring, so blind remint is unsafe.
+    // Guard before the journal read below, which is keyed by transaction_id.
+    // `transaction_id` is always `Some` for a withdrawal — only `ReleaseFunds`
+    // transactions populate `remint_cache`, and `ReleaseFunds` always carries a DB
+    // transaction_id (see `TransactionBuilder::transaction_id` in instruction_util.rs).
+    // `InitializeMint` and `ResetSmtRoot` return `None` there and exited above via
+    // `send_fatal_error`. This prevents silently enqueuing a `PendingRemint` with no
+    // DB record, which would be lost on restart since recovery reads from the DB.
+    let Some(transaction_id) = ctx.transaction_id else {
+        error!(
+            "Cannot defer remint for nonce {:?} — no transaction_id, entry would be unrecoverable on restart",
+            ctx.withdrawal_nonce,
+        );
+        return;
+    };
+
+    // Every attempt is journaled before its send, so the journal is the only
+    // complete record of what may still land: a send that errored ambiguously
+    // never reaches the in-memory stash. Classifying the stash alone can call a
+    // live release dead and remint on top of it. Recovery reads the same table.
+    let journaled = load_pending_sigs(&state.storage, transaction_id).await;
+    let signatures = match journaled {
+        Ok(sigs) => sigs,
+        // Without the broadcast set there is nothing to prove the release dead
+        // against. Put the compensation material back and leave the row
+        // Processing for recovery, which reads the same journal.
+        Err(reason) => {
+            error!(
+                transaction_id,
+                "Cannot read the release-signature journal, leaving the row to recovery: {reason}"
+            );
+            if let Some(nonce) = ctx.withdrawal_nonce {
+                state.remint_cache.insert(nonce, info);
+                state.pending_signatures.insert(nonce, stashed);
+            }
+            return;
+        }
+    };
+
+    // An empty journal means no release was broadcast, but the persist itself may
+    // have failed after reaching Postgres, so a blind remint is still unsafe.
     if signatures.is_empty() {
         error!(
             "No signatures to verify for nonce {:?} — cannot safely remint, sending to ManualReview",
             ctx.withdrawal_nonce,
         );
-        if let Some(transaction_id) = ctx.transaction_id {
-            send_guaranteed(
-                storage_tx,
-                TransactionStatusUpdate {
-                    transaction_id,
-                    trace_id: ctx.trace_id.clone(),
-                    status: TransactionStatus::ManualReview,
-                    counterpart_signature: None,
-                    processed_at: Some(Utc::now()),
-                    error_message: Some(format!(
-                        "{} | no signatures to verify — remint unsafe",
-                        error_msg
-                    )),
-                    remint_signature: None,
-                    remint_attempted: false,
-                },
-                "transaction status update",
-            )
-            .await
-            .ok();
-        }
+        send_guaranteed(
+            storage_tx,
+            TransactionStatusUpdate {
+                transaction_id,
+                trace_id: ctx.trace_id.clone(),
+                status: TransactionStatus::ManualReview,
+                counterpart_signature: None,
+                processed_at: Some(Utc::now()),
+                error_message: Some(format!(
+                    "{} | no signatures to verify — remint unsafe",
+                    error_msg
+                )),
+                remint_signature: None,
+                remint_attempted: false,
+                release_signatures: None,
+            },
+            "transaction status update",
+        )
+        .await
+        .ok();
         return;
     }
 
@@ -888,61 +1503,125 @@ pub(super) async fn handle_permanent_failure(
     // needed for the finality check. This replaces the previous Failed write —
     // keeping status as Processing until the remint resolves avoids partial state
     // if the operator crashes during the finality window.
-    if let Some(transaction_id) = ctx.transaction_id {
-        let sig_strings: Vec<String> = signatures
-            .iter()
-            .map(|pending_sig| pending_sig.signature.to_string())
-            .collect();
-        let lvbhs: Vec<i64> = signatures
-            .iter()
-            .map(|pending_sig| pending_sig.last_valid_block_height as i64)
-            .collect();
+    let sig_strings: Vec<String> = signatures
+        .iter()
+        .map(|pending_sig| pending_sig.signature.to_string())
+        .collect();
+    let lvbhs: Vec<i64> = signatures
+        .iter()
+        .map(|pending_sig| pending_sig.last_valid_block_height as i64)
+        .collect();
 
-        if let Err(e) = state
-            .storage
-            .set_pending_remint(transaction_id, sig_strings, lvbhs, deadline)
-            .await
-        {
-            error!(
-                "Failed to persist PendingRemint for transaction {} - sending to manual review: {}",
-                transaction_id, e
-            );
-            send_guaranteed(
-                storage_tx,
-                TransactionStatusUpdate {
+    // Retry the handoff: a statement timeout, deadlock or dropped connection
+    // is transient, and the compensation material is still held in the locals
+    // above, so nothing is given up while retrying.
+    let write_result = with_storage_backoff("pending remint transition", transaction_id, || {
+        state.storage.set_pending_remint(
+            transaction_id,
+            sig_strings.clone(),
+            lvbhs.clone(),
+            deadline,
+        )
+    })
+    .await;
+
+    if let Err(e) = write_result {
+        // The error is ambiguous: the write may or may not have committed.
+        // Read the row back; its status says who owns this withdrawal now.
+        let observed = with_storage_backoff("pending remint status read", transaction_id, || {
+            state.storage.get_transaction_status(transaction_id)
+        })
+        .await;
+
+        match observed {
+            // It committed and only the acknowledgement was lost, so this
+            // sender still owns the remint. Fall through and queue it.
+            Ok(Some(TransactionStatus::PendingRemint)) => {
+                warn!(
                     transaction_id,
-                    trace_id: ctx.trace_id.clone(),
-                    status: TransactionStatus::ManualReview,
-                    counterpart_signature: None,
-                    processed_at: Some(Utc::now()),
-                    error_message: Some(format!(
-                        "{} | failed to persist pending remint: {}",
-                        error_msg, e
-                    )),
-                    remint_signature: None,
-                    remint_attempted: false,
-                },
-                "transaction status update",
-            )
-            .await
-            .ok();
-            return;
+                    "set_pending_remint failed but the row is PendingRemint, treating the handoff as committed: {}",
+                    e
+                );
+            }
+            // Nothing committed. Put the compensation material back and leave
+            // the row Processing for the recovery worker, which reloads the
+            // release signatures from the journal and completes, requeues or
+            // quarantines it. Queuing the remint here as well could pay twice.
+            Ok(Some(TransactionStatus::Processing)) => {
+                error!(
+                    transaction_id,
+                    "Failed to persist PendingRemint, leaving the row to recovery: {}", e
+                );
+                if let Some(nonce) = ctx.withdrawal_nonce {
+                    state.remint_cache.insert(nonce, info);
+                    state.pending_signatures.insert(nonce, stashed);
+                }
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[
+                        state.program_type.as_label(),
+                        "pending_remint_persist_failed",
+                    ])
+                    .inc();
+                return;
+            }
+            // Another writer already moved the row, so it owns the outcome.
+            Ok(Some(status)) => {
+                warn!(
+                    transaction_id,
+                    "Failed to persist PendingRemint and the row is already {:?}, leaving it alone: {}",
+                    status,
+                    e
+                );
+                return;
+            }
+            // Neither state can be established, so retry the write itself: it is
+            // idempotent for this payload, which makes it the only probe that is
+            // safe whichever state committed. It takes a row that is still
+            // Processing and replays one that already carries this exact handoff,
+            // and either outcome makes the remint this sender's to drive. A
+            // terminal status here would strand the withdrawal instead, since no
+            // sweep selects ManualReview and the remint info and signature stash
+            // pulled from the caches above are the only live copy.
+            unresolved => {
+                error!(
+                    "Failed to persist PendingRemint for transaction {} and could not read it back ({:?}), retrying the handoff: {}",
+                    transaction_id, unresolved, e
+                );
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[
+                        state.program_type.as_label(),
+                        "pending_remint_state_unknown",
+                    ])
+                    .inc();
+                match state
+                    .storage
+                    .set_pending_remint(transaction_id, sig_strings, lvbhs, deadline)
+                    .await
+                {
+                    Ok(()) => warn!(
+                        transaction_id,
+                        "The handoff retry committed against an unreadable row; driving the remint from this sender"
+                    ),
+                    // Either the row is no longer ours to take or the database is
+                    // still unreachable. Both leave it where it is, so hold the
+                    // remint info and signature stash: a row that never left
+                    // Processing belongs to the recovery sweep, which reloads the
+                    // same journal and escalates only after classifying the
+                    // release on-chain.
+                    Err(retry_err) => {
+                        error!(
+                            transaction_id,
+                            "Could not establish the PendingRemint handoff, holding the remint info and signature stash for recovery: {retry_err}"
+                        );
+                        if let Some(nonce) = ctx.withdrawal_nonce {
+                            state.remint_cache.insert(nonce, info);
+                            state.pending_signatures.insert(nonce, stashed);
+                        }
+                        return;
+                    }
+                }
+            }
         }
-    }
-
-    // `transaction_id` is always `Some` at this point in practice — only
-    // `ReleaseFunds` transactions populate `remint_cache`, and `ReleaseFunds`
-    // always carries a DB transaction_id (see `TransactionBuilder::transaction_id`
-    // in instruction_util.rs). `InitializeMint` and `ResetSmtRoot` return `None`
-    // there and would have exited early above via `send_fatal_error`. This guard
-    // exists to prevent silently enqueuing a `PendingRemint` with no DB record,
-    // which would be lost on restart since recovery reads from the DB.
-    if ctx.transaction_id.is_none() {
-        error!(
-            "Cannot defer remint for nonce {:?} — no transaction_id, entry would be unrecoverable on restart",
-            ctx.withdrawal_nonce,
-        );
-        return;
     }
 
     info!(
@@ -988,7 +1667,7 @@ pub(super) async fn fire_and_store(
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
         .await
     {
-        Ok((signature, _last_valid_block_height)) => {
+        Ok((signature, _last_valid_block_height, _blockhash_slot)) => {
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, "in_flight"])
                 .observe(send_start.elapsed().as_secs_f64());
@@ -1042,8 +1721,7 @@ pub(super) fn spawn_fire_and_store(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    // True only for a real user-fund Mint
-    persist: bool,
+    durability: SendDurability,
 ) -> bool {
     let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
         Ok(p) => p,
@@ -1076,17 +1754,17 @@ pub(super) fn spawn_fire_and_store(
         retry_policy,
         extra_error_checks_policy,
         storage_tx,
-        persist,
+        durability,
         permit,
     ));
 
     true
 }
 
-/// Build, sign, persist the signature when `persist` is set, then broadcast and stash
-/// the in-flight tx. A persist failure aborts before broadcast and leaves the row
-/// Processing for recovery. Split from `spawn_fire_and_store` so tests can await it
-/// directly without `tokio::spawn`.
+/// Build, sign, and persist the signature write-ahead when `durability` is `Recoverable`,
+/// then broadcast and stash the in-flight tx. A persist failure aborts before broadcast
+/// and leaves the row Processing for recovery. Split from `spawn_fire_and_store` so tests
+/// can await it directly without `tokio::spawn`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fire_and_store_task(
     rpc_client: Arc<RpcClientWithRetry>,
@@ -1099,59 +1777,108 @@ pub(super) async fn fire_and_store_task(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    persist: bool,
+    durability: SendDurability,
     permit: OwnedSemaphorePermit,
 ) {
+    let mut ctx = ctx;
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
-    let (transaction, signature, last_valid_block_height) =
-        match build_and_sign(&rpc_client, instruction.clone()).await {
-            Ok(signed) => signed,
-            Err(e) => {
-                drop(permit);
-                metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[pt, "error"])
-                    .observe(send_start.elapsed().as_secs_f64());
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "build_sign_error"])
-                    .inc();
-                error!("Failed to build/sign transaction (fire-and-forget): {}", e);
-                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
-                return;
-            }
-        };
-
-    let persisted = if persist {
-        match ctx.transaction_id {
-            Some(txid) => {
-                if persist_signature_or_abort(
-                    &storage,
-                    pt,
-                    txid,
-                    &signature,
-                    last_valid_block_height,
-                )
-                .await
-                .is_err()
-                {
-                    drop(permit);
-                    return;
+    let (transaction, signature, last_valid_block_height, blockhash_slot) = match build_and_sign(
+        &rpc_client,
+        instruction.clone(),
+    )
+    .await
+    {
+        Ok(signed) => signed,
+        Err(e) => {
+            drop(permit);
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "build_sign_error"])
+                .inc();
+            // build_and_sign fetches a blockhash and calls the signer before any
+            // signature exists or is broadcast. A Recoverable mint that fails here
+            // minted no tokens, so a terminal Failed would strand the deposit: no
+            // worker re-claims a Failed row. Leave it Processing so the recovery sweep
+            // sees no signature and re-mints it. Terminal sends (InitializeMint) mint
+            // no balance, so fail fast.
+            match durability {
+                SendDurability::Recoverable { .. } => {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "left_processing_for_recovery"])
+                        .inc();
+                    warn!(
+                            transaction_id = ctx.transaction_id,
+                            "Build/sign failed for recoverable mint before broadcast; leaving row Processing for recovery: {}",
+                            e
+                        );
                 }
-                true
+                SendDurability::Terminal => {
+                    error!("Failed to build/sign transaction (fire-and-forget): {}", e);
+                    send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+                }
             }
-            // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
-            None => {
+            return;
+        }
+    };
+
+    let persisted = match durability {
+        SendDurability::Recoverable {
+            deposit_expected_updated_at,
+        } => {
+            let Some(txid) = ctx.transaction_id else {
+                // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
                 drop(permit);
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "pre_send_persist_error"])
                     .inc();
                 error!("Persist required but transaction has no id; aborting before broadcast");
                 return;
+            };
+            match storage
+                .claim_and_persist_signature(
+                    txid,
+                    deposit_expected_updated_at,
+                    signature.to_string(),
+                    last_valid_block_height as i64,
+                    i64::try_from(blockhash_slot).ok(),
+                )
+                .await
+            {
+                Ok(Some(lease)) => {
+                    ctx.deposit_claim_lease = Some(lease);
+                    true
+                }
+                Ok(None) => {
+                    drop(permit);
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "deposit_ownership_lost"])
+                        .inc();
+                    warn!(
+                        transaction_id = txid,
+                        signature = %signature,
+                        "Deposit ownership lost before broadcast; dropping stale builder without minting",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    drop(permit);
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "pre_send_persist_error"])
+                        .inc();
+                    error!(
+                        transaction_id = txid,
+                        signature = %signature,
+                        "Aborting before broadcast, leaving row Processing for recovery: {e}",
+                    );
+                    return;
+                }
             }
         }
-    } else {
-        false
+        SendDurability::Terminal => false,
     };
 
     match send_signed(&rpc_client, &transaction, retry_policy).await {
@@ -1183,15 +1910,16 @@ pub(super) async fn fire_and_store_task(
                 .with_label_values(&[pt, "rpc_send_error"])
                 .inc();
             error!("Failed to send transaction (fire-and-forget): {}", e);
-            // A node rejection (e.g. preflight) means the tx never reached the cluster, so
-            // fail fast. An ambiguous transport error on a persisted mint may have landed,
-            // so leave it Processing for recovery rather than strand a possibly-funded mint.
-            if persisted && !send_rejected_by_node(&e) {
+            // A persisted mint may already have landed, and even a preflight rejection can be
+            // a stale-node false negative, so a terminal Failed would strand a funded deposit
+            // and drop the signature recovery needs. Leave it Processing for recovery to
+            // reconcile against the persisted signature. Terminal sends mint no balance, so fail fast.
+            if persisted {
                 leave_processing_for_recovery(
                     pt,
                     ctx.transaction_id,
                     &signature,
-                    "ambiguous send error after write-ahead persist",
+                    "send error after write-ahead persist",
                 );
             } else {
                 send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
@@ -1218,7 +1946,10 @@ pub(super) async fn route_poll_results(
 ) {
     for (mut tx, status_opt) in results {
         match status_opt {
-            Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+            Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
+                // Free this finalized tx's in-flight slot now so a continuation (the JIT
+                // mint retry) can reuse it instead of being refused when in-flight is full.
+                drop(tx.permit);
                 let result = if let Some(err) = &status.err {
                     let mut extra_result = None;
                     if let ExtraErrorCheckPolicy::Extra(ref checks) = tx.extra_error_checks_policy {
@@ -1352,6 +2083,59 @@ pub(super) async fn route_poll_results(
     }
 }
 
+/// Why a chunked status fetch was rejected. Both variants make the caller reinsert
+/// the batch and retry; the split only picks the metric reason label.
+#[derive(Debug)]
+enum StatusFetchError {
+    /// A chunk response length did not equal the request (short or oversized).
+    MalformedLength,
+    /// The RPC call itself failed after retries.
+    Rpc,
+}
+
+impl StatusFetchError {
+    fn reason(&self) -> &'static str {
+        match self {
+            StatusFetchError::MalformedLength => "malformed_status_response",
+            StatusFetchError::Rpc => "status_poll_rpc_error",
+        }
+    }
+}
+
+/// Fetch statuses in `MAX_SIGS_PER_CALL` chunks. `getSignatureStatuses` is positional, so a
+/// chunk whose length differs from the request would misalign every later status; reject it.
+/// Returns `Err` on any RPC error or length mismatch so the caller reinserts the batch and retries.
+async fn fetch_statuses_checked(
+    rpc_client: &RpcClientWithRetry,
+    signatures: &[Signature],
+) -> Result<Vec<Option<solana_transaction_status::TransactionStatus>>, StatusFetchError> {
+    let mut statuses = Vec::with_capacity(signatures.len());
+    for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
+        match rpc_client.get_signature_statuses(chunk).await {
+            Ok(resp) if resp.value.len() == chunk.len() => statuses.extend(resp.value),
+            Ok(resp) => {
+                warn!(
+                    "getSignatureStatuses returned {} statuses for {} signatures \
+                     ({} in-flight) - treating as RPC failure, will retry next tick",
+                    resp.value.len(),
+                    chunk.len(),
+                    signatures.len()
+                );
+                return Err(StatusFetchError::MalformedLength);
+            }
+            Err(e) => {
+                warn!(
+                    "getSignatureStatuses failed ({} in-flight) - will retry next tick: {}",
+                    signatures.len(),
+                    e
+                );
+                return Err(StatusFetchError::Rpc);
+            }
+        }
+    }
+    Ok(statuses)
+}
+
 /// Single-cycle poll: drain the shared queue, call `getSignatureStatuses`, then
 /// route results via `route_poll_results`.
 ///
@@ -1366,25 +2150,18 @@ pub(super) async fn poll_in_flight(
     }
     let batch = state.in_flight.drain_all();
     let signatures: Vec<Signature> = batch.iter().map(|t| t.signature).collect();
-    let mut statuses: Vec<Option<_>> = Vec::with_capacity(signatures.len());
 
-    for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
-        match state.rpc_client.get_signature_statuses(chunk).await {
-            Ok(resp) => statuses.extend(resp.value),
-            Err(e) => {
-                warn!(
-                    "getSignatureStatuses failed ({} in-flight) — will retry next tick: {}",
-                    batch.len(),
-                    e
-                );
-                // Put everything back so the next drain_in_flight iteration retries.
-                for tx in batch {
-                    state.in_flight.push(tx);
-                }
-                return;
-            }
+    let statuses = match fetch_statuses_checked(&state.rpc_client, &signatures).await {
+        Ok(s) => s,
+        Err(e) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), e.reason()])
+                .inc();
+            // Reinsert the full batch so the next drain_in_flight iteration retries.
+            state.in_flight.push_all(batch);
+            return;
         }
-    }
+    };
 
     let results: Vec<_> = batch.into_iter().zip(statuses).collect();
     route_poll_results(state, results, storage_tx).await;
@@ -1447,37 +2224,26 @@ pub(super) async fn run_poll_task(
 
         signatures.clear();
         signatures.extend(batch.iter().map(|t| t.signature));
-        let mut statuses: Vec<Option<_>> = Vec::with_capacity(signatures.len());
-        let mut rpc_ok = true;
 
-        for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
-            match rpc_client.get_signature_statuses(chunk).await {
-                Ok(resp) => statuses.extend(resp.value),
-                Err(e) => {
-                    warn!(
-                        "getSignatureStatuses failed ({} in-flight) — will retry next tick: {}",
-                        batch.len(),
-                        e
-                    );
-                    rpc_ok = false;
-                    break;
-                }
+        let statuses = match fetch_statuses_checked(&rpc_client, &signatures).await {
+            Ok(s) => s,
+            Err(e) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), e.reason()])
+                    .inc();
+                // Put everything back in one lock acquisition and retry next tick.
+                in_flight.push_all(batch);
+                continue;
             }
-        }
-
-        if !rpc_ok {
-            // Put everything back in one lock acquisition.
-            in_flight.push_all(batch);
-            continue;
-        }
+        };
 
         let mut results: Vec<PollTaskResult> = Vec::with_capacity(batch.len());
 
         for (mut tx, status_opt) in batch.into_iter().zip(statuses) {
             match status_opt {
-                Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
                     if status.err.is_none() {
-                        // ── Confirmed success (hot path) ──────────────────────────────
+                        // ── Finalized success (hot path) ──────────────────────────────
                         // Handle entirely here — no need to wake the sender loop.
                         metrics::OPERATOR_MINTS_SENT
                             .with_label_values(&[program_type.as_label()])
@@ -1494,6 +2260,7 @@ pub(super) async fn run_poll_task(
                                     error_message: None,
                                     remint_signature: None,
                                     remint_attempted: false,
+                                    release_signatures: None,
                                 })
                                 .await
                                 .is_err()
@@ -1553,6 +2320,7 @@ pub(super) async fn send_fatal_error(
                 error_message: Some(error_msg.to_string()),
                 remint_signature: None,
                 remint_attempted: false,
+                release_signatures: None,
             },
             "transaction status update",
         )
@@ -1566,17 +2334,22 @@ mod tests {
     use super::*;
     use crate::config::ProgramType;
     use crate::operator::sender::types::SenderSMTState;
+    use crate::operator::utils::instruction_util::ResetSmtRootBuilderWithTarget;
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::operator::ReleaseFundsBuilderWithNonce;
+    use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::{DbTransaction, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use borsh::BorshSerialize;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
-    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::instructions::{
+        ReleaseFundsBuilder, ResetSmtRootBuilder,
+    };
     use private_channel_escrow_program_client::Instance;
     use solana_client::nonblocking::rpc_client::RpcClient;
     use solana_client::rpc_request::RpcRequest;
@@ -1608,6 +2381,7 @@ mod tests {
         SenderState {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -1622,6 +2396,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -1643,6 +2418,7 @@ mod tests {
         SenderState {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -1657,6 +2433,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -1666,6 +2443,11 @@ mod tests {
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
+            source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                &format!("remint-sig-{txn_id}"),
+                0,
+                None,
+            ),
             trace_id: format!("trace-{txn_id}"),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             user: solana_sdk::pubkey::Pubkey::new_unique(),
@@ -1673,6 +2455,54 @@ mod tests {
             token_program: spl_token::id(),
             amount: 5000,
         }
+    }
+
+    /// Serialized `Instance` reporting `current_tree_index`. Its root is deliberately
+    /// not `EMPTY_TREE_ROOT`, so any `validate_smt_root` that runs against it fails.
+    /// Instance bytes whose root matches no rebuilt tree, so an SMT init on top of it
+    /// fails. Gate tests rely on that to prove the gate ran before the init.
+    fn instance_bytes(current_tree_index: u64) -> Vec<u8> {
+        instance_bytes_with_root(current_tree_index, [0u8; 32])
+    }
+
+    fn instance_bytes_with_root(current_tree_index: u64, root: [u8; 32]) -> Vec<u8> {
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// An RPC client whose every `getAccountInfo` returns `account_data`.
+    fn mock_rpc_client(account_data: &[u8]) -> Arc<RpcClientWithRetry> {
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            serde_json::json!({
+                "context": {"slot": 1},
+                "value": {
+                    "owner": Pubkey::new_unique().to_string(),
+                    "lamports": 1_000_000u64,
+                    "data": [STANDARD.encode(account_data), "base64"],
+                    "executable": false,
+                    "rentEpoch": 0
+                }
+            }),
+        );
+        Arc::new(RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        })
     }
 
     // ── handle_permanent_failure ─────────────────────────────────────
@@ -1686,6 +2516,7 @@ mod tests {
             transaction_id: Some(42),
             withdrawal_nonce: None, // not a withdrawal
             trace_id: Some("trace-42".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "some error").await;
@@ -1707,6 +2538,7 @@ mod tests {
             transaction_id: Some(7),
             withdrawal_nonce: Some(99),
             trace_id: Some("trace-7".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "max retries").await;
@@ -1730,13 +2562,27 @@ mod tests {
             vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
+        // The PendingRemint transition is guarded on a Processing row, and the
+        // finality gate reads the journal the broadcast wrote.
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(10, 5));
+        mock.insert_release_signature(10, sig.to_string(), 0, None)
+            .await
+            .unwrap();
 
         let ctx = TransactionContext {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
@@ -1775,6 +2621,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "rpc send error").await;
@@ -1808,6 +2655,7 @@ mod tests {
                 transaction_id: txn_id,
                 trace_id: format!("trace-{txn_id}"),
                 remint_info: None,
+                fetched_updated_at: chrono::Utc::now(),
             },
         ))
     }
@@ -1820,10 +2668,9 @@ mod tests {
         );
     }
 
-    /// An SMT-init-class error from lazy init (SmtRootMismatch, SmtNotInitialized,
-    /// an OperatorError::Account from the instance fetch, or an OperatorError::Storage
-    /// from reading the completed nonces) must leave the triggering withdrawal
-    /// Processing, never Failed.
+    /// A fail-closed SMT-init error from lazy init (SmtRootMismatch, or an
+    /// OperatorError::Account that is not a transient read) must leave the
+    /// triggering withdrawal Processing for recovery, never Failed.
     #[tokio::test]
     async fn smt_init_error_leaves_row_processing_not_failed() {
         let ctx = withdrawal_ctx(10, 7);
@@ -1845,7 +2692,7 @@ mod tests {
         .await;
         assert_no_status_update(&mut storage_rx);
 
-        // Case 2: OperatorError::Account (e.g. RPC/account error during init).
+        // Case 2: OperatorError::Account that is not a transient read (missing instance).
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         route_builder_error(
             &mut state,
@@ -1859,12 +2706,64 @@ mod tests {
         )
         .await;
         assert_no_status_update(&mut storage_rx);
+    }
 
-        // Case 3: OperatorError::Storage (a transient DB read error during init) must also leave the row Processing.
+    /// A transient lazy-init read failure (RPC instance fetch AccountNotFound, or a
+    /// DB nonce read error) happens before any signing, so the row provably never
+    /// broadcast: it must requeue Processing → Pending for an automatic retry rather
+    /// than freeze for recovery to quarantine into ManualReview.
+    #[tokio::test]
+    async fn smt_init_transient_error_requeues_to_pending() {
+        // Case 1: OperatorError::Account(AccountNotFound) from the instance fetch.
+        let mut state = make_sender_state();
+        // Cached by handle_transaction_builder before init; requeue clears it.
+        state.remint_cache.insert(7, make_remint_info(10));
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(10, 7));
+
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
         route_builder_error(
             &mut state,
-            &ctx,
+            &withdrawal_ctx(10, 7),
+            release_funds_builder(10, 7),
+            &storage_tx,
+            crate::error::AccountError::AccountNotFound {
+                pubkey: Pubkey::default(),
+            }
+            .into(),
+        )
+        .await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "transient init failure must not write a terminal status"
+        );
+        assert!(!state.remint_cache.contains_key(&7));
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(row.status, TransactionStatus::Pending, "row requeued");
+        assert_eq!(row.recovery_requeue_attempts, 1);
+
+        // Case 2: OperatorError::Storage from reading the completed nonces.
+        let mut state = make_sender_state();
+        state.remint_cache.insert(7, make_remint_info(10));
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(10, 7));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        route_builder_error(
+            &mut state,
+            &withdrawal_ctx(10, 7),
             release_funds_builder(10, 7),
             &storage_tx,
             crate::error::StorageError::DatabaseError {
@@ -1873,7 +2772,47 @@ mod tests {
             .into(),
         )
         .await;
-        assert_no_status_update(&mut storage_rx);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "transient init failure must not write a terminal status"
+        );
+        assert!(!state.remint_cache.contains_key(&7));
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(row.status, TransactionStatus::Pending, "row requeued");
+        assert_eq!(row.recovery_requeue_attempts, 1);
+    }
+
+    /// Once the durable requeue cap is hit, a transient init failure with no stashed
+    /// signature can no longer safely retry, so it escalates to ManualReview.
+    #[tokio::test]
+    async fn smt_init_transient_error_at_requeue_cap_goes_to_manual_review() {
+        let mut state = make_sender_state();
+        state.remint_cache.insert(7, make_remint_info(10));
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        let mut row = processing_withdrawal_row(10, 7);
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        route_builder_error(
+            &mut state,
+            &withdrawal_ctx(10, 7),
+            release_funds_builder(10, 7),
+            &storage_tx,
+            crate::error::AccountError::AccountNotFound {
+                pubkey: Pubkey::default(),
+            }
+            .into(),
+        )
+        .await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("at the cap, a transient init failure must escalate");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
     }
 
     /// A genuine build error (not SMT-init-class) MUST still mark the row Failed, so the exemption doesn't swallow real failures.
@@ -1915,6 +2854,7 @@ mod tests {
             transaction_id: Some(50),
             withdrawal_nonce: Some(3),
             trace_id: Some("trace-50".to_string()),
+            deposit_claim_lease: None,
         };
         smt.nonce_to_builder
             .insert(3, (ctx.clone(), ReleaseFundsBuilder::new()));
@@ -1926,6 +2866,7 @@ mod tests {
             vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -1965,6 +2906,7 @@ mod tests {
             .push(PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             });
 
         assert!(state.pending_signatures.contains_key(&nonce));
@@ -1980,6 +2922,7 @@ mod tests {
             .push(PendingSig {
                 signature: sig2,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             });
         assert_eq!(state.pending_signatures[&nonce].len(), 2);
     }
@@ -1991,6 +2934,7 @@ mod tests {
             transaction_id: Some(txn_id),
             withdrawal_nonce: Some(nonce),
             trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
         }
     }
 
@@ -2036,7 +2980,8 @@ mod tests {
             .create()
     }
 
-    /// A successful send_and_confirm persists the signed transaction's signature (via `insert_release_signature`) before the broadcast.
+    /// A successful send_and_confirm persists the signed transaction's signature
+    /// (via the ownership claim) before the broadcast.
     #[tokio::test]
     async fn release_persists_signature_before_send() {
         let mut server = mockito::Server::new_async().await;
@@ -2060,6 +3005,7 @@ mod tests {
         let _status = mock_get_signature_statuses_null(&mut server);
 
         let mut state = make_sender_state_with_server(&server.url());
+        seed_release_claim(&mut state, 10, 5);
         let ctx = withdrawal_ctx(10, 5);
 
         send_and_confirm(
@@ -2079,16 +3025,24 @@ mod tests {
         let stored = mock.get_release_signatures(10).await.unwrap();
         assert_eq!(stored.len(), 1, "exactly one release signature persisted");
         assert_eq!(
-            stored[0].0,
+            stored[0].signature,
             Signature::default().to_string(),
             "persisted signature must be the signed transaction's signature"
         );
-        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
+        assert_eq!(
+            stored[0].last_valid_block_height, 100,
+            "persisted lvbh must match the blockhash"
+        );
     }
 
-    /// A failed write-ahead persist must NOT broadcast, must write no terminal status (row left Processing), and must stash nothing.
+    /// A failed write-ahead persist must NOT broadcast, must write no terminal status (row
+    /// left Processing), and must stash nothing. With nothing ever broadcast for this nonce
+    /// the Stage-1 SMT/builder/retry/remint mutations must also roll back so later
+    /// withdrawals in this tree build on a root the chain agrees with.
     #[tokio::test]
     async fn release_aborts_send_when_persist_fails() {
+        let txn_id = 10;
+        let nonce = 5;
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         // sendTransaction must never be called once persist fails.
@@ -2101,13 +3055,29 @@ mod tests {
             .create();
 
         let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
         mock.set_should_fail("insert_release_signature", true);
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
-        let ctx = withdrawal_ctx(10, 5);
+        let ctx = withdrawal_ctx(txn_id, nonce);
 
         send_and_confirm(
             &mut state,
@@ -2126,17 +3096,604 @@ mod tests {
             "no status update must be sent; row stays Processing for recovery"
         );
         assert!(
-            !state.pending_signatures.contains_key(&5),
+            !state.pending_signatures.contains_key(&nonce),
             "nothing stashed when persist failed"
+        );
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "SMT nonce rolled back when nothing broadcast"
+        );
+        assert!(
+            !smt.nonce_to_builder.contains_key(&nonce),
+            "builder cache rolled back"
+        );
+        assert!(
+            !state.remint_cache.contains_key(&nonce),
+            "remint cache rolled back"
+        );
+        assert!(
+            !state.retry_counts.contains_key(&nonce),
+            "retry count rolled back"
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "row stays Processing for recovery, no requeue"
         );
     }
 
-    /// The in-memory stash happens only after a successful broadcast, so a send that
-    /// never reached the network leaves no signature to verify and routes to
-    /// ManualReview, not a deferred remint. The write-ahead DB persist (for crash
-    /// recovery) does not change this.
+    /// Guards D1: a signature stashed from an earlier broadcast of this nonce means a real
+    /// tx may still land, so a later persist failure must leave the Stage-1 state intact
+    /// for recovery instead of rolling a still-in-flight nonce out of the SMT.
     #[tokio::test]
-    async fn send_failure_routes_to_manual_review() {
+    async fn persist_failure_with_prior_broadcast_keeps_state() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        let prior_sig = Signature::new_unique();
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: prior_sig,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("insert_release_signature", true);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = withdrawal_ctx(txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &ctx,
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row stays Processing for recovery"
+        );
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            smt.smt_state.contains_nonce(nonce),
+            "nonce kept in SMT while an earlier broadcast may still land"
+        );
+        assert!(
+            smt.nonce_to_builder.contains_key(&nonce),
+            "builder cache kept for the in-flight nonce"
+        );
+        // The stashed signature is the invariant the guard protects: recovery
+        // reconciles the in-flight nonce against it, so it must survive the abort.
+        let stashed = state
+            .pending_signatures
+            .get(&nonce)
+            .expect("stashed signature preserved for recovery to reconcile");
+        assert_eq!(stashed.len(), 1, "no signatures added or dropped");
+        assert_eq!(
+            stashed[0].signature, prior_sig,
+            "the pre-broadcast signature is intact"
+        );
+    }
+
+    // ── pre-broadcast release ownership claim ─────────────────────────
+
+    /// Seed the `Processing` row a release claim CASes against and arm the sender
+    /// with the matching lease, exactly as the submission path leaves them.
+    /// Returns the arrival token.
+    fn seed_release_claim(
+        state: &mut SenderState,
+        txn_id: i64,
+        nonce: u64,
+    ) -> chrono::DateTime<Utc> {
+        let row = processing_withdrawal_row(txn_id, nonce);
+        let token = row.updated_at;
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions.lock().unwrap().push(row);
+        state.release_leases.insert(nonce, token);
+        token
+    }
+
+    /// `seed_release_claim` plus the Stage-1 SMT/builder/remint mutations a
+    /// submitted release leaves behind, which a lost claim has to roll back.
+    fn arm_release_attempt(
+        state: &mut SenderState,
+        txn_id: i64,
+        nonce: u64,
+    ) -> chrono::DateTime<Utc> {
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        seed_release_claim(state, txn_id, nonce)
+    }
+
+    /// The row as recovery leaves it after a demote: still present, no longer
+    /// `Processing`, so the sender's lease no longer names a claimable incarnation.
+    fn demote_seeded_row(state: &SenderState, txn_id: i64) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let mut rows = mock.pending_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|r| r.id == txn_id)
+            .expect("seeded row present");
+        row.status = TransactionStatus::Pending;
+        row.updated_at = Utc::now();
+    }
+
+    /// A mock RPC that answers the blockhash but refuses to accept any send, so a
+    /// broadcast is both counted and fatal to the test's intent.
+    fn mock_no_broadcast_allowed(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create()
+    }
+
+    /// Accepting `sendTransaction`, counted `expect` times.
+    fn mock_send_ok_times(server: &mut mockito::ServerGuard, expect: usize) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(expect)
+            .create()
+    }
+
+    /// Accepting `sendTransaction` with no call-count expectation.
+    fn mock_send_ok(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// A finalized, error-free status, so a broadcast release confirms on the
+    /// first poll instead of entering the idempotent retry loop.
+    fn mock_status_finalized(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
+                            "err": null,
+                            "slot": 100,
+                            "status": {"Ok": null}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// The core safety property of the claim: once recovery has demoted the row,
+    /// the lease the sender holds is dead, so the release must not broadcast and
+    /// must leave no signature behind for recovery to misread as an attempt.
+    #[tokio::test]
+    async fn release_send_drops_builder_when_claim_lost() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = mock_no_broadcast_allowed(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        arm_release_attempt(&mut state, txn_id, nonce);
+        demote_seeded_row(&state, txn_id);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(txn_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a lost claim must persist no signature"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lost claim writes no terminal status; the winning writer owns the row"
+        );
+        assert!(
+            !state.pending_signatures.contains_key(&nonce),
+            "nothing stashed when nothing broadcast"
+        );
+    }
+
+    /// A lost claim also has to undo the Stage-1 mutations, or the local SMT keeps
+    /// a nonce the chain never accepted and every later withdrawal in the tree
+    /// builds on a root the chain disagrees with.
+    ///
+    /// The RPC here would confirm the release if it were broadcast, so the
+    /// rollback can only come from the claim aborting before the send.
+    #[tokio::test]
+    async fn release_send_rolls_back_smt_when_claim_lost() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = mock_send_ok(&mut server);
+        let _status = mock_status_finalized(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        arm_release_attempt(&mut state, txn_id, nonce);
+        demote_seeded_row(&state, txn_id);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &mpsc::channel(10).0,
+        )
+        .await;
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "SMT nonce rolled back when the claim was lost"
+        );
+        assert!(
+            !smt.nonce_to_builder.contains_key(&nonce),
+            "builder dropped when the claim was lost"
+        );
+        assert!(
+            !state.retry_counts.contains_key(&nonce),
+            "retry count cleared"
+        );
+        assert!(
+            !state.remint_cache.contains_key(&nonce),
+            "remint cache cleared"
+        );
+        assert!(
+            !state.release_leases.contains_key(&nonce),
+            "the dead lease is dropped with the builder"
+        );
+    }
+
+    /// The normal path is unchanged by the claim: the release still broadcasts
+    /// once and still records its signature write-ahead. The row's `updated_at`
+    /// advancing is what separates the claim from a bare insert, and is what makes
+    /// a concurrent recovery demote lose.
+    #[tokio::test]
+    async fn release_send_broadcasts_and_stores_lease_when_claim_wins() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = mock_send_ok_times(&mut server, 1);
+        let _status = mock_status_finalized(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let arrival_token = arm_release_attempt(&mut state, txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &mpsc::channel(10).0,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(txn_id).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the claim persists the signature write-ahead"
+        );
+
+        let row_updated_at = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == txn_id)
+            .expect("seeded row present")
+            .updated_at;
+        assert_ne!(
+            row_updated_at, arrival_token,
+            "the claim must bump the row so a racing recovery CAS loses"
+        );
+    }
+
+    /// Retry recursion is the second broadcast decision for one nonce, so it has
+    /// to present the token the first claim returned. Holding the arrival token
+    /// instead would lose the second claim and silently strand the withdrawal
+    /// after one attempt.
+    #[tokio::test]
+    async fn release_retry_presents_refreshed_lease() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        // Two sender-level attempts, then the cap; a stale lease would stop at one.
+        let send = mock_send_ok_times(&mut server, 2);
+        let _status = mock_get_signature_statuses_null(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.retry_max_attempts = 2;
+        arm_release_attempt(&mut state, txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &mpsc::channel(64).0,
+        )
+        .await;
+
+        send.assert();
+    }
+
+    /// The claim write itself failing is not evidence about ownership, so the
+    /// sender must not broadcast and must not follow one failed write with
+    /// another; the row is left `Processing` for recovery.
+    #[tokio::test]
+    async fn release_claim_error_leaves_row_processing_without_second_write() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = mock_no_broadcast_allowed(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        arm_release_attempt(&mut state, txn_id, nonce);
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("claim_and_persist_signature", true);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; the row stays Processing for recovery"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == txn_id)
+            .expect("seeded row present")
+            .clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "a failed claim write is followed by no second write"
+        );
+        assert!(
+            mock.status_updates.lock().unwrap().is_empty(),
+            "no follow-up storage write after the claim failed"
+        );
+    }
+
+    /// Guards against over-cleaning: a persist that succeeds must still broadcast, persist
+    /// the write-ahead signature, and keep the chain-accepted nonce in the SMT on a
+    /// confirmed release. Pins that the abort-branch rollback never touches the success path.
+    #[tokio::test]
+    async fn persist_success_still_broadcasts_and_keeps_nonce() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .create();
+        // A confirmed status routes to handle_success instead of the idempotent retry loop.
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
+                            "err": null,
+                            "slot": 100,
+                            "status": {"Ok": null}
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+        seed_release_claim(&mut state, txn_id, nonce);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = withdrawal_ctx(txn_id, nonce);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &ctx,
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            smt.smt_state.contains_nonce(nonce),
+            "the chain-accepted nonce must stay in the SMT on a confirmed release"
+        );
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(txn_id).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "the write-ahead signature is persisted on the success path"
+        );
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a confirmed release emits a status update");
+        assert_eq!(update.status, TransactionStatus::Completed);
+    }
+
+    /// The node answered the send with an error, so the release may still have
+    /// reached the network. The in-memory stash is only written after a successful
+    /// send and so knows nothing about this attempt, but the write-ahead journal
+    /// does: the withdrawal takes the finality-checked remint path carrying that
+    /// signature, instead of being escalated as if nothing had been broadcast.
+    #[tokio::test]
+    async fn send_failure_defers_remint_on_journaled_signature() {
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         let _send = server
@@ -2155,11 +3712,16 @@ mod tests {
             )
             .create();
 
+        let txn_id = 10;
+        let nonce = 5;
         let mut state = make_sender_state_with_server(&server.url());
-        state.remint_cache.insert(5, make_remint_info(10));
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        // The PendingRemint transition is guarded on a Processing row, and the
+        // pre-broadcast claim needs that row plus a live lease.
+        seed_release_claim(&mut state, txn_id, nonce);
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
-        let ctx = withdrawal_ctx(10, 5);
+        let ctx = withdrawal_ctx(txn_id, nonce);
 
         send_and_confirm(
             &mut state,
@@ -2173,13 +3735,322 @@ mod tests {
         .await;
 
         assert!(
-            state.pending_remints.is_empty(),
-            "a never-broadcast send must not defer a remint"
+            storage_rx.try_recv().is_err(),
+            "an ambiguously-sent release must not be terminalized"
         );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let journaled = mock.get_release_signatures(txn_id).await.unwrap();
+        assert_eq!(
+            journaled.len(),
+            1,
+            "the send was preceded by a write-ahead persist"
+        );
+        assert!(
+            !state.pending_signatures.contains_key(&nonce),
+            "the failed send never stashed its signature"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(
+            state.pending_remints[0].signatures[0].signature.to_string(),
+            journaled[0].signature,
+            "the gate must carry the journaled signature"
+        );
+    }
+
+    // ── pre-broadcast build/sign failure requeues withdrawals ────────
+
+    fn processing_withdrawal_row(txn_id: i64, nonce: u64) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id: txn_id,
+            signature: format!("sig-{txn_id}"),
+            instruction_index: 0,
+            trace_id: format!("trace-{txn_id}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(1_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce as i64),
+            status: TransactionStatus::Processing,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
+    fn mock_blockhash_failure(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(500)
+            .with_body("blockhash rpc down")
+            .create()
+    }
+
+    /// A withdrawal build/sign failure happens before any signature exists, so the
+    /// row must requeue Processing → Pending for an automatic retry: SMT rolled
+    /// back, no terminal status, retry count kept so the attempt cap still binds.
+    #[tokio::test]
+    async fn withdrawal_build_sign_failure_requeues_to_pending() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        smt.nonce_to_builder.insert(
+            nonce,
+            (withdrawal_ctx(txn_id, nonce), ReleaseFundsBuilder::new()),
+        );
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "pre-broadcast failure must not write a terminal status"
+        );
+        assert!(state.pending_remints.is_empty(), "no deferred remint");
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "nonce rolled back from local SMT"
+        );
+        assert!(!smt.nonce_to_builder.contains_key(&nonce));
+        assert!(!state.remint_cache.contains_key(&nonce));
+        assert_eq!(
+            state.retry_counts.get(&nonce),
+            Some(&1),
+            "retry count survives the requeue so the attempt cap still binds"
+        );
+
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Pending,
+            "row requeued for the fetcher"
+        );
+        assert_eq!(row.recovery_requeue_attempts, 1);
+    }
+
+    /// With a signature stashed from an earlier broadcast of the same nonce, a
+    /// later build/sign failure is not provably pre-broadcast: it must take the
+    /// finality-checked remint path, not the requeue.
+    #[tokio::test]
+    async fn build_sign_failure_with_prior_broadcast_defers_remint() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        let prior_sig = Signature::new_unique();
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: prior_sig,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+        // The PendingRemint transition is guarded on a Processing row, and the
+        // earlier broadcast journaled its signature before sending.
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+        mock.insert_release_signature(txn_id, prior_sig.to_string(), 0, None)
+            .await
+            .unwrap();
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "remint is deferred, no status update yet"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "prior broadcast must defer a remint, not requeue"
+        );
+        assert_eq!(state.pending_remints[0].signatures[0].signature, prior_sig);
+    }
+
+    /// If the requeue write fails the row stays Processing: recovery quarantines
+    /// no-signature withdrawals, so the failure still pages instead of stranding.
+    #[tokio::test]
+    async fn build_sign_failure_requeue_write_error_leaves_processing() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+        mock.set_should_fail("try_requeue_prebroadcast", true);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no terminal status on requeue write failure"
+        );
+        assert!(state.pending_remints.is_empty());
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "SMT rollback happens regardless of the requeue write"
+        );
+
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "row left Processing for recovery"
+        );
+    }
+
+    /// A row already at the durable requeue cap must not requeue again on a
+    /// build/sign failure: it pages via ManualReview instead of ping-ponging
+    /// Pending ↔ Processing forever across restarts.
+    #[tokio::test]
+    async fn build_sign_failure_at_requeue_cap_goes_to_manual_review() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+
+        let storage = state.storage.clone();
+        let Storage::Mock(ref mock) = *storage else {
+            panic!("expected mock storage");
+        };
+        let mut row = processing_withdrawal_row(txn_id, nonce);
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        mock.pending_transactions.lock().unwrap().push(row);
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(txn_id, nonce),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
         let update = storage_rx
             .try_recv()
-            .expect("send failure must surface a status update");
+            .expect("cap hit must surface a status update");
         assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("requeues"));
+
+        let row = mock.pending_transactions.lock().unwrap()[0].clone();
+        assert_eq!(
+            row.status,
+            TransactionStatus::Processing,
+            "row must not requeue past the cap"
+        );
+        let smt = state.smt_state.as_ref().unwrap();
+        assert!(
+            !smt.smt_state.contains_nonce(nonce),
+            "permanent-failure cleanup rolls back the SMT nonce"
+        );
     }
 
     // ── set_pending_remint persistence ───────────────────────────────
@@ -2206,24 +4077,27 @@ mod tests {
         let sig1_lvbh: u64 = 100;
         let sig2_lvbh: u64 = 200;
         state.remint_cache.insert(5, make_remint_info(10));
-        state.pending_signatures.insert(
-            5,
-            vec![
-                PendingSig {
-                    signature: sig1,
-                    last_valid_block_height: sig1_lvbh,
-                },
-                PendingSig {
-                    signature: sig2,
-                    last_valid_block_height: sig2_lvbh,
-                },
-            ],
-        );
+        // The PendingRemint transition is guarded on a Processing row, and both
+        // attempts were journaled write-ahead before their sends.
+        let Storage::Mock(ref seed) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        seed.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(10, 5));
+        seed.insert_release_signature(10, sig1.to_string(), sig1_lvbh as i64, None)
+            .await
+            .unwrap();
+        seed.insert_release_signature(10, sig2.to_string(), sig2_lvbh as i64, None)
+            .await
+            .unwrap();
 
         let ctx = TransactionContext {
             transaction_id: Some(10),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-10".to_string()),
+            deposit_claim_lease: None,
         };
 
         let before = Utc::now();
@@ -2294,54 +4168,420 @@ mod tests {
         );
     }
 
-    /// When the database write for `set_pending_remint` fails, the operator
-    /// cannot safely defer the remint — it has no guarantee the state will
-    /// survive a restart. Instead of silently losing the remint, it must
-    /// immediately escalate to ManualReview so an operator can intervene.
-    ///
-    /// Equally important: nothing should be queued in `pending_remints`.
-    /// Queuing in memory without the DB write would be a half-written state —
-    /// the entry would disappear on the next crash, violating the atomicity
-    /// invariant.
+    /// Attempt 1 broadcast and stashed its signature; attempt 2 was journaled
+    /// write-ahead and then its send errored ambiguously, so it never reached the
+    /// stash while its release can still land. The finality gate must be fed from
+    /// the journal, or it classifies attempt 1 alone, calls the release dead and
+    /// remints tokens the user may still be paid for on-chain.
     #[tokio::test]
-    async fn permanent_failure_sends_manual_review_when_storage_fails() {
+    async fn permanent_failure_gate_includes_ambiguously_sent_attempt() {
+        let txn_id = 77;
+        let nonce = 21;
+        let stashed_attempt = Signature::new_unique();
+        let ambiguous_attempt = Signature::new_unique();
         let mut state = make_sender_state();
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
 
-        // Instruct the mock to fail on set_pending_remint.
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
-        mock.set_should_fail("set_pending_remint", true);
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+        // Both attempts are journaled write-ahead, each before its own send.
+        mock.insert_release_signature(txn_id, stashed_attempt.to_string(), 100, None)
+            .await
+            .unwrap();
+        mock.insert_release_signature(txn_id, ambiguous_attempt.to_string(), 200, None)
+            .await
+            .unwrap();
 
-        state.remint_cache.insert(5, make_remint_info(10));
+        // Only attempt 1 reached the stash: the push runs in send_signed's Ok arm.
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
         state.pending_signatures.insert(
-            5,
+            nonce,
             vec![PendingSig {
-                signature: Signature::new_unique(),
-                last_valid_block_height: 0,
+                signature: stashed_attempt,
+                last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
         );
 
         let ctx = TransactionContext {
-            transaction_id: Some(10),
-            withdrawal_nonce: Some(5),
-            trace_id: Some("trace-10".to_string()),
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
         };
 
         handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
 
-        // Must escalate to ManualReview — human intervention is needed.
-        let update = storage_rx
-            .try_recv()
-            .expect("should receive ManualReview status");
-        assert_eq!(update.transaction_id, 10);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let (_, persisted_sigs, persisted_lvbhs, _) =
+            mock.pending_remint_signatures.lock().unwrap()[0].clone();
+        assert!(
+            persisted_sigs.contains(&ambiguous_attempt.to_string()),
+            "the ambiguously-sent attempt must be persisted for the finality check: {persisted_sigs:?}"
+        );
+        assert_eq!(
+            persisted_lvbhs.iter().max(),
+            Some(&200),
+            "the deadline bound must cover the ambiguously-sent attempt"
+        );
 
-        // Must not queue in memory — no DB write means no crash safety.
+        let queued: Vec<Signature> = state.pending_remints[0]
+            .signatures
+            .iter()
+            .map(|pending_sig| pending_sig.signature)
+            .collect();
+        assert!(
+            queued.contains(&ambiguous_attempt),
+            "the in-process gate must classify the ambiguously-sent attempt too: {queued:?}"
+        );
+    }
+
+    /// A failed `set_pending_remint` whose row still reads `Processing` proves
+    /// nothing committed. The row keeps that status so the recovery worker owns
+    /// it, and the compensation material goes back into the caches for a later
+    /// attempt on the same nonce. Escalating here would strand a row that
+    /// recovery resolves on its own.
+    #[tokio::test]
+    async fn permanent_failure_leaves_processing_row_to_recovery() {
+        let txn_id = 10;
+        let nonce = 5;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("set_pending_remint", true);
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status while the row is still Processing"
+        );
         assert!(
             state.pending_remints.is_empty(),
-            "should not queue pending remint when storage write failed"
+            "must not queue a remint without a durable PendingRemint row"
+        );
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be restored for a later attempt"
+        );
+        assert!(
+            state.pending_signatures.contains_key(&nonce),
+            "release signatures must be restored for a later attempt"
+        );
+    }
+
+    /// The write can commit and still return an error when the acknowledgement
+    /// is lost. Reading the row back shows `PendingRemint`, so the handoff did
+    /// succeed and this sender keeps driving the remint instead of escalating
+    /// over a state that is already durable.
+    #[tokio::test]
+    async fn permanent_failure_adopts_committed_pending_remint_row() {
+        let txn_id = 11;
+        let nonce = 6;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("set_pending_remint", true);
+        let mut committed = processing_withdrawal_row(txn_id, nonce);
+        committed.status = TransactionStatus::PendingRemint;
+        mock.pending_transactions.lock().unwrap().push(committed);
+
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "a committed PendingRemint row must be driven by this sender"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not overwrite a committed PendingRemint with a terminal status"
+        );
+    }
+
+    /// The write can commit while every read-back also fails, so no read can say
+    /// who owns the row. Retrying the write is the probe: it is idempotent for
+    /// this payload, so it replays against the committed PendingRemint and proves
+    /// the handoff durable. This sender then drives the remint, since no sweep
+    /// selects that status until a restart. A terminal status would be accepted
+    /// here by the writer, whose source set includes `pending_remint`, and would
+    /// strand the row instead.
+    #[tokio::test]
+    async fn permanent_failure_adopts_committed_handoff_when_reads_fail() {
+        let txn_id = 13;
+        let nonce = 8;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        // The three write attempts fail; the retry after them, which finds the DB
+        // reachable again, replays the identical payload and succeeds.
+        mock.set_fail_times("set_pending_remint", 3);
+        mock.set_should_fail("get_transaction_status", true);
+
+        let broadcast = Signature::new_unique();
+        // The handoff committed; only the acknowledgement and the reads were lost,
+        // so the row already carries the payload the retry replays.
+        let mut committed = processing_withdrawal_row(txn_id, nonce);
+        committed.status = TransactionStatus::PendingRemint;
+        committed.remint_signatures = Some(vec![broadcast.to_string()]);
+        mock.pending_transactions.lock().unwrap().push(committed);
+
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not queue a terminal status the writer would apply to a committed PendingRemint"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "a committed PendingRemint has no other driver until a restart, so it must be queued here"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            4,
+            "the three backoff attempts must be followed by the retry that resolves ownership"
+        );
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            rows[0].status,
+            TransactionStatus::PendingRemint,
+            "the committed handoff must survive"
+        );
+    }
+
+    /// The retry can also miss because another writer moved the row: a recovery
+    /// demote leaves it Pending. Adopting it would drive a remint the processor is
+    /// about to re-release against, and the recovery GC drops the remint
+    /// write-ahead rows for any row that is not PendingRemint, so a deferred
+    /// attempt would re-mint. The guard miss must leave the row alone.
+    #[tokio::test]
+    async fn permanent_failure_does_not_adopt_row_moved_by_another_writer() {
+        let txn_id = 14;
+        let nonce = 9;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_fail_times("set_pending_remint", 3);
+        mock.set_should_fail("get_transaction_status", true);
+        // Recovery demoted the row while the handoff was being retried, so the
+        // PendingRemint write never committed and the retry finds no row to take.
+        let mut demoted = processing_withdrawal_row(txn_id, nonce);
+        demoted.status = TransactionStatus::Pending;
+        mock.pending_transactions.lock().unwrap().push(demoted);
+
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "must not drive a remint for a row another writer owns"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status over another writer's row"
+        );
+        // A guard miss and an unreachable database are indistinguishable here, so
+        // both hold the remint info and signature stash. A stale nonce entry is
+        // only ever read by a later attempt on that nonce; dropping it would lose
+        // the one case that matters, a row that never left Processing.
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be held when the retry cannot prove the row moved on"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            rows[0].status,
+            TransactionStatus::Pending,
+            "the other writer's status must survive"
+        );
+    }
+
+    /// When neither the write nor the read-back establishes the row's state, the
+    /// remint info and signature stash stay in memory and the row keeps its
+    /// status. Terminalizing it here would hand a still-Processing withdrawal to
+    /// ManualReview, which no sweep selects, after the only live copy of them was
+    /// discarded.
+    #[tokio::test]
+    async fn permanent_failure_holds_remint_info_and_stash_when_state_undeterminable() {
+        let txn_id = 12;
+        let nonce = 7;
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("set_pending_remint", true);
+        mock.set_should_fail("get_transaction_status", true);
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(processing_withdrawal_row(txn_id, nonce));
+
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+                blockhash_slot: None,
+            }],
+        );
+
+        let ctx = TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
+        };
+
+        handle_permanent_failure(&mut state, &ctx, &storage_tx, "release_funds failed").await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status over a row whose state is unknown"
+        );
+        assert!(
+            state.pending_remints.is_empty(),
+            "must not queue a remint when the row state is unknown"
+        );
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be held for recovery or a later attempt"
+        );
+        assert!(
+            state.pending_signatures.contains_key(&nonce),
+            "release signatures must be held for recovery or a later attempt"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            4,
+            "the handoff must be retried once more before the caches are restored"
+        );
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            rows[0].status,
+            TransactionStatus::Processing,
+            "the row must stay Processing so the recovery sweep owns it"
         );
     }
 
@@ -2354,6 +4594,7 @@ mod tests {
             transaction_id: Some(42),
             withdrawal_nonce: None,
             trace_id: Some("trace-1".to_string()),
+            deposit_claim_lease: None,
         };
 
         send_fatal_error(&tx, &ctx, "test error").await;
@@ -2374,6 +4615,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         send_fatal_error(&tx, &ctx, "test error").await;
@@ -2392,6 +4634,7 @@ mod tests {
             transaction_id: Some(7),
             withdrawal_nonce: None,
             trace_id: Some("trace-mint".to_string()),
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -2406,16 +4649,28 @@ mod tests {
         );
     }
 
-    /// A confirmed ResetSmtRoot transaction (no transaction_id, no nonce) must advance the
-    /// tree index and send no status update to the storage channel.
+    /// A confirmed ResetSmtRoot transaction (no transaction_id, no nonce) must move the
+    /// local tree index to the target it just proved on-chain, disarm the rotation, and
+    /// send no status update to the storage channel.
     #[tokio::test]
-    async fn handle_success_reset_smt_root_increments_tree_index() {
+    async fn handle_success_reset_smt_root_advances_to_target() {
+        let target_tree_index = 1u64;
         let mut state = make_sender_state();
         // Set up SMT state
         state.smt_state = Some(super::super::types::SenderSMTState {
             smt_state: crate::operator::utils::smt_util::SmtState::new(0),
             nonce_to_builder: HashMap::new(),
         });
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index,
+        }));
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
 
         let (tx, mut rx) = mpsc::channel(10);
         // No transaction_id, no withdrawal_nonce = ResetSmtRoot context
@@ -2423,6 +4678,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -2432,8 +4688,23 @@ mod tests {
         drop(tx);
         assert!(rx.recv().await.is_none());
 
-        // Tree index should be incremented
-        assert_eq!(state.smt_state.as_ref().unwrap().smt_state.tree_index(), 1);
+        assert_eq!(
+            state.smt_state.as_ref().unwrap().smt_state.tree_index(),
+            target_tree_index
+        );
+        assert!(
+            state.pending_rotation.is_none(),
+            "a confirmed reset proves the tree advanced, so the rotation is disarmed"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "the durable target must retire on a confirmed reset"
+        );
     }
 
     /// After a successful withdrawal, the per-nonce retry counter must be removed so that
@@ -2453,6 +4724,7 @@ mod tests {
             transaction_id: Some(99),
             withdrawal_nonce: Some(5),
             trace_id: Some("trace-wd".to_string()),
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -2480,6 +4752,7 @@ mod tests {
             transaction_id: Some(10),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2517,6 +4790,7 @@ mod tests {
             transaction_id: Some(11),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2537,58 +4811,39 @@ mod tests {
         assert_eq!(update.status, TransactionStatus::Failed);
     }
 
-    /// A reset rejected with UnexpectedTreeIndex means a reset already landed on-chain.
-    /// The sender must re-fetch the authoritative tree index, sync local SMT to it, and
-    /// write nothing to the storage channel (a reset has no DB row).
+    /// A reset rejected with UnexpectedTreeIndex means the chain is not where the attempt
+    /// expected. When the chain has reached the target, a reset already landed: the sender
+    /// must sync local SMT to the on-chain index, disarm the rotation, and write nothing
+    /// to the storage channel (a reset has no DB row).
     #[tokio::test]
     async fn confirmation_result_unexpected_tree_index_resyncs_local_smt() {
         let local_index = 4u64;
-        let onchain_index = 5u64;
-
-        let instance = Instance {
-            discriminator: 0,
-            bump: 0,
-            version: 0,
-            instance_seed: Pubkey::new_unique(),
-            admin: Pubkey::new_unique(),
-            withdrawal_transactions_root: [0u8; 32],
-            current_tree_index: onchain_index,
-        };
-        let mut instance_bytes = Vec::new();
-        instance.serialize(&mut instance_bytes).unwrap();
-
-        let account_response = serde_json::json!({
-            "context": {"slot": 1},
-            "value": {
-                "owner": Pubkey::new_unique().to_string(),
-                "lamports": 1_000_000u64,
-                "data": [STANDARD.encode(&instance_bytes), "base64"],
-                "executable": false,
-                "rentEpoch": 0
-            }
-        });
-        let mut mocks = HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        let target_tree_index = 5u64;
 
         let mut state = make_sender_state();
         state.instance_pda = Some(Pubkey::new_unique());
-        state.rpc_client = Arc::new(RpcClientWithRetry {
-            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
-                "http://127.0.0.1:8899".to_string(),
-                mocks,
-            )),
-            retry_config: RetryConfig::default(),
-        });
+        state.rpc_client = mock_rpc_client(&instance_bytes(target_tree_index));
         state.smt_state = Some(SenderSMTState {
             smt_state: SmtState::new(local_index),
             nonce_to_builder: HashMap::new(),
         });
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index,
+        }));
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2608,7 +4863,20 @@ mod tests {
 
         assert_eq!(
             state.smt_state.as_ref().unwrap().smt_state.tree_index(),
-            onchain_index
+            target_tree_index
+        );
+        assert!(
+            state.pending_rotation.is_none(),
+            "chain reached the target, so the rotation is no longer owed"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "the durable target must retire once the chain proved it landed"
         );
         drop(tx);
         assert!(
@@ -2618,44 +4886,32 @@ mod tests {
     }
 
     /// If the on-chain re-fetch fails (here: an undeserializable instance account), the
-    /// sender must leave local SMT unchanged (fail-closed) rather than guessing the index.
+    /// sender must leave local SMT unchanged (fail-closed) rather than guessing the
+    /// index, and keep the rotation armed since nothing proved the tree advanced.
     #[tokio::test]
     async fn confirmation_result_unexpected_tree_index_fetch_failure_leaves_smt_unchanged() {
         let local_index = 4u64;
-
-        // Too-short account data so parse_instance fails after a successful fetch.
-        let account_response = serde_json::json!({
-            "context": {"slot": 1},
-            "value": {
-                "owner": Pubkey::new_unique().to_string(),
-                "lamports": 1_000_000u64,
-                "data": [STANDARD.encode([0u8; 4]), "base64"],
-                "executable": false,
-                "rentEpoch": 0
-            }
-        });
-        let mut mocks = HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        let target_tree_index = 5u64;
 
         let mut state = make_sender_state();
         state.instance_pda = Some(Pubkey::new_unique());
-        state.rpc_client = Arc::new(RpcClientWithRetry {
-            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
-                "http://127.0.0.1:8899".to_string(),
-                mocks,
-            )),
-            retry_config: RetryConfig::default(),
-        });
+        // Too-short account data so parse_instance fails after a successful fetch.
+        state.rpc_client = mock_rpc_client(&[0u8; 4]);
         state.smt_state = Some(SenderSMTState {
             smt_state: SmtState::new(local_index),
             nonce_to_builder: HashMap::new(),
         });
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index,
+        }));
 
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2678,8 +4934,598 @@ mod tests {
             local_index,
             "local SMT must be unchanged when re-fetch fails"
         );
+        assert!(
+            state.pending_rotation.is_some(),
+            "nothing proved the tree advanced, so the rotation stays armed"
+        );
         drop(tx);
         assert!(rx.recv().await.is_none());
+    }
+
+    /// A chain still short of the target proves nothing landed. Syncing anyway would call
+    /// reset(), which clears the tree and would drop the nonces already inserted for it,
+    /// so the sync must be skipped and the rotation stay armed.
+    #[tokio::test]
+    async fn confirmation_result_unexpected_tree_index_short_of_target_keeps_tree_and_rotation() {
+        let tree_index = 0u64;
+        let target_tree_index = 1u64;
+        let nonce = 1u64;
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rpc_client = mock_rpc_client(&instance_bytes(tree_index));
+        let mut smt = SenderSMTState {
+            smt_state: SmtState::new(tree_index),
+            nonce_to_builder: HashMap::new(),
+        };
+        smt.smt_state.insert_nonce(nonce);
+        state.smt_state = Some(smt);
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index,
+        }));
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::UnexpectedTreeIndex,
+            ))),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        let smt = state.smt_state.as_ref().unwrap();
+        assert_eq!(smt.smt_state.tree_index(), tree_index);
+        assert!(
+            smt.smt_state.contains_nonce(nonce),
+            "a sync short of the target must not clear the current tree"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "chain has not reached the target, so the rotation stays armed"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// A reset that times out in confirmation must not re-send inline: it has no
+    /// nonce, so send_and_confirm's attempt cap does not apply. The armed rotation is
+    /// left for the rotation tick, so no RPC call is made from this path.
+    #[tokio::test]
+    async fn confirmation_timeout_for_reset_does_not_resend_inline() {
+        let target_tree_index = 1u64;
+        let mut server = mockito::Server::new_async().await;
+        // A resend starts with build_and_sign, so a blockhash read proves it happened.
+        let blockhash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget {
+            builder: ResetSmtRootBuilder::new(),
+            target_tree_index,
+        }));
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+            deposit_claim_lease: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Retry),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        blockhash.assert();
+        assert!(
+            state.pending_rotation.is_some(),
+            "rotation stays armed for the tick to retry"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "a reset has no row to update");
+    }
+
+    // ── rotation gate ────────────────────────────────────────────────
+
+    /// The submit path must bind `expected_current_tree_index` from the armed target.
+    /// Deriving it from a chain read makes the program's replay guard compare chain
+    /// against chain, so it can never reject a reset that already landed.
+    ///
+    /// Chain two generations behind the target is not a state production reaches; it is
+    /// the only configuration where `target - 1` and the chain read differ, which is
+    /// what makes the bound value's provenance observable.
+    #[tokio::test]
+    async fn reset_binds_expected_index_from_target_not_chain() {
+        ensure_test_signer();
+        let target_tree_index = 5u64;
+        let onchain_index = 3u64;
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rpc_client = mock_rpc_client(&instance_bytes(onchain_index));
+        // Pre-set so the arm skips the lazy init that used to source the bound index.
+        state.smt_state = Some(SenderSMTState {
+            smt_state: SmtState::new(onchain_index),
+            nonce_to_builder: HashMap::new(),
+        });
+
+        let pk = Pubkey::new_unique();
+        let mut builder = ResetSmtRootBuilder::new();
+        builder
+            .payer(pk)
+            .operator(pk)
+            .instance(pk)
+            .operator_pda(pk)
+            .event_authority(pk);
+        let instruction = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget {
+                    builder,
+                    target_tree_index,
+                },
+            )))
+            .await
+            .expect("chain is behind the target, so the rotation is owed");
+
+        // Wire layout: one discriminator byte, then expected_current_tree_index as u64 LE.
+        let data = &instruction.instructions[0].data;
+        assert_eq!(
+            u64::from_le_bytes(data[1..9].try_into().unwrap()),
+            target_tree_index - 1,
+            "expected index must come from the target, not the {onchain_index} just read"
+        );
+    }
+
+    /// The finding's hole: with no local SMT there was no index to compare against, so
+    /// the submit went ahead and bound the index from the read its lazy init had just
+    /// done, and the program accepted a rotation that had already landed.
+    ///
+    /// Also pins gate-before-init: this instance's root matches no rebuilt tree, so an
+    /// init running first would surface `SmtRootMismatch` instead and leave the rotation
+    /// armed to be retried forever against a chain that already reached the target.
+    #[tokio::test]
+    async fn reset_gate_disarms_when_chain_reached_target() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rpc_client = mock_rpc_client(&instance_bytes(target_tree_index));
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
+        assert!(
+            state.smt_state.is_none(),
+            "the gate must not need a local SMT"
+        );
+
+        let Err(err) = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget {
+                    builder: ResetSmtRootBuilder::new(),
+                    target_tree_index,
+                },
+            )))
+            .await
+        else {
+            panic!("a rotation the chain already completed must not be submitted")
+        };
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(ProgramError::RotationNotOwed {
+                    target_tree_index: target,
+                    onchain_tree_index: onchain,
+                }) if target == target_tree_index && onchain == target_tree_index
+            ),
+            "expected RotationNotOwed, got {err:?}"
+        );
+        assert!(
+            state.pending_rotation.is_none(),
+            "a rotation the chain completed is no longer owed"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "the durable target must retire too, or the next boot re-arms a landed rotation"
+        );
+    }
+
+    /// A failed chain read proves nothing either way. Submitting blind is what let a
+    /// landed reset rotate a second time, so nothing is submitted and the rotation stays
+    /// armed for the next tick.
+    #[tokio::test]
+    async fn reset_gate_stays_armed_when_chain_read_fails() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        // Too-short account data, so parse_instance fails after a successful fetch.
+        state.rpc_client = mock_rpc_client(&[0u8; 4]);
+
+        let Err(err) = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget {
+                    builder: ResetSmtRootBuilder::new(),
+                    target_tree_index,
+                },
+            )))
+            .await
+        else {
+            panic!("an unreadable tree index must not be submitted through")
+        };
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(ProgramError::RotationGateUnavailable {
+                    target_tree_index: target,
+                }) if target == target_tree_index
+            ),
+            "expected RotationGateUnavailable, got {err:?}"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "nothing proved the rotation landed, so it stays armed"
+        );
+    }
+
+    /// A server whose every `getAccountInfo` returns an instance at `tree_index` carrying
+    /// the root of an empty tree there, so a `validate_smt_root` against an empty database
+    /// agrees with it.
+    ///
+    /// Needed wherever a test drives both the rotation gate's chain read and the SMT init
+    /// above it: the mocked `RpcClient` consumes one canned response per request, while a
+    /// mockito mock answers every call.
+    async fn server_serving_empty_instance(tree_index: u64) -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getAccountInfo"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [
+                                STANDARD.encode(instance_bytes_with_root(
+                                    tree_index,
+                                    SmtState::new(tree_index).current_root(),
+                                )),
+                                "base64"
+                            ],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+        server
+    }
+
+    /// A withdrawal row on the closing tree, at `nonce`, in a status that still owes a
+    /// release.
+    fn unreleased_withdrawal_row(nonce: i64, status: TransactionStatus) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id: nonce,
+            signature: Signature::new_unique().to_string(),
+            trace_id: format!("trace-{nonce}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(5_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce),
+            status,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
+    /// The durable half of the in-flight guard. A release can only land while the chain
+    /// holds its tree, so a rotation must not close a tree a lower nonce still owes a
+    /// release on. The processor checks this at dispatch but excludes Processing rows,
+    /// relying on the sender's in-flight map for those; that map is gone after a restart
+    /// while the owed target survives, so the check has to hold here too.
+    #[tokio::test]
+    async fn reset_gate_withholds_while_lower_nonce_unreleased() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+        let blocking_nonce = MAX_TREE_LEAVES as i64 - 1;
+
+        // Chain a generation behind the target, so the rotation is genuinely owed.
+        let server = server_serving_empty_instance(target_tree_index - 1).await;
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
+
+        // Processing, the status a restart leaves behind and the one the processor's
+        // dispatch-time query deliberately ignores.
+        let Storage::Mock(mock) = state.storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(unreleased_withdrawal_row(
+                blocking_nonce,
+                TransactionStatus::Processing,
+            ));
+
+        let Err(err) = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget {
+                    builder: ResetSmtRootBuilder::new(),
+                    target_tree_index,
+                },
+            )))
+            .await
+        else {
+            panic!("a rotation that would strand a lower nonce must not be submitted")
+        };
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(ProgramError::RotationBlockedByLowerNonce {
+                    target_tree_index: target,
+                    blocking_nonce: blocking,
+                }) if target == target_tree_index && blocking == blocking_nonce as u64
+            ),
+            "expected RotationBlockedByLowerNonce, got {err:?}"
+        );
+        assert!(
+            state.pending_rotation.is_some(),
+            "the rotation is still owed, just withheld"
+        );
+        assert_eq!(
+            state.storage.get_owed_rotation_target(pt).await.unwrap(),
+            Some(target_tree_index),
+            "withholding must not retire the durable target"
+        );
+    }
+
+    /// The mirror case: a lower nonce that already released is no reason to withhold, or
+    /// the tree could never rotate at all.
+    #[tokio::test]
+    async fn reset_gate_submits_when_lower_nonces_are_terminal() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        let server = server_serving_empty_instance(target_tree_index - 1).await;
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+
+        let Storage::Mock(mock) = state.storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        // Written off and reminted, not Completed: a completed nonce would join the rebuilt
+        // tree and no longer match the empty root this instance serves. That `completed`
+        // counts as settled is pinned against Postgres instead.
+        mock.pending_transactions.lock().unwrap().extend([
+            unreleased_withdrawal_row(MAX_TREE_LEAVES as i64 - 2, TransactionStatus::Failed),
+            unreleased_withdrawal_row(
+                MAX_TREE_LEAVES as i64 - 1,
+                TransactionStatus::FailedReminted,
+            ),
+        ]);
+
+        // Fully wired, unlike the tests that return before the build: this one gets all the
+        // way to the instruction.
+        let instance_pda = state.instance_pda.unwrap();
+        let result = state
+            .handle_transaction_builder(TransactionBuilder::ResetSmtRoot(Box::new(
+                ResetSmtRootBuilderWithTarget::new(
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    instance_pda,
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    target_tree_index,
+                ),
+            )))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "released and reminted nonces must not withhold the rotation, got {:?}",
+            result.err()
+        );
+    }
+
+    // ── rotation arming ──────────────────────────────────────────────
+
+    /// A rotation must survive the whole submission path when it cannot be sent, error
+    /// routing included: a reset has no DB row, so nothing escalates on its behalf and
+    /// the armed slot is the only thing that keeps it owed.
+    #[tokio::test]
+    async fn reset_stays_armed_through_submission_failure() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        // make_sender_state leaves instance_pda None, so the gate's tree-index read fails
+        // and the rotation is never submitted.
+        let mut state = make_sender_state();
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        handle_transaction_submission(
+            &mut state,
+            TransactionBuilder::ResetSmtRoot(Box::new(ResetSmtRootBuilderWithTarget {
+                builder: ResetSmtRootBuilder::new(),
+                target_tree_index,
+            })),
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            state.pending_rotation.is_some(),
+            "rotation must survive a failed submission so the tick can retry it"
+        );
+        assert_eq!(
+            state.storage.get_owed_rotation_target(pt).await.unwrap(),
+            Some(target_tree_index),
+            "the durable target must survive too, so a crash here still re-arms"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a reset has no row, so no status update"
+        );
+    }
+
+    /// A crash leaves nothing in memory, only the durable target. Boot re-arms from it, the
+    /// tick drives it, and the reset is signed, broadcast, confirmed, then retired from both
+    /// the arm and the row.
+    ///
+    /// The pieces are covered in isolation elsewhere; this is the one that proves they
+    /// connect, since a re-arm that never reaches `sendTransaction` would leave the rotation
+    /// owed forever while every isolated assertion still passed.
+    #[tokio::test]
+    async fn owed_rotation_survives_restart_and_is_sent_by_the_tick() {
+        ensure_test_signer();
+        let target_tree_index = 1u64;
+
+        // Chain a generation behind the target, so the rotation is owed and lands.
+        let mut server = server_serving_empty_instance(target_tree_index - 1).await;
+        let _hash = mock_blockhash(&mut server);
+        // The RPC client rejects a response whose signature differs from the one it sent,
+        // and this transaction is really signed, so echo it back out of the request: a
+        // serialized legacy transaction is a 1-byte signature count then the signature.
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body_from_request(|req| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body().expect("request body present"))
+                        .expect("request body is json");
+                let encoded = body["params"][0].as_str().expect("transaction param");
+                let raw = STANDARD.decode(encoded).expect("base64 transaction");
+                let signature = bs58::encode(&raw[1..1 + 64]).into_string();
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": signature})
+                    .to_string()
+                    .into_bytes()
+            })
+            .expect(1)
+            .create();
+        let _status = mock_status_bodies(&mut server, |_, count| finalized_value_body(count));
+
+        // A fresh process: no armed rotation, no SMT state, only the durable target.
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let pt = state.program_type.as_label();
+        state
+            .storage
+            .set_owed_rotation_target(pt, target_tree_index)
+            .await
+            .unwrap();
+
+        state.rearm_owed_rotation().await.unwrap();
+        assert!(
+            state.pending_rotation.is_some(),
+            "boot must re-arm from the durable target"
+        );
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        drive_pending_rotation(&mut state, &storage_tx).await;
+
+        send.assert();
+        assert!(
+            state.pending_rotation.is_none(),
+            "a confirmed reset retires the arm"
+        );
+        assert!(
+            state
+                .storage
+                .get_owed_rotation_target(pt)
+                .await
+                .unwrap()
+                .is_none(),
+            "and the durable target, so the next boot does not re-arm it"
+        );
+        assert_eq!(
+            state.smt_state.as_ref().unwrap().smt_state.tree_index(),
+            target_tree_index,
+            "local SMT moves to the generation the reset proved"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a reset has no row, so no status update"
+        );
     }
 
     /// A `Retry` result with `RetryPolicy::None` (non-idempotent operation) cannot be safely
@@ -2692,6 +5538,7 @@ mod tests {
             transaction_id: Some(12),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2727,6 +5574,7 @@ mod tests {
             transaction_id: Some(13),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         let rpc_err = Box::new(
@@ -2775,6 +5623,7 @@ mod tests {
             transaction_id: Some(14),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2807,6 +5656,7 @@ mod tests {
             transaction_id: None,
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -2841,6 +5691,7 @@ mod tests {
             transaction_id: Some(20),
             withdrawal_nonce: Some(5),
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         send_and_confirm(
@@ -2878,6 +5729,7 @@ mod tests {
             transaction_id: Some(30),
             withdrawal_nonce: Some(2),
             trace_id: Some("trace-confirmed".to_string()),
+            deposit_claim_lease: None,
         };
         let sig = Signature::new_unique();
 
@@ -2913,6 +5765,7 @@ mod tests {
             transaction_id: Some(15),
             withdrawal_nonce: None, // No nonce → rebuild_with_regenerated_proof returns None
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         handle_confirmation_result(
@@ -3004,6 +5857,7 @@ mod tests {
                     },
                     CommitmentConfig::confirmed(),
                 )),
+                fallback_rpc_client: None,
                 storage: storage.clone(),
                 instance_pda: None,
                 smt_state: None,
@@ -3018,6 +5872,7 @@ mod tests {
                 program_type: ProgramType::Escrow,
                 remint_cache: HashMap::new(),
                 pending_signatures: HashMap::new(),
+                release_leases: HashMap::new(),
                 pending_remints: Vec::new(),
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -3029,6 +5884,7 @@ mod tests {
             transaction_id: Some(42),
             withdrawal_nonce: None,
             trace_id: Some("trace-fire".to_string()),
+            deposit_claim_lease: None,
         };
 
         fire_and_store(
@@ -3128,6 +5984,7 @@ mod tests {
                     },
                     CommitmentConfig::confirmed(),
                 )),
+                fallback_rpc_client: None,
                 storage: storage.clone(),
                 instance_pda: None,
                 smt_state: None,
@@ -3142,6 +5999,7 @@ mod tests {
                 program_type: ProgramType::Escrow,
                 remint_cache: HashMap::new(),
                 pending_signatures: HashMap::new(),
+                release_leases: HashMap::new(),
                 pending_remints: Vec::new(),
                 in_flight: InFlightQueue::new(),
                 semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -3153,6 +6011,7 @@ mod tests {
             transaction_id: Some(55),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         fire_and_store(
@@ -3193,6 +6052,7 @@ mod tests {
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: Some(format!("trace-{txn_id}")),
+                deposit_claim_lease: None,
             },
             instruction: dummy_instruction(),
             compute_unit_price: None,
@@ -3212,7 +6072,7 @@ mod tests {
     /// A confirmed signature in the batch must route to handle_success, emitting
     /// a Completed status and removing the entry from in_flight.
     #[tokio::test]
-    async fn poll_in_flight_confirmed_tx_emits_completed() {
+    async fn poll_in_flight_finalized_tx_emits_completed() {
         let mut server = mockito::Server::new_async().await;
 
         let sig = Signature::new_unique();
@@ -3230,8 +6090,8 @@ mod tests {
                     "result": {
                         "context": {"slot": 100},
                         "value": [{
-                            "confirmationStatus": "confirmed",
-                            "confirmations": 1,
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
                             "err": null,
                             "slot": 100,
                             "status": {"Ok": null}
@@ -3262,6 +6122,7 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3276,6 +6137,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -3348,6 +6210,7 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3362,6 +6225,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -3430,6 +6294,7 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3444,6 +6309,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -3521,6 +6387,7 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3535,6 +6402,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -3604,8 +6472,8 @@ mod tests {
                         "value": [
                             // sig1 confirmed
                             {
-                                "confirmationStatus": "confirmed",
-                                "confirmations": 1,
+                                "confirmationStatus": "finalized",
+                                "confirmations": null,
                                 "err": null,
                                 "slot": 200,
                                 "status": {"Ok": null}
@@ -3639,6 +6507,7 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3653,6 +6522,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: {
                 let q = InFlightQueue::new();
@@ -3685,28 +6555,14 @@ mod tests {
     // ── poll_in_flight: chunking ──────────────────────────────────────
 
     /// When in_flight exceeds 256 entries (the getSignatureStatuses limit), poll_in_flight
-    /// must issue multiple RPC calls — one per 256-sig chunk — and merge the results.
+    /// must issue multiple RPC calls, one per 256-sig chunk, and merge the results.
     ///
-    /// Strategy: mock returns all-null statuses (not yet confirmed) so every entry stays
-    /// in `remaining` after the call.  We seed 300 entries and assert the mock was hit
-    /// at least twice (≥ 2 chunks: 256 + 44), and that all 300 entries are still in-flight.
+    /// Each chunk response is sized to exactly the number of signatures requested
+    /// (256 then 44) so strict length validation passes and the legitimate multi-chunk
+    /// merge is exercised. We seed 300 all-null entries and assert the mock was hit at
+    /// least twice and that all 300 entries stay in-flight (none confirmed, none dropped).
     #[tokio::test]
     async fn poll_in_flight_chunks_large_batch() {
-        // Build a response body with 256 null slots — enough for the largest chunk.
-        // The zip in poll_in_flight stops at the shorter of (batch, statuses), so
-        // returning 256 nulls for both the 256-sig chunk and the 44-sig chunk is fine:
-        // extra slots are ignored, missing slots cause zip to stop early (entries stay).
-        let null_statuses: Vec<serde_json::Value> = vec![serde_json::Value::Null; 256];
-        let response_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "context": {"slot": 1},
-                "value": null_statuses
-            }
-        })
-        .to_string();
-
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/")
@@ -3714,8 +6570,14 @@ mod tests {
                 "method": "getSignatureStatuses"
             })))
             .with_status(200)
-            .with_body(response_body)
-            .expect_at_least(2) // 256 sigs → chunk 1; 44 sigs → chunk 2
+            .with_body_from_request(|req| {
+                let v: serde_json::Value =
+                    serde_json::from_slice(req.body().expect("request body present"))
+                        .expect("request body is json");
+                let requested = v["params"][0].as_array().map(|a| a.len()).unwrap_or(0);
+                null_value_body(requested).into_bytes()
+            })
+            .expect_at_least(2) // 256 sigs -> chunk 1; 44 sigs -> chunk 2
             .create();
 
         let total = 300usize;
@@ -3729,13 +6591,513 @@ mod tests {
         let (storage_tx, _rx) = mpsc::channel(10);
         poll_in_flight(&mut state, &storage_tx).await;
 
-        // All entries stay in-flight (all statuses were null → not confirmed).
+        // All entries stay in-flight (all statuses were null, so not confirmed).
         assert_eq!(
             state.in_flight.len(),
             total,
             "all entries must stay in-flight"
         );
-        _m.assert(); // verifies ≥ 2 RPC calls were made
+        _m.assert(); // verifies >= 2 RPC calls were made
+    }
+
+    // ── fetch_statuses_checked: length-gate + wiring ─────────────────────
+
+    // Build an RpcClientWithRetry that points at a mockito server and fails fast.
+    fn make_rpc_client(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    // A getSignatureStatuses response body with `count` null status slots.
+    fn null_value_body(count: usize) -> String {
+        let value = vec![serde_json::Value::Null; count];
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"context": {"slot": 1}, "value": value}
+        })
+        .to_string()
+    }
+
+    // A getSignatureStatuses response body with `count` finalized-success slots.
+    fn finalized_value_body(count: usize) -> String {
+        let one = serde_json::json!({
+            "confirmationStatus": "finalized",
+            "confirmations": null,
+            "err": null,
+            "slot": 100,
+            "status": {"Ok": null}
+        });
+        let value = vec![one; count];
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"context": {"slot": 100}, "value": value}
+        })
+        .to_string()
+    }
+
+    // Mock getSignatureStatuses; the per-call counter lets a test shape one chunk while sizing the rest to their request.
+    fn mock_status_bodies<F>(server: &mut mockito::ServerGuard, f: F) -> mockito::Mock
+    where
+        F: Fn(usize, usize) -> String + Send + Sync + 'static,
+    {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let idx = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = req.body().expect("request body present");
+                let v: serde_json::Value =
+                    serde_json::from_slice(body).expect("request body is json");
+                let requested = v["params"][0].as_array().map(|a| a.len()).unwrap_or(0);
+                f(idx, requested).into_bytes()
+            })
+            .expect_at_least(1)
+            .create()
+    }
+
+    // ── fetch_statuses_checked: response shape matrix ────────────────────
+
+    // An exactly-sized single chunk returns Ok with the requested length.
+    #[tokio::test]
+    async fn fetch_statuses_e1_exact_single_chunk_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
+
+        let out = fetch_statuses_checked(&rpc, &sigs).await;
+        let statuses = out.expect("exact chunk must be Ok");
+        assert_eq!(statuses.len(), 10);
+    }
+
+    // A short single chunk (N-1 for N) is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e2_short_single_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req - 1));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // An oversized single chunk (N+1 for N) is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e3_oversized_single_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req + 1));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // An empty value array for a non-empty request is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e4_empty_value_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, _req| null_value_body(0));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..5).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // A multi-chunk request with every chunk exact returns Ok in order; only the first chunk is confirmed.
+    #[tokio::test]
+    async fn fetch_statuses_e5_multi_chunk_all_exact_ok_ordered() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                finalized_value_body(req)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        // 600 sigs -> chunks of 256 + 256 + 88.
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        let statuses = fetch_statuses_checked(&rpc, &sigs)
+            .await
+            .expect("all-exact multi-chunk must be Ok");
+        assert_eq!(statuses.len(), 600);
+        // First chunk finalized, remaining chunks null: proves concatenation order.
+        assert!(statuses[0].is_some());
+        assert!(statuses[255].is_some());
+        assert!(statuses[256].is_none());
+        assert!(statuses[599].is_none());
+    }
+
+    // A short first chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e6_short_first_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                null_value_body(req - 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // A short middle chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e7_short_middle_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 1 {
+                null_value_body(req - 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // A short final chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e8_short_final_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 2 {
+                null_value_body(req - 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // An oversized middle chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_e9_oversized_middle_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 1 {
+                null_value_body(req + 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // An RPC transport error on a chunk is surfaced as Err (existing behavior).
+    #[tokio::test]
+    async fn fetch_statuses_e10_rpc_error_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..3).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    // An empty signature slice returns Ok(empty) and issues no RPC call.
+    #[tokio::test]
+    async fn fetch_statuses_e11_empty_slice_ok_no_call() {
+        let mut server = mockito::Server::new_async().await;
+        // Any call would be a bug: assert the mock is never hit.
+        let m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(null_value_body(0))
+            .expect(0)
+            .create();
+        let rpc = make_rpc_client(&server.url());
+
+        let statuses = fetch_statuses_checked(&rpc, &[])
+            .await
+            .expect("empty is Ok");
+        assert!(statuses.is_empty());
+        m.assert();
+    }
+
+    // ── poll_in_flight: wiring and anti-misattribution ───────────────────
+
+    // A short only-chunk reinserts the full batch and settles nothing.
+    #[tokio::test]
+    async fn poll_in_flight_short_chunk_full_reinsert_no_settlement() {
+        let mut server = mockito::Server::new_async().await;
+        // Return one fewer status than requested for the single chunk.
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req - 1));
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let ids: Vec<i64> = (1..=5).collect();
+        for id in &ids {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(state.in_flight.len(), 5, "all entries reinserted");
+        {
+            let guard = state.in_flight.entries.lock().unwrap();
+            let mut present: Vec<i64> = guard.iter().filter_map(|t| t.ctx.transaction_id).collect();
+            present.sort_unstable();
+            assert_eq!(present, ids, "no entry dropped");
+            assert!(
+                guard.iter().all(|t| t.poll_attempts == 0),
+                "poll_attempts not incremented on a malformed cycle"
+            );
+        }
+        assert!(storage_rx.try_recv().is_err(), "no Completed emitted");
+    }
+
+    // Reported repro: 257 entries across a chunk boundary, chunk 1 confirmed and chunk 2 short, must settle nothing and drop nothing.
+    #[tokio::test]
+    async fn poll_in_flight_cross_chunk_short_no_misattribution() {
+        let mut server = mockito::Server::new_async().await;
+        // Chunk 0 (256 sigs) all finalized; chunk 1 (1 sig) returns an empty value.
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                finalized_value_body(req)
+            } else {
+                null_value_body(0)
+            }
+        });
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let ids: Vec<i64> = (1..=257).collect();
+        for id in &ids {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(300);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(state.in_flight.len(), 257, "all 257 entries reinserted");
+        {
+            let guard = state.in_flight.entries.lock().unwrap();
+            let mut present: Vec<i64> = guard.iter().filter_map(|t| t.ctx.transaction_id).collect();
+            present.sort_unstable();
+            assert_eq!(present, ids, "tail entry (id 257) not dropped");
+        }
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no Completed for any transaction on a malformed cross-chunk cycle"
+        );
+    }
+
+    // An oversized middle chunk is caught by the same gate as the short-chunk cases.
+    #[tokio::test]
+    async fn poll_in_flight_oversized_chunk_full_reinsert_no_settlement() {
+        let mut server = mockito::Server::new_async().await;
+        // Chunk 0 (256) finalized; chunk 1 (1 sig) returns two statuses (oversized).
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                finalized_value_body(req)
+            } else {
+                null_value_body(req + 1)
+            }
+        });
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let ids: Vec<i64> = (1..=257).collect();
+        for id in &ids {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(300);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(state.in_flight.len(), 257, "all entries reinserted");
+        assert!(storage_rx.try_recv().is_err(), "no Completed emitted");
+    }
+
+    // Happy-path multi-chunk: every chunk returns correctly-sized finalized statuses, so all entries settle with one Completed each.
+    #[tokio::test]
+    async fn poll_in_flight_multi_chunk_confirmed_settles_with_correct_pairing() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| finalized_value_body(req));
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let total = 300usize;
+        // Map each transaction_id to the signature we seeded it with.
+        let mut sig_by_id: std::collections::HashMap<i64, String> = HashMap::new();
+        for i in 0..total {
+            let sig = Signature::new_unique();
+            let id = i as i64 + 1;
+            sig_by_id.insert(id, sig.to_string());
+            state.in_flight.push(make_in_flight_tx(sig, id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(total + 10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert!(state.in_flight.is_empty(), "all confirmed entries settled");
+        let mut seen = 0usize;
+        while let Ok(update) = storage_rx.try_recv() {
+            assert_eq!(update.status, TransactionStatus::Completed);
+            // Each Completed must carry the requesting transaction's own signature.
+            assert_eq!(
+                update.counterpart_signature.as_deref(),
+                sig_by_id.get(&update.transaction_id).map(|s| s.as_str()),
+                "Completed must pair each transaction with its own signature"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, total, "exactly one Completed per transaction");
+    }
+
+    // ── run_poll_task: parity with poll_in_flight ────────────────────────
+
+    // A short chunk on the production poll task reinserts the batch and settles nothing (no PollTaskResult, no Completed).
+    #[tokio::test]
+    async fn run_poll_task_short_chunk_reinserts_no_settlement() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req - 1));
+
+        let in_flight = InFlightQueue::new();
+        let (result_tx, mut result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let rpc = Arc::new(make_rpc_client(&server.url()));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let ids: Vec<i64> = (1..=5).collect();
+        for id in &ids {
+            in_flight.push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            5,
+            token.clone(),
+        ));
+
+        // Give the task time to drain, poll, hit the short response, and reinsert.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit after cancellation")
+            .expect("task must not panic");
+
+        assert!(
+            result_rx.try_recv().is_err(),
+            "no PollTaskResult on malformed cycle"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no Completed on malformed cycle"
+        );
+        assert_eq!(in_flight.len(), 5, "batch reinserted after short chunk");
+        let mut present: Vec<i64> = {
+            let guard = in_flight.entries.lock().unwrap();
+            guard.iter().filter_map(|t| t.ctx.transaction_id).collect()
+        };
+        present.sort_unstable();
+        assert_eq!(present, ids, "no entry dropped");
+        // Prove the task actually polled, so the negative assertions above are not vacuous.
+        _m.assert();
+    }
+
+    // Happy-path finalized multi-chunk on the production task settles every entry and emits a Completed for each.
+    #[tokio::test]
+    async fn run_poll_task_multi_chunk_confirmed_settles() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| finalized_value_body(req));
+
+        let in_flight = InFlightQueue::new();
+        let (result_tx, _result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(400);
+        let rpc = Arc::new(make_rpc_client(&server.url()));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let total = 300usize;
+        let mut sig_by_id: std::collections::HashMap<i64, String> = HashMap::new();
+        for i in 0..total {
+            let sig = Signature::new_unique();
+            let id = i as i64 + 1;
+            sig_by_id.insert(id, sig.to_string());
+            in_flight.push(make_in_flight_tx(sig, id));
+        }
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            5,
+            token.clone(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit after cancellation")
+            .expect("task must not panic");
+
+        assert_eq!(in_flight.len(), 0, "all confirmed entries settled");
+        let mut seen = 0usize;
+        while let Ok(update) = storage_rx.try_recv() {
+            assert_eq!(update.status, TransactionStatus::Completed);
+            assert_eq!(
+                update.counterpart_signature.as_deref(),
+                sig_by_id.get(&update.transaction_id).map(|s| s.as_str()),
+                "Completed must pair each transaction with its own signature"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, total, "exactly one Completed per transaction");
     }
 
     /// An idempotent tx that exhausts its resend_count budget must be declared a
@@ -3813,69 +7175,24 @@ mod tests {
             transaction_id: Some(txn_id),
             withdrawal_nonce: None,
             trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
         }
     }
 
-    /// A persisting (Mint) fire-and-store run writes the signed transaction's signature
-    /// via `insert_release_signature` and then broadcasts that same signature.
-    #[tokio::test]
-    async fn mint_persists_signature_before_send() {
-        let mut server = mockito::Server::new_async().await;
-        let _hash = mock_blockhash(&mut server);
-        let send = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "method": "sendTransaction"
-            })))
-            .with_status(200)
-            .with_body(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": Signature::default().to_string()
-                })
-                .to_string(),
-            )
-            .expect(1)
-            .create();
+    fn mint_ctx_with_lease(
+        txn_id: i64,
+        lease: chrono::DateTime<chrono::Utc>,
+    ) -> TransactionContext {
+        TransactionContext {
+            deposit_claim_lease: Some(lease),
+            ..mint_ctx(txn_id)
+        }
+    }
 
-        let state = make_sender_state_with_server(&server.url());
-        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
-        let (storage_tx, _rx) = mpsc::channel(10);
-
-        fire_and_store_task(
-            state.rpc_client.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            state.program_type,
-            dummy_instruction(),
-            None,
-            mint_ctx(77),
-            RetryPolicy::None,
-            ExtraErrorCheckPolicy::None,
-            storage_tx,
-            true,
-            permit,
-        )
-        .await;
-
-        send.assert();
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        let stored = mock.get_release_signatures(77).await.unwrap();
-        assert_eq!(stored.len(), 1, "exactly one mint signature persisted");
-        assert_eq!(
-            stored[0].0,
-            Signature::default().to_string(),
-            "persisted signature must be the broadcast signature"
-        );
-        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
-        assert_eq!(
-            state.in_flight.len(),
-            1,
-            "successful broadcast stashes the in-flight tx"
-        );
+    fn recoverable(lease: chrono::DateTime<chrono::Utc>) -> SendDurability {
+        SendDurability::Recoverable {
+            deposit_expected_updated_at: lease,
+        }
     }
 
     /// A failed write-ahead persist on the mint path must NOT broadcast, must stash no
@@ -3896,6 +7213,8 @@ mod tests {
         let Storage::Mock(ref mock) = *state.storage else {
             panic!("expected mock storage");
         };
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
         mock.set_should_fail("insert_release_signature", true);
         let permit = state.semaphore.clone().try_acquire_owned().unwrap();
         let before = state.semaphore.available_permits();
@@ -3912,7 +7231,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            true,
+            recoverable(t_lock),
             permit,
         )
         .await;
@@ -3933,12 +7252,155 @@ mod tests {
         );
     }
 
-    /// A send error (e.g. preflight rejection) means the broadcast never reached the
-    /// network, so even with the signature already persisted the mint is terminal Failed,
-    /// same as the withdrawal send path. (The broadcast-accepted-but-unconfirmed case is
-    /// the one route_poll_results leaves Processing; see the poll timeout test.)
+    /// A send error after the signature is persisted may still have landed on-chain, so the
+    /// mint is never terminalized in the sender: the signature is kept and no status update is
+    /// written (row left Processing for recovery to reconcile against the persisted signature).
     #[tokio::test]
-    async fn mint_send_error_after_persist_routes_to_failed() {
+    async fn mint_send_error_after_persist_left_for_recovery() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            recoverable(t_lock),
+            permit,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            !mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "signature must be preserved so recovery can reconcile it",
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row left Processing for recovery",
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a failed broadcast stashes no in-flight entry",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on send error",
+        );
+    }
+
+    /// A preflight-style RPC rejection after the signature is persisted is deferred to
+    /// recovery too: even a "deterministic" program error can be a stale-node false negative,
+    /// so the sender never marks a persisted mint Failed and keeps the signature.
+    #[tokio::test]
+    async fn mint_preflight_failure_after_persist_left_for_recovery() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        // A preflight failure surfaces as a distinct RPC response error code (-32002); the
+        // sender's branch treats every persisted send error identically, so recovery decides.
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {
+                        "code": -32002,
+                        "message": "Transaction simulation failed",
+                        "data": {
+                            "err": {"InstructionError": [0, {"Custom": 1}]},
+                            "logs": ["Program log: preflight failure"]
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            recoverable(t_lock),
+            permit,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            !mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "signature must be preserved so recovery can reconcile it",
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a preflight rejection writes no status; row left Processing for recovery",
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a failed broadcast stashes no in-flight entry",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on send error",
+        );
+    }
+
+    /// A Terminal (non-persisted) send error still fails fast: InitializeMint mints no
+    /// balance, so there is nothing to strand and the row is terminalized to Failed.
+    #[tokio::test]
+    async fn terminal_send_error_routes_to_failed() {
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         let _send = server
@@ -3969,26 +7431,19 @@ mod tests {
             state.program_type,
             dummy_instruction(),
             None,
-            mint_ctx(77),
-            RetryPolicy::None,
+            mint_ctx(909),
+            RetryPolicy::Idempotent,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            true,
+            SendDurability::Terminal,
             permit,
         )
         .await;
 
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        assert!(
-            !mock.get_release_signatures(77).await.unwrap().is_empty(),
-            "signature must be persisted before the failing broadcast",
-        );
         let update = storage_rx
             .try_recv()
-            .expect("send error must emit a terminal status");
-        assert_eq!(update.transaction_id, 77);
+            .expect("a terminal send error must emit a status update");
+        assert_eq!(update.transaction_id, 909);
         assert_eq!(update.status, TransactionStatus::Failed);
         assert!(
             state.in_flight.is_empty(),
@@ -4001,38 +7456,773 @@ mod tests {
         );
     }
 
-    /// A node RPC rejection (preflight, blockhash, etc.) is definitive - the tx was never
-    /// submitted - so a persisted mint fails fast; a transport/IO error is ambiguous and a
-    /// persisted mint instead defers to recovery. This classifier draws that line.
-    #[test]
-    fn send_rejected_by_node_distinguishes_rejection_from_transport_error() {
-        use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind};
-        use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
+    /// A build/sign failure on a Recoverable mint happens before any signature exists or is
+    /// broadcast, so it must not be terminalized: no status update is written (row left
+    /// Processing for the recovery sweep to re-mint) and the permit is released.
+    #[tokio::test]
+    async fn mint_build_sign_failure_leaves_processing() {
+        let txn_id = 77;
+        let mut server = mockito::Server::new_async().await;
+        // getLatestBlockhash fails, so build_and_sign returns Err before signing or sending.
+        let _hash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(500)
+            .with_body("blockhash rpc down")
+            .create();
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
 
-        let node_rejection = TransactionError::Rpc(Box::new(ClientError::from(
-            ErrorKind::RpcError(RpcError::RpcResponseError {
-                code: -32002,
-                message: "preflight failure".to_string(),
-                data: RpcResponseErrorData::Empty,
-            }),
-        )));
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(txn_id),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            recoverable(Utc::now()),
+            permit,
+        )
+        .await;
+
+        send.assert();
         assert!(
-            send_rejected_by_node(&node_rejection),
-            "an RPC response error is a definitive node rejection"
+            storage_rx.try_recv().is_err(),
+            "build/sign failure must emit no terminal status; row left Processing for recovery",
         );
-
-        let transport_error = TransactionError::Rpc(Box::new(ClientError::from(
-            ErrorKind::Custom("connection reset".to_string()),
-        )));
         assert!(
-            !send_rejected_by_node(&transport_error),
-            "a transport error is ambiguous, not a node rejection"
+            state.in_flight.is_empty(),
+            "nothing stashed when build/sign failed",
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(txn_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no signature persisted when build/sign failed before signing",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be released on build/sign failure",
         );
     }
 
-    /// A non-persisting run (persist = false) broadcasts without writing any signature
-    /// even though a transaction_id is present, proving the `persist` gate (not the
-    /// id-presence guard) is what excludes the on-chain-idempotent initialization path.
+    // ── JIT mint retry: write-ahead persist before broadcast ──────
+
+    static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
+
+    /// Configure an in-memory admin signer so `SignerUtil::admin_signer()` can
+    /// resolve inside the JIT pre-check. Must run before the first access to the
+    /// process-global signer Lazy, so every test touching it calls this first.
+    fn ensure_test_signer() {
+        INIT_TEST_SIGNER.call_once(|| {
+            let kp = solana_sdk::signer::keypair::Keypair::new();
+            let b58 = bs58::encode(kp.to_bytes()).into_string();
+            std::env::set_var("ADMIN_SIGNER", "memory");
+            std::env::set_var("ADMIN_PRIVATE_KEY", &b58);
+        });
+    }
+
+    /// Mock `getAccountInfo` returning a packed, initialized SPL `Mint` whose
+    /// `mint_authority` equals `authority`, owned by the SPL token program. This
+    /// makes the JIT pre-check decode an `AuthorityCheck::Match`, so
+    /// `try_jit_mint_initialization` returns `JitOutcome::Retry` without sending
+    /// an on-chain InitializeMint. Matched by method only, so a single mock
+    /// answers any mint pubkey the pre-check looks up.
+    fn mock_get_account_info_mint(
+        server: &mut mockito::ServerGuard,
+        authority: Pubkey,
+    ) -> mockito::Mock {
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        use spl_token::state::Mint;
+
+        let mint = Mint {
+            mint_authority: COption::Some(authority),
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut data = vec![0u8; Mint::LEN];
+        Mint::pack(mint, &mut data).expect("pack mint");
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getAccountInfo"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": spl_token::id().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&data), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Seed `mint_builders[txn_id]` with a builder carrying `mint` so the JIT
+    /// pre-check's `builder.get_mint()` is `Some`.
+    fn seed_mint_builder(state: &mut SenderState, txn_id: i64, mint: Pubkey) {
+        use crate::operator::utils::instruction_util::MintToBuilder;
+        let mut builder = MintToBuilder::new();
+        builder.mint(mint);
+        state.mint_builders.insert(txn_id, builder);
+    }
+
+    /// A JIT `Retry` verdict must journal the value-bearing retry signature
+    /// (write-ahead) before broadcasting it and stash a persisted in-flight tx.
+    #[tokio::test]
+    async fn jit_retry_persists_signature_before_broadcast() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        let ctx = mint_ctx_with_lease(77, t_lock);
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(77).await.unwrap();
+        assert_eq!(stored.len(), 1, "exactly one retry signature journaled");
+        assert_eq!(
+            stored[0].signature,
+            Signature::default().to_string(),
+            "journaled signature must be the broadcast signature"
+        );
+        assert_eq!(
+            stored[0].last_valid_block_height, 100,
+            "journaled lvbh must match the blockhash"
+        );
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "successful broadcast stashes the in-flight tx"
+        );
+        assert!(
+            state.in_flight.entries.lock().unwrap()[0].persisted,
+            "the stashed JIT-retry tx must be marked persisted"
+        );
+        let stashed_lease = state.in_flight.entries.lock().unwrap()[0]
+            .ctx
+            .deposit_claim_lease;
+        assert!(
+            stashed_lease.is_some_and(|lease| lease != t_lock),
+            "the stashed JIT-retry ctx must carry the advanced claim lease"
+        );
+    }
+
+    /// A failed write-ahead persist on the JIT retry must abort before
+    /// broadcast, leave the row Processing (no status update), stash nothing, and
+    /// release the permit.
+    #[tokio::test]
+    async fn jit_retry_persist_failure_aborts_before_broadcast() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+        mock.set_should_fail("claim_and_persist_signature", true);
+        let before = state.semaphore.available_permits();
+        let ctx = mint_ctx_with_lease(77, t_lock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row stays Processing for recovery"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "nothing stashed when persist failed"
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before,
+            "permit must be released on abort"
+        );
+    }
+
+    /// A JIT retry with no carried ownership lease must fail closed: no
+    /// signature, no broadcast, no status update, and the row remains for
+    /// recovery. This is defensive; normal deposit mints get the lease from the
+    /// first successful claim.
+    #[tokio::test]
+    async fn jit_refire_missing_lease_fails_closed() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let metric = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "jit_missing_claim_lease"]);
+        let before_metric = metric.get();
+        let ctx = mint_ctx(77);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "missing lease path must journal nothing"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "missing lease path must leave the row Processing"
+        );
+        assert!(state.in_flight.is_empty(), "missing lease stashes nothing");
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "missing lease increments jit_missing_claim_lease"
+        );
+    }
+
+    /// A stale JIT retry lease means recovery or a new incarnation owns the row.
+    /// The re-fire must drop without journaling or broadcasting.
+    #[tokio::test]
+    async fn jit_refire_aborts_when_ownership_lost() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Pending, t_lock);
+        let metric = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "deposit_ownership_lost"]);
+        let before_metric = metric.get();
+        let before_permits = state.semaphore.available_permits();
+        let ctx = mint_ctx_with_lease(77, t_lock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "lost JIT claim must persist no retry signature"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "lost JIT claim writes no status"
+        );
+        assert!(state.in_flight.is_empty(), "lost JIT claim stashes nothing");
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before_permits,
+            "the acquired JIT permit must be released on lost claim"
+        );
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "lost JIT claim increments deposit_ownership_lost"
+        );
+    }
+
+    /// When the in-flight cap is reached, the JIT retry must not broadcast
+    /// (nothing journaled, no status update, nothing stashed) so the row is left
+    /// Processing for recovery.
+    #[tokio::test]
+    async fn jit_retry_cap_reached_leaves_processing() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+
+        // Drain every permit and hold them so the JIT retry can't acquire one.
+        let _held: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(state.semaphore.available_permits(), 0);
+
+        let ctx = mint_ctx_with_lease(77, t_lock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "cap path must journal nothing"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "cap path must leave the row Processing (no status update)"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "cap path stashes no in-flight entry"
+        );
+    }
+
+    /// Regression: routed through the real poll path, a MintNotInitialized confirmation
+    /// at in-flight saturation must still retry. The confirmed parent releases its slot
+    /// before the JIT retry acquires one, so the retry reuses that freed slot instead of
+    /// being spuriously refused and deferred to recovery.
+    #[tokio::test]
+    async fn jit_retry_at_saturation_reuses_freed_parent_slot() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+
+        // Parent mint confirms with an on-chain error the mint policy maps to
+        // MintNotInitialized, driving the JIT verdict.
+        let sig = Signature::new_unique();
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 200},
+                        "value": [
+                            {
+                                "confirmationStatus": "finalized",
+                                "confirmations": null,
+                                "err": {"InstructionError": [0, "InvalidAccountData"]},
+                                "slot": 200,
+                                "status": {"Err": {"InstructionError": [0, "InvalidAccountData"]}}
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+
+        // Parent in-flight tx holds a permit drawn from the state semaphore and carries
+        // the mint policy so route_poll_results classifies MintNotInitialized.
+        let parent = super::super::types::InFlightTx {
+            signature: sig,
+            ctx: mint_ctx_with_lease(77, t_lock),
+            instruction: dummy_instruction(),
+            compute_unit_price: None,
+            retry_policy: RetryPolicy::None,
+            extra_error_checks_policy: mint_extra_error_checks_policy(),
+            poll_attempts: 0,
+            resend_count: 0,
+            persisted: true,
+            permit: state.semaphore.clone().try_acquire_owned().unwrap(),
+        };
+        state.in_flight.push(parent);
+
+        // Hold every other permit so the parent's slot is the only one that can free up.
+        let _held: Vec<_> = (0..MAX_IN_FLIGHT - 1)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(state.semaphore.available_permits(), 0);
+
+        let (storage_tx, _rx) = mpsc::channel(10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            !mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "JIT retry must reuse the freed parent slot and journal its signature at saturation"
+        );
+    }
+
+    // ── JIT transient verdict: bounded requeue, never terminal ────────
+
+    /// Seed a cached builder that carries no mint pubkey so the JIT helper returns
+    /// its transient verdict on the second guard, before it reads the signer or
+    /// issues any RPC. That keeps the tests below on the caller arm alone.
+    fn seed_mint_builder_without_mint(state: &mut SenderState, txn_id: i64) {
+        use crate::operator::utils::instruction_util::MintToBuilder;
+        state.mint_builders.insert(txn_id, MintToBuilder::new());
+    }
+
+    /// Set the durable requeue counter on an already-seeded mock row.
+    fn set_requeue_attempts(state: &SenderState, id: i64, attempts: i32) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let mut rows = mock.pending_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|t| t.id == id)
+            .expect("row must be seeded");
+        row.recovery_requeue_attempts = attempts;
+    }
+
+    /// Read a seeded mock row's status and durable requeue counter together.
+    fn deposit_row_state(state: &SenderState, id: i64) -> (TransactionStatus, i32) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let rows = mock.pending_transactions.lock().unwrap();
+        let row = rows
+            .iter()
+            .find(|t| t.id == id)
+            .expect("row must be seeded");
+        (row.status, row.recovery_requeue_attempts)
+    }
+
+    /// Drive the caller arm with a transient JIT verdict against a mock storage
+    /// whose RPC endpoint is unreachable, which is itself the proof that this
+    /// path issues no RPC.
+    async fn drive_transient_jit(
+        state: &mut SenderState,
+        txn_id: i64,
+    ) -> mpsc::Receiver<TransactionStatusUpdate> {
+        let (storage_tx, storage_rx) = mpsc::channel(10);
+        handle_confirmation_result(
+            state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &mint_ctx(txn_id),
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+        storage_rx
+    }
+
+    /// A transient JIT verdict on a funded deposit must re-arm the row, not end it.
+    /// The source-chain escrow is already funded at this point and no worker reads
+    /// a Failed row, so a terminal status here strands the deposit until a human
+    /// edits the database.
+    #[tokio::test]
+    async fn jit_transient_requeues_deposit_to_pending() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 88);
+        seed_mock_deposit(&state, 88, TransactionStatus::Processing, Utc::now());
+
+        let mut storage_rx = drive_transient_jit(&mut state, 88).await;
+
+        let (status, attempts) = deposit_row_state(&state, 88);
+        assert_eq!(
+            status,
+            TransactionStatus::Pending,
+            "a transient JIT verdict must re-arm the deposit for the fetcher"
+        );
+        assert_eq!(attempts, 1, "the durable requeue counter must be consumed");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the sender must write no status for a transient deposit verdict"
+        );
+        assert!(
+            !state.mint_builders.contains_key(&88),
+            "the cached builder must be released once the row leaves this task"
+        );
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(88).await.unwrap().is_empty(),
+            "a transient verdict must journal nothing"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a transient verdict must stash no in-flight entry"
+        );
+    }
+
+    /// At the requeue cap the sender stops re-arming and hands the row to the
+    /// recovery sweep, which classifies the deposit on-chain before it escalates.
+    /// `decide_action_caps_demote_at_threshold` in the recovery module pins the
+    /// other half of that handoff: a deposit row at the cap yields Quarantine.
+    #[tokio::test]
+    async fn jit_transient_at_cap_leaves_processing() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 89);
+        seed_mock_deposit(&state, 89, TransactionStatus::Processing, Utc::now());
+        set_requeue_attempts(&state, 89, MAX_RECOVERY_REQUEUE_ATTEMPTS);
+
+        let mut storage_rx = drive_transient_jit(&mut state, 89).await;
+
+        let (status, attempts) = deposit_row_state(&state, 89);
+        assert_eq!(
+            status,
+            TransactionStatus::Processing,
+            "at the cap the row stays Processing for the recovery sweep"
+        );
+        assert_eq!(
+            attempts, MAX_RECOVERY_REQUEUE_ATTEMPTS,
+            "the cap must not be exceeded"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the sender must never terminalize a deposit, even at the cap"
+        );
+        assert!(!state.mint_builders.contains_key(&89));
+    }
+
+    /// A row another writer already advanced is left alone: nothing to requeue and
+    /// nothing to report. The row is not Processing, so the recovery sweep will not
+    /// pick it up either, which is why this branch does not claim it was left for
+    /// recovery.
+    #[tokio::test]
+    async fn jit_transient_not_processing_is_noop() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 90);
+        seed_mock_deposit(&state, 90, TransactionStatus::Pending, Utc::now());
+
+        let mut storage_rx = drive_transient_jit(&mut state, 90).await;
+
+        let (status, attempts) = deposit_row_state(&state, 90);
+        assert_eq!(status, TransactionStatus::Pending, "row left untouched");
+        assert_eq!(attempts, 0, "no counter is spent on a row we do not own");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a raced row must not receive a status from this sender"
+        );
+        assert!(!state.mint_builders.contains_key(&90));
+    }
+
+    /// A failed requeue write leaves the row exactly where it was. Recovery reads
+    /// the same row and reconciles it, so nothing is lost by not retrying here.
+    #[tokio::test]
+    async fn jit_transient_requeue_write_error_leaves_processing() {
+        ensure_test_signer();
+        let mut state = make_sender_state_with_server("http://127.0.0.1:1");
+        seed_mint_builder_without_mint(&mut state, 91);
+        seed_mock_deposit(&state, 91, TransactionStatus::Processing, Utc::now());
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("try_requeue_prebroadcast", true);
+
+        let mut storage_rx = drive_transient_jit(&mut state, 91).await;
+
+        let (status, attempts) = deposit_row_state(&state, 91);
+        assert_eq!(
+            status,
+            TransactionStatus::Processing,
+            "a failed requeue write must leave the row for recovery"
+        );
+        assert_eq!(attempts, 0, "a failed write consumes no attempt");
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a failed requeue write must not be escalated into a terminal status"
+        );
+        assert!(!state.mint_builders.contains_key(&91));
+    }
+
+    /// A Terminal run broadcasts without writing any signature even though a
+    /// transaction_id is present, proving `durability` (not the id-presence guard) is what
+    /// excludes the on-chain-idempotent initialization path from write-ahead persist.
     #[tokio::test]
     async fn initialize_mint_does_not_persist() {
         let mut server = mockito::Server::new_async().await;
@@ -4057,12 +8247,13 @@ mod tests {
         let permit = state.semaphore.clone().try_acquire_owned().unwrap();
         let (storage_tx, _rx) = mpsc::channel(10);
 
-        // Carry a transaction_id so the assertion exercises the `persist` gate
-        // itself rather than the inner id-presence guard short-circuiting.
+        // Carry a transaction_id so the assertion exercises `durability` itself
+        // rather than the inner id-presence guard short-circuiting.
         let ctx = TransactionContext {
             transaction_id: Some(909),
             withdrawal_nonce: None,
             trace_id: Some("trace-init".to_string()),
+            deposit_claim_lease: None,
         };
 
         fire_and_store_task(
@@ -4076,7 +8267,7 @@ mod tests {
             RetryPolicy::Idempotent,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            false,
+            SendDurability::Terminal,
             permit,
         )
         .await;
@@ -4086,12 +8277,197 @@ mod tests {
         };
         assert!(
             mock.get_release_signatures(909).await.unwrap().is_empty(),
-            "persist = false must not write a signature even with a transaction_id"
+            "Terminal durability must not write a signature even with a transaction_id"
         );
         assert_eq!(
             state.in_flight.len(),
             1,
             "broadcast still stashes in-flight"
+        );
+    }
+
+    // ── deposit first-fire: ownership-checked claim routing ───────────
+
+    /// Seed one deposit row directly into the mock with an explicit status and
+    /// `updated_at` so the claim CAS can be exercised against it.
+    fn seed_mock_deposit(
+        state: &SenderState,
+        id: i64,
+        status: TransactionStatus,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let row = crate::storage::common::models::DbTransaction {
+            id,
+            signature: format!("src-sig-{id}"),
+            trace_id: format!("trace-{id}"),
+            slot: 100,
+            initiator: "initiator".to_string(),
+            recipient: "recipient".to_string(),
+            mint: "mint_addr".to_string(),
+            amount: crate::storage::common::amount::TokenAmount(1_000),
+            memo: None,
+            transaction_type: crate::storage::common::models::TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status,
+            created_at: updated_at,
+            updated_at,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        };
+        mock.pending_transactions.lock().unwrap().push(row);
+    }
+
+    /// A deposit first-fire whose row was demoted (claim `Ok(false)`) must NOT
+    /// broadcast, must persist no signature, must write no status, must release
+    /// its permit, and must meter `deposit_ownership_lost`. This is the bug
+    /// closed in isolation: a stale sender-owned builder cannot double-mint.
+    #[tokio::test]
+    async fn deposit_first_fire_aborts_when_ownership_lost() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        // Recovery already demoted the row to Pending, so the fetch-time token
+        // no longer owns a Processing incarnation.
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Pending, t_lock);
+
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before_permits = state.semaphore.available_permits();
+        let metric = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "deposit_ownership_lost"]);
+        let before_metric = metric.get();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            recoverable(t_lock),
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "a lost claim must persist no signature"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a lost claim writes no status; the row's current owner handles it"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "nothing broadcast, nothing stashed in-flight"
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before_permits + 1,
+            "the permit must be released on abort"
+        );
+        assert_eq!(
+            metric.get(),
+            before_metric + 1.0,
+            "a lost claim increments deposit_ownership_lost"
+        );
+    }
+
+    /// A deposit first-fire that still owns its Processing incarnation (claim
+    /// `Ok(true)`) mints exactly once: the signature is persisted, the tx is
+    /// broadcast and stashed in-flight, and the token advances (the D3 bump).
+    #[tokio::test]
+    async fn deposit_first_fire_broadcasts_when_owned() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let t_lock = Utc::now();
+        seed_mock_deposit(&state, 77, TransactionStatus::Processing, t_lock);
+
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            recoverable(t_lock),
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let sigs = mock.get_release_signatures(77).await.unwrap();
+        assert_eq!(sigs.len(), 1, "owned claim persists exactly one signature");
+        assert_eq!(sigs[0].signature, Signature::default().to_string());
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "owned claim broadcasts and stashes"
+        );
+        let after = mock.pending_transactions.lock().unwrap()[0].updated_at;
+        assert_ne!(after, t_lock, "a successful claim bumps updated_at");
+        assert_eq!(
+            state.in_flight.entries.lock().unwrap()[0]
+                .ctx
+                .deposit_claim_lease,
+            Some(after),
+            "the in-flight context carries the next ownership lease"
         );
     }
 
@@ -4116,6 +8492,7 @@ mod tests {
             transaction_id: Some(9999),
             withdrawal_nonce: None,
             trace_id: None,
+            deposit_claim_lease: None,
         };
 
         let result = spawn_fire_and_store(
@@ -4126,7 +8503,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            false,
+            SendDurability::Terminal,
         );
 
         assert!(!result, "must return false when at capacity");
@@ -4155,11 +8532,12 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: None,
                 trace_id: None,
+                deposit_claim_lease: None,
             },
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            false,
+            SendDurability::Terminal,
         );
 
         assert!(result, "must return true when capacity is available");
@@ -4319,9 +8697,15 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("t".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    "remint-sig-1",
+                    0,
+                    None,
+                ),
                 trace_id: "t".to_string(),
                 mint: Pubkey::new_unique(),
                 user: Pubkey::new_unique(),
@@ -4376,6 +8760,7 @@ mod tests {
             transaction_id: 99,
             trace_id: "trace-99".to_string(),
             remint_info: Some(remint_info.clone()),
+            fetched_updated_at: chrono::Utc::now(),
         }));
         handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
 

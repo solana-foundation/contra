@@ -149,7 +149,7 @@ async fn test_store_and_get_block() {
 
     db.store_block(block).await.unwrap();
 
-    let retrieved = db.get_block(42).await;
+    let retrieved = db.get_block(42).await.unwrap();
     assert!(retrieved.is_some());
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.slot, 42);
@@ -179,7 +179,7 @@ async fn test_get_block_time() {
     let expected_time = block.block_time;
     db.store_block(block).await.unwrap();
 
-    let time = db.get_block_time(7).await;
+    let time = db.get_block_time(7).await.unwrap();
     assert_eq!(time, expected_time);
 }
 
@@ -254,11 +254,11 @@ async fn test_write_batch_accounts_and_transactions() {
     assert_eq!(acct.unwrap().lamports(), 500);
 
     // Verify block stored
-    let blk = db.get_block(1).await;
+    let blk = db.get_block(1).await.unwrap();
     assert!(blk.is_some());
 
     // Verify transaction stored
-    let tx = db.get_transaction(&sig).await;
+    let tx = db.get_transaction(&sig).await.unwrap();
     assert!(tx.is_some());
     assert_eq!(tx.unwrap().slot, 1);
 }
@@ -338,7 +338,7 @@ async fn test_get_transaction_roundtrip() {
     .await
     .unwrap();
 
-    let stored = db.get_transaction(&sig).await.unwrap();
+    let stored = db.get_transaction(&sig).await.unwrap().unwrap();
     assert_eq!(stored.slot, 5);
     assert_eq!(stored.block_time, 1_700_000_005);
 }
@@ -478,14 +478,14 @@ async fn test_latest_blockhash_after_store_block() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_block_nonexistent() {
     let (db, _pg) = start_postgres().await;
-    assert!(db.get_block(999).await.is_none());
+    assert!(db.get_block(999).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_transaction_nonexistent() {
     let (db, _pg) = start_postgres().await;
     let sig = solana_sdk::signature::Signature::new_unique();
-    assert!(db.get_transaction(&sig).await.is_none());
+    assert!(db.get_transaction(&sig).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -649,8 +649,8 @@ async fn test_truncate_dry_run_with_pg_dump() {
         assert!(report.backup_check.pg_dump_ok);
 
         // Dry run: blocks should still exist
-        assert!(db.get_block(1).await.is_some());
-        assert!(db.get_block(5).await.is_some());
+        assert!(db.get_block(1).await.unwrap().is_some());
+        assert!(db.get_block(5).await.unwrap().is_some());
     }
 }
 
@@ -685,11 +685,11 @@ async fn test_truncate_actually_deletes_blocks() {
         assert_eq!(report.transactions_deleted, 0);
 
         // Old blocks should be gone
-        assert!(db.get_block(1).await.is_none());
-        assert!(db.get_block(5).await.is_none());
+        assert!(db.get_block(1).await.unwrap().is_none());
+        assert!(db.get_block(5).await.unwrap().is_none());
         // Recent blocks should still exist
-        assert!(db.get_block(6).await.is_some());
-        assert!(db.get_block(10).await.is_some());
+        assert!(db.get_block(6).await.unwrap().is_some());
+        assert!(db.get_block(10).await.unwrap().is_some());
 
         // first_available_block should be updated
         assert!(report.first_available_block.is_some());

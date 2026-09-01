@@ -1035,6 +1035,7 @@ fn test_indexer_missing_escrow_instance_id_fails() {
         storage_type: private_channel_indexer::StorageType::Postgres,
         rpc_url: "http://localhost:0".to_string(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: private_channel_indexer::PostgresConfig {
             database_url: "postgresql://unused".to_string(),
             max_connections: 1,
@@ -1065,6 +1066,7 @@ fn test_indexer_withdraw_with_instance_id_fails() {
         storage_type: private_channel_indexer::StorageType::Postgres,
         rpc_url: "http://localhost:0".to_string(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: private_channel_indexer::PostgresConfig {
             database_url: "postgresql://unused".to_string(),
             max_connections: 1,

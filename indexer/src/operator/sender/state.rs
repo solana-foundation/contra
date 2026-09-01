@@ -1,15 +1,22 @@
 use crate::channel_utils::send_guaranteed;
+use crate::config::ProgramType;
 use crate::error::account::AccountError;
 use crate::error::OperatorError;
 use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
+use crate::operator::utils::instruction_util::ResetSmtRootBuilderWithTarget;
 use crate::operator::utils::smt_util::SmtState;
-use crate::operator::{parse_instance, RetryConfig, RpcClientWithRetry};
+use crate::operator::{
+    find_event_authority_pda, find_operator_pda, parse_instance, RetryConfig, RpcClientWithRetry,
+    SignerUtil,
+};
 use crate::operator::{MintCache, TransactionStatusUpdate, WithdrawalRemintInfo};
 use crate::storage::common::storage::Storage;
 use crate::storage::TransactionStatus;
 use crate::PrivateChannelIndexerConfig;
 use chrono::Utc;
+use private_channel_metrics::MetricLabel;
+use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -18,11 +25,14 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::types::{InFlightQueue, SenderSMTState, SenderState, MAX_IN_FLIGHT};
 
 impl SenderState {
+    /// `channel_blockhash_window` is seeded off the channel endpoint at operator
+    /// startup, never configured, and the retention proof re-reads it per verdict.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -44,10 +54,27 @@ impl SenderState {
         let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
         let mint_cache = MintCache::with_rpc(storage.clone(), mint_rpc_client.clone());
 
+        // Optional destination fallback, same retry/commitment as its primary.
+        // Empty means unset (env renders unconfigured as ""), so it maps to None.
+        let fallback_rpc_client = config
+            .fallback_rpc_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|url| {
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    url.to_string(),
+                    RetryConfig::default(),
+                    CommitmentConfig {
+                        commitment: operator_commitment,
+                    },
+                ))
+            });
+
         Ok(Self {
             rpc_client,
             // Source chain client (also used by MintCache). Remints broadcast here.
             source_rpc_client: mint_rpc_client,
+            fallback_rpc_client,
             storage,
             instance_pda,
             smt_state: None,
@@ -62,6 +89,7 @@ impl SenderState {
             program_type: config.program_type,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -113,17 +141,7 @@ pub(crate) async fn validate_smt_root(
         })?;
 
     let tree_index = instance.current_tree_index;
-    let min_nonce = tree_index * MAX_TREE_LEAVES as u64;
-    let max_nonce = (tree_index + 1) * MAX_TREE_LEAVES as u64;
-
-    let nonces = storage
-        .get_completed_withdrawal_nonces(min_nonce, max_nonce)
-        .await?;
-
-    let mut smt_state = SmtState::new(tree_index);
-    for nonce in &nonces {
-        smt_state.insert_nonce(*nonce);
-    }
+    let smt_state = rebuild_completed_tree(storage, tree_index).await?;
 
     let computed_root = smt_state.current_root();
     let onchain_root = instance.withdrawal_transactions_root;
@@ -134,7 +152,7 @@ pub(crate) async fn validate_smt_root(
             tree_index,
             local_root = ?computed_root,
             onchain_root = ?onchain_root,
-            nonces = ?nonces,
+            nonces = ?smt_state.get_nonces(),
             "SMT root mismatch: database out of sync with on-chain state. \
              A release likely landed on-chain but its Completed write was lost; \
              resync the database from on-chain events to reconcile."
@@ -149,11 +167,172 @@ pub(crate) async fn validate_smt_root(
 
     info!(
         tree_index,
-        nonces = nonces.len(),
+        nonces = smt_state.nonce_count(),
         "SMT root verification passed"
     );
 
     Ok(smt_state)
+}
+
+/// Rebuild the local SMT for `tree_index` from the DB-completed withdrawal
+/// nonces in that tree's window. Shared by `validate_smt_root` and the release
+/// verifier so both reason from the identical window math and insert path.
+async fn rebuild_completed_tree(
+    storage: &Storage,
+    tree_index: u64,
+) -> Result<SmtState, OperatorError> {
+    let leaves = MAX_TREE_LEAVES as u64;
+    // Window is [tree_index*leaves, (tree_index+1)*leaves). Checked math so a
+    // corrupt tree_index cannot wrap into the wrong window.
+    let min_nonce =
+        tree_index
+            .checked_mul(leaves)
+            .ok_or(AccountError::AccountIndexOutOfBounds {
+                index: tree_index as usize,
+            })?;
+    let max_nonce = tree_index
+        .checked_add(1)
+        .and_then(|t| t.checked_mul(leaves))
+        .ok_or(AccountError::AccountIndexOutOfBounds {
+            index: tree_index as usize,
+        })?;
+
+    let nonces = storage
+        .get_completed_withdrawal_nonces(min_nonce, max_nonce)
+        .await?;
+
+    let mut smt_state = SmtState::new(tree_index);
+    for nonce in &nonces {
+        smt_state.insert_nonce(*nonce);
+    }
+    Ok(smt_state)
+}
+
+/// Three-way outcome of confirming a release from the on-chain SMT root.
+/// `Uncertain` fails closed: every read/parse/window/staleness ambiguity maps
+/// here, never to `NotLanded`, so a demote or remint never fires on doubt.
+pub(crate) enum ReleaseVerdict {
+    /// The on-chain root matches the completed set WITH the candidate nonce.
+    Landed,
+    /// The on-chain root matches the completed set WITHOUT the candidate nonce.
+    NotLanded,
+    /// Could not prove either way; treat as still-pending.
+    Uncertain(String),
+}
+
+/// Check whether the withdrawal `nonce` actually released on-chain, so recovery
+/// never re-pays a release that a pruned or lagging RPC endpoint is hiding.
+///
+/// The escrow instance holds a Merkle root over every released nonce. We read it
+/// at finalized commitment, rebuild the same tree from our own DB, and compare.
+/// Any doubt returns `Uncertain`, never a false `NotLanded`.
+///
+/// The hard part is proving the snapshot is fresh even behind a load-balanced RPC
+/// where two calls can hit different backends. We first read the finalized latest
+/// blockhash together with its response context slot in one call; the tip block
+/// height at that slot is the blockhash's last_valid_block_height minus
+/// MAX_PROCESSING_AGE. If that tip height is past every attempt's lvbh we then read
+/// the instance account requiring the node to answer at a context slot at least the
+/// blockhash's slot. That binds the account snapshot to a finalized height we have
+/// already proven fresh, so a lagging backend that still excludes a released nonce
+/// cannot pass as authoritative. The nonce must also belong to the tree the instance
+/// currently holds, and the rebuilt root must equal the on-chain root either with
+/// the nonce (`Landed`) or without it (`NotLanded`).
+pub(crate) async fn verify_release_landed(
+    rpc: &RpcClientWithRetry,
+    storage: &Storage,
+    instance_pda: Option<Pubkey>,
+    nonce: u64,
+    max_lvbh: u64,
+) -> ReleaseVerdict {
+    let Some(instance_pda) = instance_pda else {
+        return ReleaseVerdict::Uncertain("no instance pda configured".to_string());
+    };
+
+    // Freshness: read the finalized latest blockhash and its context slot in one
+    // call so the slot and its height agree. The tip height at that slot is the
+    // blockhash's last_valid_block_height minus MAX_PROCESSING_AGE (a blockhash
+    // stays valid for that many blocks past the tip it was taken at).
+    let (ref_slot, lvbh0) = match rpc
+        .get_latest_blockhash_with_context(CommitmentConfig::finalized())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}"))
+        }
+    };
+    let Some(tip_height) = lvbh0.checked_sub(MAX_PROCESSING_AGE as u64) else {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized last_valid_block_height {lvbh0} below MAX_PROCESSING_AGE; cannot derive tip height"
+        ));
+    };
+
+    // The tip must be strictly past every attempt's lvbh. At height == lvbh a
+    // release can still land, so a snapshot only at that height could miss an
+    // edge-of-window release and wrongly report NotLanded, risking a double-pay.
+    if tip_height <= max_lvbh {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized tip height {tip_height} not past max lvbh {max_lvbh}; too stale to prove non-inclusion"
+        ));
+    }
+
+    // Bind the account snapshot to that proven-fresh point: require the node to
+    // answer at a context slot at least ref_slot, so its height is at least
+    // tip_height and therefore past max_lvbh. A lagging backend that cannot serve
+    // there errors instead of returning an older root, and we fail closed.
+    let response = match rpc
+        .get_account_with_context_min_slot(
+            &instance_pda,
+            CommitmentConfig::finalized(),
+            Some(ref_slot),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("instance read failed: {e}")),
+    };
+    let Some(account) = response.value else {
+        return ReleaseVerdict::Uncertain(format!(
+            "instance {instance_pda} absent at finalized commitment"
+        ));
+    };
+    let instance = match parse_instance(&account.data) {
+        Ok(i) => i,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("instance parse failed: {e}")),
+    };
+
+    // Tree-window check: membership can only be proven against the tree currently
+    // on-chain; a rotated-away nonce needs a historical root we do not fetch.
+    let expected_tree = nonce / MAX_TREE_LEAVES as u64;
+    if expected_tree != instance.current_tree_index {
+        return ReleaseVerdict::Uncertain(format!(
+            "nonce {nonce} maps to tree {expected_tree}, on-chain tree is {}",
+            instance.current_tree_index
+        ));
+    }
+
+    // Root-membership check: root equality is proof because the SMT is
+    // order-independent and collision-correct. Compare against the completed set
+    // without, then with, the candidate nonce.
+    let mut tree = match rebuild_completed_tree(storage, instance.current_tree_index).await {
+        Ok(t) => t,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("completed-tree rebuild failed: {e}")),
+    };
+    let onchain_root = instance.withdrawal_transactions_root;
+
+    // Drop the candidate so `tree` is the completed set WITHOUT it.
+    tree.remove_nonce(nonce);
+    if tree.current_root() == onchain_root {
+        return ReleaseVerdict::NotLanded;
+    }
+    tree.insert_nonce(nonce);
+    if tree.current_root() == onchain_root {
+        return ReleaseVerdict::Landed;
+    }
+    ReleaseVerdict::Uncertain(format!(
+        "on-chain root matches neither completed set (with nor without nonce {nonce})"
+    ))
 }
 
 impl SenderState {
@@ -197,6 +376,7 @@ impl SenderState {
                 error_message: Some(format!("recovery failed: {}", reason)),
                 remint_signature: None,
                 remint_attempted: false,
+                release_signatures: None,
             },
             "transaction status update",
         )
@@ -226,6 +406,11 @@ impl SenderState {
         &mut self,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
+        // Deferred remints are Withdraw-only; other roles must never claim a shared PendingRemint row.
+        if self.program_type != ProgramType::Withdraw {
+            return Ok(());
+        }
+
         let transactions = self.storage.get_pending_remint_transactions().await?;
 
         if transactions.is_empty() {
@@ -301,6 +486,9 @@ impl SenderState {
                         Ok(PendingSig {
                             signature,
                             last_valid_block_height,
+                            // The transactions-row mirror never carried a slot;
+                            // the journal table is the authority for one.
+                            blockhash_slot: None,
                         })
                     })
                     .collect()
@@ -322,10 +510,18 @@ impl SenderState {
                 // handle_permanent_failure before the row was written as PendingRemint.
                 withdrawal_nonce: tx.withdrawal_nonce.map(|n| n as u64),
                 trace_id: Some(tx.trace_id.clone()),
+                deposit_claim_lease: None,
             };
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
+                // Build from individual fields: `tx.remint_signatures` was moved out above,
+                // so the whole-row borrow `from_row` would take is no longer available.
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    &tx.signature,
+                    tx.instruction_index,
+                    tx.inner_index,
+                ),
                 trace_id: tx.trace_id.clone(),
                 mint,
                 user,
@@ -374,6 +570,62 @@ impl SenderState {
 
         Ok(())
     }
+
+    /// Re-arm the rotation this operator still owes the chain, read from the durable
+    /// target the processor wrote before dispatching it. A reset carries no DB row and
+    /// no nonce, so without this a crash between arming and confirmation would drop the
+    /// only automatic rotation for that boundary.
+    ///
+    /// Arming is all this does: the rotation tick reads the chain before every attempt,
+    /// so a target the chain already reached is disarmed there without sending.
+    pub(super) async fn rearm_owed_rotation(&mut self) -> Result<(), OperatorError> {
+        // Only the withdraw role can owe a rotation: it is the only one with an escrow
+        // instance to reset, so instance_pda is None for every other role.
+        let Some(instance_pda) = self.instance_pda else {
+            return Ok(());
+        };
+
+        let Some(target_tree_index) = self
+            .storage
+            .get_owed_rotation_target(self.program_type.as_label())
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let operator_pubkey = SignerUtil::get_operator_pubkey();
+        self.pending_rotation = Some(Box::new(ResetSmtRootBuilderWithTarget::new(
+            SignerUtil::get_admin_pubkey(),
+            operator_pubkey,
+            instance_pda,
+            find_operator_pda(&instance_pda, &operator_pubkey),
+            find_event_authority_pda(),
+            target_tree_index,
+        )));
+
+        info!(
+            target_tree_index,
+            "Re-armed owed tree rotation from persistent storage"
+        );
+
+        Ok(())
+    }
+
+    /// Retire the rotation now that a chain read proved `target_tree_index` landed.
+    /// Clears the durable target first, then the in-memory arm.
+    ///
+    /// A failed clear is not fatal: the next boot re-arms the target, and the submit
+    /// gate's chain read disarms it again without sending anything.
+    pub(super) async fn disarm_rotation(&mut self, target_tree_index: u64) {
+        if let Err(e) = self
+            .storage
+            .clear_owed_rotation_target(self.program_type.as_label(), target_tree_index)
+            .await
+        {
+            warn!(target_tree_index, "Owed rotation clear failed: {e}");
+        }
+        self.pending_rotation = None;
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +647,13 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_sender_state(mock: MockStorage) -> SenderState {
+        make_sender_state_with_role(mock, crate::config::ProgramType::Withdraw)
+    }
+
+    fn make_sender_state_with_role(
+        mock: MockStorage,
+        role: crate::config::ProgramType,
+    ) -> SenderState {
         let storage = Arc::new(Storage::Mock(mock));
         let rpc = Arc::new(RpcClientWithRetry::with_retry_config(
             "http://localhost:8899".to_string(),
@@ -404,6 +663,7 @@ mod tests {
         SenderState {
             rpc_client: rpc.clone(),
             source_rpc_client: rpc,
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -415,9 +675,10 @@ mod tests {
             rotation_retry_queue: Vec::new(),
             ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: role,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -887,6 +1148,157 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
+    /// The deferred remint queue is a Withdraw-only responsibility. An Escrow
+    /// sender sharing the transactions DB must never claim a PendingRemint row:
+    /// it would classify the release signature on the wrong chain and could
+    /// flip the row to ManualReview, stranding it from the real Withdraw sender.
+    #[tokio::test]
+    async fn recover_pending_remints_noop_for_escrow_role() {
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        let deadline = Utc::now() - chrono::Duration::seconds(10);
+
+        // A matured PendingRemint withdrawal row is present in the shared DB.
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(make_pending_remint_row(
+                70, &mint, &recipient, &sig, deadline,
+            ));
+
+        let mut state = make_sender_state_with_role(mock, crate::config::ProgramType::Escrow);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        // The Escrow sender must not hydrate the row into its queue.
+        assert!(
+            state.pending_remints.is_empty(),
+            "Escrow must not claim Withdraw remint rows"
+        );
+
+        // No status update emitted, especially no ManualReview: the row is left
+        // untouched for the real Withdraw sender.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "Escrow must not emit any status update for a remint row"
+        );
+    }
+
+    // ── rearm_owed_rotation ──────────────────────────────────────────
+
+    static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
+
+    /// Configure an in-memory admin signer so the rotation builder's account wiring can
+    /// resolve the process-global signers. Must run before their first access.
+    fn ensure_test_signer() {
+        INIT_TEST_SIGNER.call_once(|| {
+            let keypair = solana_sdk::signer::keypair::Keypair::new();
+            let encoded = bs58::encode(keypair.to_bytes()).into_string();
+            std::env::set_var("ADMIN_SIGNER", "memory");
+            std::env::set_var("ADMIN_PRIVATE_KEY", &encoded);
+        });
+    }
+
+    /// The finding's restart hole: a reset carries no DB row and no nonce, so a crash
+    /// between arming and confirmation dropped the only automatic rotation for the
+    /// boundary. The stored target is what puts it back.
+    #[tokio::test]
+    async fn rearm_owed_rotation_arms_from_stored_target() {
+        ensure_test_signer();
+        let target_tree_index = 3u64;
+
+        let mock = MockStorage::new();
+        let mut state = make_sender_state(mock);
+        state.instance_pda = Some(Pubkey::new_unique());
+        state
+            .storage
+            .set_owed_rotation_target(state.program_type.as_label(), target_tree_index)
+            .await
+            .unwrap();
+
+        state.rearm_owed_rotation().await.unwrap();
+
+        let rotation = state
+            .pending_rotation
+            .as_ref()
+            .expect("a stored target must re-arm the rotation");
+        assert_eq!(rotation.target_tree_index, target_tree_index);
+
+        // The re-armed builder must be a complete reset, not just a carrier for the
+        // target: the sender wires these accounts itself, from globals and the instance,
+        // so a wrong or missing one would only surface on-chain. Bind the generation the
+        // way the submit path does, which is the only field left unset here.
+        let operator_pubkey = SignerUtil::get_operator_pubkey();
+        let mut builder = rotation.builder.clone();
+        builder.expected_current_tree_index(target_tree_index - 1);
+        let accounts: Vec<Pubkey> = builder
+            .instruction()
+            .accounts
+            .iter()
+            .map(|account| account.pubkey)
+            .collect();
+        let instance_pda = state.instance_pda.unwrap();
+        for expected in [
+            SignerUtil::get_admin_pubkey(),
+            operator_pubkey,
+            instance_pda,
+            find_operator_pda(&instance_pda, &operator_pubkey),
+            find_event_authority_pda(),
+        ] {
+            assert!(
+                accounts.contains(&expected),
+                "re-armed reset is missing account {expected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rearm_owed_rotation_noop_without_stored_target() {
+        ensure_test_signer();
+        let mock = MockStorage::new();
+        let mut state = make_sender_state(mock);
+        state.instance_pda = Some(Pubkey::new_unique());
+
+        state.rearm_owed_rotation().await.unwrap();
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "nothing owed means nothing armed"
+        );
+    }
+
+    /// Both roles can share a database, so the escrow sender must not pick up the
+    /// withdraw operator's owed rotation. It has no instance to reset, so it must not
+    /// even read the target.
+    #[tokio::test]
+    async fn rearm_owed_rotation_noop_for_escrow_role() {
+        let mock = MockStorage::new();
+        let mut state = make_sender_state_with_role(mock, crate::config::ProgramType::Escrow);
+        state
+            .storage
+            .set_owed_rotation_target("withdraw", 3)
+            .await
+            .unwrap();
+
+        state.rearm_owed_rotation().await.unwrap();
+
+        assert!(
+            state.pending_rotation.is_none(),
+            "Escrow must not claim the withdraw operator's rotation"
+        );
+        let Storage::Mock(mock) = state.storage.as_ref() else {
+            unreachable!("mock storage")
+        };
+        assert_eq!(
+            mock.calls("get_owed_rotation_target"),
+            0,
+            "Escrow must not even read the owed target"
+        );
+    }
+
     // ── SenderState construction tests ───────────────────────────────
 
     use crate::config::{PostgresConfig, ProgramType, StorageType};
@@ -906,6 +1318,7 @@ mod tests {
         SenderState {
             rpc_client: rpc_client.clone(),
             source_rpc_client: rpc_client.clone(),
+            fallback_rpc_client: None,
             storage: storage.clone(),
             instance_pda: pda,
             smt_state: None,
@@ -920,6 +1333,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -931,6 +1345,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -1005,6 +1420,90 @@ mod tests {
         let state = result.unwrap();
         assert_eq!(state.instance_pda, Some(instance_pda));
         assert_eq!(state.retry_max_attempts, 5);
+    }
+
+    /// An empty fallback URL (how env renders an unconfigured value) must
+    /// build no client, so the destination oracle stays single-endpoint.
+    #[test]
+    fn empty_fallback_url_builds_no_client() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut config = make_config();
+        config.fallback_rpc_url = Some(String::new());
+
+        let state = SenderState::new(
+            &config,
+            CommitmentLevel::Confirmed,
+            None,
+            storage,
+            3,
+            400,
+            None,
+        )
+        .expect("construction must succeed with an empty fallback URL");
+
+        assert!(
+            state.fallback_rpc_client.is_none(),
+            "empty fallback URL must not build a client"
+        );
+        assert!(
+            state.dest_finality().fallback.is_none(),
+            "empty fallback must leave the destination single-endpoint"
+        );
+    }
+
+    /// A non-empty fallback URL builds a client, so the destination oracle
+    /// carries a corroborating endpoint.
+    #[test]
+    fn set_fallback_url_builds_client() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut config = make_config();
+        config.fallback_rpc_url = Some("http://localhost:9999".to_string());
+
+        let state = SenderState::new(
+            &config,
+            CommitmentLevel::Confirmed,
+            None,
+            storage,
+            3,
+            400,
+            None,
+        )
+        .expect("construction must succeed with a set fallback URL");
+
+        assert!(state.fallback_rpc_client.is_some());
+        assert!(state.dest_finality().fallback.is_some());
+        // Source stays single-endpoint regardless of the fallback.
+        assert!(state.source_finality().fallback.is_none());
+    }
+
+    /// The chain tag drives the height source, the retention window and the metric
+    /// label, so it must follow the role and not the field name: the two roles use
+    /// `rpc_client` and `source_rpc_client` for mirror-image chains.
+    #[test]
+    fn finality_chain_tags_follow_the_operator_role() {
+        use crate::operator::sender::remint::HeightSource;
+
+        let withdraw = make_sender_state_with_role(MockStorage::new(), ProgramType::Withdraw);
+        assert_eq!(
+            withdraw.dest_finality().height_source,
+            HeightSource::BlockHeightRpc
+        );
+        assert_eq!(
+            withdraw.source_finality().height_source,
+            HeightSource::ContextSlot
+        );
+
+        let escrow = make_sender_state_with_role(MockStorage::new(), ProgramType::Escrow);
+        assert_eq!(
+            escrow.dest_finality().height_source,
+            HeightSource::ContextSlot
+        );
+        assert_eq!(
+            escrow.source_finality().height_source,
+            HeightSource::BlockHeightRpc
+        );
     }
 
     /// Pins the SmtRootMismatch wedge: a landed release whose nonce never reaches
@@ -1091,5 +1590,367 @@ mod tests {
             }
             other => panic!("expected SmtRootMismatch, got: {other}"),
         }
+    }
+
+    // verify_release_landed (SMT confirmation gate)
+    //
+    // These run under the `test-tree` feature so MAX_TREE_LEAVES = 8 keeps the
+    // tree windows small: tree 0 covers nonces [0,8), tree 1 covers [8,16).
+    use super::{verify_release_landed, ReleaseVerdict};
+    use solana_client::nonblocking::rpc_client::RpcClient;
+
+    /// Borsh-serialize an Instance carrying `root` and `tree_index`.
+    fn instance_bytes(root: [u8; 32], tree_index: u64) -> Vec<u8> {
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index: tree_index,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// A finalized getLatestBlockhash Response whose derived tip height equals
+    /// `tip_height`. The verifier computes tip = last_valid_block_height -
+    /// MAX_PROCESSING_AGE, so we set the height to tip + MAX_PROCESSING_AGE. The
+    /// context slot (used as the account read's min_context_slot) is set to the
+    /// tip height too; the mock does not enforce it, so any value serves.
+    fn blockhash_context_response(tip_height: u64) -> serde_json::Value {
+        serde_json::json!({
+            "context": {"slot": tip_height},
+            "value": {
+                "blockhash": "11111111111111111111111111111111",
+                "lastValidBlockHeight": tip_height + MAX_PROCESSING_AGE as u64,
+            }
+        })
+    }
+
+    /// Mock RPC whose finalized getLatestBlockhash yields a tip height of
+    /// `tip_height` and whose getAccountInfo returns an Instance account with the
+    /// given root and tree_index. The verifier reads the blockhash first for
+    /// freshness, then binds the account read to it, so both mocks are required.
+    fn mock_instance_rpc(root: [u8; 32], tree_index: u64, tip_height: u64) -> RpcClientWithRetry {
+        let bytes = instance_bytes(root, tree_index);
+        let account_response = serde_json::json!({
+            "context": {"slot": tip_height},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        mocks.insert(
+            RpcRequest::GetLatestBlockhash,
+            blockhash_context_response(tip_height),
+        );
+        RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// Mock RPC whose getAccountInfo returns a null value (account absent), with a
+    /// fresh finalized getLatestBlockhash so the gate reaches the absent-account check.
+    fn mock_absent_instance_rpc(tip_height: u64) -> RpcClientWithRetry {
+        let account_response = serde_json::json!({"context": {"slot": tip_height}, "value": null});
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        mocks.insert(
+            RpcRequest::GetLatestBlockhash,
+            blockhash_context_response(tip_height),
+        );
+        RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        }
+    }
+
+    /// A completed withdrawal row so `get_completed_withdrawal_nonces` sees `nonce`.
+    fn completed_withdrawal_row(id: i64, nonce: u64) -> DbTransaction {
+        let now = Utc::now();
+        DbTransaction {
+            id,
+            signature: Signature::new_unique().to_string(),
+            trace_id: format!("trace-{id}"),
+            slot: 100,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: TokenAmount(5_000),
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(nonce as i64),
+            status: TransactionStatus::Completed,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            inner_index: None,
+            landed_remint_signature: None,
+        }
+    }
+
+    /// Build a mock storage seeded with the given completed nonces.
+    fn storage_with_completed(nonces: &[u64]) -> Arc<Storage> {
+        let mock = MockStorage::new();
+        for (i, n) in nonces.iter().enumerate() {
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .push(completed_withdrawal_row(i as i64 + 1, *n));
+        }
+        Arc::new(Storage::Mock(mock))
+    }
+
+    /// Root of a fresh tree_index-0 tree containing `nonces`.
+    fn tree_root(tree_index: u64, nonces: &[u64]) -> [u8; 32] {
+        let mut smt = SmtState::new(tree_index);
+        for n in nonces {
+            smt.insert_nonce(*n);
+        }
+        smt.current_root()
+    }
+
+    /// V1: on-chain root includes N which the DB has not recorded, fresh height, yields Landed.
+    #[tokio::test]
+    async fn verify_release_landed_v1_with_candidate_match() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1, 3]);
+        // Finalized height 100 > max_lvbh 50, so the freshness check passes.
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(matches!(verdict, ReleaseVerdict::Landed), "expected Landed");
+    }
+
+    /// V2: on-chain root equals the completed set without N, fresh height, yields NotLanded.
+    #[tokio::test]
+    async fn verify_release_landed_v2_without_candidate_match() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1]);
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::NotLanded),
+            "expected NotLanded"
+        );
+    }
+
+    /// V3: nonce belongs to a different tree window than on-chain, yields Uncertain
+    /// (tree-window check).
+    #[tokio::test]
+    async fn verify_release_landed_v3_wrong_tree_window() {
+        let storage = storage_with_completed(&[]);
+        // nonce 3 maps to tree 0, but the on-chain instance is on tree 1.
+        let onchain = tree_root(1, &[]);
+        let rpc = mock_instance_rpc(onchain, 1, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "tree-window check must fail closed"
+        );
+    }
+
+    /// V4: root would say NotLanded but the finalized height is not past max_lvbh,
+    /// yields Uncertain (freshness check).
+    #[tokio::test]
+    async fn verify_release_landed_v4_stale_snapshot() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1]);
+        // Finalized height 50 == max_lvbh 50, so height <= max_lvbh fails the gate.
+        let rpc = mock_instance_rpc(onchain, 0, 50);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "freshness check must fail closed on a stale snapshot"
+        );
+    }
+
+    /// V4b regression: a large account context slot that WOULD have passed the old
+    /// slot-based check is still Uncertain when the finalized tip height is not past
+    /// max_lvbh, proving the old slot-vs-height confusion is closed. Freshness now
+    /// comes from the blockhash tip height, so the account slot cannot paper over it.
+    #[tokio::test]
+    async fn verify_release_landed_v4b_large_slot_stale_height_uncertain() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1]);
+        // Account context slot is huge (would pass a slot > lvbh test), but the
+        // finalized tip height 100 == max_lvbh 100 is not strictly past it.
+        let bytes = instance_bytes(onchain, 0);
+        let account_response = serde_json::json!({
+            "context": {"slot": 20_000_000u64},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        mocks.insert(
+            RpcRequest::GetLatestBlockhash,
+            blockhash_context_response(100),
+        );
+        let rpc = RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        };
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 100).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "a large slot must not paper over a stale finalized tip height"
+        );
+    }
+
+    /// V5: on-chain root reflects a nonce beyond completed set plus or minus N,
+    /// yields Uncertain (matches-neither).
+    #[tokio::test]
+    async fn verify_release_landed_v5_matches_neither() {
+        let storage = storage_with_completed(&[1]);
+        let onchain = tree_root(0, &[1, 3, 5]);
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "matches-neither must be Uncertain"
+        );
+    }
+
+    /// V6: getAccountInfo value null yields Uncertain (absent is not NotLanded).
+    #[tokio::test]
+    async fn verify_release_landed_v6_absent_instance() {
+        let storage = storage_with_completed(&[1]);
+        let rpc = mock_absent_instance_rpc(100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "absent instance must be Uncertain"
+        );
+    }
+
+    /// V7: getAccountInfo RPC error yields Uncertain (read error is not NotLanded).
+    #[tokio::test]
+    async fn verify_release_landed_v7_rpc_error() {
+        let storage = storage_with_completed(&[1]);
+        // Unreachable endpoint, single attempt, so the read fails fast.
+        let rpc = RpcClientWithRetry::with_retry_config(
+            "http://127.0.0.1:1".to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "RPC error must be Uncertain"
+        );
+    }
+
+    /// V8: DB already records N as Completed and on-chain includes it, yields Landed
+    /// via the remove_nonce base path.
+    #[tokio::test]
+    async fn verify_release_landed_v8_db_has_candidate() {
+        let storage = storage_with_completed(&[1, 3]);
+        let onchain = tree_root(0, &[1, 3]);
+        let rpc = mock_instance_rpc(onchain, 0, 100);
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Landed),
+            "remove_nonce base path must still resolve Landed"
+        );
+    }
+
+    /// Bind regression (the double-pay vector). The finalized tip height is fresh,
+    /// but the account backend is behind and cannot answer at the bound context
+    /// slot, so the min_context_slot read errors. The verifier must return Uncertain,
+    /// never a false NotLanded that would demote/remint a release that may have
+    /// landed on a lagging, load-balanced RPC endpoint.
+    #[tokio::test]
+    async fn verify_release_landed_bind_account_behind_is_uncertain() {
+        // The completed set without nonce 3 would look NotLanded IF the account
+        // were served; the bind is what forces Uncertain instead.
+        let storage = storage_with_completed(&[1]);
+
+        let mut server = mockito::Server::new_async().await;
+        // Fresh finalized blockhash: tip = 100150 - 150 = 100000, past max_lvbh 50.
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":100000},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":100150}},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        // The account backend is behind: it rejects the min_context_slot bind with
+        // an RPC error rather than returning an older snapshot.
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32016,"message":"Minimum context slot has not been reached"},"id":0}"#,
+            )
+            .create_async()
+            .await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let verdict =
+            verify_release_landed(&rpc, &storage, Some(Pubkey::new_unique()), 3, 50).await;
+        assert!(
+            matches!(verdict, ReleaseVerdict::Uncertain(_)),
+            "an account backend behind the freshness point must be Uncertain, never NotLanded"
+        );
     }
 }

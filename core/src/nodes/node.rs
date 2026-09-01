@@ -1,6 +1,9 @@
 use {
     crate::{
-        accounts::{address_index_repair::repair_address_signatures, AccountsDB},
+        accounts::{
+            address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
+            redis::RedisAccountsDB, AccountsDB,
+        },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps, WriteDeps,
@@ -14,13 +17,12 @@ use {
             sequencer::start_sequence_worker,
             settle::start_settle_worker,
             sigverify::start_sigverify_workerpool,
-            AccountSettlement,
+            AccountSettlements, ExecutedBatch,
         },
     },
     futures::future::FutureExt,
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
-    solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput,
     std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, task::JoinHandle},
     tokio_util::sync::CancellationToken,
@@ -65,6 +67,9 @@ pub struct NodeConfig {
     /// batches ≥ `MIN_PARALLEL_BATCH_SIZE`; smaller batches always run sequentially.
     pub max_svm_workers: usize,
     pub accountsdb_connection_url: String,
+    /// Optional Redis cache in front of the read path. Reads consult Redis
+    /// first and fall through to `accountsdb_connection_url` on a miss.
+    pub redis_cache_url: Option<String>,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
     pub transaction_expiration_ms: u64,
     pub blocktime_ms: u64,
@@ -97,6 +102,7 @@ impl Default for NodeConfig {
             max_svm_workers: 8,
             accountsdb_connection_url: "postgresql://user:password@localhost:5432/private_channel"
                 .to_string(),
+            redis_cache_url: None,
             admin_keys: vec![],               // No admin keys by default
             transaction_expiration_ms: 15000, // 15 seconds default
             blocktime_ms: 100,                // 100ms default
@@ -124,6 +130,42 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+}
+
+/// How long a read node waits out a cache stamped for another deployment. Worth
+/// waiting for in Aio, where the settler alongside this node purges and re-stamps
+/// it moments later; a genuinely wrong Redis costs only this window and then
+/// fails closed. An unstamped cache is not waited for at all, since the node
+/// serves correctly from Postgres until a write node stamps one.
+///
+/// This covers the cache, not a Postgres the write node has not created the
+/// schema in. That case fails earlier, when the cache handle reads the deployment
+/// id, and is not retried.
+///
+/// Serving is not gated on this: every cached read rechecks the stamp for itself,
+/// so a cache condemned later is dropped without waiting for a restart. Failing
+/// here is about not starting a node whose cache is misconfigured, rather than
+/// letting it come up and quietly serve every read from Postgres.
+const CACHE_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const CACHE_VERIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn wait_for_verified_cache(
+    redis: &crate::accounts::redis::RedisAccountsDB,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + CACHE_VERIFY_TIMEOUT;
+    loop {
+        match crate::accounts::redis_coherence::verify_cache_stamp(redis).await {
+            Ok(()) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                warn!(
+                    "Redis cache not usable yet ({}), waiting for a write node",
+                    e
+                );
+                tokio::time::sleep(CACHE_VERIFY_INTERVAL).await;
+            }
+            Err(e) => return Err(format!("Redis cache never became usable: {e:#}").into()),
+        }
+    }
 }
 
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
@@ -164,14 +206,15 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
         if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-            // Create the bounded dedup channel (receives from RPC, sends to sigverify);
-            // a full queue sheds load at RPC ingress.
-            let (dedup_tx, dedup_rx) =
-                crate::stages::create_dedup_channel(config.ingress_queue_capacity);
+            // RPC ingress channel (receives from RPC, feeds the sigverify worker
+            // pool). MPMC so many sigverify workers can pull; a full queue sheds
+            // load at RPC ingress.
+            let (ingress_tx, ingress_rx) =
+                crate::stages::create_ingress_channel(config.ingress_queue_capacity);
 
-            // Create the sigverify channel (needed for NodeHandles in all modes)
-            let (sigverify_tx, sigverify_rx) =
-                async_channel::bounded::<SanitizedTransaction>(config.sigverify_queue_size);
+            // sigverify to dedup channel: dedup is a single consumer, so mpsc.
+            let (dedup_tx, dedup_rx) =
+                mpsc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
 
             // Create sequencer channel (bounded so backpressure chains upstream)
             let (sequencer_tx, sequencer_rx) =
@@ -183,14 +226,11 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
             // Create execution results channel between executor and settler (bounded for back-pressure)
             let (execution_results_tx, execution_results_rx) =
-                mpsc::channel::<(
-                    LoadAndExecuteSanitizedTransactionsOutput,
-                    Vec<SanitizedTransaction>,
-                )>(config.execution_results_capacity);
+                mpsc::channel::<ExecutedBatch>(config.execution_results_capacity);
 
             // Create settled accounts channel between settler and executor
             let (settled_accounts_tx, settled_accounts_rx) =
-                mpsc::unbounded_channel::<Vec<(Pubkey, AccountSettlement)>>();
+                mpsc::unbounded_channel::<AccountSettlements>();
 
             // Create settled blockhashes channel between settler and dedup
             let (settled_blockhashes_tx, settled_blockhashes_rx) =
@@ -228,12 +268,27 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             heartbeats.settler = Some(Arc::clone(&settler_hb));
             heartbeats.address_index_writer = Some(Arc::clone(&addr_index_writer_hb));
 
-            // Start dedup stage (filters duplicate transactions before sigverify)
+            // Start sigverify worker pool (first stage). Verification runs before
+            // dedup so only verified transactions ever reach the dedup cache.
+            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
+                num_workers: config.sigverify_workers,
+                admin_keys: config.admin_keys.clone(),
+                rx: ingress_rx,
+                output_tx: dedup_tx,
+                shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
+                heartbeat: sigverify_hb,
+            })
+            .await;
+            write_workers.extend(sigverify_workers);
+
+            // Start dedup stage (drops replays after verification, keyed on the
+            // message hash so signature variants of one message collapse to one).
             let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
                 max_blockhashes: config.max_blockhashes(),
                 input_rx: dedup_rx,
                 settled_blockhashes_rx,
-                output_tx: sigverify_tx.clone(),
+                output_tx: sequencer_tx,
                 shutdown_token: shutdown_token.clone(),
                 initial_live_blockhashes,
                 initial_dedup_cache,
@@ -242,19 +297,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             })
             .await;
             write_workers.push(dedup);
-
-            // Start sigverify worker pool
-            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
-                num_workers: config.sigverify_workers,
-                admin_keys: config.admin_keys.clone(),
-                rx: sigverify_rx,
-                sequencer_tx,
-                shutdown_token: shutdown_token.clone(),
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: sigverify_hb,
-            })
-            .await;
-            write_workers.extend(sigverify_workers);
 
             // Start sequencer (produces conflict-free batches)
             let sequence = start_sequence_worker(crate::stages::SequencerArgs {
@@ -298,7 +340,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 settled_blockhashes_tx,
                 address_signatures_tx: addr_sig_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+                redis_cache_url: config.redis_cache_url.clone(),
                 blocktime_ms: config.blocktime_ms,
+                cache_mirror_cooldown: crate::stages::settle::CACHE_MIRROR_COOLDOWN,
                 perf_sample_period_secs: config.perf_sample_period_secs,
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
@@ -323,7 +367,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
             (
                 Some(WriteDeps {
-                    dedup_tx: dedup_tx.clone(),
+                    dedup_tx: ingress_tx,
                     metrics: Arc::clone(&config.metrics),
                 }),
                 live_blockhashes,
@@ -337,7 +381,30 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
     let read_deps = match config.mode {
         NodeMode::Read | NodeMode::Aio => {
-            let accounts_db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            let accounts_db = match config.redis_cache_url {
+                // Redis in front of Postgres. Postgres stays reachable so a
+                // key missing from the cache resolves against the source of
+                // truth instead of reading as an absence.
+                Some(ref redis_url) => {
+                    let postgres = PostgresAccountsDB::new(&config.accountsdb_connection_url, true)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e)
+                        })?;
+                    let redis = RedisAccountsDB::new(redis_url, postgres)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?;
+                    // Only a write node aligns the cache, so wait for one to
+                    // publish a stamp rather than serving whatever is there. An
+                    // empty cache verifies immediately. Foreign state verifies
+                    // only once a write node purges it, which in Aio is the
+                    // settler alongside this one.
+                    wait_for_verified_cache(&redis).await?;
+                    info!("Read path caching through Redis with Postgres fallback");
+                    AccountsDB::Redis(redis)
+                }
+                None => AccountsDB::new(&config.accountsdb_connection_url, true).await?,
+            };
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).

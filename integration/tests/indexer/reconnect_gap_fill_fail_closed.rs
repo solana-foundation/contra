@@ -1,9 +1,5 @@
-//! Reconnect gap gating for `YellowstoneSource`: after a stream drop the source
-//! resubscribes immediately, but on the first live block it arms the checkpoint gate
-//! to the observed resume slot before forwarding that block. A concurrent RPC backfill
-//! closes the residual window `(checkpoint, resume]`, and until it does the gate holds
-//! the durable checkpoint, so no live `SlotComplete` can advance it over the still
-//! missing range. An un-fillable boundary keeps the checkpoint frozen (fail-closed).
+//! Gap gating for `YellowstoneSource`. The first live block of every connection, the very first
+//! included, holds the checkpoint until a backfill closes the window below it. Fail-closed.
 
 use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::config::ProgramType;
@@ -221,6 +217,8 @@ fn make_source(ys_url: String, rpc: &MockitoServer, storage: Arc<Storage>) -> Ye
     )
     .with_gap_detection(poller(rpc), 1_000, 16)
     .with_storage(storage)
+    // What `run` passes: startup accounted for everything up to the seeded anchor.
+    .with_startup_floor(CHECKPOINT)
 }
 
 /// While the boundary slot stays pruned the gate holds the durable checkpoint at the
@@ -230,6 +228,11 @@ fn make_source(ys_url: String, rpc: &MockitoServer, storage: Arc<Storage>) -> Ye
 async fn stalled_gap_fill_gates_checkpoint_then_recovers() {
     init_tracing();
     let (_pg, storage) = start_postgres().await;
+    // The anchor `run` writes before the stream opens; without it nothing is forwarded.
+    storage
+        .update_committed_checkpoint("escrow", CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
 
     let mut rpc = MockitoServer::new_async().await;
     for s in (CHECKPOINT + 1)..=TIP {
@@ -354,6 +357,11 @@ async fn shutdown_while_gap_fill_stalled_joins_promptly() {
 async fn stalled_gap_fill_never_advances_checkpoint_over_live_tip() {
     init_tracing();
     let (_pg, storage) = start_postgres().await;
+    // The anchor `run` writes before the stream opens; without it nothing is forwarded.
+    storage
+        .update_committed_checkpoint("escrow", CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
 
     let mut rpc = MockitoServer::new_async().await;
     for s in (CHECKPOINT + 1)..=TIP {
@@ -403,6 +411,78 @@ async fn stalled_gap_fill_never_advances_checkpoint_over_live_tip() {
         ys.call_count("subscribe") >= 2,
         "the source resubscribes; the gate, not a blocked resubscribe, is the guard"
     );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), processor_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer_handle).await;
+    ys.shutdown().await;
+}
+
+/// A cold start is a reconnect as far as the checkpoint is concerned, so the very first block
+/// must gate `(checkpoint, resume]` first, or it carries the checkpoint past unread slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_start_gap_gates_checkpoint_on_first_connection() {
+    init_tracing();
+    let (_pg, storage) = start_postgres().await;
+    // The startup anchor, exactly as `ensure_startup_anchor` leaves it before `start()`.
+    storage
+        .update_committed_checkpoint("escrow", CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
+
+    let mut rpc = MockitoServer::new_async().await;
+    for s in (CHECKPOINT + 1)..=TIP {
+        let _m = mock_block_ok(&mut rpc, s).await;
+    }
+    let _produced = mock_produced_slots(&mut rpc, CHECKPOINT, TIP, &GAP_FILL_SLOTS).await;
+    let pruned = mock_block_pruned(&mut rpc, CHECKPOINT, 1).await;
+
+    let ys = MockYellowstoneServer::start().await;
+    let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
+    let cancel = CancellationToken::new();
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
+    let handle = source
+        .start(tx.clone(), cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // No drop_stream anywhere: every assertion below is about connection #1.
+    wait_for_subscribes(&ys, 1, 10).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP)));
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(TIP + 1)));
+
+    // A fill was attempted, so the cold start armed rather than streaming straight through.
+    wait_until_matched(
+        &pruned,
+        20,
+        "a cold-start gap-fill attempt on the pruned slot",
+    )
+    .await;
+    assert_eq!(
+        ys.call_count("subscribe"),
+        1,
+        "the gate must arm on the first connection, with no reconnect involved"
+    );
+
+    // The gate holds the anchor while the window is unfilled, though both live slots landed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            storage
+                .get_committed_checkpoint("escrow")
+                .await
+                .expect("read checkpoint"),
+            Some(CHECKPOINT),
+            "checkpoint must never advance past the unfilled cold-start window"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Heal the boundary; the fill closes (CHECKPOINT, TIP] and the gate hands off.
+    let _healed = mock_block_ok(&mut rpc, CHECKPOINT).await;
+    wait_for_checkpoint(&storage, "escrow", TIP, 30).await;
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;

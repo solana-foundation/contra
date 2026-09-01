@@ -222,7 +222,7 @@ pub async fn start_solana_indexer(
     let backfill_config = BackfillConfig {
         enabled: true,
         batch_size: 100,
-        max_gap_slots: 100,
+        max_gap_slots: 1_000,
         exit_after_backfill: false,
         rpc_url: rpc_url.clone(),
         start_slot: None,

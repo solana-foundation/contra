@@ -5887,11 +5887,14 @@ mod tests {
             second_tip.slot
         );
 
-        let successor: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = $1")
-            .bind(first_tip.slot as i64 + 1)
-            .fetch_one(pool.as_ref())
-            .await
-            .expect("the block after the old tip exists");
+        // Idle ticks advance the slot without a block, so the successor is the
+        // next block that exists rather than the next slot.
+        let successor: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM blocks WHERE slot > $1 ORDER BY slot LIMIT 1")
+                .bind(first_tip.slot as i64)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("the block after the old tip exists");
         let successor: BlockInfo = bincode::deserialize(&successor).unwrap();
         assert_eq!(
             successor.previous_blockhash, first_tip.blockhash,

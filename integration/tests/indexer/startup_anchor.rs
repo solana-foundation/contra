@@ -10,6 +10,7 @@ use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::{
     config::{BackfillConfig, ReconciliationConfig, RpcPollingConfig, YellowstoneConfig},
     indexer::run,
+    storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
     StorageType,
 };
@@ -32,6 +33,8 @@ const TIP: u64 = 900;
 const START_SLOT: u64 = 898;
 /// Slot the cold-start stream opens at, well above the tip so a real window sits under it.
 const COLD_START_TIP: u64 = 910;
+/// A durable checkpoint the mock RPC node has not caught up to, so the floor lands above it.
+const LAGGING_CHECKPOINT: u64 = 1_000;
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -428,6 +431,58 @@ async fn run_gates_the_first_block_when_backfill_is_disabled() {
     // Heal the boundary; the fill closes the window and the gate hands off.
     let _healed = mock_block_ok(&mut rpc, TIP).await;
     wait_for_checkpoint(&pool, "withdraw", COLD_START_TIP, 60).await;
+
+    handle.abort();
+    ys.shutdown().await;
+}
+
+/// An RPC node trailing the Geyser provider that wrote the checkpoint is routine, so the
+/// floor sitting above the tip it reports must not stop the boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_starts_when_the_rpc_node_lags_the_durable_checkpoint() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_anchor_lagging_rpc").await;
+
+    // Seed a checkpoint the endpoint below has not caught up to yet.
+    let seeded = Storage::Postgres(PostgresDb::new(&postgres).await.expect("postgres storage"));
+    seeded.init_schema().await.expect("init schema");
+    seeded
+        .update_committed_checkpoint("withdraw", LAGGING_CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
+    drop(seeded);
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _slot = mock_get_slot(&mut rpc, LAGGING_CHECKPOINT - 2).await;
+
+    let ys = MockYellowstoneServer::start().await;
+    let backfill = BackfillConfig {
+        enabled: false,
+        exit_after_backfill: false,
+        rpc_url: rpc.url(),
+        batch_size: 100,
+        max_gap_slots: 1_000,
+        start_slot: None,
+    };
+    let indexer = indexer_config(ys.url(), backfill);
+    let common = common_config(postgres, rpc.url());
+
+    let (err_tx, mut err_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let handle = tokio::spawn(async move {
+        if let Err(e) = run(common, indexer, None).await {
+            let _ = err_tx.send(e.to_string()).await;
+        }
+    });
+
+    // A startup that refuses the lag would land here well inside the window.
+    if let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(20), err_rx.recv()).await {
+        panic!("a lagging RPC node must not stop startup: {e}");
+    }
+    assert_eq!(
+        anchor_of(&pool, "withdraw").await,
+        Some(LAGGING_CHECKPOINT),
+        "the durable checkpoint must survive a tip read below it"
+    );
 
     handle.abort();
     ys.shutdown().await;

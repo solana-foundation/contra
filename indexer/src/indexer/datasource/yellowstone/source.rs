@@ -189,15 +189,15 @@ where
             return GapFillOutcome::Cancelled;
         }
 
-        // A cold start is handed the slot startup already owns, so there is nothing to derive.
-        let checkpoint = match floor {
-            Some(slot) => slot,
-            // Re-read every cycle so an operator resync moves the anchor without a restart.
-            None => match get_checkpoint().await {
-                Ok(Some(slot)) => slot,
-                // With no anchor there is no lower bound to replay from, so resolving here
-                // would forward live slots over an interval nobody read. Retry instead.
-                Ok(None) => {
+        // Re-read every cycle so an operator resync moves the anchor without a restart. A cold
+        // start keeps its floor as the lower bound, so a stale checkpoint cannot drag it down.
+        let checkpoint = match get_checkpoint().await {
+            Ok(Some(slot)) => floor.map_or(slot, |f| f.max(slot)),
+            // With no anchor there is no lower bound to replay from, so resolving here
+            // would forward live slots over an interval nobody read. Retry instead.
+            Ok(None) => match floor {
+                Some(slot) => slot,
+                None => {
                     error!(
                         "Reconnect gap-fill: no durable checkpoint anchor for {:?}; holding the \
                          checkpoint rather than skipping the gap",
@@ -209,7 +209,11 @@ where
                     }
                     continue;
                 }
-                Err(e) => {
+            },
+            // The floor is a durable bound of its own, so a failed read need not stall a cold start.
+            Err(e) => match floor {
+                Some(slot) => slot,
+                None => {
                     warn!(
                         "Reconnect gap-fill: checkpoint read failed, retrying: {}",
                         e
@@ -806,6 +810,13 @@ mod tests {
         )
     }
 
+    /// An anchor an operator can move mid-run, so the retry loop can be seen re-reading it.
+    fn checkpoint_shared(
+        slot: Arc<std::sync::atomic::AtomicU64>,
+    ) -> impl Fn() -> std::future::Ready<Result<Option<u64>, CheckpointError>> {
+        move || std::future::ready(Ok(Some(slot.load(std::sync::atomic::Ordering::SeqCst))))
+    }
+
     /// A durable anchor at `slot`.
     fn checkpoint_ok(
         slot: u64,
@@ -1350,6 +1361,62 @@ mod tests {
 
         assert!(armed);
         assert_eq!(floor, None, "a spent floor must not be reused");
+    }
+
+    /// An oversized gap clears when an operator resyncs the checkpoint above the floor. Pinning
+    /// the anchor to the floor would make every retry read the same slot and never recover.
+    #[tokio::test]
+    async fn cold_start_fill_recovers_when_the_checkpoint_is_resynced() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mut server = Server::new_async().await;
+        let _enum = mock_dense_range(&mut server, 995, 1000);
+        let _blocks: Vec<_> = (995..=1000)
+            .map(|s| mock_get_block_success(&mut server, s))
+            .collect();
+
+        let poller = test_poller(&server);
+        let (tx, _rx) = mpsc::channel(256);
+        let cancel = CancellationToken::new();
+        // Gap 1000 - 100 is far over the bound, so the fill can only spin here.
+        let checkpoint = Arc::new(AtomicU64::new(100));
+
+        let fill = tokio::spawn({
+            let checkpoint = checkpoint.clone();
+            let cancel = cancel.clone();
+            let url = server.url();
+            async move {
+                let poller =
+                    RpcPoller::new(url, UiTransactionEncoding::Json, CommitmentLevel::Finalized);
+                fill_reconnect_gap_to(
+                    1000,
+                    Some(100),
+                    checkpoint_shared(checkpoint),
+                    &poller,
+                    10,
+                    10,
+                    ProgramType::Escrow,
+                    None,
+                    &tx,
+                    &cancel,
+                    TEST_BACKOFF,
+                )
+                .await
+            }
+        });
+
+        // Several retries at this backoff, so the first verdict is provably not the last.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!fill.is_finished(), "an oversized gap must not resolve");
+
+        checkpoint.store(995, Ordering::SeqCst);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), fill)
+            .await
+            .expect("the resynced checkpoint must let the fill proceed")
+            .unwrap();
+        assert!(matches!(outcome, GapFillOutcome::Resolved));
+        drop(poller);
     }
 
     /// An arm that gives up leaves no gate behind, so the next connection still needs the

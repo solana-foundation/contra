@@ -280,20 +280,19 @@ pub async fn ensure_startup_anchor(
 }
 
 /// Highest slot startup owns, one below the live boundary, or the anchor with no backfill.
-/// Bounded both ways: the first gate waits on this slot, so above the tip it waits forever.
+/// Not capped at the chain tip: a node lagging the provider that wrote the checkpoint is normal.
 #[cfg(feature = "datasource-yellowstone")]
 pub fn resolve_startup_floor(
     live_start_slot: Option<u64>,
     anchor: u64,
-    tip: u64,
 ) -> Result<u64, IndexerError> {
     let floor = live_start_slot.map_or(anchor, |slot| slot.saturating_sub(1));
 
-    if floor > tip || floor < anchor {
+    if floor < anchor {
         return Err(DataSourceError::InvalidConfig {
             reason: format!(
-                "startup floor {floor} is outside the recoverable range [{anchor}, {tip}]; \
-                 check backfill.from_slot against the chain the RPC endpoint serves"
+                "startup floor {floor} is below the durable anchor {anchor}; the live boundary \
+                 and the anchor were resolved from different ranges"
             ),
         }
         .into());
@@ -390,6 +389,18 @@ impl BackfillService {
         };
 
         let current_slot = latest_slot_with_retry(&self.rpc_poller).await?;
+
+        // A boundary this far past the chain is a misconfiguration, not lag. Warn rather than
+        // refuse, because a node trailing the provider that wrote the checkpoint is routine.
+        if from_slot.saturating_sub(current_slot) > self.config.max_gap_slots {
+            warn!(
+                "Startup boundary {} is {} slots past the tip {} this endpoint reports; check \
+                 backfill.start_slot against the chain it serves",
+                from_slot,
+                from_slot - current_slot,
+                current_slot
+            );
+        }
 
         // One past the highest slot backfill covers (gap) or the durable checkpoint
         // (no gap); max guards against an RPC node lagging behind the checkpoint.
@@ -617,40 +628,14 @@ mod tests {
     #[cfg(feature = "datasource-yellowstone")]
     #[test]
     fn startup_floor_is_the_slot_below_the_live_boundary() {
-        assert_eq!(
-            resolve_startup_floor(Some(1_001), 500, 2_000).unwrap(),
-            1_000
-        );
+        assert_eq!(resolve_startup_floor(Some(1_001), 500).unwrap(), 1_000);
     }
 
     /// With no backfill there is no range to inherit and the anchor is the boundary itself.
     #[cfg(feature = "datasource-yellowstone")]
     #[test]
     fn startup_floor_falls_back_to_the_anchor() {
-        assert_eq!(resolve_startup_floor(None, 500, 2_000).unwrap(), 500);
-    }
-
-    /// A from_slot set past the chain would gate on slots that can never be produced, which
-    /// freezes the checkpoint for good. Refuse to start rather than stall silently.
-    #[cfg(feature = "datasource-yellowstone")]
-    #[test]
-    fn startup_floor_rejects_a_boundary_above_the_chain_tip() {
-        let err = resolve_startup_floor(Some(9_001), 500, 2_000).unwrap_err();
-        assert!(
-            err.to_string().contains("9000"),
-            "the error must name the rejected floor: {err}"
-        );
-    }
-
-    /// The tip is read after the boundary is resolved, so equality is the normal case for a
-    /// deployment starting at the tip and must not be mistaken for a misconfiguration.
-    #[cfg(feature = "datasource-yellowstone")]
-    #[test]
-    fn startup_floor_accepts_a_boundary_at_the_chain_tip() {
-        assert_eq!(
-            resolve_startup_floor(Some(2_001), 500, 2_000).unwrap(),
-            2_000
-        );
+        assert_eq!(resolve_startup_floor(None, 500).unwrap(), 500);
     }
 
     /// The anchor is the lowest slot startup owns, so a floor under it means the two were
@@ -658,7 +643,7 @@ mod tests {
     #[cfg(feature = "datasource-yellowstone")]
     #[test]
     fn startup_floor_rejects_a_boundary_below_the_anchor() {
-        assert!(resolve_startup_floor(Some(401), 500, 2_000).is_err());
+        assert!(resolve_startup_floor(Some(401), 500).is_err());
     }
 
     // ============================================================================

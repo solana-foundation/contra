@@ -7,7 +7,7 @@
 //! Two properties are pinned here, both of which need real Postgres:
 //!
 //! 1. A clean run records every deposit in the range and advances the durable
-//!    checkpoint to the range top, and re-running it changes nothing.
+//!    checkpoint past the last of them, and re-running it changes nothing.
 //! 2. A run whose slot writes fail exits non-zero carrying the storage error, and
 //!    leaves the checkpoint parked below the slot it could not store, so the next
 //!    attempt replays from there.
@@ -255,7 +255,8 @@ async fn execute_deposit(
 // ── tests ───────────────────────────────────────────────────────────────────
 
 /// A backfill-only repair must record the finalized deposits in its range and only
-/// report success once the checkpoint covers that range. Re-running it must be a no-op.
+/// report success once the checkpoint covers every one of them. Re-running it must be
+/// a no-op.
 #[tokio::test(flavor = "multi_thread")]
 async fn backfill_only_records_finalized_deposits_and_exits_clean(
 ) -> Result<(), Box<dyn std::error::Error>> {

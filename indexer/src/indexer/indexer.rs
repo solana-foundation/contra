@@ -400,12 +400,8 @@ pub async fn run(
         reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage).await?;
     }
 
-    // 3. Create channels
-    let (instruction_tx, instruction_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
-    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
-
-    // 4a. Backfill-only mode is self-contained: it gates the writer to the fill range,
-    //     runs the fill and exits. Nothing below this point applies to it.
+    // 3. Backfill-only mode is self-contained: it gates the writer to the fill range,
+    //    runs the fill and exits. Nothing below this point applies to it.
     if backfill_only {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -427,6 +423,11 @@ pub async fn run(
             .await;
         }
     }
+
+    // 4a. Create channels. Below the block above because backfill-only returns without
+    //     them: it owns a short-lived pipeline and builds its own pair.
+    let (instruction_tx, instruction_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
 
     // 4b. Start the checkpoint writer ungated. When a fill runs below it arms the gate
     //     in-band with a Regate that rides ahead of the slots it protects, which also

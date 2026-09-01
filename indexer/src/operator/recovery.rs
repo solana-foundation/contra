@@ -2707,8 +2707,9 @@ mod tests {
         let mut row = make_withdrawal_row(1, Some(3));
         row.updated_at = Utc::now() - chrono::Duration::minutes(10);
         mock.pending_transactions.lock().unwrap().push(row.clone());
-        // The mint is unknown (a DB-first read), so the build is a transient error,
-        // and the rescue write that would requeue the row fails too.
+        // The allowlist read fails for the whole of its retry budget, which is the
+        // DB outage, and the rescue write that would requeue the row fails too.
+        mock.set_fail_times("get_mint", 3);
         mock.set_fail_times("try_requeue_prebroadcast", 1);
         let storage = Arc::new(Storage::Mock(mock.clone()));
 

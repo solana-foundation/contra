@@ -1,3 +1,4 @@
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -49,10 +50,69 @@ pub fn is_allowed_program_instruction(program_id: &Pubkey, data: &[u8]) -> bool 
         || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
 }
 
+/// Rejection reason shared by every admission path, so clients see one wording.
+pub const ADDRESS_LOOKUP_UNSUPPORTED: &str =
+    "Address lookup tables are not supported; submit a transaction with no address table lookups";
+
+/// True when a v0 message declares address table lookups.
+///
+/// No lookup table program is admitted here, so a declared lookup names a table
+/// that cannot exist. Admitting one unresolved would leave the transaction's
+/// account keys missing every address the lookup was supposed to supply.
+pub fn has_address_table_lookups(message: &VersionedMessage) -> bool {
+    matches!(message, VersionedMessage::V0(m) if !m.address_table_lookups.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::message::{v0, v0::MessageAddressTableLookup, Message, MessageHeader};
     use solana_system_interface::instruction::SystemInstruction;
+
+    fn v0_message(num_lookups: usize) -> VersionedMessage {
+        let address_table_lookups = (0..num_lookups)
+            .map(|_| MessageAddressTableLookup {
+                account_key: Pubkey::new_unique(),
+                writable_indexes: vec![0],
+                readonly_indexes: vec![],
+            })
+            .collect();
+        VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![Pubkey::new_unique(), spl_token::id()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![],
+            address_table_lookups,
+        })
+    }
+
+    // The predicate keys on declaration, not on whether an instruction uses the
+    // table, and legacy messages have no lookups to declare.
+    #[test]
+    fn address_table_lookup_detection() {
+        let cases = [
+            (
+                "legacy",
+                VersionedMessage::Legacy(Message::default()),
+                false,
+            ),
+            ("v0 with no lookups", v0_message(0), false),
+            ("v0 with one lookup", v0_message(1), true),
+            ("v0 with two lookups", v0_message(2), true),
+        ];
+        for (label, message, expected) in cases {
+            assert_eq!(
+                has_address_table_lookups(&message),
+                expected,
+                "{label} must report {expected}"
+            );
+        }
+    }
 
     #[test]
     fn spl_initialize_mint_is_admin() {

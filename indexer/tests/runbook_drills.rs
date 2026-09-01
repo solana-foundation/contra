@@ -227,6 +227,14 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         (
+            "unsupported withdrawal mint:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "withdrawal mint absent on target chain:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
             "withdrawal pipeline halted after poison-pill",
             "indexer/src/operator/processor.rs",
         ),

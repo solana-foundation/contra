@@ -1,9 +1,5 @@
-//! Reconnect-gap recovery for `YellowstoneSource`.
-//!
-//! After a Yellowstone disconnect, the source reads the durable checkpoint
-//! from storage and passes `checkpoint - 1`
-//! to `fill_slot_range` so the boundary slot is replayed via RPC. Tx/mint
-//! inserts are idempotent, so replaying is safe.
+//! Gap recovery for `YellowstoneSource`. Every connection, cold start or reconnect, arms on the
+//! slot it resumed at and replays from `checkpoint - 1`; inserts are idempotent, so that is safe.
 
 use mockito::{Matcher, Server as MockitoServer};
 use private_channel_indexer::config::ProgramType;
@@ -25,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "yellowstone_helpers.rs"]
 mod yellowstone_helpers;
-use yellowstone_helpers::empty_block;
+use yellowstone_helpers::{empty_block, slot_update};
 
 fn empty_block_json() -> serde_json::Value {
     json!({
@@ -188,12 +184,10 @@ async fn gap_fill_runs_after_drop_stream() {
     server.shutdown().await;
 }
 
-/// The bug, end to end. With no durable anchor there is no lower bound to replay from, so
-/// the slot the replacement stream resumes at must be withheld. Forwarding it is what used
-/// to carry the checkpoint over the slots that arrived while nothing was listening, and
-/// once the checkpoint passed them nothing revisited them on any later restart.
+/// The bug, end to end. With no anchor there is no lower bound, so the resuming slot must be
+/// withheld; forwarding it is what carried the checkpoint over slots nothing was listening for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reconnect_without_anchor_withholds_live_slots() {
+async fn cold_start_without_anchor_withholds_live_slots() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,private_channel_indexer=debug")
         .with_test_writer()
@@ -246,20 +240,28 @@ async fn reconnect_without_anchor_withholds_live_slots() {
         .await
         .expect("yellowstone source start");
 
-    // The first connection is a cold start and forwards its block without arming.
+    // Phase 1: the cold start must withhold too; hold well past the 5s arm backoff.
     server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
-    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("slot 100 must be forwarded on the first connection");
+    let cold_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut cold_leaked = vec![];
+    while tokio::time::Instant::now() < cold_deadline {
+        if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+            tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        {
+            cold_leaked.push(slot);
+        }
+    }
     assert!(
-        matches!(
-            first,
-            Some(ProcessorMessage::SlotComplete { slot: 100, .. })
-        ),
-        "expected SlotComplete for slot 100, got {first:?}"
+        cold_leaked.is_empty(),
+        "the first connection may not forward without a durable anchor; leaked: {cold_leaked:?}"
+    );
+    assert_eq!(
+        server.remaining_scripted(),
+        0,
+        "slot 100 must have been delivered to the source and withheld, not left unsent"
     );
 
-    // Drop, then resume at a later slot. Slot 101 is the value-bearing slot nobody saw.
+    // Phase 2: drop and resume at 102, the slot that would carry the checkpoint over 101.
     server.drop_stream();
     server.enqueue(UpdateMatcher, Update::ok(empty_block(102)));
 
@@ -279,9 +281,12 @@ async fn reconnect_without_anchor_withholds_live_slots() {
         "no slot may be forwarded without a durable anchor; leaked: {leaked:?}"
     );
     no_blocks.assert_async().await;
-    assert!(
-        server.call_count("subscribe") >= 2,
-        "the source resubscribes; the withheld block, not a blocked resubscribe, is the guard"
+    // Waiting for an anchor parks inside the live connection, so the drop is never seen and
+    // nothing resubscribes. Phase 1 already proved the block reached the source and was held.
+    assert_eq!(
+        server.call_count("subscribe"),
+        1,
+        "the anchor wait holds the connection open instead of cycling it"
     );
 
     cancel.cancel();
@@ -432,8 +437,7 @@ async fn first_connection_arms_when_startup_backfill_anchored() {
         None,
     )
     .with_gap_detection(rpc_poller, 1_000, 16)
-    .with_storage(storage)
-    .with_first_connection_arming();
+    .with_storage(storage);
 
     let handle = source
         .start(tx, cancel.clone())
@@ -486,5 +490,214 @@ async fn first_connection_arms_when_startup_backfill_anchored() {
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    server.shutdown().await;
+}
+
+/// Blocks are program-filtered, so a quiet program leaves a long stretch between the resume
+/// slot and the first block. Arming on the block would measure idle time and trip the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_program_arms_on_the_resume_slot_not_the_first_block() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    const CHECKPOINT: u64 = 100;
+    const RESUME: u64 = 103;
+    // Far above the resume slot, as a program left idle for a long stretch would be.
+    const FIRST_BLOCK: u64 = 5_000;
+    // Comfortably smaller than FIRST_BLOCK - CHECKPOINT, so arming there would fail closed.
+    const MAX_GAP: u64 = 100;
+
+    let mut rpc_mock = MockitoServer::new_async().await;
+    let _enumeration = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [CHECKPOINT, RESUME]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": [100, 101, 102, 103], "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let mut block_mocks = Vec::new();
+    for slot in CHECKPOINT..=RESUME {
+        block_mocks.push(
+            rpc_mock
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(
+                    json!({"method": "getBlock", "params": [slot]}),
+                ))
+                .with_status(200)
+                .with_body(
+                    json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string(),
+                )
+                .expect_at_least(1)
+                .create_async()
+                .await,
+        );
+    }
+    // Nothing may be fetched from the idle stretch above the resume slot.
+    let idle_stretch = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlock", "params": [FIRST_BLOCK]}),
+        ))
+        .expect(0)
+        .create_async()
+        .await;
+
+    let server = MockYellowstoneServer::start().await;
+    let rpc_poller = Arc::new(RpcPoller::new(
+        rpc_mock.url(),
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Confirmed,
+    ));
+    let mock_storage = MockStorage::new();
+    mock_storage.set_checkpoint("escrow", CHECKPOINT);
+    let storage: Arc<Storage> = Arc::new(Storage::Mock(mock_storage));
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(256);
+    let cancel = CancellationToken::new();
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_gap_detection(rpc_poller, MAX_GAP, 16)
+    .with_storage(storage);
+
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // The stream resumes at RESUME, then the program stays silent until FIRST_BLOCK.
+    server.enqueue(UpdateMatcher, Update::ok(slot_update(RESUME)));
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(FIRST_BLOCK)));
+
+    let mut regate: Option<(u64, u64)> = None;
+    let mut seen: HashSet<u64> = HashSet::new();
+    let wanted: HashSet<u64> = (CHECKPOINT..=RESUME).collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while regate.is_none() || !wanted.is_subset(&seen) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("timed out; regate: {regate:?}, seen: {seen:?}");
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) => {
+                seen.insert(slot);
+            }
+            Ok(Some(ProcessorMessage::Regate { from, target, .. })) => {
+                regate = Some((from, target));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("channel closed early"),
+            Err(_) => panic!("timed out; regate: {regate:?}, seen: {seen:?}"),
+        }
+    }
+
+    assert_eq!(
+        regate,
+        Some((CHECKPOINT, RESUME)),
+        "the gate must target the resume slot, not the first program block"
+    );
+    idle_stretch.assert_async().await;
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    server.shutdown().await;
+}
+
+/// A provider that sends no slot updates must still gate, falling back to the first block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_block_still_arms_when_no_slot_update_arrives() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,private_channel_indexer=debug")
+        .with_test_writer()
+        .try_init();
+
+    const CHECKPOINT: u64 = 100;
+    const TIP: u64 = 103;
+
+    let mut rpc_mock = MockitoServer::new_async().await;
+    let _enumeration = rpc_mock
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [CHECKPOINT, TIP]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": [100, 101, 102, 103], "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let mut block_mocks = Vec::new();
+    for slot in CHECKPOINT..=TIP {
+        block_mocks.push(
+            rpc_mock
+                .mock("POST", "/")
+                .match_body(Matcher::PartialJson(
+                    json!({"method": "getBlock", "params": [slot]}),
+                ))
+                .with_status(200)
+                .with_body(
+                    json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string(),
+                )
+                .expect_at_least(1)
+                .create_async()
+                .await,
+        );
+    }
+
+    let server = MockYellowstoneServer::start().await;
+    let rpc_poller = Arc::new(RpcPoller::new(
+        rpc_mock.url(),
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Confirmed,
+    ));
+    let mock_storage = MockStorage::new();
+    mock_storage.set_checkpoint("escrow", CHECKPOINT);
+    let storage: Arc<Storage> = Arc::new(Storage::Mock(mock_storage));
+
+    let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(256);
+    let cancel = CancellationToken::new();
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_gap_detection(rpc_poller, 1_000, 16)
+    .with_storage(storage);
+
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    // Blocks only: no slot update is ever delivered on this stream.
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(TIP)));
+
+    let mut regate: Option<(u64, u64)> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while regate.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ProcessorMessage::Regate { from, target, .. })) => {
+                regate = Some((from, target));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("channel closed early"),
+            Err(_) => panic!("no gate was armed without a slot update"),
+        }
+    }
+    assert_eq!(regate, Some((CHECKPOINT, TIP)));
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     server.shutdown().await;
 }

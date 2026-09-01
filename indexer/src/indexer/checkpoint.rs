@@ -379,6 +379,19 @@ pub fn start_floor(
                 checkpoint,
             })
         }
+        // Below the checkpoint the configured value is silently dropped, so say so once.
+        (Some(checkpoint), Some(start_slot)) if start_slot.saturating_sub(1) < checkpoint => {
+            warn!(
+                setting,
+                program_type = program_type.as_label(),
+                start_slot,
+                checkpoint,
+                "configured start slot is below the durable checkpoint and is ignored; \
+                 re-scanning already-indexed slots needs a destructive resync, not a lower \
+                 start slot"
+            );
+            Ok(checkpoint)
+        }
         (Some(checkpoint), _) => Ok(checkpoint),
         // Never indexed, so the configured start picks the floor, else catch up from genesis.
         (None, configured) => Ok(configured.unwrap_or(0).saturating_sub(1)),
@@ -886,7 +899,7 @@ mod tests {
         // (checkpoint, configured start, expected floor or None for a refusal, why)
         type Case = (Option<u64>, Option<u64>, Option<u64>, &'static str);
 
-        let cases: [Case; 10] = [
+        let cases: [Case; 12] = [
             (Some(100), Some(200), None, "skips 101..=199"),
             (Some(100), Some(102), None, "skips exactly one slot"),
             (
@@ -895,7 +908,14 @@ mod tests {
                 Some(100),
                 "resumes exactly, skips nothing",
             ),
-            (Some(100), Some(50), Some(100), "checkpoint wins"),
+            (Some(100), Some(50), Some(100), "checkpoint wins, warns"),
+            (
+                Some(100),
+                Some(100),
+                Some(100),
+                "one slot below the checkpoint still warns",
+            ),
+            (Some(0), Some(0), Some(0), "genesis start matches genesis checkpoint"),
             (Some(100), None, Some(100), "no configured start"),
             (Some(0), Some(1), Some(0), "genesis checkpoint resumed"),
             (Some(0), Some(2), None, "slot zero is a real checkpoint"),

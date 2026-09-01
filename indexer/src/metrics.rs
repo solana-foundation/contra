@@ -153,6 +153,21 @@ counter_vec!(
     &["program_type", "reason"]
 );
 
+/// Reason labels for the withdrawal bails that park one row and leave the
+/// pipeline running. Kept here so the emitting code and the pre-registration
+/// below read one list and a label cannot exist in only one of them.
+pub const BAIL_REASON_UNSUPPORTED_MINT: &str = "unsupported_mint";
+pub const BAIL_REASON_TARGET_MINT_MISSING: &str = "target_mint_missing";
+pub const BAIL_REASON_MINT_PAUSED: &str = "mint_paused";
+pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
+
+pub const BAIL_REASONS: [&str; 4] = [
+    BAIL_REASON_UNSUPPORTED_MINT,
+    BAIL_REASON_TARGET_MINT_MISSING,
+    BAIL_REASON_MINT_PAUSED,
+    BAIL_REASON_ESCROW_DRAINED,
+];
+
 // Supervision: a critical task inside the operator exited.  The supervisor
 // aborts the process immediately when this increments; the counter exists
 // so dashboards can alert even if the restart is fast.
@@ -308,9 +323,18 @@ pub fn init_labels(program_type: &str) {
     FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
 
     // Quarantine reasons must match the string constants returned by
-    // `classify_processor_error` in processor.rs — any mismatch is a dead
+    // `classify_processor_error` in processor.rs - any mismatch is a dead
     // label (visible in Prometheus, never incremented).
-    for reason in &["invalid_pubkey", "invalid_builder", "program_error"] {
+    for reason in &[
+        "invalid_pubkey",
+        "invalid_builder",
+        "program_error",
+        "mint_not_allowed",
+    ] {
+        OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
+    }
+
+    for reason in &BAIL_REASONS {
         OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
     }
 

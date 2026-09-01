@@ -1,5 +1,5 @@
 use crate::config::{ProgramType, ReconciliationConfig};
-use crate::error::{DataSourceError, IndexerError, ReconciliationError};
+use crate::error::{CheckpointError, DataSourceError, IndexerError, ReconciliationError};
 use crate::{
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
@@ -21,7 +21,8 @@ use crate::{
     indexer::{
         backfill::{BackfillService, StartupRange},
         checkpoint::{
-            get_last_checkpoint, wait_for_checkpoint_commit, CHECKPOINT_COMMIT_TIMEOUT_SECS,
+            get_last_checkpoint, program_key, wait_for_checkpoint_commit,
+            CHECKPOINT_COMMIT_TIMEOUT_SECS,
         },
     },
     operator::escrow_sweep::CustodySnapshot,
@@ -269,9 +270,28 @@ async fn run_backfill_only(
     storage: Arc<Storage>,
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
+    configured_start_slot: Option<u64>,
 ) -> Result<(), IndexerError> {
     // Resolve first and fail closed: with no live stream there is no ungated fallback.
     let range = backfill_service.resolve_range().await?;
+
+    // A floor above the durable checkpoint means the slots in between are outside the
+    // fill, yet the gated writer seeds its frontier at that floor and would walk it to
+    // the target, committing a checkpoint over slots nothing ever fetched. Absence of a
+    // checkpoint is the one case a configured start slot may set the floor: it is
+    // initializing a ledger, not skipping one.
+    if let Some(committed) = get_last_checkpoint(&storage, program_type).await? {
+        if range.anchor > committed {
+            return Err(IndexerError::Checkpoint(
+                CheckpointError::StartSlotAheadOfCheckpoint {
+                    setting: "indexer.backfill.start_slot",
+                    program_type: program_key(program_type),
+                    start_slot: configured_start_slot.unwrap_or(range.anchor + 1),
+                    checkpoint: committed,
+                },
+            ));
+        }
+    }
 
     let (instruction_tx, instruction_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
@@ -419,6 +439,7 @@ pub async fn run(
                 storage.clone(),
                 common_config.program_type,
                 common_config.escrow_instance_id,
+                indexer_config.backfill.start_slot,
             )
             .await;
         }
@@ -1026,6 +1047,34 @@ mod tests {
             )
         }
 
+        /// Escrow backfill service with a configured start slot, which is what pushes the
+        /// resolved floor above the durable checkpoint.
+        fn service_starting_at(
+            server: &Server,
+            storage: Arc<Storage>,
+            start_slot: u64,
+        ) -> BackfillService {
+            let poller = Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            ));
+            BackfillService::new(
+                storage,
+                poller,
+                ProgramType::Escrow,
+                BackfillConfig {
+                    enabled: true,
+                    exit_after_backfill: true,
+                    rpc_url: server.url(),
+                    batch_size: 10,
+                    max_gap_slots: u64::MAX,
+                    start_slot: Some(start_slot),
+                },
+                None,
+            )
+        }
+
         /// Escrow checkpoint currently held by the mock store.
         fn checkpoint_of(mock: &MockStorage) -> Option<u64> {
             mock.committed_checkpoints
@@ -1033,6 +1082,84 @@ mod tests {
                 .unwrap()
                 .get("escrow")
                 .copied()
+        }
+
+        /// A start slot above the durable checkpoint would leave the slots in between
+        /// unfetched while the gated writer walked its frontier to the target, committing
+        /// a checkpoint over them. The run must refuse instead.
+        #[tokio::test]
+        async fn backfill_only_refuses_start_slot_above_checkpoint() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 6000);
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service_starting_at(&server, storage.clone(), 5000);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(5000)).await;
+
+            let err = result.expect_err("a start slot past the checkpoint must refuse");
+            assert!(
+                matches!(
+                    err,
+                    IndexerError::Checkpoint(CheckpointError::StartSlotAheadOfCheckpoint {
+                        setting: "indexer.backfill.start_slot",
+                        start_slot: 5000,
+                        checkpoint: 100,
+                        ..
+                    })
+                ),
+                "expected a start-slot refusal naming the backfill key, got {err:?}"
+            );
+            assert_eq!(
+                checkpoint_of(&mock),
+                Some(100),
+                "a refused run must leave the checkpoint exactly where it was"
+            );
+        }
+
+        /// The one legitimate use of the knob: a ledger that has never been indexed has no
+        /// checkpoint to skip past, so the configured slot sets the floor.
+        #[tokio::test]
+        async fn backfill_only_allows_start_slot_on_an_unindexed_ledger() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 5002);
+            let _blocks = chain(
+                &mut server,
+                5000,
+                5002,
+                &[(5000, 4999), (5001, 5000), (5002, 5001)],
+            );
+            let mock = MockStorage::new();
+            let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+
+            let backfill = service_starting_at(&server, storage.clone(), 5000);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(5000)).await;
+
+            assert!(
+                result.is_ok(),
+                "an unindexed ledger may be initialised from a configured start slot: {result:?}"
+            );
+        }
+
+        /// The floor is exclusive and the configured slot inclusive, so an ordinary restart
+        /// that passes the checkpoint back in lands exactly on it. That must not be refused.
+        #[tokio::test]
+        async fn backfill_only_allows_start_slot_resuming_at_the_checkpoint() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 102);
+            let _blocks = chain(&mut server, 101, 102, &[(101, 100), (102, 101)]);
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service_starting_at(&server, storage.clone(), 101);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(101)).await;
+
+            assert!(
+                result.is_ok(),
+                "a start slot resolving to the checkpoint itself must not refuse: {result:?}"
+            );
+            assert_eq!(checkpoint_of(&mock), Some(102));
         }
 
         /// Every slot in the range is consumed, so the checkpoint lands on the target.
@@ -1044,7 +1171,8 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result = run_backfill_only(backfill, storage, ProgramType::Escrow, None).await;
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
 
             assert!(result.is_ok(), "clean backfill must succeed: {result:?}");
             assert_eq!(
@@ -1070,7 +1198,7 @@ mod tests {
             let backfill = service(&server, storage.clone(), 10_000, u64::MAX, None);
             let outcome = tokio::time::timeout(
                 Duration::from_secs(60),
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None),
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None),
             )
             .await;
 
@@ -1093,7 +1221,8 @@ mod tests {
 
             let instance = Some(deposit_fixture_instance());
             let backfill = service(&server, storage.clone(), 10, 1000, instance);
-            let result = run_backfill_only(backfill, storage, ProgramType::Escrow, instance).await;
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, instance, None).await;
 
             assert!(result.is_ok(), "deposit backfill must succeed: {result:?}");
             let rows: Vec<_> = mock
@@ -1127,7 +1256,8 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service(&server, storage.clone(), 2, 1000, None);
-            let result = run_backfill_only(backfill, storage, ProgramType::Escrow, None).await;
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
 
             assert!(result.is_err(), "a failed fetch must fail the run");
             assert_eq!(
@@ -1148,7 +1278,8 @@ mod tests {
             mock.set_should_fail("escrow", true);
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result = run_backfill_only(backfill, storage, ProgramType::Escrow, None).await;
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
 
             match result {
                 Err(IndexerError::BackfillIncomplete {
@@ -1176,7 +1307,8 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result = run_backfill_only(backfill, storage, ProgramType::Escrow, None).await;
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
 
             assert!(result.is_ok(), "an empty range must succeed: {result:?}");
             no_blocks.assert();

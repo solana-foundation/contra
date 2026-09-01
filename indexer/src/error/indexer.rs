@@ -212,4 +212,19 @@ pub enum CheckpointError {
         target: u64,
         waited_secs: u64,
     },
+
+    /// `setting` names the offending config key so the message points at the knob to
+    /// change, since the two keys that can trigger this need different remedies.
+    #[error(
+        "Configured {setting} {start_slot} is ahead of the durable checkpoint {checkpoint} \
+         for {program_type}: the slots after {checkpoint} and below {start_slot} have never \
+         been indexed and would be skipped. Lower {setting} to {checkpoint} or below, unset \
+         it, or run a destructive resync if the skip is intended."
+    )]
+    StartSlotAheadOfCheckpoint {
+        setting: &'static str,
+        program_type: String,
+        start_slot: u64,
+        checkpoint: u64,
+    },
 }

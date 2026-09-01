@@ -89,6 +89,15 @@ WHERE program_type = 'escrow';
 Everything between that slot and the tip is then re-indexed. That is safe but not free, so
 pick the highest slot that still sits below the hole.
 
+**Raising `start_slot` above the checkpoint is refused.** The floor would land above slots
+that were never indexed, and because the checkpoint writer is gated from that floor it would
+walk to the top of the range and commit a checkpoint over them. Nothing would go back for
+them afterwards: the next run resolves its floor from that higher checkpoint. The run stops
+with `StartSlotAheadOfCheckpoint` instead. A configured `start_slot` may set the floor only
+on a database that has never been indexed, where there is no checkpoint to skip past. If a
+skip is genuinely intended, drop the checkpoint with a destructive resync rather than
+raising the start slot.
+
 ### Transaction Identity & CPI Indexing
 
 Each indexed instruction is keyed on the triple **`(signature, instruction_index, inner_index)`**:

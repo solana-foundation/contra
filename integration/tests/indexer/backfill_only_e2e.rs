@@ -25,7 +25,7 @@ mod setup;
 use helpers::{db, send_and_confirm_instructions};
 use private_channel_indexer::{
     config::{BackfillConfig, ReconciliationConfig},
-    error::IndexerError,
+    error::{CheckpointError, IndexerError},
     indexer::run,
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType,
@@ -403,6 +403,80 @@ async fn backfill_only_exits_nonzero_when_slot_writes_fail(
         checkpoint.is_none_or(|slot| slot < deposit_slot),
         "checkpoint {checkpoint:?} must stay below the unwritten deposit slot \
          {deposit_slot} so a retry replays it"
+    );
+
+    Ok(())
+}
+
+/// A repair whose start slot sits above the durable checkpoint must refuse.
+///
+/// The fill would cover only the range above that slot while the gated writer, seeded at
+/// the same floor, walked its frontier to the target. The run would exit clean having
+/// committed a checkpoint over slots nothing ever fetched, and because the next run reads
+/// that higher checkpoint as its floor, the skipped band would never be offered again.
+#[tokio::test(flavor = "multi_thread")]
+async fn backfill_only_refuses_a_start_slot_above_the_checkpoint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = Arc::new(RpcClient::new_with_commitment(
+        rpc_url.clone(),
+        CommitmentConfig::confirmed(),
+    ));
+    let (db_url, _storage, _pg) = start_postgres("backfill_only_start_slot_guard").await?;
+
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    let user = &env.users[0];
+
+    let (_sig, deposit_slot) =
+        execute_deposit(&client, user, &env.instance, &env.mint, DEPOSIT_AMOUNT_A).await?;
+    wait_for_finalized_slot(&rpc_url, deposit_slot + 3).await;
+    wait_for_block_available(&rpc_url, deposit_slot).await;
+
+    // Establish the checkpoint through the real repair path rather than seeding a row, so
+    // the guard is tested against a checkpoint this pipeline actually wrote.
+    let (common, indexer) =
+        backfill_only_config(rpc_url.clone(), db_url.clone(), env.instance, deposit_slot);
+    run_backfill_only_once(common, indexer)
+        .await
+        .expect("the first repair must succeed and leave a checkpoint");
+
+    let pool: PgPool = db::connect(&db_url).await?;
+    let committed = db::get_checkpoint_slot(&pool, "escrow")
+        .await?
+        .expect("the first run must leave a durable checkpoint");
+
+    // Well clear of the tip, so the skipped band is unambiguous.
+    let (common, indexer) = backfill_only_config(
+        rpc_url.clone(),
+        db_url.clone(),
+        env.instance,
+        committed + 10_000,
+    );
+    let err = run_backfill_only_once(common, indexer)
+        .await
+        .expect_err("a start slot above the checkpoint must refuse");
+
+    match err {
+        IndexerError::Checkpoint(CheckpointError::StartSlotAheadOfCheckpoint {
+            setting,
+            start_slot,
+            checkpoint,
+            ..
+        }) => {
+            assert_eq!(setting, "indexer.backfill.start_slot");
+            assert_eq!(start_slot, committed + 10_000);
+            assert_eq!(checkpoint, committed);
+        }
+        other => panic!("expected a start-slot refusal, got: {other:?}"),
+    }
+
+    // The refusal is only worth anything if it committed nothing on the way out.
+    let after = db::get_checkpoint_slot(&pool, "escrow").await?;
+    assert_eq!(
+        after,
+        Some(committed),
+        "a refused run must leave the checkpoint untouched, got {after:?}"
     );
 
     Ok(())

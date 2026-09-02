@@ -75,8 +75,26 @@ async fn publish_idle_slot(
         warn!("Failed to publish the idle slot: {:#}", e);
         return;
     }
-    if let Some(redis) = redis_db {
-        crate::accounts::current_slot::mirror_current_slot(redis, slot).await;
+    // A cache given up on is left alone here too: ten writes a second into one
+    // the batch path is deliberately not touching is most of the cost the
+    // give-up exists to avoid.
+    let Some(redis) = redis_db.filter(|redis| !redis.is_mirroring_paused()) else {
+        return;
+    };
+    // Awaited on the blocktime tick, so an unbounded wait here would stop the
+    // slot advancing and with it the heartbeat and expiry. The cache is never
+    // allowed to hold the chain, on this path or the batch one.
+    if tokio::time::timeout(
+        CACHE_MIRROR_BUDGET,
+        crate::accounts::current_slot::mirror_current_slot(redis, slot),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            "Mirroring the idle slot exceeded its {:?} budget, abandoning it",
+            CACHE_MIRROR_BUDGET
+        );
     }
 }
 
@@ -5984,6 +6002,80 @@ mod tests {
         assert_eq!(
             genesis_before, genesis_after,
             "the canonical slot zero must not be overwritten by a genesis restart"
+        );
+    }
+
+    /// A cache the settler gave up on is left alone by idle ticks too. Ten writes
+    /// a second into a paused cache is most of what the pause exists to stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_leaves_a_paused_cache_alone() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        publish_idle_slot(&postgres_db, Some(&redis_raw), 10).await;
+        redis_raw.pause_mirroring(Duration::from_secs(60));
+        publish_idle_slot(&postgres_db, Some(&redis_raw), 11).await;
+
+        let mut conn = redis_raw.connection.clone();
+        let mirrored: Option<u64> = conn
+            .get(crate::accounts::current_slot::CURRENT_SLOT_KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            mirrored,
+            Some(10),
+            "a paused cache must not be written by an idle tick"
+        );
+        assert_eq!(
+            pg_db.get_current_slot().await.unwrap(),
+            Some(11),
+            "the durable counter must advance whatever the cache is doing"
+        );
+    }
+
+    /// The idle publish is awaited on the blocktime tick, so a cache that accepts
+    /// the connection and stops answering would stop the chain: no slot advance,
+    /// no heartbeat block, no expiry. The budget is what keeps that impossible.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_does_not_wait_on_the_cache_past_its_budget() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let mut conn = redis_raw.connection.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(30_000u64)
+            .arg("ALL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        // Its own ceiling, because the failure this pins is a hang.
+        tokio::time::timeout(
+            CACHE_MIRROR_BUDGET * 10,
+            publish_idle_slot(&postgres_db, Some(&redis_raw), 42),
+        )
+        .await
+        .expect("a stalled cache must not hold the settler tick");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < CACHE_MIRROR_BUDGET * 3,
+            "the idle publish must abandon the cache at its budget, waited {waited:?}"
+        );
+        assert_eq!(
+            pg_db.get_current_slot().await.unwrap(),
+            Some(42),
+            "the slot must keep advancing while the cache is stalled"
         );
     }
 }

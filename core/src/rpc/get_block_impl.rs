@@ -27,12 +27,15 @@ pub async fn get_block_impl(
             .accounts_db
             .get_current_slot()
             .await
-            .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
-            .unwrap_or(0);
-        return Err(if slot <= tip {
-            slot_skipped(slot)
-        } else {
-            block_not_available(slot)
+            .map_err(|e| {
+                custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+            })?;
+        // No tip is a chain that has passed no slot, so nothing on it was
+        // skipped. Reading it as a tip of zero would call genesis skipped, the
+        // one slot here that never is.
+        return Err(match tip {
+            Some(tip) if slot <= tip => slot_skipped(slot),
+            _ => block_not_available(slot),
         });
     };
 

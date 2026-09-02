@@ -546,6 +546,24 @@ mod tests {
         assert_eq!(err.code(), crate::rpc::error::BLOCK_NOT_AVAILABLE_CODE);
     }
 
+    /// A chain that has produced nothing has passed no slot, so nothing on it can
+    /// have been skipped. Slot 0 is genesis, the one slot that is never skipped,
+    /// and calling it skipped tells a client not to retry the slot about to exist.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_on_a_chain_with_no_tip_is_not_available() {
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+
+        let err = get_block_impl::get_block_impl(&deps, 0, None)
+            .await
+            .expect_err("genesis does not exist yet on a chain with no tip");
+        assert_eq!(
+            err.code(),
+            crate::rpc::error::BLOCK_NOT_AVAILABLE_CODE,
+            "no tip means no slot has been passed, so none was skipped"
+        );
+    }
+
     /// The tip itself is the boundary: it has been reached, so a missing block
     /// there is a skip rather than an unreached slot.
     #[tokio::test(flavor = "multi_thread")]

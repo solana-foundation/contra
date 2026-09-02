@@ -174,6 +174,7 @@ ci-integration-test-prebuilt:
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@cd integration && cargo test --test backfill_only_e2e -- --nocapture
 	@cd integration && cargo test --test truncate_integration -- --nocapture
 	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
 	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
@@ -220,6 +221,7 @@ ci-integration-test-indexer:
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@cd integration && cargo test --test backfill_only_e2e -- --nocapture
 	@cd integration && cargo test --test truncate_integration -- --nocapture
 	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
 	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture

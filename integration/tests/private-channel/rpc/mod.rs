@@ -26,6 +26,7 @@ mod test_tx_replay;
 mod test_vote_accounts;
 mod utils;
 
+mod test_address_lookup_rejection;
 mod test_blocks_in_range_boundaries;
 mod test_health_endpoint;
 mod test_oversized_body;
@@ -66,6 +67,7 @@ pub use test_tx_replay::run_tx_replay_test;
 pub use test_vote_accounts::run_vote_accounts_test;
 pub use utils::*;
 
+pub use test_address_lookup_rejection::run_address_lookup_rejection_test;
 pub use test_blocks_in_range_boundaries::run_blocks_in_range_boundaries_test;
 pub use test_health_endpoint::run_health_endpoint_test;
 pub use test_oversized_body::run_oversized_body_test;

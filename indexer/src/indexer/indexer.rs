@@ -1,5 +1,5 @@
 use crate::config::{ProgramType, ReconciliationConfig};
-use crate::error::{DataSourceError, IndexerError, ReconciliationError};
+use crate::error::{CheckpointError, DataSourceError, IndexerError, ReconciliationError};
 use crate::{
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
@@ -21,7 +21,8 @@ use crate::{
     indexer::{
         backfill::{BackfillService, StartupRange},
         checkpoint::{
-            get_last_checkpoint, wait_for_checkpoint_commit, CHECKPOINT_COMMIT_TIMEOUT_SECS,
+            get_last_checkpoint, program_key, wait_for_checkpoint_commit,
+            CHECKPOINT_COMMIT_TIMEOUT_SECS,
         },
     },
     operator::escrow_sweep::CustodySnapshot,
@@ -30,7 +31,7 @@ use crate::{
 use std::time::Duration;
 
 #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
-use crate::indexer::backfill::ensure_startup_anchor;
+use crate::indexer::backfill::{ensure_startup_anchor, resolve_startup_floor};
 
 #[cfg(feature = "datasource-rpc")]
 use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
@@ -46,6 +47,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "datasource-rpc")]
 use tracing::warn;
 use tracing::{error, info};
+
+/// Buffer depth for both pipeline channels, shared so the two creation sites cannot drift.
+const PIPELINE_CHANNEL_CAPACITY: usize = 1000;
 
 /// Which side of the processor-vs-shutdown race fired.
 enum Supervision {
@@ -254,6 +258,112 @@ fn spawn_transaction_processor(
     tokio::spawn(transaction_processor.start(instruction_rx))
 }
 
+/// Run a one-shot backfill and exit, with no live datasource behind it.
+///
+/// This owns the whole short-lived pipeline. The processor is the only component that
+/// writes rows and the only source of checkpoint updates, so it has to be running before
+/// the fill starts: with nothing draining the instruction channel the fill either fills
+/// the buffer and parks forever or finishes and has its whole output dropped unread.
+#[cfg(feature = "datasource-rpc")]
+async fn run_backfill_only(
+    backfill_service: BackfillService,
+    storage: Arc<Storage>,
+    program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
+    configured_start_slot: Option<u64>,
+) -> Result<(), IndexerError> {
+    // Resolve first and fail closed: with no live stream there is no ungated fallback.
+    let range = backfill_service.resolve_range().await?;
+
+    // A floor above the durable checkpoint means the slots in between are outside the
+    // fill, yet the gated writer seeds its frontier at that floor and would walk it to
+    // the target, committing a checkpoint over slots nothing ever fetched. Absence of a
+    // checkpoint is the one case a configured start slot may set the floor: it is
+    // initializing a ledger, not skipping one.
+    if let Some(committed) = get_last_checkpoint(&storage, program_type).await? {
+        if range.anchor > committed {
+            return Err(IndexerError::Checkpoint(
+                CheckpointError::StartSlotAheadOfCheckpoint {
+                    setting: "indexer.backfill.start_slot",
+                    program_type: program_key(program_type),
+                    start_slot: configured_start_slot.unwrap_or(range.anchor + 1),
+                    checkpoint: committed,
+                },
+            ));
+        }
+    }
+
+    let (instruction_tx, instruction_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
+
+    // Gating to the fill range keeps a failed slot from being leapfrogged by a later one.
+    let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
+    if let Some((from_slot, target)) = range.gap {
+        checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
+    }
+    let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
+    info!("CheckpointWriter service started");
+
+    // Health is deliberately left unwired. The indexer health contract demands continuous
+    // progress on a 30 second window, which fits a live stream but not a one-shot job:
+    // an ordinary slow stretch here, such as a block fetch riding out its retries, would
+    // report the process unhealthy and invite a supervisor to restart a repair that is
+    // still making progress. A run that never reports progress stays healthy instead.
+    let processor_handle = spawn_transaction_processor(
+        storage.clone(),
+        checkpoint_tx.clone(),
+        instruction_rx,
+        escrow_instance_id,
+        None,
+    );
+    info!("TransactionProcessor task spawned");
+
+    // Held, not propagated, so the drain below still runs and a partial fill keeps its slots.
+    let fill_result = match range.gap {
+        Some((from_slot, target)) => {
+            backfill_service
+                .run_range(from_slot, target, instruction_tx.clone())
+                .await
+        }
+        None => {
+            info!("No backfill gap to fill");
+            Ok(())
+        }
+    };
+
+    // Releasing the last sender is what ends the processor's receive loop.
+    drop(instruction_tx);
+    let processor_result = match processor_handle.await {
+        Ok(result) => result,
+        Err(join_err) => {
+            error!("TransactionProcessor task panicked: {:?}", join_err);
+            Err(IndexerError::ProcessorPanicked)
+        }
+    };
+
+    info!("Backfill completed, performing graceful cleanup...");
+    // The processor is joined above rather than here for a reason worth stating: it holds
+    // a clone of the checkpoint sender, so the writer cannot see its channel close while
+    // the processor is alive. Draining first would burn the full drain timeout and then
+    // flush a frontier missing every slot the processor had not finished writing yet.
+    let cleanup_result = cleanup_after_backfill(
+        checkpoint_handle,
+        checkpoint_tx,
+        storage,
+        range.gap.map(|(_, target)| (program_type, target)),
+    )
+    .await;
+
+    // Order of reporting matters because these failures cause one another. A processor
+    // that gives up on a write drops the instruction receiver, which the fill then sees
+    // as a send failure, and both leave the checkpoint short of its target. Reporting the
+    // processor first names the database error that actually started it, instead of
+    // pointing an operator at the channel or at the completeness check downstream of it.
+    processor_result?;
+    fill_result?;
+    cleanup_result
+}
+
 pub async fn run(
     common_config: PrivateChannelIndexerConfig,
     indexer_config: IndexerConfig,
@@ -310,12 +420,8 @@ pub async fn run(
         reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage).await?;
     }
 
-    // 3. Create channels
-    let (instruction_tx, instruction_rx) = mpsc::channel(1000);
-    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
-
-    // 4a. Backfill-only mode is self-contained: it gates the writer to the fill range,
-    //     runs the fill and exits. Nothing below this point applies to it.
+    // 3. Backfill-only mode is self-contained: it gates the writer to the fill range,
+    //    runs the fill and exits. Nothing below this point applies to it.
     if backfill_only {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -328,30 +434,21 @@ pub async fn run(
             let backfill_service =
                 build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
 
-            // Gate the writer to the fill range so a withheld (failed-write) slot stalls
-            // the checkpoint instead of being leapfrogged by a later one. No live stream,
-            // so a resolve failure fails closed rather than falling back to ungated.
-            let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
-            let range = backfill_service.resolve_range().await?;
-            if let Some((from_slot, target)) = range.gap {
-                checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
-            }
-            let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
-            info!("CheckpointWriter service started");
-            if let Some((from_slot, target)) = range.gap {
-                backfill_service
-                    .run_range(from_slot, target, instruction_tx.clone())
-                    .await?;
-            }
-            info!("Backfill completed, performing graceful cleanup...");
-            if let Err(e) = cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage).await
-            {
-                error!("Cleanup after backfill failed: {}", e);
-                return Err(IndexerError::ShutdownChannelSend);
-            }
-            return Ok(());
+            return run_backfill_only(
+                backfill_service,
+                storage.clone(),
+                common_config.program_type,
+                common_config.escrow_instance_id,
+                indexer_config.backfill.start_slot,
+            )
+            .await;
         }
     }
+
+    // 4a. Create channels. Below the block above because backfill-only returns without
+    //     them: it owns a short-lived pipeline and builds its own pair.
+    let (instruction_tx, instruction_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel(PIPELINE_CHANNEL_CAPACITY);
 
     // 4b. Start the checkpoint writer ungated. When a fill runs below it arms the gate
     //     in-band with a Regate that rides ahead of the slots it protects, which also
@@ -379,11 +476,6 @@ pub async fn run(
     // Floor of the resolved startup range; None makes the anchor fall back to the chain tip.
     #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
     let mut startup_anchor_hint: Option<u64> = None;
-
-    // Whether a startup fill ran ahead of the live stream, which is what opens the window
-    // the Yellowstone source has to repair on its very first connection.
-    #[cfg(all(feature = "datasource-rpc", feature = "datasource-yellowstone"))]
-    let mut backfill_preceded_stream = false;
 
     // 4d. Fill the missing range. An escrow indexer waits for that fill to become durable
     // and reconciles before the stream starts; every other program type keeps the fill
@@ -541,13 +633,6 @@ pub async fn run(
                             Err(e) => return Err(e),
                         }
                     }
-
-                    // Only this path leaves a window between the fill and the first
-                    // streamed slot; a concurrent fill still covers the cold start itself.
-                    #[cfg(feature = "datasource-yellowstone")]
-                    {
-                        backfill_preceded_stream = true;
-                    }
                 }
                 None => {
                     let range = resolve_startup_range(&backfill_service).await?;
@@ -669,7 +754,7 @@ pub async fn run(
                 // before the stream can deliver anything. Failing here refuses to start,
                 // which beats streaming past a window that could never be recovered: once a
                 // later slot is checkpointed, the slots below it stop being reachable.
-                ensure_startup_anchor(
+                let anchor = ensure_startup_anchor(
                     &storage,
                     common_config.program_type,
                     &gap_rpc_poller,
@@ -677,24 +762,18 @@ pub async fn run(
                 )
                 .await?;
 
-                let source = source
+                // Startup owns everything below its live boundary, so the first stream only
+                // replays above it. With no backfill the anchor is that boundary itself.
+                let startup_floor = resolve_startup_floor(rpc_live_start_slot, anchor)?;
+
+                source
+                    .with_startup_floor(startup_floor)
                     .with_gap_detection(
                         gap_rpc_poller,
                         indexer_config.backfill.max_gap_slots,
                         indexer_config.backfill.batch_size,
                     )
-                    .with_storage(storage.clone());
-
-                // A fill that ran to completion above leaves the slots produced since its
-                // target covered by neither it nor the stream, and the first streamed slot
-                // would carry the checkpoint straight over them. Arming the first
-                // connection replays that window instead. The anchor it needs was just
-                // guaranteed above.
-                if backfill_preceded_stream {
-                    source.with_first_connection_arming()
-                } else {
-                    source
-                }
+                    .with_storage(storage.clone())
             };
 
             let source = if let Some(h) = health.clone() {
@@ -891,5 +970,335 @@ mod tests {
         let outcome = supervise(&mut handle, std::future::pending::<std::io::Result<()>>()).await;
 
         assert!(matches!(outcome, Supervision::ProcessorEnded(Err(_))));
+    }
+
+    /// One-shot backfill: every slot recorded, and the checkpoint only reaching the target
+    /// once the whole range is durably stored.
+    ///
+    /// Each case scripts a mock RPC and a mock store, then drives the real pipeline, so
+    /// what is under test is the wiring between the fill, the processor and the writer
+    /// rather than any one of them in isolation.
+    #[cfg(feature = "datasource-rpc")]
+    mod backfill_only {
+        use super::*;
+        use crate::config::BackfillConfig;
+        use crate::storage::common::storage::mock::MockStorage;
+        use crate::test_utils::rpc_mocks::{
+            chain, deposit_fixture_instance, mock_get_block_at, mock_get_block_error,
+            mock_get_block_with_deposit, mock_get_blocks, mock_get_blocks_with_limit,
+            mock_get_slot,
+        };
+        use mockito::Server;
+        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_transaction_status::UiTransactionEncoding;
+        use std::time::Duration;
+
+        /// Store seeded with an escrow checkpoint, plus the handle tests assert against.
+        fn seeded_storage(checkpoint: u64) -> (MockStorage, Arc<Storage>) {
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", checkpoint);
+            (mock.clone(), Arc::new(Storage::Mock(mock)))
+        }
+
+        /// Escrow backfill service pointed at the mock RPC.
+        fn service(
+            server: &Server,
+            storage: Arc<Storage>,
+            batch_size: usize,
+            max_gap_slots: u64,
+            escrow_instance_id: Option<Pubkey>,
+        ) -> BackfillService {
+            let poller = Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            ));
+            BackfillService::new(
+                storage,
+                poller,
+                ProgramType::Escrow,
+                BackfillConfig {
+                    enabled: true,
+                    exit_after_backfill: true,
+                    rpc_url: server.url(),
+                    batch_size,
+                    max_gap_slots,
+                    start_slot: None,
+                },
+                escrow_instance_id,
+            )
+        }
+
+        /// Escrow backfill service with a configured start slot, which is what pushes the
+        /// resolved floor above the durable checkpoint.
+        fn service_starting_at(
+            server: &Server,
+            storage: Arc<Storage>,
+            start_slot: u64,
+        ) -> BackfillService {
+            let poller = Arc::new(RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            ));
+            BackfillService::new(
+                storage,
+                poller,
+                ProgramType::Escrow,
+                BackfillConfig {
+                    enabled: true,
+                    exit_after_backfill: true,
+                    rpc_url: server.url(),
+                    batch_size: 10,
+                    max_gap_slots: u64::MAX,
+                    start_slot: Some(start_slot),
+                },
+                None,
+            )
+        }
+
+        /// Escrow checkpoint currently held by the mock store.
+        fn checkpoint_of(mock: &MockStorage) -> Option<u64> {
+            mock.committed_checkpoints
+                .lock()
+                .unwrap()
+                .get("escrow")
+                .copied()
+        }
+
+        /// A start slot above the durable checkpoint would leave the slots in between
+        /// unfetched while the gated writer walked its frontier to the target, committing
+        /// a checkpoint over them. The run must refuse instead.
+        #[tokio::test]
+        async fn backfill_only_refuses_start_slot_above_checkpoint() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 6000);
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service_starting_at(&server, storage.clone(), 5000);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(5000)).await;
+
+            let err = result.expect_err("a start slot past the checkpoint must refuse");
+            assert!(
+                matches!(
+                    err,
+                    IndexerError::Checkpoint(CheckpointError::StartSlotAheadOfCheckpoint {
+                        setting: "indexer.backfill.start_slot",
+                        start_slot: 5000,
+                        checkpoint: 100,
+                        ..
+                    })
+                ),
+                "expected a start-slot refusal naming the backfill key, got {err:?}"
+            );
+            assert_eq!(
+                checkpoint_of(&mock),
+                Some(100),
+                "a refused run must leave the checkpoint exactly where it was"
+            );
+        }
+
+        /// The one legitimate use of the knob: a ledger that has never been indexed has no
+        /// checkpoint to skip past, so the configured slot sets the floor.
+        #[tokio::test]
+        async fn backfill_only_allows_start_slot_on_an_unindexed_ledger() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 5002);
+            let _blocks = chain(
+                &mut server,
+                5000,
+                5002,
+                &[(5000, 4999), (5001, 5000), (5002, 5001)],
+            );
+            let mock = MockStorage::new();
+            let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+
+            let backfill = service_starting_at(&server, storage.clone(), 5000);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(5000)).await;
+
+            assert!(
+                result.is_ok(),
+                "an unindexed ledger may be initialised from a configured start slot: {result:?}"
+            );
+        }
+
+        /// The floor is exclusive and the configured slot inclusive, so an ordinary restart
+        /// that passes the checkpoint back in lands exactly on it. That must not be refused.
+        #[tokio::test]
+        async fn backfill_only_allows_start_slot_resuming_at_the_checkpoint() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 102);
+            let _blocks = chain(&mut server, 101, 102, &[(101, 100), (102, 101)]);
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service_starting_at(&server, storage.clone(), 101);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(101)).await;
+
+            assert!(
+                result.is_ok(),
+                "a start slot resolving to the checkpoint itself must not refuse: {result:?}"
+            );
+            assert_eq!(checkpoint_of(&mock), Some(102));
+        }
+
+        /// Every slot in the range is consumed, so the checkpoint lands on the target.
+        #[tokio::test]
+        async fn backfill_only_records_slots_and_advances_checkpoint() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 103);
+            let _blocks = chain(&mut server, 101, 103, &[(101, 100), (102, 101), (103, 102)]);
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service(&server, storage.clone(), 10, 1000, None);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+
+            assert!(result.is_ok(), "clean backfill must succeed: {result:?}");
+            assert_eq!(
+                checkpoint_of(&mock),
+                Some(103),
+                "the checkpoint must reach the fill target, which only happens if a \
+                 processor consumed every SlotComplete"
+            );
+        }
+
+        /// A range larger than the channel buffer must still drain rather than deadlock.
+        #[tokio::test]
+        async fn backfill_only_drains_more_slots_than_channel_capacity() {
+            let tip = 100 + PIPELINE_CHANNEL_CAPACITY as u64 + 500;
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, tip);
+            // No producers plus a witness past the range proves every slot empty in one batch.
+            let _blocks = mock_get_blocks(&mut server, 101, tip, &[]);
+            let _witness = mock_get_blocks_with_limit(&mut server, tip + 1, &[tip + 1]);
+            let _witness_block = mock_get_block_at(&mut server, tip + 1, 100);
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service(&server, storage.clone(), 10_000, u64::MAX, None);
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(60),
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None),
+            )
+            .await;
+
+            let result = outcome.expect(
+                "a backfill wider than the channel buffer must not park forever waiting \
+                 for a consumer",
+            );
+            assert!(result.is_ok(), "wide backfill must succeed: {result:?}");
+            assert_eq!(checkpoint_of(&mock), Some(tip));
+        }
+
+        /// Parsed instructions, not just slot markers, have to reach storage.
+        #[tokio::test]
+        async fn backfill_only_writes_deposit_rows_for_configured_instance() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 101);
+            let _blocks = mock_get_blocks(&mut server, 101, 101, &[101]);
+            let _block = mock_get_block_with_deposit(&mut server, 101, 100, 4242);
+            let (mock, storage) = seeded_storage(100);
+
+            let instance = Some(deposit_fixture_instance());
+            let backfill = service(&server, storage.clone(), 10, 1000, instance);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, instance, None).await;
+
+            assert!(result.is_ok(), "deposit backfill must succeed: {result:?}");
+            let rows: Vec<_> = mock
+                .inserted_transactions
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "the backfilled deposit must be written; an unscoped processor drops it"
+            );
+            assert_eq!(rows[0].amount.value(), 4242);
+            assert_eq!(checkpoint_of(&mock), Some(101));
+        }
+
+        /// A fill that dies part way still persists the contiguous prefix it completed.
+        #[tokio::test]
+        async fn backfill_only_persists_partial_frontier_when_fill_fails() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 103);
+            // batch_size 2 splits the range so the first batch lands before the second fails.
+            let _first = mock_get_blocks(&mut server, 101, 102, &[101, 102]);
+            let _b1 = mock_get_block_at(&mut server, 101, 100);
+            let _b2 = mock_get_block_at(&mut server, 102, 101);
+            let _second = mock_get_blocks(&mut server, 103, 103, &[103]);
+            let _b3 = mock_get_block_error(&mut server, 103, -32600, "Invalid request");
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service(&server, storage.clone(), 2, 1000, None);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+
+            assert!(result.is_err(), "a failed fetch must fail the run");
+            assert_eq!(
+                checkpoint_of(&mock),
+                Some(102),
+                "the slots that were stored must still be checkpointed so a retry resumes"
+            );
+        }
+
+        /// A checkpoint that never reaches the target must not report success.
+        #[tokio::test]
+        async fn backfill_only_reports_incomplete_when_checkpoint_flush_fails() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 103);
+            let _blocks = chain(&mut server, 101, 103, &[(101, 100), (102, 101), (103, 102)]);
+            let (mock, storage) = seeded_storage(100);
+            // Every checkpoint write fails; the writer only warns, so the run must catch it.
+            mock.set_should_fail("escrow", true);
+
+            let backfill = service(&server, storage.clone(), 10, 1000, None);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+
+            match result {
+                Err(IndexerError::BackfillIncomplete {
+                    committed, target, ..
+                }) => {
+                    assert_eq!(committed, Some(100));
+                    assert_eq!(target, 103);
+                }
+                other => panic!("a stalled checkpoint must fail the run, got: {other:?}"),
+            }
+        }
+
+        /// Nothing to fill is a clean exit that touches neither RPC blocks nor the checkpoint.
+        #[tokio::test]
+        async fn backfill_only_no_gap_is_a_clean_noop() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 100);
+            let no_blocks = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(
+                    serde_json::json!({ "method": "getBlocks" }),
+                ))
+                .expect(0)
+                .create();
+            let (mock, storage) = seeded_storage(100);
+
+            let backfill = service(&server, storage.clone(), 10, 1000, None);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+
+            assert!(result.is_ok(), "an empty range must succeed: {result:?}");
+            no_blocks.assert();
+            assert_eq!(
+                checkpoint_of(&mock),
+                Some(100),
+                "no gap means no slot was processed, so the checkpoint stands still"
+            );
+        }
     }
 }

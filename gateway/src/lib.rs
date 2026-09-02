@@ -699,6 +699,7 @@ impl Gateway {
                             &data,
                             &program_owner,
                             &pubkey,
+                            method,
                             user_id,
                             auth_db,
                         )

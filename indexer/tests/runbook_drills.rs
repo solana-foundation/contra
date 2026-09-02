@@ -227,6 +227,14 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         (
+            "unsupported withdrawal mint:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "withdrawal mint absent on target chain:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
             "withdrawal pipeline halted after poison-pill",
             "indexer/src/operator/processor.rs",
         ),
@@ -408,7 +416,7 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
     // `error_message IS NULL` filter applies cleanly. (The DB schema has no
     // error_message column today; the runbook semantics rely on the alert
     // payload, but the recovery SQL itself is column-free for the dispatch.)
-    let excluded_ids = vec![poison_id, held_id];
+    let excluded_ids = [poison_id, held_id];
     let updated = sqlx::query(
         r#"
         UPDATE transactions

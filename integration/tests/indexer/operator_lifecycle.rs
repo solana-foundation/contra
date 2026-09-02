@@ -198,28 +198,6 @@ async fn start_operator_with_config(
     })
 }
 
-async fn wait_for_transaction_status(
-    pool: &sqlx::PgPool,
-    signature: &str,
-    expected_status: &str,
-    timeout_secs: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let start = std::time::Instant::now();
-    while start.elapsed().as_secs() < timeout_secs {
-        if let Some(tx) = db::get_transaction(pool, signature).await? {
-            if tx.status == expected_status {
-                return Ok(());
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    Err(format!(
-        "Transaction {} did not reach status {} within {}s",
-        signature, expected_status, timeout_secs
-    )
-    .into())
-}
-
 /// Poll until the row reaches one of `expected_statuses`, returning the one it
 /// reached. A permanently-failed withdrawal is resolved by the deferred-remint
 /// gate, which can land on either a completed remint or an escalation, so the
@@ -600,14 +578,13 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
 }
 
 /// Triggers one preflight-failing mint (wrong-authority `mint_to`) and one bad
-/// withdrawal (mint not whitelisted on the instance).
+/// withdrawal (mint never allowlisted on the escrow).
 ///
-/// Neither is terminalized by the sender on the send error, because both journal
-/// their signature write-ahead: the mint is left Processing for recovery and fires
-/// no alert, and the withdrawal is handed to the deferred-remint gate, which
-/// resolves it once the journaled signature can no longer land. Only that final
-/// withdrawal disposition fires a webhook, so the configured `alert_webhook_url`
-/// receives exactly one POST via `db_transaction_writer::send_webhook_alert`.
+/// Neither terminalizes the operator: the mint journals its signature write-ahead
+/// and is left Processing for recovery with no alert, while the withdrawal is
+/// parked by the mint gate before a release is built. Only that parking fires a
+/// webhook, so the configured `alert_webhook_url` receives exactly one POST via
+/// `db_transaction_writer::send_webhook_alert`.
 ///
 /// Uses a `mockito` HTTP server as the webhook endpoint so no external service
 /// is required.
@@ -762,23 +739,13 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     )
     .await?;
 
-    // The bad withdrawal preflights with `invalid account data for instruction`
-    // from the escrow program (the mint isn't whitelisted on the instance), so the
-    // send fails — but only after the write-ahead journal recorded its signature.
-    // The sender cannot tell a preflight rejection from an ambiguous transport
-    // error, so it hands the row to the deferred-remint gate instead of
-    // terminalizing it as never-broadcast.
-    wait_for_transaction_status(&pool, &withdrawal_sig, "pending_remint", 180).await?;
-
-    // Once the tip passes the journaled signature's blockhash validity the gate
-    // proves it dead and remints the burned tokens; if it exhausts its deferral
-    // budget first it escalates instead. Both are terminal and fire exactly one
-    // webhook, which is what this test asserts. The env-aware timeout keeps
-    // coverage-instrumented runs off the uninstrumented ceiling.
+    // The mint has no on-chain AllowedMint account, so the withdrawal gate parks it
+    // before a release is ever built. No signature is journaled and the deferred-remint
+    // gate never sees it; the row goes straight to ManualReview.
     let disposition = wait_for_any_transaction_status(
         &pool,
         &withdrawal_sig,
-        &["failed_reminted", "manual_review"],
+        &["manual_review"],
         *WAIT_TIMEOUT_SECS,
     )
     .await?;

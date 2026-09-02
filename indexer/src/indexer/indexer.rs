@@ -15,8 +15,6 @@ use crate::{
 };
 
 #[cfg(feature = "datasource-rpc")]
-use private_channel_metrics::MetricLabel;
-#[cfg(feature = "datasource-rpc")]
 use crate::{
     channel_utils::send_guaranteed,
     error::BackfillError,
@@ -29,6 +27,8 @@ use crate::{
     },
     operator::escrow_sweep::CustodySnapshot,
 };
+#[cfg(feature = "datasource-rpc")]
+use private_channel_metrics::MetricLabel;
 #[cfg(feature = "datasource-rpc")]
 use std::time::Duration;
 

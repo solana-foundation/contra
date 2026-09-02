@@ -8,7 +8,7 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
-> **Three conditions are not webhook-routed.** The indexer's
+> **Four conditions are not webhook-routed.** The indexer's
 > **`block_unavailable`** wedge pages through Grafana instead, because it changes
 > no transaction row; see
 > [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
@@ -28,6 +28,13 @@ routes by webhook + `transaction_type`.
 > Recognize it by that pattern, not a single alert, and not via this
 > dispatch table. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+>
+> **One node condition crash-loops instead of alerting.** A row in the node's
+> `accounts` table that will not deserialize makes the executor refuse to run any
+> batch touching it, so the node exits and is restarted in a loop. It marks no
+> transaction row, and is detected from
+> `private_channel_executor_corrupt_account_total` plus the pubkey in the
+> executor log; see [`corrupt_account_row.md`](corrupt_account_row.md).
 
 ## Alert dispatch
 

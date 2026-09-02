@@ -84,6 +84,10 @@ name = "test_health_endpoint_standalone"
 path = "tests/private-channel/rpc/test_health_endpoint_standalone.rs"
 
 [[test]]
+name = "test_account_read_failures"
+path = "tests/private-channel/rpc/test_account_read_failures.rs"
+
+[[test]]
 name = "bootstrap_validation"
 path = "tests/indexer/bootstrap_validation.rs"
 

@@ -598,11 +598,11 @@ async fn two_writers_racing_one_slot_leave_a_single_ledger() {
     );
     assert_eq!(db.get_latest_blockhash().await.unwrap(), winner_blockhash);
     assert!(
-        db.get_accounts(&[winner_account]).await[0].is_some(),
+        db.get_accounts(&[winner_account]).await.unwrap()[0].is_some(),
         "the winning writer's account must be stored"
     );
     assert!(
-        db.get_accounts(&[loser_account]).await[0].is_none(),
+        db.get_accounts(&[loser_account]).await.unwrap()[0].is_none(),
         "the losing writer's account must have rolled back with its batch"
     );
 }
@@ -664,7 +664,7 @@ async fn a_writer_whose_slot_was_truncated_away_is_still_rejected() {
         "a truncated slot must not be resurrected"
     );
     assert!(
-        db.get_accounts(&[stale_account]).await[0].is_none(),
+        db.get_accounts(&[stale_account]).await.unwrap()[0].is_none(),
         "the stale writer's account must have rolled back with its batch"
     );
 }

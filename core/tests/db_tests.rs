@@ -400,7 +400,7 @@ async fn write_batch_rejects_a_block_at_or_below_the_stored_tip() {
             "the committed tip block must not be rewritten"
         );
         assert!(db.get_block(4).await.unwrap().is_none());
-        assert!(db.get_account_shared_data(&pk).await.is_none());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
         assert!(db.get_transaction(&sig).await.unwrap().is_none());
         assert_eq!(db.get_transaction_count().await.unwrap(), count_before);
     }

@@ -1,5 +1,8 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, types::StoredTransaction},
+    super::{
+        get_accounts::AccountLoadError, postgres::PostgresAccountsDB, redis::RedisAccountsDB,
+        types::StoredTransaction,
+    },
     crate::stages::AccountSettlement,
     anyhow::Result,
     serde::{Deserialize, Serialize},
@@ -52,7 +55,10 @@ pub enum AccountsDB {
 }
 
 impl AccountsDB {
-    pub async fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+    pub async fn get_account_shared_data(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Result<Option<AccountSharedData>, AccountLoadError> {
         super::get_account_shared_data::get_account_shared_data(self, pubkey).await
     }
 
@@ -143,7 +149,10 @@ impl AccountsDB {
         super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
-    pub async fn get_accounts(&self, accounts: &[Pubkey]) -> Vec<Option<AccountSharedData>> {
+    pub async fn get_accounts(
+        &self,
+        accounts: &[Pubkey],
+    ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
         super::get_accounts::get_accounts(self, accounts).await
     }
 
@@ -246,11 +255,11 @@ mod tests {
         let account = AccountSharedData::new(42_000, 0, &owner);
 
         // miss before set
-        assert!(db.get_account_shared_data(&pubkey).await.is_none());
+        assert!(db.get_account_shared_data(&pubkey).await.unwrap().is_none());
 
         db.set_account(pubkey, account.clone()).await;
 
-        let loaded = db.get_account_shared_data(&pubkey).await;
+        let loaded = db.get_account_shared_data(&pubkey).await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(
             solana_sdk::account::ReadableAccount::lamports(&loaded.unwrap()),
@@ -269,7 +278,7 @@ mod tests {
 
         db.set_account(pk2, acct.clone()).await;
 
-        let results = db.get_accounts(&[pk1, pk2, pk3]).await;
+        let results = db.get_accounts(&[pk1, pk2, pk3]).await.unwrap();
         assert_eq!(results.len(), 3);
         assert!(results[0].is_none(), "pk1 was never stored");
         assert!(results[1].is_some(), "pk2 should be found");
@@ -293,15 +302,15 @@ mod tests {
             .await;
 
         assert!(
-            db.get_account_shared_data(&zero).await.is_none(),
+            db.get_account_shared_data(&zero).await.unwrap().is_none(),
             "a zero-lamport row must read as absent"
         );
         assert!(
-            db.get_account_shared_data(&floor).await.is_some(),
+            db.get_account_shared_data(&floor).await.unwrap().is_some(),
             "an account on the 1-lamport floor must still read back"
         );
 
-        let results = db.get_accounts(&[zero, floor, never_stored]).await;
+        let results = db.get_accounts(&[zero, floor, never_stored]).await.unwrap();
         assert_eq!(results.len(), 3);
         assert!(results[0].is_none(), "the zero-lamport row is filtered out");
         assert!(
@@ -451,12 +460,13 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(lamports),
             "a cached miss must not read as a nonexistent account"
         );
         assert_eq!(
-            cache_db.get_accounts(&[pubkey]).await[0]
+            cache_db.get_accounts(&[pubkey]).await.unwrap()[0]
                 .as_ref()
                 .map(|account| account.lamports()),
             Some(lamports)
@@ -519,7 +529,8 @@ mod tests {
 
         let results = cache_db
             .get_accounts(&[first.0, second.0, third.0, absent])
-            .await;
+            .await
+            .unwrap();
 
         let lamports: Vec<Option<u64>> = results
             .iter()
@@ -572,6 +583,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(stale_lamports),
             "a stamped cache is served, stale value and all"
@@ -588,6 +600,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(settled_lamports),
             "once condemned, reads must bypass the cache and reach Postgres"
@@ -631,6 +644,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(lamports),
             "a corrupt entry must fall through to Postgres"
@@ -764,6 +778,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(settled_lamports),
             "the stale cached balance must no longer be served"
@@ -953,7 +968,7 @@ mod tests {
             .unwrap();
 
         // account was stored
-        assert!(db.get_account_shared_data(&pk).await.is_some());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
         // block was stored
         let loaded = db.get_block(1).await.unwrap();
@@ -1432,7 +1447,7 @@ mod tests {
 
         // first store an account
         db.set_account(pk, acct.clone()).await;
-        assert!(db.get_account_shared_data(&pk).await.is_some());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
         // now write_batch with deleted=true
         let settlement = AccountSettlement {
@@ -1444,6 +1459,6 @@ mod tests {
             .unwrap();
 
         // account is gone
-        assert!(db.get_account_shared_data(&pk).await.is_none());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
     }
 }

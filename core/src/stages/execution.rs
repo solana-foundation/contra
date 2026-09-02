@@ -1,6 +1,6 @@
 use {
     crate::{
-        accounts::{bob::BOB, AccountsDB},
+        accounts::{bob::BOB, get_accounts::AccountLoadError, AccountsDB},
         nodes::node::WorkerHandle,
         processor::{
             create_transaction_batch_processor, get_transaction_check_results,
@@ -136,7 +136,15 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                     debug!("Executor received batch with {} transactions", batch_size);
 
                     let execution_result =
-                        execute_batch(batch, &mut execution_deps, &metrics).await;
+                        match execute_batch(batch, &mut execution_deps, &metrics).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                // Nothing was executed or settled; a restart is
+                                // preferable to executing against unknown state.
+                                error!("Executor stopping: {}", e);
+                                break;
+                            }
+                        };
 
                     let num_transactions_executed = execution_result.admin_transactions.len()
                         + execution_result.regular_transactions.len();
@@ -599,11 +607,13 @@ fn enforce_lamport_conservation(
     }
 }
 
+/// Returns `Err` when the accounts this batch needs could not be loaded. The
+/// abort happens before any SVM run or BOB write, so nothing has changed yet.
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
     metrics: &SharedMetrics,
-) -> ExecutionResult {
+) -> Result<ExecutionResult, AccountLoadError> {
     let t_batch = Instant::now();
     let batch_size = batch.transactions.len();
     debug!("Executing batch with {} transactions", batch_size);
@@ -692,10 +702,23 @@ pub async fn execute_batch(
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
     let t_op = Instant::now();
-    let (preload_fetched, preload_cached) = execution_deps
+    // Executing against accounts BOB could not load would settle state derived
+    // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
+    let (preload_fetched, preload_cached) = match execution_deps
         .bob
         .preload_accounts(&accounts_to_preload)
-        .await;
+        .await
+    {
+        Ok(counts) => counts,
+        Err(e) => {
+            if let AccountLoadError::Corrupt(_) = e {
+                metrics.executor_corrupt_account();
+            }
+            metrics.executor_preload_fatal();
+            error!("execution: aborting batch, account preload failed: {}", e);
+            return Err(e);
+        }
+    };
     let t_preload = t_op.elapsed();
     debug!(
         "preload: {} accounts ({} fetched, {} cached) in {:?}",
@@ -900,14 +923,14 @@ pub async fn execute_batch(
     );
     metrics.executor_batch_duration_ms(t_total.as_secs_f64() * 1000.0);
 
-    ExecutionResult {
+    Ok(ExecutionResult {
         admin_transactions,
         regular_transactions,
         admin_results,
         regular_results,
         admin_generation,
         regular_generation,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1009,7 +1032,9 @@ mod tests {
                 index: i,
             })
             .collect();
-        execute_batch(ConflictFreeBatch { transactions }, deps, metrics).await
+        execute_batch(ConflictFreeBatch { transactions }, deps, metrics)
+            .await
+            .expect("test batch must load its accounts")
     }
 
     fn regular_result(
@@ -2075,7 +2100,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         assert_eq!(result.regular_transactions.len(), n);
         assert!(result.admin_transactions.is_empty());
@@ -2106,7 +2131,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let results = result.regular_results.unwrap();
         assert_eq!(results.processing_results.len(), n);
@@ -2180,7 +2205,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(empty_batch, &mut deps, &noop).await;
+        let result = execute_batch(empty_batch, &mut deps, &noop).await.unwrap();
         assert!(result.admin_transactions.is_empty());
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_none());
@@ -2202,7 +2227,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert!(!result.regular_transactions.is_empty());
         assert!(result.admin_transactions.is_empty());
         assert!(
@@ -2237,7 +2262,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.regular_transactions.len(), 2);
         assert!(result.admin_transactions.is_empty());
         let results = result.regular_results.unwrap();
@@ -2281,7 +2306,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         assert_eq!(
             result.regular_transactions.len(),
@@ -2327,7 +2352,9 @@ mod tests {
         };
 
         // Pass 1: bh is in the live window — all 3 must execute.
-        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop)
+            .await
+            .unwrap();
         assert_eq!(
             r1.regular_transactions.len(),
             3,
@@ -2338,7 +2365,9 @@ mod tests {
         live.write().unwrap().clear();
 
         // Pass 2: same blockhash, now expired — all 3 must be filtered.
-        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop)
+            .await
+            .unwrap();
         assert_eq!(
             r2.regular_transactions.len(),
             0,
@@ -2419,7 +2448,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -2470,7 +2499,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -2524,7 +2553,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -2726,7 +2755,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.admin_transactions.len(), 1);
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_some());
@@ -2752,7 +2781,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert!(
             result.admin_transactions.is_empty(),
             "mixed tx must not be admin-routed"
@@ -2786,7 +2815,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.admin_transactions.len(), 1);
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());
@@ -2904,5 +2933,40 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
         assert!(result.is_ok(), "executor must exit once its input closes");
+    }
+
+    /// A batch whose accounts could not be loaded must abort before any SVM run,
+    /// so nothing is executed against phantom-absent state and settled.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn execute_batch_aborts_when_preload_cannot_read_the_store() {
+        use crate::accounts::get_accounts::{reset_test_retry, set_test_retry};
+
+        set_test_retry(2, 1);
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(
+            crate::test_helpers::dead_postgres_db(),
+            rx,
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(sanitize_transfer(&payer, Hash::default())),
+                index: 0,
+            }],
+        };
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        reset_test_retry();
+
+        assert!(result.is_err(), "an unreadable store must abort the batch");
+        assert!(
+            deps.bob.get_account_shared_data(&payer.pubkey()).is_none(),
+            "nothing may be cached from a read that failed"
+        );
     }
 }

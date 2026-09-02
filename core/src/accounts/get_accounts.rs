@@ -36,8 +36,9 @@ impl Display for AccountLoadError {
 
 impl std::error::Error for AccountLoadError {}
 
-/// Bounded retry for a whole-query failure. A blip must not restart the node,
-/// but a sustained outage must still reach a verdict in well under a second.
+/// Bounded retry for a whole-query failure. A load error stops the node, so the
+/// schedule only has to outlast a blip such as a failover or a recycled
+/// connection; a longer outage is handled better by a restart than by a stall.
 const LOAD_MAX_ATTEMPTS: u32 = 4;
 const LOAD_BACKOFF_BASE_MS: u64 = 20;
 const LOAD_BACKOFF_CAP_MS: u64 = 500;
@@ -100,18 +101,29 @@ pub(crate) fn reset_test_retry() {
     set_test_budget_ms(LOAD_TOTAL_BUDGET_MS);
 }
 
-/// Whether a failed query could plausibly succeed if tried again. A database
-/// that answered with an error answered: a missing table or a rejected
-/// permission will say the same thing every time, so only transport and pool
-/// failures are worth a second attempt.
+/// Whether a failed query could plausibly succeed if tried again. Transport and
+/// pool failures always could; a server-side error only if its SQLSTATE names a
+/// condition that clears on its own.
 fn is_transient(error: &sqlx::Error) -> bool {
-    matches!(
-        error,
+    match error {
         sqlx::Error::Io(_)
-            | sqlx::Error::PoolTimedOut
-            | sqlx::Error::PoolClosed
-            | sqlx::Error::WorkerCrashed
-    )
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(db) => db.code().is_some_and(|code| is_transient_sqlstate(&code)),
+        // A missing table or a rejected permission answers the same way every time.
+        _ => false,
+    }
+}
+
+/// SQLSTATE classes that describe a condition outside the query itself: 08 is a
+/// broken connection, 53 the server running out of a resource, 57 an operator
+/// action such as a shutdown. The two rollbacks come from a concurrent writer.
+fn is_transient_sqlstate(code: &str) -> bool {
+    code.starts_with("08")
+        || code.starts_with("53")
+        || code.starts_with("57")
+        || matches!(code, "40001" | "40P01")
 }
 
 /// Exponential backoff for a 1-based attempt number, capped so the worst-case
@@ -453,6 +465,20 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A server-side error is not automatically permanent: a failover or an
+    /// exhausted connection limit arrives as a SQLSTATE and clears on its own.
+    #[test]
+    fn transient_sqlstates_are_told_apart_from_permanent_ones() {
+        // Connection lost, out of connections, shutting down, write conflict.
+        for code in ["08006", "53300", "57P01", "40001", "40P01"] {
+            assert!(is_transient_sqlstate(code), "{code} should be retried");
+        }
+        // Missing table, missing column, denied permission, bad syntax.
+        for code in ["42P01", "42703", "42501", "42601"] {
+            assert!(!is_transient_sqlstate(code), "{code} should not be retried");
+        }
     }
 
     /// A corrupt row must name itself rather than vanishing from the batch: a

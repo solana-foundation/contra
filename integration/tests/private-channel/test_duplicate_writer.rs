@@ -106,6 +106,14 @@ async fn await_slot_above(conn: &mut PgConnection, floor: i64) -> i64 {
     panic!("no slot above {floor} was committed");
 }
 
+/// The tip, or `None` on a ledger with no blocks.
+async fn latest_slot_opt(conn: &mut PgConnection) -> Option<i64> {
+    sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
+        .fetch_one(conn)
+        .await
+        .expect("failed to read the tip")
+}
+
 async fn latest_slot(conn: &mut PgConnection) -> i64 {
     sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
         .fetch_one(conn)
@@ -306,4 +314,58 @@ async fn a_settler_whose_tip_moves_underneath_it_stops_instead_of_forking() {
     WriterLease::acquire(&url, CancellationToken::new())
         .await
         .expect("the lease must be free once a stopped node has shut down");
+}
+
+/// A startup that fails after the lease is taken must hand it back before the
+/// error reaches the caller, or a caller retrying at once is refused by a lock
+/// nothing means to hold. Occupying the RPC port fails the node late, with the
+/// write pipeline already running, so those workers must be stopped as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_startup_frees_the_lease_before_returning() {
+    let (_pg, url) = start_postgres().await;
+
+    // Opened up front so the assertion below costs one round trip, not a connect.
+    let mut probe = PgConnection::connect(&url)
+        .await
+        .expect("failed to open the probe connection");
+
+    let port = get_free_port();
+    let _occupied =
+        std::net::TcpListener::bind(("0.0.0.0", port)).expect("failed to take the port");
+
+    let failure = run_node(write_node_config(url.clone(), port))
+        .await
+        .err()
+        .expect("a node whose RPC port is taken must fail to start");
+    assert!(
+        failure.to_string().to_lowercase().contains("address"),
+        "the failure must be the port bind, got: {failure}"
+    );
+
+    // No polling: the lock being gone the moment the error returns is the point,
+    // and a retry loop would hide a release that only lands later.
+    let still_held: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted)",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .expect("failed to read pg_locks");
+    assert!(
+        !still_held,
+        "a failed startup must not return while the writer lease is still held"
+    );
+
+    WriterLease::acquire(&url, CancellationToken::new())
+        .await
+        .expect("a failed startup must leave the writer lease available");
+
+    // The workers must be stopped too, not just detached: a pipeline left running
+    // would keep committing slots with no lease and no way to shut it down.
+    let tip_after_failure = latest_slot_opt(&mut probe).await;
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        latest_slot_opt(&mut probe).await,
+        tip_after_failure,
+        "a failed startup must leave no worker still committing blocks"
+    );
 }

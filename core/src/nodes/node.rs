@@ -212,11 +212,39 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         None
     };
 
+    // A failure past this point must not return while the lease is still held,
+    // since a caller retrying at once would be refused by a lock nothing wants.
+    let mut workers = Vec::new();
+    let started = start_services(config, shutdown_token.clone(), &mut workers).await;
+    let handles = NodeHandles {
+        workers,
+        shutdown_token,
+        writer_lease,
+    };
+
+    match started {
+        Ok(()) => Ok(handles),
+        Err(e) => {
+            // Cancels and joins whatever started, so the lease only goes back
+            // once nothing this node spawned is still running.
+            handles.shutdown().await;
+            Err(e)
+        }
+    }
+}
+
+/// Start the workers this node's mode needs, pushing each into `workers` as it is
+/// spawned. The caller keeps that list even on failure, so a partial startup is
+/// shut down in order rather than left to unwind on its own.
+async fn start_services(
+    config: NodeConfig,
+    shutdown_token: CancellationToken,
+    workers: &mut Vec<WorkerHandle>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat registry — populated for stages that actually run, consumed by /health.
     let mut heartbeats = crate::health::HeartbeatRegistry::new();
 
     // Only create write pipeline for Write and Aio modes
-    let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
         if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
             // RPC ingress channel (receives from RPC, feeds the sigverify worker
@@ -293,7 +321,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: sigverify_hb,
             })
             .await;
-            write_workers.extend(sigverify_workers);
+            workers.extend(sigverify_workers);
 
             // Start dedup stage (drops replays after verification, keyed on the
             // message hash so signature variants of one message collapse to one).
@@ -309,7 +337,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: dedup_hb,
             })
             .await;
-            write_workers.push(dedup);
+            workers.push(dedup);
 
             // Start sequencer (produces conflict-free batches)
             let sequence = start_sequence_worker(crate::stages::SequencerArgs {
@@ -322,7 +350,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: sequencer_hb,
             })
             .await;
-            write_workers.push(sequence);
+            workers.push(sequence);
 
             // Start executor (executes and settles batches)
             let execution = start_execution_worker(crate::stages::ExecutionArgs {
@@ -337,7 +365,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 live_blockhashes: Arc::clone(&live_blockhashes),
             })
             .await;
-            write_workers.push(execution);
+            workers.push(execution);
 
             // Each item is one tick worth of (address, slot, signature) rows.
             const ADDR_SIG_QUEUE_CAPACITY: usize = 1024;
@@ -362,7 +390,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: settler_hb,
             })
             .await;
-            write_workers.push(settle);
+            workers.push(settle);
 
             // Push the writer AFTER the settler so shutdown awaits in the
             // right order: settler drains its buffer, drops its sender, the
@@ -376,7 +404,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: addr_index_writer_hb,
             })
             .await;
-            write_workers.push(addr_index_writer);
+            workers.push(addr_index_writer);
 
             (
                 Some(WriteDeps {
@@ -452,15 +480,10 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     }
     info!("  Max connections: {}", config.max_connections);
 
-    // Build vector of all worker handles
-    let mut workers = vec![rpc_handle];
-    workers.extend(write_workers);
+    // RPC first, the order the shutdown loop has always joined them in.
+    workers.insert(0, rpc_handle);
 
-    Ok(NodeHandles {
-        workers,
-        shutdown_token,
-        writer_lease,
-    })
+    Ok(())
 }
 
 impl NodeHandles {

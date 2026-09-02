@@ -33,6 +33,13 @@ routes by webhook + `transaction_type`.
 > skip slots nothing would ever go back for. It also shows as a boot-time
 > crash-loop, recognized by that marker in the indexer logs; see
 > [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
+>
+> **One node condition crash-loops instead of alerting.** A row in the node's
+> `accounts` table that will not deserialize makes the executor refuse to run any
+> batch touching it, so the node exits and is restarted in a loop. It marks no
+> transaction row, and is detected from
+> `private_channel_executor_corrupt_account_total` plus the pubkey in the
+> executor log; see [`corrupt_account_row.md`](corrupt_account_row.md).
 
 ## Alert dispatch
 

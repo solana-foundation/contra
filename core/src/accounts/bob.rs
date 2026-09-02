@@ -187,7 +187,13 @@ impl BOB {
     /// Only queries the database for accounts that are actual cache misses
     /// (not in BOB's HashMap and not a precompile). Once the working set is
     /// warm, most batches will skip the DB entirely.
-    pub async fn preload_accounts(&mut self, pubkeys: &[Pubkey]) -> (usize, usize) {
+    ///
+    /// A read the store could not answer is an `Err`, never an empty cache: the
+    /// SVM cannot tell "unknown" from "does not exist", so the caller must stop.
+    pub async fn preload_accounts(
+        &mut self,
+        pubkeys: &[Pubkey],
+    ) -> Result<(usize, usize), crate::accounts::get_accounts::AccountLoadError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -224,11 +230,11 @@ impl BOB {
 
         // If everything is warm, skip the DB round-trip entirely.
         if miss_keys.is_empty() {
-            return (0, already_cached);
+            return Ok((0, already_cached));
         }
 
         // Only fetch the cache-miss keys from the database.
-        let accounts = self.accounts_db.get_accounts(&miss_keys).await;
+        let accounts = self.accounts_db.get_accounts(&miss_keys).await?;
         let mut fetched = 0usize;
         for (index, account_opt) in accounts.iter().enumerate() {
             if let Some(account) = account_opt {
@@ -251,7 +257,7 @@ impl BOB {
             }
         }
 
-        (fetched, already_cached)
+        Ok((fetched, already_cached))
     }
 
     // TODO: Merge this implementation with the one in the settlement stage
@@ -1689,7 +1695,7 @@ mod tests {
         );
 
         // Everything is cached, so no DB round-trip happens.
-        bob.preload_accounts(&[pubkey]).await;
+        bob.preload_accounts(&[pubkey]).await.unwrap();
 
         let meta = bob.accounts.get(&pubkey).unwrap();
         assert!(
@@ -1713,7 +1719,7 @@ mod tests {
             },
         );
 
-        bob.preload_accounts(&[pubkey]).await;
+        bob.preload_accounts(&[pubkey]).await.unwrap();
 
         let meta = bob.accounts.get(&pubkey).unwrap();
         assert!(
@@ -1823,7 +1829,7 @@ mod tests {
         );
 
         // All keys are cached, so this stays in-memory (no DB round-trip).
-        bob.preload_accounts(&[referenced]).await;
+        bob.preload_accounts(&[referenced]).await.unwrap();
 
         assert!(
             bob.accounts.contains_key(&referenced),
@@ -1970,7 +1976,7 @@ mod tests {
         let mut bob = BOB::new_test(rx, db);
 
         let now = now_secs();
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (1, 0),
@@ -2020,6 +2026,7 @@ mod tests {
             bob.accounts_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .is_some(),
             "the stale funded row must be in the database for this test to mean anything"
         );
@@ -2049,7 +2056,7 @@ mod tests {
             })
             .unwrap();
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
@@ -2062,7 +2069,7 @@ mod tests {
 
         // Had the tombstone been erased above, this is the batch where the
         // funded row would be read back in.
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
@@ -2110,7 +2117,7 @@ mod tests {
             })
             .unwrap();
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
 
         assert!(
             !bob.accounts.contains_key(&pubkey),
@@ -2139,7 +2146,7 @@ mod tests {
 
         bob.accounts_db.set_account(pubkey, stored.clone()).await;
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
 
         assert_eq!(
             (fetched, cached),
@@ -2180,7 +2187,7 @@ mod tests {
             },
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await;
+        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
 
         assert_eq!(
             (fetched, cached),
@@ -2215,7 +2222,7 @@ mod tests {
             .set_account(floor, make_account(1, &[1, 2, 3], &spl_token::id()))
             .await;
 
-        let (fetched, cached) = bob.preload_accounts(&[zero, floor]).await;
+        let (fetched, cached) = bob.preload_accounts(&[zero, floor]).await.unwrap();
 
         assert_eq!(
             (fetched, cached),
@@ -2298,5 +2305,58 @@ mod tests {
         assert_eq!(bob.account_lamports(&deleted), None);
         assert_eq!(bob.account_lamports(&ghost), None);
         assert_eq!(bob.account_lamports(&absent), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Preload fails closed rather than caching absence it cannot vouch for
+    // -----------------------------------------------------------------------
+
+    /// An unreadable store must not leave the SVM believing the account does not
+    /// exist; that is how a real funded row gets overwritten by phantom state.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn preload_unreadable_store_errors_and_caches_nothing() {
+        use crate::accounts::get_accounts::{reset_test_retry, set_test_retry, AccountLoadError};
+
+        set_test_retry(2, 1);
+        let (mut bob, _settled_tx) = create_test_bob();
+        let pubkey = Pubkey::new_unique();
+        let result = bob.preload_accounts(&[pubkey]).await;
+        reset_test_retry();
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Backend(_))),
+            "expected Backend, got {result:?}"
+        );
+        assert!(!bob.accounts.contains_key(&pubkey));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_corrupt_row_errors_and_caches_nothing() {
+        use crate::accounts::get_accounts::AccountLoadError;
+
+        let (mut bob, _settled_tx, _pg) =
+            crate::test_helpers::create_test_bob_with_postgres().await;
+        let corrupt = Pubkey::new_unique();
+        let pool = match &bob.accounts_db {
+            crate::accounts::AccountsDB::Postgres(pg) => std::sync::Arc::clone(&pg.pool),
+            crate::accounts::AccountsDB::Redis(_) => panic!("test harness is Postgres-backed"),
+        };
+        sqlx::query(
+            "INSERT INTO accounts (pubkey, data) VALUES ($1, $2)
+             ON CONFLICT (pubkey) DO UPDATE SET data = $2",
+        )
+        .bind(&corrupt.to_bytes()[..])
+        .bind(&[0u8, 1, 2][..])
+        .execute(pool.as_ref())
+        .await
+        .unwrap();
+
+        let result = bob.preload_accounts(&[corrupt]).await;
+        assert!(
+            matches!(result, Err(AccountLoadError::Corrupt(key)) if key == corrupt),
+            "expected Corrupt({corrupt}), got {result:?}"
+        );
+        assert!(!bob.accounts.contains_key(&corrupt));
     }
 }

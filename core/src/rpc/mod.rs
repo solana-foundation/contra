@@ -1151,4 +1151,96 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.code(), -32001);
     }
+
+    // ── get_account_info / get_token_account_balance ──────────────────────
+
+    /// How the account store is broken before an account read runs.
+    #[derive(Clone, Copy)]
+    enum AccountStore {
+        /// Readable, pubkey genuinely absent.
+        Healthy,
+        /// The lookup query itself fails.
+        Unreadable,
+        /// The row is present but its payload cannot be deserialized.
+        Corrupt,
+    }
+
+    /// Read one pubkey's account info against a store in the given state.
+    async fn account_with_store(
+        state: AccountStore,
+    ) -> (Pubkey, AccountsDB, testcontainers::ContainerAsync<Postgres>) {
+        let (mut db, pg) = start_pg().await;
+        seed_db(&mut db).await;
+        let pubkey = Pubkey::new_unique();
+        let pool = test_pool(&db);
+
+        match state {
+            AccountStore::Healthy => {}
+            AccountStore::Unreadable => {
+                sqlx::query("DROP TABLE accounts")
+                    .execute(pool.as_ref())
+                    .await
+                    .unwrap();
+            }
+            AccountStore::Corrupt => {
+                sqlx::query("INSERT INTO accounts (pubkey, data) VALUES ($1, $2)")
+                    .bind(&pubkey.to_bytes()[..])
+                    .bind(&[0u8, 1, 2][..])
+                    .execute(pool.as_ref())
+                    .await
+                    .unwrap();
+            }
+        }
+
+        (pubkey, db, pg)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_info_db_error_is_rpc_error() {
+        let (pubkey, db, _pg) = account_with_store(AccountStore::Unreadable).await;
+        let deps = make_read_deps(db);
+        assert!(
+            get_account_info_impl::get_account_info_impl(&deps, pubkey.to_string(), None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_info_corrupt_row_is_rpc_error() {
+        let (pubkey, db, _pg) = account_with_store(AccountStore::Corrupt).await;
+        let deps = make_read_deps(db);
+        assert!(
+            get_account_info_impl::get_account_info_impl(&deps, pubkey.to_string(), None)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A never-stored account is routine, so `null` must keep meaning absent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_info_genuine_miss_is_null() {
+        let (pubkey, db, _pg) = account_with_store(AccountStore::Healthy).await;
+        let deps = make_read_deps(db);
+        let resp = get_account_info_impl::get_account_info_impl(&deps, pubkey.to_string(), None)
+            .await
+            .unwrap();
+        assert!(resp.value.is_none());
+    }
+
+    /// An unreadable store is a server fault. Reporting it as INVALID_PARAMS
+    /// tells the caller not to retry a condition that retrying would fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_token_account_balance_db_error_is_a_server_error() {
+        let (pubkey, db, _pg) = account_with_store(AccountStore::Unreadable).await;
+        let deps = make_read_deps(db);
+        let err = get_token_account_balance_impl::get_token_account_balance_impl(
+            &deps,
+            pubkey.to_string(),
+            None,
+        )
+        .await
+        .expect_err("an unreadable store must be an error");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+    }
 }

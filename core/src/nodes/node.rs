@@ -30,16 +30,14 @@ use {
 };
 
 /// Total time the whole pipeline gets to drain on shutdown. A saturated drain
-/// measures well under a second, but the settler may already be inside a commit
-/// that runs to its own bound before it gives up, so this covers that worst case
-/// plus the cascade and still leaves room under the container default stop grace
-/// period for the process to exit.
-pub const DRAIN_DEADLINE: Duration = Duration::from_secs(8);
+/// measures well under a second, and the settler bounds its own shutdown work
+/// below this, so the remainder covers the cascade.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(6);
 
-/// How long an aborted worker gets to actually end. Short because cancellation
-/// lands at the next await point, and bounded because a task without one never
-/// ends and would otherwise hold the drain open indefinitely.
-const ABORT_GRACE: Duration = Duration::from_secs(2);
+/// Shared across every worker that had to be aborted, not spent per worker: a
+/// per-worker reserve would scale with the pipeline. `DRAIN_DEADLINE` plus this
+/// is the whole shutdown, and it has to stay under the container stop grace.
+const ABORT_RESERVE: Duration = Duration::from_secs(2);
 
 /// RPC→dedup ingress queue capacity. Sized so steady state never sheds.
 pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
@@ -478,8 +476,13 @@ impl NodeHandles {
             })
             .collect();
 
-        let (completed_idx, _result, _remaining) = futures::future::select_all(futures).await;
-        let worker_name = self.workers[completed_idx].name().to_string();
+        let (completed_idx, _result, remaining) = futures::future::select_all(futures).await;
+        // Released before the list is touched, and the finished worker is taken
+        // out of it: that poll consumed the task's output, and polling a
+        // finished JoinHandle again panics. `remove` rather than `swap_remove`
+        // because shutdown drains in pipeline order.
+        drop(remaining);
+        let worker_name = self.workers.remove(completed_idx).name().to_string();
 
         error!("{} worker quit unexpectedly", worker_name);
         worker_name
@@ -505,6 +508,9 @@ impl NodeHandles {
         // the number of stages and overrun the container's stop grace period,
         // which kills the process mid-drain and loses what the order preserved.
         let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+        // One reserve for all aborts, so the total stays bounded however many
+        // workers overrun.
+        let abort_deadline = deadline + ABORT_RESERVE;
         let mut overran = false;
         for mut worker in self.workers {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -519,10 +525,10 @@ impl NodeHandles {
                     overran = true;
 
                     // `abort()` only schedules cancellation, so wait for the task
-                    // to actually end. Bounded, because a task that never yields
-                    // cannot be cancelled at all and must not hold the drain open
-                    // past the container's stop grace period.
-                    let stopped = tokio::time::timeout(ABORT_GRACE, &mut worker.handle)
+                    // to actually end. Bounded by the shared reserve, because a
+                    // task that never yields cannot be cancelled at all and must
+                    // not hold shutdown open past the container's stop grace.
+                    let stopped = tokio::time::timeout_at(abort_deadline, &mut worker.handle)
                         .await
                         .is_ok();
                     if stopped {
@@ -552,6 +558,81 @@ impl NodeHandles {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Docker's default SIGTERM-to-SIGKILL window. The whole shutdown has to
+    /// finish inside it or the process is killed part-way through.
+    const CONTAINER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+    fn handles_from(workers: Vec<WorkerHandle>) -> NodeHandles {
+        NodeHandles {
+            workers,
+            shutdown_token: CancellationToken::new(),
+            ingress_tx: None,
+        }
+    }
+
+    /// A handle whose output was already taken must leave the drain list. Tokio
+    /// panics when a finished JoinHandle is polled again, and that panic escapes
+    /// shutdown and main, so the process aborts instead of draining.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quit_worker_is_not_polled_again_by_shutdown() {
+        let quitting = tokio::spawn(async {});
+        let live = tokio::spawn(async {});
+        let mut handles = handles_from(vec![
+            WorkerHandle::new("Quitting".to_string(), quitting),
+            WorkerHandle::new("Live".to_string(), live),
+        ]);
+
+        handles.wait_for_any_worker_quit().await;
+        handles.shutdown().await;
+    }
+
+    /// The name must come from the worker that actually finished, and every other
+    /// worker must still be drained in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_any_worker_quit_names_the_worker_that_quit() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let blocked = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        let quitting = tokio::spawn(async {});
+        let mut handles = handles_from(vec![
+            WorkerHandle::new("Blocked".to_string(), blocked),
+            WorkerHandle::new("Quitting".to_string(), quitting),
+        ]);
+
+        let name = handles.wait_for_any_worker_quit().await;
+        assert_eq!(name, "Quitting");
+        assert_eq!(handles.workers.len(), 1, "the finished worker must be gone");
+        assert_eq!(handles.workers[0].name(), "Blocked");
+
+        // Let the survivor exit so shutdown drains it rather than aborting it.
+        let _ = tx.send(());
+        handles.shutdown().await;
+    }
+
+    /// The abort reserve is shared, not per worker. Spent per worker it would
+    /// scale with the pipeline and push the whole shutdown past the stop grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_abort_reserve_does_not_scale_with_worker_count() {
+        let workers: Vec<WorkerHandle> = (0..6)
+            .map(|i| {
+                let spinning = tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_secs(30));
+                });
+                WorkerHandle::new(format!("Spinning{i}"), spinning)
+            })
+            .collect();
+        let handles = handles_from(workers);
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < CONTAINER_STOP_GRACE,
+            "shutdown took {:?}, which does not fit the container stop grace",
+            started.elapsed()
+        );
+    }
 
     /// A worker that outlives the drain must be stopped, not merely stopped
     /// waiting on. A dropped JoinHandle leaves the task running, so an

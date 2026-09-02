@@ -243,7 +243,7 @@ async fn assert_all_queryable(client: &RpcClient, accepted: &[Signature]) {
             metric_total("private_channel_executor_dropped_expired_bh_total"),
             metric_total("private_channel_executor_results_send_failed_total"),
             metric_total("private_channel_settler_txs_settled_total"),
-            metric_total("private_channel_settler_discarded_transactions_total"),
+            metric_total("private_channel_discarded_executed_transactions_total"),
         );
     }
     assert!(
@@ -268,7 +268,7 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
     let (handles, url) = start_node(load_config(db_url.clone(), free_port())).await;
     let client = RpcClient::new_with_commitment(url.clone(), CommitmentConfig::processed());
 
-    let discarded_before = metric_total("private_channel_settler_discarded_transactions_total");
+    let discarded_before = metric_total("private_channel_discarded_executed_transactions_total");
     let in_flight_before = in_flight();
 
     let loader = Loader::spawn(&url, 4).await;
@@ -309,7 +309,7 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
     );
 
     let discarded =
-        metric_total("private_channel_settler_discarded_transactions_total") - discarded_before;
+        metric_total("private_channel_discarded_executed_transactions_total") - discarded_before;
     assert_eq!(
         discarded, 0.0,
         "a clean shutdown must not discard executed transactions"
@@ -334,7 +334,7 @@ async fn a_saturated_pipeline_still_drains_within_the_deadline() {
     let (_pg, db_url) = start_postgres().await;
     let (handles, url) = start_node(load_config(db_url.clone(), free_port())).await;
 
-    let discarded_before = metric_total("private_channel_settler_discarded_transactions_total");
+    let discarded_before = metric_total("private_channel_discarded_executed_transactions_total");
     let in_flight_before = in_flight();
 
     // More submitters than the first test, to hold every queue at capacity.
@@ -364,7 +364,7 @@ async fn a_saturated_pipeline_still_drains_within_the_deadline() {
     );
 
     let discarded =
-        metric_total("private_channel_settler_discarded_transactions_total") - discarded_before;
+        metric_total("private_channel_discarded_executed_transactions_total") - discarded_before;
     assert_eq!(
         discarded, 0.0,
         "a saturated shutdown must not discard executed transactions either"

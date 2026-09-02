@@ -368,11 +368,31 @@ fn chunk_ranges_by_bytes(
 }
 
 /// Send one batch to the settler, waiting for room rather than giving up.
-async fn send_one(results_tx: &mpsc::Sender<ExecutedBatch>, batch: ExecutedBatch) -> SendOutcome {
+/// A closed queue hands the batch back so the caller can record it.
+async fn send_one(
+    results_tx: &mpsc::Sender<ExecutedBatch>,
+    batch: ExecutedBatch,
+) -> Result<(), ExecutedBatch> {
     match results_tx.send(batch).await {
-        Ok(()) => SendOutcome::Sent,
-        Err(_) => SendOutcome::ChannelClosed,
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendError(batch)) => Err(batch),
     }
+}
+
+/// Name what the executor could not hand over. The settler closes its queue
+/// when it gives up, so these are executed and uncommitted just like the buffer
+/// it recorded on its own side, and they end here rather than nowhere.
+fn record_unsent(
+    unsent: &[SanitizedTransaction],
+    never_sent: &[SanitizedTransaction],
+    metrics: &SharedMetrics,
+) {
+    let signatures: Vec<solana_sdk::signature::Signature> = unsent
+        .iter()
+        .chain(never_sent.iter())
+        .map(|transaction| *transaction.signature())
+        .collect();
+    crate::stages::record_discarded("executor", "settler queue closed", &signatures, metrics);
 }
 
 /// Send results to the settler in byte-bounded messages.
@@ -388,7 +408,13 @@ async fn send_results_chunked(
 ) -> SendOutcome {
     let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
     if ranges.len() <= 1 {
-        return send_one(results_tx, (output, transactions, generation)).await;
+        return match send_one(results_tx, (output, transactions, generation)).await {
+            Ok(()) => SendOutcome::Sent,
+            Err((_, transactions, _)) => {
+                record_unsent(&transactions, &[], metrics);
+                SendOutcome::ChannelClosed
+            }
+        };
     }
 
     metrics.executor_results_chunked(ranges.len());
@@ -425,13 +451,16 @@ async fn send_results_chunked(
         // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
         let chunk_generation = if position == last { generation } else { 0 };
         match send_one(results_tx, (chunk, chunk_transactions, chunk_generation)).await {
-            SendOutcome::Sent => sent += take,
-            other => {
+            Ok(()) => sent += take,
+            Err((_, chunk_transactions, _)) => {
                 // Report what actually landed; the caller only counts a whole batch.
                 if sent > 0 {
                     metrics.executor_results_sent(sent);
                 }
-                return other;
+                // The chunks still undrained never left either, so they belong
+                // in the same record as the one that just failed.
+                record_unsent(&chunk_transactions, &transactions, metrics);
+                return SendOutcome::ChannelClosed;
             }
         }
     }
@@ -1202,6 +1231,80 @@ mod tests {
             gens.push(g);
         }
         assert_eq!(gens, vec![7], "an unsplit batch stays one message");
+    }
+
+    use crate::stage_metrics::PrometheusMetrics;
+
+    /// The Prometheus registry is process-global, so counter deltas are read
+    /// one test at a time.
+    static DISCARD_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn discarded_total() -> f64 {
+        private_channel_metrics::prometheus::gather()
+            .into_iter()
+            .filter(|mf| mf.name() == "private_channel_discarded_executed_transactions_total")
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .map(|m| m.get_counter().value())
+            .sum()
+    }
+
+    /// The settler closes its queue when it gives up, so the batch the executor
+    /// was holding comes back to it. Dropping that silently moves the audit gap
+    /// one stage upstream instead of closing it.
+    #[tokio::test]
+    async fn a_closed_settler_channel_records_the_unsent_batch() {
+        let _guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = discarded_total();
+
+        let (results, txs) = sized_batch(&[10, 10, 10]);
+        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(4);
+        drop(rx);
+
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            1,
+            MAX_SEND_CHUNK_BYTES,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::ChannelClosed));
+        assert_eq!(
+            discarded_total() - before,
+            3.0,
+            "every executed transaction the executor still held must be recorded"
+        );
+    }
+
+    /// A split batch fails partway. The chunks that never went are just as
+    /// executed and just as uncommitted as the one whose send failed.
+    #[tokio::test]
+    async fn a_closed_channel_mid_chunk_records_the_remainder() {
+        let _guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = discarded_total();
+
+        // One transaction per chunk, and room for only the first.
+        let (results, txs) = sized_batch(&[5000, 5000, 5000]);
+        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(1);
+        // The receiver never drains, so the second chunk parks. Closing it then
+        // is what the settler does when it gives up mid-handover.
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(rx);
+        });
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 9, 1000, &metrics).await;
+
+        assert!(matches!(outcome, SendOutcome::ChannelClosed));
+        assert_eq!(
+            discarded_total() - before,
+            2.0,
+            "the failed chunk and the undrained remainder must both be recorded"
+        );
+        let _ = closer.await;
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.

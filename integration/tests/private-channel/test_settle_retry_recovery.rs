@@ -249,7 +249,7 @@ async fn an_unrecoverable_failure_records_what_it_discards() {
     let client = RpcClient::new_with_commitment(url.clone(), CommitmentConfig::processed());
 
     let good_slot = current_slot(&db_url).await;
-    let discarded_before = metric_total("private_channel_settler_discarded_transactions_total");
+    let discarded_before = metric_total("private_channel_discarded_executed_transactions_total");
 
     block_slots_from(&db_url, good_slot + 2).await;
     let accepted = submit(&client, 40).await;
@@ -259,7 +259,7 @@ async fn an_unrecoverable_failure_records_what_it_discards() {
     sleep(Duration::from_secs(35)).await;
 
     let discarded =
-        metric_total("private_channel_settler_discarded_transactions_total") - discarded_before;
+        metric_total("private_channel_discarded_executed_transactions_total") - discarded_before;
     assert!(
         discarded > 0.0,
         "an unsettleable buffer must be recorded, not dropped silently"

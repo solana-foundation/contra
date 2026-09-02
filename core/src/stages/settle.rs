@@ -61,9 +61,14 @@ const SETTLE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// blocks, so pinning it to the transaction expiry caps the overshoot at 2x.
 const SETTLE_RETRY_BUDGET: Duration = Duration::from_secs(15);
 
-/// Attempt bound once shutdown has been signalled: one last try, short enough
-/// to fit inside the node's drain deadline.
-const SETTLE_SHUTDOWN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Attempt bound once shutdown has been signalled. Short so two attempts fit
+/// the shutdown budget below.
+const SETTLE_SHUTDOWN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// All the settling a cancelled node gets, measured from cancellation so an
+/// attempt already in flight counts against it. Sized to fit two attempts and
+/// to leave the rest of the drain deadline for the cascade.
+const SETTLE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
 
 /// First delay between attempts, doubled after each failure up to the cap.
 const SETTLE_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(100);
@@ -727,10 +732,6 @@ fn compute_blockhash(
     hashv(&parts)
 }
 
-/// Signatures named per log line, so one discard cannot emit a single
-/// unreadable record while still naming every transaction it dropped.
-const DISCARD_SIGNATURES_PER_LINE: usize = 100;
-
 /// Record executed transactions that could not be committed, then drop them.
 ///
 /// The only place a buffer clears without a commit, so the record is written
@@ -741,6 +742,11 @@ fn discard_buffer(
     execution_results_rx: &mut mpsc::Receiver<ExecutedBatch>,
     metrics: &crate::stage_metrics::SharedMetrics,
 ) {
+    // Closed before the drain, not just emptied: every `try_recv` frees a slot
+    // and the executor may be parked on a send waiting for exactly that slot,
+    // so a snapshot lets a batch land behind the record and die with the
+    // receiver. Closing refuses it instead, and the executor records its own.
+    execution_results_rx.close();
     while let Ok((svm_output, transactions, _generation)) = execution_results_rx.try_recv() {
         processing_results.extend(
             svm_output
@@ -756,26 +762,7 @@ fn discard_buffer(
         .collect();
     processing_results.clear();
 
-    if signatures.is_empty() {
-        return;
-    }
-
-    metrics.settler_discarded_transactions(signatures.len());
-    error!(
-        "Discarding {} executed transactions that could not be settled: {}",
-        signatures.len(),
-        reason
-    );
-    for (index, chunk) in signatures.chunks(DISCARD_SIGNATURES_PER_LINE).enumerate() {
-        let listed: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
-        error!(
-            "Discarded signatures {}-{} of {}: {}",
-            index * DISCARD_SIGNATURES_PER_LINE + 1,
-            index * DISCARD_SIGNATURES_PER_LINE + chunk.len(),
-            signatures.len(),
-            listed.join(",")
-        );
-    }
+    crate::stages::record_discarded("settler", reason, &signatures, metrics);
 }
 
 /// Commit a batch, retrying a storage failure until the budget runs out.
@@ -804,9 +791,20 @@ async fn settle_with_retry(
         .as_nanos();
 
     let has_work = !processing_results.is_empty();
-    let deadline = Instant::now() + SETTLE_RETRY_BUDGET;
     let mut backoff = SETTLE_RETRY_BACKOFF_BASE;
     let mut attempts = 0u32;
+
+    // Cancelling swaps the budget for a shorter one measured from the moment it
+    // arrives, so an attempt already in flight is spent out of the drain's time
+    // rather than before it. Both are hard caps: no attempt starts that cannot
+    // finish inside the deadline that applies to it.
+    let mut draining = shutdown_token.is_cancelled();
+    let mut deadline = Instant::now()
+        + if draining {
+            SETTLE_SHUTDOWN_BUDGET
+        } else {
+            SETTLE_RETRY_BUDGET
+        };
 
     loop {
         // Health compares last input against last progress, so without a bump both
@@ -816,14 +814,8 @@ async fn settle_with_retry(
         }
         attempts += 1;
 
-        // A cancelled node has a drain deadline to meet, so it gets one short try.
-        let commit_timeout = if shutdown_token.is_cancelled() {
-            SETTLE_SHUTDOWN_ATTEMPT_TIMEOUT
-        } else {
-            SETTLE_ATTEMPT_TIMEOUT
-        };
-
-        let error = match settle_transactions(
+        let commit_timeout = attempt_timeout(draining, deadline);
+        let attempt = settle_transactions(
             last_block.clone(),
             accounts_db,
             redis_db.as_deref_mut(),
@@ -833,9 +825,28 @@ async fn settle_with_retry(
             generation,
             block_time_nanos,
             commit_timeout,
-        )
-        .await
-        {
+        );
+
+        let outcome = if draining {
+            attempt.await
+        } else {
+            tokio::pin!(attempt);
+            tokio::select! {
+                result = &mut attempt => result,
+                _ = shutdown_token.cancelled() => {
+                    draining = true;
+                    deadline = Instant::now() + SETTLE_SHUTDOWN_BUDGET;
+                    match tokio::time::timeout_at(deadline, &mut attempt).await {
+                        Ok(result) => result,
+                        Err(_) => Err(SettleError::Other(
+                            "settle attempt outlived the shutdown budget".to_string(),
+                        )),
+                    }
+                }
+            }
+        };
+
+        let error = match outcome {
             Ok(settle_result) => return Ok(settle_result),
             // Raised only after the commit landed, so the block is already
             // durable and retrying would write it a second time. The index it
@@ -846,9 +857,15 @@ async fn settle_with_retry(
             Err(e) => e,
         };
 
-        // Re-read: cancellation may have arrived while the attempt was running,
-        // and a second attempt would then run past the node's drain deadline.
-        if shutdown_token.is_cancelled() || Instant::now() + backoff >= deadline {
+        // Cancellation may have arrived while a draining attempt was running.
+        if !draining && shutdown_token.is_cancelled() {
+            draining = true;
+            deadline = deadline.min(Instant::now() + SETTLE_SHUTDOWN_BUDGET);
+        }
+
+        // Counted in full, so the budget bounds the call rather than the moment
+        // the last attempt starts.
+        if Instant::now() + backoff + attempt_timeout(draining, deadline) > deadline {
             return Err(error);
         }
 
@@ -856,11 +873,23 @@ async fn settle_with_retry(
         metrics.settler_settle_retried();
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            // Cancelling collapses the budget to the single short attempt above.
-            _ = shutdown_token.cancelled() => {}
+            _ = shutdown_token.cancelled(), if !draining => {
+                draining = true;
+                deadline = deadline.min(Instant::now() + SETTLE_SHUTDOWN_BUDGET);
+            }
         }
         backoff = (backoff * 2).min(SETTLE_RETRY_BACKOFF_MAX);
     }
+}
+
+/// The most one attempt may take: its own bound, never past the deadline.
+fn attempt_timeout(draining: bool, deadline: Instant) -> Duration {
+    let bound = if draining {
+        SETTLE_SHUTDOWN_ATTEMPT_TIMEOUT
+    } else {
+        SETTLE_ATTEMPT_TIMEOUT
+    };
+    bound.min(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// Settle transactions: Update accounts database with changes
@@ -1482,6 +1511,10 @@ mod tests {
     }
 
     /// Sum of one settler counter family, sampled as a delta by the callers.
+    /// The Prometheus registry is process-global, so tests that measure a
+    /// counter delta have to hold this while they do it.
+    static DISCARD_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn settler_metric(name: &str) -> f64 {
         private_channel_metrics::prometheus::gather()
             .into_iter()
@@ -2153,6 +2186,163 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A drain has time to spare, so a failure that clears must still settle.
+    /// Giving up on the first one throws the whole buffer away instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_settler_retries_within_its_shutdown_budget() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let _metrics_guard = DISCARD_METRIC_LOCK.lock().await;
+        let before = settler_metric("private_channel_discarded_executed_transactions_total");
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, metrics, shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        let tip = block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Cancel while it is retrying, then let the failure clear well inside
+        // the shutdown budget. The sender goes with it, since the settler
+        // drains until its input closes.
+        shutdown.cancel();
+        drop(exec_tx);
+        let clearing = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            unblock_slots(&clearing).await;
+        });
+
+        let exited = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
+        assert!(exited.is_ok(), "the settler must finish its drain");
+        assert!(
+            await_block(&pool, tip + 1, Duration::from_secs(5)).await,
+            "a cancelled settler must retry a failure that clears inside its budget"
+        );
+        let discarded =
+            settler_metric("private_channel_discarded_executed_transactions_total") - before;
+        assert_eq!(
+            discarded, 0.0,
+            "nothing may be discarded once the retry succeeded"
+        );
+    }
+
+    /// The budget is a bound as well as an allowance: the drain deadline is
+    /// shared with every other stage, so a doomed settle cannot spend it all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_settler_stops_at_its_shutdown_budget() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let t0 = tokio::time::Instant::now();
+        shutdown.cancel();
+        let exited = tokio::time::timeout(Duration::from_secs(30), handle.handle).await;
+        assert!(exited.is_ok(), "the settler must give up, not hang");
+        assert!(
+            t0.elapsed() < SETTLE_SHUTDOWN_BUDGET + Duration::from_millis(1500),
+            "gave up after {:?}, which overruns the shutdown budget",
+            t0.elapsed()
+        );
+    }
+
+    /// Cancellation must bound an attempt that is already running. Waiting it
+    /// out first and only then starting the budget stacks the two, which is
+    /// what pushes the settler past the drain deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_during_an_attempt_shortens_it() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+
+        // Hold the table so the attempt hangs rather than failing.
+        let mut locker = pool.begin().await.expect("begin locker");
+        sqlx::query("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *locker)
+            .await
+            .expect("lock blocks");
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        // Long enough that an attempt is in flight, short enough that its own
+        // timeout has not fired.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let t0 = tokio::time::Instant::now();
+        shutdown.cancel();
+        let exited = tokio::time::timeout(Duration::from_secs(40), handle.handle).await;
+        assert!(exited.is_ok(), "a hung attempt must still end the drain");
+        assert!(
+            t0.elapsed() < SETTLE_SHUTDOWN_BUDGET + Duration::from_millis(1500),
+            "took {:?} from cancellation, so the in-flight attempt was not re-bounded",
+            t0.elapsed()
+        );
+        let _ = locker.rollback().await;
+    }
+
+    /// The discard drain frees queue slots, and a parked executor fills them
+    /// immediately. Draining has to close the queue, not just empty it, or a
+    /// batch lands behind the record and dies with the receiver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discard_closes_the_queue_so_nothing_arrives_behind_the_record() {
+        let _metrics_guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = settler_metric("private_channel_discarded_executed_transactions_total");
+
+        // Capacity one, so the second sender parks exactly as the executor does.
+        let (tx, mut rx) = mpsc::channel::<ExecutedBatch>(1);
+        let (output, txs) = sized_settle_batch(1024);
+        tx.send((output, txs, 1)).await.unwrap();
+
+        let parked_tx = tx.clone();
+        let parked = tokio::spawn(async move {
+            let (output, txs) = sized_settle_batch(1024);
+            parked_tx.send((output, txs, 2)).await.is_ok()
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut buffer = Vec::new();
+        discard_buffer("test", &mut buffer, &mut rx, &metrics);
+        let recorded =
+            settler_metric("private_channel_discarded_executed_transactions_total") - before;
+
+        let handed_over = parked.await.unwrap();
+        assert_eq!(
+            recorded,
+            if handed_over { 2.0 } else { 1.0 },
+            "a batch the queue accepted must be in the record"
+        );
+
+        let (output, txs) = sized_settle_batch(1024);
+        assert!(
+            tx.send((output, txs, 3)).await.is_err(),
+            "the queue must be closed once the buffer is discarded, not merely emptied"
+        );
+    }
+
     /// Nothing may be dropped silently. When the budget runs out the settler
     /// must name every executed transaction it is throwing away, including the
     /// ones still queued behind it, because those are just as executed and just
@@ -2164,7 +2354,8 @@ mod tests {
         let pool = test_pool(&db);
         let shutdown = CancellationToken::new();
         let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
-        let before = settler_metric("private_channel_settler_discarded_transactions_total");
+        let _metrics_guard = DISCARD_METRIC_LOCK.lock().await;
+        let before = settler_metric("private_channel_discarded_executed_transactions_total");
 
         let (exec_tx, _rx, handle, _sinks, _hb) =
             settler_under_test(url, 100, 4, metrics, shutdown.clone()).await;
@@ -2188,7 +2379,7 @@ mod tests {
         );
 
         let discarded =
-            settler_metric("private_channel_settler_discarded_transactions_total") - before;
+            settler_metric("private_channel_discarded_executed_transactions_total") - before;
         assert_eq!(
             discarded, 2.0,
             "both the buffered and the queued transaction must be recorded"

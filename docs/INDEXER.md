@@ -18,6 +18,8 @@ Real-time block streaming via gRPC (requires a gRPC endpoint). Handles both Escr
 
 Enumerates the producing slots in each batch with `getBlocks`, then fetches only those blocks in parallel with `getBlock`. Higher latency (~1-5 seconds) but no special infrastructure required.
 
+Slots and blocks are decoupled on a Solana Private Channels node: slots tick every `blocktime_ms` whether or not a block is produced, and an idle node produces one block per second. A batch window can therefore contain no block at all. When that happens the poller looks past the window with `getBlocksWithLimit` for the next producing slot and claims the range up to it, so `batch_size` caps how much work one batch does and never determines whether the indexer can advance. It is not coupled to the node's `blocktime_ms` or its idle block cadence.
+
 **Location**: [`indexer/src/indexer/datasource/rpc_polling/`](../indexer/src/indexer/datasource/rpc_polling/)
 
 

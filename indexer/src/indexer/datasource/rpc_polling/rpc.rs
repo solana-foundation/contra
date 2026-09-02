@@ -5,7 +5,12 @@ use serde_json::json;
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// How far past an empty window the poller reaches for the next producer. The
+/// widest legal idle gap is a thousand slots, so this leaves tenfold room while
+/// keeping a hole in the ledger out of a batch that carries a slot per entry.
+const MAX_LOOKAHEAD_SLOTS: u64 = 10_000;
 
 pub struct RpcPoller {
     client: reqwest::Client,
@@ -373,7 +378,8 @@ impl RpcPoller {
 
     /// Get slot range to process, returning (slots, chain_tip). The range ends on
     /// a produced block: a tail is proven by the next block's parent link, and the
-    /// tip is a tick that usually carries none.
+    /// tip is a tick that usually carries none. `max_slots` caps the batch, not
+    /// the search, so an idle stretch wider than it still advances.
     pub async fn get_slots_to_process(
         &self,
         from_slot: u64,
@@ -393,12 +399,56 @@ impl RpcPoller {
         }
         let produced = self.get_blocks(from_slot, window_end).await?;
 
-        // Nothing produced in the window yet, so there is nothing provable to
-        // walk. The next poll asks again from the same place.
-        match produced.iter().max() {
-            Some(&last) => Ok(((from_slot..=last).collect(), latest_slot)),
-            None => Ok((vec![], latest_slot)),
+        // An empty window is an idle stretch wider than the batch, not the end of
+        // the chain, so the search continues past it. Bounding it here instead
+        // would tie the batch size to the node's idle block cadence.
+        let last = match produced.iter().max() {
+            Some(&last) => last,
+            None => match self
+                .next_producer(from_slot, latest_slot.saturating_sub(1))
+                .await?
+            {
+                Some(slot) => slot,
+                None => return Ok((vec![], latest_slot)),
+            },
+        };
+
+        Ok(((from_slot..=last).collect(), latest_slot))
+    }
+
+    /// The first slot at or after `from` that produced a block, with `highest` the
+    /// last slot the poller may claim. `None` is an idle tip rather than an error,
+    /// so the caller waits and asks again.
+    async fn next_producer(
+        &self,
+        from: u64,
+        highest: u64,
+    ) -> Result<Option<u64>, DataSourceRpcError> {
+        let Some(&slot) = self.get_blocks_with_limit(from, 1).await?.first() else {
+            return Ok(None);
+        };
+
+        if slot < from {
+            warn!("lookahead from slot {from} answered with slot {slot}; endpoint is inconsistent");
+            return Ok(None);
         }
+        // A block on the tip slot is claimed by the next poll, the same way the
+        // window has always stopped short of it.
+        if slot > highest {
+            return Ok(None);
+        }
+        // This far out is a hole in the ledger, not an idle gap, and claiming it
+        // would build a batch carrying an entry for every slot across the hole.
+        if slot - from > MAX_LOOKAHEAD_SLOTS {
+            warn!(
+                "the next block after slot {from} is at slot {slot}, {} slots away and past the \
+                 lookahead cap of {MAX_LOOKAHEAD_SLOTS}; the poller is not advancing",
+                slot - from
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(slot))
     }
 }
 
@@ -1067,10 +1117,20 @@ mod tests {
         let mut server = Server::new_async().await;
         let _m_slot = mock_get_slot(&mut server, 150);
         let _m_enum = mock_get_blocks(&mut server, 100, 129, &[100, 110, 120]);
+        // A window that holds a block settles the range on its own, so the
+        // loaded path never pays for the lookahead.
+        let m_next = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlocksWithLimit"
+            })))
+            .expect(0)
+            .create();
 
         let poller = poller(&server);
         let (slots, chain_tip) = poller.get_slots_to_process(100, 30).await.unwrap();
 
+        m_next.assert();
         assert_eq!(slots.first(), Some(&100));
         assert_eq!(
             slots.last(),
@@ -1080,19 +1140,95 @@ mod tests {
         assert_eq!(chain_tip, 150);
     }
 
-    /// A long idle stretch produces nothing inside the window. There is nothing
-    /// provable to walk, so the poller waits rather than claiming the slots.
+    /// An idle stretch wider than the batch leaves the window empty while a block
+    /// sits past it. The window caps the batch, it does not bound the search, so
+    /// the range has to reach that block. Stopping at the window would park the
+    /// poller on a range it can never advance out of.
     #[tokio::test]
-    async fn get_slots_to_process_waits_when_the_window_produced_nothing() {
+    async fn get_slots_to_process_extends_past_an_empty_window_to_the_next_producer() {
         let mut server = Server::new_async().await;
         let _m_slot = mock_get_slot(&mut server, 150);
         let _m_enum = mock_get_blocks(&mut server, 100, 129, &[]);
+        let _m_next = mock_get_blocks_with_limit(&mut server, 100, &[140]);
+
+        let poller = poller(&server);
+        let (slots, chain_tip) = poller.get_slots_to_process(100, 30).await.unwrap();
+
+        assert_eq!(slots.first(), Some(&100));
+        assert_eq!(
+            slots.last(),
+            Some(&140),
+            "the range must reach the first producer past the window"
+        );
+        assert_eq!(chain_tip, 150);
+    }
+
+    /// Nothing produced anywhere at or after the window is a genuinely idle tip,
+    /// not a stall. There is nothing provable to walk, so the poller waits.
+    #[tokio::test]
+    async fn get_slots_to_process_waits_when_no_block_has_been_produced_yet() {
+        let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[]);
+        let _m_next = mock_get_blocks_with_limit(&mut server, 100, &[]);
 
         let poller = poller(&server);
         let (slots, chain_tip) = poller.get_slots_to_process(100, 30).await.unwrap();
 
         assert!(slots.is_empty());
         assert_eq!(chain_tip, 150);
+    }
+
+    /// The tip slot is never processed, so a block landing on it waits for the
+    /// next poll. The lookahead must respect that ceiling rather than widen it.
+    #[tokio::test]
+    async fn get_slots_to_process_ignores_a_producer_at_the_tip() {
+        let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[]);
+        let _m_next = mock_get_blocks_with_limit(&mut server, 100, &[150]);
+
+        let poller = poller(&server);
+        let (slots, chain_tip) = poller.get_slots_to_process(100, 30).await.unwrap();
+
+        assert!(slots.is_empty(), "the tip slot must not be claimed");
+        assert_eq!(chain_tip, 150);
+    }
+
+    /// A producer this far out is a hole in the ledger rather than an idle gap.
+    /// Claiming it would build a batch per slot across the hole, so the poller
+    /// declines and leaves the distance in the log.
+    #[tokio::test]
+    async fn get_slots_to_process_refuses_a_lookahead_beyond_the_cap() {
+        let mut server = Server::new_async().await;
+        let far = 100 + MAX_LOOKAHEAD_SLOTS + 1;
+        let _m_slot = mock_get_slot(&mut server, far + 10);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[]);
+        let _m_next = mock_get_blocks_with_limit(&mut server, 100, &[far]);
+
+        let poller = poller(&server);
+        let (slots, _) = poller.get_slots_to_process(100, 30).await.unwrap();
+
+        assert!(
+            slots.is_empty(),
+            "a producer past the cap must not be claimed"
+        );
+    }
+
+    /// An answer below the window start contradicts the request. Building the
+    /// range anyway yields an empty one, which would read as caught up and stall
+    /// the poller silently, so it is refused outright.
+    #[tokio::test]
+    async fn get_slots_to_process_rejects_a_producer_before_the_window() {
+        let mut server = Server::new_async().await;
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_enum = mock_get_blocks(&mut server, 100, 129, &[]);
+        let _m_next = mock_get_blocks_with_limit(&mut server, 100, &[90]);
+
+        let poller = poller(&server);
+        let (slots, _) = poller.get_slots_to_process(100, 30).await.unwrap();
+
+        assert!(slots.is_empty());
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use yellowstone_grpc_proto::geyser::{
-    subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlock,
+    subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlock, SubscribeUpdateSlot,
     SubscribeUpdateTransactionInfo,
 };
 use yellowstone_grpc_proto::solana::storage::confirmed_block::{
@@ -35,6 +35,18 @@ pub fn block(slot: u64, txs: Vec<SubscribeUpdateTransactionInfo>) -> SubscribeUp
 /// A produced block with no program transactions still completes its slot.
 pub fn empty_block(slot: u64) -> SubscribeUpdate {
     block(slot, vec![])
+}
+
+/// The stream's own resume point. Carries no transactions, so it only arms the gap gate.
+pub fn slot_update(slot: u64) -> SubscribeUpdate {
+    SubscribeUpdate {
+        filters: vec!["private_channel_slots".to_string()],
+        update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+            slot,
+            ..Default::default()
+        })),
+        created_at: None,
+    }
 }
 
 /// The DepositEvent CPI payload the escrow parser reads the authoritative

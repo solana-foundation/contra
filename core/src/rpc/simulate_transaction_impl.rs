@@ -8,6 +8,7 @@ use crate::{
     scheduler::{ConflictFreeBatch, TransactionWithIndex},
     stage_metrics::{NoopMetrics, SharedMetrics},
     stages::{execute_batch, get_execution_deps, sigverify_transaction, SigverifyResult},
+    transactions::{has_address_table_lookups, ADDRESS_LOOKUP_UNSUPPORTED},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bincode::Options;
@@ -165,6 +166,15 @@ pub async fn simulate_transaction(
             )
         })?;
 
+    if has_address_table_lookups(&versioned_tx.message) {
+        return Err(custom_error(
+            INVALID_PARAMS_CODE,
+            ADDRESS_LOOKUP_UNSUPPORTED,
+        ));
+    }
+
+    // Every remaining v0 message declares no lookups, so an empty loaded set is
+    // the true resolution rather than a stand-in for one.
     let runtime_tx = RuntimeTransaction::try_create(
         versioned_tx,
         MessageHash::Compute,

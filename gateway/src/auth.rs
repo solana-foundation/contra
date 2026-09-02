@@ -78,6 +78,12 @@ const ACCOUNT_GATED_METHODS: &[&str] = &[
 /// Transaction history. Gated like the two above.
 pub const GET_SIGNATURES_FOR_ADDRESS: &str = "getSignaturesForAddress";
 
+/// Gated methods that a token-account delegate must not unlock. A delegate is a
+/// current spend authority, often temporary and allowance-scoped, so it may read
+/// the balance it can spend. It says nothing about who controlled the address
+/// when past transactions landed, so it cannot open a history page.
+const OWNER_ONLY_METHODS: &[&str] = &[GET_SIGNATURES_FOR_ADDRESS];
+
 /// Signature status lookup. Ungated, since any caller may poll a signature it
 /// already holds, but its response carries the same execution errors as a
 /// history page.
@@ -276,16 +282,19 @@ pub fn check_request_auth(
 /// - DvP swap escrow: `check_swap_dvp_ownership`.
 /// - Anything else (e.g. a System Program wallet account): falls back to
 ///   checking whether the `pubkey` itself is a verified wallet.
+///
+/// `method` narrows the token-account check only: see `OWNER_ONLY_METHODS`.
 pub async fn check_account_data_ownership(
     data: &[u8],
     program_owner: &str,
     pubkey: &str,
+    method: &str,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> AuthDecision {
     match program_owner {
         SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM => {
-            check_token_account_ownership(data, user_id, auth_db).await
+            check_token_account_ownership(data, method, user_id, auth_db).await
         }
         DVP_SWAP_PROGRAM => check_swap_dvp_ownership(data, user_id, auth_db).await,
         // Non-token-program account (e.g. System Program wallet, unknown PDA).
@@ -301,13 +310,15 @@ pub async fn check_account_data_ownership(
 
 /// Ownership check for SPL Token and Token-2022 accounts. Both programs share
 /// the same base layout, so this checks the `owner` field (bytes 32-63) and,
-/// if it doesn't match, the `delegate` field (bytes 76-107) when present — a
-/// delegate has spend authority and counts as ownership for read access.
+/// if it doesn't match, the `delegate` field (bytes 76-107) when present. The
+/// delegate grants read access for a current-state method, but is skipped for
+/// an `OWNER_ONLY_METHODS` one.
 ///
 /// Mints are owned by the same programs but are only 82 bytes, below
 /// `TOKEN_ACCOUNT_SIZE`; they are not user accounts and are denied.
 async fn check_token_account_ownership(
     data: &[u8],
+    method: &str,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> AuthDecision {
@@ -321,8 +332,14 @@ async fn check_token_account_ownership(
 
     match is_wallet_owned_by_user(auth_db, user_id, &owner).await {
         Ok(true) => return AuthDecision::Proceed,
-        Ok(false) => {} // fall through to delegate check
+        Ok(false) => {} // not the owner
         Err(_) => return AuthDecision::Reject(StatusCode::INTERNAL_SERVER_ERROR, db_error_body()),
+    }
+
+    // Checked after the owner so delegating an account never costs the owner
+    // access to its own history.
+    if OWNER_ONLY_METHODS.contains(&method) {
+        return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
     }
 
     // Check the `delegate` field if one is set.
@@ -725,6 +742,18 @@ mod tests {
         ));
     }
 
+    /// An owner-only method that is not account-gated never reaches the token
+    /// account check, leaving the policy silently dead.
+    #[test]
+    fn owner_only_methods_are_account_gated() {
+        for method in OWNER_ONLY_METHODS {
+            assert!(
+                ACCOUNT_GATED_METHODS.contains(method),
+                "{method} is owner-only but not account-gated"
+            );
+        }
+    }
+
     // ── redacts_transaction_errors ────────────────────────────────────────────
 
     /// `getSignatureStatuses` is ungated, so the anonymous caller (the shape the
@@ -795,6 +824,7 @@ mod tests {
             &data,
             SPL_TOKEN_PROGRAM,
             "SomePubkey",
+            "getAccountInfo",
             Uuid::new_v4(),
             &pool,
         )
@@ -813,6 +843,7 @@ mod tests {
             &data,
             SPL_TOKEN_2022_PROGRAM,
             "SomePubkey",
+            "getAccountInfo",
             Uuid::new_v4(),
             &pool,
         )
@@ -833,6 +864,7 @@ mod tests {
             &data,
             DVP_SWAP_PROGRAM,
             "SomePubkey",
+            "getAccountInfo",
             Uuid::new_v4(),
             &pool,
         )

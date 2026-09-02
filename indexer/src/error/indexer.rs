@@ -36,6 +36,36 @@ pub enum IndexerError {
 
     #[error("Reconciliation failed: {0}")]
     Reconciliation(#[from] ReconciliationError),
+
+    /// A backfill-only run finished without durably recording its whole range.
+    /// `committed` is `None` when no checkpoint was ever written, which is not
+    /// the same as a checkpoint that stalled part way and must stay
+    /// distinguishable in the logs an operator reads after a failed repair.
+    #[error(
+        "backfill for {program_type} left the committed checkpoint at {committed:?}, short of \
+         target slot {target}; the range was not fully recorded"
+    )]
+    BackfillIncomplete {
+        program_type: String,
+        committed: Option<u64>,
+        target: u64,
+    },
+
+    /// The checkpoint writer had to be cancelled before it confirmed its final flush, so the
+    /// run cannot prove it finished even though its slots may all be stored. Kept apart from
+    /// `BackfillIncomplete` because the operator action differs: this one points at a slow or
+    /// wedged database, not at a slot the pipeline failed to record.
+    #[error(
+        "backfill for {program_type} could not confirm its checkpoint: the writer was still \
+         running after {waited_secs}s and was cancelled, leaving the durable checkpoint at \
+         {committed:?} against target {target}. Re-run the repair once the database is healthy"
+    )]
+    BackfillCheckpointUnconfirmed {
+        program_type: String,
+        committed: Option<u64>,
+        target: u64,
+        waited_secs: u64,
+    },
 }
 
 /// Errors from startup reconciliation against on-chain state
@@ -181,5 +211,20 @@ pub enum CheckpointError {
         last: Option<u64>,
         target: u64,
         waited_secs: u64,
+    },
+
+    /// `setting` names the offending config key so the message points at the knob to
+    /// change, since the two keys that can trigger this need different remedies.
+    #[error(
+        "Configured {setting} {start_slot} is ahead of the durable checkpoint {checkpoint} \
+         for {program_type}: the slots after {checkpoint} and below {start_slot} have never \
+         been indexed and would be skipped. Lower {setting} to {checkpoint} or below, unset \
+         it, or run a destructive resync if the skip is intended."
+    )]
+    StartSlotAheadOfCheckpoint {
+        setting: &'static str,
+        program_type: String,
+        start_slot: u64,
+        checkpoint: u64,
     },
 }

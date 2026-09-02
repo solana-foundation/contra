@@ -45,6 +45,7 @@ integration-test:
 	@echo "=== prod-feature indexer group ==="
 	@cargo test --test reconciliation_integration -- --nocapture
 	@cargo test --test gap_detection_integration -- --nocapture
+	@cargo test --test backfill_only_e2e -- --nocapture
 	@cargo test --test truncate_integration -- --nocapture
 	@cargo test --test pausable_mint_integration -- --nocapture
 	@cargo test --test permanent_delegate_mint_integration -- --nocapture
@@ -238,6 +239,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture
 	@echo "Running gap detection integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
+	@echo "Running backfill-only e2e tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test backfill_only_e2e -- --nocapture
 	@echo "Running truncate integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test truncate_integration -- --nocapture
 	@echo "Running pausable mint integration tests with coverage instrumentation..."

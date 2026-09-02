@@ -117,7 +117,23 @@ impl ResyncService {
         // future-slot, an unreachable channel, or a legacy-scheme memo can never leave a
         // half-wiped database.
 
-        // Pre-flight 1: genesis_slot must not be ahead of the chain tip.
+        // Pre-flight 1: an escrow rebuild needs its instance scope. The processor filters
+        // escrow instructions by it and an unset scope drops every one of them, so a rebuild
+        // without it would empty the tables, refill them with nothing, and still advance the
+        // checkpoint to the tip. That leaves no gap for a later run to detect, which makes it
+        // the one failure here that is not recoverable by repeating the operation.
+        if self.program_type == ProgramType::Escrow && self.escrow_instance_id.is_none() {
+            error!("Refusing to resync the escrow indexer with no escrow instance id");
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::InvalidPubkey {
+                    pubkey: "<missing>".to_string(),
+                    reason: "escrow_instance_id is required to resync the escrow indexer"
+                        .to_string(),
+                },
+            ));
+        }
+
+        // Pre-flight 2: genesis_slot must not be ahead of the chain tip.
         let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
             error!("Failed to fetch current slot before resync backfill: {}", e);
             IndexerError::DataSource(e.into())
@@ -135,7 +151,7 @@ impl ResyncService {
             }));
         }
 
-        // Pre-flight 2+3: channel reachability + consumed-set completeness + cross-scheme
+        // Pre-flight 3+4: channel reachability + consumed-set completeness + cross-scheme
         // guard, all inside build_consumed_set, which returns Err on any of them.
         let consumed = self.build_consumed_set().await?;
 
@@ -236,16 +252,22 @@ impl ResyncService {
             }
         }
 
-        // Perform cleanup after backfill
+        // Perform cleanup after backfill, with no completeness target to check. A rebuild
+        // resolves its range inside the backfill service and never surfaces the top slot,
+        // so there is nothing to compare against here. Leaving it unchecked is acceptable
+        // because a stale checkpoint after a rebuild heals itself: the next live start
+        // detects the gap below the tip and fills it.
         if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
             checkpoint_handle,
             checkpoint_tx,
             self.storage.clone(),
+            None,
         )
         .await
         {
             error!("Cleanup after resync backfill failed: {}", e);
-            return Err(IndexerError::ShutdownChannelSend);
+            // Returned as-is so the operator sees which stage failed, not a generic one.
+            return Err(e);
         }
 
         info!(
@@ -297,5 +319,49 @@ mod tests {
         assert_eq!(service.program_type, ProgramType::Withdraw);
         assert_eq!(service.escrow_instance_id, Some(instance_id));
         assert_eq!(service.backfill_config_base.start_slot, Some(1000));
+    }
+
+    /// An escrow rebuild with no instance scope would drop every table and refill them with
+    /// nothing, so it must abort before the drop rather than after it.
+    ///
+    /// The RPC points at a dead port, which is what makes the ordering observable: the tip
+    /// fetch sits between this guard and the drop, so an `InvalidPubkey` here can only mean
+    /// the guard ran first. Had it run later, the unreachable node would have produced a
+    /// datasource error instead, and the tables would already be gone.
+    #[tokio::test]
+    async fn run_refuses_escrow_resync_without_instance_id_before_dropping_tables() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://127.0.0.1:1".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+
+        let service = ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Escrow,
+            backfill_config,
+            None,
+        );
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::InvalidPubkey {
+                reason,
+                ..
+            })) => assert!(
+                reason.contains("escrow_instance_id"),
+                "reason must name the missing scope, got: {reason}"
+            ),
+            other => panic!("escrow resync with no instance id must fail closed, got: {other:?}"),
+        }
     }
 }

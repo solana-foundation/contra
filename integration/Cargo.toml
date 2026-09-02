@@ -116,6 +116,11 @@ path = "tests/indexer/reconnect_gap_fill_fail_closed.rs"
 name = "startup_anchor"
 path = "tests/indexer/startup_anchor.rs"
 
+# One-shot backfill repair: records its range, verifies it, fails closed on write errors.
+[[test]]
+name = "backfill_only_e2e"
+path = "tests/indexer/backfill_only_e2e.rs"
+
 # Startup ordering: backfill completes and commits before escrow reconciliation.
 [[test]]
 name = "startup_backfill_reconcile"

@@ -1,6 +1,7 @@
 use {
     crate::{
         accounts::{
+            get_tip::get_tip,
             postgres::PostgresAccountsDB,
             redis::{RedisAccountsDB, CACHE_FAILURE_LIMIT},
             redis_coherence,
@@ -173,11 +174,9 @@ struct LastBlock {
 /// resolve against Postgres.
 ///
 /// `postgres_slot` and `postgres_blockhash` are the caller's view of the
-/// Postgres tip. The caller checks only that the two agree on being present or
-/// absent, and reads them in a way that maps a query failure to absent, so an
-/// unreachable Postgres arrives here as an empty ledger and purges the cache.
-/// Wrong in the safe direction, and worth tightening at the read rather than
-/// here.
+/// Postgres tip, both taken from the same tip block row. The caller treats a
+/// failed read as fatal, so an absent tip here always means a ledger with no
+/// blocks rather than a database it could not reach.
 ///
 /// This covers what a restart can see, including a cache left unstamped by an
 /// interrupted rebuild. Gaps that open while the settler keeps running are caught
@@ -338,28 +337,18 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 }
             };
 
-            // Propagated, never mapped to "no blocks": an unreachable Postgres
-            // read as an empty ledger makes the settler believe it is at genesis
-            // and start writing slot 0 over a live chain. `Ok(None)` here means
-            // the ledger genuinely has no blocks.
-            let last_slot = accounts_db
-                .get_latest_slot()
+            // Where this settler resumes, slot and hash from the one tip block row.
+            // A failed read is fatal: read as an empty ledger it would restart a
+            // live chain at slot 0. `None` means the ledger provably has no blocks.
+            let mut last_block = get_tip(&postgres_db)
                 .await
-                .context("Failed to read the latest slot at startup")?;
-            let last_blockhash = accounts_db.get_latest_blockhash().await.ok();
-
-            // Validate that last_slot and last_blockhash are both present or both absent.
-            // Runs before the cache is aligned: an incoherent tip is not a
-            // baseline anything can be checked against.
-            match (last_slot, last_blockhash) {
-                (Some(_), None) => {
-                    anyhow::bail!("Invalid state: last_slot exists but last_blockhash is missing");
-                }
-                (None, Some(_)) => {
-                    anyhow::bail!("Invalid state: last_blockhash exists but last_slot is missing");
-                }
-                _ => {}
-            }
+                .context("Failed to read the chain tip at startup")?
+                .map(|tip| LastBlock {
+                    slot: tip.slot,
+                    blockhash: tip.blockhash,
+                });
+            let last_slot = last_block.as_ref().map(|b| b.slot);
+            let last_blockhash = last_block.as_ref().map(|b| b.blockhash);
 
             // Align the cache with Postgres before the first dual-write. Failing
             // to verify it means the cache cannot be trusted, so run Postgres-only
@@ -397,13 +386,6 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 None => None,
             };
 
-            let mut last_block = match (last_slot, last_blockhash) {
-                (Some(last_slot), Some(last_blockhash)) => Some(LastBlock {
-                    slot: last_slot,
-                    blockhash: last_blockhash,
-                }),
-                _ => None,
-            };
             let mut processing_results = Vec::new();
             // Settled bytes since the last block; gates the recv arm below.
             let mut buffered_account_bytes = 0usize;
@@ -5333,5 +5315,175 @@ mod tests {
         );
 
         p.shutdown.cancel();
+    }
+
+    /// Poll until the settler has committed a tip at or past `at_least`.
+    async fn wait_for_tip(pg: &PostgresAccountsDB, at_least: u64, what: &str) -> BlockInfo {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(tip) = crate::accounts::get_tip::get_tip(pg).await.unwrap() {
+                if tip.slot >= at_least {
+                    return tip;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A restart must continue the existing chain, not start a second one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_resumes_from_the_tip_after_a_restart() {
+        let (db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref pg) = db else {
+            panic!("Expected Postgres variant")
+        };
+        let pool = pg.pool.clone();
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let first_shutdown = CancellationToken::new();
+        let (_tx, _rx, handle, _sinks) = settler_under_test(
+            url.clone(),
+            50,
+            RESULTS_CAP,
+            Arc::new(NoopMetrics) as SharedMetrics,
+            first_shutdown.clone(),
+        )
+        .await;
+        wait_for_tip(pg, 0, "the first settler must produce a block").await;
+        first_shutdown.cancel();
+        let _ = handle.handle.await;
+
+        let first_tip = crate::accounts::get_tip::get_tip(pg)
+            .await
+            .unwrap()
+            .expect("the first settler produced blocks");
+
+        // Point the derived metadata at a hash no block carries; the restart must ignore it.
+        sqlx::query("UPDATE metadata SET value = $1 WHERE key = 'latest_blockhash'")
+            .bind(Hash::new_unique().as_ref().to_vec())
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+
+        let second_shutdown = CancellationToken::new();
+        let (_tx2, _rx2, handle2, _sinks2) = settler_under_test(
+            url,
+            50,
+            RESULTS_CAP,
+            Arc::new(NoopMetrics) as SharedMetrics,
+            second_shutdown.clone(),
+        )
+        .await;
+        let second_tip = wait_for_tip(
+            pg,
+            first_tip.slot + 1,
+            "the restarted settler must advance past the tip it resumed from",
+        )
+        .await;
+        second_shutdown.cancel();
+        let _ = handle2.handle.await;
+        assert!(
+            second_tip.slot > first_tip.slot,
+            "the restarted settler must advance past the tip it resumed from, {} then {}",
+            first_tip.slot,
+            second_tip.slot
+        );
+
+        let successor: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = $1")
+            .bind(first_tip.slot as i64 + 1)
+            .fetch_one(pool.as_ref())
+            .await
+            .expect("the block after the old tip exists");
+        let successor: BlockInfo = bincode::deserialize(&successor).unwrap();
+        assert_eq!(
+            successor.previous_blockhash, first_tip.blockhash,
+            "the first block after a restart must chain off the tip block's own hash"
+        );
+        assert_eq!(
+            successor.parent_slot, first_tip.slot,
+            "the first block after a restart must name the tip as its parent"
+        );
+    }
+
+    /// A tip the settler cannot read must stop it, never pass as an empty ledger.
+    /// Resuming from genesis would overwrite slot zero, so the assertions below
+    /// check the canonical row is still byte-for-byte intact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_refuses_to_restart_from_genesis_when_the_tip_is_unreadable() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref pg) = db else {
+            panic!("Expected Postgres variant")
+        };
+        let pool = pg.pool.clone();
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        db.store_block(crate::test_helpers::create_test_block_info(
+            0,
+            Hash::new_unique(),
+        ))
+        .await
+        .unwrap();
+        db.store_block(crate::test_helpers::create_test_block_info(
+            1,
+            Hash::new_unique(),
+        ))
+        .await
+        .unwrap();
+
+        let genesis_before: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = 0")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+
+        // Only the tip row is damaged, so the settler fails on the read it now depends on.
+        sqlx::query("UPDATE blocks SET data = $1 WHERE slot = 1")
+            .bind(vec![0xFFu8; 16])
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+
+        let shutdown = CancellationToken::new();
+        let (_tx, _rx, handle, _sinks) = settler_under_test(
+            url,
+            50,
+            RESULTS_CAP,
+            Arc::new(NoopMetrics) as SharedMetrics,
+            shutdown.clone(),
+        )
+        .await;
+
+        let quit = tokio::time::timeout(
+            Duration::from_millis(SETTLE_START_DELAY_MS + 3_000),
+            handle.handle,
+        )
+        .await;
+        assert!(
+            quit.is_ok(),
+            "the settler must quit when it cannot prove the tip"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "the settler must quit on its own, not because the test shut it down"
+        );
+
+        let max_slot: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            max_slot,
+            Some(1),
+            "a settler that cannot read the tip must not produce blocks"
+        );
+
+        let genesis_after: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = 0")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            genesis_before, genesis_after,
+            "the canonical slot zero must not be overwritten by a genesis restart"
+        );
     }
 }

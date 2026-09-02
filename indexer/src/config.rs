@@ -244,6 +244,13 @@ impl IndexerConfig {
             }
         }
 
+        // The one-shot repair only runs when backfill is also enabled. Without this the
+        // pair reads as a typo that starts a normal live indexer, which for a job the
+        // operator expects to exit means it silently never does.
+        if self.backfill.exit_after_backfill && !self.backfill.enabled {
+            return Err("backfill.backfill_only requires backfill.enabled to be true".to_string());
+        }
+
         Ok(())
     }
 }
@@ -523,6 +530,27 @@ mod tests {
             let result = config.validate();
             assert!(result.is_ok());
         }
+    }
+
+    /// backfill_only on its own would start a live indexer that never exits, which is the
+    /// opposite of the one-shot repair the flag names, so the pair is rejected up front.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_backfill_only_without_backfill_enabled() {
+        let mut config = create_indexer_config();
+        config.backfill.enabled = false;
+        config.backfill.exit_after_backfill = true;
+
+        let err = config
+            .validate()
+            .expect_err("backfill_only without enabled must not validate");
+        assert!(
+            err.contains("backfill.enabled"),
+            "error must name the missing flag, got: {err}"
+        );
+
+        config.backfill.enabled = true;
+        assert!(config.validate().is_ok(), "the enabled pair must validate");
     }
 
     // ── operator operational commitment floor ───────────────────────────

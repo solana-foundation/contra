@@ -208,6 +208,12 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
         full_api: true,
         disable_health_check: true,
         enable_rpc_transaction_history: true,
+        // Inner instructions and logs are only persisted with this on, and the escrow
+        // programs report every deposit and withdrawal through a self-CPI event that the
+        // indexer reads out of the inner instruction list. Without it a block comes back
+        // with the top-level instruction and no event, so anything reading chain history
+        // over RPC decodes each deposit to nothing.
+        enable_extended_tx_metadata_storage: true,
         ..Default::default()
     };
 
@@ -287,6 +293,12 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
         full_api: true,
         disable_health_check: true,
         enable_rpc_transaction_history: true,
+        // Inner instructions and logs are only persisted with this on, and the escrow
+        // programs report every deposit and withdrawal through a self-CPI event that the
+        // indexer reads out of the inner instruction list. Without it a block comes back
+        // with the top-level instruction and no event, so anything reading chain history
+        // over RPC decodes each deposit to nothing.
+        enable_extended_tx_metadata_storage: true,
         ..Default::default()
     };
 

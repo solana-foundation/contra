@@ -917,6 +917,51 @@ async fn test_get_token_account_balance_gated_by_ownership() {
     assert_eq!(res2.status(), 403);
 }
 
+/// A delegate may still read current state: it can spend the balance, so
+/// reading it discloses nothing the delegation did not already grant. Only the
+/// historical method is owner-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_token_account_balance_delegate_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate_bytes = [47u8; 32];
+    let delegate_pubkey = bs58::encode(delegate_bytes).into_string();
+    let unrelated_owner = [48u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &delegate_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([49u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &unrelated_owner,
+        Some(&delegate_bytes),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountBalance",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
 /// An expired operator JWT must be rejected with 401 on operator-only methods.
 /// Verifies that token expiry is validated before the role check.
 #[tokio::test(flavor = "multi_thread")]
@@ -1353,6 +1398,135 @@ async fn test_get_signatures_for_address_unowned_address_returns_403() {
         .unwrap();
 
     assert_eq!(res.status(), 403);
+}
+
+/// A token-account delegate must not be able to read the address' history.
+/// A delegation is a current spend authority and says nothing about who
+/// controlled the address when the returned transactions landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_delegate_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate_bytes = [44u8; 32];
+    let delegate_pubkey = bs58::encode(delegate_bytes).into_string();
+    let unrelated_owner = [45u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &delegate_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([46u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &unrelated_owner,
+        Some(&delegate_bytes),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
+/// The token-account owner still reads its own history. The owned-wallet test
+/// above goes through the System Program fallback, so this is the only cover
+/// for the token-account path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner_bytes = [50u8; 32];
+    let owner_pubkey = bs58::encode(owner_bytes).into_string();
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &owner_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([51u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(&owner_bytes, None)).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
+/// Approving a delegate must not cost the owner access to its own history.
+/// Fails if the owner-only rejection is checked before the owner field.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner_bytes = [52u8; 32];
+    let owner_pubkey = bs58::encode(owner_bytes).into_string();
+    let unrelated_delegate = [53u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &owner_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([54u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &owner_bytes,
+        Some(&unrelated_delegate),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
 }
 
 /// `getSignaturesForAddress` with an Operator JWT must be proxied for any address.

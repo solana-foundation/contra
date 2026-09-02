@@ -36,6 +36,36 @@ pub enum IndexerError {
 
     #[error("Reconciliation failed: {0}")]
     Reconciliation(#[from] ReconciliationError),
+
+    /// A backfill-only run finished without durably recording its whole range.
+    /// `committed` is `None` when no checkpoint was ever written, which is not
+    /// the same as a checkpoint that stalled part way and must stay
+    /// distinguishable in the logs an operator reads after a failed repair.
+    #[error(
+        "backfill for {program_type} left the committed checkpoint at {committed:?}, short of \
+         target slot {target}; the range was not fully recorded"
+    )]
+    BackfillIncomplete {
+        program_type: String,
+        committed: Option<u64>,
+        target: u64,
+    },
+
+    /// The checkpoint writer had to be cancelled before it confirmed its final flush, so the
+    /// run cannot prove it finished even though its slots may all be stored. Kept apart from
+    /// `BackfillIncomplete` because the operator action differs: this one points at a slow or
+    /// wedged database, not at a slot the pipeline failed to record.
+    #[error(
+        "backfill for {program_type} could not confirm its checkpoint: the writer was still \
+         running after {waited_secs}s and was cancelled, leaving the durable checkpoint at \
+         {committed:?} against target {target}. Re-run the repair once the database is healthy"
+    )]
+    BackfillCheckpointUnconfirmed {
+        program_type: String,
+        committed: Option<u64>,
+        target: u64,
+        waited_secs: u64,
+    },
 }
 
 /// Errors from startup reconciliation against on-chain state

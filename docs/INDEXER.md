@@ -55,6 +55,56 @@ Recovers missed slots on indexer restart or network issues:
 
 **Location**: [`indexer/src/indexer/backfill.rs`](../indexer/src/indexer/backfill.rs)
 
+#### Backfill-only mode
+
+Setting `indexer.backfill.backfill_only = true` (alongside `backfill.enabled`) turns the
+indexer into a one-shot repair: it fills the resolved slot range and exits instead of
+starting a live datasource. This is the tool to run when finalized deposits or withdrawals
+are known to be missing from the database.
+
+The mode runs the same pipeline as normal indexing (backfill producer, transaction
+processor, checkpoint writer), so the rows it recovers land exactly as a live run would
+have written them: deposits enter as `pending` for the operator to service. Startup
+reconciliation is deliberately skipped, because the database is known-incomplete and
+reconciling it would block the very repair that fixes it. An escrow instance id is still
+required: without it every escrow instruction is filtered out as out of scope.
+
+The exit code is the contract:
+
+- **Exit 0** means every slot in the resolved range is durably recorded *and* the committed
+  checkpoint reached the top of that range. The checkpoint is re-read from the database
+  after the pipeline drains, so a stalled or failed checkpoint write cannot be reported as
+  success.
+- **Non-zero** means the range was not fully recorded. The checkpoint is left at the last
+  slot that was completely stored, so re-running the repair resumes from there rather than
+  redoing work that already committed.
+
+Re-running a completed repair is safe: the range is resolved from the committed checkpoint,
+and every write is idempotent, so no rows are duplicated.
+
+**The range never reaches below the committed checkpoint.** It is resolved as
+`(max(start_slot - 1, last_committed_slot), tip]`, so `backfill.start_slot` can only move
+the floor *up*. If the hole sits below the checkpoint (the indexer has since streamed past
+it), setting `start_slot` to the hole does nothing: the repair refills slots that were never
+missing and exits 0 with the hole intact. Lower the checkpoint first, then run the repair:
+
+```sql
+UPDATE indexer_state SET last_committed_slot = <slot before the hole>
+WHERE program_type = 'escrow';
+```
+
+Everything between that slot and the tip is then re-indexed. That is safe but not free, so
+pick the highest slot that still sits below the hole.
+
+**Raising `start_slot` above the checkpoint is refused.** The floor would land above slots
+that were never indexed, and because the checkpoint writer is gated from that floor it would
+walk to the top of the range and commit a checkpoint over them. Nothing would go back for
+them afterwards: the next run resolves its floor from that higher checkpoint. The run stops
+with `StartSlotAheadOfCheckpoint` instead. A configured `start_slot` may set the floor only
+on a database that has never been indexed, where there is no checkpoint to skip past. If a
+skip is genuinely intended, drop the checkpoint with a destructive resync rather than
+raising the start slot.
+
 ### Transaction Identity & CPI Indexing
 
 Each indexed instruction is keyed on the triple **`(signature, instruction_index, inner_index)`**:

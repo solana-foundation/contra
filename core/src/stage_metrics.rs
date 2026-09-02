@@ -26,6 +26,12 @@ pub trait StageMetrics: Send + Sync {
     fn executor_missing_results(&self, kind: &'static str);
     fn executor_dropped_expired_blockhash(&self, count: usize);
     fn executor_conservation_rejected(&self);
+    /// A batch aborted because its accounts could not be loaded. Non-zero means
+    /// the executor stopped rather than execute against unknown state.
+    fn executor_preload_fatal(&self);
+    /// A stored account row would not deserialize. Alert on any: it recurs on
+    /// restart until the row is repaired.
+    fn executor_corrupt_account(&self);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -117,6 +123,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_conservation_rejected(&self) {
         debug!("executor: rejected tx failing lamport conservation");
+    }
+    fn executor_preload_fatal(&self) {
+        debug!("executor: batch aborted, account preload failed");
+    }
+    fn executor_corrupt_account(&self) {
+        debug!("executor: corrupt stored account");
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -317,6 +329,18 @@ counter_vec!(
     &[]
 );
 counter_vec!(
+    EXECUTOR_PRELOAD_FATAL,
+    "private_channel_executor_preload_fatal_total",
+    "Batches aborted because the accounts they reference could not be loaded",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_CORRUPT_ACCOUNT,
+    "private_channel_executor_corrupt_account_total",
+    "Stored account rows that could not be deserialized",
+    &[]
+);
+counter_vec!(
     SETTLER_TXS_SETTLED,
     "private_channel_settler_txs_settled_total",
     "Transactions settled to DB",
@@ -502,6 +526,16 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc();
     }
+    fn executor_preload_fatal(&self) {
+        EXECUTOR_PRELOAD_FATAL
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn executor_corrupt_account(&self) {
+        EXECUTOR_CORRUPT_ACCOUNT
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -640,6 +674,8 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_MISSING_RESULTS,
         EXECUTOR_DROPPED_EXPIRED_BH,
         EXECUTOR_CONSERVATION_REJECTED,
+        EXECUTOR_PRELOAD_FATAL,
+        EXECUTOR_CORRUPT_ACCOUNT,
         SETTLER_TXS_SETTLED,
         SETTLER_BACKPRESSURE_ENGAGED,
         EXECUTOR_RESULTS_CHUNKED,

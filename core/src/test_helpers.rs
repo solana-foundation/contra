@@ -194,6 +194,26 @@ pub(crate) async fn start_test_redis(
     (db, container)
 }
 
+/// An AccountsDB whose pool points at a bogus URL, so every query fails with a
+/// connection error. Use it to exercise the unreadable-store path.
+#[cfg(test)]
+pub(crate) fn dead_postgres_db() -> crate::accounts::AccountsDB {
+    use crate::accounts::{AccountsDB, PostgresAccountsDB};
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    // Without a short acquire timeout the pool spends its default 30s trying to
+    // connect, which would make every unreadable-store test a minute long.
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(50))
+        .connect_lazy("postgres://test@localhost:1/test")
+        .expect("connect_lazy should not fail");
+    AccountsDB::Postgres(PostgresAccountsDB {
+        pool: Arc::new(pool),
+        read_only: true,
+    })
+}
+
 /// Create a BOB with empty state and a dummy (non-connecting) Postgres pool.
 /// The pool uses a bogus URL — any accidental DB call will fail with a
 /// connection timeout. Only for unit tests that stay in-memory.
@@ -202,19 +222,8 @@ pub(crate) fn create_test_bob() -> (
     crate::accounts::bob::BOB,
     tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
 ) {
-    use crate::accounts::{AccountsDB, PostgresAccountsDB};
-    use sqlx::postgres::PgPoolOptions;
-    use std::sync::Arc;
-
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://test@localhost:1/test")
-        .expect("connect_lazy should not fail");
-    let db = AccountsDB::Postgres(PostgresAccountsDB {
-        pool: Arc::new(pool),
-        read_only: true,
-    });
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let bob = crate::accounts::bob::BOB::new_test(rx, db);
+    let bob = crate::accounts::bob::BOB::new_test(rx, dead_postgres_db());
     (bob, tx)
 }
 

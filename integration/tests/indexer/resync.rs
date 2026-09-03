@@ -595,6 +595,20 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         "Should have 1 row before resync"
     );
 
+    // A durable checkpoint far below the genesis slot resync is about to use. Ordinary
+    // startup refuses that combination; resync must not, because it drops the checkpoint
+    // before resolving and rebuilds everything above the genesis slot from chain.
+    {
+        let pool = fresh_pool(&db_url).await;
+        sqlx::query(
+            "INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
+             VALUES ('escrow', 1, NOW())
+             ON CONFLICT (program_type) DO UPDATE SET last_committed_slot = 1",
+        )
+        .execute(&pool)
+        .await?;
+    }
+
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?

@@ -180,6 +180,28 @@ fn spawn_indexer(
     instance: Pubkey,
     start_slot: u64,
 ) -> JoinHandle<Result<(), IndexerError>> {
+    spawn_indexer_with(
+        postgres,
+        rpc_url,
+        channel_rpc_url,
+        instance,
+        Some(start_slot),
+        None,
+    )
+}
+
+/// Same startup, with the two start-slot knobs opened up.
+///
+/// `backfill_start` of `None` disables backfill entirely, which is the only shape where
+/// `rpc_polling_start` decides where the live source begins.
+fn spawn_indexer_with(
+    postgres: PostgresConfig,
+    rpc_url: String,
+    channel_rpc_url: String,
+    instance: Pubkey,
+    backfill_start: Option<u64>,
+    rpc_polling_start: Option<u64>,
+) -> JoinHandle<Result<(), IndexerError>> {
     let common = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
@@ -193,7 +215,7 @@ fn spawn_indexer(
     let indexer = IndexerConfig {
         datasource_type: DatasourceType::RpcPolling,
         rpc_polling: Some(RpcPollingConfig {
-            from_slot: None,
+            from_slot: rpc_polling_start,
             poll_interval_ms: 200,
             error_retry_interval_ms: 1_000,
             batch_size: 10,
@@ -207,12 +229,12 @@ fn spawn_indexer(
         }),
         yellowstone: None,
         backfill: BackfillConfig {
-            enabled: true,
+            enabled: backfill_start.is_some(),
             exit_after_backfill: false,
             rpc_url,
             batch_size: 100,
             max_gap_slots: u64::MAX,
-            start_slot: Some(start_slot),
+            start_slot: backfill_start,
         },
         reconciliation: ReconciliationConfig {
             mismatch_threshold_raw: 0,
@@ -485,14 +507,29 @@ async fn deposit_row(pool: &PgPool, mint: &str) -> Option<(i64, String)> {
 }
 
 async fn checkpoint_of(pool: &PgPool, program: &str) -> Option<i64> {
-    let row: Option<(i64,)> =
+    // The column is nullable, so a row can exist before any slot has been committed.
+    let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
             .bind(program)
             .fetch_optional(pool)
             .await
             .ok()
             .flatten();
-    row.map(|(slot,)| slot)
+    row.and_then(|(slot,)| slot)
+}
+
+/// Put a durable checkpoint in place before startup, standing in for an earlier run.
+async fn seed_checkpoint(pool: &PgPool, program: &str, slot: i64) {
+    sqlx::query(
+        "INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (program_type) DO UPDATE SET last_committed_slot = EXCLUDED.last_committed_slot",
+    )
+    .bind(program)
+    .bind(slot)
+    .execute(pool)
+    .await
+    .expect("seed checkpoint");
 }
 
 /// The finding, verbatim: a supported deposit finalizes while the indexer is down, so
@@ -973,6 +1010,161 @@ async fn matching_ledger_reconciles_after_the_fill_and_startup_continues() {
         !handle.is_finished(),
         "a ledger that matches custody must not stop startup at threshold 0"
     );
+
+    handle.abort();
+    chain.shutdown().await;
+}
+
+/// A configured backfill start above the durable checkpoint would leave the slots between
+/// them unfetched, and nothing downstream records them as still owed, so startup refuses.
+///
+/// The refusal has to land before any block is fetched and before the custody comparison.
+/// Reconciliation would otherwise report the missing deposits as a custody mismatch, which
+/// sends an operator after the wrong fault entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_slot_ahead_of_checkpoint_refuses_startup() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_start_slot_ahead").await;
+
+    // An earlier run stopped here, well below the slice the configured start would begin at.
+    let stale_checkpoint = (MOCK_START_SLOT - 10) as i64;
+    seed_checkpoint(&pool, "escrow", stale_checkpoint).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    // Custody is captured before the floor is resolved, so that read still has to succeed.
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    // The fill never starts, so no slot is ever enumerated.
+    let no_enumeration = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getBlocks"})))
+        .expect(0)
+        .create_async()
+        .await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        MOCK_START_SLOT,
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must not hang")
+        .expect("startup task must not panic")
+        .expect_err("a start slot past the checkpoint must refuse to boot");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("indexer.backfill.start_slot"),
+        "the refusal must name the offending key, got: {rendered}"
+    );
+    assert_eq!(
+        checkpoint_of(&pool, "escrow").await,
+        Some(stale_checkpoint),
+        "a refused boot must leave the durable checkpoint exactly where it was"
+    );
+    no_enumeration.assert_async().await;
+    chain.shutdown().await;
+}
+
+/// With backfill off the live stream is the only producer, so a configured polling start
+/// above the checkpoint strands those slots with nothing able to go back for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_polling_start_slot_ahead_of_checkpoint_refuses_startup() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_polling_start_ahead").await;
+
+    let stale_checkpoint = (MOCK_START_SLOT - 10) as i64;
+    seed_checkpoint(&pool, "escrow", stale_checkpoint).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        Some(MOCK_START_SLOT),
+    );
+
+    let err = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must not hang")
+        .expect("startup task must not panic")
+        .expect_err("a polling start past the checkpoint must refuse to boot");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("indexer.rpc_polling.start_slot"),
+        "the refusal must name the polling key, not the backfill one, got: {rendered}"
+    );
+    assert_eq!(
+        checkpoint_of(&pool, "escrow").await,
+        Some(stale_checkpoint),
+        "a refused boot must leave the durable checkpoint exactly where it was"
+    );
+    chain.shutdown().await;
+}
+
+/// With backfill off and no configured polling start, the source would otherwise begin at
+/// the chain tip and strand everything above the checkpoint. Nothing else fetches those
+/// slots, so the stream has to resume from the checkpoint instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_source_resumes_from_checkpoint_when_nothing_configures_a_start() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_polling_default_start").await;
+
+    let checkpoint = (MOCK_TIP - 20) as i64;
+    seed_checkpoint(&pool, "escrow", checkpoint).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+    // Answering the tip proves the resume slot is not taken from it.
+    let _slot = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({"method": "getSlot"})))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": MOCK_TIP, "id": 1}).to_string())
+        .expect_at_least(0)
+        .create_async()
+        .await;
+    // The stream must ask for the slot right after the checkpoint, never the tip.
+    let resumes_at_checkpoint = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(json!({
+            "method": "getBlocks", "params": [checkpoint + 1]
+        })))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": [], "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        None,
+    );
+
+    // The enumeration is the assertion; give the poller a few intervals to issue it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    resumes_at_checkpoint.assert_async().await;
 
     handle.abort();
     chain.shutdown().await;

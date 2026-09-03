@@ -33,6 +33,13 @@ jobs:
     timeout-minutes: 90
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/private-channel-app
+    # Expose the pushed manifest digest so dependent jobs (and operators pinning a
+    # deploy) can reference the exact bytes that were scanned and signed, rather
+    # than a mutable tag.
+    outputs:
+      image: ghcr.io/${{ github.repository_owner }}/private-channel-app
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.tags.outputs.tags }}
     steps:
       # Actions are pinned to commit SHAs (supply-chain hardening); the trailing
       # comment is the human-readable version. Reused from the vetted pins in
@@ -123,3 +130,28 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # Surface the immutable digest in the run summary so a deploy can pin
+      # image_registry/private-channel-app@<digest> (what cosign verified and
+      # signed) instead of trusting a mutable tag at pull time.
+      - name: Record published digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Published image"
+            echo
+            echo "Pin the deploy to this digest (verified + signed):"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Tags pointing at it:"
+            echo
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

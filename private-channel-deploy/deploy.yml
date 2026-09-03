@@ -333,6 +333,15 @@
             Verified {{ image_registry }}/private-channel-app:{{ image_tag }}
             @ {{ (_cosign_verify.stdout | from_json)[0].critical.image['docker-manifest-digest'] }}
 
+    # Pin the render + deploy to the exact digest cosign just verified, so the
+    # phase-4 pull can't fetch a tag that moved between verify and pull. Set on
+    # the target host (not delegated) so the render task can read it.
+    - name: Record the verified image digest for digest-pinned deploy
+      when: verify_image_signature | default(false) | bool
+      ansible.builtin.set_fact:
+        pc_app_image_digest: "{{ (_cosign_verify.stdout | from_json)[0].critical.image['docker-manifest-digest'] }}"
+      tags: [ preflight, deploy ]
+
     - name: Assert network is set
       ansible.builtin.assert:
         that: network | default('') | length > 0

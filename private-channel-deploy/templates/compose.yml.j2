@@ -16,8 +16,15 @@ services:
 {% for svc in ['write-node', 'read-node', 'gateway', 'streamer', 'auth',
                'indexer-solana', 'indexer-private-channel', 'operator-solana', 'operator-private-channel'] %}
   {{ svc }}:
-    # Pin every Solana Private Channels-app service to the deployed image tag.
+    # Pin every Solana Private Channels-app service to the deployed image. With
+    # signature verification on, pin the exact digest cosign verified in preflight
+    # (pc_app_image_digest) so `compose pull` can't resolve a tag that moved after
+    # the check; otherwise pin the tag.
+{% if verify_image_signature | default(false) | bool and pc_app_image_digest is defined %}
+    image: {{ img_prefix }}private-channel-app@{{ pc_app_image_digest }}
+{% else %}
     image: {{ img_prefix }}private-channel-app:{{ image_tag }}
+{% endif %}
 {% endfor %}
 
   # Stamp the deployed tag onto the validator image too (built from validator.Dockerfile).

@@ -416,7 +416,7 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
     // `error_message IS NULL` filter applies cleanly. (The DB schema has no
     // error_message column today; the runbook semantics rely on the alert
     // payload, but the recovery SQL itself is column-free for the dispatch.)
-    let excluded_ids = vec![poison_id, held_id];
+    let excluded_ids = [poison_id, held_id];
     let updated = sqlx::query(
         r#"
         UPDATE transactions

@@ -4,7 +4,7 @@ use crate::{
     config::{BackfillConfig, ProgramType},
     error::{BackfillError, DataSourceError, IndexerError},
     indexer::{
-        checkpoint::{get_last_checkpoint, program_key},
+        checkpoint::{get_last_checkpoint, program_key, start_floor, BACKFILL_START_SETTING},
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
             rpc_polling::{decoder, rpc::RpcPoller, types::BlockFetch},
@@ -356,37 +356,22 @@ impl BackfillService {
             self.program_type
         );
 
-        // Catch-up starts at genesis when nothing was ever indexed, so absence is a zero here.
-        let last_checkpoint = get_last_checkpoint(&self.storage, self.program_type)
-            .await?
-            .unwrap_or(0);
+        // Absence and slot zero must stay apart here: only a ledger that has never been
+        // indexed lets the configured start_slot pick the floor.
+        let last_checkpoint = get_last_checkpoint(&self.storage, self.program_type).await?;
 
-        // Use the larger of configured start_slot and database checkpoint
-        // Note: start_slot is inclusive (first slot to process), checkpoint is exclusive (last processed)
-        let from_slot = if let Some(configured_start) = self.config.start_slot {
-            // Convert inclusive start_slot to exclusive checkpoint format
-            let configured_checkpoint = if configured_start > 0 {
-                configured_start - 1
-            } else {
-                0
-            };
+        let from_slot = start_floor(
+            BACKFILL_START_SETTING,
+            self.program_type,
+            last_checkpoint,
+            self.config.start_slot,
+        )?;
 
-            let effective_slot = std::cmp::max(configured_checkpoint, last_checkpoint);
-            if configured_checkpoint > last_checkpoint {
-                info!(
-                    "Using configured start_slot {} (will process from slot {}, ahead of database checkpoint {})",
-                    configured_start, configured_start, last_checkpoint
-                );
-            } else {
-                info!(
-                    "Database checkpoint {} is ahead of configured start_slot {}, using checkpoint",
-                    last_checkpoint, configured_start
-                );
-            }
-            effective_slot
-        } else {
-            last_checkpoint
-        };
+        // One line naming the floor and both inputs, so a log says which one decided it.
+        info!(
+            "Backfill floor for {:?}: slot {} (durable checkpoint {:?}, configured start_slot {:?})",
+            self.program_type, from_slot, last_checkpoint, self.config.start_slot
+        );
 
         let current_slot = latest_slot_with_retry(&self.rpc_poller).await?;
 
@@ -1028,6 +1013,7 @@ mod tests {
     mod backfill_service_tests {
         use super::*;
         use crate::config::BackfillConfig;
+        use crate::error::CheckpointError;
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
         use crate::storage::common::storage::mock::MockStorage;
         use crate::test_utils::rpc_mocks::mock_get_blocks;
@@ -1222,13 +1208,13 @@ mod tests {
 
         // ---- BackfillService::run — start_slot configured ----
 
-        /// When start_slot=200 is ahead of the DB checkpoint=100, the effective from_slot
-        /// becomes 199 (start_slot-1), so nothing before slot 200 is re-processed.
+        /// A start_slot of 200 over a checkpoint of 100 would leave 101..=199 unfetched
+        /// with nothing recording them as owed, so the run must refuse instead.
         #[tokio::test]
-        async fn run_start_slot_ahead_of_checkpoint_uses_start_slot() {
+        async fn run_start_slot_ahead_of_checkpoint_is_refused() {
             let mut server = Server::new_async().await;
-            // effective from_slot=199; current_slot=199 → no gap, no blocks fetched
-            let _m_slot = mock_get_slot(&mut server, 199);
+            // Never requested: the floor is resolved before the tip is probed.
+            let untouched = server.mock("POST", "/").expect(0).create();
 
             let mock = MockStorage::new();
             mock.set_checkpoint("escrow", 100);
@@ -1239,12 +1225,28 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
 
             let service = BackfillService::new(storage, poller, ProgramType::Escrow, config, None);
-            service.run(tx).await.unwrap();
+            let err = service
+                .run(tx)
+                .await
+                .expect_err("a start_slot past the checkpoint must refuse");
 
             assert!(
-                rx.try_recv().is_err(),
-                "no messages expected; start_slot skipped past the gap"
+                matches!(
+                    err,
+                    IndexerError::Checkpoint(CheckpointError::StartSlotAheadOfCheckpoint {
+                        setting: "indexer.backfill.start_slot",
+                        start_slot: 200,
+                        checkpoint: 100,
+                        ..
+                    })
+                ),
+                "expected a start-slot refusal naming the backfill key, got {err:?}"
             );
+            assert!(
+                rx.try_recv().is_err(),
+                "no messages expected; the run refused before fetching anything"
+            );
+            untouched.assert();
         }
 
         /// When the DB checkpoint=200 is ahead of start_slot=50, the checkpoint wins
@@ -1357,16 +1359,14 @@ mod tests {
             assert_eq!(range.live_start_slot, 101);
         }
 
-        /// A configured start_slot ahead of the tip flows through from_slot, so the
-        /// live source begins at start_slot, preserving operator intent.
+        /// An empty ledger is the one case where a configured start_slot sets the floor,
+        /// including above the tip, so the live source begins exactly there.
         #[tokio::test]
-        async fn resolve_range_start_slot_ahead_sets_live_start_to_start_slot() {
+        async fn resolve_range_start_slot_initialises_an_empty_ledger() {
             let mut server = Server::new_async().await;
             let _m_slot = mock_get_slot(&mut server, 150);
 
-            let mock = MockStorage::new();
-            mock.set_checkpoint("escrow", 100);
-            let storage = Arc::new(Storage::Mock(mock));
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
             let poller = make_poller(&server.url());
             let mut config = make_config(&server.url(), 10_000);
             config.start_slot = Some(200);
@@ -1375,6 +1375,7 @@ mod tests {
             let range = service.resolve_range().await.unwrap();
 
             assert_eq!(range.gap, None);
+            assert_eq!(range.anchor, 199);
             assert_eq!(range.live_start_slot, 200);
         }
     }

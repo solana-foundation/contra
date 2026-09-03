@@ -30,7 +30,13 @@ Alternative datasource using the Vixen parsing framework for instruction decodin
 ### Backfill Strategy
 
 Recovers missed slots on indexer restart or network issues:
-1. Read last processed slot from database (`indexer_state` table)
+1. Read last processed slot from database (`indexer_state` table). That checkpoint is the
+   lower bound. A configured `start_slot` only applies to a ledger that has never been
+   indexed; one set above an existing checkpoint would skip the slots in between, so the
+   indexer refuses to start instead. The same rule covers
+   `indexer.rpc_polling.start_slot` when backfill is disabled, where no fill exists to
+   recover those slots at all. See
+   [`indexer_start_slot_ahead_of_checkpoint.md`](runbooks/indexer_start_slot_ahead_of_checkpoint.md)
 2. Query RPC for current slot
 3. If gap > threshold, for each batch of slots:
    - Enumerate which slots in the batch produced a block (`getBlocks`)

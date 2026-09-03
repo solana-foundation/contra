@@ -8,19 +8,19 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
-> **Five conditions are not webhook-routed.** The indexer's
+> **Six conditions are not webhook-routed.** The indexer's
 > **`block_unavailable`** wedge pages through Grafana instead, because it changes
 > no transaction row; see
 > [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
 >
-> **A third condition pages through Grafana, not the webhook.** The
+> **A second condition pages through Grafana, not the webhook.** The
 > **`sender-lock-lost`** alert fires when a sender cannot prove it still owns
 > its Postgres advisory lock and shuts the whole operator down to stop two
 > senders running at once. It changes no transaction row, so it is not in the
 > dispatch table; see
 > [`sender_lock_lost_runbook.md`](sender_lock_lost_runbook.md).
 >
-> **One halt has no dedicated alert.** The **SMT-root-mismatch boot
+> **Two halts have no dedicated alert.** The **SMT-root-mismatch boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
 > The common cause is auto-reconciled at boot; an unforeseen divergence the
 > reconcile cannot resolve makes the operator **refuse to start**, surfacing
@@ -28,6 +28,11 @@ routes by webhook + `transaction_type`.
 > Recognize it by that pattern, not a single alert, and not via this
 > dispatch table. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+> The **`StartSlotAheadOfCheckpoint`** startup refusal is the other: a
+> configured start slot sits above the durable checkpoint, so booting would
+> skip slots nothing would ever go back for. It also shows as a boot-time
+> crash-loop, recognized by that marker in the indexer logs; see
+> [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
 >
 > **One node condition crash-loops instead of alerting.** A row in the node's
 > `accounts` table that will not deserialize makes the executor refuse to run any

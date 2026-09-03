@@ -223,7 +223,7 @@ pub enum CheckpointError {
     )]
     StartSlotAheadOfCheckpoint {
         setting: &'static str,
-        program_type: String,
+        program_type: &'static str,
         start_slot: u64,
         checkpoint: u64,
     },

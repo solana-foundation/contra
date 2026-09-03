@@ -228,10 +228,58 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
 
-    // Read-modify-write inside BEGIN…COMMIT: the settler always extends the tip by
-    // one slot, so the block insert below lets only one writer commit that slot and
-    // a rejected writer's increment rolls back with the rest of its batch.
-    if tx_count > 0 {
+    // ── Block info: at most 2 queries (block row + latest_blockhash) ──
+    // Runs before the counter because whether this slot is new is what decides
+    // whether the counter may advance.
+    let slot_is_new = if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
+        // A block may only extend the stored ledger, and a slot already stored may
+        // only be rewritten with the same bytes: that admits the settler's own
+        // retry after a lost acknowledgement and rejects every other writer.
+        //
+        // `xmax = 0` then separates a real insert from such a replay, so the
+        // counter below advances once per slot however often the commit retries.
+        let inserted: Option<bool> = sqlx::query_scalar(
+            "INSERT INTO blocks (slot, data)
+                 SELECT $1, $2
+                 WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot > $1)
+                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data
+                   WHERE blocks.data = EXCLUDED.data
+                 RETURNING (xmax = 0)",
+        )
+        .bind(block_info.slot as i64)
+        .bind(block_data)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to store block: {}", e))?;
+
+        // No row means a newer block is already stored, or this slot holds a
+        // different one. Either way another writer has passed this batch.
+        let Some(inserted) = inserted else {
+            return Err(stale_tip_error(block_info.slot));
+        };
+
+        sqlx::query(
+            "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(block_info.blockhash.as_ref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
+
+        inserted
+    } else {
+        // No slot to key on, so there is nothing to suppress.
+        true
+    };
+
+    // Read-modify-write inside BEGIN…COMMIT. The block insert above already let
+    // only one writer past for this slot, and a rejected writer's increment rolls
+    // back with the rest of its batch.
+    //
+    // Skipped on a replayed slot: every other write here is an idempotent upsert,
+    // so this is the one statement that would count the same batch twice.
+    if tx_count > 0 && slot_is_new {
         let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT value FROM metadata WHERE key = 'transaction_count'",
         )
@@ -253,43 +301,6 @@ async fn write_batch_postgres(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to update transaction count: {}", e))?;
-    }
-
-    // ── Block info: at most 2 queries (block row + latest_blockhash) ──
-    if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        // A block may only extend the stored ledger. The WHERE clause rejects a
-        // writer whose tip has already been passed, and the slot primary key
-        // rejects a second writer racing this one for the same slot.
-        let inserted = sqlx::query(
-            "INSERT INTO blocks (slot, data)
-                 SELECT $1, $2
-                 WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot >= $1)",
-        )
-        .bind(block_info.slot as i64)
-        .bind(block_data)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| match &e {
-            // 23505 = unique_violation: the racing writer committed first.
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505") => {
-                stale_tip_error(block_info.slot)
-            }
-            _ => format!("Failed to store block: {}", e),
-        })?;
-
-        // No row inserted means a block at or above this slot was already stored.
-        if inserted.rows_affected() == 0 {
-            return Err(stale_tip_error(block_info.slot));
-        }
-
-        sqlx::query(
-            "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(block_info.blockhash.as_ref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
     }
 
     // Commit — if this fails, the entire batch is rolled back.

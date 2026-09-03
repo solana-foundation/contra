@@ -684,6 +684,47 @@ async fn owed_rotation_target_no_row_returns_none() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// Arming a rotation must not fabricate a checkpoint. The row it creates carries no slot,
+/// and reporting one would tell startup a never-indexed program had been indexed.
+#[tokio::test(flavor = "multi_thread")]
+async fn owed_rotation_target_does_not_create_a_checkpoint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage.set_owed_rotation_target("withdraw", 7).await?;
+
+    assert_eq!(
+        storage.get_committed_checkpoint("withdraw").await?,
+        None,
+        "a row created only to hold a rotation target must report no checkpoint"
+    );
+    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(7));
+    Ok(())
+}
+
+/// The monotonic guard has to keep working over a row whose slot is still unset, so the
+/// first real checkpoint lands and a later lower one is still rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_upsert_over_a_null_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage.set_owed_rotation_target("withdraw", 3).await?;
+    storage.update_committed_checkpoint("withdraw", 500).await?;
+    assert_eq!(
+        storage.get_committed_checkpoint("withdraw").await?,
+        Some(500),
+        "the first checkpoint must land on a row that had no slot"
+    );
+
+    storage.update_committed_checkpoint("withdraw", 400).await?;
+    assert_eq!(
+        storage.get_committed_checkpoint("withdraw").await?,
+        Some(500),
+        "a lower slot must still be rejected"
+    );
+    Ok(())
+}
+
 /// The set must work whether or not the program's `indexer_state` row exists yet: the
 /// sender's boot re-arm reads it, so an insert that silently no-ops would drop the
 /// rotation the same way the in-memory-only arm did.

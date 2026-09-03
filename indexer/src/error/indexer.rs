@@ -167,9 +167,6 @@ pub enum BackfillError {
         source: DataSourceRpcError,
     },
 
-    #[error("No block was produced in slots {from}..={to}, so there is no witnessed slot to anchor the backfill boundary on and the chain appears to have stopped producing")]
-    NoProducerFound { from: u64, to: u64 },
-
     // Channel errors
     #[error("Channel send failed: {0}")]
     ChannelSend(#[source] Box<dyn std::error::Error + Send + Sync>),

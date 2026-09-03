@@ -106,13 +106,13 @@ async fn last_produced_at_or_below(
         }
     };
 
-    produced.into_iter().max().ok_or_else(|| {
-        BackfillError::NoProducerFound {
-            from: start,
-            to: tip,
-        }
-        .into()
-    })
+    // An empty window is not the unwitnessable case: the batch walk witnesses a
+    // tail from the first producer above it, and fails closed itself if none is
+    // servable. Refusing here would turn a long skipped run into a failed boot.
+    Ok(produced.into_iter().max().unwrap_or_else(|| {
+        warn!("No block was produced in slots {start}..={tip}, so the backfill boundary is the tip and its tail must be witnessed from above");
+        tip
+    }))
 }
 
 async fn fetch_blocks_with_retry(
@@ -562,11 +562,11 @@ mod tests {
         );
     }
 
-    /// An endpoint that answers with no block at all is a chain that has stopped
-    /// producing. The tip is the one anchor that cannot be witnessed, so this
-    /// fails closed rather than handing it back.
+    /// A window with no block is answerable, unlike one that could not be read:
+    /// the walk witnesses that tail from the first producer above it, so the tip
+    /// stands as the boundary rather than stopping the run.
     #[tokio::test]
-    async fn last_produced_fails_when_no_block_was_produced_below_the_tip() {
+    async fn last_produced_keeps_the_tip_when_the_window_holds_no_block() {
         let mut server = Server::new_async().await;
         let _m = crate::test_utils::rpc_mocks::mock_get_blocks(&mut server, 0, 19, &[]);
         let poller = RpcPoller::new(
@@ -575,13 +575,7 @@ mod tests {
             CommitmentLevel::Finalized,
         );
 
-        let err = last_produced_at_or_below(&poller, 0, 19)
-            .await
-            .expect_err("a chain that produced nothing must not anchor on its tip");
-        assert!(
-            err.to_string().contains("19"),
-            "the error must name the range it searched: {err}"
-        );
+        assert_eq!(last_produced_at_or_below(&poller, 0, 19).await.unwrap(), 19);
     }
 
     /// Nothing below the tip to search, so there is no listing to fail and no

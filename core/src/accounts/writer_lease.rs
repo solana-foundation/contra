@@ -21,6 +21,13 @@ pub const LEASE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Cap on one probe, so a hung backend is not read as a healthy one.
 const LEASE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Idle seconds before Postgres starts probing the lease socket, then the probe
+/// spacing and how many may go unanswered. Same values as the gateway uses, and
+/// together they reap a vanished writer in under two minutes.
+const LEASE_KEEPALIVE_IDLE_SECS: u32 = 60;
+const LEASE_KEEPALIVE_INTERVAL_SECS: u32 = 15;
+const LEASE_KEEPALIVE_COUNT: u32 = 3;
+
 /// Owns the Postgres session holding the writer lease, and the heartbeat task
 /// that re-proves it. The connection is opened directly rather than pooled: sqlx
 /// does not reset a returned connection, so a pooled lock would never free.
@@ -53,6 +60,31 @@ async fn lock_is_still_held(conn: &mut PgConnection) -> Result<bool, sqlx::Error
     .await
 }
 
+/// Ask Postgres to reap this session quickly if the node's host disappears. A
+/// vanished host sends no FIN, so the default leaves the lock held for about two
+/// hours. Best effort: an unsupported platform or a unix socket ignores these.
+async fn apply_lease_keepalives(conn: &mut PgConnection) {
+    // `SET` takes no bind parameters, which would force the values into the
+    // statement text.
+    let applied = sqlx::query(
+        "SELECT set_config('tcp_keepalives_idle', $1, false),
+                set_config('tcp_keepalives_interval', $2, false),
+                set_config('tcp_keepalives_count', $3, false)",
+    )
+    .bind(LEASE_KEEPALIVE_IDLE_SECS.to_string())
+    .bind(LEASE_KEEPALIVE_INTERVAL_SECS.to_string())
+    .bind(LEASE_KEEPALIVE_COUNT.to_string())
+    .execute(conn)
+    .await;
+
+    if let Err(e) = applied {
+        warn!(
+            "Could not set TCP keepalives on the writer lease session: {}",
+            e
+        );
+    }
+}
+
 /// Re-prove ownership on `interval`, and cancel `node_shutdown` the first time it
 /// cannot be proven. No retries: during a full outage this node cannot do useful
 /// work anyway, and during a partial one a replacement can already take the lock.
@@ -82,6 +114,11 @@ async fn run_heartbeat(
         };
         error!("Writer lease ownership could not be proven ({reason}); stopping the node");
         node_shutdown.cancel();
+
+        // A false positive leaves the lock genuinely ours, so hold the socket open
+        // until the node reports its workers stopped, then just drop it: a probe
+        // that timed out was dropped mid-flight and cannot carry an unlock.
+        stop.cancelled().await;
         return;
     }
 
@@ -117,6 +154,9 @@ impl WriterLease {
         let mut conn = PgConnection::connect(database_url)
             .await
             .context("Failed to open the writer lease connection")?;
+
+        // Before the lock, so a session that takes it is already reapable.
+        apply_lease_keepalives(&mut conn).await;
 
         let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(WRITER_LEASE_LOCK_ID)
@@ -166,7 +206,7 @@ impl WriterLease {
 
 impl Drop for WriterLease {
     /// A lease dropped on an error path still has to free the lock, so cancel and
-    /// let the heartbeat unlock and close the session on its way out.
+    /// let the heartbeat close the session on its way out.
     fn drop(&mut self) {
         self.stop.cancel();
     }
@@ -286,5 +326,126 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), shutdown.cancelled())
             .await
             .expect("losing the lease must stop the node");
+    }
+
+    /// Can a third session take `id` right now? Unlocks again so the answer is
+    /// repeatable on a pooled connection, which sqlx never resets.
+    async fn lock_is_free(pool: &sqlx::PgPool, id: i64) -> bool {
+        let mut conn = pool.acquire().await.expect("failed to check the lock");
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("failed to probe the lock");
+        if taken {
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .expect("failed to release the probe lock");
+        }
+        taken
+    }
+
+    /// A verdict can be a false positive, and the node keeps committing for the
+    /// whole drain. So an unprovable probe must stop the node without ending the
+    /// session: the lock lives exactly as long as that session does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unprovable_probe_keeps_the_lease_session_until_it_is_stopped() {
+        /// Stands in for the lease lock. Held on the same session, so it is held
+        /// for exactly as long, and a third session can watch it from outside.
+        const WITNESS_LOCK_ID: i64 = 0x50435F_5749544E; // "PC_WITN" as hex
+
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let mut conn = PgConnection::connect(&url)
+            .await
+            .expect("failed to open the lease connection");
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(WITNESS_LOCK_ID)
+            .fetch_one(&mut conn)
+            .await
+            .expect("failed to take the witness lock");
+        assert!(taken, "the witness lock must start free");
+
+        // This session never took the lease, so the first probe proves "not held"
+        // at once and no healthy probe has to be made to lie.
+        let stop = CancellationToken::new();
+        let node_shutdown = CancellationToken::new();
+        let heartbeat = tokio::spawn(run_heartbeat(
+            conn,
+            Duration::from_millis(50),
+            stop.clone(),
+            node_shutdown.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(10), node_shutdown.cancelled())
+            .await
+            .expect("an unprovable probe must stop the node");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !heartbeat.is_finished(),
+            "the heartbeat must outlive the verdict, or the lock goes with it"
+        );
+        assert!(
+            !lock_is_free(db.pool.as_ref(), WITNESS_LOCK_ID).await,
+            "the lease session must still be open while the node drains"
+        );
+
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(5), heartbeat)
+            .await
+            .expect("stopping the lease must end the heartbeat")
+            .expect("the heartbeat must not panic");
+
+        // The socket closes as the connection drops, so the lock frees a moment
+        // later rather than on the await above.
+        for _ in 0..50 {
+            if lock_is_free(db.pool.as_ref(), WITNESS_LOCK_ID).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("stopping the lease must close its session");
+    }
+
+    /// A host that vanishes sends no FIN, so without these the lease backend sits
+    /// in recv() holding the lock until the OS default expires, about two hours.
+    /// Postgres reports 0 over a unix socket; the test container speaks TCP.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lease_session_sets_its_own_tcp_keepalives() {
+        let (_db, _pg, url) = start_test_postgres_with_url().await;
+        let mut conn = PgConnection::connect(&url)
+            .await
+            .expect("failed to open the lease connection");
+
+        apply_lease_keepalives(&mut conn).await;
+
+        let settings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, setting FROM pg_settings
+             WHERE name LIKE 'tcp_keepalives%' ORDER BY name",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("failed to read the keepalive settings");
+
+        assert_eq!(
+            settings,
+            vec![
+                (
+                    "tcp_keepalives_count".to_string(),
+                    LEASE_KEEPALIVE_COUNT.to_string()
+                ),
+                (
+                    "tcp_keepalives_idle".to_string(),
+                    LEASE_KEEPALIVE_IDLE_SECS.to_string()
+                ),
+                (
+                    "tcp_keepalives_interval".to_string(),
+                    LEASE_KEEPALIVE_INTERVAL_SECS.to_string()
+                ),
+            ],
+            "the lease session must carry its own keepalives"
+        );
     }
 }

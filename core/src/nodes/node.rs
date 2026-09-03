@@ -29,6 +29,16 @@ use {
     tracing::{error, info, warn},
 };
 
+/// Total time the whole pipeline gets to drain on shutdown. A saturated drain
+/// measures well under a second, and the settler bounds its own shutdown work
+/// below this, so the remainder covers the cascade.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(6);
+
+/// Shared across every worker that had to be aborted, not spent per worker: a
+/// per-worker reserve would scale with the pipeline. `DRAIN_DEADLINE` plus this
+/// is the whole shutdown, and it has to stay under the container stop grace.
+const ABORT_RESERVE: Duration = Duration::from_secs(2);
+
 /// RPC→dedup ingress queue capacity. Sized so steady state never sheds.
 pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
 /// sigverify→sequencer queue capacity (mirrors the sigverify queue size).
@@ -130,6 +140,9 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+    /// Closed first on shutdown, which is what refuses admission. `None` on a
+    /// read node, which has no write pipeline to close.
+    ingress_tx: Option<async_channel::Sender<SanitizedTransaction>>,
 }
 
 /// How long a read node waits out a cache stamped for another deployment. Worth
@@ -275,7 +288,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 admin_keys: config.admin_keys.clone(),
                 rx: ingress_rx,
                 output_tx: dedup_tx,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: sigverify_hb,
             })
@@ -289,7 +301,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 input_rx: dedup_rx,
                 settled_blockhashes_rx,
                 output_tx: sequencer_tx,
-                shutdown_token: shutdown_token.clone(),
                 initial_live_blockhashes,
                 initial_dedup_cache,
                 metrics: Arc::clone(&config.metrics),
@@ -304,7 +315,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 batch_deadline_ms: config.batch_deadline_ms,
                 rx: sequencer_rx,
                 batch_tx,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: sequencer_hb,
             })
@@ -317,7 +327,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 settled_accounts_rx,
                 execution_results_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 max_svm_workers: config.max_svm_workers,
                 heartbeat: executor_hb,
@@ -358,7 +367,6 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 rows_rx: addr_sig_rx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 flush_chunk_size: ADDR_SIG_FLUSH_CHUNK,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: addr_index_writer_hb,
             })
@@ -419,6 +427,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         NodeMode::Write => None,
     };
 
+    // The admission handle, kept so shutdown can close it before anything else.
+    let ingress_tx = write_deps.as_ref().map(|deps| deps.dedup_tx.clone());
+
     let rpc_config = RpcServiceConfig {
         port: config.port,
         max_connections: config.max_connections,
@@ -446,6 +457,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     Ok(NodeHandles {
         workers,
         shutdown_token,
+        ingress_tx,
     })
 }
 
@@ -464,8 +476,13 @@ impl NodeHandles {
             })
             .collect();
 
-        let (completed_idx, _result, _remaining) = futures::future::select_all(futures).await;
-        let worker_name = self.workers[completed_idx].name().to_string();
+        let (completed_idx, _result, remaining) = futures::future::select_all(futures).await;
+        // Released before the list is touched, and the finished worker is taken
+        // out of it: that poll consumed the task's output, and polling a
+        // finished JoinHandle again panics. `remove` rather than `swap_remove`
+        // because shutdown drains in pipeline order.
+        drop(remaining);
+        let worker_name = self.workers.remove(completed_idx).name().to_string();
 
         error!("{} worker quit unexpectedly", worker_name);
         worker_name
@@ -474,25 +491,210 @@ impl NodeHandles {
     pub async fn shutdown(self) {
         info!("Shutting down node...");
 
-        // Cancel the token - this signals all services to shutdown
+        // Closes admission. Every stage after the ingress edge exits when its
+        // own input closes, so cancelling here starts a drain that walks the
+        // pipeline in order rather than stopping all stages at once.
+        // Closed before the token so admission stops first. A closed channel
+        // still hands its buffered transactions to sigverify, so this refuses
+        // new work without discarding anything already accepted. Reversed, the
+        // stages would start unwinding while admission was still open.
+        if let Some(ref ingress_tx) = self.ingress_tx {
+            ingress_tx.close();
+        }
         self.shutdown_token.cancel();
 
-        // Wait for all workers to finish
-        for worker in self.workers {
-            match tokio::time::timeout(Duration::from_secs(5), worker.handle).await {
+        // One deadline for the whole drain, not one per worker: the workers are
+        // awaited in pipeline order, so a per-worker budget would multiply by
+        // the number of stages and overrun the container's stop grace period,
+        // which kills the process mid-drain and loses what the order preserved.
+        let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+        // One reserve for all aborts, so the total stays bounded however many
+        // workers overrun.
+        let abort_deadline = deadline + ABORT_RESERVE;
+        let mut overran = false;
+        for mut worker in self.workers {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, &mut worker.handle).await {
                 Ok(Ok(_)) => info!("{} stopped gracefully", worker.name),
                 Ok(Err(e)) => error!("{} error: {:?}", worker.name, e),
-                Err(_) => warn!("{} shutdown timeout", worker.name),
+                Err(_) => {
+                    // Dropping a JoinHandle detaches the task rather than
+                    // stopping it, so an in-process restart would leave this
+                    // stage holding its pool and channels beside the new one.
+                    worker.handle.abort();
+                    overran = true;
+
+                    // `abort()` only schedules cancellation, so wait for the task
+                    // to actually end. Bounded by the shared reserve, because a
+                    // task that never yields cannot be cancelled at all and must
+                    // not hold shutdown open past the container's stop grace.
+                    let stopped = tokio::time::timeout_at(abort_deadline, &mut worker.handle)
+                        .await
+                        .is_ok();
+                    if stopped {
+                        warn!(
+                            "{} did not drain within the deadline and was aborted",
+                            worker.name
+                        );
+                    } else {
+                        error!(
+                            "{} ignored the abort and is still running; an in-process restart would overlap it",
+                            worker.name
+                        );
+                    }
+                }
             }
         }
 
-        info!("Node shutdown complete");
+        if overran {
+            warn!("Node shutdown finished with at least one stage aborted mid-drain");
+        } else {
+            info!("Node shutdown complete");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Docker's default SIGTERM-to-SIGKILL window. The whole shutdown has to
+    /// finish inside it or the process is killed part-way through.
+    const CONTAINER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+    fn handles_from(workers: Vec<WorkerHandle>) -> NodeHandles {
+        NodeHandles {
+            workers,
+            shutdown_token: CancellationToken::new(),
+            ingress_tx: None,
+        }
+    }
+
+    /// A handle whose output was already taken must leave the drain list. Tokio
+    /// panics when a finished JoinHandle is polled again, and that panic escapes
+    /// shutdown and main, so the process aborts instead of draining.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quit_worker_is_not_polled_again_by_shutdown() {
+        let quitting = tokio::spawn(async {});
+        let live = tokio::spawn(async {});
+        let mut handles = handles_from(vec![
+            WorkerHandle::new("Quitting".to_string(), quitting),
+            WorkerHandle::new("Live".to_string(), live),
+        ]);
+
+        handles.wait_for_any_worker_quit().await;
+        handles.shutdown().await;
+    }
+
+    /// The name must come from the worker that actually finished, and every other
+    /// worker must still be drained in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_any_worker_quit_names_the_worker_that_quit() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let blocked = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        let quitting = tokio::spawn(async {});
+        let mut handles = handles_from(vec![
+            WorkerHandle::new("Blocked".to_string(), blocked),
+            WorkerHandle::new("Quitting".to_string(), quitting),
+        ]);
+
+        let name = handles.wait_for_any_worker_quit().await;
+        assert_eq!(name, "Quitting");
+        assert_eq!(handles.workers.len(), 1, "the finished worker must be gone");
+        assert_eq!(handles.workers[0].name(), "Blocked");
+
+        // Let the survivor exit so shutdown drains it rather than aborting it.
+        let _ = tx.send(());
+        handles.shutdown().await;
+    }
+
+    /// The abort reserve is shared, not per worker. Spent per worker it would
+    /// scale with the pipeline and push the whole shutdown past the stop grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_abort_reserve_does_not_scale_with_worker_count() {
+        let workers: Vec<WorkerHandle> = (0..6)
+            .map(|i| {
+                let spinning = tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_secs(30));
+                });
+                WorkerHandle::new(format!("Spinning{i}"), spinning)
+            })
+            .collect();
+        let handles = handles_from(workers);
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < CONTAINER_STOP_GRACE,
+            "shutdown took {:?}, which does not fit the container stop grace",
+            started.elapsed()
+        );
+    }
+
+    /// A worker that outlives the drain must be stopped, not merely stopped
+    /// waiting on. A dropped JoinHandle leaves the task running, so an
+    /// in-process restart would put a second pipeline on the same database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_overruns_the_drain_is_aborted() {
+        // Set when the task is dropped, which only happens if it was aborted.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&stopped));
+        let stuck = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await
+        });
+        let handles = NodeHandles {
+            workers: vec![WorkerHandle::new("Stuck".to_string(), stuck)],
+            shutdown_token: CancellationToken::new(),
+            ingress_tx: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(2),
+            "shutdown must return once the drain deadline passes"
+        );
+
+        // Checked with no grace period: `abort()` only schedules cancellation, so
+        // returning before the task is gone lets a replacement pipeline overlap
+        // the old one, which is the whole reason for aborting at all.
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the overrunning worker was still running when shutdown returned"
+        );
+    }
+
+    /// A task with no await point cannot be cancelled, so waiting on it must not
+    /// hold the drain open past its budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uncancellable_worker_does_not_extend_the_drain() {
+        let spinning = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let handles = NodeHandles {
+            workers: vec![WorkerHandle::new("Spinning".to_string(), spinning)],
+            shutdown_token: CancellationToken::new(),
+            ingress_tx: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(3),
+            "shutdown waited on a task that can never be cancelled"
+        );
+    }
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_blocktime() {

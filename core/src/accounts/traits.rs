@@ -1343,6 +1343,101 @@ mod tests {
         );
     }
 
+    /// One executed transaction, reusable by the counter cases below.
+    fn counted_tx(to: &Pubkey) -> (SanitizedTransaction, ProcessedTransaction) {
+        let keypair = Keypair::new();
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        (
+            create_test_sanitized_transaction(&keypair, to, 1),
+            processed,
+        )
+    }
+
+    /// A commit whose acknowledgement is lost is retried with the same slot and
+    /// the same rows. Every other write is an upsert, so only the counter can
+    /// double-apply, and an inflated getTransactionCount never self-heals.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replaying_a_committed_batch_counts_it_once() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        let txs = [counted_tx(&to), counted_tx(&to)];
+        let block = create_test_block_info(1, Hash::new_unique());
+
+        for _ in 0..2 {
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 1u64, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(&[], refs, Some(block.clone()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.get_transaction_count().await.unwrap(),
+            2,
+            "a replayed slot must not advance the counter twice"
+        );
+    }
+
+    /// The gate must key on the slot being new, not on the batch looking
+    /// familiar: distinct slots are ordinary traffic and must both count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_slots_each_advance_the_counter() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        for slot in 1..=3u64 {
+            let txs = [counted_tx(&to)];
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(
+                &[],
+                refs,
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(db.get_transaction_count().await.unwrap(), 3);
+    }
+
+    /// A batch with no block has no slot to key the gate on, so it keeps
+    /// counting unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blockless_batch_still_counts() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        for _ in 0..2 {
+            let txs = [counted_tx(&to)];
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 0u64, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(&[], refs, None).await.unwrap();
+        }
+
+        assert_eq!(db.get_transaction_count().await.unwrap(), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_batch_deleted_account_removes_from_db() {
         let (mut db, _pg) = start_test_postgres().await;

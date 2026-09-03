@@ -7,10 +7,15 @@ use solana_transaction_status::UiTransactionEncoding;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
-/// How far past an empty window the poller reaches for the next producer. The
-/// widest legal idle gap is a thousand slots, so this leaves tenfold room while
-/// keeping a hole in the ledger out of a batch that carries a slot per entry.
-const MAX_LOOKAHEAD_SLOTS: u64 = 10_000;
+/// The widest run of slots an idle node can pass with no block. It heartbeats one
+/// block a second and a slot is one `blocktime_ms` tick, so the run is
+/// `1000 / blocktime_ms`: ten by default, and at most this at a 1ms blocktime.
+pub(crate) const MAX_IDLE_GAP_SLOTS: u64 = 1_000;
+
+/// How far to search for the next producing slot before calling the distance a
+/// hole in the ledger rather than an idle gap. Tenfold the gap above, because the
+/// same poller also reads chains whose skipped runs no heartbeat bounds.
+pub(crate) const MAX_LOOKAHEAD_SLOTS: u64 = MAX_IDLE_GAP_SLOTS * 10;
 
 pub struct RpcPoller {
     client: reqwest::Client,

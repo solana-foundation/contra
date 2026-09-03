@@ -7,7 +7,7 @@ use crate::{
         checkpoint::{get_last_checkpoint, program_key},
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
-            rpc_polling::{decoder, rpc::RpcPoller, types::BlockFetch},
+            rpc_polling::{decoder, rpc::MAX_LOOKAHEAD_SLOTS, rpc::RpcPoller, types::BlockFetch},
         },
     },
     storage::Storage,
@@ -62,26 +62,54 @@ fn calculate_batches(from_slot: u64, to_slot: u64, batch_size: usize) -> Vec<Vec
     batches
 }
 
-/// How far back to look for the last produced block. The idle heartbeat caps the
-/// gap between blocks at a handful of slots, so this is generous; finding none
-/// means the chain is not producing and the tip is left as it was.
-const PRODUCER_LOOKBACK_SLOTS: u64 = 1_000;
-
 /// The highest slot at or below `tip` that produced a block, floored at `floor`.
-/// Falls back to `tip` when the lookback window holds no block at all, which
-/// leaves the caller exactly where it was before.
-async fn last_produced_at_or_below(rpc_poller: &RpcPoller, floor: u64, tip: u64) -> u64 {
+/// Failing is deliberate: the tip is the one anchor no parent link can witness,
+/// so falling back to it would plant the failure this lookup exists to prevent.
+async fn last_produced_at_or_below(
+    rpc_poller: &RpcPoller,
+    floor: u64,
+    tip: u64,
+) -> Result<u64, IndexerError> {
+    // Nothing below the tip to search, so there is no producer to miss.
     if tip <= floor {
-        return tip;
+        return Ok(tip);
     }
-    let start = std::cmp::max(floor, tip.saturating_sub(PRODUCER_LOOKBACK_SLOTS));
-    match rpc_poller.get_blocks(start, tip).await {
-        Ok(produced) => produced.into_iter().max().unwrap_or(tip),
-        Err(e) => {
-            warn!("Could not list produced blocks up to slot {tip}: {e}");
-            tip
+    let start = std::cmp::max(floor, tip.saturating_sub(MAX_LOOKAHEAD_SLOTS));
+
+    let mut retry_count = 0;
+    let produced = loop {
+        match rpc_poller.get_blocks(start, tip).await {
+            Ok(produced) => break produced,
+            Err(source) => {
+                retry_count += 1;
+                if retry_count >= BACKFILL_MAX_RETRIES {
+                    error!(
+                        "Could not list produced blocks in slots {start}..={tip} after {} retries: {source}",
+                        BACKFILL_MAX_RETRIES
+                    );
+                    return Err(BackfillError::ProducerLookupFailed {
+                        from: start,
+                        to: tip,
+                        source,
+                    }
+                    .into());
+                }
+                warn!(
+                    "Retry {}/{} listing produced blocks in slots {start}..={tip}: {source}",
+                    retry_count, BACKFILL_MAX_RETRIES
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    BACKFILL_RETRY_DELAY_MS * retry_count as u64,
+                ))
+                .await;
+            }
         }
-    }
+    };
+
+    produced
+        .into_iter()
+        .max()
+        .ok_or_else(|| BackfillError::NoProducerFound { from: start, to: tip }.into())
 }
 
 async fn fetch_blocks_with_retry(
@@ -414,7 +442,8 @@ impl BackfillService {
         // Backfill stops at the last produced block. A slot is proven by the next
         // block's parent link, and the tip is a tick that usually carries none, so
         // ending there leaves a tail nothing can witness.
-        let current_slot = last_produced_at_or_below(&self.rpc_poller, from_slot, chain_tip).await;
+        let current_slot =
+            last_produced_at_or_below(&self.rpc_poller, from_slot, chain_tip).await?;
 
         // A boundary this far past the chain is a misconfiguration, not lag. Warn rather than
         // refuse, because a node trailing the provider that wrote the checkpoint is routine.
@@ -497,6 +526,7 @@ mod tests {
     use super::*;
     use crate::config::BackfillConfig;
     use crate::storage::common::storage::mock::MockStorage;
+    use crate::indexer::datasource::rpc_polling::rpc::MAX_IDLE_GAP_SLOTS;
     use crate::test_utils::rpc_mocks::mock_get_slot;
     use mockito::Server;
     use solana_sdk::commitment_config::CommitmentLevel;
@@ -519,13 +549,14 @@ mod tests {
             CommitmentLevel::Finalized,
         );
 
-        assert_eq!(last_produced_at_or_below(&poller, 0, 19).await, 10);
+        assert_eq!(last_produced_at_or_below(&poller, 0, 19).await.unwrap(), 10);
     }
 
-    /// A lookup that cannot be answered leaves the caller exactly where it was,
-    /// so an RPC hiccup narrows nothing and loses nothing.
+    /// Anchoring on the tip is exactly the unwitnessable tail this lookup exists
+    /// to avoid, so a listing that cannot be read stops startup instead of
+    /// quietly producing it.
     #[tokio::test]
-    async fn last_produced_falls_back_to_the_tip_when_the_listing_fails() {
+    async fn last_produced_fails_when_the_listing_cannot_be_read() {
         let server = Server::new_async().await;
         let poller = RpcPoller::new(
             server.url(),
@@ -533,7 +564,71 @@ mod tests {
             CommitmentLevel::Finalized,
         );
 
-        assert_eq!(last_produced_at_or_below(&poller, 0, 19).await, 19);
+        let err = last_produced_at_or_below(&poller, 0, 19)
+            .await
+            .expect_err("an unreadable listing must not fall back to the tip");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("19"),
+            "the error must name the range it searched: {msg}"
+        );
+    }
+
+    /// An endpoint that answers with no block at all is a chain that has stopped
+    /// producing. The tip is the one anchor that cannot be witnessed, so this
+    /// fails closed rather than handing it back.
+    #[tokio::test]
+    async fn last_produced_fails_when_no_block_was_produced_below_the_tip() {
+        let mut server = Server::new_async().await;
+        let _m = crate::test_utils::rpc_mocks::mock_get_blocks(&mut server, 0, 19, &[]);
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        let err = last_produced_at_or_below(&poller, 0, 19)
+            .await
+            .expect_err("a chain that produced nothing must not anchor on its tip");
+        assert!(
+            err.to_string().contains("19"),
+            "the error must name the range it searched: {err}"
+        );
+    }
+
+    /// Nothing below the tip to search, so there is no listing to fail and no
+    /// producer to miss. Registering no route proves the short-circuit is real.
+    #[tokio::test]
+    async fn last_produced_returns_the_tip_when_there_is_nothing_below_it() {
+        let server = Server::new_async().await;
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        assert_eq!(last_produced_at_or_below(&poller, 19, 19).await.unwrap(), 19);
+    }
+
+    /// The lookback has to reach past the widest gap an idle node can leave, and
+    /// past what another chain's skipped run can leave, so it searches the same
+    /// distance the poller's lookahead does.
+    #[tokio::test]
+    async fn last_produced_searches_past_the_widest_idle_gap() {
+        let tip = MAX_IDLE_GAP_SLOTS * 5;
+        let producer = tip - MAX_IDLE_GAP_SLOTS * 2;
+        let mut server = Server::new_async().await;
+        let _m = crate::test_utils::rpc_mocks::mock_get_blocks(&mut server, 0, tip, &[producer]);
+        let poller = RpcPoller::new(
+            server.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        );
+
+        assert_eq!(
+            last_produced_at_or_below(&poller, 0, tip).await.unwrap(),
+            producer
+        );
     }
 
     /// Mock RPC plus a store either seeded with a checkpoint or left empty.
@@ -578,6 +673,9 @@ mod tests {
         for (tip, want_gap, want_live_start) in cases {
             let mut server = Server::new_async().await;
             let _slot = mock_get_slot(&mut server, tip);
+            // Below the checkpoint there is nothing to search, so only the gap arm lists.
+            let _blocks = (tip > 100)
+                .then(|| crate::test_utils::rpc_mocks::mock_get_blocks(&mut server, 100, tip, &[tip]));
             let mock = MockStorage::new();
             mock.set_checkpoint("escrow", 100);
             let storage: Arc<Storage> = Arc::new(Storage::Mock(mock));
@@ -1221,6 +1319,7 @@ mod tests {
         async fn run_gap_too_large_returns_err() {
             let mut server = Server::new_async().await;
             let _m_slot = mock_get_slot(&mut server, 5000); // checkpoint=0, gap=5000
+            let _m_blocks = mock_get_blocks(&mut server, 0, 5000, &[5000]);
 
             let storage = Arc::new(Storage::Mock(MockStorage::new()));
             let poller = make_poller(&server.url());
@@ -1246,6 +1345,7 @@ mod tests {
         async fn run_fills_gap_sends_slot_complete_per_slot() {
             let mut server = Server::new_async().await;
             let _m_slot = mock_get_slot(&mut server, 103);
+            let _m_anchor = mock_get_blocks(&mut server, 100, 103, &[101, 102, 103]);
             let _m_blocks = mock_get_blocks(&mut server, 101, 103, &[101, 102, 103]);
             let _m_b101 = mock_get_block_empty(&mut server, 101);
             let _m_b102 = mock_get_block_empty(&mut server, 102);
@@ -1359,6 +1459,7 @@ mod tests {
         async fn resolve_range_gap_sets_live_start_to_target_plus_one() {
             let mut server = Server::new_async().await;
             let _m_slot = mock_get_slot(&mut server, 110);
+            let _m_blocks = mock_get_blocks(&mut server, 100, 110, &[110]);
 
             let mock = MockStorage::new();
             mock.set_checkpoint("escrow", 100);

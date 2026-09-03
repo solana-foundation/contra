@@ -124,6 +124,11 @@ async fn start_postgres_for_resync(
 }
 
 /// Source-RPC-only resync service (no channel reconciliation): legacy behavior.
+///
+/// An escrow rebuild is refused without an instance scope, since an unset scope
+/// filters out every escrow instruction and would rebuild an empty DB. These
+/// tests run against a bare validator with no escrow deposits, so the scope only
+/// has to be present; which key it names does not change the outcome.
 fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService {
     let rpc_poller = Arc::new(RpcPoller::new(
         rpc_url.clone(),
@@ -143,7 +148,7 @@ fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService 
         rpc_poller,
         ProgramType::Escrow,
         backfill_config,
-        None,
+        Some(Pubkey::new_unique()),
     )
 }
 
@@ -589,6 +594,20 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         1,
         "Should have 1 row before resync"
     );
+
+    // A durable checkpoint far below the genesis slot resync is about to use. Ordinary
+    // startup refuses that combination; resync must not, because it drops the checkpoint
+    // before resolving and rebuilds everything above the genesis slot from chain.
+    {
+        let pool = fresh_pool(&db_url).await;
+        sqlx::query(
+            "INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
+             VALUES ('escrow', 1, NOW())
+             ON CONFLICT (program_type) DO UPDATE SET last_committed_slot = 1",
+        )
+        .execute(&pool)
+        .await?;
+    }
 
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());

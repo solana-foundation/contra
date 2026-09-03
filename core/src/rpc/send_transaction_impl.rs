@@ -1,6 +1,6 @@
 use crate::rpc::{
     constants::PACKET_DATA_SIZE,
-    error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+    error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE},
     WriteDeps,
 };
 use crate::transactions::{
@@ -126,10 +126,13 @@ pub async fn send_transaction_impl(
             warn!("Shed transaction {}: ingress queue full", signature);
             Err(node_at_capacity())
         }
-        Err(async_channel::TrySendError::Closed(_)) => Err(custom_error(
-            JSON_RPC_SERVER_ERROR,
-            "Internal error: ingress channel closed",
-        )),
+        // Shutdown closes the channel, so this is the atomic refusal: a
+        // signature can never be handed out for work no stage will read.
+        // Retryable, because another node or a restart can still take it.
+        Err(async_channel::TrySendError::Closed(_)) => {
+            warn!("Refused transaction {}: ingress closed", signature);
+            Err(node_at_capacity())
+        }
     }
 }
 
@@ -200,6 +203,43 @@ mod tests {
     ) -> (WriteDeps, async_channel::Receiver<SanitizedTransaction>) {
         let (dedup_tx, rx) = async_channel::bounded(TEST_INGRESS_CAP);
         (WriteDeps { dedup_tx, metrics }, rx)
+    }
+
+    /// A shutting-down node must refuse admission rather than acknowledge work
+    /// no stage will read: the accept loop stops first, but in-flight
+    /// connections are served by detached tasks that can still reach this path.
+    #[tokio::test]
+    async fn shutting_down_refuses_admission_without_enqueueing() {
+        let (deps, rx) = make_write_deps();
+        deps.dedup_tx.close();
+
+        let err = send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+            .await
+            .expect_err("a shutting-down node must not accept transactions");
+        assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
+        assert!(
+            rx.is_empty(),
+            "nothing may be enqueued after shutdown starts"
+        );
+    }
+
+    /// Closing is what refuses, so admission flips on channel state alone. A
+    /// separate flag could be read just before an enqueue that still succeeds.
+    #[tokio::test]
+    async fn admission_flips_on_channel_state_alone() {
+        let (deps, rx) = make_write_deps();
+
+        send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+            .await
+            .expect("an open node accepts");
+        assert_eq!(rx.len(), 1);
+
+        deps.dedup_tx.close();
+        let err = send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+            .await
+            .expect_err("a closed node refuses");
+        assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
+        assert_eq!(rx.len(), 1, "the refused transaction must not be enqueued");
     }
 
     fn spl_tx() -> Transaction {
@@ -464,8 +504,9 @@ mod tests {
         assert_eq!(rx.len(), 1, "the accepted tx must reach the ingress queue");
     }
 
-    // A closed ingress channel (receiver dropped) must surface the closed error,
-    // not the retryable capacity shed. Guards the async_channel error mapping.
+    // A closed ingress channel refuses as retryable whether it was closed by
+    // shutdown or by the last receiver going away: in both cases this node is
+    // on its way out, so the client should retry rather than treat it as a bug.
     #[tokio::test]
     async fn ingress_closed_yields_error() {
         let (deps, rx) = make_write_deps();
@@ -473,15 +514,7 @@ mod tests {
 
         let result = send_transaction_impl(&deps, encode_tx(&spl_tx()), None).await;
         let err = result.expect_err("a closed ingress channel must error");
-        assert_ne!(
-            err.code(),
-            NODE_AT_CAPACITY_CODE,
-            "closed is not a retryable capacity shed"
-        );
-        assert!(
-            err.to_string().contains("ingress channel closed"),
-            "expected closed-channel error, got: {err}"
-        );
+        assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
     }
 
     // A declared lookup table is never resolved here, so the message's account

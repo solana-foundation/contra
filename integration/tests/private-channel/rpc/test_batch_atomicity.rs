@@ -243,14 +243,14 @@ async fn test_write_batch_constraint_injection() {
 
     // pubkey_slot2's account was written to the accounts table BEFORE the block
     // insert failed. It must have been rolled back with the rest of the transaction.
-    let accounts = db.get_accounts(&[pubkey_slot2]).await;
+    let accounts = db.get_accounts(&[pubkey_slot2]).await.unwrap();
     assert!(
         accounts[0].is_none(),
         "pubkey_slot2 account must not exist — it was rolled back with the transaction"
     );
 
     // Slot 1 data must be completely intact.
-    let accounts = db.get_accounts(&[pubkey_slot1]).await;
+    let accounts = db.get_accounts(&[pubkey_slot1]).await.unwrap();
     assert!(
         accounts[0].is_some(),
         "pubkey_slot1 (slot 1 baseline) must still exist"
@@ -473,14 +473,14 @@ async fn test_write_batch_process_kill_simulation() {
     );
 
     // The account written inside the killed transaction must not exist.
-    let accounts = db.get_accounts(&[pubkey_slot2]).await;
+    let accounts = db.get_accounts(&[pubkey_slot2]).await.unwrap();
     assert!(
         accounts[0].is_none(),
         "pubkey_slot2 must not exist — rolled back with the killed transaction"
     );
 
     // Slot 1 baseline must be fully intact.
-    let accounts = db.get_accounts(&[pubkey_slot1]).await;
+    let accounts = db.get_accounts(&[pubkey_slot1]).await.unwrap();
     assert!(
         accounts[0].is_some(),
         "pubkey_slot1 (slot 1 baseline) must still exist"

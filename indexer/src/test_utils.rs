@@ -271,6 +271,86 @@ pub mod rpc_mocks {
             .create()
     }
 
+    /// Escrow instance the `mock_get_block_with_deposit` fixture parses to.
+    ///
+    /// A Deposit reads its instance from account index 2, and the fixture passes
+    /// accounts `0..12` straight through, so the instance is whatever sits at
+    /// account key 2. Callers configure the indexer with this value; anything
+    /// else makes the processor drop the deposit as out of scope.
+    pub fn deposit_fixture_instance() -> solana_sdk::pubkey::Pubkey {
+        crate::test_utils::pubkey::test_pubkey(2)
+    }
+
+    /// Mock `getBlock(slot)` returning a block with one top-level escrow Deposit.
+    ///
+    /// The deposit's amount is carried by its DepositEvent self-CPI, which is the
+    /// value the parser records, so both halves are built from `amount`.
+    pub fn mock_get_block_with_deposit(
+        server: &mut Server,
+        slot: u64,
+        parent_slot: u64,
+        amount: u64,
+    ) -> Mock {
+        use crate::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes};
+
+        // Escrow program at key index 0; the rest pad the deposit's 12 accounts.
+        let mut account_keys: Vec<String> = (0u8..12)
+            .map(|i| crate::test_utils::pubkey::test_pubkey(i).to_string())
+            .collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+
+        let deposit_data = bs58::encode(deposit_ix_bytes(amount, None)).into_string();
+        let event_data = bs58::encode(deposit_event_bytes(amount)).into_string();
+
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": format!("TestBlockHash{slot}"),
+                        "parentSlot": parent_slot,
+                        "transactions": [{
+                            "transaction": {
+                                "signatures": [format!("sig_deposit_slot_{slot}")],
+                                "message": {
+                                    "accountKeys": account_keys,
+                                    "instructions": [{
+                                        "programIdIndex": 0,
+                                        "accounts": (0u8..12).collect::<Vec<u8>>(),
+                                        "data": deposit_data
+                                    }]
+                                }
+                            },
+                            "meta": {
+                                "err": null,
+                                "logMessages": null,
+                                "loadedAddresses": null,
+                                "innerInstructions": [{
+                                    "index": 0,
+                                    "instructions": [{
+                                        "programIdIndex": 0,
+                                        "accounts": [],
+                                        "data": event_data,
+                                        "stackHeight": 2
+                                    }]
+                                }]
+                            }
+                        }]
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
     /// Mock `getBlock(slot)` answering a JSON-RPC error with the given code.
     pub fn mock_get_block_error(server: &mut Server, slot: u64, code: i32, message: &str) -> Mock {
         server

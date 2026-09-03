@@ -1,5 +1,8 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, types::StoredTransaction},
+    super::{
+        get_accounts::AccountLoadError, postgres::PostgresAccountsDB, redis::RedisAccountsDB,
+        types::StoredTransaction,
+    },
     crate::stages::AccountSettlement,
     anyhow::Result,
     serde::{Deserialize, Serialize},
@@ -52,7 +55,10 @@ pub enum AccountsDB {
 }
 
 impl AccountsDB {
-    pub async fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+    pub async fn get_account_shared_data(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Result<Option<AccountSharedData>, AccountLoadError> {
         super::get_account_shared_data::get_account_shared_data(self, pubkey).await
     }
 
@@ -151,7 +157,10 @@ impl AccountsDB {
         super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
-    pub async fn get_accounts(&self, accounts: &[Pubkey]) -> Vec<Option<AccountSharedData>> {
+    pub async fn get_accounts(
+        &self,
+        accounts: &[Pubkey],
+    ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
         super::get_accounts::get_accounts(self, accounts).await
     }
 
@@ -254,11 +263,11 @@ mod tests {
         let account = AccountSharedData::new(42_000, 0, &owner);
 
         // miss before set
-        assert!(db.get_account_shared_data(&pubkey).await.is_none());
+        assert!(db.get_account_shared_data(&pubkey).await.unwrap().is_none());
 
         db.set_account(pubkey, account.clone()).await;
 
-        let loaded = db.get_account_shared_data(&pubkey).await;
+        let loaded = db.get_account_shared_data(&pubkey).await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(
             solana_sdk::account::ReadableAccount::lamports(&loaded.unwrap()),
@@ -277,7 +286,7 @@ mod tests {
 
         db.set_account(pk2, acct.clone()).await;
 
-        let results = db.get_accounts(&[pk1, pk2, pk3]).await;
+        let results = db.get_accounts(&[pk1, pk2, pk3]).await.unwrap();
         assert_eq!(results.len(), 3);
         assert!(results[0].is_none(), "pk1 was never stored");
         assert!(results[1].is_some(), "pk2 should be found");
@@ -301,15 +310,15 @@ mod tests {
             .await;
 
         assert!(
-            db.get_account_shared_data(&zero).await.is_none(),
+            db.get_account_shared_data(&zero).await.unwrap().is_none(),
             "a zero-lamport row must read as absent"
         );
         assert!(
-            db.get_account_shared_data(&floor).await.is_some(),
+            db.get_account_shared_data(&floor).await.unwrap().is_some(),
             "an account on the 1-lamport floor must still read back"
         );
 
-        let results = db.get_accounts(&[zero, floor, never_stored]).await;
+        let results = db.get_accounts(&[zero, floor, never_stored]).await.unwrap();
         assert_eq!(results.len(), 3);
         assert!(results[0].is_none(), "the zero-lamport row is filtered out");
         assert!(
@@ -540,12 +549,13 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(lamports),
             "a cached miss must not read as a nonexistent account"
         );
         assert_eq!(
-            cache_db.get_accounts(&[pubkey]).await[0]
+            cache_db.get_accounts(&[pubkey]).await.unwrap()[0]
                 .as_ref()
                 .map(|account| account.lamports()),
             Some(lamports)
@@ -608,7 +618,8 @@ mod tests {
 
         let results = cache_db
             .get_accounts(&[first.0, second.0, third.0, absent])
-            .await;
+            .await
+            .unwrap();
 
         let lamports: Vec<Option<u64>> = results
             .iter()
@@ -661,6 +672,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(stale_lamports),
             "a stamped cache is served, stale value and all"
@@ -677,6 +689,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(settled_lamports),
             "once condemned, reads must bypass the cache and reach Postgres"
@@ -720,6 +733,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(lamports),
             "a corrupt entry must fall through to Postgres"
@@ -853,6 +867,7 @@ mod tests {
             cache_db
                 .get_account_shared_data(&pubkey)
                 .await
+                .unwrap()
                 .map(|account| account.lamports()),
             Some(settled_lamports),
             "the stale cached balance must no longer be served"
@@ -1042,7 +1057,7 @@ mod tests {
             .unwrap();
 
         // account was stored
-        assert!(db.get_account_shared_data(&pk).await.is_some());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
         // block was stored
         let loaded = db.get_block(1).await.unwrap();
@@ -1417,6 +1432,101 @@ mod tests {
         );
     }
 
+    /// One executed transaction, reusable by the counter cases below.
+    fn counted_tx(to: &Pubkey) -> (SanitizedTransaction, ProcessedTransaction) {
+        let keypair = Keypair::new();
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        (
+            create_test_sanitized_transaction(&keypair, to, 1),
+            processed,
+        )
+    }
+
+    /// A commit whose acknowledgement is lost is retried with the same slot and
+    /// the same rows. Every other write is an upsert, so only the counter can
+    /// double-apply, and an inflated getTransactionCount never self-heals.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replaying_a_committed_batch_counts_it_once() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        let txs = [counted_tx(&to), counted_tx(&to)];
+        let block = create_test_block_info(1, Hash::new_unique());
+
+        for _ in 0..2 {
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 1u64, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(&[], refs, Some(block.clone()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.get_transaction_count().await.unwrap(),
+            2,
+            "a replayed slot must not advance the counter twice"
+        );
+    }
+
+    /// The gate must key on the slot being new, not on the batch looking
+    /// familiar: distinct slots are ordinary traffic and must both count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_slots_each_advance_the_counter() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        for slot in 1..=3u64 {
+            let txs = [counted_tx(&to)];
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(
+                &[],
+                refs,
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(db.get_transaction_count().await.unwrap(), 3);
+    }
+
+    /// A batch with no block has no slot to key the gate on, so it keeps
+    /// counting unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blockless_batch_still_counts() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        for _ in 0..2 {
+            let txs = [counted_tx(&to)];
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 0u64, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(&[], refs, None).await.unwrap();
+        }
+
+        assert_eq!(db.get_transaction_count().await.unwrap(), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_batch_deleted_account_removes_from_db() {
         let (mut db, _pg) = start_test_postgres().await;
@@ -1426,7 +1536,7 @@ mod tests {
 
         // first store an account
         db.set_account(pk, acct.clone()).await;
-        assert!(db.get_account_shared_data(&pk).await.is_some());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
         // now write_batch with deleted=true
         let settlement = AccountSettlement {
@@ -1438,6 +1548,6 @@ mod tests {
             .unwrap();
 
         // account is gone
-        assert!(db.get_account_shared_data(&pk).await.is_none());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
     }
 }

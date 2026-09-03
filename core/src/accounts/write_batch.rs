@@ -221,41 +221,21 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
 
-    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
-    // via this path and MVCC returns the caller's own last commit.
-    if tx_count > 0 {
-        let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT value FROM metadata WHERE key = 'transaction_count'",
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to fetch transaction count: {}", e))?;
-
-        let mut count = current_count_bytes
-            .and_then(|bytes| TransactionCount::from_bytes(&bytes))
-            .unwrap_or_default();
-
-        count.increment(tx_count as u64);
-
-        sqlx::query(
-            "INSERT INTO metadata (key, value) VALUES ('transaction_count', $1)
-                 ON CONFLICT (key) DO UPDATE SET value = $1",
-        )
-        .bind(&count.to_bytes()[..])
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to update transaction count: {}", e))?;
-    }
-
     // ── Block info: at most 2 queries (block row + latest_blockhash) ──
-    if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        sqlx::query(
+    // Runs before the counter because whether this slot is new is what decides
+    // whether the counter may advance.
+    let slot_is_new = if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
+        // `xmax = 0` distinguishes a real insert from an ON CONFLICT update. It
+        // reads correctly only because the settler is the sole writer of this
+        // table, which is the same assumption the counter below already makes.
+        let inserted: bool = sqlx::query_scalar(
             "INSERT INTO blocks (slot, data) VALUES ($1, $2)
-                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data",
+                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data
+                 RETURNING (xmax = 0)",
         )
         .bind(block_info.slot as i64)
         .bind(block_data)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| format!("Failed to store block: {}", e))?;
 
@@ -284,6 +264,41 @@ async fn write_batch_postgres(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to update the chain tip metadata: {}", e))?;
+
+        inserted
+    } else {
+        // No slot to key on, so there is nothing to suppress.
+        true
+    };
+
+    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
+    // via this path and MVCC returns the caller's own last commit.
+    //
+    // Skipped when this slot already had a block. Every other write here is an
+    // idempotent upsert, so a commit replayed after a lost acknowledgement would
+    // otherwise be the one statement that counted the same batch twice.
+    if tx_count > 0 && slot_is_new {
+        let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT value FROM metadata WHERE key = 'transaction_count'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to fetch transaction count: {}", e))?;
+
+        let mut count = current_count_bytes
+            .and_then(|bytes| TransactionCount::from_bytes(&bytes))
+            .unwrap_or_default();
+
+        count.increment(tx_count as u64);
+
+        sqlx::query(
+            "INSERT INTO metadata (key, value) VALUES ('transaction_count', $1)
+                 ON CONFLICT (key) DO UPDATE SET value = $1",
+        )
+        .bind(&count.to_bytes()[..])
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to update transaction count: {}", e))?;
     }
 
     // Commit — if this fails, the entire batch is rolled back.

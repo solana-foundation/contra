@@ -1,4 +1,10 @@
 apiVersion: 1
+# Grafana file provisioning never removes a rule that vanishes from this file,
+# so retired uids must be deleted explicitly or boxes provisioned from an
+# older commit keep firing the stale rule alongside the current ones.
+deleteRules:
+  - orgId: 1
+    uid: service-down-probe-indexer
 groups:
   - orgId: 1
     name: indexer-lag-alerts
@@ -51,7 +57,11 @@ groups:
         title: "Solana Private Channels service down (scrape target unreachable)"
         condition: C
         for: 30s
-        noDataState: Alerting
+        # Same policy as the probe rule below: no series means this stack has
+        # none of these scrape jobs configured, not an outage. A configured
+        # target that goes down still emits up=0 and fires. Silent loss of the
+        # series themselves is caught by monitored-series-vanished below.
+        noDataState: OK
         execErrState: Error
         annotations:
           summary: "Service {{ $labels.job }} is down (Prometheus scrape failed)"
@@ -64,7 +74,9 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway"}
+              # Prod (Ansible) job names plus the dev/devnet compose job names.
+              # Keep in sync with monitored-series-vanished below.
+              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}
               instant: true
               refId: A
           - refId: C
@@ -102,7 +114,14 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: probe_success{job="blackbox-http"}
+              # The `or up` arm keeps each firing instance alive if the blackbox
+              # exporter itself dies mid-outage: probe_success goes stale (which
+              # would resolve the alert and send a false all-clear), but the
+              # per-target up series keep reporting 0 with the same instance
+              # label, so the incident stays firing under the same title while
+              # blackbox-probe-pipeline-down names the cause. On a stack with no
+              # blackbox job both arms are empty and noDataState: OK applies.
+              expr: min by (instance) (probe_success{job="blackbox-http"}) or min by (instance) (up{job="blackbox-http"})
               instant: true
               refId: A
           - refId: C
@@ -133,7 +152,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Blackbox exporter unreachable ({{ $labels.instance }}); /health probes are not running"
+          summary: "Blackbox exporter unreachable; no /health probing is happening and every service-down (health probe failed) alert is unreliable until this resolves. Check the blackbox-exporter container (docker compose ps blackbox-exporter, then its logs) and the blackbox-http job in the prometheus scrape config."
         labels:
           severity: critical
         data:
@@ -143,7 +162,13 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job="blackbox-http"}
+              # max() over the per-target up series: one alert instance for the
+              # exporter instead of one per probed URL (relabeling sets instance
+              # to the probed service URL, so without the aggregation a dead
+              # exporter paged as if every service URL were "the unreachable
+              # exporter"). Aggregation over no series is still no data, so
+              # noDataState: OK is preserved.
+              expr: max(up{job="blackbox-http"})
               instant: true
               refId: A
           - refId: C
@@ -158,6 +183,54 @@ groups:
                 - evaluator:
                     type: lt
                     params: [1]
+              refId: C
+
+      # Loss-of-coverage guard for the noDataState: OK rules above. Those stay
+      # quiet when series never existed (a stack that doesn't run these jobs),
+      # which also means they stay quiet if the series silently vanish: a probe
+      # target dropped from the blackbox job, a renamed or deleted scrape job,
+      # prometheus.yml render drift, or Grafana pointed at the wrong Prometheus.
+      # This pages when a health-probe or scrape-target series that existed in
+      # the last 24h is gone now. Self-limiting by design: an intentional
+      # removal pages until the old series ages out of the 24h window, then
+      # goes quiet on its own.
+      - uid: monitored-series-vanished
+        title: "Monitoring coverage lost (previously monitored series vanished)"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "{{ $values.A }} health-probe or scrape-target series present in the last 24h are gone. A down service would page; a missing series is silent — check the prometheus scrape config (blackbox-http targets and the service jobs) and PROMETHEUS_URL before trusting the quiet."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              # Series seen in the last 24h minus series present now, for the
+              # blackbox probes and the service scrape jobs (job regex kept in
+              # sync with service-down-scrape). The `or vector(0)` on every
+              # operand keeps the expression defined, so this rule itself can
+              # never sit in NoData while Prometheus is reachable.
+              expr: ((count(last_over_time(probe_success{job="blackbox-http"}[24h])) or vector(0)) - (count(probe_success{job="blackbox-http"}) or vector(0))) + ((count(last_over_time(up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}[24h])) or vector(0)) - (count(up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}) or vector(0)))
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
               refId: C
 
   - orgId: 1
@@ -239,10 +312,15 @@ groups:
     interval: 1m
     rules:
       # Early smoke for a reconnect storm, before it becomes a sustained stall.
-      # Baseline is near-zero reconnects/day; >5 in 15m means the upstream stream
-      # is genuinely flapping (provider or network churn). Warning severity: it
-      # rides the default contact point (single receiver here), so it is an FYI,
-      # not a hard page.
+      # Baseline is near-zero reconnects/day; more than 5 in 15m means the
+      # upstream stream is genuinely flapping (provider or network churn). The
+      # threshold is 5.5 rather than 5 because increase() extrapolates to the
+      # window boundaries: exactly 5 reconnects evaluates just above 5 and
+      # would trip a gt-5 check one reconnect below the bar. Severity warning:
+      # the default notification policy has a single receiver and no severity
+      # matchers, so today this delivers exactly like a critical — the label
+      # exists so a deployment can route warnings to a softer channel with a
+      # severity matcher in notification-policies.yml.
       - uid: indexer-reconnect-storm
         title: "Indexer datasource reconnecting abnormally often"
         condition: C
@@ -250,7 +328,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} reconnected {{ $values.A }} times in 15m (routine is near-zero); upstream stream is flapping"
+          summary: "Indexer {{ $labels.program_type }} reconnected {{ printf \"%.0f\" $values.A.Value }} times in 15m (routine is near-zero); upstream stream is flapping"
         labels:
           severity: warning
         data:
@@ -274,7 +352,7 @@ groups:
               conditions:
                 - evaluator:
                     type: gt
-                    params: [5]
+                    params: [5.5]
               refId: C
 
   - orgId: 1

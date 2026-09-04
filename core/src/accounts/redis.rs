@@ -15,6 +15,7 @@ use {
         time::Duration,
     },
     tokio::time::Instant,
+    tracing::error,
 };
 
 /// How long a command may go unanswered before it fails. Redis can accept a
@@ -248,23 +249,38 @@ impl RedisAccountsDB {
 impl InvokeContextCallback for RedisAccountsDB {}
 
 impl TransactionProcessingCallback for RedisAccountsDB {
+    // The upstream signature cannot carry a failure, so a load error is logged
+    // and collapses to `None` here. Nothing in production reaches this impl: the
+    // SVM always runs against BOB or a gasless callback, both in-memory.
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         let db = super::traits::AccountsDB::Redis(self.clone());
         let pubkey = *pubkey;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                super::get_account_shared_data::get_account_shared_data(&db, &pubkey).await
+                super::get_account_shared_data::get_account_shared_data(&db, &pubkey)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("account load failed at the SVM callback boundary: {}", e);
+                        None
+                    })
             })
         })
     }
 
+    // Same boundary as above: an unanswerable read is logged and reads as "no
+    // match" only because the upstream signature offers nowhere else to go.
     fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
         let db = super::traits::AccountsDB::Redis(self.clone());
         let account = *account;
         let owners = owners.to_vec();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                super::account_matches_owners::account_matches_owners(&db, &account, &owners).await
+                super::account_matches_owners::account_matches_owners(&db, &account, &owners)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("account load failed at the SVM callback boundary: {}", e);
+                        None
+                    })
             })
         })
     }

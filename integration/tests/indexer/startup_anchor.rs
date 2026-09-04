@@ -72,14 +72,15 @@ async fn start_postgres(
 
 /// Read the anchor row. `run` creates the schema, so an early query is a "not yet".
 async fn anchor_of(pool: &PgPool, program: &str) -> Option<u64> {
-    let row: Option<(i64,)> =
+    // The column is nullable, so a row can exist before any slot has been committed.
+    let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
             .bind(program)
             .fetch_optional(pool)
             .await
             .ok()
             .flatten();
-    row.map(|(slot,)| slot as u64)
+    row.and_then(|(slot,)| slot).map(|slot| slot as u64)
 }
 
 /// Poll until the anchor row appears, so the assertion does not race startup.
@@ -354,6 +355,63 @@ async fn run_anchors_at_resolved_from_slot_not_the_tip() {
     );
 
     handle.abort();
+    ys.shutdown().await;
+}
+
+/// The withdraw program has no custody comparison to fall back on, so nothing else would
+/// notice a configured start slot that skips real burns. A skipped burn is a release that
+/// is never queued, so startup has to refuse outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withdraw_start_slot_ahead_of_checkpoint_refuses_startup() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_anchor_refuse").await;
+
+    // Create the schema the way startup would, then stand in for an earlier run that
+    // stopped well below the slice the configured start would begin at.
+    let storage = private_channel_indexer::storage::Storage::Postgres(
+        private_channel_indexer::storage::PostgresDb::new(&postgres)
+            .await
+            .expect("storage"),
+    );
+    storage.init_schema().await.expect("schema");
+    let stale_checkpoint = START_SLOT - 50;
+    storage
+        .update_committed_checkpoint("withdraw", stale_checkpoint)
+        .await
+        .expect("seed checkpoint");
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _slot = mock_get_slot(&mut rpc, TIP).await;
+
+    let ys = MockYellowstoneServer::start().await;
+
+    let backfill = BackfillConfig {
+        enabled: true,
+        exit_after_backfill: false,
+        rpc_url: rpc.url(),
+        batch_size: 100,
+        max_gap_slots: 1_000,
+        start_slot: Some(START_SLOT),
+    };
+    let indexer = indexer_config(ys.url(), backfill);
+    let common = common_config(postgres, rpc.url());
+
+    let err = tokio::time::timeout(Duration::from_secs(60), run(common, indexer, None))
+        .await
+        .expect("startup must not hang")
+        .expect_err("a start slot past the checkpoint must refuse to boot");
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("indexer.backfill.start_slot"),
+        "the refusal must name the offending key, got: {rendered}"
+    );
+    assert_eq!(
+        anchor_of(&pool, "withdraw").await,
+        Some(stale_checkpoint),
+        "a refused boot must not move or overwrite the durable checkpoint"
+    );
+
     ys.shutdown().await;
 }
 

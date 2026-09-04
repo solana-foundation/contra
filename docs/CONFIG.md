@@ -130,6 +130,8 @@ The write node does not use a WAL — all state is deterministically recoverable
 
 On restart, the indexer compares its last checkpoint slot against the current on-chain slot. If the gap exceeds the configured threshold, it triggers a parallel backfill before switching to real-time mode. See [Indexer Architecture](INDEXER.md) for details.
 
+The durable checkpoint is always the lower bound. `indexer.backfill.start_slot` (and `indexer.rpc_polling.start_slot` when backfill is off) only picks the starting point on a database that has never been indexed; set above an existing checkpoint it would skip real slots, so the indexer refuses to start. See [`indexer_start_slot_ahead_of_checkpoint.md`](runbooks/indexer_start_slot_ahead_of_checkpoint.md). A start slot of `0` begins at slot 1, because proving a slot empty needs a predecessor to anchor on and genesis has none.
+
 ## Operational Tools
 
 ### Admin CLI

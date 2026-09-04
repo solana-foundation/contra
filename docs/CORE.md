@@ -71,6 +71,20 @@ Execute transaction batches through the SVM with custom execution modes.
 
 **Location**: [`core/src/stages/execution.rs`](../core/src/stages/execution.rs), [`core/src/vm/`](../core/src/vm/)
 
+**Account loading**: the executor preloads every account a batch references
+before running it. An account that is not in the store is loaded as absent, but a
+store that *could not answer* aborts the batch and stops the executor, which the
+node supervisor turns into a restart. Nothing in an aborted batch is executed or
+settled, so its transactions stay resubmittable. Treating an unreadable account
+as absent would let the SVM run against state it wrongly believes is empty and
+settle the result over the real row. Transient query failures are retried under a
+hard total time budget, so a dead database reaches its verdict in seconds rather
+than blocking on connection acquisition; an error the database itself returned
+and a row that will not deserialize are both fatal on sight, since neither can
+change on a second ask. The same split reaches RPC: `getAccountInfo` returns a
+null account only when the account is genuinely absent, and a server error when
+the store could not be read.
+
 
 **Execution Modes**:
 

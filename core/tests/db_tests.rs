@@ -80,7 +80,7 @@ async fn test_set_and_get_account() {
 
     db.set_account(pubkey, account.clone()).await;
 
-    let retrieved = db.get_account_shared_data(&pubkey).await;
+    let retrieved = db.get_account_shared_data(&pubkey).await.unwrap();
     assert!(retrieved.is_some());
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.lamports(), 1_000_000);
@@ -91,7 +91,10 @@ async fn test_set_and_get_account() {
 async fn test_get_nonexistent_account() {
     let (db, _pg) = start_postgres().await;
 
-    let result = db.get_account_shared_data(&Pubkey::new_unique()).await;
+    let result = db
+        .get_account_shared_data(&Pubkey::new_unique())
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -107,7 +110,7 @@ async fn test_get_multiple_accounts() {
     db.set_account(pk1, make_account(100, &owner)).await;
     db.set_account(pk2, make_account(200, &owner)).await;
 
-    let results = db.get_accounts(&[pk1, pk2, pk3]).await;
+    let results = db.get_accounts(&[pk1, pk2, pk3]).await.unwrap();
     assert_eq!(results.len(), 3);
     assert!(results[0].is_some());
     assert_eq!(results[0].as_ref().unwrap().lamports(), 100);
@@ -249,7 +252,7 @@ async fn test_write_batch_accounts_and_transactions() {
     .unwrap();
 
     // Verify account stored
-    let acct = db.get_account_shared_data(&pk).await;
+    let acct = db.get_account_shared_data(&pk).await.unwrap();
     assert!(acct.is_some());
     assert_eq!(acct.unwrap().lamports(), 500);
 
@@ -272,7 +275,7 @@ async fn test_write_batch_deleted_account() {
 
     // First store the account
     db.set_account(pk, make_account(1000, &owner)).await;
-    assert!(db.get_account_shared_data(&pk).await.is_some());
+    assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
     // Delete it via write_batch
     let settlements = vec![(
@@ -286,7 +289,7 @@ async fn test_write_batch_deleted_account() {
     db.write_batch(&settlements, vec![], None).await.unwrap();
 
     // Should be gone
-    assert!(db.get_account_shared_data(&pk).await.is_none());
+    assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -434,7 +437,7 @@ async fn test_write_batch_read_only_noop() {
     ro_db.write_batch(&settlements, vec![], None).await.unwrap();
 
     // Account should not exist (write was silently skipped)
-    assert!(ro_db.get_account_shared_data(&pk).await.is_none());
+    assert!(ro_db.get_account_shared_data(&pk).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -497,14 +500,22 @@ async fn test_set_account_overwrite() {
 
     db.set_account(pk, make_account(100, &owner)).await;
     assert_eq!(
-        db.get_account_shared_data(&pk).await.unwrap().lamports(),
+        db.get_account_shared_data(&pk)
+            .await
+            .unwrap()
+            .unwrap()
+            .lamports(),
         100
     );
 
     // Overwrite
     db.set_account(pk, make_account(200, &owner)).await;
     assert_eq!(
-        db.get_account_shared_data(&pk).await.unwrap().lamports(),
+        db.get_account_shared_data(&pk)
+            .await
+            .unwrap()
+            .unwrap()
+            .lamports(),
         200
     );
 }

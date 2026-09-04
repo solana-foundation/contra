@@ -12,6 +12,14 @@ name = "ingress_backpressure"
 path = "tests/private-channel/test_ingress_backpressure.rs"
 
 [[test]]
+name = "ordered_shutdown_e2e"
+path = "tests/private-channel/test_ordered_shutdown_e2e.rs"
+
+[[test]]
+name = "settle_retry_recovery"
+path = "tests/private-channel/test_settle_retry_recovery.rs"
+
+[[test]]
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
 
@@ -84,6 +92,10 @@ name = "test_health_endpoint_standalone"
 path = "tests/private-channel/rpc/test_health_endpoint_standalone.rs"
 
 [[test]]
+name = "test_account_read_failures"
+path = "tests/private-channel/rpc/test_account_read_failures.rs"
+
+[[test]]
 name = "bootstrap_validation"
 path = "tests/indexer/bootstrap_validation.rs"
 
@@ -115,6 +127,11 @@ path = "tests/indexer/reconnect_gap_fill_fail_closed.rs"
 [[test]]
 name = "startup_anchor"
 path = "tests/indexer/startup_anchor.rs"
+
+# One-shot backfill repair: records its range, verifies it, fails closed on write errors.
+[[test]]
+name = "backfill_only_e2e"
+path = "tests/indexer/backfill_only_e2e.rs"
 
 # Startup ordering: backfill completes and commits before escrow reconciliation.
 [[test]]

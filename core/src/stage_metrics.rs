@@ -26,6 +26,12 @@ pub trait StageMetrics: Send + Sync {
     fn executor_missing_results(&self, kind: &'static str);
     fn executor_dropped_expired_blockhash(&self, count: usize);
     fn executor_conservation_rejected(&self);
+    /// A batch aborted because its accounts could not be loaded. Non-zero means
+    /// the executor stopped rather than execute against unknown state.
+    fn executor_preload_fatal(&self);
+    /// A stored account row would not deserialize. Alert on any: it recurs on
+    /// restart until the row is repaired.
+    fn executor_corrupt_account(&self);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -47,6 +53,10 @@ pub trait StageMetrics: Send + Sync {
     fn settler_buffered_account_bytes(&self, bytes: usize);
     fn settler_backpressure_engaged(&self);
     fn settler_txs_settled(&self, count: usize);
+    fn settler_settle_retried(&self);
+    /// Executed transactions dropped without a settled block, by the stage
+    /// that was holding them.
+    fn discarded_executed_transactions(&self, stage: &'static str, count: usize);
     fn settler_settle_duration_ms(&self, ms: f64);
     fn settler_db_write_duration_ms(&self, ms: f64);
     fn settler_processing_duration_ms(&self, ms: f64);
@@ -118,6 +128,12 @@ impl StageMetrics for NoopMetrics {
     fn executor_conservation_rejected(&self) {
         debug!("executor: rejected tx failing lamport conservation");
     }
+    fn executor_preload_fatal(&self) {
+        debug!("executor: batch aborted, account preload failed");
+    }
+    fn executor_corrupt_account(&self) {
+        debug!("executor: corrupt stored account");
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
     }
@@ -156,6 +172,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn settler_txs_settled(&self, n: usize) {
         debug!("settler: settled {}", n);
+    }
+    fn settler_settle_retried(&self) {
+        debug!("settler: settle retried");
+    }
+    fn discarded_executed_transactions(&self, stage: &'static str, n: usize) {
+        debug!("{}: discarded {}", stage, n);
     }
     fn settler_settle_duration_ms(&self, ms: f64) {
         debug!("settler: settle_duration={:.3}ms", ms);
@@ -317,6 +339,18 @@ counter_vec!(
     &[]
 );
 counter_vec!(
+    EXECUTOR_PRELOAD_FATAL,
+    "private_channel_executor_preload_fatal_total",
+    "Batches aborted because the accounts they reference could not be loaded",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_CORRUPT_ACCOUNT,
+    "private_channel_executor_corrupt_account_total",
+    "Stored account rows that could not be deserialized",
+    &[]
+);
+counter_vec!(
     SETTLER_TXS_SETTLED,
     "private_channel_settler_txs_settled_total",
     "Transactions settled to DB",
@@ -327,6 +361,18 @@ counter_vec!(
     "private_channel_settler_backpressure_engaged_total",
     "Ticks that flushed a settle buffer already at or over its byte budget",
     &[]
+);
+counter_vec!(
+    SETTLER_SETTLE_RETRIED,
+    "private_channel_settler_settle_retried_total",
+    "Settle attempts that failed and were retried",
+    &[]
+);
+counter_vec!(
+    DISCARDED_EXECUTED_TRANSACTIONS,
+    "private_channel_discarded_executed_transactions_total",
+    "Executed transactions dropped without a settled block",
+    &["stage"]
 );
 counter_vec!(
     ADDRESS_SIGNATURES_ROWS_FLUSHED,
@@ -502,6 +548,16 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc();
     }
+    fn executor_preload_fatal(&self) {
+        EXECUTOR_PRELOAD_FATAL
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn executor_corrupt_account(&self) {
+        EXECUTOR_CORRUPT_ACCOUNT
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -563,6 +619,16 @@ impl StageMetrics for PrometheusMetrics {
     fn settler_txs_settled(&self, n: usize) {
         SETTLER_TXS_SETTLED
             .with_label_values(&[] as &[&str])
+            .inc_by(n as f64);
+    }
+    fn settler_settle_retried(&self) {
+        SETTLER_SETTLE_RETRIED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn discarded_executed_transactions(&self, stage: &'static str, n: usize) {
+        DISCARDED_EXECUTED_TRANSACTIONS
+            .with_label_values(&[stage])
             .inc_by(n as f64);
     }
     fn settler_settle_duration_ms(&self, ms: f64) {
@@ -640,6 +706,8 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_MISSING_RESULTS,
         EXECUTOR_DROPPED_EXPIRED_BH,
         EXECUTOR_CONSERVATION_REJECTED,
+        EXECUTOR_PRELOAD_FATAL,
+        EXECUTOR_CORRUPT_ACCOUNT,
         SETTLER_TXS_SETTLED,
         SETTLER_BACKPRESSURE_ENGAGED,
         EXECUTOR_RESULTS_CHUNKED,

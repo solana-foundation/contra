@@ -1,6 +1,6 @@
 use {
     crate::{
-        accounts::{bob::BOB, AccountsDB},
+        accounts::{bob::BOB, get_accounts::AccountLoadError, AccountsDB},
         nodes::node::WorkerHandle,
         processor::{
             create_transaction_batch_processor, get_transaction_check_results,
@@ -41,7 +41,6 @@ use {
         time::{Duration, Instant},
     },
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
     tracing::{debug, error, info, warn},
 };
 
@@ -57,7 +56,6 @@ pub struct ExecutionArgs {
     pub settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
     pub execution_results_tx: mpsc::Sender<ExecutedBatch>,
     pub accountsdb_connection_url: String,
-    pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     /// Max parallel SVM workers per batch (including calling thread).
     /// 1 disables parallelism; >=2 enables it once the batch is large enough
@@ -103,7 +101,6 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         settled_accounts_rx,
         execution_results_tx,
         accountsdb_connection_url,
-        shutdown_token,
         metrics,
         max_svm_workers,
         heartbeat,
@@ -130,111 +127,99 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         let mut total_batches_processed = 0u64;
 
         loop {
-            tokio::select! {
-                // Process batches
-                result = batch_rx.recv() => {
-                    match result {
-                        Some(batch) => {
-                            heartbeat.record_input();
-                            let batch_size = batch.transactions.len();
-                            debug!("Executor received batch with {} transactions", batch_size);
+            // Process batches. Closing the input is the only exit: shutdown
+            // arrives as an upstream close so every admitted batch is run.
+            match batch_rx.recv().await {
+                Some(batch) => {
+                    heartbeat.record_input();
+                    let batch_size = batch.transactions.len();
+                    debug!("Executor received batch with {} transactions", batch_size);
 
-                            let execution_result = execute_batch(
-                                batch,
-                                &mut execution_deps,
+                    let execution_result =
+                        match execute_batch(batch, &mut execution_deps, &metrics).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                // Nothing was executed or settled; a restart is
+                                // preferable to executing against unknown state.
+                                error!("Executor stopping: {}", e);
+                                break;
+                            }
+                        };
+
+                    let num_transactions_executed = execution_result.admin_transactions.len()
+                        + execution_result.regular_transactions.len();
+                    heartbeat.record_progress();
+                    if !execution_result.admin_transactions.is_empty() {
+                        if let Some(admin_results) = execution_result.admin_results {
+                            let len = execution_result.admin_transactions.len();
+                            // Bounded send applies backpressure; race shutdown so a full
+                            // settler queue never wedges executor exit. Owned values only,
+                            // no lock guard is held across this await.
+                            match send_results_chunked(
+                                &execution_results_tx,
+                                admin_results,
+                                execution_result.admin_transactions,
+                                execution_result.admin_generation,
+                                MAX_SEND_CHUNK_BYTES,
                                 &metrics,
-                            ).await;
-
-                            let num_transactions_executed = execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
-                            heartbeat.record_progress();
-                            if !execution_result.admin_transactions.is_empty() {
-                                if let Some(admin_results) = execution_result.admin_results {
-                                    let len = execution_result.admin_transactions.len();
-                                    // Bounded send applies backpressure; race shutdown so a full
-                                    // settler queue never wedges executor exit. Owned values only,
-                                    // no lock guard is held across this await.
-                                    match send_results_chunked(
-                                        &execution_results_tx,
-                                        admin_results,
-                                        execution_result.admin_transactions,
-                                        execution_result.admin_generation,
-                                        MAX_SEND_CHUNK_BYTES,
-                                        &shutdown_token,
-                                        &metrics,
-                                    )
-                                    .await
-                                    {
-                                        SendOutcome::Sent => {}
-                                        SendOutcome::ChannelClosed => {
-                                            metrics.executor_results_send_failed("admin");
-                                            error!("Failed to send admin results: channel closed");
-                                            break;
-                                        }
-                                        SendOutcome::ShuttingDown => {
-                                            info!("Executor shutdown while sending admin results");
-                                            return;
-                                        }
-                                    }
-                                    metrics.executor_results_sent(len);
-                                } else {
-                                    metrics.executor_missing_results("admin");
-                                    error!("Unexpected error: No result found for admin transactions");
+                            )
+                            .await
+                            {
+                                SendOutcome::Sent => {}
+                                SendOutcome::ChannelClosed => {
+                                    metrics.executor_results_send_failed("admin");
+                                    error!("Failed to send admin results: channel closed");
                                     break;
                                 }
                             }
-                            if !execution_result.regular_transactions.is_empty() {
-                                if let Some(regular_results) = execution_result.regular_results {
-                                    let len = execution_result.regular_transactions.len();
-                                    match send_results_chunked(
-                                        &execution_results_tx,
-                                        regular_results,
-                                        execution_result.regular_transactions,
-                                        execution_result.regular_generation,
-                                        MAX_SEND_CHUNK_BYTES,
-                                        &shutdown_token,
-                                        &metrics,
-                                    )
-                                    .await
-                                    {
-                                        SendOutcome::Sent => {}
-                                        SendOutcome::ChannelClosed => {
-                                            metrics.executor_results_send_failed("regular");
-                                            error!("Failed to send regular results: channel closed");
-                                            break;
-                                        }
-                                        SendOutcome::ShuttingDown => {
-                                            info!("Executor shutdown while sending regular results");
-                                            return;
-                                        }
-                                    }
-                                    metrics.executor_results_sent(len);
-                                } else {
-                                    metrics.executor_missing_results("regular");
-                                    error!("Unexpected error: No result found for regular transactions");
-                                    break;
-                                }
-                            }
-
-                            total_transactions_executed += num_transactions_executed as u64;
-                            total_batches_processed += 1;
-
-                            if total_batches_processed.is_multiple_of(100) {
-                                info!("Executor has processed {} batches, {} total transactions",
-                                      total_batches_processed, total_transactions_executed);
-                            }
-                        }
-                        None => {
-                            info!("Executor stopped - channel closed, executed {} total transactions in {} batches",
-                                  total_transactions_executed, total_batches_processed);
-                            return;
+                            metrics.executor_results_sent(len);
+                        } else {
+                            metrics.executor_missing_results("admin");
+                            error!("Unexpected error: No result found for admin transactions");
+                            break;
                         }
                     }
-                }
+                    if !execution_result.regular_transactions.is_empty() {
+                        if let Some(regular_results) = execution_result.regular_results {
+                            let len = execution_result.regular_transactions.len();
+                            match send_results_chunked(
+                                &execution_results_tx,
+                                regular_results,
+                                execution_result.regular_transactions,
+                                execution_result.regular_generation,
+                                MAX_SEND_CHUNK_BYTES,
+                                &metrics,
+                            )
+                            .await
+                            {
+                                SendOutcome::Sent => {}
+                                SendOutcome::ChannelClosed => {
+                                    metrics.executor_results_send_failed("regular");
+                                    error!("Failed to send regular results: channel closed");
+                                    break;
+                                }
+                            }
+                            metrics.executor_results_sent(len);
+                        } else {
+                            metrics.executor_missing_results("regular");
+                            error!("Unexpected error: No result found for regular transactions");
+                            break;
+                        }
+                    }
 
-                // Handle shutdown signal
-                _ = shutdown_token.cancelled() => {
-                    info!("Executor received shutdown signal, executed {} total transactions in {} batches",
-                          total_transactions_executed, total_batches_processed);
+                    total_transactions_executed += num_transactions_executed as u64;
+                    total_batches_processed += 1;
+
+                    if total_batches_processed.is_multiple_of(100) {
+                        info!(
+                            "Executor has processed {} batches, {} total transactions",
+                            total_batches_processed, total_transactions_executed
+                        );
+                    }
+                }
+                None => {
+                    info!("Executor stopped - channel closed, executed {} total transactions in {} batches",
+                                  total_transactions_executed, total_batches_processed);
                     return;
                 }
             }
@@ -344,11 +329,12 @@ pub(crate) const MAX_SEND_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 /// A chunk must never exceed the settler budget it is measured against.
 const _: () = assert!(MAX_SEND_CHUNK_BYTES <= crate::stages::MAX_BUFFERED_SETTLE_BYTES);
 
-/// Outcome of a settler send, mirroring the caller's three existing paths.
+/// Outcome of a settler send. There is no shutdown variant: abandoning a send
+/// would discard a batch that has already executed and already mutated the
+/// in-memory accounts, and the settler is still draining when this stage exits.
 pub(crate) enum SendOutcome {
     Sent,
     ChannelClosed,
-    ShuttingDown,
 }
 
 /// Where to split a batch, as end-exclusive index ranges over its transactions.
@@ -381,21 +367,32 @@ fn chunk_ranges_by_bytes(
     ranges
 }
 
-/// Send one batch, racing the shutdown token exactly as the inline send did.
+/// Send one batch to the settler, waiting for room rather than giving up.
+/// A closed queue hands the batch back so the caller can record it.
 async fn send_one(
     results_tx: &mpsc::Sender<ExecutedBatch>,
     batch: ExecutedBatch,
-    shutdown_token: &CancellationToken,
-) -> SendOutcome {
-    tokio::select! {
-        send_result = results_tx.send(batch) => {
-            match send_result {
-                Ok(()) => SendOutcome::Sent,
-                Err(_) => SendOutcome::ChannelClosed,
-            }
-        }
-        _ = shutdown_token.cancelled() => SendOutcome::ShuttingDown,
+) -> Result<(), ExecutedBatch> {
+    match results_tx.send(batch).await {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendError(batch)) => Err(batch),
     }
+}
+
+/// Name what the executor could not hand over. The settler closes its queue
+/// when it gives up, so these are executed and uncommitted just like the buffer
+/// it recorded on its own side, and they end here rather than nowhere.
+fn record_unsent(
+    unsent: &[SanitizedTransaction],
+    never_sent: &[SanitizedTransaction],
+    metrics: &SharedMetrics,
+) {
+    let signatures: Vec<solana_sdk::signature::Signature> = unsent
+        .iter()
+        .chain(never_sent.iter())
+        .map(|transaction| *transaction.signature())
+        .collect();
+    crate::stages::record_discarded("executor", "settler queue closed", &signatures, metrics);
 }
 
 /// Send results to the settler in byte-bounded messages.
@@ -407,17 +404,17 @@ async fn send_results_chunked(
     transactions: Vec<SanitizedTransaction>,
     generation: u64,
     cap: usize,
-    shutdown_token: &CancellationToken,
     metrics: &SharedMetrics,
 ) -> SendOutcome {
     let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
     if ranges.len() <= 1 {
-        return send_one(
-            results_tx,
-            (output, transactions, generation),
-            shutdown_token,
-        )
-        .await;
+        return match send_one(results_tx, (output, transactions, generation)).await {
+            Ok(()) => SendOutcome::Sent,
+            Err((_, transactions, _)) => {
+                record_unsent(&transactions, &[], metrics);
+                SendOutcome::ChannelClosed
+            }
+        };
     }
 
     metrics.executor_results_chunked(ranges.len());
@@ -453,20 +450,17 @@ async fn send_results_chunked(
         let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
         // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
         let chunk_generation = if position == last { generation } else { 0 };
-        match send_one(
-            results_tx,
-            (chunk, chunk_transactions, chunk_generation),
-            shutdown_token,
-        )
-        .await
-        {
-            SendOutcome::Sent => sent += take,
-            other => {
+        match send_one(results_tx, (chunk, chunk_transactions, chunk_generation)).await {
+            Ok(()) => sent += take,
+            Err((_, chunk_transactions, _)) => {
                 // Report what actually landed; the caller only counts a whole batch.
                 if sent > 0 {
                     metrics.executor_results_sent(sent);
                 }
-                return other;
+                // The chunks still undrained never left either, so they belong
+                // in the same record as the one that just failed.
+                record_unsent(&chunk_transactions, &transactions, metrics);
+                return SendOutcome::ChannelClosed;
             }
         }
     }
@@ -642,11 +636,13 @@ fn enforce_lamport_conservation(
     }
 }
 
+/// Returns `Err` when the accounts this batch needs could not be loaded. The
+/// abort happens before any SVM run or BOB write, so nothing has changed yet.
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
     metrics: &SharedMetrics,
-) -> ExecutionResult {
+) -> Result<ExecutionResult, AccountLoadError> {
     let t_batch = Instant::now();
     let batch_size = batch.transactions.len();
     debug!("Executing batch with {} transactions", batch_size);
@@ -735,10 +731,23 @@ pub async fn execute_batch(
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
     let t_op = Instant::now();
-    let (preload_fetched, preload_cached) = execution_deps
+    // Executing against accounts BOB could not load would settle state derived
+    // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
+    let (preload_fetched, preload_cached) = match execution_deps
         .bob
         .preload_accounts(&accounts_to_preload)
-        .await;
+        .await
+    {
+        Ok(counts) => counts,
+        Err(e) => {
+            if let AccountLoadError::Corrupt(_) = e {
+                metrics.executor_corrupt_account();
+            }
+            metrics.executor_preload_fatal();
+            error!("execution: aborting batch, account preload failed: {}", e);
+            return Err(e);
+        }
+    };
     let t_preload = t_op.elapsed();
     debug!(
         "preload: {} accounts ({} fetched, {} cached) in {:?}",
@@ -943,14 +952,14 @@ pub async fn execute_batch(
     );
     metrics.executor_batch_duration_ms(t_total.as_secs_f64() * 1000.0);
 
-    ExecutionResult {
+    Ok(ExecutionResult {
         admin_transactions,
         regular_transactions,
         admin_results,
         regular_results,
         admin_generation,
         regular_generation,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1052,7 +1061,9 @@ mod tests {
                 index: i,
             })
             .collect();
-        execute_batch(ConflictFreeBatch { transactions }, deps, metrics).await
+        execute_batch(ConflictFreeBatch { transactions }, deps, metrics)
+            .await
+            .expect("test batch must load its accounts")
     }
 
     fn regular_result(
@@ -1188,22 +1199,14 @@ mod tests {
     #[tokio::test]
     async fn chunked_send_stamps_generation_on_final_chunk_only() {
         let cap = 1000usize;
-        let shutdown = CancellationToken::new();
+        let _shutdown = CancellationToken::new();
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         // Each transaction alone exceeds the cap, so this splits into three.
         let (results, txs) = sized_batch(&[5000, 5000, 5000]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let outcome = send_results_chunked(
-            &chan_tx,
-            output_of(results),
-            txs,
-            42,
-            cap,
-            &shutdown,
-            &metrics,
-        )
-        .await;
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 42, cap, &metrics).await;
         assert!(matches!(outcome, SendOutcome::Sent));
 
         let mut gens = Vec::new();
@@ -1219,16 +1222,8 @@ mod tests {
         // Under the cap the batch goes as one message, still stamped.
         let (results, txs) = sized_batch(&[10, 10]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let outcome = send_results_chunked(
-            &chan_tx,
-            output_of(results),
-            txs,
-            7,
-            cap,
-            &shutdown,
-            &metrics,
-        )
-        .await;
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 7, cap, &metrics).await;
         assert!(matches!(outcome, SendOutcome::Sent));
 
         let mut gens = Vec::new();
@@ -1236,6 +1231,80 @@ mod tests {
             gens.push(g);
         }
         assert_eq!(gens, vec![7], "an unsplit batch stays one message");
+    }
+
+    use crate::stage_metrics::PrometheusMetrics;
+
+    /// The Prometheus registry is process-global, so counter deltas are read
+    /// one test at a time.
+    static DISCARD_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn discarded_total() -> f64 {
+        private_channel_metrics::prometheus::gather()
+            .into_iter()
+            .filter(|mf| mf.name() == "private_channel_discarded_executed_transactions_total")
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .map(|m| m.get_counter().value())
+            .sum()
+    }
+
+    /// The settler closes its queue when it gives up, so the batch the executor
+    /// was holding comes back to it. Dropping that silently moves the audit gap
+    /// one stage upstream instead of closing it.
+    #[tokio::test]
+    async fn a_closed_settler_channel_records_the_unsent_batch() {
+        let _guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = discarded_total();
+
+        let (results, txs) = sized_batch(&[10, 10, 10]);
+        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(4);
+        drop(rx);
+
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            1,
+            MAX_SEND_CHUNK_BYTES,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::ChannelClosed));
+        assert_eq!(
+            discarded_total() - before,
+            3.0,
+            "every executed transaction the executor still held must be recorded"
+        );
+    }
+
+    /// A split batch fails partway. The chunks that never went are just as
+    /// executed and just as uncommitted as the one whose send failed.
+    #[tokio::test]
+    async fn a_closed_channel_mid_chunk_records_the_remainder() {
+        let _guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = discarded_total();
+
+        // One transaction per chunk, and room for only the first.
+        let (results, txs) = sized_batch(&[5000, 5000, 5000]);
+        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(1);
+        // The receiver never drains, so the second chunk parks. Closing it then
+        // is what the settler does when it gives up mid-handover.
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(rx);
+        });
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 9, 1000, &metrics).await;
+
+        assert!(matches!(outcome, SendOutcome::ChannelClosed));
+        assert_eq!(
+            discarded_total() - before,
+            2.0,
+            "the failed chunk and the undrained remainder must both be recorded"
+        );
+        let _ = closer.await;
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.
@@ -2134,7 +2203,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         assert_eq!(result.regular_transactions.len(), n);
         assert!(result.admin_transactions.is_empty());
@@ -2165,7 +2234,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let results = result.regular_results.unwrap();
         assert_eq!(results.processing_results.len(), n);
@@ -2239,7 +2308,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(empty_batch, &mut deps, &noop).await;
+        let result = execute_batch(empty_batch, &mut deps, &noop).await.unwrap();
         assert!(result.admin_transactions.is_empty());
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_none());
@@ -2261,7 +2330,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert!(!result.regular_transactions.is_empty());
         assert!(result.admin_transactions.is_empty());
         assert!(
@@ -2296,7 +2365,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.regular_transactions.len(), 2);
         assert!(result.admin_transactions.is_empty());
         let results = result.regular_results.unwrap();
@@ -2340,7 +2409,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         assert_eq!(
             result.regular_transactions.len(),
@@ -2386,7 +2455,9 @@ mod tests {
         };
 
         // Pass 1: bh is in the live window — all 3 must execute.
-        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop)
+            .await
+            .unwrap();
         assert_eq!(
             r1.regular_transactions.len(),
             3,
@@ -2397,7 +2468,9 @@ mod tests {
         live.write().unwrap().clear();
 
         // Pass 2: same blockhash, now expired — all 3 must be filtered.
-        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop)
+            .await
+            .unwrap();
         assert_eq!(
             r2.regular_transactions.len(),
             0,
@@ -2409,23 +2482,22 @@ mod tests {
         );
     }
 
+    /// The stage exits when its input closes, which is how shutdown reaches it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_execution_worker_shutdown_exits_cleanly() {
+    async fn test_execution_worker_exits_when_input_closes() {
         let (_accounts_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (_batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
+        let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
         let (execution_results_tx, _execution_results_rx) =
             mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
-        let shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
@@ -2433,10 +2505,10 @@ mod tests {
         })
         .await;
 
-        shutdown.cancel();
+        drop(batch_tx);
 
-        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
-        assert!(result.is_ok(), "worker should exit promptly after shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
+        assert!(result.is_ok(), "worker should exit once its input closes");
     }
 
     // --- Corner-case coverage for the parallel SVM execution path.
@@ -2479,7 +2551,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -2530,7 +2602,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -2584,7 +2656,7 @@ mod tests {
         let batch = ConflictFreeBatch { transactions };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
 
         let output_signatures: Vec<_> = result
             .regular_transactions
@@ -2744,14 +2816,13 @@ mod tests {
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
         let (execution_results_tx, _execution_results_rx) =
             mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
-        let shutdown = CancellationToken::new();
+        let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
@@ -2787,7 +2858,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.admin_transactions.len(), 1);
         assert!(result.regular_transactions.is_empty());
         assert!(result.admin_results.is_some());
@@ -2813,7 +2884,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert!(
             result.admin_transactions.is_empty(),
             "mixed tx must not be admin-routed"
@@ -2847,7 +2918,7 @@ mod tests {
         };
 
         let noop: SharedMetrics = Arc::new(NoopMetrics);
-        let result = execute_batch(batch, &mut deps, &noop).await;
+        let result = execute_batch(batch, &mut deps, &noop).await.unwrap();
         assert_eq!(result.admin_transactions.len(), 1);
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());
@@ -2883,7 +2954,6 @@ mod tests {
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 1,
@@ -2919,21 +2989,20 @@ mod tests {
     // A full results channel with no receiver must not wedge executor shutdown:
     // the send is raced against the shutdown token.
     #[tokio::test(flavor = "multi_thread")]
-    async fn executor_exits_on_shutdown_with_full_results() {
+    async fn a_full_results_channel_never_costs_an_executed_batch() {
         let (_accounts_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
         let (execution_results_tx, execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
-        let shutdown = CancellationToken::new();
+        let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 1,
@@ -2947,18 +3016,60 @@ mod tests {
                 index: 0,
             }],
         };
-        // Fill the cap-1 channel and leave a second batch whose send will block;
-        // never drain the results channel.
+        // Fill the cap-1 channel so the second send parks, then close the input.
         batch_tx.send(one_batch()).await.unwrap();
         batch_tx.send(one_batch()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(batch_tx);
 
-        shutdown.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
+        // Draining lets the parked send complete. Both batches have already run
+        // against the in-memory accounts, so neither may be abandoned.
+        let mut received = 0;
+        let mut rx = execution_results_rx;
+        while received < 2 {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(_)) => received += 1,
+                _ => break,
+            }
+        }
+        assert_eq!(received, 2, "a full results channel must not drop a batch");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(result.is_ok(), "executor must exit once its input closes");
+    }
+
+    /// A batch whose accounts could not be loaded must abort before any SVM run,
+    /// so nothing is executed against phantom-absent state and settled.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn execute_batch_aborts_when_preload_cannot_read_the_store() {
+        use crate::accounts::get_accounts::{reset_test_retry, set_test_retry};
+
+        set_test_retry(2, 1);
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(
+            crate::test_helpers::dead_postgres_db(),
+            rx,
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(sanitize_transfer(&payer, Hash::default())),
+                index: 0,
+            }],
+        };
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        reset_test_retry();
+
+        assert!(result.is_err(), "an unreadable store must abort the batch");
         assert!(
-            result.is_ok(),
-            "executor must exit promptly even with a full results channel"
+            deps.bob.get_account_shared_data(&payer.pubkey()).is_none(),
+            "nothing may be cached from a read that failed"
         );
-        drop(execution_results_rx);
     }
 }

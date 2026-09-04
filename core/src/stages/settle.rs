@@ -53,6 +53,27 @@ pub const CACHE_MIRROR_COOLDOWN: Duration = Duration::from_secs(60);
 /// slow to answer the first time.
 const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Bounds one settle attempt, matching the stage health margin so an overrun is
+/// already unhealthy. Unbounded, the pool's 30s acquire would outlast the budget.
+const SETTLE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Total retry time. Blocks stop while it runs and the blockhash window counts
+/// blocks, so pinning it to the transaction expiry caps the overshoot at 2x.
+const SETTLE_RETRY_BUDGET: Duration = Duration::from_secs(15);
+
+/// Attempt bound once shutdown has been signalled. Short so two attempts fit
+/// the shutdown budget below.
+const SETTLE_SHUTDOWN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// All the settling a cancelled node gets, measured from cancellation so an
+/// attempt already in flight counts against it. Sized to fit two attempts and
+/// to leave the rest of the drain deadline for the cascade.
+const SETTLE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
+
+/// First delay between attempts, doubled after each failure up to the cap.
+const SETTLE_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(100);
+const SETTLE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
 /// A single account that has been settled
 /// We need to track if the account was deleted so we can tombstone it
 /// in the accounts database
@@ -127,6 +148,7 @@ struct SettleResult {
 }
 
 /// The channels a committed block is announced on, ahead of any cache work.
+#[derive(Clone, Copy)]
 struct BlockPublishers<'a> {
     /// Advances the dedup window. Until dedup holds the hash, transactions
     /// built on it are dropped.
@@ -426,14 +448,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 // before the (almost-always-ready) result-buffer arm so a
                 // tick is never delayed by an arbitrary number of recvs, and
                 // MissedTickBehavior::Delay won't slide the schedule out.
+                // Exits when the executor closes its results channel, not on the
+                // shutdown signal, so every executed batch reaches a commit. The
+                // signal still reaches settle_with_retry, where it shortens a
+                // running retry to fit the node's drain deadline.
                 tokio::select! {
                     biased;
-
-                    // Handle shutdown signal
-                    _ = shutdown_token.cancelled() => {
-                        info!("Settle worker received shutdown signal");
-                        break;
-                    }
 
                     // Blocktime tick: unconditionally produce a block with
                     // whatever has accumulated since the last tick.
@@ -458,7 +478,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         if buffered_account_bytes >= MAX_BUFFERED_SETTLE_BYTES {
                             metrics.settler_backpressure_engaged();
                         }
-                        match settle_transactions(
+                        match settle_with_retry(
                             last_block.clone(),
                             &mut accounts_db,
                             redis_db.as_mut(),
@@ -470,6 +490,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 address_signatures: &address_signatures_tx,
                             }),
                             highest_generation,
+                            &heartbeat,
+                            &shutdown_token,
                         )
                         .await
                         {
@@ -496,7 +518,14 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 // Both announcements are attempted before the
                                 // commit returns, so stopping here cannot leave
                                 // this block half-announced.
-                                if settle_result.publisher_gone {
+                                //
+                                // A drain retires dedup and the executor ahead of
+                                // this stage, so their channels closing is the
+                                // expected end state and must not cut the drain
+                                // short while the executor is still feeding us.
+                                // Outside a drain it means a stage died, which
+                                // still stops the node.
+                                if settle_result.publisher_gone && !shutdown_token.is_cancelled() {
                                     break;
                                 }
                             }
@@ -507,6 +536,15 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             }
                             Err(SettleError::Other(msg)) => {
                                 error!("Failed to settle transactions: {}", msg);
+                                // Cleared here so the final flush below does not
+                                // spend a second budget on the same doomed batch.
+                                discard_buffer(
+                                    &msg,
+                                    &mut processing_results,
+                                    &mut execution_results_rx,
+                                    &metrics,
+                                );
+                                metrics.settler_buffered_account_bytes(0);
                                 break;
                             }
                         }
@@ -598,7 +636,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             // exit — without this, the final partial block is silently dropped
             if !processing_results.is_empty() {
                 let num_results = processing_results.len();
-                match settle_transactions(
+                match settle_with_retry(
                     last_block.clone(),
                     &mut accounts_db,
                     redis_db.as_mut(),
@@ -610,6 +648,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         address_signatures: &address_signatures_tx,
                     }),
                     highest_generation,
+                    &heartbeat,
+                    &shutdown_token,
                 )
                 .await
                 {
@@ -632,7 +672,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         );
                     }
                     Err(e) => {
-                        warn!("Final flush failed (buffered txs lost): {:?}", e);
+                        discard_buffer(
+                            &e.to_string(),
+                            &mut processing_results,
+                            &mut execution_results_rx,
+                            &metrics,
+                        );
                     }
                 }
                 processing_results.clear();
@@ -687,7 +732,168 @@ fn compute_blockhash(
     hashv(&parts)
 }
 
+/// Record executed transactions that could not be committed, then drop them.
+///
+/// The only place a buffer clears without a commit, so the record is written
+/// first. Queued results fold in; a DB-backed one would need the dead database.
+fn discard_buffer(
+    reason: &str,
+    processing_results: &mut Vec<(TransactionProcessingResult, SanitizedTransaction)>,
+    execution_results_rx: &mut mpsc::Receiver<ExecutedBatch>,
+    metrics: &crate::stage_metrics::SharedMetrics,
+) {
+    // Closed before the drain, not just emptied: every `try_recv` frees a slot
+    // and the executor may be parked on a send waiting for exactly that slot,
+    // so a snapshot lets a batch land behind the record and die with the
+    // receiver. Closing refuses it instead, and the executor records its own.
+    execution_results_rx.close();
+    while let Ok((svm_output, transactions, _generation)) = execution_results_rx.try_recv() {
+        processing_results.extend(
+            svm_output
+                .processing_results
+                .into_iter()
+                .zip(transactions.into_iter()),
+        );
+    }
+
+    let signatures: Vec<Signature> = processing_results
+        .iter()
+        .map(|(_, transaction)| *transaction.signature())
+        .collect();
+    processing_results.clear();
+
+    crate::stages::record_discarded("settler", reason, &signatures, metrics);
+}
+
+/// Commit a batch, retrying a storage failure until the budget runs out.
+///
+/// The whole batch is either committed or reported as failed, never split, so
+/// every attempt rebuilds the same block from the same pinned timestamp. That
+/// matters because a commit can succeed on the server and still fail to
+/// acknowledge; the retry then rewrites byte-identical rows instead of minting
+/// a second blockhash for a slot a replica may already be serving.
+#[allow(clippy::too_many_arguments)]
+async fn settle_with_retry(
+    last_block: Option<LastBlock>,
+    accounts_db: &mut AccountsDB,
+    mut redis_db: Option<&mut RedisAccountsDB>,
+    processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
+    metrics: &crate::stage_metrics::SharedMetrics,
+    publishers: Option<BlockPublishers<'_>>,
+    generation: u64,
+    heartbeat: &crate::health::StageHeartbeat,
+    shutdown_token: &CancellationToken,
+) -> Result<SettleResult, SettleError> {
+    // One clock read for the whole call, shared by every attempt.
+    let block_time_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    let has_work = !processing_results.is_empty();
+    let mut backoff = SETTLE_RETRY_BACKOFF_BASE;
+    let mut attempts = 0u32;
+
+    // Cancelling swaps the budget for a shorter one measured from the moment it
+    // arrives, so an attempt already in flight is spent out of the drain's time
+    // rather than before it. Both are hard caps: no attempt starts that cannot
+    // finish inside the deadline that applies to it.
+    let mut draining = shutdown_token.is_cancelled();
+    let mut deadline = Instant::now()
+        + if draining {
+            SETTLE_SHUTDOWN_BUDGET
+        } else {
+            SETTLE_RETRY_BUDGET
+        };
+
+    loop {
+        // Health compares last input against last progress, so without a bump both
+        // freeze mid-retry and read healthy. Idle first attempts stay exempt.
+        if has_work || attempts > 0 {
+            heartbeat.record_input();
+        }
+        attempts += 1;
+
+        let commit_timeout = attempt_timeout(draining, deadline);
+        let attempt = settle_transactions(
+            last_block.clone(),
+            accounts_db,
+            redis_db.as_deref_mut(),
+            processing_results,
+            metrics,
+            publishers,
+            generation,
+            block_time_nanos,
+            commit_timeout,
+        );
+
+        let outcome = if draining {
+            attempt.await
+        } else {
+            tokio::pin!(attempt);
+            tokio::select! {
+                result = &mut attempt => result,
+                _ = shutdown_token.cancelled() => {
+                    draining = true;
+                    deadline = Instant::now() + SETTLE_SHUTDOWN_BUDGET;
+                    match tokio::time::timeout_at(deadline, &mut attempt).await {
+                        Ok(result) => result,
+                        Err(_) => Err(SettleError::Other(
+                            "settle attempt outlived the shutdown budget".to_string(),
+                        )),
+                    }
+                }
+            }
+        };
+
+        let error = match outcome {
+            Ok(settle_result) => return Ok(settle_result),
+            // Raised only after the commit landed, so the block is already
+            // durable and retrying would write it a second time. The index it
+            // failed to reach is rebuilt from Postgres on the next boot.
+            Err(SettleError::AddressIndexWriterGone) => {
+                return Err(SettleError::AddressIndexWriterGone)
+            }
+            Err(e) => e,
+        };
+
+        // Cancellation may have arrived while a draining attempt was running.
+        if !draining && shutdown_token.is_cancelled() {
+            draining = true;
+            deadline = deadline.min(Instant::now() + SETTLE_SHUTDOWN_BUDGET);
+        }
+
+        // Counted in full, so the budget bounds the call rather than the moment
+        // the last attempt starts.
+        if Instant::now() + backoff + attempt_timeout(draining, deadline) > deadline {
+            return Err(error);
+        }
+
+        warn!("Settle attempt failed, retrying in {backoff:?}: {error}");
+        metrics.settler_settle_retried();
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown_token.cancelled(), if !draining => {
+                draining = true;
+                deadline = deadline.min(Instant::now() + SETTLE_SHUTDOWN_BUDGET);
+            }
+        }
+        backoff = (backoff * 2).min(SETTLE_RETRY_BACKOFF_MAX);
+    }
+}
+
+/// The most one attempt may take: its own bound, never past the deadline.
+fn attempt_timeout(draining: bool, deadline: Instant) -> Duration {
+    let bound = if draining {
+        SETTLE_SHUTDOWN_ATTEMPT_TIMEOUT
+    } else {
+        SETTLE_ATTEMPT_TIMEOUT
+    };
+    bound.min(deadline.saturating_duration_since(Instant::now()))
+}
+
 /// Settle transactions: Update accounts database with changes
+#[allow(clippy::too_many_arguments)]
 async fn settle_transactions(
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
@@ -698,6 +904,10 @@ async fn settle_transactions(
     // High-water mark of executor generations covered by this commit. Read at
     // the call site so it can never fold in a batch buffered after the flush.
     generation: u64,
+    // Sampled by the caller, never here, so a retry rebuilds the same block.
+    block_time_nanos: u128,
+    // Bounds the commit only: replaying the post-commit publishes would evict a still-live dedup entry.
+    commit_timeout: Duration,
 ) -> Result<SettleResult, SettleError> {
     let t_total = tokio::time::Instant::now();
     // Preallocate per-tick collections from the known result count so the hot
@@ -708,11 +918,9 @@ async fn settle_transactions(
     let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> =
         HashMap::with_capacity(n * 4);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let block_time = now.as_secs() as i64;
-    let block_time_nanos = now.as_nanos();
+    // Derived rather than passed alongside, so the seconds and the nanoseconds
+    // in a block can never disagree about when it was produced.
+    let block_time = (block_time_nanos / 1_000_000_000) as i64;
 
     let (next_slot, last_blockhash, last_slot, is_genesis) = match last_block {
         Some(ref lb) => (lb.slot + 1, lb.blockhash, lb.slot, false),
@@ -831,13 +1039,20 @@ async fn settle_transactions(
 
     // Phase 2: Postgres write (source of truth, fatal on failure)
     let t_db_start = tokio::time::Instant::now();
-    let addr_sig_rows = accounts_db
-        .write_batch(
+    let addr_sig_rows = tokio::time::timeout(
+        commit_timeout,
+        accounts_db.write_batch(
             &accounts_vec,
             transactions_for_db.clone(),
             Some(block_info.clone()),
-        )
-        .await?;
+        ),
+    )
+    .await
+    .map_err(|_| {
+        SettleError::Other(format!(
+            "commit exceeded {commit_timeout:?} and was abandoned"
+        ))
+    })??;
     let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
 
     // Both announcements go out before any optional work: the ack unpins the
@@ -1195,6 +1410,8 @@ mod tests {
                 address_signatures: &address_signatures_tx,
             }),
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .expect("settle_transactions succeeded");
@@ -1294,6 +1511,10 @@ mod tests {
     }
 
     /// Sum of one settler counter family, sampled as a delta by the callers.
+    /// The Prometheus registry is process-global, so tests that measure a
+    /// counter delta have to hold this while they do it.
+    static DISCARD_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn settler_metric(name: &str) -> f64 {
         private_channel_metrics::prometheus::gather()
             .into_iter()
@@ -1350,11 +1571,13 @@ mod tests {
         mpsc::UnboundedReceiver<AccountSettlements>,
         WorkerHandle,
         SettlerSinks,
+        Arc<crate::health::StageHeartbeat>,
     ) {
         let (exec_tx, exec_rx) = mpsc::channel(capacity);
         let (settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, address_signatures_rx) = mpsc::channel(64);
+        let heartbeat = crate::health::StageHeartbeat::new();
         let handle = start_settle_worker(SettleArgs {
             execution_results_rx: exec_rx,
             settled_accounts_tx,
@@ -1367,7 +1590,7 @@ mod tests {
             shutdown_token: shutdown,
             metrics,
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
-            heartbeat: crate::health::StageHeartbeat::new(),
+            heartbeat: Arc::clone(&heartbeat),
         })
         .await;
         (
@@ -1378,7 +1601,78 @@ mod tests {
                 _blockhashes_rx: blockhashes_rx,
                 _address_signatures_rx: address_signatures_rx,
             },
+            heartbeat,
         )
+    }
+
+    /// Current wall clock in nanoseconds, the value the worker pins per settle.
+    fn settle_now() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    }
+
+    /// Pool onto the same database the settler under test is writing to.
+    fn test_pool(db: &AccountsDB) -> Arc<sqlx::PgPool> {
+        match db {
+            AccountsDB::Postgres(pg) => Arc::clone(&pg.pool),
+            _ => panic!("expected a Postgres accounts database"),
+        }
+    }
+
+    /// Make every slot above the current tip fail to commit, the way a
+    /// storage-side error would, and return that tip.
+    ///
+    /// A constraint aimed at one slot races the settler, which mints an empty
+    /// block every tick and may already have passed it. Capping the whole table
+    /// cannot race: whatever slot comes next is above the cap and fails.
+    async fn block_slots_above_tip(pool: &sqlx::PgPool) -> u64 {
+        let tip: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+            .fetch_one(pool)
+            .await
+            .expect("read tip");
+        let tip = tip.unwrap_or(0) as u64;
+        sqlx::query(&format!(
+            "ALTER TABLE blocks ADD CONSTRAINT test_slot_ceiling CHECK (slot <= {tip}) NOT VALID"
+        ))
+        .execute(pool)
+        .await
+        .expect("add blocking constraint");
+        tip
+    }
+
+    /// Lift the ceiling so commits succeed again.
+    async fn unblock_slots(pool: &sqlx::PgPool) {
+        sqlx::query("ALTER TABLE blocks DROP CONSTRAINT test_slot_ceiling")
+            .execute(pool)
+            .await
+            .expect("drop blocking constraint");
+    }
+
+    /// Seconds since the epoch, for comparing against a committed block time.
+    fn unix_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
+    /// Wait until the settler has committed a block at `slot`, up to `within`.
+    async fn await_block(pool: &sqlx::PgPool, slot: u64, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            let found: Option<i64> = sqlx::query_scalar("SELECT slot FROM blocks WHERE slot = $1")
+                .bind(slot as i64)
+                .fetch_optional(pool)
+                .await
+                .expect("query blocks");
+            if found.is_some() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
     }
 
     /// The finding itself: unguarded, the settler drains forever and one tick can
@@ -1391,7 +1685,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // A long blocktime means no tick rescues the buffer during the test.
-        let (exec_tx, _rx, _h, _sinks) =
+        let (exec_tx, _rx, _h, _sinks, _hb) =
             settler_under_test(url, 60_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         // An eighth of the budget each, so the guard trips before all of them fit.
@@ -1422,7 +1716,7 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
         let shutdown = CancellationToken::new();
 
-        let (exec_tx, mut settled_rx, _h, _sinks) =
+        let (exec_tx, mut settled_rx, _h, _sinks, _hb) =
             settler_under_test(url, 50, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         let batch_bytes = MAX_BUFFERED_SETTLE_BYTES / 4;
@@ -1460,7 +1754,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // No tick while sampling, and a one-slot channel blocks sends until a drain.
-        let (exec_tx, _rx, _h, _sinks) = settler_under_test(
+        let (exec_tx, _rx, _h, _sinks, _hb) = settler_under_test(
             url,
             600_000,
             1,
@@ -1512,7 +1806,7 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
         let shutdown = CancellationToken::new();
 
-        let (exec_tx, _rx, _h, _sinks) =
+        let (exec_tx, _rx, _h, _sinks, _hb) =
             settler_under_test(url, 600_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         let batch_bytes = MAX_BUFFERED_SETTLE_BYTES / 8;
@@ -1543,7 +1837,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let before = settler_metric("private_channel_settler_backpressure_engaged_total");
 
-        let (exec_tx, mut settled_rx, _h, _sinks) = settler_under_test(
+        let (exec_tx, mut settled_rx, _h, _sinks, _hb) = settler_under_test(
             url,
             50,
             RESULTS_CAP,
@@ -1576,7 +1870,7 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
         let shutdown = CancellationToken::new();
 
-        let (exec_tx, mut settled_rx, _h, _sinks) =
+        let (exec_tx, mut settled_rx, _h, _sinks, _hb) =
             settler_under_test(url, 400, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         // Generation 1 saturates the buffer on its own.
@@ -1661,16 +1955,500 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
         let shutdown = CancellationToken::new();
 
-        let (exec_tx, _rx, handle, _sinks) =
+        let (exec_tx, _rx, handle, _sinks, _hb) =
             settler_under_test(url, 60_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES + 4096);
         exec_tx.send((output, txs, 1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        shutdown.cancel();
-        let exited = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
+        drop(exec_tx);
+        let exited = tokio::time::timeout(Duration::from_secs(30), handle.handle).await;
         assert!(exited.is_ok(), "final flush must exit promptly");
+        shutdown.cancel();
+    }
+
+    // --- settle retry, pinned timestamps and stall health ---
+
+    /// A storage error that clears must cost a stall, not the node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_retries_until_a_transient_failure_clears() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        // Genesis is slot 0, so the first block carrying our batch is slot 1.
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        let tip = block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        unblock_slots(&pool).await;
+
+        assert!(
+            await_block(&pool, tip + 1, Duration::from_secs(20)).await,
+            "the batch must land once the failure clears"
+        );
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
+    }
+
+    /// A retry must rewrite the same block, not a freshly timestamped one: a
+    /// replica can already be serving the first attempt's blockhash from the
+    /// metadata row, and re-minting it there would strand every client that
+    /// signed against it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retried_settle_keeps_the_timestamp_of_the_first_attempt() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        let tip = block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+
+        // Held long enough that a timestamp sampled at the winning attempt
+        // would be several seconds later than one pinned at the first.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let unblocked_at = unix_secs();
+        unblock_slots(&pool).await;
+
+        assert!(await_block(&pool, tip + 1, Duration::from_secs(20)).await);
+        let raw: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = $1")
+            .bind((tip + 1) as i64)
+            .fetch_one(pool.as_ref())
+            .await
+            .expect("read the blocked block");
+        let block: BlockInfo = bincode::deserialize(&raw).expect("decode block 1");
+        let block_time = block.block_time.expect("block time present");
+        assert!(
+            block_time < unblocked_at,
+            "block time {block_time} must predate the unblock at {unblocked_at}"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
+    }
+
+    /// Identical inputs must produce an identical block, which is what makes a
+    /// retry after an unacknowledged commit safe to repeat.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_is_deterministic_given_a_pinned_timestamp() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let results = single_successful_transfer();
+        let nanos = 1_700_000_000_123_456_789u128;
+
+        let r1 = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &metrics,
+            None,
+            0,
+            nanos,
+            SETTLE_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let r2 = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &metrics,
+            None,
+            0,
+            nanos,
+            SETTLE_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r1.slot, r2.slot);
+        assert_eq!(r1.blockhash, r2.blockhash);
+    }
+
+    /// While the settler is stuck retrying it must stop reporting healthy, or a
+    /// load balancer keeps sending it work it cannot commit. Both heartbeat
+    /// timestamps would otherwise freeze together and the verdict would freeze
+    /// with them, because no new input arrives during a retry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_settler_reports_unhealthy() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, heartbeat) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+
+        // Past the stage progress margin, so a frozen verdict would still read healthy.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        assert!(
+            !heartbeat.is_healthy(),
+            "a settler that cannot commit must not report healthy"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
+    }
+
+    /// Shutdown must cut a running retry short rather than run out the full
+    /// budget, so the drain still fits inside the container grace period.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cuts_a_running_retry_short() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let t0 = tokio::time::Instant::now();
+        shutdown.cancel();
+        let exited = tokio::time::timeout(Duration::from_secs(12), handle.handle).await;
+        assert!(
+            exited.is_ok(),
+            "cancelled retry must not run the full budget"
+        );
+        assert!(
+            t0.elapsed() < SETTLE_RETRY_BUDGET,
+            "exit took {:?}, which is the uncancelled budget",
+            t0.elapsed()
+        );
+    }
+
+    /// An attempt that hangs must be abandoned, otherwise the pool's own
+    /// acquire timeout outlasts the retry budget and the settler stalls far
+    /// longer than the blockhash window allows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hung_attempt_is_abandoned_and_the_budget_still_holds() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+
+        // Hold the table so the settler's insert blocks instead of failing.
+        let mut locker = pool.begin().await.expect("begin locker");
+        sqlx::query("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *locker)
+            .await
+            .expect("lock blocks");
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+
+        let t0 = tokio::time::Instant::now();
+        let exited = tokio::time::timeout(Duration::from_secs(60), handle.handle).await;
+        assert!(
+            exited.is_ok(),
+            "a hung attempt must be abandoned, not waited on forever"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(45),
+            "gave up after {:?}, which exceeds the bounded budget",
+            t0.elapsed()
+        );
+        let _ = locker.rollback().await;
+        shutdown.cancel();
+    }
+
+    /// A drain has time to spare, so a failure that clears must still settle.
+    /// Giving up on the first one throws the whole buffer away instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_settler_retries_within_its_shutdown_budget() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let _metrics_guard = DISCARD_METRIC_LOCK.lock().await;
+        let before = settler_metric("private_channel_discarded_executed_transactions_total");
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, metrics, shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        let tip = block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Cancel while it is retrying, then let the failure clear well inside
+        // the shutdown budget. The sender goes with it, since the settler
+        // drains until its input closes.
+        shutdown.cancel();
+        drop(exec_tx);
+        let clearing = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            unblock_slots(&clearing).await;
+        });
+
+        let exited = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
+        assert!(exited.is_ok(), "the settler must finish its drain");
+        assert!(
+            await_block(&pool, tip + 1, Duration::from_secs(5)).await,
+            "a cancelled settler must retry a failure that clears inside its budget"
+        );
+        let discarded =
+            settler_metric("private_channel_discarded_executed_transactions_total") - before;
+        assert_eq!(
+            discarded, 0.0,
+            "nothing may be discarded once the retry succeeded"
+        );
+    }
+
+    /// The budget is a bound as well as an allowance: the drain deadline is
+    /// shared with every other stage, so a doomed settle cannot spend it all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_settler_stops_at_its_shutdown_budget() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        block_slots_above_tip(&pool).await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let t0 = tokio::time::Instant::now();
+        shutdown.cancel();
+        let exited = tokio::time::timeout(Duration::from_secs(30), handle.handle).await;
+        assert!(exited.is_ok(), "the settler must give up, not hang");
+        assert!(
+            t0.elapsed() < SETTLE_SHUTDOWN_BUDGET + Duration::from_millis(1500),
+            "gave up after {:?}, which overruns the shutdown budget",
+            t0.elapsed()
+        );
+    }
+
+    /// Cancellation must bound an attempt that is already running. Waiting it
+    /// out first and only then starting the budget stacks the two, which is
+    /// what pushes the settler past the drain deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_during_an_attempt_shortens_it() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+
+        // Hold the table so the attempt hangs rather than failing.
+        let mut locker = pool.begin().await.expect("begin locker");
+        sqlx::query("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *locker)
+            .await
+            .expect("lock blocks");
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        // Long enough that an attempt is in flight, short enough that its own
+        // timeout has not fired.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let t0 = tokio::time::Instant::now();
+        shutdown.cancel();
+        let exited = tokio::time::timeout(Duration::from_secs(40), handle.handle).await;
+        assert!(exited.is_ok(), "a hung attempt must still end the drain");
+        assert!(
+            t0.elapsed() < SETTLE_SHUTDOWN_BUDGET + Duration::from_millis(1500),
+            "took {:?} from cancellation, so the in-flight attempt was not re-bounded",
+            t0.elapsed()
+        );
+        let _ = locker.rollback().await;
+    }
+
+    /// The discard drain frees queue slots, and a parked executor fills them
+    /// immediately. Draining has to close the queue, not just empty it, or a
+    /// batch lands behind the record and dies with the receiver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discard_closes_the_queue_so_nothing_arrives_behind_the_record() {
+        let _metrics_guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = settler_metric("private_channel_discarded_executed_transactions_total");
+
+        // Capacity one, so the second sender parks exactly as the executor does.
+        let (tx, mut rx) = mpsc::channel::<ExecutedBatch>(1);
+        let (output, txs) = sized_settle_batch(1024);
+        tx.send((output, txs, 1)).await.unwrap();
+
+        let parked_tx = tx.clone();
+        let parked = tokio::spawn(async move {
+            let (output, txs) = sized_settle_batch(1024);
+            parked_tx.send((output, txs, 2)).await.is_ok()
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut buffer = Vec::new();
+        discard_buffer("test", &mut buffer, &mut rx, &metrics);
+        let recorded =
+            settler_metric("private_channel_discarded_executed_transactions_total") - before;
+
+        let handed_over = parked.await.unwrap();
+        assert_eq!(
+            recorded,
+            if handed_over { 2.0 } else { 1.0 },
+            "a batch the queue accepted must be in the record"
+        );
+
+        let (output, txs) = sized_settle_batch(1024);
+        assert!(
+            tx.send((output, txs, 3)).await.is_err(),
+            "the queue must be closed once the buffer is discarded, not merely emptied"
+        );
+    }
+
+    /// Nothing may be dropped silently. When the budget runs out the settler
+    /// must name every executed transaction it is throwing away, including the
+    /// ones still queued behind it, because those are just as executed and just
+    /// as uncommitted as the ones it had already buffered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsettleable_buffer_is_recorded_before_it_is_dropped() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let _metrics_guard = DISCARD_METRIC_LOCK.lock().await;
+        let before = settler_metric("private_channel_discarded_executed_transactions_total");
+
+        let (exec_tx, _rx, handle, _sinks, _hb) =
+            settler_under_test(url, 100, 4, metrics, shutdown.clone()).await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        let tip = block_slots_above_tip(&pool).await;
+
+        // Buffered before the tick that fails.
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 1)).await.unwrap();
+
+        // Queued while the settler is retrying and therefore not draining.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send((output, txs, 2)).await.unwrap();
+
+        let exited = tokio::time::timeout(Duration::from_secs(40), handle.handle).await;
+        assert!(
+            exited.is_ok(),
+            "settler must give up once the budget is spent"
+        );
+
+        let discarded =
+            settler_metric("private_channel_discarded_executed_transactions_total") - before;
+        assert_eq!(
+            discarded, 2.0,
+            "both the buffered and the queued transaction must be recorded"
+        );
+        assert!(
+            !await_block(&pool, tip + 1, Duration::from_millis(200)).await,
+            "no block may exist for a batch that was discarded"
+        );
+        shutdown.cancel();
+    }
+
+    /// A commit that lands but is abandoned before its publishes must not make
+    /// the retry announce the same blockhash twice. Dedup keeps a plain list, so
+    /// a duplicate entry means evicting the first copy drops the replay cache
+    /// for a blockhash that is still live, and an executed transaction could be
+    /// resubmitted. The commit alone is bounded; nothing after it is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settled_blockhash_is_published_exactly_once() {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let pool = test_pool(&db);
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, mut blockhashes_rx) = mpsc::unbounded_channel();
+        // Capacity one and never drained, so the post-commit address-index send
+        // parks for far longer than the commit bound.
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(1);
+
+        let handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
+        for _ in 0..4 {
+            let (output, txs) = sized_settle_batch(1024);
+            exec_tx.send((output, txs, 1)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut seen: Vec<Hash> = Vec::new();
+        while let Ok(hash) = blockhashes_rx.try_recv() {
+            seen.push(hash);
+        }
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "a blockhash was published more than once: {seen:?}"
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
     }
 
     /// Account holding `len` bytes of data, funded so it is not a tombstone.
@@ -1899,6 +2677,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -1916,6 +2696,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -1958,6 +2740,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -1991,6 +2775,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -2310,14 +3096,14 @@ mod tests {
 
         // Drains the acknowledgement and drops the tombstone, then proves the
         // now-absent key is not refilled from the database.
-        let (fetched, cached) = bob.preload_accounts(&[closed]).await;
+        let (fetched, cached) = bob.preload_accounts(&[closed]).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
             "the tombstone is still resident when the hit/miss split runs"
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[closed]).await;
+        let (fetched, cached) = bob.preload_accounts(&[closed]).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 0),
@@ -2355,6 +3141,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -2383,6 +3171,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -2567,11 +3357,12 @@ mod tests {
     // --- Settle worker integration tests ---
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_settle_worker_shutdown_exits_cleanly() {
+    async fn settle_worker_final_flushes_when_its_input_closes() {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let url_for_check = url.clone();
 
-        let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -2593,10 +3384,25 @@ mod tests {
         })
         .await;
 
-        shutdown.cancel();
+        // Buffered work, then the executor goes away: the final flush must
+        // commit it rather than the stage exiting on the signal and dropping it.
+        let (output, txs) = sized_settle_batch(1024);
+        let landed = *txs[0].signature();
+        exec_tx.send((output, txs, 1)).await.unwrap();
+        drop(exec_tx);
 
-        let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
-        assert!(result.is_ok(), "settle worker should exit after shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "settle worker should exit once its input closes"
+        );
+
+        let db = AccountsDB::new(&url_for_check, false).await.unwrap();
+        assert!(
+            db.get_transaction(&landed).await.unwrap().is_some(),
+            "the buffered batch must have been committed by the final flush"
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2979,6 +3785,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3012,6 +3820,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3082,6 +3892,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3186,6 +3998,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3498,6 +4312,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3553,6 +4369,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3608,6 +4426,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3681,6 +4501,8 @@ mod tests {
                     address_signatures: &address_signatures_tx,
                 }),
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .expect("the commit must succeed with the cache unreachable")
@@ -3768,6 +4590,8 @@ mod tests {
                     address_signatures: &address_signatures_tx,
                 }),
                 generation,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .expect("the commit must succeed with the cache unreachable")
@@ -3833,6 +4657,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3864,6 +4690,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3928,6 +4756,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3987,6 +4817,8 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 None,
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .unwrap();
@@ -4040,6 +4872,8 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 None,
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .unwrap();
@@ -4099,6 +4933,8 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 None,
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .unwrap();
@@ -4157,6 +4993,8 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 None,
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .unwrap();
@@ -4211,6 +5049,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -4228,6 +5068,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -4282,6 +5124,8 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 None,
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await
             .unwrap();
@@ -4386,6 +5230,8 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -4970,6 +5816,8 @@ mod tests {
                     address_signatures: &addr_sig_tx,
                 }),
                 0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
             )
             .await;
             (r, db)
@@ -5033,6 +5881,8 @@ mod tests {
                 address_signatures: &addr_sig_tx,
             }),
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -5070,6 +5920,8 @@ mod tests {
                 address_signatures: &addr_sig_tx,
             }),
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await;
 
@@ -5109,6 +5961,8 @@ mod tests {
                 address_signatures: &addr_sig_tx,
             }),
             0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
         )
         .await
         .unwrap();
@@ -5177,7 +6031,6 @@ mod tests {
             input_rx: dedup_in_rx,
             settled_blockhashes_rx,
             output_tx: dedup_out_tx,
-            shutdown_token: shutdown.clone(),
             initial_live_blockhashes: LinkedList::new(),
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
@@ -5342,7 +6195,7 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let first_shutdown = CancellationToken::new();
-        let (_tx, _rx, handle, _sinks) = settler_under_test(
+        let (tx, _rx, handle, _sinks, _hb) = settler_under_test(
             url.clone(),
             50,
             RESULTS_CAP,
@@ -5351,7 +6204,10 @@ mod tests {
         )
         .await;
         wait_for_tip(pg, 0, "the first settler must produce a block").await;
+        // The settler drains until its input closes, so retire the sender the way
+        // a real executor would. Cancelling alone leaves it settling.
         first_shutdown.cancel();
+        drop(tx);
         let _ = handle.handle.await;
 
         let first_tip = crate::accounts::get_tip::get_tip(pg)
@@ -5367,7 +6223,7 @@ mod tests {
             .unwrap();
 
         let second_shutdown = CancellationToken::new();
-        let (_tx2, _rx2, handle2, _sinks2) = settler_under_test(
+        let (tx2, _rx2, handle2, _sinks2, _hb2) = settler_under_test(
             url,
             50,
             RESULTS_CAP,
@@ -5382,6 +6238,7 @@ mod tests {
         )
         .await;
         second_shutdown.cancel();
+        drop(tx2);
         let _ = handle2.handle.await;
         assert!(
             second_tip.slot > first_tip.slot,
@@ -5444,7 +6301,7 @@ mod tests {
             .unwrap();
 
         let shutdown = CancellationToken::new();
-        let (_tx, _rx, handle, _sinks) = settler_under_test(
+        let (_tx, _rx, handle, _sinks, _hb) = settler_under_test(
             url,
             50,
             RESULTS_CAP,

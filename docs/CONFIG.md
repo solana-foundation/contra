@@ -159,12 +159,16 @@ Truncation deletes in batches, and each batch commits the new retention floor
 aborted run therefore never advertises history it has already removed.
 
 **`--keep-slots` is a slot span, not a block count.** Blocks are sparse relative
-to slots: an idle node ticks about ten slots per block it produces, so a given
-retention keeps far fewer blocks than slots. Keep it well above
-`10 x max_blockhashes` (1500 at the defaults). Below that, a restart rebuilds the
-dedup window from fewer blocks than the node advertises through
-`lastValidBlockHeight`, and transactions carrying a blockhash still inside the
-published deadline are rejected as unknown.
+to slots: an idle node ticks `1000 / blocktime_ms` slots per block it produces
+(ten at the default), so a given retention keeps far fewer blocks than slots.
+Keep it well above `max_blockhashes x 1000 / blocktime_ms` (1500 at the
+defaults). Below that, a restart rebuilds the dedup window from fewer blocks
+than the node advertises through `lastValidBlockHeight`, and transactions
+carrying a blockhash still inside the published deadline are rejected as
+unknown. Both ends guard it: `truncate` warns when `--keep-slots` is below the
+floor, sized from `--max-blockhashes` and `--blocktime-ms` (defaults 150 and
+100, pass the node's values if they differ), and a node that boots into a window
+shorter than `max_blockhashes` logs the shortfall at warn.
 
 ### Makefile Targets
 

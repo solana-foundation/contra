@@ -55,7 +55,12 @@ const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Idle block cadence, so block height and therefore expiry keep advancing.
 /// One second cuts idle rows tenfold against a block every tick, while a longer
 /// gap would save little more and stretch idle expiry well past the loaded case.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the idle-slot write may hold the tick, one default blocktime like
+/// the mirror budget. The write is one row on a quiet pool, and a tick that
+/// outlives this is one tick late: the next tick republishes a higher slot.
+const IDLE_SLOT_PUBLISH_BUDGET: Duration = Duration::from_millis(100);
 
 /// A tick produces a block when it settled work, or when the heartbeat is due.
 /// Genesis is always produced so the chain has an anchor.
@@ -64,26 +69,38 @@ fn should_produce_block(has_work: bool, is_genesis: bool, since_last_block: Dura
 }
 
 /// Record a tick that produced no block, so `getSlot` keeps moving while the
-/// node is idle. Best effort: the in-memory counter is what production uses, and
-/// a failure here costs a stale published slot, never a wrong block.
+/// node is idle. The in-memory counter is what production uses, so a failed
+/// write costs a stale published slot until the next tick, never a wrong block.
 async fn publish_idle_slot(
     postgres_db: &PostgresAccountsDB,
     redis_db: Option<&RedisAccountsDB>,
     slot: u64,
-) {
-    if let Err(e) = crate::accounts::current_slot::set_current_slot(postgres_db, slot).await {
-        warn!("Failed to publish the idle slot: {:#}", e);
-        return;
+) -> Result<()> {
+    // Awaited on the tick with no retry budget behind it, so a Postgres that sits
+    // on the statement would stop the chain here. Bounded, the stall reaches the
+    // heartbeat block instead, and that path has retries and a failure budget.
+    match tokio::time::timeout(
+        IDLE_SLOT_PUBLISH_BUDGET,
+        crate::accounts::current_slot::set_current_slot(postgres_db, slot),
+    )
+    .await
+    {
+        Ok(written) => written?,
+        Err(_) => {
+            return Err(anyhow!(
+                "publishing the idle slot exceeded its {:?} budget",
+                IDLE_SLOT_PUBLISH_BUDGET
+            ))
+        }
     }
     // A cache given up on is left alone here too: ten writes a second into one
     // the batch path is deliberately not touching is most of the cost the
     // give-up exists to avoid.
     let Some(redis) = redis_db.filter(|redis| !redis.is_mirroring_paused()) else {
-        return;
+        return Ok(());
     };
-    // Awaited on the blocktime tick, so an unbounded wait here would stop the
-    // slot advancing and with it the heartbeat and expiry. The cache is never
-    // allowed to hold the chain, on this path or the batch one.
+    // Same reason as above: the cache is never allowed to hold the chain, on
+    // this path or the batch one.
     if tokio::time::timeout(
         CACHE_MIRROR_BUDGET,
         crate::accounts::current_slot::mirror_current_slot(redis, slot),
@@ -96,6 +113,7 @@ async fn publish_idle_slot(
             CACHE_MIRROR_BUDGET
         );
     }
+    Ok(())
 }
 
 /// Bounds one settle attempt, matching the stage health margin so an overrun is
@@ -590,7 +608,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             // The chain is on this slot even though no block
                             // backs it. Only reached when the tick carried no
                             // work, so the loaded path never pays for it.
-                            publish_idle_slot(&postgres_db, redis_db.as_ref(), next_slot).await;
+                            if let Err(e) =
+                                publish_idle_slot(&postgres_db, redis_db.as_ref(), next_slot).await
+                            {
+                                warn!("Failed to publish idle slot {next_slot}, the next tick republishes: {e:#}");
+                                metrics.settler_idle_slot_publish_failed();
+                            }
                             next_slot += 1;
                             continue;
                         }
@@ -6881,9 +6904,13 @@ mod tests {
         let postgres_db = postgres_db.clone();
         let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
 
-        publish_idle_slot(&postgres_db, Some(&redis_raw), 10).await;
+        publish_idle_slot(&postgres_db, Some(&redis_raw), 10)
+            .await
+            .unwrap();
         redis_raw.pause_mirroring(Duration::from_secs(60));
-        publish_idle_slot(&postgres_db, Some(&redis_raw), 11).await;
+        publish_idle_slot(&postgres_db, Some(&redis_raw), 11)
+            .await
+            .unwrap();
 
         let mut conn = redis_raw.connection.clone();
         let mirrored: Option<u64> = conn
@@ -6930,7 +6957,8 @@ mod tests {
             publish_idle_slot(&postgres_db, Some(&redis_raw), 42),
         )
         .await
-        .expect("a stalled cache must not hold the settler tick");
+        .expect("a stalled cache must not hold the settler tick")
+        .expect("the durable half publishes whatever the cache does");
         let waited = started.elapsed();
 
         assert!(
@@ -6942,5 +6970,56 @@ mod tests {
             Some(42),
             "the slot must keep advancing while the cache is stalled"
         );
+    }
+
+    /// Same contract for the durable half: a Postgres that accepts the statement
+    /// and sits on it would stop the tick just as a stalled cache would, and this
+    /// is the one path in the loop with no retry budget to surface that through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_does_not_wait_on_postgres_past_its_budget() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        publish_idle_slot(&postgres_db, None, 10)
+            .await
+            .expect("a quiet pool publishes");
+
+        // A row lock held open is the smallest server-side stall there is: the
+        // next upsert queues behind it for as long as this transaction lives.
+        let mut lock = postgres_db.pool.begin().await.unwrap();
+        sqlx::query("SELECT value FROM metadata WHERE key = $1 FOR UPDATE")
+            .bind(crate::accounts::current_slot::CURRENT_SLOT_KEY)
+            .fetch_one(&mut *lock)
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            IDLE_SLOT_PUBLISH_BUDGET * 10,
+            publish_idle_slot(&postgres_db, None, 11),
+        )
+        .await
+        .expect("a stalled Postgres must not hold the settler tick");
+        let waited = started.elapsed();
+
+        let error = outcome.expect_err("a write past its budget is a failure the tick reports");
+        assert!(
+            format!("{error:#}").contains("budget"),
+            "the failure must name the budget, got: {error:#}"
+        );
+        assert!(
+            waited < IDLE_SLOT_PUBLISH_BUDGET * 3,
+            "the idle publish must abandon Postgres at its budget, waited {waited:?}"
+        );
+
+        // Releasing the lock is all it takes for the next tick to land, so the
+        // stall was the lock and not a pool the timeout left unusable.
+        lock.rollback().await.unwrap();
+        publish_idle_slot(&postgres_db, None, 12)
+            .await
+            .expect("the tick after the stall publishes");
+        assert_eq!(pg_db.get_current_slot().await.unwrap(), Some(12));
     }
 }

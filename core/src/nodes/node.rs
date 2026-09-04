@@ -45,6 +45,9 @@ pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
 pub const DEFAULT_SEQUENCER_QUEUE_CAPACITY: usize = 1000;
 /// executor→settler results queue capacity.
 pub const DEFAULT_EXECUTION_RESULTS_CAPACITY: usize = 1000;
+/// The blockhash window in blocks, matching Solana.
+pub const DEFAULT_MAX_BLOCKHASHES: usize = 150;
+pub const DEFAULT_BLOCKTIME_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum NodeMode {
@@ -134,8 +137,8 @@ impl Default for NodeConfig {
             redis_cache_url: None,
             redis_block_ttl_secs: 3600, // one hour, well past the blockhash window
             admin_keys: vec![],         // No admin keys by default
-            max_blockhashes: 150,       // 150 blocks, matching Solana
-            blocktime_ms: 100,          // 100ms default
+            max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
+            blocktime_ms: DEFAULT_BLOCKTIME_MS,
             perf_sample_period_secs: 60, // 60 seconds default
             metrics: Arc::new(NoopMetrics),
         }

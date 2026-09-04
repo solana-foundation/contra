@@ -65,6 +65,14 @@ pub async fn load_dedup_state(
     }
 
     let loaded = blocks.len();
+    if dedup_window_is_short(&blocks, max_blockhashes) {
+        warn!(
+            "Dedup: only {loaded} blocks survived retention against a window of {max_blockhashes}, \
+             so transactions carrying a blockhash from the missing {} blocks will be rejected as \
+             unknown inside their published lastValidBlockHeight; retention was cut below the window",
+            max_blockhashes - loaded
+        );
+    }
     let (live_blockhashes, dedup_cache) = build_dedup_state(&blocks)?;
 
     info!(
@@ -78,6 +86,16 @@ pub async fn load_dedup_state(
 }
 
 type DedupState = (LinkedList<Hash>, HashMap<Hash, HashSet<Hash>>);
+
+/// A window short of `max_blockhashes` means retention cut it, unless genesis
+/// is in it: then the chain has simply not produced that many blocks yet.
+/// `blocks` is newest first, so the oldest loaded block is the last.
+fn dedup_window_is_short(
+    blocks: &[crate::accounts::traits::BlockInfo],
+    max_blockhashes: usize,
+) -> bool {
+    blocks.len() < max_blockhashes && blocks.last().is_some_and(|oldest| oldest.slot != 0)
+}
 
 /// Ingest pending blockhash updates into `live_blockhashes`
 ///
@@ -1069,5 +1087,30 @@ mod tests {
         );
         drop(bh_tx);
         let _ = watcher.await;
+    }
+
+    /// A window short of `max_blockhashes` is only a truncation problem when the
+    /// blocks below it existed. Genesis in the window means the chain is young.
+    #[test]
+    fn dedup_window_is_short_only_when_truncation_cut_it() {
+        // Newest first, as `get_last_blocks` returns them.
+        let chain = |oldest_slot: u64, loaded: u64| -> Vec<BlockInfo> {
+            (0..loaded)
+                .rev()
+                .map(|i| make_block(oldest_slot + i, Hash::new_unique(), &[]))
+                .collect()
+        };
+        for (oldest_slot, loaded, max, short) in [
+            (5, 3, 8, true),
+            (0, 3, 8, false),
+            (5, 8, 8, false),
+            (5, 0, 8, false),
+        ] {
+            assert_eq!(
+                dedup_window_is_short(&chain(oldest_slot, loaded), max),
+                short,
+                "{loaded} blocks from slot {oldest_slot} against a window of {max}"
+            );
+        }
     }
 }

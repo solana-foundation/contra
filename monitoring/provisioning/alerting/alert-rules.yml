@@ -250,7 +250,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} reconnected {{ $values.A }} times in 15m (routine is ~2-4/hr); upstream stream is flapping"
+          summary: "Indexer {{ $labels.program_type }} reconnected {{ $values.A }} times in 15m (routine is near-zero); upstream stream is flapping"
         labels:
           severity: warning
         data:

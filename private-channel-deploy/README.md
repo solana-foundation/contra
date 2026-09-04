@@ -32,13 +32,13 @@ Three one-time edits per environment, done before the first deploy. They tell th
 
 1. **Point at a host** ([`inventory.ini`](./inventory.ini)): IP, SSH user, key path.
 2. **Choose what to deploy** ([`vars/dev.yml`](./vars/dev.yml)): image registry/tag, target Solana network, on-host paths. Each option has an inline comment explaining what to pick.
-3. **Provide credentials**: copy the template, then fill in real values:
+3. **Provide credentials**, via one of the two backends below. For the default file backend, copy the template and fill in real values:
 
    ```bash
    cp secrets.yml.example secrets.yml
    ```
 
-   `secrets.yml` is plain text and gitignored. See the file header for required vs optional and how to generate each value.
+   `secrets.yml` is plain text and gitignored. See the file header for required vs optional and how to generate each value. Doppler-only operators skip this file entirely — preflight does not require it when the doppler backend is selected.
 
 Everything else is wired and shouldn't need routine changes.
 

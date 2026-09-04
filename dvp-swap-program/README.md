@@ -51,5 +51,7 @@ grep DVP_SWAP_PROGRAM_ID dvp-swap-program/clients/rust/src/generated/programs.rs
 make dvp-client-test
 ```
 
-If the `SwapDvp` layout changes, update the hand-mirrored size and field offsets
-in `gateway/src/auth.rs` (`SWAP_DVP_SIZE`, `SWAP_DVP_OWNER_FIELDS`) to match.
+The gateway reads the `SwapDvp` account size and owner fields straight from the
+vendored client (`SwapDvp::try_from_bytes` in `gateway/src/auth.rs`), so a layout
+change is picked up when you re-vendor the client above. There are no
+hand-mirrored constants to keep in sync.

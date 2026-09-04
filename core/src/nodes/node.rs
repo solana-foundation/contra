@@ -220,7 +220,14 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     // before it repairs indexes or serves RPC. Losing the lease later cancels the
     // same token, so the node stops rather than running on without it.
     let writer_lease = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-        Some(WriterLease::acquire(&config.accountsdb_connection_url, shutdown_token.clone()).await?)
+        Some(
+            WriterLease::acquire(
+                &config.accountsdb_connection_url,
+                shutdown_token.clone(),
+                Arc::clone(&config.metrics),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -774,13 +781,50 @@ mod tests {
         }
     }
 
+    /// Dropping the handles stops no worker: they are separate tasks holding
+    /// their own token clones. Freeing the lock there would let a replacement
+    /// start beside a pipeline that is still committing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_node_handles_without_shutdown_keeps_the_lease() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = Arc::clone(&running);
+        let worker = WorkerHandle::new(
+            "Busy".to_string(),
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        drop(handles_with(worker, token, lease));
+
+        // Long enough for a release to have landed if one were on its way.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            running.load(std::sync::atomic::Ordering::SeqCst),
+            "the worker must still be running, or the test proves nothing"
+        );
+        assert!(
+            WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+                .await
+                .is_err(),
+            "dropped handles must keep the lease while their workers run"
+        );
+    }
+
     /// The clean path: every worker stops, so the lease is handed over at once and
     /// a replacement node can start immediately.
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_releases_the_lease_when_every_worker_stops() {
         let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
         let token = CancellationToken::new();
-        let lease = WriterLease::acquire(&url, token.clone())
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
             .await
             .expect("the lease must be granted");
 
@@ -792,7 +836,7 @@ mod tests {
 
         handles_with(worker, token, lease).shutdown().await;
 
-        WriterLease::acquire(&url, CancellationToken::new())
+        WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
             .await
             .expect("a stopped node must hand the lease over");
     }
@@ -804,7 +848,7 @@ mod tests {
     async fn shutdown_keeps_the_lease_when_a_worker_ignores_its_abort() {
         let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
         let token = CancellationToken::new();
-        let lease = WriterLease::acquire(&url, token.clone())
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
             .await
             .expect("the lease must be granted");
 
@@ -818,7 +862,7 @@ mod tests {
         handles_with(worker, token, lease).shutdown().await;
 
         assert!(
-            WriterLease::acquire(&url, CancellationToken::new())
+            WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
                 .await
                 .is_err(),
             "the lease must stay held while a worker could still be committing"
@@ -832,7 +876,7 @@ mod tests {
     async fn shutdown_releases_the_lease_when_an_overrunning_worker_is_aborted() {
         let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
         let token = CancellationToken::new();
-        let lease = WriterLease::acquire(&url, token.clone())
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
             .await
             .expect("the lease must be granted");
 
@@ -843,7 +887,7 @@ mod tests {
 
         handles_with(worker, token, lease).shutdown().await;
 
-        WriterLease::acquire(&url, CancellationToken::new())
+        WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
             .await
             .expect("an aborted worker cannot commit, so the lease must be free");
     }

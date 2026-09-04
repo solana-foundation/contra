@@ -76,6 +76,41 @@ Two things defeat that:
 Without keepalives the fallback is the OS default: on Linux
 `net.ipv4.tcp_keepalive_time = 7200` plus 9 probes at 75s, so **about 2h11m**.
 
+## The other case that sticks: a node that stopped without releasing
+
+The lease is handed back only by a clean `shutdown()`. Every other ending keeps
+the lock until the process exits, on purpose: a node that cannot prove its
+workers stopped can still be committing, and freeing the lock there would let a
+replacement start beside it.
+
+So a node that stopped for one of these reasons still holds the lock until its
+process is gone:
+
+- **`Writer lease ownership unconfirmed for Ns`** - Postgres stopped answering
+  the ownership probe for 30 seconds. The lock is probably still held and still
+  ours, which is why the session is kept.
+- **`Holding the writer lease: a worker did not stop in time`** - a worker
+  ignored its abort during shutdown.
+
+In both cases the fix is to make sure the old process is actually dead. Once it
+exits the socket closes and the lock frees in milliseconds. Only reach for
+[Recovery](#recovery-terminate-the-zombie-backend) if the process is gone and the
+lock is not.
+
+Two counters describe this from the outside:
+
+- `private_channel_writer_lease_probe_total{outcome}` - `held`, `not_held`,
+  `probe_error`, `probe_timeout`. A rising `probe_error` or `probe_timeout` with
+  no `not_held` is a slow or unreachable database, not a lost lease.
+- `private_channel_writer_lease_lost_total{reason}` - `not_held` (proof: another
+  session holds it, or the backend is gone) or `probe_unavailable` (the 30s
+  budget ran out).
+
+> **Do not set `idle_session_timeout` on the node's database role.** The lease
+> session is idle for the node's whole life by design, since ownership is read
+> from a separate connection. A timeout would kill it, free the lock under a
+> running writer, and stop the node on the next probe.
+
 ## Triage
 
 ### 1. Confirm the lock is held, and by whom

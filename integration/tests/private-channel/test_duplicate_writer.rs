@@ -311,7 +311,7 @@ async fn a_settler_whose_tip_moves_underneath_it_stops_instead_of_forking() {
     // survive an already-finished worker and still hand the lease back, or an
     // operator restarting the crashed node would be locked out by its corpse.
     handles.shutdown().await;
-    WriterLease::acquire(&url, CancellationToken::new())
+    WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
         .await
         .expect("the lease must be free once a stopped node has shut down");
 }
@@ -355,7 +355,7 @@ async fn a_failed_startup_frees_the_lease_before_returning() {
         "a failed startup must not return while the writer lease is still held"
     );
 
-    WriterLease::acquire(&url, CancellationToken::new())
+    WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
         .await
         .expect("a failed startup must leave the writer lease available");
 

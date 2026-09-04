@@ -640,11 +640,15 @@
         dest: "{{ target_versions_env_file }}"
         mode: "0644"
 
+    # Also tagged `deploy` so a standalone `--tags deploy` re-renders the override
+    # with the digest that this invocation's verify step just captured, instead of
+    # reusing a stale override from a prior render.
     - name: Render compose override
       ansible.builtin.template:
         src: templates/compose.yml.j2
         dest: "{{ target_override_file }}"
         mode: "0644"
+      tags: [ render, deploy ]
 
     # If a prior run wrote a real escrow instance ID into the .env file,
     # preserve it across re-renders. Otherwise the next deploy overwrites it

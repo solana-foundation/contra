@@ -10,6 +10,7 @@ use crate::{
         transaction_processor::TransactionProcessor,
     },
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer},
+    storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
@@ -62,6 +63,16 @@ enum Supervision {
     ShutdownSignalled(std::io::Result<()>),
 }
 
+/// The reasons this indexer stops on its own: an operator interrupt, or losing the
+/// live-state lock. Both take the same graceful path, since both mean this process
+/// must stop writing and let a restart sort it out.
+async fn shutdown_signal(lock_lost: CancellationToken) -> std::io::Result<()> {
+    tokio::select! {
+        result = signal::ctrl_c() => result,
+        _ = lock_lost.cancelled() => Ok(()),
+    }
+}
+
 /// Race the running processor task against the shutdown signal. Biased to the
 /// processor so a fatal error that becomes ready at the same moment as the
 /// signal still wins, and the caller exits non-zero instead of reporting a
@@ -76,6 +87,9 @@ async fn supervise(
         sig = shutdown => Supervision::ShutdownSignalled(sig),
     }
 }
+
+/// Metric label for the live-state lock this role holds.
+const INDEXER_LOCK_ROLE: &str = "indexer";
 
 /// Reconcile attempts before a mismatch is treated as real rather than as a deposit that
 /// landed while startup was still catching up.
@@ -386,6 +400,26 @@ pub async fn run(
                 .map_err(|e| IndexerError::Storage(e.into()))?,
         )),
     };
+
+    // The token every stop reason funnels into, created here so the live-state lock
+    // can cancel it. Do not move this below the lock: a lost lock would then have
+    // nothing to cancel.
+    let cancellation_token = CancellationToken::new();
+
+    // Take the live-state lock before touching the schema. A resync rebuilding this
+    // database holds it exclusively, and starting underneath one would write rows into
+    // tables it is about to drop. Held for the whole run, so a resync cannot start
+    // either. Refusing here is the point: the supervisor retries once the resync exits.
+    let _live_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            INDEXER_LOCK_ROLE,
+            cancellation_token.clone(),
+            LIVE_LOCK_HEARTBEAT_INTERVAL,
+        )
+        .await
+        .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
+
     storage.init_schema().await?;
     info!("Storage initialized");
 
@@ -827,9 +861,6 @@ pub async fn run(
         }
     };
 
-    // 7. Create cancellation token for graceful shutdown
-    let cancellation_token = CancellationToken::new();
-
     info!("Starting datasource...");
     let datasource_handle = datasource
         .start(instruction_tx.clone(), cancellation_token.clone())
@@ -842,7 +873,12 @@ pub async fn run(
     // and by the datasource), so the processor side only fires on a fatal write
     // failure or a panic - both must crash the process so the supervisor
     // restarts it and the failed slot replays from the durable checkpoint.
-    match supervise(&mut processor_handle, signal::ctrl_c()).await {
+    match supervise(
+        &mut processor_handle,
+        shutdown_signal(cancellation_token.clone()),
+    )
+    .await
+    {
         Supervision::ProcessorEnded(res) => {
             // Flush batched checkpoints for already-committed slots so a restart resumes
             // from the latest durable point; timeout-bounded since a dead DB would stall it.
@@ -972,6 +1008,44 @@ mod tests {
             Supervision::ProcessorEnded(Ok(Err(IndexerError::CheckpointChannelClosed))) => {}
             _ => panic!("biased select must report the finished processor's fatal error"),
         }
+    }
+
+    /// U4. Losing the live-state lock has to reach the same graceful shutdown a
+    /// ctrl-c takes, or the indexer would keep writing to a database it no longer
+    /// has the right to write to.
+    #[tokio::test]
+    async fn shutdown_signal_resolves_when_the_lock_token_is_cancelled() {
+        let token = CancellationToken::new();
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        token.cancel();
+        let outcome = supervise(&mut handle, shutdown_signal(token)).await;
+
+        assert!(
+            matches!(outcome, Supervision::ShutdownSignalled(Ok(()))),
+            "a cancelled lock token must drive the graceful shutdown path"
+        );
+        handle.abort();
+    }
+
+    /// The signal must stay pending while nothing has happened, or every start
+    /// would immediately shut itself down.
+    #[tokio::test]
+    async fn shutdown_signal_stays_pending_without_a_reason() {
+        let token = CancellationToken::new();
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            shutdown_signal(token),
+        )
+        .await;
+
+        assert!(
+            pending.is_err(),
+            "an idle indexer must not shut itself down"
+        );
     }
 
     /// While the processor is still running, a ready shutdown signal wins.

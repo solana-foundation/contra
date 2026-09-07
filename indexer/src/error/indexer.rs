@@ -122,6 +122,15 @@ pub enum ReconciliationError {
     /// aborts before any destruction so the live DB is left intact.
     #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
     ConsumedSetUnavailable { reason: String },
+
+    /// A rebuild drops the table the halt flag lives in, so it would clear a halt
+    /// that is still unresolved and destroy the ledger evidence behind it. Resolve
+    /// the halt and clear the flag first, then resync.
+    #[error(
+        "reconciliation halt is set ({reason}); resync would erase it, so resolve and clear \
+         the halt first (see the reconciliation halt runbook)"
+    )]
+    ReconciliationHalted { reason: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

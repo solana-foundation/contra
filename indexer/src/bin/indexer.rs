@@ -151,6 +151,11 @@ enum Mode {
         /// refuses to run without it so it cannot rebuild without fail-closed reconciliation.
         #[arg(long)]
         channel_rpc_url: Option<String>,
+        /// Acknowledge that this drops every table and rebuilds from chain. Required.
+        /// Deliberately not bound to an environment variable, so it cannot be left
+        /// switched on in a deployment's env file.
+        #[arg(long)]
+        destroy_existing_data: bool,
     },
 }
 
@@ -215,7 +220,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Resync {
             genesis_slot,
             channel_rpc_url,
-        } => run_resync(figment, args.verbose, genesis_slot, channel_rpc_url).await,
+            destroy_existing_data,
+        } => {
+            run_resync(
+                figment,
+                args.verbose,
+                genesis_slot,
+                channel_rpc_url,
+                destroy_existing_data,
+            )
+            .await
+        }
     }
 }
 
@@ -394,11 +409,6 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
             private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
         )),
     };
-    storage
-        .init_schema()
-        .await
-        .map_err(|e| format!("Storage error: {}", e))?;
-
     let escrow_instance_id = common
         .escrow_instance_id
         .map(|id_str| {
@@ -449,7 +459,17 @@ async fn run_resync(
     verbose: bool,
     genesis_slot: u64,
     channel_rpc_url: Option<String>,
+    destroy_existing_data: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Checked before anything connects, so a mistyped subcommand cannot get as far as
+    // opening the database. The live-state lock is the real guard; this only makes the
+    // destruction something the operator had to ask for by name.
+    if !destroy_existing_data {
+        return Err("resync drops every table and rebuilds from chain; pass \
+                    --destroy-existing-data to confirm"
+            .into());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
             "info,private_channel_indexer=debug"

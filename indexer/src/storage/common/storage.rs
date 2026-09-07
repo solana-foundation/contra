@@ -36,6 +36,7 @@ pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
+pub mod live_lock;
 pub mod lowest_unreleased_withdrawal_below;
 pub mod quarantine_all_active_withdrawals;
 pub mod reconciliation_halt;
@@ -409,6 +410,19 @@ impl Storage {
         transaction_id: i64,
     ) -> Result<Option<TransactionStatus>, StorageError> {
         get_transaction_status::get_transaction_status(self, transaction_id).await
+    }
+
+    /// Take the live-state lock, which keeps live workers and a destructive
+    /// resync off the same database at the same time. Errors say what is holding
+    /// it. `on_lost` is cancelled if ownership later stops being provable.
+    pub async fn try_acquire_live_lock(
+        &self,
+        mode: live_lock::LiveLockMode,
+        role: &'static str,
+        on_lost: tokio_util::sync::CancellationToken,
+        heartbeat_interval: std::time::Duration,
+    ) -> Result<live_lock::LiveLockGuard, StorageError> {
+        live_lock::try_acquire_live_lock(self, mode, role, on_lost, heartbeat_interval).await
     }
 
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means

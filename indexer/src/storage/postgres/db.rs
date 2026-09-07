@@ -10,6 +10,7 @@ use crate::{
         DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
         MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
     },
+    storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::RequeueOutcome,
     storage::postgres::lock_connection::LockConnection,
     PostgresConfig,
@@ -57,6 +58,37 @@ pub struct PostgresDb {
     /// proves ownership. `None` in every other process and in tests that never
     /// take the lock, where those writes use the pool exactly as before.
     sender_fence: Arc<Mutex<Option<Arc<LockConnection>>>>,
+}
+
+/// Idle seconds before Postgres starts probing a lock session's socket, then the
+/// probe spacing and how many may go unanswered. Together they reap a vanished
+/// holder in under two minutes instead of the OS default of roughly two hours.
+const LOCK_KEEPALIVE_IDLE_SECS: u32 = 60;
+const LOCK_KEEPALIVE_INTERVAL_SECS: u32 = 15;
+const LOCK_KEEPALIVE_COUNT: u32 = 3;
+
+/// Ask Postgres to reap this session quickly if the holder's host disappears.
+///
+/// A vanished host sends no FIN, so the backend sits in `recv()` holding the
+/// advisory lock for hours while nothing is running. Every worker holds the
+/// live-state key, so one such host would refuse every resync for that long.
+/// Best effort: a unix socket or an unsupported platform ignores these.
+pub async fn apply_lock_session_keepalives(conn: &mut PgConnection) {
+    // `SET` takes no bind parameters, which would force the values into the statement text.
+    let applied = sqlx::query(
+        "SELECT set_config('tcp_keepalives_idle', $1, false),
+                set_config('tcp_keepalives_interval', $2, false),
+                set_config('tcp_keepalives_count', $3, false)",
+    )
+    .bind(LOCK_KEEPALIVE_IDLE_SECS.to_string())
+    .bind(LOCK_KEEPALIVE_INTERVAL_SECS.to_string())
+    .bind(LOCK_KEEPALIVE_COUNT.to_string())
+    .execute(conn)
+    .await;
+
+    if let Err(e) = applied {
+        warn!("Could not set TCP keepalives on the lock session: {e}");
+    }
 }
 
 /// Does *this* session still hold the advisory lock for `key`?
@@ -1187,6 +1219,38 @@ impl PostgresDb {
             .lock()
             .expect("sender fence mutex poisoned") = Some(lock.clone());
         Ok(Some(lock))
+    }
+
+    /// Try to take the live-state lock in `mode`. `None` means a conflicting
+    /// holder exists, and the connection goes straight back to the pool.
+    ///
+    /// The session is detached from the pool on success. It has to outlive every
+    /// database write the caller makes, and shutdown closes the pool while waiting
+    /// for checked-out connections, so a pooled one would stall every shutdown
+    /// until that wait timed out.
+    ///
+    /// Detaching frees the pool's permit rather than shrinking it, so the pool can
+    /// still open `max_connections`. That means a worker holds one server-side
+    /// session more than its pool size, which the server's own `max_connections`
+    /// has to have room for.
+    pub(crate) async fn try_acquire_live_lock(
+        &self,
+        mode: LiveLockMode,
+    ) -> Result<Option<PgConnection>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        // Before the lock, so a session that takes it is already reapable. Doing it
+        // after would leave a window where a dying process holds the lock for hours,
+        // which is the failure these settings exist to prevent. A refused acquire
+        // returns the connection to the pool still carrying them, which is harmless.
+        apply_lock_session_keepalives(&mut conn).await;
+        let acquired: bool = sqlx::query_scalar(mode.acquire_sql())
+            .bind(LIVE_STATE_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !acquired {
+            return Ok(None);
+        }
+        Ok(Some(conn.detach()))
     }
 
     /// Get all transactions of a given type regardless of status

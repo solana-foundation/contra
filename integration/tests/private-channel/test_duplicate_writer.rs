@@ -52,8 +52,9 @@ fn write_node_config(db_url: String, port: u16) -> NodeConfig {
         max_svm_workers: 2,
         accountsdb_connection_url: db_url,
         redis_cache_url: None,
+        redis_block_ttl_secs: 3_600,
         admin_keys: vec![],
-        transaction_expiration_ms: 15_000,
+        max_blockhashes: 150,
         blocktime_ms: 100,
         perf_sample_period_secs: 3600,
         metrics: Arc::new(NoopMetrics),
@@ -104,6 +105,16 @@ async fn await_slot_above(conn: &mut PgConnection, floor: i64) -> i64 {
         sleep(Duration::from_millis(100)).await;
     }
     panic!("no slot above {floor} was committed");
+}
+
+/// The durable tick counter. Idle ticks advance it without producing a block, so
+/// it sits at or above the block tip and is what a restart resumes from.
+async fn current_slot(conn: &mut PgConnection) -> i64 {
+    let raw: Vec<u8> = sqlx::query_scalar("SELECT value FROM metadata WHERE key = 'current_slot'")
+        .fetch_one(conn)
+        .await
+        .expect("failed to read the current slot");
+    i64::from_le_bytes(raw.try_into().expect("current_slot must be 8 bytes"))
 }
 
 /// The tip, or `None` on a ledger with no blocks.
@@ -181,6 +192,7 @@ async fn a_second_write_node_is_refused_until_the_first_releases_the_lease() {
 
     first.shutdown().await;
     let tip_at_handover = latest_slot(&mut probe).await;
+    let ticks_at_handover = current_slot(&mut probe).await;
 
     let replacement_port = get_free_port();
     let replacement: NodeHandles = run_node(write_node_config(url, replacement_port))
@@ -188,8 +200,10 @@ async fn a_second_write_node_is_refused_until_the_first_releases_the_lease() {
         .expect("a replacement write node must start once the lease is released");
     await_slot_above(&mut probe, tip_at_handover).await;
 
-    // The guard tolerates gaps, so nothing else would catch a restart that
-    // resumed from the wrong slot.
+    // Slots and blocks are separate now: idle ticks move the slot without
+    // producing a block, so how far above the tip the first new block lands is
+    // timing-dependent. What must hold is that it never reuses a slot an idle
+    // tick already published, which is what would fork the chain.
     let first_new_slot =
         sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(slot) FROM blocks WHERE slot > $1")
             .bind(tip_at_handover)
@@ -197,10 +211,10 @@ async fn a_second_write_node_is_refused_until_the_first_releases_the_lease() {
             .await
             .expect("failed to read the replacement's first slot")
             .expect("the replacement must have committed a block");
-    assert_eq!(
-        first_new_slot,
-        tip_at_handover + 1,
-        "a restart must continue the chain without leaving a gap"
+    assert!(
+        first_new_slot > ticks_at_handover,
+        "a restart must resume above the tick counter, not reuse a published slot; \
+         first new slot {first_new_slot}, ticks at handover {ticks_at_handover}"
     );
 
     replacement.shutdown().await;

@@ -149,6 +149,10 @@ pub async fn serve(listener: TcpListener, app: Router, limits: Limits) -> std::i
     // changing what a default-level operator sees.
     let mut refused_at_global_cap: u64 = 0;
     let mut refused_at_ip_cap: u64 = 0;
+    // Keepalive is set with the same options on every connection, so a failure
+    // is the platform's and not the connection's: the first one says everything
+    // a repeat would, and repeating it is the amplification the report avoids.
+    let mut keepalive_warned = false;
     // Bumped from the connection tasks, so this one is shared.
     let closed_on_header_timeout = Arc::new(AtomicU64::new(0));
     let mut refusal_report = tokio::time::interval(REFUSAL_REPORT_INTERVAL);
@@ -216,12 +220,15 @@ pub async fn serve(listener: TcpListener, app: Router, limits: Limits) -> std::i
 
         // Enable OS TCP keepalive so a peer that vanishes without a close (its
         // network dropped) is detected and the socket reclaimed. Best-effort:
-        // log and keep serving if it fails.
+        // keep serving if it fails, warning once.
         let keepalive = TcpKeepalive::new()
             .with_time(limits.tcp_keepalive_idle)
             .with_interval(limits.tcp_keepalive_interval);
         if let Err(e) = SockRef::from(&stream).set_tcp_keepalive(&keepalive) {
-            warn!("Failed to set TCP keepalive for {ip}: {e}");
+            if !keepalive_warned {
+                keepalive_warned = true;
+                warn!("Failed to set TCP keepalive, serving without it: {e}");
+            }
         }
 
         let io = TokioIo::new(stream);

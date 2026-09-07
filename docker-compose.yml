@@ -268,6 +268,13 @@ services:
     container_name: private-channel-auth
     restart: unless-stopped
     logging: *default-logging
+    # Must stay above AUTH_MAX_CONNECTIONS plus the DB pool, or accept() hits
+    # EMFILE before the connection cap engages and the listener stalls instead
+    # of shedding.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       postgres-primary:
         condition: service_healthy

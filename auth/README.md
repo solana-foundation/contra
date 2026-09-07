@@ -33,6 +33,12 @@ are bounded separately by `AUTH_MAX_CONNECTIONS` and `AUTH_MAX_CONNECTIONS_PER_I
 header and request timeouts close clients that connect and then stall. These hold whether or
 not an ingress proxy adds limits of its own, so a proxy bypass still meets a bounded listener.
 
+`AUTH_MAX_CONNECTIONS` only binds if the process may open that many descriptors. Keep
+`RLIMIT_NOFILE` (`ulimit -n`) above it plus `AUTH_DATABASE_MAX_CONNECTIONS`, or `accept` hits
+`EMFILE` first and the listener backs off for 100 ms at a time — refusing everyone — instead
+of shedding the one connection over the cap. The Compose files set `nofile` to 65536; a
+common 1024 default is below the cap.
+
 `AUTH_HEADER_READ_TIMEOUT_SECS` is also the idle timeout. The header deadline is re-armed for
 each request on a kept-alive connection, so an idle connection is closed that many seconds
 after the previous response. Keep a pooled client's idle timeout below it: a client that

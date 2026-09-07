@@ -222,13 +222,39 @@ impl DataSource for RpcPollingSource {
                                 }
                             };
 
-                            // Parse program-specific instructions from block with metadata
-                            let instructions_with_meta = decoder::parse_block(
+                            // Parse program-specific instructions from block with metadata.
+                            // A supported instruction that will not decode leaves the slot's
+                            // contents unknown, so fail closed exactly like an unavailable
+                            // block: no SlotComplete, no advance, re-fetch on the next poll.
+                            let instructions_with_meta = match decoder::parse_block(
                                 &block,
                                 slot,
                                 program_type,
                                 escrow_instance_id.as_ref(),
-                            );
+                            ) {
+                                Ok(instructions) => instructions,
+                                Err(failure) => {
+                                    error!(
+                                        "Slot {} transaction {} instruction {} (inner {:?}) will not decode: {}; refusing to checkpoint past unknown contents",
+                                        slot,
+                                        failure.signature,
+                                        failure.instruction_index,
+                                        failure.inner_index,
+                                        failure.source
+                                    );
+                                    metrics::INDEXER_RPC_ERRORS
+                                        .with_label_values(&[
+                                            program_type.as_label(),
+                                            "parse_failed",
+                                        ])
+                                        .inc();
+                                    tokio::time::sleep(Duration::from_millis(
+                                        error_retry_interval_ms,
+                                    ))
+                                    .await;
+                                    break;
+                                }
+                            };
 
                             if !instructions_with_meta.is_empty() {
                                 info!(
@@ -458,15 +484,21 @@ mod tests {
             .create()
     }
 
-    /// Program id and account keys for a top-level WithdrawFunds transaction, so a
-    /// block built from these would yield exactly one indexed instruction if it
-    /// were treated as a success.
-    fn withdraw_block_transaction(meta: serde_json::Value) -> serde_json::Value {
-        use crate::indexer::datasource::common::parser::withdraw::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID;
-        // WithdrawFunds: discriminator 0, then borsh amount (u64 LE) + None destination.
+    /// A well-formed WithdrawFunds payload: discriminator 0, borsh amount (u64 LE), then
+    /// a None destination.
+    fn withdraw_ix_data() -> Vec<u8> {
         let mut data = vec![0u8];
         data.extend_from_slice(&1000u64.to_le_bytes());
         data.push(0);
+        data
+    }
+
+    /// Program id and account keys for a top-level WithdrawFunds transaction, so a
+    /// block built from these would yield exactly one indexed instruction if it
+    /// were treated as a success. `data` is the raw instruction payload, so a caller can
+    /// supply a truncated one the parser recognizes but cannot decode.
+    fn withdraw_block_transaction(meta: serde_json::Value, data: Vec<u8>) -> serde_json::Value {
+        use crate::indexer::datasource::common::parser::withdraw::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID;
         let ix_data = bs58::encode(data).into_string();
         let mut account_keys = vec![PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_string()];
         for seed in 1u8..=5 {
@@ -508,7 +540,7 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
-                        "transactions": [withdraw_block_transaction(serde_json::Value::Null)]
+                        "transactions": [withdraw_block_transaction(serde_json::Value::Null, withdraw_ix_data())]
                     },
                     "id": 1
                 })
@@ -560,7 +592,44 @@ mod tests {
                     "result": {
                         "blockhash": blockhash,
                         "parentSlot": slot - 1,
-                        "transactions": [withdraw_block_transaction(meta)]
+                        "transactions": [withdraw_block_transaction(meta, withdraw_ix_data())]
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .expect_at_least(expect_at_least)
+            .create()
+    }
+
+    /// getBlock returns a complete block whose in-scope WithdrawFunds carries only its
+    /// discriminator: an instruction the indexer supports, with a borsh body that cannot
+    /// be decoded. The block itself is well-formed, so only the parser can catch this.
+    fn mock_get_block_undecodable_withdraw(
+        server: &mut Server,
+        slot: u64,
+        expect_at_least: usize,
+    ) -> mockito::Mock {
+        let meta = json!({
+            "err": null,
+            "logMessages": null,
+            "innerInstructions": null,
+            "loadedAddresses": null
+        });
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": "TestBlockHash11111111111111111111111111111",
+                        "parentSlot": slot - 1,
+                        "transactions": [withdraw_block_transaction(meta, vec![0u8])]
                     },
                     "id": 1
                 })
@@ -832,6 +901,65 @@ mod tests {
         assert!(
             !emitted_instruction,
             "no phantom Instruction must be emitted for an incomplete block"
+        );
+    }
+
+    /// An instruction the indexer claims to support but cannot decode leaves the slot's
+    /// contents unknown, so the slot must not complete: completing it would checkpoint
+    /// past a real on-chain action that was never indexed, and normal polling would
+    /// never come back for it. Before the fail-closed arm the slot advanced and the
+    /// instruction was lost for good, so both assertions are falsifiable.
+    #[tokio::test]
+    async fn undecodable_instruction_does_not_emit_slot_complete_or_instruction() {
+        let mut server = Server::new_async().await;
+
+        // Chain tip ahead and batch size 1 so each poll asks for exactly [100].
+        let _m_slot = mock_get_slot(&mut server, 105);
+        let _m_enum = mock_get_blocks(&mut server, 100, 100, &[100]);
+        // Slot 100 always returns the undecodable payload; expect >=2 fetches proving no advance.
+        let m_block = mock_get_block_undecodable_withdraw(&mut server, 100, 2);
+
+        let mut source = RpcPollingSource::new(
+            server.url(),
+            Some(100),
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            None,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        // Slot 100 re-requested at least twice: polling did not advance past it.
+        m_block.assert();
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        let emitted_slot_complete = messages
+            .iter()
+            .any(|message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100));
+        assert!(
+            !emitted_slot_complete,
+            "SlotComplete{{slot:100}} must not be emitted for a slot holding an undecodable instruction"
+        );
+        let emitted_instruction = messages
+            .iter()
+            .any(|message| matches!(message, ProcessorMessage::Instruction(_)));
+        assert!(
+            !emitted_instruction,
+            "no instruction may be emitted from a slot that failed to decode"
         );
     }
 

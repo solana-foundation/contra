@@ -24,6 +24,18 @@ type ParseInstructionFn<T> = fn(
     location: InstructionLocation,
 ) -> Result<Option<T>, ParserError>;
 
+/// An instruction of the indexed program whose discriminator is supported but whose
+/// payload would not decode, with the position an operator needs to find it. Unknown
+/// discriminators parse to `Ok(None)` and never land here, so this always means a slot
+/// holds contents the indexer claims to cover but could not read.
+#[derive(Debug)]
+pub struct UndecodableInstruction {
+    pub signature: String,
+    pub instruction_index: u32,
+    pub inner_index: Option<u32>,
+    pub source: ParserError,
+}
+
 /// Returns a label for the first `meta`-less
 /// transaction in `block`, or `None` if all carry metadata; a single `meta: null`
 /// tx makes the slot unverifiable, so callers MUST fail closed on `Some(_)`.
@@ -33,10 +45,9 @@ type ParseInstructionFn<T> = fn(
 /// null legitimately for every transaction, so rejecting it wedges them on every
 /// block.
 ///
-/// This leaves a known gap on Solana: an escrow deposit whose event self-CPI has not
-/// been written yet passes this guard, decodes to no event, and the parser drops it
-/// with a warning. Distinguishing that from a chain with no inner instructions needs
-/// the parser, not this guard, and is deliberately not fixed here.
+/// An escrow deposit whose event self-CPI is absent still passes this guard, which
+/// cannot tell it apart from a chain that records no inner instructions. The parser
+/// catches that case instead, and `parse_block` fails the slot closed on it.
 pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
     for (index, tx_with_meta) in block.transactions.iter().enumerate() {
         if tx_with_meta.meta.is_none() {
@@ -55,21 +66,22 @@ pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
 
 /// Parse a block and extract program-specific instructions with metadata.
 ///
-/// Precondition: every transaction in `block` must carry `meta`.
+/// Precondition: every transaction in `block` must carry `meta`. Errs when a supported
+/// instruction will not decode, leaving the slot's contents unknown.
 pub fn parse_block(
     block: &RpcBlock,
     slot: u64,
     program_type: ProgramType,
     escrow_instance_id: Option<&Pubkey>,
-) -> Vec<InstructionWithMetadata> {
+) -> Result<Vec<InstructionWithMetadata>, UndecodableInstruction> {
     match program_type {
-        ProgramType::Escrow => parse_block_for_program::<EscrowInstruction>(
+        ProgramType::Escrow => Ok(parse_block_for_program::<EscrowInstruction>(
             block,
             PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
             parse_escrow_instruction,
             escrow_inner_discriminator_excluded,
             escrow_instance_id,
-        )
+        )?
         .into_iter()
         .map(|(signature, location, ix)| InstructionWithMetadata {
             instruction: ProgramInstruction::Escrow(Box::new(ix)),
@@ -79,14 +91,14 @@ pub fn parse_block(
             instruction_index: location.top_level_index,
             inner_index: location.inner.map(|i| i.inner_index),
         })
-        .collect(),
-        ProgramType::Withdraw => parse_block_for_program::<WithdrawInstruction>(
+        .collect()),
+        ProgramType::Withdraw => Ok(parse_block_for_program::<WithdrawInstruction>(
             block,
             PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
             parse_withdraw_instruction,
             withdraw_inner_discriminator_excluded,
             None,
-        )
+        )?
         .into_iter()
         .map(|(signature, location, ix)| InstructionWithMetadata {
             instruction: ProgramInstruction::Withdraw(Box::new(ix)),
@@ -96,7 +108,7 @@ pub fn parse_block(
             instruction_index: location.top_level_index,
             inner_index: location.inner.map(|i| i.inner_index),
         })
-        .collect(),
+        .collect()),
     }
 }
 
@@ -116,7 +128,7 @@ pub fn parse_block_for_program<T>(
     parse_instruction: ParseInstructionFn<T>,
     inner_discriminator_excluded: fn(u8) -> bool,
     escrow_instance_id: Option<&Pubkey>,
-) -> Vec<(String, InstructionLocation, T)>
+) -> Result<Vec<(String, InstructionLocation, T)>, UndecodableInstruction>
 where
     T: std::fmt::Debug,
 {
@@ -184,7 +196,7 @@ where
         // programming error, not a per-transaction condition.
         let Ok(filter_pubkey) = Pubkey::from_str(filter_program_id) else {
             error!("Invalid filter program id: {filter_program_id}");
-            return instructions;
+            return Ok(instructions);
         };
 
         // Enumerate before the program-id filter so the index is the instruction's
@@ -208,8 +220,15 @@ where
                     Ok(None) => {
                         debug!("Skipped unsupported instruction");
                     }
-                    Err(e) => {
-                        warn!("Failed to parse instruction: {}", e);
+                    // A discriminator we support that will not decode leaves this slot's
+                    // contents unknown, so fail the whole slot rather than drop the row.
+                    Err(source) => {
+                        return Err(UndecodableInstruction {
+                            signature: signature.clone(),
+                            instruction_index: location.top_level_index,
+                            inner_index: location.inner.map(|inner| inner.inner_index),
+                            source,
+                        });
                     }
                 }
             }
@@ -248,15 +267,20 @@ where
                     Ok(None) => {
                         debug!("Skipped unsupported inner instruction");
                     }
-                    Err(e) => {
-                        warn!("Failed to parse inner instruction: {}", e);
+                    Err(source) => {
+                        return Err(UndecodableInstruction {
+                            signature: signature.clone(),
+                            instruction_index: location.top_level_index,
+                            inner_index: location.inner.map(|inner| inner.inner_index),
+                            source,
+                        });
                     }
                 }
             }
         }
     }
 
-    instructions
+    Ok(instructions)
 }
 
 #[cfg(test)]
@@ -321,6 +345,7 @@ mod tests {
             never_excluded,
             escrow_instance_id,
         )
+        .expect("the mock parsers used here decode every instruction")
         .into_iter()
         .map(|(sig, location, value)| (sig, location.top_level_index, value))
         .collect()
@@ -531,22 +556,37 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    /// A supported instruction that will not decode must fail the whole slot rather than
+    /// vanish from the output: dropping it would let the caller complete and checkpoint a
+    /// slot whose contents it never read. The reported location is what the caller logs.
     #[test]
-    fn test_parse_returns_error() {
+    fn parse_error_fails_the_slot_with_the_offending_location() {
         let mut block = create_test_block();
         let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
         let instruction = create_instruction(0, vec![], "test_data".to_string());
+        let signature = "sig1";
 
         block.transactions.push(create_successful_transaction(
-            "sig1".to_string(),
+            signature.to_string(),
             account_keys,
             vec![instruction],
         ));
 
-        let result = parse_for_test(&block, TEST_PROGRAM_ID, mock_parser_returns_error, None);
+        let failure = parse_block_for_program(
+            &block,
+            TEST_PROGRAM_ID,
+            mock_parser_returns_error,
+            never_excluded,
+            None,
+        )
+        .expect_err("an undecodable supported instruction must fail the slot");
 
-        // Should be empty because parser returned error (logged but continued)
-        assert!(result.is_empty());
+        assert_eq!(failure.signature, signature);
+        assert_eq!(failure.instruction_index, 0);
+        assert!(
+            failure.inner_index.is_none(),
+            "a top-level instruction has no inner index"
+        );
     }
 
     #[test]
@@ -726,7 +766,8 @@ mod tests {
         block.transactions.push(tx);
 
         let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None);
+            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
+                .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 1);
         let (sig, location, data) = &result[0];
@@ -765,7 +806,8 @@ mod tests {
         block.transactions.push(tx);
 
         let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None);
+            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
+                .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 2);
         // Each CPI deposit is attributed to the top-level instruction it ran under.
@@ -806,7 +848,8 @@ mod tests {
             mock_parser,
             escrow_inner_discriminator_excluded,
             None,
-        );
+        )
+        .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 1, "only the non-excluded inner is indexed");
         assert_eq!(result[0].2, deposit_data);
@@ -863,7 +906,8 @@ mod tests {
             count_keys_parser,
             never_excluded,
             None,
-        );
+        )
+        .expect("the key-counting parser decodes every instruction");
 
         assert_eq!(result.len(), 1);
         assert_eq!(
@@ -901,7 +945,8 @@ mod tests {
         block.transactions.push(tx);
 
         let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None);
+            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
+                .expect("the mock parser decodes every instruction");
 
         assert_eq!(
             result.len(),
@@ -930,7 +975,8 @@ mod tests {
         block.transactions.push(tx);
 
         let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None);
+            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
+                .expect("the mock parser decodes every instruction");
 
         assert_eq!(
             result.len(),
@@ -1009,7 +1055,8 @@ mod tests {
         let mut block = create_test_block();
         block.transactions.push(tx);
 
-        let result = parse_block(&block, 7, ProgramType::Escrow, None);
+        let result = parse_block(&block, 7, ProgramType::Escrow, None)
+            .expect("every deposit in this block decodes");
 
         assert_eq!(
             result.len(),
@@ -1070,7 +1117,8 @@ mod tests {
         let mut block = create_test_block();
         block.transactions.push(tx);
 
-        let result = parse_block(&block, 7, ProgramType::Escrow, None);
+        let result = parse_block(&block, 7, ProgramType::Escrow, None)
+            .expect("every deposit in this block decodes");
 
         assert_eq!(
             result.len(),
@@ -1154,7 +1202,8 @@ mod tests {
         let mut block = create_test_block();
         block.transactions.push(tx);
 
-        let result = parse_block(&block, 9, ProgramType::Escrow, None);
+        let result = parse_block(&block, 9, ProgramType::Escrow, None)
+            .expect("every deposit in this block decodes");
 
         // Only the three deposits surface (events parse to Ok(None); foreign skipped).
         assert_eq!(

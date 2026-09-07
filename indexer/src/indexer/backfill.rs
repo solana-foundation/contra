@@ -202,12 +202,39 @@ pub async fn fill_slot_range(
                         return Err(BackfillError::MissingMeta { slot, signature }.into());
                     }
 
-                    let instructions_with_meta = decoder::parse_block(
+                    // A supported instruction that will not decode leaves the slot's contents
+                    // unknown: abort before the SlotComplete send so the checkpoint never
+                    // advances past it. Re-parsing the same bytes fails the same way, so the
+                    // caller's retry only clears once the data source serves fuller meta.
+                    let instructions_with_meta = match decoder::parse_block(
                         &block,
                         slot,
                         program_type,
                         escrow_instance_id.as_ref(),
-                    );
+                    ) {
+                        Ok(instructions) => instructions,
+                        Err(failure) => {
+                            error!(
+                                "Backfill slot {} transaction {} instruction {} (inner {:?}) will not decode: {}; aborting before checkpoint",
+                                slot,
+                                failure.signature,
+                                failure.instruction_index,
+                                failure.inner_index,
+                                failure.source
+                            );
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "parse_failed"])
+                                .inc();
+                            return Err(BackfillError::InstructionUndecodable {
+                                slot,
+                                signature: failure.signature,
+                                instruction_index: failure.instruction_index,
+                                inner_index: failure.inner_index,
+                                reason: failure.source.to_string(),
+                            }
+                            .into());
+                        }
+                    };
 
                     for instruction_meta in instructions_with_meta {
                         send_guaranteed(
@@ -869,6 +896,7 @@ mod tests {
     #[cfg(feature = "datasource-rpc")]
     mod fill_slot_range_tests {
         use super::*;
+        use crate::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
         use crate::test_utils::rpc_mocks::{
             chain, mock_get_block_at, mock_get_blocks, mock_get_blocks_with_limit,
@@ -935,6 +963,92 @@ mod tests {
                     .to_string(),
                 )
                 .create()
+        }
+
+        /// getBlock returns a complete block holding an escrow Deposit with no borsh body:
+        /// a discriminator the indexer supports that cannot be decoded. Deposit's borsh
+        /// deserialize runs before its account and event checks, so a one-byte payload is
+        /// enough. The block and its meta are well-formed, so only the parser catches it.
+        fn mock_get_block_undecodable_deposit(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash11111111111111111111111111111",
+                            "parentSlot": slot - 1,
+                            "transactions": [{
+                                "transaction": {
+                                    "signatures": ["sig_undecodable"],
+                                    "message": {
+                                        "accountKeys": [PRIVATE_CHANNEL_ESCROW_PROGRAM_ID],
+                                        "instructions": [{
+                                            "programIdIndex": 0,
+                                            "accounts": [],
+                                            "data": bs58::encode([6u8]).into_string()
+                                        }]
+                                    }
+                                },
+                                "meta": {
+                                    "err": null,
+                                    "logMessages": null,
+                                    "innerInstructions": null,
+                                    "loadedAddresses": null
+                                }
+                            }]
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        /// A batch where slot N holds an instruction the indexer supports but cannot decode
+        /// must abort before SlotComplete{N} (and before any SlotComplete after N), so the
+        /// checkpoint never advances past a slot whose contents were never read. Retrying
+        /// the same endpoint re-parses the same bytes, so only fuller meta clears it.
+        #[tokio::test]
+        async fn fill_slot_range_undecodable_instruction_aborts_before_slot_complete() {
+            let mut server = Server::new_async().await;
+
+            // Batch over (100, 102] = [101, 102]; slot 101 will not decode.
+            let _blocks = mock_get_blocks(&mut server, 101, 102, &[101, 102]);
+            let _m1 = mock_get_block_undecodable_deposit(&mut server, 101);
+            let _m2 = mock_get_block_at(&mut server, 102, 101);
+
+            let poller = poller(&server);
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            let err = result.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("will not decode"),
+                "unexpected error: {message}"
+            );
+            assert!(
+                message.contains("101"),
+                "error should name the slot: {message}"
+            );
+
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let advanced = messages.iter().any(
+                |message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot >= 101),
+            );
+            assert!(
+                !advanced,
+                "no SlotComplete must be sent for slot 101 or beyond on an undecodable instruction"
+            );
         }
 
         #[tokio::test]

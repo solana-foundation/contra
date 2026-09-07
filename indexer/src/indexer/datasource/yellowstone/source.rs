@@ -2302,6 +2302,57 @@ mod tests {
         }
         assert!(!saw_complete, "slot must not complete when a tx lacks meta");
     }
+
+    /// An instruction the indexer claims to support but cannot decode leaves the slot's
+    /// contents unknown, so the whole block fails closed and the slot is not completed.
+    /// Dropping it instead would checkpoint past a real on-chain action nothing indexed,
+    /// and the reconnect gap-fill would never come back for it.
+    #[tokio::test]
+    async fn block_undecodable_instruction_errs_without_completing() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // A WithdrawFunds carrying only its discriminator: the parser recognizes it and
+        // fails on the missing borsh body.
+        let mut tx_info = withdraw_tx_update(vec![9u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        tx_info
+            .transaction
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .instructions[0]
+            .data = vec![0u8];
+        let block = block_update(1300, vec![tx_info]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        assert!(
+            res.is_err(),
+            "an undecodable supported instruction must fail the block"
+        );
+        drop(tx);
+
+        let mut saw_complete = false;
+        let mut saw_instruction = false;
+        while let Some(message) = rx.recv().await {
+            match message {
+                ProcessorMessage::SlotComplete { .. } => saw_complete = true,
+                ProcessorMessage::Instruction(_) => saw_instruction = true,
+                ProcessorMessage::Regate { .. } => panic!("no Regate expected here"),
+            }
+        }
+        assert!(
+            !saw_complete,
+            "slot must not complete when an instruction will not decode"
+        );
+        assert!(
+            !saw_instruction,
+            "no instruction may be emitted from a block that failed to decode"
+        );
+    }
 }
 
 /// Parse all of the block's transactions, then send SlotComplete last so a completion never
@@ -2560,62 +2611,63 @@ async fn parse_and_send(
     signature: &str,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
-    let instruction_data = match program_type {
+    let parsed = match program_type {
         ProgramType::Escrow => {
-            match parse_escrow_instruction(compiled_ix, account_keys, inner_instructions, location)
-            {
-                Ok(Some(inst)) => Some(ProgramInstruction::Escrow(Box::new(inst))),
-                Ok(None) => {
-                    debug!("Yellowstone: Unsupported escrow instruction at slot {slot}");
-                    None
-                }
-                Err(e) => {
-                    error!("Failed to parse escrow instruction at slot {slot}: {e}");
-                    None
-                }
-            }
+            parse_escrow_instruction(compiled_ix, account_keys, inner_instructions, location)
+                .map(|parsed| parsed.map(|inst| ProgramInstruction::Escrow(Box::new(inst))))
         }
         ProgramType::Withdraw => {
-            match parse_withdraw_instruction(
-                compiled_ix,
-                account_keys,
-                inner_instructions,
-                location,
-            ) {
-                Ok(Some(inst)) => Some(ProgramInstruction::Withdraw(Box::new(inst))),
-                Ok(None) => {
-                    debug!("Yellowstone: Unsupported withdraw instruction at slot {slot}");
-                    None
-                }
-                Err(e) => {
-                    error!("Failed to parse withdraw instruction at slot {slot}: {e}");
-                    None
-                }
-            }
+            parse_withdraw_instruction(compiled_ix, account_keys, inner_instructions, location)
+                .map(|parsed| parsed.map(|inst| ProgramInstruction::Withdraw(Box::new(inst))))
         }
     };
 
-    if let Some(instruction_data) = instruction_data {
-        let instruction_meta = InstructionWithMetadata {
-            instruction: instruction_data,
-            slot,
-            program_type,
-            signature: Some(signature.to_string()),
-            // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
-            instruction_index: location.top_level_index,
-            inner_index: location.inner.map(|i| i.inner_index),
-        };
+    let inner_index = location.inner.map(|inner| inner.inner_index);
+    let instruction_data = match parsed {
+        Ok(Some(instruction_data)) => instruction_data,
+        Ok(None) => {
+            debug!("Yellowstone: unsupported {program_type:?} instruction at slot {slot}");
+            return Ok(());
+        }
+        // A discriminator we support that will not decode leaves this slot's contents
+        // unknown. Failing the block here skips its SlotComplete, so the checkpoint holds
+        // and the reconnect gap-fill replays the slot.
+        Err(e) => {
+            error!(
+                "Slot {slot} transaction {signature} instruction {} (inner {inner_index:?}) will not decode: {e}; refusing to complete the slot",
+                location.top_level_index
+            );
+            metrics::INDEXER_RPC_ERRORS
+                .with_label_values(&[program_type.as_label(), "parse_failed"])
+                .inc();
+            return Err(DataSourceRpcError::Protocol {
+                reason: format!(
+                    "slot {slot} transaction {signature} instruction {} will not decode: {e}",
+                    location.top_level_index
+                ),
+            });
+        }
+    };
 
-        send_guaranteed(
-            channel,
-            ProcessorMessage::Instruction(instruction_meta),
-            "instruction (yellowstone)",
-        )
-        .await
-        .map_err(|e| DataSourceRpcError::Protocol {
-            reason: format!("Instruction send failed: {e}"),
-        })?;
-    }
+    let instruction_meta = InstructionWithMetadata {
+        instruction: instruction_data,
+        slot,
+        program_type,
+        signature: Some(signature.to_string()),
+        // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
+        instruction_index: location.top_level_index,
+        inner_index,
+    };
+
+    send_guaranteed(
+        channel,
+        ProcessorMessage::Instruction(instruction_meta),
+        "instruction (yellowstone)",
+    )
+    .await
+    .map_err(|e| DataSourceRpcError::Protocol {
+        reason: format!("Instruction send failed: {e}"),
+    })?;
 
     Ok(())
 }

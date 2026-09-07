@@ -81,9 +81,18 @@ pub async fn truncate_slots(
 
     let pool = db.pool.clone();
 
+    // The lock belongs to one session, so acquire and release have to run on the
+    // same connection. Taken from the pool, a statement lands on whichever
+    // connection is free, and unlocking from a different one is a silent no-op
+    // that strands the lock on the acquiring connection until it is recycled.
+    let mut lock_conn = pool
+        .acquire()
+        .await
+        .context("Failed to reserve a connection for the truncation lock")?;
+
     let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .fetch_one(pool.as_ref())
+        .fetch_one(&mut *lock_conn)
         .await
         .context("Failed to acquire advisory lock")?;
     if !acquired {
@@ -94,11 +103,18 @@ pub async fn truncate_slots(
 
     let result = truncate_slots_inner(pool.as_ref(), options).await;
 
-    sqlx::query("SELECT pg_advisory_unlock($1)")
+    // Read the answer rather than discarding it: false means this session did not
+    // hold the lock, which is the bug above and must not pass unnoticed.
+    let released = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .execute(pool.as_ref())
+        .fetch_one(&mut *lock_conn)
         .await
         .context("Failed to release advisory lock")?;
+    if !released {
+        return Err(anyhow!(
+            "Truncation advisory lock was not held by the releasing session"
+        ));
+    }
 
     result
 }
@@ -801,17 +817,13 @@ mod tests {
         assert_eq!(updated, 1, "expected to corrupt exactly one block");
     }
 
-    /// Run one truncation against a pool of its own, close it, and wait until the
-    /// server has actually dropped the truncation advisory lock.
+    /// Run one truncation against a pool of its own and prove the lock is gone
+    /// before the pool is torn down.
     ///
-    /// `truncate_slots` takes that lock on whichever pooled connection serves the
-    /// acquire statement and releases it on whichever connection serves the
-    /// release statement. Those are not guaranteed to be the same connection, so
-    /// a second run against a still-open pool can find the lock held by an idle
-    /// one. Closing the pool ends those sessions, but the backends exit
-    /// asynchronously, so the wait below is what makes multi-run tests
-    /// deterministic. This is test scaffolding only; the lock's connection
-    /// affinity is not part of this change.
+    /// The check runs while the pool is still open on purpose. `truncate_slots`
+    /// holds the lock on one reserved connection and releases it there, so the
+    /// lock must be gone the moment it returns. Closing the pool first would free
+    /// the lock as a side effect and hide a release that never happened.
     async fn truncate_on_fresh_pool(
         url: &str,
         options: &TruncateOptions,
@@ -821,27 +833,25 @@ mod tests {
             .await
             .expect("test pool connects");
         let report = truncate_slots(&db, options).await;
+        assert_advisory_locks_released(observer).await;
         db.pool.close().await;
-        await_advisory_locks_released(observer).await;
         report
     }
 
-    /// Block until no advisory lock is held anywhere on the test database. Each
-    /// test owns its container, so the truncation lock is the only one possible.
-    async fn await_advisory_locks_released(pool: &PgPool) {
-        for _ in 0..600 {
-            let held = sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("pg_locks is readable");
-            if held == 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!("truncation advisory lock still held after its pool was closed");
+    /// No advisory lock may be held once a truncation has returned. Asserted once
+    /// rather than polled: the release is synchronous, so a retry loop here would
+    /// only turn a stranded lock into a slow test that passes.
+    async fn assert_advisory_locks_released(pool: &PgPool) {
+        let held = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_locks is readable");
+        assert_eq!(
+            held, 0,
+            "truncate_slots must release its advisory lock before returning"
+        );
     }
 
     fn apply_opts(keep_slots: u64, batch_size: usize, backup: &Path) -> TruncateOptions {

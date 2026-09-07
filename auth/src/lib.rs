@@ -151,8 +151,9 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str, request_timeout: Du
 ///
 /// Reported as 503, not 408. The usual cause is server-side contention (the
 /// pool or the Argon2 queue), and 408 tells the client it may repeat the request
-/// unchanged, which turns a struggling database into a retry storm. 503 is
-/// already what this service returns when it sheds for the Argon2 cap.
+/// unchanged, which turns a struggling database into a retry storm. 503 is what
+/// this service returns for every other shed: the Argon2 cap, and a database
+/// that never answered.
 ///
 /// Going through `AppError` also gives the response the `{"error": ...}` body
 /// every other failure here has; a bare status from a timeout layer would be

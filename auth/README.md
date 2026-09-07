@@ -25,7 +25,8 @@ Authentication service for the Solana Private Channels platform. Handles user re
 The credential routes run Argon2, which is deliberately CPU and memory heavy. They are
 rate limited per IP and per username, capped at `AUTH_ARGON2_MAX_CONCURRENCY` concurrent
 hashes, and limited to a 4 KB request body. Over-budget requests get `429`; requests that
-wait too long for a hashing slot, or outrun `AUTH_REQUEST_TIMEOUT_SECS`, get `503`.
+wait too long for a hashing slot, outrun `AUTH_REQUEST_TIMEOUT_SECS`, or find the database
+unreachable, get `503`. A `500` means the database answered and we asked it wrong.
 
 Those budgets are per request, so they are only charged once a request arrives. Connections
 are bounded separately by `AUTH_MAX_CONNECTIONS` and `AUTH_MAX_CONNECTIONS_PER_IP`, and the

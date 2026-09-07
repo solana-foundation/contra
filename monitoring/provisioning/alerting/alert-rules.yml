@@ -194,6 +194,11 @@ groups:
       # the last 24h is gone now. Self-limiting by design: an intentional
       # removal pages until the old series ages out of the 24h window, then
       # goes quiet on its own.
+      # Known limit: it needs a 24h baseline, so it cannot flag a job that was
+      # never configured on a fresh Prometheus volume (no history to compare
+      # against). That first-boot case is indistinguishable at the metrics layer
+      # from a stack that correctly runs no probes; confirming the scrape config
+      # on a new instance is a deploy-time check, not something this rule catches.
       - uid: monitored-series-vanished
         title: "Monitoring coverage lost (previously monitored series vanished)"
         condition: C

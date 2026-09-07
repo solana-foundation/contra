@@ -74,12 +74,12 @@ async fn start_node(
     Ok((node, pg_url, pg))
 }
 
-/// Start a node against an existing database and wait for it to produce a block.
-async fn start_node_on(pg_url: &str, max_blockhashes: usize) -> Result<TestNode> {
-    let rpc_port = get_free_port();
-    let config = NodeConfig {
+/// The configuration every test in this file drives a node with. Shared so a
+/// restart is configured exactly like the first start.
+fn node_config(pg_url: &str, port: u16, max_blockhashes: usize) -> NodeConfig {
+    NodeConfig {
         mode: NodeMode::Aio,
-        port: rpc_port,
+        port,
         sigverify_queue_size: 100,
         sigverify_workers: 1,
         max_connections: 50,
@@ -100,8 +100,15 @@ async fn start_node_on(pg_url: &str, max_blockhashes: usize) -> Result<TestNode>
         blocktime_ms: BLOCKTIME_MS,
         perf_sample_period_secs: 3_600,
         metrics: Arc::new(NoopMetrics),
-    };
-    let handles = run_node(config).await.expect("run_node");
+    }
+}
+
+/// Start a node against an existing database and wait for it to produce a block.
+async fn start_node_on(pg_url: &str, max_blockhashes: usize) -> Result<TestNode> {
+    let rpc_port = get_free_port();
+    let handles = run_node(node_config(pg_url, rpc_port, max_blockhashes))
+        .await
+        .expect("run_node");
 
     let url = format!("http://127.0.0.1:{rpc_port}");
     let client = RpcClient::new(url.clone());
@@ -323,6 +330,45 @@ async fn a_blockhash_expires_after_max_blockhashes_blocks() -> Result<()> {
     assert!(
         slot - slot_at_mint > height - height_at_mint,
         "an idle stretch must consume more slots than blocks: slots {slot_at_mint} -> {slot}, heights {height_at_mint} -> {height}"
+    );
+    Ok(())
+}
+
+/// A block row lost from the middle of the window must stop the node coming back
+/// up. Its transactions named older hashes that are still live, so a restore that
+/// skipped it would leave every one of them replayable.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_refuses_an_interior_block_gap() -> Result<()> {
+    let (mut node, pg_url, _pg) = start_node(150).await?;
+    sleep(HEARTBEAT * 4).await;
+    node.handles
+        .take()
+        .expect("the node is running")
+        .shutdown()
+        .await;
+
+    let pool = sqlx::PgPool::connect(&pg_url).await?;
+    let slots: Vec<i64> = sqlx::query_scalar("SELECT slot FROM blocks ORDER BY slot")
+        .fetch_all(&pool)
+        .await?;
+    assert!(
+        slots.len() >= 3,
+        "the chain needs blocks either side of the hole: {slots:?}"
+    );
+    sqlx::query("DELETE FROM blocks WHERE slot = $1")
+        .bind(slots[slots.len() / 2])
+        .execute(&pool)
+        .await?;
+
+    // Started directly rather than through the helper, which expects a node that
+    // comes up.
+    let error = match run_node(node_config(&pg_url, get_free_port(), 150)).await {
+        Ok(_) => panic!("the node must refuse to restore a window with a hole"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        error.contains("dedup restore window has a gap"),
+        "the node must refuse over the missing block, got {error:?}"
     );
     Ok(())
 }

@@ -20,6 +20,13 @@ routes by webhook + `transaction_type`.
 > dispatch table; see
 > [`sender_lock_lost_runbook.md`](sender_lock_lost_runbook.md).
 >
+> **A third condition pages through Grafana, not the webhook.** The
+> **`live-state-lock-lost`** alert fires when an indexer, operator or resync
+> cannot prove it still owns the live-state lock, which is what keeps live
+> workers and a destructive resync off the same database. The same runbook
+> covers the two refusals that lock produces at startup; see
+> [`live_state_lock_runbook.md`](live_state_lock_runbook.md).
+>
 > **Two halts have no dedicated alert.** The **SMT-root-mismatch boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
 > The common cause is auto-reconciled at boot; an unforeseen divergence the

@@ -144,10 +144,13 @@ impl MockStorage {
     }
 
     pub async fn init_schema(&self) -> Result<(), StorageError> {
+        self.check_should_fail("init_schema")?;
         Ok(())
     }
 
+    // Counted, so a test can assert the rebuild never reached the destruction.
     pub async fn drop_tables(&self) -> Result<(), StorageError> {
+        self.check_should_fail("drop_tables")?;
         Ok(())
     }
 

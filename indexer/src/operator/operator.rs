@@ -6,6 +6,7 @@ use crate::operator::{
     RetryConfig, RpcClientWithRetry,
 };
 use crate::shutdown_utils::shutdown_operator;
+use crate::storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL};
 use crate::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use private_channel_metrics::{HealthState, MetricLabel};
@@ -14,6 +15,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// Metric label for the live-state lock this role holds.
+const OPERATOR_LOCK_ROLE: &str = "operator";
 
 pub async fn run(
     storage: Arc<Storage>,
@@ -33,6 +37,25 @@ pub async fn run(
     info!("Retry max attempts: {}", config.retry_max_attempts);
 
     let cancellation_token = CancellationToken::new();
+
+    // Take the live-state lock before touching the schema or any row. A resync
+    // rebuilding this database holds it exclusively, and starting underneath one would
+    // mint and release against tables it is about to drop. Held for the whole run, so a
+    // resync cannot start either. Refusing here is the point: orchestration retries
+    // once the resync exits.
+    let _live_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            OPERATOR_LOCK_ROLE,
+            cancellation_token.clone(),
+            LIVE_LOCK_HEARTBEAT_INTERVAL,
+        )
+        .await
+        .inspect_err(|e| error!("Operator refusing to start: {}", e))?;
+
+    // Moved here from the binary so it runs under the lock, never against tables a
+    // resync is dropping.
+    storage.init_schema().await?;
 
     // Initialize global RPC client with retry
     let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
